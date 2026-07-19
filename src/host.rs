@@ -105,7 +105,7 @@ pub mod unop {
 
 /// A compiled function template: parameter shape + body chunk. Shared by every
 /// closure created from the same function/arrow.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct FuncDef {
     pub name: String,
     /// Parameter binding templates (destructuring lowered by the compiler into
@@ -123,7 +123,7 @@ pub struct FuncDef {
 
 /// One parameter slot. `name` is the simple bound name; a destructuring pattern
 /// is lowered to a synthetic `.arg{i}` name plus body prologue code.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParamSlot {
     pub name: String,
     /// True for the `...rest` collector.
@@ -134,7 +134,7 @@ pub struct ParamSlot {
 
 /// A compiled `try`/`catch`/`finally` block. Bodies are bare chunks run in the
 /// current scope.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TryDef {
     pub block: Chunk,
     /// `(catch_param_name, catch_body)`.
@@ -1534,6 +1534,12 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
     // directly — NOT get_property — so the Object.prototype-builtin fallback
     // never routes back through a BoundMethod and recurses.
     if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Object(_))) {
+        // A native stdlib instance (`Buffer`/crypto `Hash`/`EventEmitter`/`URL`/
+        // fs `Stats`) carries a hidden `@@native` tag; route its methods to the
+        // stdlib instance dispatcher before generic object resolution.
+        if let Some(tag) = crate::stdlib::native_tag(recv) {
+            return crate::stdlib::instance_call(&tag, recv, name, args);
+        }
         if let Some((Some(getter), _)) = with_host(|h| lookup_accessor(h, recv, name)) {
             let f = invoke(&getter, Vec::new(), Some(recv.clone()))?;
             if with_host(|h| is_callable(h, &f)) {

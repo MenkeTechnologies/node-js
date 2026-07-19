@@ -14,6 +14,10 @@ pub struct Cli {
     #[arg(short = 'e', long = "eval", value_name = "SRC")]
     pub eval: Option<String>,
 
+    /// Start the interactive REPL.
+    #[arg(long = "repl")]
+    pub repl: bool,
+
     /// Speak the Language Server Protocol over stdio.
     #[arg(long = "lsp")]
     pub lsp: bool,
@@ -22,7 +26,15 @@ pub struct Cli {
     #[arg(long = "dap")]
     pub dap: bool,
 
-    /// The `.js` script to run (omit with --lsp / --dap / -e or to read stdin).
+    /// Ahead-of-time compile the script to a standalone native executable.
+    #[arg(long = "build")]
+    pub build: bool,
+
+    /// Print the compiled fusevm bytecode for the script and exit.
+    #[arg(long = "dump-bytecode")]
+    pub dump_bytecode: bool,
+
+    /// The `.js` script to run (omit with --repl / --lsp / --dap / -e).
     #[arg(value_name = "FILE")]
     pub file: Option<String>,
 

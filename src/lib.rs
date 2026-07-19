@@ -7,8 +7,12 @@
 //! operation. There is no bespoke VM or JIT here — execution and codegen live in
 //! fusevm.
 
+pub mod aot;
+pub mod aot_native;
 pub mod ast;
+pub mod banner;
 pub mod builtins;
+pub mod cache;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
@@ -16,6 +20,8 @@ pub mod host;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod repl;
+pub mod stdlib;
 
 pub use fusevm::Value;
 
@@ -52,17 +58,46 @@ pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
     host::run_main(load_merged(prog))
 }
 
-/// Parse/compile and run a JS source string on a fresh host.
-pub fn eval_str(src: &str) -> Result<Value, String> {
-    host::reset_host();
-    run_compiled(compile(src)?)
+/// Transparent bytecode cache: return the cached compiled `Program` for `src`
+/// (skipping lex/parse/lower entirely), else compile it, store it in the
+/// `~/.node-js/scripts.rkyv` shard, and return it. This runs on EVERY ordinary
+/// `node foo.js` / `node -e` invocation, so scripts are rkyv-cached automatically
+/// — not only under `--build`. Set `NODE_JS_TRACE=1` to log hit/miss to stderr
+/// (silent otherwise; normal runs print nothing).
+pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
+    if let Some(prog) = cache::load(src) {
+        if std::env::var_os("NODE_JS_TRACE").is_some() {
+            eprintln!(
+                "node-js: cache HIT ({} ops, {} functions) — skipped lex/parse/lower",
+                prog.main.ops.len(),
+                prog.functions.len()
+            );
+        }
+        return Ok(prog);
+    }
+    let prog = compile(src)?;
+    let _ = cache::store(src, &prog);
+    if std::env::var_os("NODE_JS_TRACE").is_some() {
+        eprintln!(
+            "node-js: cache MISS — compiled + stored ({} ops, {} functions)",
+            prog.main.ops.len(),
+            prog.functions.len()
+        );
+    }
+    Ok(prog)
 }
 
-/// Read and run a `.js` file.
+/// Parse/load, compile, and run a JS source string on a fresh host (rkyv-cached).
+pub fn eval_str(src: &str) -> Result<Value, String> {
+    host::reset_host();
+    run_compiled(compile_or_load(src)?)
+}
+
+/// Read and run a `.js` file (transparently rkyv-cached — see `compile_or_load`).
 pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     host::reset_host();
-    run_compiled(compile(&src)?)
+    run_compiled(compile_or_load(&src)?)
 }
 
 /// Read and run a `.js` file under the DAP debugger.

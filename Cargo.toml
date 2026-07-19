@@ -68,11 +68,36 @@ indexmap = "2"
 # across every suspend/resume because the coroutine runs on the same thread.
 corosensei = "0.3"
 
+# rkyv-backed bytecode cache at ~/.node-js/scripts.rkyv (mirrors pythonrs/
+# zshrs/rubylang): the outer shard is a zero-copy rkyv archive; the inner
+# per-script fusevm::Chunk is bincode (fusevm::Chunk is serde-owned, not
+# rkyv::Archive). Versioned from day one so a cached .js that worked never
+# breaks (compat floor).
+rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
+bincode = "1.3"
+memmap2 = "0.9"
+dirs = "5"
+once_cell = "1"
+
 # LSP (`node --lsp`) + DAP (`node --dap`) over stdio. libc gives the DAP server
 # a pipe + dup2 to capture the debuggee's stdout (console.log) so program output
-# streams as `output` events instead of corrupting the JSON-RPC channel.
+# streams as `output` events instead of corrupting the JSON-RPC channel; it also
+# backs the `isatty` REPL fallthrough.
 lsp-server = "0.7.9"
 lsp-types = "0.97.0"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+
+# Interactive REPL (`node --repl` / TTY fallthrough): reedline line editor,
+# nu-ansi-term for status colors.
+reedline = "0.47.0"
+nu-ansi-term = "0.50"
+
+# Hash backends for the `crypto` module (createHash md5/sha1/sha256).
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

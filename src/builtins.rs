@@ -723,6 +723,11 @@ fn namespace_property(ns: &str, name: &str) -> Value {
     if ns == "Symbol" && name == "iterator" {
         return with_host(|h| h.well_known_iterator());
     }
+    // Non-function constants on a stdlib namespace (`path.sep`, `os.EOL`,
+    // `buffer.Buffer`, `url.URL`).
+    if let Some(v) = crate::stdlib::constant(ns, name) {
+        return v;
+    }
     let qualified = format!("{ns}.{name}");
     if is_known_builtin(&qualified) {
         return with_host(|h| h.alloc(JsObj::Builtin(qualified)));
@@ -1339,6 +1344,8 @@ fn is_namespace(name: &str) -> bool {
             | "Reflect"
             | "Promise"
             | "process"
+            | "Buffer"
+            | "URL"
     )
 }
 
@@ -1374,6 +1381,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "clearTimeout",
     "clearInterval",
     "structuredClone",
+    "require",
 ];
 
 const NS_METHODS: &[&str] = &[
@@ -1448,11 +1456,23 @@ const NS_METHODS: &[&str] = &[
 ];
 
 pub fn is_known_builtin(name: &str) -> bool {
-    GLOBAL_FUNCS.contains(&name) || NS_METHODS.contains(&name) || is_namespace(name)
+    GLOBAL_FUNCS.contains(&name) || NS_METHODS.contains(&name) || is_namespace(name) || crate::stdlib::is_method(name)
 }
 
 /// Call a resolved builtin function (global or `namespace.method`).
 pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // `require(spec)`: resolve a supported core module to its namespace value.
+    if name == "require" {
+        let spec = with_host(|h| h.str_of(&arg0(&args)));
+        return match crate::stdlib::resolve(&spec) {
+            Some(ns) => Ok(with_host(|h| h.alloc(JsObj::Builtin(ns.to_string())))),
+            None => Err(format!("Error: Cannot find module '{spec}'")),
+        };
+    }
+    // Native stdlib module methods (path/os/fs/util/assert/crypto/buffer/url).
+    if let Some(r) = crate::stdlib::call(name, &args) {
+        return r;
+    }
     match name {
         "console.log" | "console.info" | "console.debug" => {
             print_line(&args, false);
@@ -1606,6 +1626,10 @@ fn object_call(args: Vec<Value>) -> Value {
 
 /// Construct via `new` for the builtin constructors.
 pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // Native stdlib constructors (`new URL(...)`, `new EventEmitter()`, `new Buffer(...)`).
+    if let Some(r) = crate::stdlib::construct(name, &args) {
+        return r;
+    }
     match name {
         "Array" => {
             // new Array(n) -> length-n array; new Array(a, b) -> [a, b].
