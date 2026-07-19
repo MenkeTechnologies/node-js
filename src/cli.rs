@@ -14,7 +14,15 @@ pub struct Cli {
     #[arg(short = 'e', long = "eval", value_name = "SRC")]
     pub eval: Option<String>,
 
-    /// The `.js` script to run (omit with -e or to read stdin).
+    /// Speak the Language Server Protocol over stdio.
+    #[arg(long = "lsp")]
+    pub lsp: bool,
+
+    /// Speak the Debug Adapter Protocol over stdio.
+    #[arg(long = "dap")]
+    pub dap: bool,
+
+    /// The `.js` script to run (omit with --lsp / --dap / -e or to read stdin).
     #[arg(value_name = "FILE")]
     pub file: Option<String>,
 

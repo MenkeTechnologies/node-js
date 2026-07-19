@@ -75,6 +75,7 @@ pub mod ops {
     pub const DEF_FIELD: u16 = 50; // [class, name, thunk] -> register an instance field initializer
     pub const AWAIT: u16 = 51; // [v] -> await v (suspend the async coroutine until v settles)
     pub const DEF_ACCESSOR: u16 = 52; // [obj, name, kind, fn] -> install a getter/setter on obj
+    pub const DBG_LINE: u16 = 53; // [line] -> DAP statement marker (debug only)
 }
 
 /// `DEF_MEMBER` member-kind tags.
@@ -294,6 +295,12 @@ pub struct Frame {
     /// The class value owning the running method (drives `super`); `None` outside
     /// a class method/constructor.
     pub home_class: Option<Value>,
+    /// Source line the frame is currently executing (updated by the DAP line hook
+    /// under `--dap`; stays 0 on ordinary runs).
+    pub line: u32,
+    /// The function name that owns this frame, for the DAP `stackTrace`; `None`
+    /// for the module frame and anonymous activations.
+    pub owner: Option<String>,
 }
 
 /// A non-local control signal.
@@ -449,6 +456,8 @@ impl JsHost {
                 this_obj: None,
                 new_target: None,
                 home_class: None,
+                line: 0,
+                owner: None,
             }],
             error: None,
             exc: None,
@@ -686,6 +695,42 @@ impl JsHost {
         self.frame().env.clone()
     }
 
+    // ── DAP debug introspection (used only under `--dap`) ────────────────────
+    /// Number of active call frames (the debugger's step-depth reference).
+    pub fn frame_depth(&self) -> usize {
+        self.frames.len()
+    }
+    /// Record the source line the innermost frame is executing (DAP line hook).
+    pub fn set_cur_line(&mut self, line: u32) {
+        if let Some(f) = self.frames.last_mut() {
+            f.line = line;
+        }
+    }
+    /// The call stack as (frame name, line) pairs, innermost first — for the DAP
+    /// `stackTrace`. `owner` carries the function name where known.
+    pub fn dbg_stack(&self) -> Vec<(String, u32)> {
+        self.frames
+            .iter()
+            .rev()
+            .map(|f| {
+                let name = f.owner.clone().unwrap_or_else(|| "<module>".to_string());
+                (name, f.line)
+            })
+            .collect()
+    }
+    /// The innermost frame's locals as (name, inspect) pairs — for DAP `variables`.
+    pub fn dbg_locals(&self) -> Vec<(String, String)> {
+        let env = self.cur_env();
+        let names: Vec<String> = env.borrow().vars.keys().cloned().collect();
+        names
+            .into_iter()
+            .map(|n| {
+                let v = self.read_name(&n).unwrap_or(Value::Undef);
+                (n, self.inspect(&v))
+            })
+            .collect()
+    }
+
     /// Scope-chain read: local + enclosing chain, then globals.
     pub fn read_name(&self, name: &str) -> Option<Value> {
         let mut env = Some(self.cur_env());
@@ -804,6 +849,15 @@ pub fn ref_error(name: &str) -> String {
 
 // ── the fusevm run plumbing ──────────────────────────────────────────────────
 
+thread_local! {
+    static DEBUG_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable DAP debug execution (`node --dap`).
+pub fn set_debug_mode(on: bool) {
+    DEBUG_MODE.with(|d| d.set(on));
+}
+
 /// Register every node-js builtin + the numeric hook on a VM, then run it.
 pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     let mut vm = VM::new(chunk);
@@ -811,7 +865,17 @@ pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
         crate::builtins::numeric_hook(op, a, b)
     }));
-    vm.enable_tracing_jit();
+    // Under `--dap` the tracing JIT would compile hot loops and skip the
+    // per-statement `DBG_LINE` markers, so debug runs stay on the pure
+    // interpreter. The `DBG_LINE` builtin fires the debugger line hook; the
+    // extension seam mirrors pythonrs should the marker emission ever switch.
+    if DEBUG_MODE.with(|d| d.get()) {
+        vm.set_extension_handler(Box::new(|vm, id, _| {
+            crate::dap::on_ext(vm, id);
+        }));
+    } else {
+        vm.enable_tracing_jit();
+    }
     let outcome = vm.run();
     if let Some(e) = with_host(|h| h.take_error()) {
         return Err(e);
@@ -1579,6 +1643,8 @@ pub fn run_user_func_nt(
             this_obj: this_val,
             new_target,
             home_class: home,
+            line: 0,
+            owner: Some(def.name.clone()),
         })
     });
     let r = run_chunk_on(def.chunk.clone());
@@ -1993,6 +2059,8 @@ fn make_generator(chunk: Chunk, env: Env, this_val: Option<Value>, home_class: O
         this_obj: this_val,
         new_target: None,
         home_class: home,
+        line: 0,
+        owner: None,
     };
     let id = with_host(|h| {
         let id = h.generators.len() as u32;

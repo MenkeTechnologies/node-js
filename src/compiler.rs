@@ -80,11 +80,16 @@ pub struct Compiler {
     tries: Vec<TryDef>,
     loops: Vec<LoopCtx>,
     tmp: usize,
+    /// Emit per-statement `DBG_LINE` markers for the DAP debugger (`node --dap`).
+    debug: bool,
 }
 
-/// Compile a parsed program.
-pub fn compile(stmts: &[Stmt]) -> Result<Program, String> {
-    let mut c = Compiler::default();
+/// Compile a parsed program. `debug` enables per-statement DAP line markers.
+pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
+    let mut c = Compiler {
+        debug,
+        ..Default::default()
+    };
     let mut b = ChunkBuilder::new();
     // Hoist function declarations to the top (JS function hoisting).
     c.hoist_funcs(&mut b, stmts)?;
@@ -150,6 +155,11 @@ impl Compiler {
     }
 
     fn compile_stmt(&mut self, b: &mut ChunkBuilder, s: &Stmt) -> Result<(), String> {
+        if self.debug && s.line != 0 {
+            b.emit(Op::LoadInt(s.line as i64), s.line);
+            b.emit(Op::CallBuiltin(ops::DBG_LINE, 1), s.line);
+            b.emit(Op::Pop, s.line);
+        }
         let line = s.line;
         match &s.kind {
             StmtKind::Expr(e) => {

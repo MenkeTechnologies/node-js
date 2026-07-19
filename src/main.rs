@@ -1,13 +1,27 @@
 //! The `node` binary entry point.
 //!
-//! Dispatch: `-e <src>` runs a one-liner; a positional `.js` file is executed;
-//! otherwise stdin is read and run as a script. Errors go to stderr in terse
-//! `node: <reason>` form; nothing else is printed.
+//! Dispatch: `--lsp`/`--dap` speak their protocols over stdio; `-e <src>` runs a
+//! one-liner; a positional `.js` file is executed; otherwise stdin is read and
+//! run as a script. Errors go to stderr in terse `node: <reason>` form; nothing
+//! else is printed.
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let cli = nodejs::cli::parse();
+
+    if cli.lsp {
+        return match nodejs::lsp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
+    if cli.dap {
+        return match nodejs::dap::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
 
     if let Some(src) = cli.eval {
         return run_source(&src);

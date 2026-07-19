@@ -61,6 +61,21 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::NEW_TARGET, b_new_target);
     vm.register_builtin(ops::AWAIT, b_await);
     vm.register_builtin(ops::DEF_ACCESSOR, b_def_accessor);
+    vm.register_builtin(ops::DBG_LINE, b_dbg_line);
+}
+
+/// DAP per-statement marker (`node --dap` only; the compiler emits this before
+/// each statement under `debug`). Pops the source line pushed by the preceding
+/// `LoadInt` and fires the debugger line hook, which pauses at breakpoints/step
+/// targets. Returns `undefined` (the compiler pops it). A no-op unless a debug
+/// session is active.
+fn b_dbg_line(vm: &mut VM, _: u8) -> Value {
+    let line = match vm.pop() {
+        Value::Int(n) => n as u32,
+        _ => 0,
+    };
+    crate::dap::on_debug_line(line);
+    Value::Undef
 }
 
 /// Install an object-literal getter/setter on an object (`kind` is `member::GET`

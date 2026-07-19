@@ -11,6 +11,7 @@ pub mod ast;
 pub mod builtins;
 pub mod cli;
 pub mod compiler;
+pub mod dap;
 pub mod host;
 pub mod lexer;
 pub mod lsp;
@@ -21,7 +22,13 @@ pub use fusevm::Value;
 /// Compile a source string to a runnable program.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile(&stmts)
+    compiler::compile(&stmts, false)
+}
+
+/// Compile with per-statement DAP line markers enabled (`node --dap`).
+pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
+    let stmts = parser::parse(src)?;
+    compiler::compile(&stmts, true)
 }
 
 /// Rebase a freshly compiled program's func/try ids above those already loaded
@@ -56,4 +63,15 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     host::reset_host();
     run_compiled(compile(&src)?)
+}
+
+/// Read and run a `.js` file under the DAP debugger.
+pub fn eval_file_debug(path: &str) -> Result<Value, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let prog = compile_debug(&src)?;
+    host::reset_host();
+    host::set_debug_mode(true);
+    let r = run_compiled(prog);
+    host::set_debug_mode(false);
+    r
 }
