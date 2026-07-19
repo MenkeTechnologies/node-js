@@ -84,7 +84,7 @@ fn build_body(corpus: &[(&str, &str, &str, &str)]) -> String {
                 "        <article class=\"doc-entry\" id=\"{anchor}\">\n\
                  \x20         <h3><a class=\"doc-anchor\" href=\"#{anchor}\">#</a> <code>{name}</code></h3>\n\
                  \x20         <p>{doc}</p>\n\
-                 \x20         <pre><code class=\"lang-javascript\">{example}</code></pre>\n\
+                 \x20         <pre><code class=\"lang-js\">{example}</code></pre>\n\
                  \x20       </article>\n",
                 anchor = anchor,
                 name = html_escape(name),
