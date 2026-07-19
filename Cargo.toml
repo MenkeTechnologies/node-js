@@ -63,3 +63,7 @@ thiserror = "2.0"
 rustc-hash = "2.1"
 # JS objects preserve property insertion order (observable in iteration / repr).
 indexmap = "2"
+# Stackful, same-thread coroutines backing generators (`function*`/`yield`) and
+# `await` suspension — mirrors pythonrs. The thread_local JsHost heap is shared
+# across every suspend/resume because the coroutine runs on the same thread.
+corosensei = "0.3"

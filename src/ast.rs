@@ -82,6 +82,15 @@ pub enum Prop {
     },
     /// `...spread`.
     Spread(Expr),
+    /// `get key() {}` / `set key(v) {}` — an accessor property.
+    Accessor {
+        key: Expr,
+        computed: bool,
+        /// `true` for a getter, `false` for a setter.
+        is_getter: bool,
+        /// The accessor function (an `Expr::Function`).
+        func: Expr,
+    },
 }
 
 /// A JavaScript expression.
@@ -104,6 +113,19 @@ pub enum Expr {
     Ident(String),
     /// `this`.
     This,
+    /// `super` (only valid as `super(...)` call callee or `super.x` object).
+    Super,
+    /// `new.target`.
+    NewTarget,
+    /// `yield expr` / `yield* expr` / `yield` (generator).
+    Yield {
+        arg: Option<Box<Expr>>,
+        delegate: bool,
+    },
+    /// `await expr` (async function).
+    Await(Box<Expr>),
+    /// A `class` expression.
+    Class(Box<ClassNode>),
 
     Array(Vec<Expr>),
     Object(Vec<Prop>),
@@ -163,10 +185,50 @@ pub enum Expr {
         body: FnBody,
         is_arrow: bool,
         name: Option<String>,
+        is_generator: bool,
+        is_async: bool,
     },
 
     /// `,`-sequence expression: evaluate all, yield the last.
     Sequence(Vec<Expr>),
+}
+
+/// A `class` declaration/expression body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassNode {
+    pub name: Option<String>,
+    /// The `extends` expression, if any.
+    pub parent: Option<Box<Expr>>,
+    pub members: Vec<ClassMember>,
+}
+
+/// One member of a class body: a method, accessor, or field, on the instance or
+/// static side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassMember {
+    /// The property key (an `Expr::Str` for a plain name, or any expr when
+    /// `computed`).
+    pub key: Expr,
+    pub computed: bool,
+    pub kind: MemberKind,
+    pub is_static: bool,
+    pub is_generator: bool,
+    pub is_async: bool,
+    /// Params + body for a method/accessor/constructor.
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+    /// Initializer expression for a field (`x = expr;`).
+    pub field_init: Option<Expr>,
+}
+
+/// The kind of a class member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    Constructor,
+    Method,
+    Get,
+    Set,
+    Field,
 }
 
 /// A function/arrow body: either a brace-delimited statement list or (arrow) a
@@ -221,7 +283,11 @@ pub enum StmtKind {
         name: String,
         params: Vec<Param>,
         body: Vec<Stmt>,
+        is_generator: bool,
+        is_async: bool,
     },
+    /// `class Name … { … }`.
+    ClassDecl(ClassNode),
 
     If {
         test: Expr,

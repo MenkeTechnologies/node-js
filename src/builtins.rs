@@ -51,6 +51,141 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::APPLY_METHOD, b_apply_method);
     vm.register_builtin(ops::OBJ_REST, b_obj_rest);
     vm.register_builtin(ops::DIV, b_div);
+    vm.register_builtin(ops::MKCLASS, b_mkclass);
+    vm.register_builtin(ops::DEF_MEMBER, b_def_member);
+    vm.register_builtin(ops::DEF_FIELD, b_def_field);
+    vm.register_builtin(ops::SUPER_CALL, b_super_call);
+    vm.register_builtin(ops::SUPER_GET, b_super_get);
+    vm.register_builtin(ops::YIELD, b_yield);
+    vm.register_builtin(ops::PROPKEY, b_propkey);
+    vm.register_builtin(ops::NEW_TARGET, b_new_target);
+    vm.register_builtin(ops::AWAIT, b_await);
+    vm.register_builtin(ops::DEF_ACCESSOR, b_def_accessor);
+}
+
+/// Install an object-literal getter/setter on an object (`kind` is `member::GET`
+/// or `member::SET`). Keeps the object on the stack.
+fn b_def_accessor(vm: &mut VM, _: u8) -> Value {
+    let func = vm.pop();
+    let kind = match vm.pop() {
+        Value::Int(n) => n,
+        _ => 0,
+    };
+    let name = sval(&vm.pop());
+    let obj = vm.pop();
+    with_host(|h| {
+        if kind == host::member::SET {
+            h.set_accessor(&obj, &name, None, Some(func));
+        } else {
+            h.set_accessor(&obj, &name, Some(func), None);
+        }
+    });
+    obj
+}
+
+fn b_await(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    match host::await_value(v) {
+        Ok(r) => r,
+        Err(e) => abort(vm, e),
+    }
+}
+
+// ── classes / super / generators / property keys (compiler-emitted ops) ──────
+
+fn b_mkclass(vm: &mut VM, _: u8) -> Value {
+    let ctor = vm.pop();
+    let parent = vm.pop();
+    let name = sval(&vm.pop());
+    host::build_class(&name, parent, ctor)
+}
+
+fn b_def_member(vm: &mut VM, _: u8) -> Value {
+    let func = vm.pop();
+    let is_static = matches!(vm.pop(), Value::Bool(true));
+    let kind = match vm.pop() {
+        Value::Int(n) => n,
+        _ => 0,
+    };
+    let name = sval(&vm.pop());
+    let class_val = vm.pop();
+    host::define_member(&class_val, &name, kind, is_static, func);
+    class_val
+}
+
+fn b_def_field(vm: &mut VM, _: u8) -> Value {
+    let thunk = vm.pop();
+    let name = sval(&vm.pop());
+    let class_val = vm.pop();
+    host::define_field(&class_val, &name, thunk);
+    class_val
+}
+
+/// `super(...args)` in a derived constructor: run the parent constructor on the
+/// current `this`, then this class's field initializers.
+fn b_super_call(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_n(vm, argc as usize);
+    let this = with_host(|h| h.current_this());
+    let this = match this {
+        Some(t) => t,
+        None => return abort(vm, host::type_error("'super' keyword unexpected here")),
+    };
+    // The class whose constructor is running = the running method's home class.
+    let (parent, fields) = with_host(|h| h.super_context());
+    let (parent, fields) = match parent {
+        Some(p) => (p, fields),
+        None => return abort(vm, host::type_error("'super' keyword unexpected here")),
+    };
+    let nt = with_host(|h| h.current_new_target()).unwrap_or_else(|| this.clone());
+    let r = host::super_construct(&parent, args, &this, &nt);
+    if let Err(e) = r {
+        return abort(vm, e);
+    }
+    // Run this (derived) class's own instance-field initializers after super.
+    for (name, thunk) in fields {
+        match host::invoke(&thunk, Vec::new(), Some(this.clone())) {
+            Ok(val) => with_host(|h| {
+                if let Some(JsObj::Object(props)) = h.get_mut(&this) {
+                    props.insert(name, val);
+                }
+            }),
+            Err(e) => return abort(vm, e),
+        }
+    }
+    Value::Undef
+}
+
+/// `super.name` — a method from the parent's prototype, or a getter's result.
+fn b_super_get(vm: &mut VM, _: u8) -> Value {
+    let name = sval(&vm.pop());
+    match with_host(|h| h.super_resolve(&name)) {
+        host::SuperRef::Data(v) => v,
+        host::SuperRef::Getter(getter) => {
+            let this = with_host(|h| h.current_this());
+            match host::invoke(&getter, Vec::new(), this) {
+                Ok(v) => v,
+                Err(e) => abort(vm, e),
+            }
+        }
+    }
+}
+
+fn b_yield(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    match host::gen_yield(v) {
+        Ok(sent) => sent,
+        Err(e) => abort(vm, e),
+    }
+}
+
+fn b_propkey(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    let k = with_host(|h| h.property_key(&v));
+    with_host(|h| h.new_str(k))
+}
+
+fn b_new_target(_vm: &mut VM, _: u8) -> Value {
+    with_host(|h| h.current_new_target().unwrap_or(Value::Undef))
 }
 
 /// `a / b` with JS/IEEE-754 semantics. fusevm's native `Op::Div` returns `Undef`
@@ -185,23 +320,106 @@ fn b_getattr(vm: &mut VM, _: u8) -> Value {
     }
 }
 
-/// Read `recv.name` (also the computed-key path for string keys).
-fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
+/// Read `recv.name` (also the computed-key path for string keys). Walks own
+/// properties, accessors, and the prototype chain (class methods / getters).
+pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
     if with_host(|h| h.is_nullish(recv)) {
         return Err(host::type_error(&format!(
             "Cannot read properties of {} (reading '{name}')",
             with_host(|h| h.str_of(recv))
         )));
     }
+    // Accessor (own or inherited getter) takes precedence over the chain walk.
+    if let Some((getter, _)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
+        return match getter {
+            Some(g) => host::invoke(&g, Vec::new(), Some(recv.clone())),
+            None => Ok(Value::Undef), // set-only property reads as undefined
+        };
+    }
+    // `constructor`: a user class/function sets it on the prototype chain, and
+    // that wins; otherwise every builtin instance reports its native
+    // constructor (so `[].constructor`, `new Map().constructor`,
+    // `Promise.resolve(1).constructor`, `(5).constructor` match Node).
+    if name == "constructor" {
+        if let Some(v) = with_host(|h| {
+            match h.get(recv) {
+                Some(JsObj::Object(p)) => p.get("constructor").cloned(),
+                _ => None,
+            }
+            .or_else(|| host::lookup_chain(h, recv, "constructor"))
+        }) {
+            return Ok(v);
+        }
+        if let Some(cn) = with_host(|h| default_ctor_name(h, recv)) {
+            return Ok(with_host(|h| h.alloc(JsObj::Builtin(cn.to_string()))));
+        }
+    }
     let obj = with_host(|h| h.get(recv).cloned());
     Ok(match obj {
-        Some(JsObj::Object(props)) => props.get(name).cloned().unwrap_or(Value::Undef),
+        Some(JsObj::Object(props)) => {
+            if let Some(v) = props.get(name) {
+                v.clone()
+            } else if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
+                // A method / data property inherited from the prototype chain.
+                v
+            } else if name == "__proto__" {
+                with_host(|h| h.proto_of(recv)).unwrap_or_else(|| with_host(|h| h.null()))
+            } else if is_object_method(name) {
+                bound_method(recv, name)
+            } else {
+                Value::Undef
+            }
+        }
+        Some(JsObj::Class(_)) | Some(JsObj::Func(_)) | Some(JsObj::BoundFunc { .. }) => {
+            function_property(recv, name)
+        }
+        Some(JsObj::Symbol { desc, .. }) => match name {
+            "description" => match desc {
+                Some(d) => with_host(|h| h.new_str(d)),
+                None => Value::Undef,
+            },
+            "toString" => bound_method(recv, name),
+            _ => Value::Undef,
+        },
+        Some(JsObj::Map { entries, .. }) => match name {
+            "size" => Value::Float(entries.len() as f64),
+            "@@iterator" => bound_method(recv, name),
+            _ if is_map_method(name) => bound_method(recv, name),
+            _ => Value::Undef,
+        },
+        Some(JsObj::Set { entries, .. }) => match name {
+            "size" => Value::Float(entries.len() as f64),
+            "@@iterator" => bound_method(recv, name),
+            _ if is_set_method(name) => bound_method(recv, name),
+            _ => Value::Undef,
+        },
+        Some(JsObj::Generator { .. }) => {
+            if is_generator_method(name) {
+                bound_method(recv, name)
+            } else {
+                Value::Undef
+            }
+        }
+        Some(JsObj::Promise { .. }) => {
+            if matches!(name, "then" | "catch" | "finally") {
+                bound_method(recv, name)
+            } else {
+                Value::Undef
+            }
+        }
+        Some(JsObj::Iter { .. }) => {
+            if matches!(name, "next" | "return" | "@@iterator") {
+                bound_method(recv, name)
+            } else {
+                Value::Undef
+            }
+        }
         Some(JsObj::Array(items)) => {
             if name == "length" {
                 Value::Float(items.len() as f64)
             } else if let Ok(i) = name.parse::<usize>() {
                 items.get(i).cloned().unwrap_or(Value::Undef)
-            } else if is_array_method(name) {
+            } else if name == "@@iterator" || is_array_method(name) || is_object_method(name) {
                 bound_method(recv, name)
             } else {
                 Value::Undef
@@ -215,7 +433,7 @@ fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                     Some(c) => with_host(|h| h.new_str(c.to_string())),
                     None => Value::Undef,
                 }
-            } else if is_string_method(name) {
+            } else if name == "@@iterator" || is_string_method(name) {
                 bound_method(recv, name)
             } else {
                 Value::Undef
@@ -233,12 +451,224 @@ fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
     })
 }
 
+/// The builtin constructor name for a value with no own/inherited `constructor`
+/// property, so `x.constructor` (and thus `x.constructor.name`) matches Node for
+/// arrays, plain objects, Map/Set, promises, iterators, functions, and boxed
+/// primitives. `None` ⇒ leave `.constructor` as `undefined` (e.g. generators,
+/// whose `.constructor.name` is `""` in Node — not worth modelling).
+fn default_ctor_name(h: &host::JsHost, recv: &Value) -> Option<&'static str> {
+    match h.get(recv) {
+        Some(JsObj::Array(_)) => Some("Array"),
+        Some(JsObj::Object(_)) => Some("Object"),
+        Some(JsObj::Map { weak, .. }) => Some(if *weak { "WeakMap" } else { "Map" }),
+        Some(JsObj::Set { weak, .. }) => Some(if *weak { "WeakSet" } else { "Set" }),
+        Some(JsObj::Promise { .. }) => Some("Promise"),
+        Some(JsObj::Str(_)) => Some("String"),
+        Some(JsObj::Symbol { .. }) => Some("Symbol"),
+        Some(JsObj::Iter { .. }) => Some("Iterator"),
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => {
+            Some("Function")
+        }
+        _ => match recv {
+            Value::Float(_) | Value::Int(_) => Some("Number"),
+            Value::Bool(_) => Some("Boolean"),
+            _ => None,
+        },
+    }
+}
+
+/// The builtin globals that are constructor *functions* (callable via `new`), so
+/// `Ctor.name` is the constructor name. Excludes the non-callable namespaces
+/// (`Math`, `JSON`, `console`, `Reflect`, `process`), whose `.name` is
+/// `undefined` in Node.
+fn is_builtin_ctor(name: &str) -> bool {
+    matches!(
+        name,
+        "Array"
+            | "Object"
+            | "Number"
+            | "String"
+            | "Boolean"
+            | "Symbol"
+            | "Function"
+            | "Map"
+            | "Set"
+            | "WeakMap"
+            | "WeakSet"
+            | "Promise"
+            | "BigInt"
+            | "Iterator"
+    ) || host::ERROR_NAMES.contains(&name)
+}
+
 fn bound_method(recv: &Value, name: &str) -> Value {
     with_host(|h| {
         h.alloc(JsObj::BoundMethod {
             recv: recv.clone(),
             name: name.to_string(),
         })
+    })
+}
+
+/// `Object.prototype` methods reachable on any object.
+fn is_object_method(name: &str) -> bool {
+    matches!(
+        name,
+        "hasOwnProperty" | "isPrototypeOf" | "propertyIsEnumerable" | "toString" | "valueOf" | "constructor"
+    )
+}
+
+pub fn is_object_builtin_method(name: &str) -> bool {
+    matches!(
+        name,
+        "hasOwnProperty" | "isPrototypeOf" | "propertyIsEnumerable" | "toString" | "valueOf"
+    )
+}
+
+/// Dispatch an `Object.prototype` builtin method on an object/instance.
+pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "hasOwnProperty" => {
+            let k = with_host(|h| h.property_key(&arg0(&args)));
+            let has = with_host(|h| match h.get(recv) {
+                Some(JsObj::Object(p)) => p.contains_key(&k),
+                Some(JsObj::Array(items)) => {
+                    k == "length" || k.parse::<usize>().map(|i| i < items.len()).unwrap_or(false)
+                }
+                _ => false,
+            });
+            Ok(Value::Bool(has))
+        }
+        "isPrototypeOf" => {
+            let target = arg0(&args);
+            let mut cur = with_host(|h| h.proto_of(&target));
+            while let Some(p) = cur {
+                if with_host(|h| h.strict_eq(&p, recv)) {
+                    return Ok(Value::Bool(true));
+                }
+                cur = with_host(|h| h.proto_of(&p));
+            }
+            Ok(Value::Bool(false))
+        }
+        "propertyIsEnumerable" => {
+            let k = with_host(|h| h.str_of(&arg0(&args)));
+            let has = with_host(|h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key(&k)));
+            Ok(Value::Bool(has))
+        }
+        "toString" => Ok(with_host(|h| {
+            // An instance with a custom `toString` up the chain is handled by
+            // call_method before reaching here; this is the default.
+            let s = h.str_of(recv);
+            h.new_str(s)
+        })),
+        "valueOf" => Ok(recv.clone()),
+        _ => Err(host::type_error(&format!("{name} is not a function"))),
+    }
+}
+
+/// `Function.prototype` methods (`call`/`apply`/`bind`) plus `Symbol.prototype`/
+/// generator handling done elsewhere. Returns `Ok(None)` if `name` is not one of
+/// these (so the caller can try statics).
+pub fn function_builtin_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    match name {
+        "call" => {
+            let this = args.first().cloned();
+            let rest = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
+            Ok(Some(host::invoke(recv, rest, this)?))
+        }
+        "apply" => {
+            let this = args.first().cloned();
+            let arr = args.get(1).cloned().unwrap_or(Value::Undef);
+            let call_args = if matches!(arr, Value::Undef) || with_host(|h| h.is_null(&arr)) {
+                Vec::new()
+            } else {
+                with_host(|h| h.iter_vec(&arr)).unwrap_or_default()
+            };
+            Ok(Some(host::invoke(recv, call_args, this)?))
+        }
+        "bind" => {
+            let this = args.first().cloned().unwrap_or(Value::Undef);
+            let pre = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
+            Ok(Some(with_host(|h| {
+                h.alloc(JsObj::BoundFunc {
+                    target: recv.clone(),
+                    this,
+                    args: pre,
+                })
+            })))
+        }
+        "toString" => Ok(Some(with_host(|h| {
+            let s = h.str_of(recv);
+            h.new_str(s)
+        }))),
+        _ => Ok(None),
+    }
+}
+
+fn is_function_method(name: &str) -> bool {
+    matches!(name, "call" | "apply" | "bind" | "toString")
+}
+fn is_map_method(name: &str) -> bool {
+    matches!(
+        name,
+        "get" | "set" | "has" | "delete" | "clear" | "forEach" | "keys" | "values" | "entries"
+    )
+}
+fn is_set_method(name: &str) -> bool {
+    matches!(
+        name,
+        "add" | "has" | "delete" | "clear" | "forEach" | "keys" | "values" | "entries"
+    )
+}
+fn is_generator_method(name: &str) -> bool {
+    matches!(name, "next" | "return" | "throw")
+}
+
+/// A property read on a function/class value: own fn-props (statics, name,
+/// prototype, length) plus inherited statics and `call`/`apply`/`bind`.
+fn function_property(recv: &Value, name: &str) -> Value {
+    // A class static, inherited down the constructor chain.
+    if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Class(_))) {
+        if let Some(v) = with_host(|h| h.class_static(recv, name)) {
+            return v;
+        }
+    } else if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
+        return v;
+    }
+    match name {
+        "name" => with_host(|h| {
+            let n = h.callable_name(recv);
+            h.new_str(n)
+        }),
+        "length" => Value::Float(with_host(|h| h.func_arity(recv)) as f64),
+        "prototype" => ensure_fn_prototype(recv),
+        _ if is_function_method(name) => bound_method(recv, name),
+        _ => Value::Undef,
+    }
+}
+
+/// The `.prototype` of a function value, auto-created on first access (as Node
+/// does for every non-arrow function) with `.constructor` linking back. Arrow
+/// functions have no `prototype`.
+fn ensure_fn_prototype(recv: &Value) -> Value {
+    if let Some(p) = with_host(|h| h.fn_prop(recv, "prototype")) {
+        return p;
+    }
+    // Arrows / classes: no auto prototype (classes set their own).
+    let is_arrow = matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Func(f)) if f.is_arrow);
+    if is_arrow {
+        return Value::Undef;
+    }
+    if !matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Func(_))) {
+        return Value::Undef;
+    }
+    with_host(|h| {
+        let proto = h.new_object(IndexMap::new());
+        if let Some(JsObj::Object(p)) = h.get_mut(&proto) {
+            p.insert("constructor".to_string(), recv.clone());
+        }
+        h.set_fn_prop(recv, "prototype", proto.clone());
+        proto
     })
 }
 
@@ -268,6 +698,16 @@ fn namespace_property(ns: &str, name: &str) -> Value {
     if let Some(k) = konst {
         return Value::Float(k);
     }
+    // `Ctor.name` on a builtin constructor is the constructor name (`Array.name`
+    // === "Array"); non-callable namespaces (`Math`/`JSON`) fall through to
+    // `undefined`.
+    if name == "name" && is_builtin_ctor(ns) {
+        return with_host(|h| h.new_str(ns.to_string()));
+    }
+    // The well-known `Symbol.iterator` symbol (used as a computed method key).
+    if ns == "Symbol" && name == "iterator" {
+        return with_host(|h| h.well_known_iterator());
+    }
     let qualified = format!("{ns}.{name}");
     if is_known_builtin(&qualified) {
         return with_host(|h| h.alloc(JsObj::Builtin(qualified)));
@@ -284,6 +724,28 @@ fn b_setattr(vm: &mut VM, _: u8) -> Value {
 }
 
 fn set_property(recv: &Value, name: &str, val: Value) {
+    // `obj.__proto__ = p` re-links the prototype.
+    if name == "__proto__" && matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Object(_))) {
+        with_host(|h| h.set_proto(recv, val));
+        return;
+    }
+    // An inherited/own setter accessor intercepts the write.
+    if let Some((_, Some(setter))) = with_host(|h| host::lookup_accessor(h, recv, name)) {
+        let _ = host::invoke(&setter, vec![val], Some(recv.clone()));
+        return;
+    }
+    // A set-only-elsewhere getter (accessor with no setter): ignore the write.
+    if let Some((Some(_), None)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
+        return;
+    }
+    // Writing `name`/`prototype`/statics on a function value.
+    if matches!(
+        with_host(|h| h.get(recv).cloned()),
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_))
+    ) {
+        with_host(|h| h.set_fn_prop(recv, name, val));
+        return;
+    }
     with_host(|h| match h.get_mut(recv) {
         Some(JsObj::Object(props)) => {
             props.insert(name.to_string(), val);
@@ -314,7 +776,7 @@ fn h_val_to_len(v: &Value) -> usize {
 fn b_getitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
-    let key = with_host(|h| h.str_of(&idx));
+    let key = with_host(|h| h.property_key(&idx));
     match get_property(&recv, &key) {
         Ok(v) => v,
         Err(e) => abort(vm, e),
@@ -325,7 +787,7 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let idx = vm.pop();
     let recv = vm.pop();
-    let key = with_host(|h| h.str_of(&idx));
+    let key = with_host(|h| h.property_key(&idx));
     set_property(&recv, &key, val.clone());
     val
 }
@@ -377,6 +839,8 @@ fn b_mkarr(vm: &mut VM, argc: u8) -> Value {
 fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_n(vm, argc as usize);
     let mut props: IndexMap<String, Value> = IndexMap::new();
+    // A literal `__proto__: x` key sets the object's prototype (not an own prop).
+    let mut proto_override: Option<Value> = None;
     let mut i = 0;
     while i + 2 < flat.len() || (i + 2 == flat.len() && flat.len() % 3 == 0 && i < flat.len()) {
         if i + 2 >= flat.len() {
@@ -399,11 +863,23 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
             }
         } else {
             let key = with_host(|h| h.str_of(&flat[i + 1]));
-            props.insert(key, flat[i + 2].clone());
+            if key == "__proto__" {
+                proto_override = Some(flat[i + 2].clone());
+            } else {
+                props.insert(key, flat[i + 2].clone());
+            }
         }
         i += 3;
     }
-    with_host(|h| h.new_object(props))
+    with_host(|h| {
+        let o = h.new_object(props);
+        if let Some(p) = proto_override {
+            if matches!(p, Value::Obj(_)) {
+                h.set_proto(&o, p);
+            }
+        }
+        o
+    })
 }
 
 fn b_mkfunc(vm: &mut VM, _: u8) -> Value {
@@ -421,6 +897,7 @@ fn b_mkfunc(vm: &mut VM, _: u8) -> Value {
             env: Some(env),
             this,
             is_arrow,
+            home_class: None,
         }))
     })
 }
@@ -439,10 +916,12 @@ fn b_nullish(vm: &mut VM, _: u8) -> Value {
 
 fn b_tostr(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
-    with_host(|h| {
-        let s = h.str_of(&v);
-        h.new_str(s)
-    })
+    // ToString with user-`toString`/`valueOf` dispatch (template interpolation,
+    // `String(x)`, object keys).
+    match host::to_string_value(&v) {
+        Ok(s) => s,
+        Err(e) => abort(vm, e),
+    }
 }
 
 fn b_typeof(vm: &mut VM, _: u8) -> Value {
@@ -466,10 +945,12 @@ fn b_loose_eq(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_instanceof(vm: &mut VM, _: u8) -> Value {
-    let _ctor = vm.pop();
-    let _obj = vm.pop();
-    // Prototype chains are not modeled; report false (conservative).
-    Value::Bool(false)
+    let ctor = vm.pop();
+    let obj = vm.pop();
+    match host::instance_of(&obj, &ctor) {
+        Ok(b) => Value::Bool(b),
+        Err(e) => abort(vm, e),
+    }
 }
 
 // ── bitwise / unary ───────────────────────────────────────────────────────────
@@ -506,12 +987,12 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
 fn b_contains(vm: &mut VM, _: u8) -> Value {
     let container = vm.pop();
     let key = vm.pop();
-    let k = with_host(|h| h.str_of(&key));
-    Value::Bool(with_host(|h| match h.get(&container) {
-        Some(JsObj::Object(props)) => props.contains_key(&k),
-        Some(JsObj::Array(items)) => k.parse::<usize>().map(|i| i < items.len()).unwrap_or(false),
-        _ => false,
-    }))
+    // `x in y` requires y to be an object.
+    if !matches!(container, Value::Obj(_)) {
+        return abort(vm, host::type_error("Cannot use 'in' operator to search"));
+    }
+    let k = with_host(|h| h.property_key(&key));
+    Value::Bool(has_property(&container, &k))
 }
 
 // ── control ───────────────────────────────────────────────────────────────────
@@ -598,24 +1079,48 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
     Value::Undef
 }
 
-/// Synthesize an `Error`-shaped object from an internal error string.
-fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
+/// Synthesize an `Error`-shaped object from an internal error string, linked to
+/// the matching builtin error prototype so `instanceof`/`.constructor` work.
+pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
+    h.ensure_error_protos();
     let (name, message) = match e.split_once(": ") {
-        Some((n, m)) => (n.to_string(), m.to_string()),
-        None => ("Error".to_string(), e.to_string()),
+        Some((n, m)) if host::ERROR_NAMES.contains(&n) => (n.to_string(), m.to_string()),
+        _ => ("Error".to_string(), e.to_string()),
     };
     let mut props: IndexMap<String, Value> = IndexMap::new();
-    let nv = h.new_str(name);
-    let mv = h.new_str(message);
-    props.insert("name".into(), nv);
+    let mv = h.new_str(message.clone());
     props.insert("message".into(), mv);
-    h.new_object(props)
+    let stack = if message.is_empty() {
+        format!("{name}\n    at <anonymous>")
+    } else {
+        format!("{name}: {message}\n    at <anonymous>")
+    };
+    let sv = h.new_str(stack);
+    props.insert("stack".into(), sv);
+    let obj = h.new_object(props);
+    if let Some(p) = host::error_proto_of(h, &name) {
+        h.set_proto(&obj, p);
+    }
+    obj
 }
 
 // ── iteration ─────────────────────────────────────────────────────────────────
 
 fn b_getiter(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
+    // A generator is its own iterator (resumed lazily by FORITER).
+    if with_host(|h| h.is_generator_val(&v)) {
+        return v;
+    }
+    // An object with a user `Symbol.iterator`: call it to get the iterator object.
+    if let Some(iter_fn) = with_host(|h| host::lookup_chain(h, &v, "@@iterator")) {
+        if with_host(|h| host::is_callable(h, &iter_fn)) {
+            return match host::invoke(&iter_fn, Vec::new(), Some(v.clone())) {
+                Ok(it) => it,
+                Err(e) => abort(vm, e),
+            };
+        }
+    }
     match with_host(|h| h.iter_vec(&v)) {
         Ok(items) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })),
         Err(e) => abort(vm, e),
@@ -633,22 +1138,55 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
         Some(v) => v.clone(),
         None => return abort(vm, "internal: FORITER with empty stack".into()),
     };
-    let next = with_host(|h| {
+    // Eager array-backed iterator (arrays/strings/Map/Set).
+    let eager = with_host(|h| {
         if let Some(JsObj::Iter { items, idx }) = h.get_mut(&it) {
             if *idx < items.len() {
                 let v = items[*idx].clone();
                 *idx += 1;
-                return Some(v);
+                return Some(Some(v));
             }
+            return Some(None);
         }
         None
     });
-    match next {
-        Some(v) => {
-            vm.push(v);
-            Value::Bool(true)
+    if let Some(step) = eager {
+        return match step {
+            Some(v) => {
+                vm.push(v);
+                Value::Bool(true)
+            }
+            None => Value::Bool(false),
+        };
+    }
+    // Generator: resume one step.
+    if with_host(|h| h.is_generator_val(&it)) {
+        return match host::gen_resume(&it, Value::Undef) {
+            Ok(host::GenStep::Yield(v)) => {
+                vm.push(v);
+                Value::Bool(true)
+            }
+            Ok(host::GenStep::Done(_)) => Value::Bool(false),
+            Err(e) => abort(vm, e),
+        };
+    }
+    // A user iterator object with a `.next()` returning `{ value, done }`.
+    match host::call_method(&it, "next", Vec::new()) {
+        Ok(step) => {
+            let done = get_property(&step, "done").map(|d| with_host(|h| h.truthy(&d))).unwrap_or(true);
+            if done {
+                Value::Bool(false)
+            } else {
+                match get_property(&step, "value") {
+                    Ok(v) => {
+                        vm.push(v);
+                        Value::Bool(true)
+                    }
+                    Err(e) => abort(vm, e),
+                }
+            }
         }
-        None => Value::Bool(false),
+        Err(e) => abort(vm, e),
     }
 }
 
@@ -662,7 +1200,7 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
         _ => 0,
     };
     let iterable = vm.pop();
-    let items = match with_host(|h| h.iter_vec(&iterable)) {
+    let items = match host::iter_all(&iterable) {
         Ok(v) => v,
         Err(e) => return abort(vm, e),
     };
@@ -700,7 +1238,7 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
         let spread = matches!(flat[i], Value::Int(1));
         let val = flat[i + 1].clone();
         if spread {
-            match with_host(|h| h.iter_vec(&val)) {
+            match host::iter_all(&val) {
                 Ok(items) => out.extend(items),
                 Err(e) => return abort(vm, e),
             }
@@ -746,7 +1284,7 @@ fn b_new(vm: &mut VM, argc: u8) -> Value {
 fn b_apply(vm: &mut VM, _: u8) -> Value {
     let args_arr = vm.pop();
     let callable = vm.pop();
-    let args = with_host(|h| h.iter_vec(&args_arr)).unwrap_or_default();
+    let args = host::iter_all(&args_arr).unwrap_or_default();
     let r = host::invoke(&callable, args, None);
     finish(vm, r)
 }
@@ -755,7 +1293,7 @@ fn b_apply_method(vm: &mut VM, _: u8) -> Value {
     let args_arr = vm.pop();
     let name = sval(&vm.pop());
     let recv = vm.pop();
-    let args = with_host(|h| h.iter_vec(&args_arr)).unwrap_or_default();
+    let args = host::iter_all(&args_arr).unwrap_or_default();
     let r = host::call_method(&recv, &name, args);
     finish(vm, r)
 }
@@ -774,7 +1312,18 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
 fn is_namespace(name: &str) -> bool {
     matches!(
         name,
-        "console" | "Math" | "JSON" | "Object" | "Array" | "Number" | "String" | "Boolean"
+        "console"
+            | "Math"
+            | "JSON"
+            | "Object"
+            | "Array"
+            | "Number"
+            | "String"
+            | "Boolean"
+            | "Symbol"
+            | "Reflect"
+            | "Promise"
+            | "process"
     )
 }
 
@@ -787,9 +1336,29 @@ const GLOBAL_FUNCS: &[&str] = &[
     "Number",
     "Boolean",
     "Array",
+    "Object",
+    "Function",
+    "Symbol",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "Promise",
     "Error",
     "TypeError",
     "RangeError",
+    "SyntaxError",
+    "ReferenceError",
+    "EvalError",
+    "URIError",
+    "BigInt",
+    "queueMicrotask",
+    "setTimeout",
+    "setInterval",
+    "setImmediate",
+    "clearTimeout",
+    "clearInterval",
+    "structuredClone",
 ];
 
 const NS_METHODS: &[&str] = &[
@@ -830,6 +1399,12 @@ const NS_METHODS: &[&str] = &[
     "Object.assign",
     "Object.freeze",
     "Object.fromEntries",
+    "Object.getPrototypeOf",
+    "Object.setPrototypeOf",
+    "Object.create",
+    "Object.getOwnPropertyNames",
+    "Object.defineProperty",
+    "Object.getOwnPropertyDescriptor",
     "Array.isArray",
     "Array.from",
     "Array.of",
@@ -840,6 +1415,21 @@ const NS_METHODS: &[&str] = &[
     "Number.parseInt",
     "Number.parseFloat",
     "String.fromCharCode",
+    "String.fromCodePoint",
+    "Symbol.for",
+    "Symbol.keyFor",
+    "Reflect.ownKeys",
+    "Reflect.has",
+    "Reflect.get",
+    "Reflect.set",
+    "Reflect.getPrototypeOf",
+    "Promise.resolve",
+    "Promise.reject",
+    "Promise.all",
+    "Promise.allSettled",
+    "Promise.race",
+    "Promise.any",
+    "process.nextTick",
 ];
 
 pub fn is_known_builtin(name: &str) -> bool {
@@ -865,10 +1455,15 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Number.isSafeInteger" => Ok(Value::Bool(is_safe_integer(arg0(&args)))),
         "Number.isNaN" => Ok(Value::Bool(matches!(arg0(&args), Value::Float(f) if f.is_nan()))),
         "Number.isFinite" => Ok(Value::Bool(matches!(arg0(&args), Value::Float(f) if f.is_finite()) || matches!(arg0(&args), Value::Int(_)))),
-        "String" => Ok(with_host(|h| {
-            let s = if args.is_empty() { String::new() } else { h.str_of(&args[0]) };
-            h.new_str(s)
-        })),
+        "String" => {
+            if args.is_empty() {
+                Ok(with_host(|h| h.new_str("")))
+            } else {
+                // A symbol argument stringifies to `Symbol(desc)` (explicit String()
+                // is allowed); everything else via ToString method dispatch.
+                host::to_string_value(&args[0])
+            }
+        }
         "Number" => Ok(Value::Float(if args.is_empty() { 0.0 } else { with_host(|h| h.to_number(&args[0])) })),
         "Boolean" => Ok(Value::Bool(with_host(|h| h.truthy(&arg0(&args))))),
         "String.fromCharCode" => Ok(with_host(|h| {
@@ -881,17 +1476,116 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Array" | "Array.of" => Ok(with_host(|h| h.new_array(args))),
         "Array.isArray" => Ok(Value::Bool(matches!(with_host(|h| h.get(&arg0(&args)).cloned()), Some(JsObj::Array(_))))),
         "Array.from" => array_from(args),
+        "Object" => Ok(object_call(args)),
         "Object.keys" => object_keys(args, 0),
         "Object.values" => object_keys(args, 1),
         "Object.entries" => object_keys(args, 2),
         "Object.assign" => object_assign(args),
         "Object.freeze" => Ok(arg0(&args)),
         "Object.fromEntries" => object_from_entries(args),
+        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => Ok(with_host(|h| h.proto_of(&arg0(&args)).unwrap_or_else(|| h.null()))),
+        "Object.setPrototypeOf" => {
+            let obj = arg0(&args);
+            let proto = args.get(1).cloned().unwrap_or(Value::Undef);
+            with_host(|h| h.set_proto(&obj, proto));
+            Ok(obj)
+        }
+        "Object.create" => object_create(args),
+        "Object.getOwnPropertyNames" => object_keys(args, 0),
+        "Object.defineProperty" => object_define_property(args),
+        "Object.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
+        "Symbol" => Ok(with_host(|h| {
+            let desc = args.first().filter(|a| !matches!(a, Value::Undef)).map(|a| h.str_of(a));
+            h.new_symbol(desc)
+        })),
+        "Symbol.for" => Ok(with_host(|h| {
+            let key = h.str_of(&arg0(&args));
+            h.symbol_for(&key)
+        })),
+        "Symbol.keyFor" => Ok(with_host(|h| match h.get(&arg0(&args)) {
+            Some(JsObj::Symbol { desc, .. }) => desc.clone().map(|d| h.new_str(d)).unwrap_or(Value::Undef),
+            _ => Value::Undef,
+        })),
+        "Map" | "WeakMap" | "Set" | "WeakSet" | "Promise" => construct_builtin(name, args),
+        "Reflect.ownKeys" => object_keys(args, 0),
+        "Reflect.has" => {
+            let obj = arg0(&args);
+            let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            Ok(Value::Bool(has_property(&obj, &k)))
+        }
+        "Reflect.get" => {
+            let obj = arg0(&args);
+            let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            get_property(&obj, &k)
+        }
+        "Reflect.set" => {
+            let obj = arg0(&args);
+            let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let v = args.get(2).cloned().unwrap_or(Value::Undef);
+            set_property(&obj, &k, v);
+            Ok(Value::Bool(true))
+        }
         "JSON.stringify" => json_stringify(args),
         "JSON.parse" => json_parse(args),
-        "Error" | "TypeError" | "RangeError" => Ok(make_error(name, &args)),
+        "structuredClone" => Ok(deep_clone(&arg0(&args))),
+        "queueMicrotask" | "process.nextTick" => {
+            let cb = arg0(&args);
+            let rest = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
+            enqueue_microtask(name == "process.nextTick", cb, rest);
+            Ok(Value::Undef)
+        }
+        "setTimeout" | "setInterval" | "setImmediate" => Ok(schedule_timer(name, args)),
+        "clearTimeout" | "clearInterval" => {
+            clear_timer(&arg0(&args));
+            Ok(Value::Undef)
+        }
+        "Promise.resolve" => promise_resolve(arg0(&args)),
+        "Promise.reject" => promise_reject(arg0(&args)),
+        "Promise.all" => promise_all(args, AllMode::All),
+        "Promise.allSettled" => promise_all(args, AllMode::AllSettled),
+        "Promise.race" => promise_race(args, false),
+        "Promise.any" => promise_race(args, true),
+        n if host::ERROR_NAMES.contains(&n) => Ok(make_error(name, &args)),
         _ if name.starts_with("Math.") => math_fn(&name[5..], &args),
+        // Internal continuations (Promise resolve/reject fns, `.finally` wrappers).
+        _ if name.starts_with("@@presolve:") => {
+            let id: u32 = name[11..].parse().unwrap_or(0);
+            host::resolve_promise_val(id, arg0(&args));
+            Ok(Value::Undef)
+        }
+        _ if name.starts_with("@@preject:") => {
+            let id: u32 = name[10..].parse().unwrap_or(0);
+            host::reject_promise_val(id, arg0(&args));
+            Ok(Value::Undef)
+        }
+        _ if name.starts_with("@@finpass:") => {
+            // finally(cb) on fulfill: run cb, then pass the value through.
+            let i: u32 = name[10..].parse().unwrap_or(0);
+            let cb = Value::Obj(i);
+            host::invoke(&cb, Vec::new(), None)?;
+            Ok(arg0(&args))
+        }
+        _ if name.starts_with("@@finthrow:") => {
+            // finally(cb) on reject: run cb, then re-throw the reason.
+            let i: u32 = name[11..].parse().unwrap_or(0);
+            let cb = Value::Obj(i);
+            host::invoke(&cb, Vec::new(), None)?;
+            let reason = arg0(&args);
+            with_host(|h| h.exc = Some(reason.clone()));
+            Err(with_host(|h| error_string(h, &reason)))
+        }
         _ => Err(host::type_error(&format!("{name} is not a function"))),
+    }
+}
+
+/// `Object(x)`: box/pass-through — for our model, non-object args just return a
+/// fresh object; objects pass through.
+fn object_call(args: Vec<Value>) -> Value {
+    let a = arg0(&args);
+    if matches!(with_host(|h| h.get(&a).cloned()), Some(JsObj::Object(_)) | Some(JsObj::Array(_))) {
+        a
+    } else {
+        with_host(|h| h.new_object(IndexMap::new()))
     }
 }
 
@@ -909,21 +1603,61 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
             }
             Ok(with_host(|h| h.new_array(args)))
         }
-        "Object" => Ok(with_host(|h| h.new_object(IndexMap::new()))),
-        "Error" | "TypeError" | "RangeError" => Ok(make_error(name, &args)),
+        "Object" => Ok(object_call(args)),
+        "Map" | "WeakMap" => {
+            let weak = name == "WeakMap";
+            let m = with_host(|h| h.alloc(JsObj::Map { entries: indexmap::IndexMap::new(), weak }));
+            if let Some(init) = args.first().filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a))) {
+                let pairs = host::iter_all(init)?;
+                for p in pairs {
+                    let kv = host::iter_all(&p)?;
+                    let k = kv.first().cloned().unwrap_or(Value::Undef);
+                    let v = kv.get(1).cloned().unwrap_or(Value::Undef);
+                    map_method(&m, "set", vec![k, v])?;
+                }
+            }
+            Ok(m)
+        }
+        "Set" | "WeakSet" => {
+            let weak = name == "WeakSet";
+            let s = with_host(|h| h.alloc(JsObj::Set { entries: indexmap::IndexMap::new(), weak }));
+            if let Some(init) = args.first().filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a))) {
+                let vals = host::iter_all(init)?;
+                for v in vals {
+                    set_method(&s, "add", vec![v])?;
+                }
+            }
+            Ok(s)
+        }
+        "Promise" => new_promise(arg0(&args)),
+        "Error" => Ok(make_error(name, &args)),
+        n if host::ERROR_NAMES.contains(&n) => Ok(make_error(name, &args)),
         _ => Err(host::type_error(&format!("{name} is not a constructor"))),
     }
 }
 
 fn make_error(name: &str, args: &[Value]) -> Value {
     with_host(|h| {
+        h.ensure_error_protos();
         let mut props: IndexMap<String, Value> = IndexMap::new();
-        let nv = h.new_str(name);
-        props.insert("name".into(), nv);
-        let msg = args.first().map(|a| h.str_of(a)).unwrap_or_default();
-        let mv = h.new_str(msg);
-        props.insert("message".into(), mv);
-        h.new_object(props)
+        let msg = args.first().filter(|a| !matches!(a, Value::Undef)).map(|a| h.str_of(a));
+        if let Some(m) = &msg {
+            let mv = h.new_str(m.clone());
+            props.insert("message".into(), mv);
+        }
+        // `.stack` is engine-specific; a simple `Name: message` header line
+        // suffices for parity (the fuzzer never prints raw stacks).
+        let stack = match &msg {
+            Some(m) if !m.is_empty() => format!("{name}: {m}\n    at <anonymous>"),
+            _ => format!("{name}\n    at <anonymous>"),
+        };
+        let sv = h.new_str(stack);
+        props.insert("stack".into(), sv);
+        let e = h.new_object(props);
+        if let Some(p) = host::error_proto_of(h, name) {
+            h.set_proto(&e, p);
+        }
+        e
     })
 }
 
@@ -1147,7 +1881,11 @@ fn pseudo_random() -> f64 {
 fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
     let v = arg0(&args);
     let entries: Vec<(String, Value)> = with_host(|h| match h.get(&v) {
-        Some(JsObj::Object(props)) => props.iter().map(|(k, val)| (k.clone(), val.clone())).collect(),
+        Some(JsObj::Object(props)) => props
+            .iter()
+            .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
+            .map(|(k, val)| (k.clone(), val.clone()))
+            .collect(),
         Some(JsObj::Array(items)) => items.iter().enumerate().map(|(i, val)| (i.to_string(), val.clone())).collect(),
         _ => Vec::new(),
     });
@@ -1198,7 +1936,13 @@ fn object_from_entries(args: Vec<Value>) -> Result<Value, String> {
 }
 
 fn array_from(args: Vec<Value>) -> Result<Value, String> {
-    let items = with_host(|h| h.iter_vec(&arg0(&args))).unwrap_or_default();
+    // `Array.from` accepts generators and user iterables, plus array-likes with a
+    // numeric `.length`.
+    let src = arg0(&args);
+    let items = match host::iter_all(&src) {
+        Ok(v) => v,
+        Err(_) => array_like_items(&src),
+    };
     if let Some(cb) = args.get(1).cloned() {
         let mut out = Vec::with_capacity(items.len());
         for (i, it) in items.into_iter().enumerate() {
@@ -1207,6 +1951,17 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
         return Ok(with_host(|h| h.new_array(out)));
     }
     Ok(with_host(|h| h.new_array(items)))
+}
+
+/// Items of an array-like `{ length, 0, 1, … }` object (for `Array.from`).
+fn array_like_items(src: &Value) -> Vec<Value> {
+    let len = get_property(src, "length").ok().map(|l| with_host(|h| h.to_number(&l))).unwrap_or(0.0);
+    if !len.is_finite() || len <= 0.0 {
+        return Vec::new();
+    }
+    (0..len as usize)
+        .map(|i| get_property(src, &i.to_string()).unwrap_or(Value::Undef))
+        .collect()
 }
 
 // ── JSON ──────────────────────────────────────────────────────────────────────
@@ -1235,7 +1990,16 @@ fn json_str(h: &host::JsHost, v: &Value, indent: &str, depth: usize) -> Option<S
         Value::Obj(_) => match h.get(v) {
             Some(JsObj::Str(s)) => Some(json_quote(s)),
             Some(JsObj::Null) => Some("null".into()),
-            Some(JsObj::Func(_)) | Some(JsObj::Builtin(_)) | Some(JsObj::BoundMethod { .. }) => None,
+            // Map/Set have no enumerable own string keys → serialize as `{}`.
+            Some(JsObj::Map { .. }) | Some(JsObj::Set { .. }) => Some("{}".into()),
+            // Functions and symbols are omitted (undefined) as values.
+            Some(JsObj::Func(_))
+            | Some(JsObj::Builtin(_))
+            | Some(JsObj::BoundMethod { .. })
+            | Some(JsObj::BoundFunc { .. })
+            | Some(JsObj::Class(_))
+            | Some(JsObj::Symbol { .. })
+            | Some(JsObj::Generator { .. }) => None,
             Some(JsObj::Array(items)) => {
                 if items.is_empty() {
                     return Some("[]".into());
@@ -1249,6 +2013,7 @@ fn json_str(h: &host::JsHost, v: &Value, indent: &str, depth: usize) -> Option<S
             Some(JsObj::Object(props)) => {
                 let parts: Vec<String> = props
                     .iter()
+                    .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
                     .filter_map(|(k, val)| {
                         json_str(h, val, indent, depth + 1).map(|vs| {
                             let sep = if indent.is_empty() { ":" } else { ": " };
@@ -1490,6 +2255,18 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
     match obj {
         Some(JsObj::Array(_)) => array_method(recv, name, args),
         Some(JsObj::Str(s)) => string_method(&s, name, args),
+        Some(JsObj::Map { .. }) => map_method(recv, name, args),
+        Some(JsObj::Set { .. }) => set_method(recv, name, args),
+        Some(JsObj::Generator { .. }) => generator_method(recv, name, args),
+        Some(JsObj::Promise { .. }) => promise_method(recv, name, args),
+        Some(JsObj::Iter { .. }) => iter_method(recv, name, args),
+        Some(JsObj::Symbol { .. }) => symbol_method(recv, name, args),
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => {
+            match function_builtin_method(recv, name, &args)? {
+                Some(v) => Ok(v),
+                None => Err(host::type_error(&format!("{name} is not a function"))),
+            }
+        }
         Some(JsObj::Object(props)) => {
             if let Some(f) = props.get(name).cloned() {
                 host::invoke(&f, args, Some(recv.clone()))
@@ -1818,7 +2595,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let items: Vec<Value> = (0..n).map(|i| Value::Float(i as f64)).collect();
             Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
         }
-        "values" => {
+        "values" | "@@iterator" => {
             let items = array_items(recv);
             Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
         }
@@ -1893,6 +2670,10 @@ fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
 fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String> {
     let chars: Vec<char> = s.chars().collect();
     match name {
+        "@@iterator" => {
+            let items: Vec<Value> = chars.iter().map(|c| new_s(c.to_string())).collect();
+            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+        }
         "toUpperCase" => Ok(new_s(s.to_uppercase())),
         "toLowerCase" => Ok(new_s(s.to_lowercase())),
         "trim" => Ok(new_s(s.trim().to_string())),
@@ -2245,4 +3026,538 @@ fn to_radix(n: f64, radix: u32) -> String {
     }
     out.reverse();
     String::from_utf8(out).unwrap()
+}
+
+// ══ Map / Set / Symbol / generator methods ═══════════════════════════════════
+
+fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "get" => {
+            let key = with_host(|h| host::map_key(h, &arg0(&args)));
+            Ok(with_host(|h| match h.get(recv) {
+                Some(JsObj::Map { entries, .. }) => entries.get(&key).map(|(_, v)| v.clone()).unwrap_or(Value::Undef),
+                _ => Value::Undef,
+            }))
+        }
+        "set" => {
+            let kv = arg0(&args);
+            let vv = args.get(1).cloned().unwrap_or(Value::Undef);
+            let key = with_host(|h| host::map_key(h, &kv));
+            with_host(|h| {
+                if let Some(JsObj::Map { entries, .. }) = h.get_mut(recv) {
+                    entries.insert(key, (kv, vv));
+                }
+            });
+            Ok(recv.clone())
+        }
+        "has" => {
+            let key = with_host(|h| host::map_key(h, &arg0(&args)));
+            Ok(Value::Bool(with_host(|h| matches!(h.get(recv), Some(JsObj::Map { entries, .. }) if entries.contains_key(&key)))))
+        }
+        "delete" => {
+            let key = with_host(|h| host::map_key(h, &arg0(&args)));
+            Ok(Value::Bool(with_host(|h| match h.get_mut(recv) {
+                Some(JsObj::Map { entries, .. }) => entries.shift_remove(&key).is_some(),
+                _ => false,
+            })))
+        }
+        "clear" => {
+            with_host(|h| {
+                if let Some(JsObj::Map { entries, .. }) = h.get_mut(recv) {
+                    entries.clear();
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "forEach" => {
+            let cb = arg0(&args);
+            let pairs: Vec<(Value, Value)> = with_host(|h| match h.get(recv) {
+                Some(JsObj::Map { entries, .. }) => entries.values().cloned().collect(),
+                _ => Vec::new(),
+            });
+            for (k, v) in pairs {
+                host::invoke(&cb, vec![v, k, recv.clone()], None)?;
+            }
+            Ok(Value::Undef)
+        }
+        "keys" | "values" | "entries" | "@@iterator" => {
+            let items: Vec<Value> = with_host(|h| {
+                let pairs: Vec<(Value, Value)> = match h.get(recv) {
+                    Some(JsObj::Map { entries, .. }) => entries.values().cloned().collect(),
+                    _ => Vec::new(),
+                };
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| match name {
+                        "keys" => k,
+                        "values" => v,
+                        _ => h.new_array(vec![k, v]), // entries + @@iterator
+                    })
+                    .collect()
+            });
+            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+        }
+        _ => Err(host::type_error(&format!("map.{name} is not a function"))),
+    }
+}
+
+fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "add" => {
+            let vv = arg0(&args);
+            let key = with_host(|h| host::map_key(h, &vv));
+            with_host(|h| {
+                if let Some(JsObj::Set { entries, .. }) = h.get_mut(recv) {
+                    entries.insert(key, vv);
+                }
+            });
+            Ok(recv.clone())
+        }
+        "has" => {
+            let key = with_host(|h| host::map_key(h, &arg0(&args)));
+            Ok(Value::Bool(with_host(|h| matches!(h.get(recv), Some(JsObj::Set { entries, .. }) if entries.contains_key(&key)))))
+        }
+        "delete" => {
+            let key = with_host(|h| host::map_key(h, &arg0(&args)));
+            Ok(Value::Bool(with_host(|h| match h.get_mut(recv) {
+                Some(JsObj::Set { entries, .. }) => entries.shift_remove(&key).is_some(),
+                _ => false,
+            })))
+        }
+        "clear" => {
+            with_host(|h| {
+                if let Some(JsObj::Set { entries, .. }) = h.get_mut(recv) {
+                    entries.clear();
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "forEach" => {
+            let cb = arg0(&args);
+            let vals: Vec<Value> = with_host(|h| match h.get(recv) {
+                Some(JsObj::Set { entries, .. }) => entries.values().cloned().collect(),
+                _ => Vec::new(),
+            });
+            for v in vals {
+                host::invoke(&cb, vec![v.clone(), v, recv.clone()], None)?;
+            }
+            Ok(Value::Undef)
+        }
+        "keys" | "values" | "entries" | "@@iterator" => {
+            let items: Vec<Value> = with_host(|h| {
+                let vals: Vec<Value> = match h.get(recv) {
+                    Some(JsObj::Set { entries, .. }) => entries.values().cloned().collect(),
+                    _ => Vec::new(),
+                };
+                if name == "entries" {
+                    vals.into_iter().map(|v| h.new_array(vec![v.clone(), v])).collect()
+                } else {
+                    vals
+                }
+            });
+            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+        }
+        _ => Err(host::type_error(&format!("set.{name} is not a function"))),
+    }
+}
+
+fn generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "next" => {
+            let send = arg0(&args);
+            match host::gen_resume(recv, send)? {
+                host::GenStep::Yield(v) => Ok(iter_result(v, false)),
+                host::GenStep::Done(v) => Ok(iter_result(v, true)),
+            }
+        }
+        "return" => {
+            host::gen_close(recv);
+            Ok(iter_result(arg0(&args), true))
+        }
+        "throw" => {
+            // Minimal: closing the generator and propagating the thrown value.
+            host::gen_close(recv);
+            with_host(|h| h.exc = Some(arg0(&args)));
+            Err(with_host(|h| error_display(h, &arg0(&args))).replace("Uncaught ", ""))
+        }
+        _ => Err(host::type_error(&format!("generator.{name} is not a function"))),
+    }
+}
+
+/// A `{ value, done }` iterator-result object.
+fn iter_result(value: Value, done: bool) -> Value {
+    with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert("value".into(), value);
+        m.insert("done".into(), Value::Bool(done));
+        h.new_object(m)
+    })
+}
+
+/// Built-in iterator object (`arr.values()`, `arr[Symbol.iterator]()`): a lazy
+/// cursor over a materialized item list.
+fn iter_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "next" => {
+            let step = with_host(|h| {
+                if let Some(JsObj::Iter { items, idx }) = h.get_mut(recv) {
+                    if *idx < items.len() {
+                        let v = items[*idx].clone();
+                        *idx += 1;
+                        return Some(v);
+                    }
+                }
+                None
+            });
+            Ok(match step {
+                Some(v) => iter_result(v, false),
+                None => iter_result(Value::Undef, true),
+            })
+        }
+        "return" => {
+            // Exhaust the cursor and report done.
+            with_host(|h| {
+                if let Some(JsObj::Iter { items, idx }) = h.get_mut(recv) {
+                    *idx = items.len();
+                }
+            });
+            Ok(iter_result(arg0(&args), true))
+        }
+        // An iterator is its own iterable.
+        "@@iterator" => Ok(recv.clone()),
+        _ => Err(host::type_error(&format!("iterator.{name} is not a function"))),
+    }
+}
+
+fn symbol_method(recv: &Value, name: &str, _args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "toString" => Ok(with_host(|h| {
+            let s = h.str_of(recv);
+            h.new_str(s)
+        })),
+        _ => Err(host::type_error(&format!("symbol.{name} is not a function"))),
+    }
+}
+
+// ══ Object.* prototype helpers, `in`, deep clone ═════════════════════════════
+
+fn object_create(args: Vec<Value>) -> Result<Value, String> {
+    let proto = arg0(&args);
+    let obj = with_host(|h| h.new_object(IndexMap::new()));
+    if !with_host(|h| h.is_null(&proto)) && !matches!(proto, Value::Undef) {
+        with_host(|h| h.set_proto(&obj, proto));
+    }
+    // Optional second arg: a property-descriptor map.
+    if let Some(descs) = args.get(1).filter(|d| !matches!(d, Value::Undef)) {
+        let entries: Vec<(String, Value)> = with_host(|h| match h.get(descs) {
+            Some(JsObj::Object(p)) => p.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            _ => Vec::new(),
+        });
+        for (k, d) in entries {
+            apply_descriptor(&obj, &k, &d);
+        }
+    }
+    Ok(obj)
+}
+
+fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
+    let obj = arg0(&args);
+    let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+    let desc = args.get(2).cloned().unwrap_or(Value::Undef);
+    apply_descriptor(&obj, &key, &desc);
+    Ok(obj)
+}
+
+/// Apply a `{ value | get | set }` descriptor object to `obj[key]`.
+fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
+    let (value, get, set) = with_host(|h| match h.get(desc) {
+        Some(JsObj::Object(p)) => (p.get("value").cloned(), p.get("get").cloned(), p.get("set").cloned()),
+        _ => (None, None, None),
+    });
+    if get.is_some() || set.is_some() {
+        with_host(|h| h.set_accessor(obj, key, get, set));
+    } else if let Some(v) = value {
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(obj) {
+                p.insert(key.to_string(), v);
+            }
+        });
+    }
+}
+
+fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
+    let obj = arg0(&args);
+    let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+    // Accessor descriptor?
+    if let Some((get, set)) = with_host(|h| h.own_accessor(&obj, &key)) {
+        return Ok(with_host(|h| {
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("get".into(), get.unwrap_or(Value::Undef));
+            m.insert("set".into(), set.unwrap_or(Value::Undef));
+            m.insert("enumerable".into(), Value::Bool(true));
+            m.insert("configurable".into(), Value::Bool(true));
+            h.new_object(m)
+        }));
+    }
+    let val = with_host(|h| match h.get(&obj) {
+        Some(JsObj::Object(p)) => p.get(&key).cloned(),
+        _ => None,
+    });
+    match val {
+        Some(v) => Ok(with_host(|h| {
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("value".into(), v);
+            m.insert("writable".into(), Value::Bool(true));
+            m.insert("enumerable".into(), Value::Bool(true));
+            m.insert("configurable".into(), Value::Bool(true));
+            h.new_object(m)
+        })),
+        None => Ok(Value::Undef),
+    }
+}
+
+/// `key in obj` respecting the prototype chain.
+pub fn has_property(obj: &Value, key: &str) -> bool {
+    if with_host(|h| host::lookup_chain(h, obj, key)).is_some() {
+        return true;
+    }
+    if with_host(|h| host::lookup_accessor(h, obj, key)).is_some() {
+        return true;
+    }
+    with_host(|h| match h.get(obj) {
+        Some(JsObj::Object(p)) => p.contains_key(key),
+        Some(JsObj::Array(items)) => {
+            key == "length" || key.parse::<usize>().map(|i| i < items.len()).unwrap_or(false)
+        }
+        _ => false,
+    })
+}
+
+/// `structuredClone` — a deep copy of plain data (objects/arrays/primitives).
+fn deep_clone(v: &Value) -> Value {
+    match with_host(|h| h.get(v).cloned()) {
+        Some(JsObj::Array(items)) => {
+            let cloned: Vec<Value> = items.iter().map(deep_clone).collect();
+            with_host(|h| h.new_array(cloned))
+        }
+        Some(JsObj::Object(props)) => {
+            let cloned: IndexMap<String, Value> =
+                props.iter().map(|(k, val)| (k.clone(), deep_clone(val))).collect();
+            with_host(|h| h.new_object(cloned))
+        }
+        _ => v.clone(),
+    }
+}
+
+// ══ Promises, timers, microtasks (event-loop-driven) ═════════════════════════
+
+/// A short `Name: message` string for an error value (used when an await
+/// rejection unwinds as a thrown error).
+pub fn error_string(h: &host::JsHost, v: &Value) -> String {
+    if let Some(JsObj::Object(props)) = h.get(v) {
+        let name = props
+            .get("name")
+            .map(|x| h.str_of(x))
+            .or_else(|| host::lookup_chain(h, v, "name").map(|x| h.str_of(&x)))
+            .unwrap_or_else(|| "Error".into());
+        if let Some(m) = props.get("message") {
+            return format!("{name}: {}", h.str_of(m));
+        }
+        return name;
+    }
+    h.str_of(v)
+}
+
+fn make_builtin(name: String) -> Value {
+    with_host(|h| h.alloc(JsObj::Builtin(name)))
+}
+
+/// `new Promise((resolve, reject) => …)` — run the executor synchronously with
+/// internal resolve/reject functions.
+fn new_promise(executor: Value) -> Result<Value, String> {
+    let p = with_host(|h| h.new_promise());
+    let id = with_host(|h| h.promise_id(&p).unwrap());
+    let res = make_builtin(format!("@@presolve:{id}"));
+    let rej = make_builtin(format!("@@preject:{id}"));
+    if let Err(e) = host::invoke(&executor, vec![res, rej], None) {
+        // A throw in the executor rejects the promise.
+        let ev = host::take_exc_or_error(&e);
+        host::reject_promise_val(id, ev);
+    }
+    Ok(p)
+}
+
+fn promise_resolve(v: Value) -> Result<Value, String> {
+    Ok(host::promise_of(&v))
+}
+fn promise_reject(v: Value) -> Result<Value, String> {
+    let p = with_host(|h| h.new_promise());
+    let id = with_host(|h| h.promise_id(&p).unwrap());
+    host::reject_promise_val(id, v);
+    with_host(|h| h.promise_mark_handled(id)); // avoid spurious unhandled noise
+    Ok(p)
+}
+
+#[derive(Clone, Copy)]
+enum AllMode {
+    All,
+    AllSettled,
+}
+
+/// `Promise.all` / `Promise.allSettled`.
+fn promise_all(args: Vec<Value>, mode: AllMode) -> Result<Value, String> {
+    let items = host::iter_all(&arg0(&args))?;
+    let result = with_host(|h| h.new_promise());
+    let rid = with_host(|h| h.promise_id(&result).unwrap());
+    let n = items.len();
+    if n == 0 {
+        let empty = with_host(|h| h.new_array(Vec::new()));
+        host::resolve_promise_val(rid, empty);
+        return Ok(result);
+    }
+    // Shared mutable accumulator via Rc<RefCell<…>>.
+    let slots = std::rc::Rc::new(std::cell::RefCell::new(vec![Value::Undef; n]));
+    let remaining = std::rc::Rc::new(std::cell::RefCell::new(n));
+    for (i, it) in items.into_iter().enumerate() {
+        let ap = host::promise_of(&it);
+        let aid = with_host(|h| h.promise_id(&ap).unwrap());
+        let slots = slots.clone();
+        let remaining = remaining.clone();
+        host::subscribe_native(
+            aid,
+            Box::new(move |state, val| {
+                let settled = match mode {
+                    AllMode::All => {
+                        if state == host::PromiseState::Rejected {
+                            host::reject_promise_val(rid, val);
+                            return Ok(());
+                        }
+                        val
+                    }
+                    AllMode::AllSettled => with_host(|h| {
+                        let mut m: IndexMap<String, Value> = IndexMap::new();
+                        if state == host::PromiseState::Rejected {
+                            m.insert("status".into(), h.new_str("rejected"));
+                            m.insert("reason".into(), val);
+                        } else {
+                            m.insert("status".into(), h.new_str("fulfilled"));
+                            m.insert("value".into(), val);
+                        }
+                        h.new_object(m)
+                    }),
+                };
+                slots.borrow_mut()[i] = settled;
+                let mut r = remaining.borrow_mut();
+                *r -= 1;
+                if *r == 0 {
+                    let arr = with_host(|h| h.new_array(slots.borrow().clone()));
+                    host::resolve_promise_val(rid, arr);
+                }
+                Ok(())
+            }),
+        );
+    }
+    Ok(result)
+}
+
+/// `Promise.race` (first to settle wins) / `Promise.any` (first to fulfill wins).
+fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
+    let items = host::iter_all(&arg0(&args))?;
+    let result = with_host(|h| h.new_promise());
+    let rid = with_host(|h| h.promise_id(&result).unwrap());
+    let n = items.len();
+    let errors = std::rc::Rc::new(std::cell::RefCell::new(vec![Value::Undef; n]));
+    let remaining = std::rc::Rc::new(std::cell::RefCell::new(n));
+    for (i, it) in items.into_iter().enumerate() {
+        let ap = host::promise_of(&it);
+        let aid = with_host(|h| h.promise_id(&ap).unwrap());
+        let errors = errors.clone();
+        let remaining = remaining.clone();
+        host::subscribe_native(
+            aid,
+            Box::new(move |state, val| {
+                if any {
+                    if state == host::PromiseState::Fulfilled {
+                        host::resolve_promise_val(rid, val);
+                    } else {
+                        errors.borrow_mut()[i] = val;
+                        let mut r = remaining.borrow_mut();
+                        *r -= 1;
+                        if *r == 0 {
+                            // All rejected → AggregateError (simplified to an Error).
+                            let agg = with_host(|h| synth_error(h, "AggregateError: All promises were rejected"));
+                            host::reject_promise_val(rid, agg);
+                        }
+                    }
+                } else if state == host::PromiseState::Rejected {
+                    host::reject_promise_val(rid, val);
+                } else {
+                    host::resolve_promise_val(rid, val);
+                }
+                Ok(())
+            }),
+        );
+    }
+    Ok(result)
+}
+
+/// `.then` / `.catch` / `.finally` on a promise.
+fn promise_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "then" => Ok(host::promise_then(
+            recv,
+            args.first().cloned().unwrap_or(Value::Undef),
+            args.get(1).cloned().unwrap_or(Value::Undef),
+        )),
+        "catch" => Ok(host::promise_then(
+            recv,
+            Value::Undef,
+            args.first().cloned().unwrap_or(Value::Undef),
+        )),
+        "finally" => {
+            let cb = arg0(&args);
+            let i = match cb {
+                Value::Obj(i) => i,
+                _ => 0,
+            };
+            let pass = make_builtin(format!("@@finpass:{i}"));
+            let throw = make_builtin(format!("@@finthrow:{i}"));
+            Ok(host::promise_then(recv, pass, throw))
+        }
+        _ => Err(host::type_error(&format!("promise.{name} is not a function"))),
+    }
+}
+
+fn enqueue_microtask(next_tick: bool, cb: Value, args: Vec<Value>) {
+    with_host(|h| {
+        if next_tick {
+            h.queue_nexttick(cb, args);
+        } else {
+            h.queue_micro(cb, args);
+        }
+    });
+}
+
+/// `setTimeout`/`setInterval`/`setImmediate` — register a macrotask. We do NOT
+/// implement repeating intervals (each fires once) to keep output deterministic
+/// and terminating; the delay orders timers on a virtual clock.
+fn schedule_timer(name: &str, args: Vec<Value>) -> Value {
+    let cb = arg0(&args);
+    let delay = if name == "setImmediate" {
+        -1.0 // before any 0ms timeout
+    } else {
+        args.get(1).map(|d| with_host(|h| h.to_number(d))).unwrap_or(0.0).max(0.0)
+    };
+    let extra = if name == "setImmediate" {
+        args.get(1..).map(|s| s.to_vec()).unwrap_or_default()
+    } else {
+        args.get(2..).map(|s| s.to_vec()).unwrap_or_default()
+    };
+    let id = with_host(|h| h.add_timer(delay, cb, extra));
+    Value::Float(id as f64)
+}
+
+fn clear_timer(v: &Value) {
+    let id = with_host(|h| h.to_number(v)) as u64;
+    with_host(|h| h.cancel_timer(id));
 }

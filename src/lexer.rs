@@ -143,6 +143,10 @@ impl Lexer {
         if c.is_ascii_alphabetic() || c == '_' || c == '$' {
             return self.scan_name();
         }
+        // Private class member (`#name`): scanned as an identifier keeping the `#`.
+        if c == '#' && self.peek_at(1).map(|d| d.is_ascii_alphabetic() || d == '_' || d == '$').unwrap_or(false) {
+            return self.scan_name();
+        }
         if c.is_ascii_digit() || (c == '.' && self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false))
         {
             return self.scan_number();
@@ -152,6 +156,11 @@ impl Lexer {
 
     fn scan_name(&mut self) -> Result<(), String> {
         let mut s = String::new();
+        // A leading `#` (private class member name) is kept as part of the ident.
+        if self.peek() == Some('#') {
+            s.push('#');
+            self.pos += 1;
+        }
         while let Some(c) = self.peek() {
             if c.is_alphanumeric() || c == '_' || c == '$' {
                 s.push(c);

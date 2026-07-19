@@ -13,7 +13,7 @@
 //! constants; JS-level strings are always heap objects built by `MKSTR`.
 
 use crate::ast::*;
-use crate::host::{binop as bop, ops, unop, FuncDef, ParamSlot, TryDef};
+use crate::host::{binop as bop, member, ops, unop, FuncDef, ParamSlot, TryDef};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 
 /// A compiled program: the top-level chunk plus the function template table and
@@ -126,8 +126,15 @@ impl Compiler {
 
     fn hoist_funcs(&mut self, b: &mut ChunkBuilder, stmts: &[Stmt]) -> Result<(), String> {
         for s in stmts {
-            if let StmtKind::FuncDecl { name, params, body } = &s.kind {
-                let def_id = self.build_function(name, params, body)?;
+            if let StmtKind::FuncDecl {
+                name,
+                params,
+                body,
+                is_generator,
+                is_async,
+            } = &s.kind
+            {
+                let def_id = self.build_function(name, params, body, *is_generator, *is_async)?;
                 self.emit_mkfunc(b, def_id);
                 self.declare(b, &Expr::Ident(name.clone()));
             }
@@ -151,10 +158,26 @@ impl Compiler {
             }
             StmtKind::Empty => {}
             StmtKind::FuncDecl { .. } => {} // hoisted at block entry
+            StmtKind::ClassDecl(node) => {
+                self.compile_class(b, node)?;
+                // Bind the class to its name in the current scope.
+                if let Some(name) = &node.name {
+                    self.declare(b, &Expr::Ident(name.clone()));
+                } else {
+                    b.emit(Op::Pop, line);
+                }
+            }
             StmtKind::Decl { decls, .. } => {
                 for d in decls {
                     match &d.init {
-                        Some(v) => self.compile_expr(b, v)?,
+                        Some(v) => {
+                            self.compile_expr(b, v)?;
+                            // Name inference: `const f = () => {}` / `= function(){}`
+                            // / `= class {}` gives the function/class the name `f`.
+                            if let Expr::Ident(name) = &d.target {
+                                self.infer_name(b, v, name);
+                            }
+                        }
                         None => {
                             b.emit(Op::LoadUndef, line);
                         }
@@ -351,6 +374,8 @@ impl Compiler {
                     b.emit(Op::CallBuiltin(ops::OBJ_REST, 2), 0); // [rest_object]
                     self.compile_bind(b, target, declare)?;
                 }
+                // Accessors never appear in a destructuring pattern.
+                Prop::Accessor { .. } => {}
             }
         }
         Ok(())
@@ -618,7 +643,14 @@ impl Compiler {
     }
 
     // ── functions ────────────────────────────────────────────────────────
-    fn build_function(&mut self, name: &str, params: &[Param], body: &[Stmt]) -> Result<usize, String> {
+    fn build_function(
+        &mut self,
+        name: &str,
+        params: &[Param],
+        body: &[Stmt],
+        is_generator: bool,
+        is_async: bool,
+    ) -> Result<usize, String> {
         let (slots, prologue) = self.lower_params(params)?;
         let mut fb = ChunkBuilder::new();
         // Function-body function hoisting.
@@ -631,20 +663,166 @@ impl Compiler {
             params: slots,
             chunk: fb.build(),
             is_arrow: false,
+            is_generator,
+            is_async,
         };
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
     }
 
-    fn build_arrow(&mut self, params: &[Param], body: &FnBody) -> Result<usize, String> {
+    fn build_arrow(&mut self, params: &[Param], body: &FnBody, is_async: bool) -> Result<usize, String> {
         let stmts = match body {
             FnBody::Block(b) => b.clone(),
             FnBody::Expr(e) => vec![Stmt::from(StmtKind::Return(Some((**e).clone())))],
         };
-        let id = self.build_function("", params, &stmts)?;
+        let id = self.build_function("", params, &stmts, false, is_async)?;
         // Mark the template as an arrow so `this` is captured lexically.
         self.functions[id].1.is_arrow = true;
         Ok(id)
+    }
+
+    // ── classes ──────────────────────────────────────────────────────────
+    /// Lower a `class` to runtime builder ops, leaving the class value on the
+    /// stack: `MKCLASS` (name, parent, ctor) then `DEF_MEMBER`/`DEF_FIELD` for
+    /// each member (each keeps the class on the stack).
+    fn compile_class(&mut self, b: &mut ChunkBuilder, node: &ClassNode) -> Result<(), String> {
+        let cname = node.name.clone().unwrap_or_default();
+        // Push name, parent (or undefined), constructor (or undefined).
+        self.name_const(b, &cname);
+        match &node.parent {
+            Some(p) => self.compile_expr(b, p)?,
+            None => {
+                b.emit(Op::LoadUndef, 0);
+            }
+        }
+        let ctor = node.members.iter().find(|m| m.kind == MemberKind::Constructor);
+        match ctor {
+            Some(m) => {
+                let def_id = self.build_function(&cname, &m.params, &m.body, false, false)?;
+                self.emit_mkfunc(b, def_id);
+            }
+            None => {
+                b.emit(Op::LoadUndef, 0);
+            }
+        }
+        b.emit(Op::CallBuiltin(ops::MKCLASS, 3), 0); // -> [class]
+
+        for m in &node.members {
+            match m.kind {
+                MemberKind::Constructor => {}
+                MemberKind::Field if m.is_static => {
+                    // A static field is evaluated once at class-definition time and
+                    // set as an own property of the constructor: `[class]` stays on
+                    // the stack, `Dup` it as the SETATTR receiver.
+                    b.emit(Op::Dup, 0); // [class, class]
+                    self.emit_member_key(b, m)?; // [class, class, name]
+                    match &m.field_init {
+                        Some(e) => self.compile_expr(b, e)?,
+                        None => {
+                            b.emit(Op::LoadUndef, 0);
+                        }
+                    }
+                    // [class, class, name, val] -> SETATTR sets on the class -> [class, val]
+                    b.emit(Op::CallBuiltin(ops::SETATTR, 3), 0);
+                    b.emit(Op::Pop, 0); // drop the returned value -> [class]
+                }
+                MemberKind::Field => {
+                    // [class] name thunk -> DEF_FIELD -> [class]
+                    self.emit_member_key(b, m)?;
+                    let init = m.field_init.clone().unwrap_or(Expr::Undefined);
+                    let stmts = vec![Stmt::from(StmtKind::Return(Some(init)))];
+                    let def_id = self.build_function("", &[], &stmts, false, false)?;
+                    self.emit_mkfunc(b, def_id);
+                    b.emit(Op::CallBuiltin(ops::DEF_FIELD, 3), 0);
+                }
+                MemberKind::Method | MemberKind::Get | MemberKind::Set => {
+                    // [class] name kind static fn -> DEF_MEMBER -> [class]
+                    self.emit_member_key(b, m)?;
+                    let kind = match m.kind {
+                        MemberKind::Get => member::GET,
+                        MemberKind::Set => member::SET,
+                        _ => member::METHOD,
+                    };
+                    b.emit(Op::LoadInt(kind), 0);
+                    b.emit(if m.is_static { Op::LoadTrue } else { Op::LoadFalse }, 0);
+                    let mname = match &m.key {
+                        Expr::Str(s) if !m.computed => s.clone(),
+                        _ => String::new(),
+                    };
+                    let def_id = self.build_function(&mname, &m.params, &m.body, m.is_generator, m.is_async)?;
+                    self.emit_mkfunc(b, def_id);
+                    b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// If `init` is an anonymous function/arrow/class (value already on TOS), set
+    /// its `.name` to `name` (JS binding name-inference). No-op otherwise.
+    fn infer_name(&mut self, b: &mut ChunkBuilder, init: &Expr, name: &str) {
+        let anon = matches!(
+            init,
+            Expr::Function { name: None, .. } | Expr::Class(_)
+        ) && !matches!(init, Expr::Class(node) if node.name.is_some());
+        if !anon {
+            return;
+        }
+        // [fn] Dup; .name = name; drop the SETATTR result.
+        b.emit(Op::Dup, 0);
+        self.name_const(b, "name");
+        self.strlit(b, name);
+        b.emit(Op::CallBuiltin(ops::SETATTR, 3), 0);
+        b.emit(Op::Pop, 0);
+    }
+
+    /// Push a class/object member's property key: a computed expression coerced
+    /// via `PROPKEY` (Symbol-aware), or a static name constant.
+    fn emit_member_key(&mut self, b: &mut ChunkBuilder, m: &ClassMember) -> Result<(), String> {
+        if m.computed {
+            self.compile_expr(b, &m.key)?;
+            b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
+        } else if let Expr::Str(s) = &m.key {
+            self.name_const(b, s);
+        } else {
+            self.compile_expr(b, &m.key)?;
+            b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
+        }
+        Ok(())
+    }
+
+    // ── generators / yield ───────────────────────────────────────────────
+    fn compile_yield(&mut self, b: &mut ChunkBuilder, arg: &Option<Box<Expr>>, delegate: bool) -> Result<(), String> {
+        if delegate {
+            // `yield* iterable`: iterate, yielding each element.
+            match arg {
+                Some(e) => self.compile_expr(b, e)?,
+                None => {
+                    b.emit(Op::LoadUndef, 0);
+                }
+            }
+            b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
+            let start = b.current_pos();
+            b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next]
+            let jdone = b.emit(Op::JumpIfFalse(0), 0);
+            b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // yield the value -> [iterator, sent]
+            b.emit(Op::Pop, 0); // drop the sent value
+            b.emit(Op::Jump(start), 0);
+            let done = b.current_pos();
+            b.patch_jump(jdone, done);
+            b.emit(Op::Pop, 0); // drop the iterator
+            b.emit(Op::LoadUndef, 0); // `yield*` evaluates to the delegate's return
+        } else {
+            match arg {
+                Some(e) => self.compile_expr(b, e)?,
+                None => {
+                    b.emit(Op::LoadUndef, 0);
+                }
+            }
+            // YIELD suspends and leaves the value sent by `.next(x)` on the stack.
+            b.emit(Op::CallBuiltin(ops::YIELD, 1), 0);
+        }
+        Ok(())
     }
 
     /// Lower a formal-parameter list into simple slots plus prologue statements
@@ -754,18 +932,32 @@ impl Compiler {
             Expr::Index { object, index, optional } => {
                 self.compile_index(b, object, index, *optional)?
             }
-            Expr::Function { params, body, is_arrow, name } => {
+            Expr::Function { params, body, is_arrow, name, is_generator, is_async } => {
                 let def_id = if *is_arrow {
-                    self.build_arrow(params, body)?
+                    self.build_arrow(params, body, *is_async)?
                 } else {
                     let n = name.clone().unwrap_or_default();
                     let stmts = match body {
                         FnBody::Block(b) => b.clone(),
                         FnBody::Expr(e) => vec![Stmt::from(StmtKind::Return(Some((**e).clone())))],
                     };
-                    self.build_function(&n, params, &stmts)?
+                    self.build_function(&n, params, &stmts, *is_generator, *is_async)?
                 };
                 self.emit_mkfunc(b, def_id);
+            }
+            Expr::Class(node) => self.compile_class(b, node)?,
+            Expr::Super => {
+                // Bare `super` only appears as a call/member callee, handled by
+                // compile_call / compile_member; a stray `super` yields undefined.
+                b.emit(Op::LoadUndef, 0);
+            }
+            Expr::NewTarget => {
+                b.emit(Op::CallBuiltin(ops::NEW_TARGET, 0), 0);
+            }
+            Expr::Yield { arg, delegate } => self.compile_yield(b, arg, *delegate)?,
+            Expr::Await(inner) => {
+                self.compile_expr(b, inner)?;
+                b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0);
             }
             Expr::Sequence(items) => {
                 for (i, it) in items.iter().enumerate() {
@@ -821,14 +1013,20 @@ impl Compiler {
     }
 
     fn compile_object(&mut self, b: &mut ChunkBuilder, props: &[Prop]) -> Result<(), String> {
-        // (tag, key, val) triples; tag 1 = ...spread (key holds the source obj).
-        for p in props {
+        // (tag, key, val) triples for the data/spread props; tag 1 = ...spread.
+        // Accessors are installed afterward via DEF_ACCESSOR.
+        let data: Vec<&Prop> = props
+            .iter()
+            .filter(|p| !matches!(p, Prop::Accessor { .. }))
+            .collect();
+        for p in &data {
             match p {
                 Prop::KeyValue { key, value, .. } => {
                     b.emit(Op::LoadInt(0), 0);
-                    // Key coerces to a string property name.
+                    // Key coerces to a property key (Symbol-aware: a Symbol maps to
+                    // its internal `@@…` key rather than a `String()` coercion).
                     self.compile_expr(b, key)?;
-                    b.emit(Op::CallBuiltin(ops::TOSTR, 1), 0);
+                    b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
                     self.compile_expr(b, value)?;
                 }
                 Prop::Spread(src) => {
@@ -836,9 +1034,27 @@ impl Compiler {
                     self.compile_expr(b, src)?;
                     b.emit(Op::LoadUndef, 0);
                 }
+                Prop::Accessor { .. } => unreachable!(),
             }
         }
-        b.emit(Op::CallBuiltin(ops::MKOBJ, argc(props.len() * 3)?), 0);
+        b.emit(Op::CallBuiltin(ops::MKOBJ, argc(data.len() * 3)?), 0); // [obj]
+        // Install any getters/setters, keeping the object on the stack.
+        for p in props {
+            if let Prop::Accessor { key, computed, is_getter, func } = p {
+                if *computed {
+                    self.compile_expr(b, key)?;
+                    b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
+                } else if let Expr::Str(s) = key {
+                    self.name_const(b, s);
+                } else {
+                    self.compile_expr(b, key)?;
+                    b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
+                }
+                b.emit(Op::LoadInt(if *is_getter { member::GET } else { member::SET }), 0);
+                self.compile_expr(b, func)?;
+                b.emit(Op::CallBuiltin(ops::DEF_ACCESSOR, 4), 0);
+            }
+        }
         Ok(())
     }
 
@@ -1018,6 +1234,12 @@ impl Compiler {
     }
 
     fn compile_member(&mut self, b: &mut ChunkBuilder, object: &Expr, property: &str, optional: bool) -> Result<(), String> {
+        // `super.prop` — read a data/accessor property off the parent prototype.
+        if matches!(object, Expr::Super) {
+            self.name_const(b, property);
+            b.emit(Op::CallBuiltin(ops::SUPER_GET, 1), 0);
+            return Ok(());
+        }
         self.compile_expr(b, object)?;
         if optional {
             let jshort = self.emit_optional_guard(b);
@@ -1065,6 +1287,30 @@ impl Compiler {
     fn compile_call(&mut self, b: &mut ChunkBuilder, func: &Expr, args: &[Expr], _optional: bool) -> Result<(), String> {
         let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
         match func {
+            // `super(...args)` — invoke the parent constructor on the current
+            // `this` (SUPER_CALL runs the parent ctor + this class's field inits).
+            Expr::Super => {
+                for a in args {
+                    self.compile_expr(b, a)?;
+                }
+                b.emit(Op::CallBuiltin(ops::SUPER_CALL, argc(args.len())?), 0);
+                return Ok(());
+            }
+            // `super.method(...args)` — resolve the parent method, call it bound to
+            // the current `this` via `method.call(this, ...args)`.
+            Expr::Member { object, property, .. } if matches!(**object, Expr::Super) => {
+                self.name_const(b, property);
+                b.emit(Op::CallBuiltin(ops::SUPER_GET, 1), 0); // [method]
+                self.name_const(b, "call"); // [method, "call"]
+                b.emit(Op::CallBuiltin(ops::THIS, 0), 0); // [method, "call", this]
+                // `method.call(this, ...args)`: compile args (spread expands into
+                // the flat run) and dispatch as a method call named "call".
+                for a in args {
+                    self.compile_expr(b, a)?;
+                }
+                b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(3 + args.len())?), 0);
+                return Ok(());
+            }
             Expr::Member { object, property, .. } => {
                 self.compile_expr(b, object)?;
                 self.name_const(b, property);

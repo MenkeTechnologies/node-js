@@ -20,11 +20,17 @@
 //! is a real parity gap, not a false positive.
 //!
 //! Scope invariant: the generator only emits constructs node-js actually
-//! implements. It does NOT emit `class`, generators (`function*`/`yield`),
-//! `async`/`await`, regex literals, `Map`/`Set`/`Promise`, `BigInt` (`10n`), or
-//! `instanceof` — those are known-unimplemented, so generating them would flood
-//! the report with "not built yet" noise instead of finding real bugs in shipped
-//! features. They are recorded as known gaps in BUGS.md, not fuzzed.
+//! implements. The implemented surface now includes ES6 `class`
+//! (fields/methods/inheritance/`super`/statics/getters/setters), the prototype
+//! chain + `instanceof`, generators (`function*`/`yield`/`yield*`),
+//! `Map`/`Set`/`WeakMap`/`WeakSet`, `Symbol`/`Symbol.iterator`, and
+//! Promises + `async`/`await` + the microtask/timer event loop — all exercised by
+//! the `class`, `generator`, `mapset`, `proto`, and `async` modes. Still NOT
+//! emitted (genuine gaps, see BUGS.md): regex literals, `BigInt` (`10n`), and the
+//! `util.inspect` multi-line array-grouping regime (>6 elements). The async mode
+//! emits ONLY deterministically-schedulable output (fixed microtask/timer
+//! ordering, resolved-value chains) — never wall-clock- or identity-dependent
+//! results.
 //!
 //! Subprocess-only: this binary never links the nodejs library — it compares two
 //! `node` processes, exactly as a user would observe them.
@@ -635,6 +641,239 @@ fn gen_control(seed: u64) -> Vec<String> {
     }
 }
 
+/// ES6 classes — fields, methods, inheritance + `super`, static members,
+/// getters/setters, computed methods, `instanceof`. Every probe prints a
+/// deterministic value (numbers/booleans/strings), never an object identity.
+fn gen_class(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(9) {
+        0 => vec![
+            format!("class C {{ constructor(x) {{ this.x = x; }} dbl() {{ return this.x * 2; }} }}"),
+            format!("console.log(new C({a}).dbl());"),
+        ],
+        1 => vec![
+            "class A { constructor(n) { this.n = n; } val() { return this.n; } }".into(),
+            "class B extends A { constructor(n) { super(n); this.m = n + 1; } val() { return super.val() + this.m; } }".into(),
+            format!("console.log(new B({a}).val());"),
+        ],
+        2 => vec![
+            format!("class C {{ static add(a, b) {{ return a + b; }} static k = {a}; }}"),
+            format!("console.log(C.add({a}, {b}), C.k);"),
+        ],
+        3 => vec![
+            "class Temp { constructor(c) { this._c = c; } get f() { return this._c * 2; } set f(v) { this._c = v - 1; } }".into(),
+            format!("const t = new Temp({a}); const before = t.f; t.f = {b}; console.log(before, t.f);"),
+        ],
+        4 => vec![
+            "class Base {} class Mid extends Base {} class Leaf extends Mid {}".into(),
+            "const x = new Leaf();".into(),
+            "console.log(x instanceof Leaf, x instanceof Mid, x instanceof Base, x instanceof Object);".into(),
+        ],
+        5 => vec![
+            format!("class C {{ #secret = {a}; reveal() {{ return this.#secret + {b}; }} }}"),
+            "const c = new C();".into(),
+            "console.log(c.reveal(), JSON.stringify(c), Object.keys(c).length);".into(),
+        ],
+        6 => vec![
+            format!("class Counter {{ constructor() {{ this.c = 0; }} inc() {{ this.c++; return this; }} }}"),
+            format!("const k = new Counter(); k.inc().inc().inc(); console.log(k.c);"),
+        ],
+        7 => vec![
+            "class P { constructor(x, y) { this.x = x; this.y = y; } toString() { return `(${this.x},${this.y})`; } }".into(),
+            format!("console.log(String(new P({a}, {b})), new P({a}, {b}).constructor.name);"),
+        ],
+        _ => vec![
+            format!("class Shape {{ area() {{ return 0; }} }}"),
+            format!("class Sq extends Shape {{ constructor(s) {{ super(); this.s = s; }} area() {{ return this.s * this.s; }} }}"),
+            format!("const arr = [new Sq({}), new Sq({})]; console.log(arr.map(x => x.area()));", 1 + r.below(6), 1 + r.below(6)),
+        ],
+    }
+}
+
+/// Generators — `function*`, `yield`, `yield*`, `.next()` sequencing,
+/// generator-as-iterable in spread / `for-of` / `Array.from`. Deterministic
+/// output only (no generator-object identity printing).
+fn gen_generator(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = 2 + r.below(4);
+    match r.below(7) {
+        0 => vec![
+            format!("function* g() {{ yield {}; yield {}; yield {}; }}", pick(r, INTS), pick(r, INTS), pick(r, INTS)),
+            "console.log([...g()]);".into(),
+        ],
+        1 => vec![
+            format!("function* g() {{ for (let i = 0; i < {n}; i++) yield i * {n}; }}"),
+            "console.log(Array.from(g()));".into(),
+        ],
+        2 => vec![
+            format!("function* g() {{ yield* [{}, {}]; yield {}; }}", pick(r, INTS), pick(r, INTS), pick(r, INTS)),
+            "console.log([...g()]);".into(),
+        ],
+        3 => vec![
+            "function* g() { let x = yield 1; let y = yield x + 1; yield y + 1; }".into(),
+            format!("const it = g(); console.log(it.next().value, it.next({a}).value, it.next({b}).value);", a = 10 + r.below(5), b = 20 + r.below(5)),
+        ],
+        4 => vec![
+            format!("function* g() {{ yield {}; yield {}; }}", pick(r, POSINTS), pick(r, POSINTS)),
+            "let sum = 0; for (const v of g()) sum += v; console.log(sum);".into(),
+        ],
+        5 => vec![
+            format!("function* range(n) {{ for (let i = 0; i < n; i++) yield i; }}"),
+            format!("console.log(Math.max(...range({})));", 1 + r.below(6)),
+        ],
+        _ => vec![
+            "function* g() { yield 1; return 99; yield 2; }".into(),
+            "const it = g(); console.log(it.next().value, it.next().value, it.next().done);".into(),
+        ],
+    }
+}
+
+/// Map / Set / WeakMap / WeakSet — construction from iterables, get/set/has/
+/// delete/size/clear, insertion-order iteration, forEach, spread. Keys/values are
+/// primitives so iteration order and output are deterministic.
+fn gen_mapset(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(8) {
+        0 => vec![format!(
+            "const m = new Map(); m.set('a', {a}); m.set('b', {b}); console.log(m.size, m.get('a'), m.has('b'), [...m.keys()]);"
+        )],
+        1 => vec![format!(
+            "const s = new Set([{a}, {b}, {a}, {b}]); console.log(s.size, [...s]);"
+        )],
+        2 => vec![format!(
+            "const m = new Map([['x', {a}], ['y', {b}]]); console.log([...m.values()], [...m.entries()]);"
+        )],
+        3 => vec![format!(
+            "const s = new Set(); s.add({a}); s.add({b}); s.delete({a}); console.log(s.has({a}), s.size);"
+        )],
+        4 => vec![
+            format!("const m = new Map([['k', {a}]]); let out = []; m.forEach((v, k) => out.push(k + ':' + v)); console.log(out);"),
+        ],
+        5 => vec![format!(
+            "const s = new Set([1, 2, 3, 4]); const doubled = [...s].map(x => x * {}); console.log(doubled);", 1 + r.below(4)
+        )],
+        6 => vec![format!(
+            "const m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.clear(); console.log(m.size, [...m.keys()]);"
+        )],
+        _ => vec![format!(
+            "const wm = new WeakMap(); const k = {{}}; wm.set(k, {a}); console.log(wm.get(k), wm.has(k), wm.has({{}}));"
+        )],
+    }
+}
+
+/// Prototype chain, `instanceof`, `in`, `hasOwnProperty`, `Object.getPrototypeOf`
+/// / `create` / `setPrototypeOf`, `Symbol` basics + `Symbol.iterator`. All output
+/// is a deterministic boolean/number/string (never a symbol identity address).
+fn gen_proto(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, INTS);
+    match r.below(13) {
+        0 => vec![format!(
+            "const o = {{ a: {a}, b: 2 }}; console.log('a' in o, 'c' in o, o.hasOwnProperty('a'), o.hasOwnProperty('toString'));"
+        )],
+        1 => vec![
+            "const proto = { greet() { return 'hi'; } };".into(),
+            "const o = Object.create(proto); o.x = 1;".into(),
+            "console.log(o.greet(), o.hasOwnProperty('greet'), Object.getPrototypeOf(o) === proto);".into(),
+        ],
+        2 => vec![
+            "function Animal(n) { this.n = n; } Animal.prototype.speak = function() { return this.n; };".into(),
+            format!("const d = new Animal('rex'); console.log(d.speak(), d instanceof Animal, d.constructor === Animal);"),
+        ],
+        3 => vec![format!(
+            "console.log([] instanceof Array, [] instanceof Object, ({{}}) instanceof Object, (() => {{}}) instanceof Function);"
+        )],
+        4 => vec![
+            "const a = Symbol('x'), b = Symbol('x');".into(),
+            "console.log(typeof a, a.description, a === b, Symbol.for('k') === Symbol.for('k'));".into(),
+        ],
+        5 => vec![
+            "const o = {};".into(),
+            "o[Symbol.iterator] = function*() { yield 1; yield 2; yield 3; };".into(),
+            "console.log([...o]);".into(),
+        ],
+        6 => vec![
+            format!("const base = {{ v: {a} }}; const o = {{ __proto__: base }};"),
+            "console.log(o.v, Object.getPrototypeOf(o) === base);".into(),
+        ],
+        7 => vec![
+            "class A {} class B extends A {}".into(),
+            "console.log(Object.getPrototypeOf(B.prototype) === A.prototype, new B() instanceof A);".into(),
+        ],
+        8 => vec![
+            "const o = { get x() { return 42; } };".into(),
+            "console.log(o.x, Object.getOwnPropertyDescriptor(o, 'x').get !== undefined);".into(),
+        ],
+        // `.constructor.name` on builtin instances and boxed primitives.
+        9 => vec![format!(
+            "console.log([].constructor.name, ({{}}).constructor.name, ({a}).constructor.name, 'x'.constructor.name, true.constructor.name);"
+        )],
+        // `.constructor.name` on Map/Set/Promise instances.
+        10 => vec![
+            "console.log(new Map().constructor.name, new Set().constructor.name, Promise.resolve(1).constructor.name);".into(),
+        ],
+        // `Ctor.name` on builtin constructors vs `undefined` on non-callable namespaces.
+        11 => vec![
+            "console.log(Array.name, Object.name, Number.name, String.name, Symbol.name, Promise.name, Map.name, Set.name, Error.name, TypeError.name, typeof Math.name, typeof JSON.name);".into(),
+        ],
+        // A runtime-thrown error reports its type through `.constructor.name`.
+        _ => vec![
+            "let r;".into(),
+            "try { null.x; } catch (e) { r = [e instanceof TypeError, e instanceof Error, e.constructor.name]; }".into(),
+            "console.log(r);".into(),
+        ],
+    }
+}
+
+/// Async / Promise ordering — DETERMINISTIC output only: microtask vs timer
+/// ordering, `.then` chains, `Promise.all`/`race`, `async`/`await`, and the
+/// sync→nextTick→microtask→timer sequence. Never prints anything time- or
+/// identity-dependent; every path settles synchronously-schedulable values.
+fn gen_async(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(8) {
+        0 => vec![format!(
+            "Promise.resolve({a}).then(v => v * 2).then(v => console.log(v));"
+        )],
+        1 => vec![
+            "console.log('sync');".into(),
+            "Promise.resolve().then(() => console.log('micro'));".into(),
+            "console.log('sync2');".into(),
+        ],
+        2 => vec![
+            format!("async function f() {{ const x = await Promise.resolve({a}); const y = await {b}; return x + y; }}"),
+            "f().then(v => console.log(v));".into(),
+        ],
+        3 => vec![format!(
+            "Promise.all([Promise.resolve({a}), Promise.resolve({b}), 7]).then(a => console.log(a));"
+        )],
+        4 => vec![
+            "console.log(1);".into(),
+            "Promise.resolve().then(() => console.log(3));".into(),
+            "process.nextTick(() => console.log(2));".into(),
+            "console.log('end');".into(),
+        ],
+        5 => vec![
+            "setTimeout(() => console.log('timer'), 0);".into(),
+            "Promise.resolve().then(() => console.log('promise'));".into(),
+            "console.log('main');".into(),
+        ],
+        6 => vec![
+            format!("async function f() {{ try {{ await Promise.reject(new Error('e{a}')); }} catch (e) {{ return e.message; }} }}"),
+            "f().then(v => console.log(v));".into(),
+        ],
+        _ => vec![format!(
+            "Promise.race([Promise.resolve('a'), Promise.resolve('b')]).then(v => console.log(v)); Promise.allSettled([Promise.resolve({a}), Promise.reject({b})]).then(r => console.log(r.map(x => x.status)));"
+        )],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -655,6 +894,11 @@ enum Mode {
     Arith,
     Math,
     Control,
+    Class,
+    Generator,
+    MapSet,
+    Proto,
+    Async,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -671,6 +915,11 @@ const REAL_MODES: &[Mode] = &[
     Mode::Arith,
     Mode::Math,
     Mode::Control,
+    Mode::Class,
+    Mode::Generator,
+    Mode::MapSet,
+    Mode::Proto,
+    Mode::Async,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -694,6 +943,11 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Arith => gen_arith(seed),
         Mode::Math => gen_math(seed),
         Mode::Control => gen_control(seed),
+        Mode::Class => gen_class(seed),
+        Mode::Generator => gen_generator(seed),
+        Mode::MapSet => gen_mapset(seed),
+        Mode::Proto => gen_proto(seed),
+        Mode::Async => gen_async(seed),
     }
 }
 
@@ -713,6 +967,11 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Arith => "arith",
         Mode::Math => "math",
         Mode::Control => "control",
+        Mode::Class => "class",
+        Mode::Generator => "generator",
+        Mode::MapSet => "mapset",
+        Mode::Proto => "proto",
+        Mode::Async => "async",
     }
 }
 
@@ -731,6 +990,11 @@ const ALL_MODES: &[Mode] = &[
     Mode::Arith,
     Mode::Math,
     Mode::Control,
+    Mode::Class,
+    Mode::Generator,
+    Mode::MapSet,
+    Mode::Proto,
+    Mode::Async,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {

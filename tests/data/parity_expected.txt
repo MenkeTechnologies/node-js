@@ -4,6 +4,42 @@
 [ 1, 2, 3, 5, 8, 9 ]
 [ 3, 8, 1 ] 2 true
 5 3 [ 8, 1, 9, 2 ]
+==== async.js ====
+start
+end
+nextTick
+microtask
+chain 20
+all [ 1, 2, 3 ]
+allSettled [ 'fulfilled', 'rejected' ]
+caught: boom
+compute result 7
+timeout
+==== classes.js ====
+rectangle with area 12
+perimeter 14
+area after resize 20
+square: square with area 36
+area 36
+instanceof Rectangle true
+instanceof Shape true
+instanceof Object true
+static [ 'circle', 'rect', 'square' ]
+ctor name Square
+==== collections.js ====
+size 3
+get bob 75
+has dave false
+keys [ 'alice', 'bob', 'carol' ]
+values [ 90, 75, 88 ]
+forEach alice=90,bob=75,carol=88
+unique [ 'a', 'b', 'c' ] count 3
+set has b true
+after delete [ 'a', 'c' ]
+typeof symbol desc id
+interned true
+custom iterable [ 10, 20, 30 ]
+sum 60
 ==== control.js ====
 total 12
 negative zero positive
@@ -12,6 +48,15 @@ done
 ==== fib.js ====
 fib: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
 1 2 3
+==== generators.js ====
+range [ 2, 3, 4, 5, 6 ]
+fib [ 0, 1, 1, 2, 3, 5 ]
+concat [ 1, 2, 10, 11, 12, 99 ]
+manual 0 1 2
+sum of fib(8) 33
+max via spread 8
+echo: a
+echo: b
 ==== hello.js ====
 hello, world
 7 256 2.5 2
