@@ -13,6 +13,7 @@ pub mod cli;
 pub mod compiler;
 pub mod host;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
 
 pub use fusevm::Value;

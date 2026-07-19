@@ -26,6 +26,13 @@ path = "src/main.rs"
 # `node`, diffing stdout. Development tool — needs `node` on PATH, so CI never
 # runs it; its frozen outputs live in tests/data/parity_expected.txt, which
 # tests/parity.rs replays with no `node` installed.
+# Offline reference-manual generator: consumes the `nodejs::lsp` corpus and
+# writes docs/reference.html (article-format keyword/global/method reference).
+# The MenkeTechnologiesPublications reference PDF pipeline runs this.
+[[bin]]
+name = "gen-docs"
+path = "src/bin/gen_docs.rs"
+
 [[bin]]
 name = "parity"
 path = "src/bin/parity.rs"
