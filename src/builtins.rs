@@ -50,6 +50,19 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::APPLY, b_apply);
     vm.register_builtin(ops::APPLY_METHOD, b_apply_method);
     vm.register_builtin(ops::OBJ_REST, b_obj_rest);
+    vm.register_builtin(ops::DIV, b_div);
+}
+
+/// `a / b` with JS/IEEE-754 semantics. fusevm's native `Op::Div` returns `Undef`
+/// for a zero divisor (so a frontend whose `/` differs must lower to a builtin —
+/// its own documented guidance), but JavaScript requires `x/0 === ±Infinity` and
+/// `0/0 === NaN`, so `/` is lowered here instead. Non-number operands are coerced
+/// via `ToNumber`, exactly as the numeric hook's `arith(Div)` path does.
+fn b_div(vm: &mut VM, _: u8) -> Value {
+    let b = vm.pop();
+    let a = vm.pop();
+    let r = with_host(|h| h.arith(NumOp::Div, &a, &b));
+    finish(vm, r)
 }
 
 /// `{ ...rest } = obj`: a new object of `obj`'s own keys minus the excluded set.
@@ -980,7 +993,16 @@ fn parse_int(args: &[Value]) -> f64 {
 
 fn parse_float(args: &[Value]) -> f64 {
     let s = with_host(|h| h.str_of(&arg0(args)));
-    let t = s.trim();
+    let t = s.trim_start();
+    // `Infinity` / `+Infinity` / `-Infinity` are valid parseFloat prefixes.
+    let inf_body = t.strip_prefix('+').or_else(|| t.strip_prefix('-')).unwrap_or(t);
+    if inf_body.starts_with("Infinity") {
+        return if t.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
     // Longest numeric prefix.
     let mut end = 0;
     let bytes = t.as_bytes();
@@ -1009,7 +1031,16 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
     let r = match fname {
         "floor" => x.floor(),
         "ceil" => x.ceil(),
-        "round" => (x + 0.5).floor(), // JS rounds half up toward +Infinity
+        "round" => {
+            // JS rounds half up toward +Infinity, but preserves the sign of a
+            // zero result: Math.round(-0.5) === -0, Math.round(-0.4) === -0.
+            let r = (x + 0.5).floor();
+            if r == 0.0 && x.is_sign_negative() {
+                -0.0
+            } else {
+                r
+            }
+        }
         "trunc" => x.trunc(),
         "abs" => x.abs(),
         "sign" => {
@@ -1037,7 +1068,25 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
         "atan" => x.atan(),
         "atan2" => x.atan2(arg_num(args, 1)),
         "pow" => x.powf(arg_num(args, 1)),
-        "hypot" => args.iter().map(|a| with_host(|h| h.to_number(a)).powi(2)).sum::<f64>().sqrt(),
+        "hypot" => {
+            // Scale by the largest magnitude before squaring — this avoids the
+            // last-ULP error of the naive `sqrt(Σ xᵢ²)` and matches V8's result.
+            let xs: Vec<f64> = args.iter().map(|a| with_host(|h| h.to_number(a))).collect();
+            let mut max = 0.0f64;
+            for x in &xs {
+                if x.abs() > max {
+                    max = x.abs();
+                }
+            }
+            if xs.iter().any(|x| x.is_infinite()) {
+                f64::INFINITY
+            } else if max == 0.0 || !max.is_finite() {
+                max
+            } else {
+                let s: f64 = xs.iter().map(|x| (x / max) * (x / max)).sum();
+                max * s.sqrt()
+            }
+        }
         "random" => pseudo_random(),
         "max" => {
             if args.is_empty() {
@@ -1836,7 +1885,9 @@ fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
     } else {
         norm(arg_num(args, 1))
     };
-    (lo.min(hi), hi.max(lo))
+    // A start at or past the end (`'World'.slice(2, 1)`) yields the empty range,
+    // never a reversed one: JS `slice` clamps `end` up to `start`.
+    (lo, hi.max(lo))
 }
 
 fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String> {
@@ -1908,11 +1959,20 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             Ok(new_s(chars[a..b].iter().collect()))
         }
         "substr" => {
-            let start = arg_num(&args, 0) as usize;
-            let count = if args.len() >= 2 { arg_num(&args, 1) as usize } else { chars.len() };
+            // A negative start counts from the end: max(len + start, 0).
+            let len = chars.len() as i64;
+            let mut start = arg_num(&args, 0) as i64;
+            if start < 0 {
+                start = (len + start).max(0);
+            }
+            let start = (start as usize).min(chars.len());
+            let count = if args.len() >= 2 {
+                arg_num(&args, 1).max(0.0) as usize
+            } else {
+                chars.len()
+            };
             let end = (start + count).min(chars.len());
-            let start = start.min(chars.len());
-            Ok(new_s(chars[start..end.max(start)].iter().collect()))
+            Ok(new_s(chars[start..end].iter().collect()))
         }
         "repeat" => {
             let n = arg_num(&args, 0);
@@ -1996,7 +2056,7 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
     match name {
         "toFixed" => {
             let digits = arg_num(&args, 0).max(0.0) as usize;
-            Ok(new_s(format!("{n:.digits$}")))
+            Ok(new_s(to_fixed(n, digits)))
         }
         "toString" => {
             let radix = args.first().map(|_| arg_num(&args, 0) as u32).unwrap_or(10);
@@ -2011,11 +2071,157 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
                 Ok(new_s(host::fmt_number(n)))
             } else {
                 let p = arg_num(&args, 0) as usize;
-                Ok(new_s(format!("{n:.*}", p.saturating_sub(1))))
+                Ok(new_s(to_precision(n, p.max(1))))
             }
         }
         "valueOf" => Ok(Value::Float(n)),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
+    }
+}
+
+/// `Number.prototype.toFixed(f)`: fixed-point with `f` fractional digits, rounding
+/// half away from zero on the actual IEEE-754 value (so `(1.005).toFixed(2)` is
+/// `"1.00"` because 1.005 is really 1.00499…). The sign of a negative input is
+/// preserved even when the rounded magnitude is zero: `(-0.4).toFixed(0) === "-0"`.
+///
+/// The rounding is done on the value's EXACT decimal expansion (Rust's fixed
+/// formatting is exact), not on `x * 10^f` — the latter loses precision for large
+/// magnitudes (`(9.999999e20).toFixed(4)` must keep every integer digit).
+fn to_fixed(n: f64, f: usize) -> String {
+    if !n.is_finite() {
+        return host::fmt_number(n);
+    }
+    // Spec: for |x| ≥ 10^21, toFixed falls back to ToString(x).
+    if n.abs() >= 1e21 {
+        return host::fmt_number(n);
+    }
+    let neg = n < 0.0;
+    // Exact decimal with guard digits past the rounding position; then round the
+    // digit string half-away-from-zero (nonneg operand ⇒ round-half-up).
+    let full = format!("{:.*}", f + 25, n.abs());
+    let mut body = round_decimal_string(&full, f);
+    if neg {
+        body.insert(0, '-'); // JS keeps the sign even for "-0" / "-0.00".
+    }
+    body
+}
+
+/// Round the exact decimal string `s` (`"int.frac"`, nonnegative) to `f`
+/// fractional digits, half away from zero, propagating carry across the point.
+fn round_decimal_string(s: &str, f: usize) -> String {
+    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
+    let mut digits: Vec<u8> = int_part.bytes().chain(frac_part.bytes()).map(|b| b - b'0').collect();
+    let point = int_part.len(); // digits before the decimal point
+    let keep = point + f; // number of leading digits to keep
+
+    // Round up if the first dropped digit is ≥ 5 (exact-half ⇒ up).
+    if digits.get(keep).map(|&d| d >= 5).unwrap_or(false) {
+        let mut i = keep;
+        loop {
+            if i == 0 {
+                digits.insert(0, 1);
+                // A new leading digit shifts the decimal point right by one.
+                return assemble_decimal(&digits, point + 1, f);
+            }
+            i -= 1;
+            if digits[i] == 9 {
+                digits[i] = 0;
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    assemble_decimal(&digits, point, f)
+}
+
+/// Reassemble `digits` into `"int.frac"` keeping `f` fractional digits, given that
+/// `point` digits precede the decimal point.
+fn assemble_decimal(digits: &[u8], point: usize, f: usize) -> String {
+    let int_str: String = digits[..point].iter().map(|d| (d + b'0') as char).collect();
+    let int_str = int_str.trim_start_matches('0');
+    let int_str = if int_str.is_empty() { "0" } else { int_str };
+    if f == 0 {
+        return int_str.to_string();
+    }
+    let frac: String = digits[point..point + f].iter().map(|d| (d + b'0') as char).collect();
+    format!("{int_str}.{frac}")
+}
+
+/// `Number.prototype.toPrecision(p)`: `p` significant digits, switching to
+/// exponential form when the decimal exponent `e` satisfies `e < -6` or `e ≥ p`
+/// (ECMAScript Number.prototype.toPrecision). Trailing zeros are significant and
+/// retained (`(100).toPrecision(5) === "100.00"`).
+fn to_precision(n: f64, p: usize) -> String {
+    if !n.is_finite() {
+        return host::fmt_number(n);
+    }
+    if n == 0.0 {
+        return if p == 1 {
+            "0".into()
+        } else {
+            format!("0.{}", "0".repeat(p - 1))
+        };
+    }
+    let neg = n < 0.0;
+    let a = n.abs();
+    // Take the EXACT digits with guard positions past the p-th, then round to p
+    // significant digits half away from zero — Rust's `{:.*e}` rounds half to
+    // EVEN (`(2.5).toPrecision(1)` would give "2"), but JS rounds half up ("3").
+    let sci = format!("{a:.*e}", p - 1 + 25);
+    let (mant, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
+    let mut e: i32 = exp_str.parse().expect("LowerExp exponent is an integer");
+    let all: Vec<u8> = mant.chars().filter(|c| c.is_ascii_digit()).map(|c| c as u8 - b'0').collect();
+    let mut s: String = all[..p].iter().map(|d| (d + b'0') as char).collect();
+    if all.get(p).map(|&d| d >= 5).unwrap_or(false) {
+        // Round the p-digit mantissa up, propagating carry; a carry out of the
+        // leading digit (`9.99 → 10`) bumps the decimal exponent by one.
+        let mut d: Vec<u8> = all[..p].to_vec();
+        let mut i = p;
+        loop {
+            if i == 0 {
+                d.insert(0, 1);
+                d.truncate(p);
+                e += 1;
+                break;
+            }
+            i -= 1;
+            if d[i] == 9 {
+                d[i] = 0;
+            } else {
+                d[i] += 1;
+                break;
+            }
+        }
+        s = d.iter().map(|x| (x + b'0') as char).collect();
+    }
+    let pp = p as i32;
+
+    let body = if e < -6 || e >= pp {
+        // Exponential: first digit, optional '.rest', signed exponent.
+        let sign = if e >= 0 { '+' } else { '-' };
+        let mag = e.abs();
+        if p == 1 {
+            format!("{s}e{sign}{mag}")
+        } else {
+            format!("{}.{}e{sign}{mag}", &s[..1], &s[1..])
+        }
+    } else if e >= 0 {
+        // e in 0..p-1: (e+1) integer digits, then any remaining as fraction.
+        let ip = (e + 1) as usize;
+        if ip == p {
+            s
+        } else {
+            format!("{}.{}", &s[..ip], &s[ip..])
+        }
+    } else {
+        // -6 ≤ e < 0: "0." then (−e−1) zeros then all p digits.
+        format!("0.{}{}", "0".repeat((-e - 1) as usize), s)
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
     }
 }
 

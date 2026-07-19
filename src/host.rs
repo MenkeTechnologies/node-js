@@ -63,6 +63,7 @@ pub mod ops {
     pub const APPLY: u16 = 39; // [callable, argsArray] -> call with spread args
     pub const APPLY_METHOD: u16 = 40; // [recv, name, argsArray] -> method call with spread
     pub const OBJ_REST: u16 = 41; // [obj, excludedKeys] -> object of remaining keys
+    pub const DIV: u16 = 42; // [a, b] -> IEEE `a / b` (JS: x/0 = ±Infinity, 0/0 = NaN)
 }
 
 /// Bitwise/shift op tags carried by `ops::BINOP` (JS ToInt32/ToUint32 rules).
@@ -424,9 +425,53 @@ pub fn fmt_number(f: f64) -> String {
         // Covers -0.0 too: (-0).toString() === "0".
         return "0".into();
     }
-    // Rust's f64 Display is shortest-round-trip, matching ECMAScript for the
-    // magnitudes these programs use; whole numbers print without a fraction.
-    format!("{f}")
+    if f < 0.0 {
+        return format!("-{}", js_number_repr(-f));
+    }
+    js_number_repr(f)
+}
+
+/// ECMAScript `Number::toString` layout for a positive, finite, nonzero value.
+///
+/// Rust's `Display`/`LowerExp` give the shortest round-trip decimal digits, but
+/// NOT JavaScript's exponential-vs-fixed threshold: Rust prints `1e21` as
+/// `1000000000000000000000` and `1e-7` as `0.0000001`, whereas JS prints `1e+21`
+/// and `1e-7`. So we take the shortest digits from `{:e}` and re-lay them out per
+/// the spec (steps 5–10 of Number::toString): `k` significant digits `s` with
+/// decimal exponent `n` (value = s × 10^(n−k)); exponential form only when
+/// `n > 21` or `n ≤ -6`.
+fn js_number_repr(a: f64) -> String {
+    // `{:e}` yields `d[.ddd]e<exp>` with the mantissa in [1, 10) and shortest
+    // round-trip digits. Split it into the digit string `s` and exponent `E`.
+    let sci = format!("{a:e}");
+    let (mant, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
+    let e: i32 = exp_str.parse().expect("LowerExp exponent is an integer");
+    let s: String = mant.chars().filter(|c| *c != '.').collect();
+    let k = s.len() as i32; // number of significant digits
+    let n = e + 1; // value = s × 10^(n−k), 10^(k−1) ≤ s < 10^k
+
+    if k <= n && n <= 21 {
+        // Integer with trailing zeros: all digits, then n−k zeros.
+        let mut out = s;
+        out.push_str(&"0".repeat((n - k) as usize));
+        out
+    } else if 0 < n && n <= 21 {
+        // Decimal point inside the digit run: n digits, '.', the rest.
+        format!("{}.{}", &s[..n as usize], &s[n as usize..])
+    } else if -6 < n && n <= 0 {
+        // Leading "0." then (−n) zeros then all digits.
+        format!("0.{}{}", "0".repeat((-n) as usize), s)
+    } else {
+        // Exponential form. Exponent digit is n−1, always signed.
+        let exp = n - 1;
+        let sign = if exp >= 0 { '+' } else { '-' };
+        let mag = exp.abs();
+        if k == 1 {
+            format!("{s}e{sign}{mag}")
+        } else {
+            format!("{}.{}e{sign}{mag}", &s[..1], &s[1..])
+        }
+    }
 }
 
 impl JsHost {
@@ -630,40 +675,71 @@ impl JsHost {
         matches!(v, Value::Undef) || self.is_null(v)
     }
 
-    /// Loose equality (`==`) with the ECMAScript abstract-equality coercions.
+    /// The ECMAScript "loose type" of `v` for the `==` algorithm: `"number"`,
+    /// `"string"` (primitive or heap string), `"boolean"`, `"undefined"`,
+    /// `"null"`, or `"object"` (array / plain object / function).
+    fn js_type(&self, v: &Value) -> &'static str {
+        match v {
+            Value::Undef => "undefined",
+            Value::Bool(_) => "boolean",
+            Value::Int(_) | Value::Float(_) => "number",
+            Value::Str(_) => "string",
+            Value::Obj(_) => match self.get(v) {
+                Some(JsObj::Str(_)) => "string",
+                Some(JsObj::Null) => "null",
+                _ => "object",
+            },
+            _ => "object",
+        }
+    }
+
+    /// Loose equality (`==`) following the ECMAScript Abstract Equality Comparison.
+    /// Objects reduce via `ToPrimitive` (which for our heap objects is always their
+    /// string `toString`), so `[0] == "0"` is `true` (string compare of `"0"`) but
+    /// `[0] == ""` is `false` — never a number coercion of the object.
     pub fn loose_eq(&self, a: &Value, b: &Value) -> bool {
+        // Same type: identical to `===` (number==number, string==string, etc.).
         if self.strict_eq(a, b) {
             return true;
         }
-        // null == undefined (and vice-versa), but nothing else.
-        let an = self.is_nullish(a);
-        let bn = self.is_nullish(b);
-        if an || bn {
-            return an && bn;
+        let ta = self.js_type(a);
+        let tb = self.js_type(b);
+        // null and undefined are loosely equal only to each other.
+        if self.is_nullish(a) || self.is_nullish(b) {
+            return self.is_nullish(a) && self.is_nullish(b);
         }
-        let a_str = self.as_str(a);
-        let b_str = self.as_str(b);
-        let a_num = matches!(a, Value::Int(_) | Value::Float(_));
-        let b_num = matches!(b, Value::Int(_) | Value::Float(_));
-        let a_bool = matches!(a, Value::Bool(_));
-        let b_bool = matches!(b, Value::Bool(_));
-        // number == string / bool: coerce the other to number.
-        if a_num && (b_str.is_some() || b_bool) {
+        if ta == tb {
+            // Same type but not strict-equal (and not nullish) ⇒ not equal.
+            return false;
+        }
+        // number ⇄ string: compare as numbers.
+        if (ta == "number" && tb == "string") || (ta == "string" && tb == "number") {
             return self.to_number(a) == self.to_number(b);
         }
-        if b_num && (a_str.is_some() || a_bool) {
-            return self.to_number(a) == self.to_number(b);
+        // boolean side coerces to number, then recompares.
+        if ta == "boolean" {
+            return self.loose_eq(&Value::Float(self.to_number(a)), b);
         }
-        if a_bool || b_bool {
-            return self.to_number(a) == self.to_number(b);
+        if tb == "boolean" {
+            return self.loose_eq(a, &Value::Float(self.to_number(b)));
         }
-        // string == string handled by strict_eq already; object == primitive
-        // would need ToPrimitive — coerce object to number as a reasonable fallback.
-        if (a_str.is_some() || a_num) && matches!(b, Value::Obj(_)) {
-            return self.to_number(a) == self.to_number(b);
+        // object ⇄ (number|string): ToPrimitive the object (→ its string form),
+        // then recompare as string==string or number==string.
+        if ta == "object" && (tb == "number" || tb == "string") {
+            let pa = self.str_of(a);
+            return if tb == "string" {
+                pa == self.str_of(b)
+            } else {
+                str_to_number(&pa) == self.to_number(b)
+            };
         }
-        if (b_str.is_some() || b_num) && matches!(a, Value::Obj(_)) {
-            return self.to_number(a) == self.to_number(b);
+        if tb == "object" && (ta == "number" || ta == "string") {
+            let pb = self.str_of(b);
+            return if ta == "string" {
+                self.str_of(a) == pb
+            } else {
+                self.to_number(a) == str_to_number(&pb)
+            };
         }
         false
     }
@@ -697,9 +773,17 @@ impl JsHost {
         }
     }
 
-    /// Whether `v` should drive `+` toward string concatenation.
+    /// Whether `v`'s primitive (`ToPrimitive` with the default hint) is a string,
+    /// which drives `+` toward concatenation. Primitive strings qualify, and so
+    /// do heap objects whose default `ToPrimitive` is their (string) `toString`:
+    /// arrays (`[1,2,3]+3 → "1,2,33"`), plain objects (`{}+[] → "[object Object]"`),
+    /// and functions. `null`/`undefined`/`boolean`/`number` do not.
     fn prefers_string(&self, v: &Value) -> bool {
-        matches!(v, Value::Str(_)) || matches!(self.get(v), Some(JsObj::Str(_)))
+        match v {
+            Value::Str(_) => true,
+            Value::Obj(_) => !matches!(self.get(v), Some(JsObj::Null) | None),
+            _ => false,
+        }
     }
 
     /// Relational comparison (`< <= > >=`) with JS coercion: string/string is

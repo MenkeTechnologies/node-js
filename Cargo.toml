@@ -22,6 +22,25 @@ crate-type = ["rlib", "staticlib"]
 name = "node"
 path = "src/main.rs"
 
+# Differential parity harness: runs the corpus through node-js and the reference
+# `node`, diffing stdout. Development tool — needs `node` on PATH, so CI never
+# runs it; its frozen outputs live in tests/data/parity_expected.txt, which
+# tests/parity.rs replays with no `node` installed.
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
+
+# Differential parity FUZZER: generates thousands of deterministic-output JS
+# snippets (biased toward float repr / exponential-notation threshold, ToInt32
+# bitwise wrap, the `==` coercion matrix, `+` coercion, string/array methods,
+# toFixed/toPrecision rounding, JSON round-trips) and diffs `node -e` against the
+# reference `node -e`, delta-debugging every divergence to a minimal repro.
+# Subprocess-only (never links the lib); std-only (no `rand`). Dev tool — needs
+# `node` on PATH, so CI never runs it.
+[[bin]]
+name = "parity-fuzz"
+path = "src/bin/parity_fuzz.rs"
+
 [dependencies]
 # JavaScript executes on fusevm. node-js is a pure frontend: it lowers JS to
 # fusevm bytecode (src/compiler.rs) and hosts the JS object heap (src/host.rs,

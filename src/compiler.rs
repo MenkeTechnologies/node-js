@@ -925,7 +925,15 @@ impl Compiler {
             BinOp::Add => native!(Op::Add),
             BinOp::Sub => native!(Op::Sub),
             BinOp::Mul => native!(Op::Mul),
-            BinOp::Div => native!(Op::Div),
+            BinOp::Div => {
+                // NOT native `Op::Div`: fusevm returns `Undef` for a zero divisor,
+                // but JS needs `x/0 === ±Infinity` / `0/0 === NaN`, so `/` is a
+                // builtin (fusevm's own documented pattern for non-default `/`).
+                self.compile_expr(b, l)?;
+                self.compile_expr(b, r)?;
+                b.emit(Op::CallBuiltin(ops::DIV, 2), 0);
+                return Ok(());
+            }
             BinOp::Mod => native!(Op::Mod),
             BinOp::Pow => native!(Op::Pow),
             BinOp::Lt => native!(Op::NumLt),

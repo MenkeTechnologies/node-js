@@ -1,0 +1,32 @@
+==== arrays.js ====
+[ 25, 9, 1, 81 ]
+28
+[ 1, 2, 3, 5, 8, 9 ]
+[ 3, 8, 1 ] 2 true
+5 3 [ 8, 1, 9, 2 ]
+==== control.js ====
+total 12
+negative zero positive
+caught: failure
+done
+==== fib.js ====
+fib: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
+1 2 3
+==== hello.js ====
+hello, world
+7 256 2.5 2
+template: WORLD has 5 letters
+42 number 101010 3.14
+==== objects.js ====
+Ada { age: 36, roles: [ 'admin', 'dev' ] }
+[ 'name', 'age', 'roles', 'active' ] [ 36, [ 'admin', 'dev' ] ]
+{"name":"Ada","age":36,"roles":["admin","dev"],"active":true}
+1 [ 2, 3 ]
+==== wordcount.js ====
+the: 3
+fox: 2
+quick: 1
+brown: 1
+lazy: 1
+dog: 1
+max frequency: 3
