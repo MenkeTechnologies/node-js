@@ -1,0 +1,39 @@
+[package]
+name = "node-js"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "JavaScript as a fusevm frontend: a lexer/parser and compiler to fusevm::Chunk on a JsHost object heap, with no bespoke VM or JIT"
+license = "MIT"
+publish = false
+
+# node-js is a standalone crate, not a workspace member. An explicit empty
+# `[workspace]` stops cargo walking up to the MenkeTechnologiesMeta parent.
+[workspace]
+
+[lib]
+name = "nodejs"
+path = "src/lib.rs"
+# staticlib so an AOT object can be linked against the nodejs runtime into a
+# standalone native executable (mirrors pythonrs).
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "node"
+path = "src/main.rs"
+
+[dependencies]
+# JavaScript executes on fusevm. node-js is a pure frontend: it lowers JS to
+# fusevm bytecode (src/compiler.rs) and hosts the JS object heap (src/host.rs,
+# reached from fusevm's builtin dispatch + numeric hook). Object/str/array cells
+# ride through the VM as `Value::Obj(u32)` handles into that heap.
+#
+# `jit-disk-cache` turns on fusevm's Cranelift JIT *and* its persistent on-disk
+# cache of compiled native code; `aot` enables the ahead-of-time object emitter.
+fusevm = { version = "0.14.10", features = ["jit", "jit-disk-cache", "aot"] }
+
+clap = { version = "4.5", features = ["derive", "cargo"] }
+thiserror = "2.0"
+rustc-hash = "2.1"
+# JS objects preserve property insertion order (observable in iteration / repr).
+indexmap = "2"
