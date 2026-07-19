@@ -1,0 +1,10 @@
+#compdef node
+# zsh completion for node-js `node`.
+_node() {
+  _arguments -s \
+    '(-e --eval)'{-e,--eval}'[evaluate a one-liner instead of a file]:source' \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '(-V --version)'{-V,--version}'[show version]' \
+    '*:JavaScript file:_files -g "*.js"'
+}
+_node "$@"

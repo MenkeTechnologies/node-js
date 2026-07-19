@@ -1,0 +1,75 @@
+.TH NODE 1 "2026-07-19" "node-js 0.1.0" "User Commands"
+.SH NAME
+node \- JavaScript on fusevm, a compiled JS runtime (bytecode VM + Cranelift JIT)
+.SH SYNOPSIS
+.B node
+[\fIOPTIONS\fR] [\fIFILE\fR] [\fIARGS\fR...]
+.br
+.B node
+\fB\-e\fR \fISRC\fR [\fIARGS\fR...]
+.SH DESCRIPTION
+.B node-js
+lexes and parses JavaScript and lowers it to
+.B fusevm
+bytecode executed on a Cranelift JIT over a JsHost object heap.
+There is no bespoke VM or JIT; execution and codegen live in fusevm.
+Object, string, and array cells ride through the VM as handles into that heap.
+.PP
+With no
+.B \-e
+and no
+.I FILE
+argument,
+.B node
+reads a script from standard input and runs it.
+.SH OPTIONS
+.TP
+.B \-e \fISRC\fR, \-\-eval \fISRC\fR
+Evaluate a one\-liner instead of a file.
+.TP
+.B \-h, \-\-help
+Print help and exit.
+.TP
+.B \-V, \-\-version
+Print version and exit.
+.SH ARGUMENTS
+.TP
+.I FILE
+The
+.I .js
+script to run. Omit it to read from standard input, or when
+.B \-e
+is given.
+.TP
+.I ARGS
+Trailing arguments passed through to the JavaScript program.
+.SH EXIT STATUS
+Exits 0 on success. On error, a terse
+.RB \(dq node:\ <reason> \(dq
+message is written to standard error and the exit status is 1.
+.SH EXAMPLES
+Evaluate a one\-liner:
+.PP
+.RS
+.EX
+node \-e 'console.log(1 + 1)'
+.EE
+.RE
+.PP
+Run a script file:
+.PP
+.RS
+.EX
+node app.js
+.EE
+.RE
+.PP
+Pipe a script over standard input:
+.PP
+.RS
+.EX
+echo 'console.log("hi")' | node
+.EE
+.RE
+.SH SEE ALSO
+Project home: <https://github.com/MenkeTechnologies/node-js>
