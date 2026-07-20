@@ -1262,6 +1262,11 @@ impl JsHost {
                     if items.is_empty() {
                         return "[]".into();
                     }
+                    // Node's default inspect depth is 2 (root = depth 0); deeper
+                    // nesting collapses to `[Array]`. indent grows by 2 per level.
+                    if indent > 2 * inspect_max_depth() {
+                        return "[Array]".into();
+                    }
                     let inner: Vec<String> =
                         items.iter().map(|x| self.inspect_lvl(x, indent + 2)).collect();
                     self.render_array(&inner, items, indent)
@@ -1278,6 +1283,15 @@ impl JsHost {
                         props.iter().filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#')).collect();
                     if shown.is_empty() {
                         return format!("{prefix}{{}}");
+                    }
+                    // Depth limit (Node default 2): deeper objects collapse to
+                    // `[Object]` (or `[ClassName]` for a named instance).
+                    if indent > 2 * inspect_max_depth() {
+                        return if prefix.is_empty() {
+                            "[Object]".into()
+                        } else {
+                            format!("[{}]", prefix.trim_end())
+                        };
                     }
                     let inner: Vec<String> = shown
                         .iter()
@@ -1783,6 +1797,21 @@ fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
 /// JS `%` remainder (sign follows the dividend; matches `f64::rem`).
 fn js_mod(a: f64, b: f64) -> f64 {
     a % b
+}
+
+thread_local! {
+    /// The active `util.inspect` `depth` (nesting levels shown before collapsing
+    /// to `[Object]`/`[Array]`). Node's default is 2; `util.inspect(v,{depth:N})`
+    /// overrides it for one call, `console.log`/`util.format` use the default.
+    static INSPECT_MAX_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
+}
+
+/// Set the `util.inspect` depth for the next render (restore to 2 after).
+pub fn set_inspect_max_depth(d: usize) {
+    INSPECT_MAX_DEPTH.with(|c| c.set(d));
+}
+fn inspect_max_depth() -> usize {
+    INSPECT_MAX_DEPTH.with(|c| c.get())
 }
 
 fn to_int32(f: f64) -> i32 {

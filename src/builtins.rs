@@ -1969,7 +1969,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             h.new_str(s)
         })),
         "String.raw" => string_raw(&args),
-        "Array" | "Array.of" => Ok(with_host(|h| h.new_array(args))),
+        // `Array(5)` === `new Array(5)` (length-5 empty), but `Array.of(5)` is `[5]`.
+        "Array" => construct_builtin("Array", args),
+        "Array.of" => Ok(with_host(|h| h.new_array(args))),
         "Array.isArray" => Ok(Value::Bool(matches!(with_host(|h| h.get(&arg0(&args)).cloned()), Some(JsObj::Array(_))))),
         "Array.from" => array_from(args),
         "Object" => Ok(object_call(args)),

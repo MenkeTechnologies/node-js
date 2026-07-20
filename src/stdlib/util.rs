@@ -38,10 +38,28 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let s = format(args.get(1..).unwrap_or(&[]));
             Ok(with_host(|h| h.new_str(s)))
         }
-        "inspect" => Ok(with_host(|h| {
-            let s = h.inspect(&args.first().cloned().unwrap_or(Value::Undef));
-            h.new_str(s)
-        })),
+        "inspect" => {
+            // Honor an options `{ depth: N | null }` (default 2; null = unlimited).
+            let depth = match args.get(1) {
+                Some(opts) => match crate::builtins::get_property(opts, "depth") {
+                    Ok(Value::Undef) => 2,
+                    Ok(v) if with_host(|h| h.is_null(&v)) => usize::MAX,
+                    Ok(v) => {
+                        let n = with_host(|h| h.to_number(&v));
+                        if n.is_finite() && n >= 0.0 { n as usize } else { usize::MAX }
+                    }
+                    Err(_) => 2,
+                },
+                None => 2,
+            };
+            crate::host::set_inspect_max_depth(depth);
+            let out = with_host(|h| {
+                let s = h.inspect(&args.first().cloned().unwrap_or(Value::Undef));
+                h.new_str(s)
+            });
+            crate::host::set_inspect_max_depth(2);
+            Ok(out)
+        }
         // `deprecate(fn, msg)`: return a callable that behaves like `fn`. The
         // house rule is no deprecation nags, so no warning is emitted — the
         // original function is handed back unchanged.
