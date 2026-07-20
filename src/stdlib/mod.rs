@@ -37,6 +37,16 @@ pub mod tty;
 pub mod url;
 pub mod util;
 pub mod zlib;
+pub mod async_hooks;
+pub mod child_process;
+pub mod console;
+pub mod diagnostics_channel;
+pub mod dns;
+pub mod perf_hooks;
+pub mod punycode;
+pub mod timers;
+pub mod util_types;
+pub mod v8;
 
 /// Canonical namespace name a `require(spec)` resolves to (after stripping an
 /// optional `node:` prefix), or `None` for an unsupported module.
@@ -61,6 +71,17 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "string_decoder" => Some("string_decoder"),
         "zlib" => Some("zlib"),
         "querystring" => Some("querystring"),
+        "console" => Some("console"),
+        "child_process" => Some("child_process"),
+        "dns" => Some("dns"),
+        "punycode" => Some("punycode"),
+        "timers" => Some("timers"),
+        "timers/promises" => Some("timers/promises"),
+        "perf_hooks" => Some("perf_hooks"),
+        "async_hooks" => Some("async_hooks"),
+        "util/types" => Some("util/types"),
+        "diagnostics_channel" => Some("diagnostics_channel"),
+        "v8" => Some("v8"),
         _ => None,
     }
 }
@@ -91,6 +112,17 @@ pub fn is_method(qualified: &str) -> bool {
         "tty" => tty::METHODS.contains(&m),
         "process" => process::METHODS.contains(&m),
         "EventEmitter" => m == "EventEmitter",
+        "console" => console::METHODS.contains(&m),
+        "child_process" => child_process::METHODS.contains(&m),
+        "dns" => dns::METHODS.contains(&m),
+        "punycode" => punycode::METHODS.contains(&m),
+        "timers" => timers::METHODS.contains(&m),
+        "timers/promises" => timers::PROMISES_METHODS.contains(&m),
+        "perf_hooks" | "performance" => perf_hooks::METHODS.contains(&m),
+        "async_hooks" => async_hooks::METHODS.contains(&m),
+        "util/types" => util_types::METHODS.contains(&m),
+        "diagnostics_channel" => diagnostics_channel::METHODS.contains(&m),
+        "v8" => v8::METHODS.contains(&m),
         _ => false,
     }
 }
@@ -125,6 +157,17 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "EventEmitter" if m == "EventEmitter" => {
             Ok(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
         }
+        "console" => console::call(m, args)?,
+        "child_process" => child_process::call(m, args)?,
+        "dns" => dns::call(m, args)?,
+        "punycode" => punycode::call(m, args)?,
+        "timers" => timers::call(m, args)?,
+        "timers/promises" => timers::promises_call(m, args)?,
+        "perf_hooks" | "performance" => perf_hooks::call(m, args)?,
+        "async_hooks" => async_hooks::call(m, args)?,
+        "util/types" => util_types::call(m, args)?,
+        "diagnostics_channel" => diagnostics_channel::call(m, args)?,
+        "v8" => v8::call(m, args)?,
         _ => return None,
     })
 }
@@ -148,6 +191,15 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "EventEmitter" if name == "EventEmitter" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
         }
+        "perf_hooks" | "performance" => perf_hooks::constant(name),
+        "dns" => dns::constant(name),
+        "punycode" => punycode::constant(name),
+        "async_hooks" if matches!(name, "AsyncLocalStorage" | "AsyncResource") => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
+        }
+        "util" if name == "types" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("util/types".into()))))
+        }
         _ => None,
     }
 }
@@ -167,6 +219,7 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "TextDecoder" => Some(typedarray::construct_text_decoder(args)),
         n if typedarray::is_ctor(n) => Some(typedarray::construct(n, args)),
         n if stream::is_class(n) => Some(Ok(stream::construct(n))),
+        "AsyncLocalStorage" | "AsyncResource" => async_hooks::construct(name, args),
         _ => None,
     }
 }
@@ -210,6 +263,9 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
             &["read", "write", "end", "pipe", "pause", "resume", "setEncoding", "destroy", "push"]
         }
         "URL" => &["toString", "toJSON"],
+        "AsyncLocalStorage" => async_hooks::ALS_METHODS,
+        "AsyncHook" => async_hooks::HOOK_METHODS,
+        "Channel" => &["subscribe", "unsubscribe", "publish"],
         _ => &[],
     };
     let is_emitter = matches!(
@@ -239,6 +295,8 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "Server" | "Socket" => net::instance_call(tag, recv, method, args),
         "IncomingMessage" | "ServerResponse" => http::instance_call(tag, recv, method, args),
         "Readable" | "Writable" | "Duplex" | "Transform" => stream::instance_call(tag, recv, method, args),
+        "AsyncLocalStorage" | "AsyncHook" => async_hooks::instance_call(tag, recv, method, args),
+        "Channel" => diagnostics_channel::instance_call(recv, method, &args),
         _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
     }
 }
