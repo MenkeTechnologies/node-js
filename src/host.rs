@@ -2043,9 +2043,21 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
     // never routes back through a BoundMethod and recurses.
     if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Object(_))) {
         // A native stdlib instance (`Buffer`/crypto `Hash`/`EventEmitter`/`URL`/
-        // fs `Stats`) carries a hidden `@@native` tag; route its methods to the
-        // stdlib instance dispatcher before generic object resolution.
+        // fs `Stats`/http `ServerResponse`…) carries a hidden `@@native` tag.
+        // A user-added or reparented-prototype method takes precedence over the
+        // native dispatcher — matching JS resolution order (own → prototype
+        // chain). This is what lets Express work: it does
+        // `Object.setPrototypeOf(res, app.response)` and calls `res.send(...)`,
+        // where `send` is a plain function on the reparented prototype. Native
+        // instance methods (`res.end`/`write`/…) are NOT stored as plain
+        // function properties, so `lookup_chain` misses them and we fall through
+        // to `instance_call` for the real native behavior.
         if let Some(tag) = crate::stdlib::native_tag(recv) {
+            if let Some(f) = with_host(|h| lookup_chain(h, recv, name)) {
+                if with_host(|h| is_callable(h, &f)) {
+                    return invoke(&f, args, Some(recv.clone()));
+                }
+            }
             return crate::stdlib::instance_call(&tag, recv, name, args);
         }
         if let Some((Some(getter), _)) = with_host(|h| lookup_accessor(h, recv, name)) {
