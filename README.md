@@ -130,7 +130,9 @@ rest parameters, labeled statements, `RegExp`, `Map` / `Set` / `Promise`, and th
 Node.js standard library (`fs`, `path`, `process`, `require`, event loop). The
 crate is built as a `staticlib` with fusevm's `aot` and `jit-disk-cache` features
 enabled (mirroring `pythonrs`), but **AOT native-executable emission and the
-persistent bytecode cache are not yet exposed on the CLI**. No LSP or DAP yet.
+persistent bytecode cache are not yet exposed on the CLI**. An LSP server
+(`--lsp`) and a DAP debug adapter (`--dap`) — source-line and function
+breakpoints, stepping, call stack, locals, and expression `evaluate` — are wired.
 
 ## [0x05] PARITY HARNESS & FUZZER
 
