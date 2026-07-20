@@ -99,5 +99,16 @@ md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
 
+# Arbitrary-precision integers backing JS `BigInt` (the `10n` literal + bigint
+# arithmetic). Same crates/versions pythonrs uses for its bignum path.
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+
+# JS regular-expression literals (`/pat/flags`) + `RegExp`. Rust `regex` is NOT a
+# superset of JS regex (no backreferences/lookaround) — node-js translates the
+# overlapping subset and rejects the rest at RegExp-construction time. See BUGS.md.
+regex = "1"
+
 [dev-dependencies]
 tempfile = "3"

@@ -13,11 +13,20 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Num(f64),
+    /// A `BigInt` literal (`10n`, `0xffn`, …) carried as its canonical decimal
+    /// digit string; the compiler lowers it to a heap `JsObj::BigInt`.
+    BigInt(String),
+    /// A regular-expression literal (`/pat/flags`): `(pattern, flags)`. The lexer
+    /// only recognizes it in expression-start position (see `regex_allowed`).
+    Regex(String, String),
     Str(String),
-    /// A template literal: `quasis.len() == exprs.len() + 1`. Each `exprs`
-    /// entry is the raw source text between `${` and its matching `}`.
+    /// A template literal: `quasis.len() == exprs.len() + 1`. `quasis` are the
+    /// cooked (escape-decoded) strings, `raws` the corresponding raw source
+    /// (undecoded, for tagged templates / `String.raw`), and each `exprs` entry is
+    /// the raw source text between `${` and its matching `}`.
     Template {
         quasis: Vec<String>,
+        raws: Vec<String>,
         exprs: Vec<String>,
     },
     Ident(String),
@@ -125,10 +134,91 @@ impl Lexer {
                         self.bump();
                     }
                 }
+                // A `/` in expression-start position is a regex literal, not the
+                // division operator (comments were already ruled out above).
+                Some('/') if self.regex_allowed() => self.scan_regex()?,
                 Some(_) => self.scan_token()?,
             }
         }
         self.push(Tok::Eof);
+        Ok(())
+    }
+
+    /// Whether a `/` here begins a regex literal (expression-start position)
+    /// rather than the division operator. Decided by the previous significant
+    /// token: after a value (identifier/number/string/`)`/`]`) `/` is division;
+    /// after an operator, `(`, `,`, `{`, `[`, `;`, `:`, `return`, etc. it opens a
+    /// regex. This is the standard "regex-or-divide" ASI-adjacent heuristic.
+    fn regex_allowed(&self) -> bool {
+        match self.out.last().map(|t| &t.tok) {
+            None => true, // program start
+            Some(Tok::Num(_)) | Some(Tok::BigInt(_)) | Some(Tok::Str(_))
+            | Some(Tok::Template { .. }) | Some(Tok::Regex(..)) => false,
+            Some(Tok::Ident(s)) => matches!(
+                s.as_str(),
+                // Keywords that precede an expression → regex; a plain variable
+                // name (or a value keyword like `this`/`true`) → division.
+                "return" | "typeof" | "instanceof" | "in" | "of" | "new" | "delete"
+                    | "void" | "do" | "else" | "case" | "throw" | "yield" | "await"
+            ),
+            Some(Tok::Punct(p)) => !matches!(p.as_str(), ")" | "]" | "}" | "++" | "--"),
+            Some(Tok::Eof) => true,
+        }
+    }
+
+    /// Scan a `/pat/flags` regex literal. The opening `/` is current. The body
+    /// runs to the next unescaped `/` that is not inside a `[...]` character
+    /// class; trailing ASCII-letter flags follow.
+    fn scan_regex(&mut self) -> Result<(), String> {
+        self.bump(); // opening slash
+        let mut pat = String::new();
+        let mut in_class = false;
+        loop {
+            match self.peek() {
+                None | Some('\n') => {
+                    return Err(format!(
+                        "SyntaxError: unterminated regular expression (line {})",
+                        self.line
+                    ))
+                }
+                Some('\\') => {
+                    // Keep the escape verbatim (the translator interprets it).
+                    pat.push('\\');
+                    self.bump();
+                    if let Some(c) = self.bump() {
+                        pat.push(c);
+                    }
+                }
+                Some('[') => {
+                    in_class = true;
+                    pat.push('[');
+                    self.bump();
+                }
+                Some(']') => {
+                    in_class = false;
+                    pat.push(']');
+                    self.bump();
+                }
+                Some('/') if !in_class => {
+                    self.bump();
+                    break;
+                }
+                Some(c) => {
+                    pat.push(c);
+                    self.bump();
+                }
+            }
+        }
+        let mut flags = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphabetic() {
+                flags.push(c);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.push(Tok::Regex(pat, flags));
         Ok(())
     }
 
@@ -211,8 +301,10 @@ impl Lexer {
     fn scan_template(&mut self) -> Result<(), String> {
         self.bump(); // opening backtick
         let mut quasis = Vec::new();
+        let mut raws = Vec::new();
         let mut exprs = Vec::new();
         let mut cur = String::new();
+        let mut cur_raw = String::new();
         loop {
             match self.peek() {
                 None => return Err(format!("SyntaxError: unterminated template (line {})", self.line)),
@@ -221,15 +313,22 @@ impl Lexer {
                     break;
                 }
                 Some('\\') => {
+                    // Cooked decodes the escape; raw keeps the exact source span it
+                    // spans (including any hex/unicode digits push_escape consumes).
+                    let start = self.pos;
                     self.bump();
                     if let Some(e) = self.bump() {
                         push_escape(&mut cur, e, self);
+                    }
+                    for c in &self.src[start..self.pos] {
+                        cur_raw.push(*c);
                     }
                 }
                 Some('$') if self.peek_at(1) == Some('{') => {
                     self.bump();
                     self.bump();
                     quasis.push(std::mem::take(&mut cur));
+                    raws.push(std::mem::take(&mut cur_raw));
                     // Capture raw source until the matching `}` (brace-balanced,
                     // skipping strings).
                     let mut depth = 1;
@@ -281,12 +380,14 @@ impl Lexer {
                 }
                 Some(c) => {
                     cur.push(c);
+                    cur_raw.push(c);
                     self.bump();
                 }
             }
         }
         quasis.push(cur);
-        self.push(Tok::Template { quasis, exprs });
+        raws.push(cur_raw);
+        self.push(Tok::Template { quasis, raws, exprs });
         Ok(())
     }
 
@@ -312,6 +413,16 @@ impl Lexer {
                         } else {
                             break;
                         }
+                    }
+                    // `0x..n` / `0o..n` / `0b..n` BigInt literal: the digits carry
+                    // arbitrary precision, so parse them as a bignum (radix-aware)
+                    // rather than through `i64`.
+                    if self.peek() == Some('n') {
+                        self.pos += 1;
+                        let big = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
+                            .ok_or_else(|| format!("SyntaxError: bad bigint (line {})", self.line))?;
+                        self.push(Tok::BigInt(big.to_string()));
+                        return Ok(());
                     }
                     let n = i64::from_str_radix(&digits, radix)
                         .map_err(|_| format!("SyntaxError: bad number (line {})", self.line))?;
@@ -344,6 +455,14 @@ impl Lexer {
                 }
                 _ => break,
             }
+        }
+        // Decimal `BigInt` literal (`123n`): only integer digit runs may carry the
+        // `n` suffix (a `.`/`e` makes it an ordinary number, and `1.5n` is a
+        // SyntaxError in JS — we leave the `n` as a stray identifier so it fails).
+        if self.peek() == Some('n') && !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+            self.push(Tok::BigInt(s));
+            return Ok(());
         }
         let v: f64 = s
             .parse()

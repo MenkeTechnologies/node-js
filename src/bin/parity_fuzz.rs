@@ -23,14 +23,18 @@
 //! implements. The implemented surface now includes ES6 `class`
 //! (fields/methods/inheritance/`super`/statics/getters/setters), the prototype
 //! chain + `instanceof`, generators (`function*`/`yield`/`yield*`),
-//! `Map`/`Set`/`WeakMap`/`WeakSet`, `Symbol`/`Symbol.iterator`, and
-//! Promises + `async`/`await` + the microtask/timer event loop — all exercised by
-//! the `class`, `generator`, `mapset`, `proto`, and `async` modes. Still NOT
-//! emitted (genuine gaps, see BUGS.md): regex literals, `BigInt` (`10n`), and the
-//! `util.inspect` multi-line array-grouping regime (>6 elements). The async mode
-//! emits ONLY deterministically-schedulable output (fixed microtask/timer
-//! ordering, resolved-value chains) — never wall-clock- or identity-dependent
-//! results.
+//! `Map`/`Set`/`WeakMap`/`WeakSet`, `Symbol`/`Symbol.iterator`, Promises +
+//! `async`/`await` + the microtask/timer event loop, `BigInt` (`10n` arithmetic,
+//! mixing-`TypeError`, comparisons, formatting), and regular expressions (the
+//! Rust-`regex`-supported subset: char classes, quantifiers, anchors, groups,
+//! alternation, `\d\w\s`, flags `g`/`i`/`m` — NOT backreferences/lookaround) —
+//! all exercised by the `class`, `generator`, `mapset`, `proto`, `async`,
+//! `bigint`, and `regex` modes. The `regex` mode deliberately emits ONLY patterns
+//! Rust `regex` can represent (see BUGS.md for the exact subset and divergences);
+//! it never generates backreferences or lookaround, which node-js honestly
+//! rejects rather than mis-executes. The async mode emits ONLY
+//! deterministically-schedulable output (fixed microtask/timer ordering,
+//! resolved-value chains) — never wall-clock- or identity-dependent results.
 //!
 //! Subprocess-only: this binary never links the nodejs library — it compares two
 //! `node` processes, exactly as a user would observe them.
@@ -874,6 +878,77 @@ fn gen_async(seed: u64) -> Vec<String> {
     }
 }
 
+/// BigInt — `10n` literal arithmetic (`+ - * / % **`, truncating division/sign),
+/// bitwise, comparisons across BigInt/Number, the mix-`TypeError`, `typeof`,
+/// formatting (`String`/`toString`/`toString(radix)`), and the `BigInt(...)`
+/// constructor. Every probe prints a deterministic value or a caught error message.
+fn gen_bigint(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let bigs = &["0n", "1n", "2n", "3n", "7n", "10n", "-3n", "-7n", "42n", "100n", "255n", "1000n"];
+    let a = pick(r, bigs);
+    let b = pick(r, bigs);
+    let nb = pick(r, &["1", "2", "10", "-3", "0", "100"]); // a Number, for the mix path
+    let e = match r.below(14) {
+        0 => format!("{a} + {b}"),
+        1 => format!("{a} - {b}"),
+        2 => format!("{a} * {b}"),
+        // Division/modulo guard against a zero divisor (a deterministic RangeError
+        // otherwise, which is fine, but keep the arithmetic clean).
+        3 => format!("({b} === 0n) ? 0n : {a} / {b}"),
+        4 => format!("({b} === 0n) ? 0n : {a} % {b}"),
+        // Parenthesize the base: JS makes `-x ** y` a SyntaxError (unary minus
+        // directly before `**`), so the base is wrapped — same as the `arith` mode.
+        5 => format!("({a}) ** {}", pick(r, &["0n", "1n", "2n", "3n"])),
+        6 => format!("{a} < {b}, {a} > {b}, {a} <= {b}, {a} >= {b}"),
+        7 => format!("{a} == {nb}, {a} === {nb}, {a} != {nb}"),
+        8 => format!("typeof {a}, String({a}), {a}.toString()"),
+        9 => format!("{a}.toString({})", 2 + r.below(35)),
+        10 => format!("{a} & {b}, {a} | {b}, {a} ^ {b}, ~{a}"),
+        // The BigInt/Number mix is a hard TypeError — verify the exact message.
+        11 => format!("(() => {{ try {{ return {a} + {nb}; }} catch (e) {{ return e.message; }} }})()"),
+        12 => format!("BigInt({}), BigInt('{}'), BigInt(true)", pick(r, &["5", "42", "-7", "0"]), pick(r, &["10", "255", "0x1f"])),
+        _ => format!("{a} + {b} * {}", pick(r, bigs)),
+    };
+    vec![format!("console.log({e})")]
+}
+
+/// Regex — ONLY the Rust-`regex`-supported subset (char classes, quantifiers,
+/// anchors, groups, alternation, `\d\w\s`, flags `g`/`i`/`m`), with fixed ASCII
+/// inputs so output is deterministic. Never emits backreferences/lookaround
+/// (node-js rejects those by design). Probes access `[0]`/`.index`/`.length`/
+/// `.groups` rather than printing a raw match array (whose extra-prop inspect is a
+/// documented gap).
+fn gen_regex(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // (pattern, an input that the pattern can match somewhere)
+    let cases: &[(&str, &str)] = &[
+        (r"\d+", "abc123def456"),
+        (r"[a-z]+", "Hello World"),
+        (r"\w+", "foo_bar baz"),
+        (r"a|b", "xayb"),
+        (r"^\w+", "start here"),
+        (r"\d{2,3}", "a1b22c333"),
+        (r"(ab)+", "xababy"),
+        (r"\s+", "a  b   c"),
+        (r"[0-9]{4}", "year 2024 end"),
+        (r"[A-Z]\w*", "Foo bar Baz"),
+    ];
+    let (pat, input) = *pick(r, cases);
+    let e = match r.below(10) {
+        0 => format!("/{pat}/.test(\"{input}\")"),
+        1 => format!("/{pat}/.exec(\"{input}\")[0]"),
+        2 => format!("/{pat}/.exec(\"{input}\").index"),
+        3 => format!("\"{input}\".match(/{pat}/g)"),
+        4 => format!("\"{input}\".replace(/{pat}/g, \"#\")"),
+        5 => format!("\"{input}\".replace(/{pat}/, \"#\")"),
+        6 => format!("\"{input}\".split(/{pat}/)"),
+        7 => format!("\"{input}\".search(/{pat}/)"),
+        8 => format!("[...\"{input}\".matchAll(/{pat}/g)].map(m => m[0])"),
+        _ => format!("/{pat}/i.test(\"{input}\"), /{pat}/.source, /{pat}/g.flags"),
+    };
+    vec![format!("console.log({e})")]
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -899,6 +974,8 @@ enum Mode {
     MapSet,
     Proto,
     Async,
+    Bigint,
+    Regex,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -920,6 +997,8 @@ const REAL_MODES: &[Mode] = &[
     Mode::MapSet,
     Mode::Proto,
     Mode::Async,
+    Mode::Bigint,
+    Mode::Regex,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -948,6 +1027,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::MapSet => gen_mapset(seed),
         Mode::Proto => gen_proto(seed),
         Mode::Async => gen_async(seed),
+        Mode::Bigint => gen_bigint(seed),
+        Mode::Regex => gen_regex(seed),
     }
 }
 
@@ -972,6 +1053,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::MapSet => "mapset",
         Mode::Proto => "proto",
         Mode::Async => "async",
+        Mode::Bigint => "bigint",
+        Mode::Regex => "regex",
     }
 }
 
@@ -995,6 +1078,8 @@ const ALL_MODES: &[Mode] = &[
     Mode::MapSet,
     Mode::Proto,
     Mode::Async,
+    Mode::Bigint,
+    Mode::Regex,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {

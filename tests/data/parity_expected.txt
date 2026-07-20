@@ -15,6 +15,15 @@ allSettled [ 'fulfilled', 'rejected' ]
 caught: boom
 compute result 7
 timeout
+==== bigint.js ====
+10n -3n bigint
+255 ff 11111111
+3n -3n 1n -1n 1024n
+15511210043330985984000000n
+true true false true
+1n 7n 4n -6n 256n
+TypeError: Cannot mix BigInt and other types, use explicit conversions
+42n 255n 1n
 ==== classes.js ====
 rectangle with area 12
 perimeter 14
@@ -67,6 +76,21 @@ Ada { age: 36, roles: [ 'admin', 'dev' ] }
 [ 'name', 'age', 'roles', 'active' ] [ 36, [ 'admin', 'dev' ] ]
 {"name":"Ada","age":36,"roles":["admin","dev"],"active":true}
 1 [ 2, 3 ]
+==== regexp.js ====
+true true false
+a b
+5
+a.c gi true true
+a#b#c#
+15/01/2024
+[ 'hello', 'world', 'foo' ]
+[ '1', '2', '3' ]
+3
+[ '1', '2', '3' ]
+36
+true 2 true 4
+[ 'bar', 'BAZ' ]
+true gi
 ==== wordcount.js ====
 the: 3
 fox: 2

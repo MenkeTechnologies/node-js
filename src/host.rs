@@ -76,6 +76,13 @@ pub mod ops {
     pub const AWAIT: u16 = 51; // [v] -> await v (suspend the async coroutine until v settles)
     pub const DEF_ACCESSOR: u16 = 52; // [obj, name, kind, fn] -> install a getter/setter on obj
     pub const DBG_LINE: u16 = 53; // [line] -> DAP statement marker (debug only)
+    pub const MKBIGINT: u16 = 54; // [decimal_str] -> heap BigInt value
+    pub const MKREGEX: u16 = 55; // [pattern, flags] -> heap RegExp value
+    pub const TAG_TMPL: u16 = 56; // [tag, cooked..., raw..., n, values...] -> tagged-template call
+    pub const GET_ASYNC_ITER: u16 = 57; // [iterable] -> async iterator (for-await-of)
+    pub const ASYNC_STEP: u16 = 58; // [asyncIterator] -> Promise of {value, done}
+    pub const NUM_STEP: u16 = 59; // [tag(±1), old] -> pushes ToNumeric(old), returns old±1 (type-preserving; BigInt-aware ++/--)
+    pub const ITER_CLOSE: u16 = 60; // [iterator] -> close it (for-of break: run a generator's finally / call .return())
 }
 
 /// `DEF_MEMBER` member-kind tags.
@@ -193,6 +200,31 @@ pub enum JsObj {
     Generator { id: u32 },
     /// A Promise, backed by a `PromiseCell` in `JsHost.promises`.
     Promise { id: u32 },
+    /// An arbitrary-precision `BigInt` (`typeof === "bigint"`).
+    BigInt(num_bigint::BigInt),
+    /// A compiled regular expression (`/pat/flags` or `new RegExp(...)`).
+    RegExp(Box<RegExpObj>),
+}
+
+/// A `RegExp` object: the compiled Rust `regex::Regex` plus the JS-visible source,
+/// flag booleans, and the mutable `lastIndex` cursor (used by `g`/`y` matching).
+#[derive(Clone)]
+pub struct RegExpObj {
+    /// The translated Rust regex. `None` means the pattern used a JS feature Rust
+    /// `regex` cannot express (backreference/lookaround) — construction of such a
+    /// RegExp throws, so a live `RegExpObj` always has `Some`.
+    pub re: regex::Regex,
+    pub source: String,
+    pub flags: String,
+    pub global: bool,
+    pub ignore_case: bool,
+    pub multiline: bool,
+    pub dot_all: bool,
+    pub sticky: bool,
+    pub unicode: bool,
+    /// `lastIndex`, in UTF-16 code units-approximated-as-chars; advanced by
+    /// `exec`/`test` under the `g`/`y` flags.
+    pub last_index: usize,
 }
 
 /// A Promise's settled state and pending reactions.
@@ -261,6 +293,8 @@ pub enum MapKey {
     Bool(bool),
     /// f64 bit pattern with `NaN` canonicalized and `-0` normalized to `+0`.
     Num(u64),
+    /// A `BigInt` key, by its decimal string (SameValueZero: `1n` is one key).
+    Big(String),
     Str(String),
     /// Heap identity (objects, arrays, functions, symbols).
     Ref(u32),
@@ -403,6 +437,18 @@ struct GenCell {
     yielder: *const (),
     ctx: GenContext,
     done: bool,
+    /// True once the body has been resumed at least once (so it is suspended at a
+    /// `yield`). `.return()`/`.throw()` only unwind a *started* generator.
+    started: bool,
+    /// A completion injected by `.return(v)` / `.throw(e)`: consumed by the next
+    /// `yield` resume so the body unwinds (running any pending `finally`).
+    inject: Option<GenInject>,
+}
+
+/// A forced completion pushed into a suspended generator by `.return()`/`.throw()`.
+enum GenInject {
+    Return(Value),
+    Throw(Value),
 }
 
 /// The mutable "execution registers" swapped at every generator resume/suspend
@@ -616,6 +662,10 @@ impl JsHost {
     pub fn well_known_iterator(&mut self) -> Value {
         self.symbol_for("@@Symbol.iterator")
     }
+    /// The well-known `Symbol.asyncIterator` (internal key `@@asyncIterator`).
+    pub fn well_known_async_iterator(&mut self) -> Value {
+        self.symbol_for("@@Symbol.asyncIterator")
+    }
     /// The internal property-key string for a value used as a key. A `Symbol`
     /// maps to a stable per-symbol string so symbol-keyed props round-trip;
     /// `Symbol.iterator` maps to the sentinel `@@iterator`.
@@ -623,6 +673,9 @@ impl JsHost {
         if let Some(JsObj::Symbol { desc, id }) = self.get(v) {
             if desc.as_deref() == Some("@@Symbol.iterator") {
                 return "@@iterator".to_string();
+            }
+            if desc.as_deref() == Some("@@Symbol.asyncIterator") {
+                return "@@asyncIterator".to_string();
             }
             return format!("@@sym:{id}");
         }
@@ -979,6 +1032,7 @@ impl JsHost {
                 | Some(JsObj::BoundFunc { .. })
                 | Some(JsObj::Class(_)) => "function",
                 Some(JsObj::Symbol { .. }) => "symbol",
+                Some(JsObj::BigInt(_)) => "bigint",
                 _ => "object", // arrays, objects, null, Map/Set, generators
             },
             _ => "object",
@@ -996,6 +1050,7 @@ impl JsHost {
             Value::Obj(_) => match self.get(v) {
                 Some(JsObj::Str(s)) => !s.is_empty(),
                 Some(JsObj::Null) => false,
+                Some(JsObj::BigInt(b)) => !num_traits::Zero::is_zero(b),
                 _ => true, // arrays, objects, functions
             },
             _ => true,
@@ -1019,6 +1074,7 @@ impl JsHost {
             Value::Obj(_) => match self.get(v) {
                 Some(JsObj::Str(s)) => str_to_number(s),
                 Some(JsObj::Null) => 0.0,
+                Some(JsObj::BigInt(b)) => bigint_to_f64(b),
                 Some(JsObj::Array(items)) => {
                     // [] -> 0, [x] -> ToNumber(x), else NaN.
                     if items.is_empty() {
@@ -1046,6 +1102,8 @@ impl JsHost {
             Value::Obj(_) => match self.get(v) {
                 Some(JsObj::Str(s)) => s.clone(),
                 Some(JsObj::Null) => "null".into(),
+                Some(JsObj::BigInt(b)) => b.to_string(),
+                Some(JsObj::RegExp(r)) => format!("/{}/{}", r.source, r.flags),
                 Some(JsObj::Array(items)) => {
                     // Array.prototype.toString: comma-join, null/undefined -> "".
                     let parts: Vec<String> = items
@@ -1094,6 +1152,12 @@ impl JsHost {
 
     /// `util.inspect`-style rendering (nested; strings quoted).
     pub fn inspect(&self, v: &Value) -> String {
+        self.inspect_lvl(v, 0)
+    }
+
+    /// `util.inspect` at a given indentation level (drives array multi-line
+    /// grouping and nested indentation).
+    fn inspect_lvl(&self, v: &Value, indent: usize) -> String {
         match v {
             Value::Undef => "undefined".into(),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
@@ -1105,12 +1169,16 @@ impl JsHost {
             Value::Obj(_) => match self.get(v) {
                 Some(JsObj::Str(s)) => quote_str(s),
                 Some(JsObj::Null) => "null".into(),
+                // `util.inspect` renders a bigint with the `n` suffix, a regex bare.
+                Some(JsObj::BigInt(b)) => format!("{b}n"),
+                Some(JsObj::RegExp(r)) => format!("/{}/{}", r.source, r.flags),
                 Some(JsObj::Array(items)) => {
                     if items.is_empty() {
                         return "[]".into();
                     }
-                    let inner: Vec<String> = items.iter().map(|x| self.inspect(x)).collect();
-                    format!("[ {} ]", inner.join(", "))
+                    let inner: Vec<String> =
+                        items.iter().map(|x| self.inspect_lvl(x, indent + 2)).collect();
+                    self.render_array(&inner, items, indent)
                 }
                 Some(JsObj::Object(props)) => {
                     // Instances print with their constructor name as a prefix
@@ -1127,7 +1195,7 @@ impl JsHost {
                     }
                     let inner: Vec<String> = shown
                         .iter()
-                        .map(|(k, val)| format!("{}: {}", fmt_key(k), self.inspect(val)))
+                        .map(|(k, val)| format!("{}: {}", fmt_key(k), self.inspect_lvl(val, indent + 2)))
                         .collect();
                     format!("{prefix}{{ {} }}", inner.join(", "))
                 }
@@ -1202,6 +1270,33 @@ impl JsHost {
         }
     }
 
+    /// Render a non-empty array's already-formatted element strings, applying
+    /// Node's `util.inspect` layout: a single line when it fits, else a multi-line
+    /// grid via `groupArrayElements` (for >6 entries), else one element per line.
+    /// `values` is the raw element list (drives numeric right-alignment); `indent`
+    /// is the array's own indentation level.
+    fn render_array(&self, output: &[String], values: &[Value], indent: usize) -> String {
+        // Group array elements together if the array has more than six entries.
+        let entries = output.len();
+        let (lines, grouped) = if entries > 6 {
+            group_array_elements(self, output, values, indent)
+        } else {
+            (output.to_vec(), false)
+        };
+        // If no grouping happened, try to line everything up on a single line.
+        if !grouped {
+            // start = output.length + indentationLvl + braces[0].len(1) + base(0) + 10
+            let start = output.len() + indent + 1 + 10;
+            if is_below_break_length(output, start) {
+                return format!("[ {} ]", output.join(", "));
+            }
+        }
+        // Otherwise: one (grouped or single) entry per line, indented by indent+2.
+        let pad = " ".repeat(indent);
+        let sep = format!(",\n{pad}  ");
+        format!("[\n{pad}  {}\n{pad}]", lines.join(&sep))
+    }
+
     /// The `.name` of any callable (function/class/builtin/bound).
     pub fn callable_name(&self, v: &Value) -> String {
         // A user-set `.name` own property wins.
@@ -1232,6 +1327,12 @@ impl JsHost {
                 if an && bn {
                     let x = self.to_number(a);
                     let y = self.to_number(b);
+                    return x == y;
+                }
+                // BigInt === BigInt compares by value (each literal is a distinct
+                // heap cell, so reference identity would be wrong). BigInt is never
+                // `===` a Number (different types).
+                if let (Some(x), Some(y)) = (self.as_bigint(a), self.as_bigint(b)) {
                     return x == y;
                 }
                 // Heap values.
@@ -1266,6 +1367,7 @@ impl JsHost {
             Value::Obj(_) => match self.get(v) {
                 Some(JsObj::Str(_)) => "string",
                 Some(JsObj::Null) => "null",
+                Some(JsObj::BigInt(_)) => "bigint",
                 _ => "object",
             },
             _ => "object",
@@ -1286,6 +1388,11 @@ impl JsHost {
         // null and undefined are loosely equal only to each other.
         if self.is_nullish(a) || self.is_nullish(b) {
             return self.is_nullish(a) && self.is_nullish(b);
+        }
+        // BigInt ⇄ (Number | String | Boolean | Object): compare mathematical
+        // values (both-BigInt was already settled by the `strict_eq` above).
+        if ta == "bigint" || tb == "bigint" {
+            return self.bigint_loose_eq(a, b);
         }
         if ta == tb {
             // Same type but not strict-equal (and not nullish) ⇒ not equal.
@@ -1334,17 +1441,25 @@ impl JsHost {
                 let a_str = self.prefers_string(a);
                 let b_str = self.prefers_string(b);
                 if a_str || b_str {
+                    // String concatenation wins even with a bigint operand
+                    // (`1n + "x"` → `"1x"`).
                     let s = format!("{}{}", self.str_of(a), self.str_of(b));
                     Ok(self.new_str(s))
+                } else if self.is_bigint_val(a) || self.is_bigint_val(b) {
+                    self.bigint_arith(op, a, b)
                 } else {
                     Ok(Value::Float(self.to_number(a) + self.to_number(b)))
                 }
+            }
+            Sub | Mul | Div | Mod | Pow if self.is_bigint_val(a) || self.is_bigint_val(b) => {
+                self.bigint_arith(op, a, b)
             }
             Sub => Ok(Value::Float(self.to_number(a) - self.to_number(b))),
             Mul => Ok(Value::Float(self.to_number(a) * self.to_number(b))),
             Div => Ok(Value::Float(self.to_number(a) / self.to_number(b))),
             Mod => Ok(Value::Float(js_mod(self.to_number(a), self.to_number(b)))),
             Pow => Ok(Value::Float(self.to_number(a).powf(self.to_number(b)))),
+            Neg if self.is_bigint_val(a) => self.bigint_arith(op, a, b),
             Neg => Ok(Value::Float(-self.to_number(a))),
             Lt | Le | Gt | Ge => Ok(Value::Bool(self.relational(op, a, b))),
             Eq => Ok(Value::Bool(self.loose_eq(a, b))),
@@ -1360,7 +1475,10 @@ impl JsHost {
     fn prefers_string(&self, v: &Value) -> bool {
         match v {
             Value::Str(_) => true,
-            Value::Obj(_) => !matches!(self.get(v), Some(JsObj::Null) | None),
+            // A BigInt's `ToPrimitive` is the bigint itself (numeric), NOT a string,
+            // so `1n + 2n` is bigint addition, not concatenation. `null` has no
+            // string primitive either.
+            Value::Obj(_) => !matches!(self.get(v), Some(JsObj::Null) | Some(JsObj::BigInt(_)) | None),
             _ => false,
         }
     }
@@ -1369,7 +1487,10 @@ impl JsHost {
     /// lexicographic, otherwise numeric (NaN yields false).
     fn relational(&self, op: NumOp, a: &Value, b: &Value) -> bool {
         use std::cmp::Ordering;
-        let ord = if let (Some(x), Some(y)) = (self.as_str(a), self.as_str(b)) {
+        let ord = if let (Some(x), Some(y)) = (self.as_bigint(a), self.as_bigint(b)) {
+            // BigInt < BigInt: exact (no f64 precision loss for large magnitudes).
+            x.cmp(&y)
+        } else if let (Some(x), Some(y)) = (self.as_str(a), self.as_str(b)) {
             x.cmp(&y)
         } else {
             let x = self.to_number(a);
@@ -1388,8 +1509,13 @@ impl JsHost {
         }
     }
 
-    /// Bitwise/shift ops with JS ToInt32/ToUint32 semantics.
-    pub fn bitwise(&self, tag: i64, a: &Value, b: &Value) -> Value {
+    /// Bitwise/shift ops with JS ToInt32/ToUint32 semantics — or true
+    /// arbitrary-width BigInt bitwise when both operands are BigInt (mixing a
+    /// BigInt with a Number throws, matching Node).
+    pub fn bitwise(&mut self, tag: i64, a: &Value, b: &Value) -> Result<Value, String> {
+        if self.is_bigint_val(a) || self.is_bigint_val(b) {
+            return self.bigint_bitwise(tag, a, b);
+        }
         let x = to_int32(self.to_number(a));
         let y = to_int32(self.to_number(b));
         let r: i64 = match tag {
@@ -1401,8 +1527,171 @@ impl JsHost {
             binop::USHR => (to_uint32(self.to_number(a)) >> ((y as u32) & 31)) as i64,
             _ => 0,
         };
-        Value::Float(r as f64)
+        Ok(Value::Float(r as f64))
     }
+
+    // ── BigInt operations ────────────────────────────────────────────────────
+    /// Whether `v` is a heap `BigInt`.
+    pub fn is_bigint_val(&self, v: &Value) -> bool {
+        matches!(self.get(v), Some(JsObj::BigInt(_)))
+    }
+    /// The `BigInt` value of `v` (a heap bigint), else `None`.
+    pub fn as_bigint(&self, v: &Value) -> Option<num_bigint::BigInt> {
+        match self.get(v) {
+            Some(JsObj::BigInt(b)) => Some(b.clone()),
+            _ => None,
+        }
+    }
+    /// Allocate a heap `BigInt`.
+    pub fn new_bigint(&mut self, b: num_bigint::BigInt) -> Value {
+        self.alloc(JsObj::BigInt(b))
+    }
+
+    /// BigInt arithmetic (`+ - * / % **`, unary `-`). Requires BOTH operands to be
+    /// BigInt for a binary op; mixing a BigInt with a Number throws the exact Node
+    /// `TypeError` (a string operand is handled as concatenation before we get
+    /// here). Division/`%` truncate toward zero; `**` needs a non-negative
+    /// exponent.
+    fn bigint_arith(&mut self, op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+        use num_traits::{Signed, Zero};
+        use NumOp::*;
+        if op == Neg {
+            let x = self.as_bigint(a).expect("bigint_arith Neg on non-bigint");
+            return Ok(self.new_bigint(-x));
+        }
+        let (x, y) = match (self.as_bigint(a), self.as_bigint(b)) {
+            (Some(x), Some(y)) => (x, y),
+            // Exactly one side is a BigInt → the other is a Number/Boolean: illegal.
+            _ => return Err(type_error(
+                "Cannot mix BigInt and other types, use explicit conversions",
+            )),
+        };
+        let r = match op {
+            Add => x + y,
+            Sub => x - y,
+            Mul => x * y,
+            Div => {
+                if y.is_zero() {
+                    return Err("RangeError: Division by zero".into());
+                }
+                x / y // truncates toward zero (matches JS BigInt division)
+            }
+            Mod => {
+                if y.is_zero() {
+                    return Err("RangeError: Division by zero".into());
+                }
+                x % y // sign follows the dividend (truncated), like JS
+            }
+            Pow => {
+                if y.is_negative() {
+                    return Err("RangeError: Exponent must be positive".into());
+                }
+                let exp = num_traits::ToPrimitive::to_u32(&y)
+                    .ok_or_else(|| "RangeError: Maximum BigInt size exceeded".to_string())?;
+                num_traits::Pow::pow(x, exp)
+            }
+            _ => return Err(type_error("unsupported BigInt operation")),
+        };
+        Ok(self.new_bigint(r))
+    }
+
+    /// BigInt bitwise (`& | ^ << >>`); `>>>` has no BigInt form. Both operands must
+    /// be BigInt (mixing throws).
+    fn bigint_bitwise(&mut self, tag: i64, a: &Value, b: &Value) -> Result<Value, String> {
+        let (x, y) = match (self.as_bigint(a), self.as_bigint(b)) {
+            (Some(x), Some(y)) => (x, y),
+            _ => return Err(type_error(
+                "Cannot mix BigInt and other types, use explicit conversions",
+            )),
+        };
+        let r = match tag {
+            binop::BITAND => x & y,
+            binop::BITOR => x | y,
+            binop::BITXOR => x ^ y,
+            binop::SHL => {
+                let n = num_traits::ToPrimitive::to_i64(&y).unwrap_or(0);
+                if n >= 0 { x << (n as usize) } else { x >> ((-n) as usize) }
+            }
+            binop::SHR => {
+                let n = num_traits::ToPrimitive::to_i64(&y).unwrap_or(0);
+                if n >= 0 { x >> (n as usize) } else { x << ((-n) as usize) }
+            }
+            binop::USHR => {
+                return Err(type_error(
+                    "BigInts have no unsigned right shift, use >> instead",
+                ))
+            }
+            _ => return Err(type_error("unsupported BigInt operation")),
+        };
+        Ok(self.new_bigint(r))
+    }
+
+    /// BigInt ⇄ (Number | Boolean | String | Object) loose equality (`==`). Both
+    /// being BigInt was already handled by `strict_eq`.
+    fn bigint_loose_eq(&self, a: &Value, b: &Value) -> bool {
+        // Order so `big` is the BigInt side and `other` the counterpart.
+        let (big, other) = match (self.as_bigint(a), self.as_bigint(b)) {
+            (Some(x), _) => (x, b),
+            (_, Some(y)) => (y, a),
+            _ => return false,
+        };
+        match other {
+            Value::Bool(bo) => big == num_bigint::BigInt::from(*bo as i64),
+            Value::Int(n) => big == num_bigint::BigInt::from(*n),
+            Value::Float(f) => {
+                // Equal only when the float is an integer with the same value.
+                if !f.is_finite() || f.fract() != 0.0 {
+                    return false;
+                }
+                bigint_to_f64(&big) == *f
+            }
+            Value::Str(s) => match parse_bigint_str(s) {
+                Some(bs) => big == bs,
+                None => false,
+            },
+            Value::Obj(_) => match self.get(other) {
+                // A heap string parses like a primitive string.
+                Some(JsObj::Str(s)) => parse_bigint_str(s).map(|bs| big == bs).unwrap_or(false),
+                _ => {
+                    // Other objects reduce via ToPrimitive (their string form).
+                    let s = self.str_of(other);
+                    parse_bigint_str(&s).map(|bs| big == bs).unwrap_or(false)
+                }
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Parse a string to a BigInt under JS `StringToBigInt` rules: trimmed, empty →
+/// `0n`, decimal or `0x`/`0o`/`0b` prefixed; any junk → `None`.
+pub fn parse_bigint_str(s: &str) -> Option<num_bigint::BigInt> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Some(num_bigint::BigInt::from(0));
+    }
+    let (radix, digits) = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (16, h)
+    } else if let Some(o) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        (8, o)
+    } else if let Some(bb) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        (2, bb)
+    } else {
+        (10, t)
+    };
+    num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
+}
+
+/// Coerce a BigInt to `f64` (for `Number(bigint)` and mixed relational compares);
+/// out-of-range magnitudes become ±Infinity, matching Node.
+fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
+    num_traits::ToPrimitive::to_f64(b).unwrap_or_else(|| {
+        if num_traits::Signed::is_negative(b) {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }
+    })
 }
 
 /// JS `%` remainder (sign follows the dividend; matches `f64::rem`).
@@ -1437,6 +1726,137 @@ fn str_to_number(s: &str) -> f64 {
         "Infinity" | "+Infinity" => f64::INFINITY,
         "-Infinity" => f64::NEG_INFINITY,
         _ => t.parse::<f64>().unwrap_or(f64::NAN),
+    }
+}
+
+/// `util.inspect` break length (the width past which entries wrap). Node's default.
+const BREAK_LENGTH: usize = 80;
+/// Node's default `compact` setting (the `compact * 4` column cap term).
+const COMPACT: usize = 3;
+
+/// Whether `output` fits on a single line — a faithful port of Node's
+/// `isBelowBreakLength` (no colors, no `base`). `start` is the caller's seed
+/// length (braces + indentation + slack).
+fn is_below_break_length(output: &[String], start: usize) -> bool {
+    let mut total = output.len() + start;
+    if total + output.len() > BREAK_LENGTH {
+        return false;
+    }
+    for o in output {
+        if o.contains('\n') {
+            return false;
+        }
+        total += o.chars().count();
+        if total > BREAK_LENGTH {
+            return false;
+        }
+    }
+    true
+}
+
+/// Faithful port of Node's `util.inspect` `groupArrayElements`: lay out the
+/// already-formatted element strings into an aligned multi-column grid. Returns
+/// `(lines, grouped)` — `grouped` is false when Node would leave the output
+/// ungrouped (so the caller falls back to single-line / one-per-line).
+fn group_array_elements(
+    host: &JsHost,
+    output: &[String],
+    values: &[Value],
+    indentation_lvl: usize,
+) -> (Vec<String>, bool) {
+    let separator_space = 2usize; // ", " between entries
+    let output_length = output.len();
+    let data_len: Vec<usize> = output.iter().map(|o| o.chars().count()).collect();
+    let mut total_length = 0usize;
+    let mut max_length = 0usize;
+    for &len in &data_len {
+        total_length += len + separator_space;
+        if len > max_length {
+            max_length = len;
+        }
+    }
+    let actual_max = max_length + separator_space;
+    // Only group when ≥3 entries fit across AND the entries aren't wildly uneven.
+    if !(actual_max * 3 + indentation_lvl < BREAK_LENGTH
+        && (total_length as f64 / actual_max as f64 > 5.0 || max_length <= 6))
+    {
+        return (output.to_vec(), false);
+    }
+    let approx_char_heights = 2.5f64;
+    let average_bias = (actual_max as f64 - total_length as f64 / output_length as f64).sqrt();
+    let biased_max = (actual_max as f64 - 3.0 - average_bias).max(1.0);
+    // Ideally a square grid; capped by break length, compact*4, and 15 columns.
+    let columns = [
+        ((approx_char_heights * biased_max * output_length as f64).sqrt() / biased_max).round() as i64,
+        ((BREAK_LENGTH - indentation_lvl) as f64 / actual_max as f64).floor() as i64,
+        (COMPACT * 4) as i64,
+        15,
+    ]
+    .into_iter()
+    .min()
+    .unwrap();
+    if columns <= 1 {
+        return (output.to_vec(), false);
+    }
+    let columns = columns as usize;
+    // The widest entry (plus separator) in each column.
+    let mut max_line_length = vec![0usize; columns];
+    for (i, slot) in max_line_length.iter_mut().enumerate() {
+        let mut line_length = 0;
+        let mut j = i;
+        while j < output_length {
+            if data_len[j] > line_length {
+                line_length = data_len[j];
+            }
+            j += columns;
+        }
+        *slot = line_length + separator_space;
+    }
+    // Right-align (padStart) only when every element is a number/bigint.
+    let pad_start = values.iter().all(|v| {
+        matches!(v, Value::Int(_) | Value::Float(_))
+            || matches!(host.get(v), Some(JsObj::BigInt(_)))
+    });
+    let mut tmp = Vec::new();
+    let mut i = 0;
+    while i < output_length {
+        let max = (i + columns).min(output_length);
+        let mut str_line = String::new();
+        let mut j = i;
+        while j < max.saturating_sub(1) {
+            // `output[j]` has no colors here, so padding == max_line_length[col].
+            let col = j - i;
+            let cell = format!("{}, ", output[j]);
+            let target = max_line_length[col];
+            str_line.push_str(&pad_to(&cell, target, pad_start));
+            j += 1;
+        }
+        // The last cell of the row: right-aligned entries pad without the ", ".
+        if pad_start {
+            let col = j - i;
+            let target = max_line_length[col] - separator_space;
+            str_line.push_str(&pad_to(&output[j], target, true));
+        } else {
+            str_line.push_str(&output[j]);
+        }
+        tmp.push(str_line);
+        i += columns;
+    }
+    (tmp, true)
+}
+
+/// Pad `s` to `width` chars: right-justified when `pad_start`, else left-justified.
+/// (Padding is measured in chars; already ANSI-free here.)
+fn pad_to(s: &str, width: usize, pad_start: bool) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        return s.to_string();
+    }
+    let fill = " ".repeat(width - len);
+    if pad_start {
+        format!("{fill}{s}")
+    } else {
+        format!("{s}{fill}")
     }
 }
 
@@ -2052,6 +2472,9 @@ impl JsHost {
     pub fn gen_done(&self, id: u32) -> bool {
         self.generators.get(id as usize).map(|g| g.done).unwrap_or(true)
     }
+    fn gen_started(&self, id: u32) -> bool {
+        self.generators.get(id as usize).map(|g| g.started).unwrap_or(false)
+    }
 }
 
 /// Build a suspended generator whose body is `chunk`, run in a frame with the
@@ -2078,6 +2501,8 @@ fn make_generator(chunk: Chunk, env: Env, this_val: Option<Value>, home_class: O
                 ..GenContext::default()
             },
             done: false,
+            started: false,
+            inject: None,
         });
         id
     });
@@ -2111,7 +2536,62 @@ pub fn gen_yield(v: Value) -> Result<Value, String> {
     // SAFETY: same-thread coroutine; the yielder lives for the whole body, and we
     // only reach here from inside that body (its stack is live).
     let yielder = unsafe { &*(yp as *const corosensei::Yielder<Value, Value>) };
-    Ok(yielder.suspend(v))
+    let sent = yielder.suspend(v);
+    // On resume, a `.return(v)`/`.throw(e)` may have queued a forced completion:
+    // convert it into a Return signal / thrown value so the body unwinds and any
+    // `finally` runs, exactly as a source-level `return`/`throw` would.
+    if let Some(inj) = with_host(|h| h.generators[id as usize].inject.take()) {
+        match inj {
+            GenInject::Return(rv) => {
+                with_host(|h| h.signal = Some(Signal::Return(rv)));
+                return Ok(Value::Undef);
+            }
+            GenInject::Throw(ev) => {
+                let msg = with_host(|h| crate::builtins::error_string(h, &ev));
+                with_host(|h| h.exc = Some(ev));
+                return Err(msg);
+            }
+        }
+    }
+    Ok(sent)
+}
+
+/// `generator.return(v)`: force the generator to complete, running any pending
+/// `finally`. If it is already done (or never started) it just reports
+/// `{value:v, done:true}` without executing the body.
+pub fn gen_return(gen: &Value, v: Value) -> Result<GenStep, String> {
+    let id = match with_host(|h| h.get(gen).cloned()) {
+        Some(JsObj::Generator { id }) => id,
+        _ => return Err(type_error("not a generator")),
+    };
+    // Not started yet (coro present, ctx never resumed) OR already done → no body
+    // to unwind: complete immediately with the supplied value.
+    let started = with_host(|h| h.gen_started(id));
+    if with_host(|h| h.generators[id as usize].done) || !started {
+        with_host(|h| h.generators[id as usize].done = true);
+        return Ok(GenStep::Done(v));
+    }
+    with_host(|h| h.generators[id as usize].inject = Some(GenInject::Return(v)));
+    gen_resume(gen, Value::Undef)
+}
+
+/// `generator.throw(e)`: inject a throw at the suspension point, running any
+/// pending `finally` and letting an enclosing `try/catch` in the body handle it.
+pub fn gen_throw(gen: &Value, e: Value) -> Result<GenStep, String> {
+    let id = match with_host(|h| h.get(gen).cloned()) {
+        Some(JsObj::Generator { id }) => id,
+        _ => return Err(type_error("not a generator")),
+    };
+    let started = with_host(|h| h.gen_started(id));
+    if with_host(|h| h.generators[id as usize].done) || !started {
+        // A throw into a done/unstarted generator propagates to the caller.
+        with_host(|h| h.generators[id as usize].done = true);
+        let msg = with_host(|h| crate::builtins::error_string(h, &e));
+        with_host(|h| h.exc = Some(e));
+        return Err(msg);
+    }
+    with_host(|h| h.generators[id as usize].inject = Some(GenInject::Throw(e)));
+    gen_resume(gen, Value::Undef)
 }
 
 /// Outcome of resuming a generator: a yielded value (not done), or the final
@@ -2137,6 +2617,7 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<GenStep, String> {
         Some(c) => c,
         None => return Err("TypeError: generator already executing".into()),
     };
+    with_host(|h| h.generators[id as usize].started = true);
     let gen_ctx = with_host(|h| std::mem::take(&mut h.generators[id as usize].ctx));
     let caller_ctx = with_host(|h| h.install_gen_ctx(gen_ctx));
     let prev = CUR_GEN.with(|c| c.replace(Some(id)));
@@ -2183,6 +2664,7 @@ pub fn map_key(h: &JsHost, v: &Value) -> MapKey {
         Value::Obj(i) => match h.get(v) {
             Some(JsObj::Str(s)) => MapKey::Str(s.clone()),
             Some(JsObj::Null) => MapKey::Null,
+            Some(JsObj::BigInt(b)) => MapKey::Big(b.to_string()),
             _ => MapKey::Ref(*i),
         },
         _ => MapKey::Undef,
@@ -2216,6 +2698,85 @@ pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
         return drain_iterator(&iterator);
     }
     with_host(|h| h.iter_vec(v))
+}
+
+// ── async iteration (`for await (… of …)`) ───────────────────────────────────
+
+/// Obtain an async iterator for `for await`. If `src` has a `Symbol.asyncIterator`
+/// method, use it (its `.next()` returns a promise of `{value, done}`); otherwise
+/// fall back to the sync iterable, materialized into a `JsObj::Iter` whose values
+/// are awaited one at a time by `async_step`.
+pub fn get_async_iterator(src: &Value) -> Result<Value, String> {
+    if let Some(f) = user_async_iterator_fn(src) {
+        return invoke(&f, Vec::new(), Some(src.clone()));
+    }
+    let items = iter_all(src)?;
+    Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+}
+
+/// If `v` has an own/inherited `Symbol.asyncIterator` method, return it.
+fn user_async_iterator_fn(v: &Value) -> Option<Value> {
+    let is_plain = with_host(|h| matches!(h.get(v), Some(JsObj::Object(_))));
+    if !is_plain {
+        return None;
+    }
+    let f = with_host(|h| lookup_chain(h, v, "@@asyncIterator"));
+    match f {
+        Some(f) if with_host(|h| is_callable(h, &f)) => Some(f),
+        _ => None,
+    }
+}
+
+/// One step of a `for await` loop: return a Promise that settles to a
+/// `{value, done}` record. For a native async iterator this is `iter.next()`
+/// (already a promise of the record). For the sync fallback it pops the next raw
+/// value, awaits it, and packages `{value: resolved, done:false}` (or
+/// `{done:true}` at exhaustion).
+pub fn async_step(iterator: &Value) -> Result<Value, String> {
+    // Sync-fallback iterator: drive it here, awaiting each yielded value.
+    if let Some(JsObj::Iter { items, idx }) = with_host(|h| h.get(iterator).cloned()) {
+        if idx >= items.len() {
+            let rec = with_host(|h| {
+                let mut m = IndexMap::new();
+                m.insert("value".to_string(), Value::Undef);
+                m.insert("done".to_string(), Value::Bool(true));
+                h.new_object(m)
+            });
+            return Ok(promise_of(&rec));
+        }
+        let raw = items[idx].clone();
+        with_host(|h| {
+            if let Some(JsObj::Iter { idx, .. }) = h.get_mut(iterator) {
+                *idx += 1;
+            }
+        });
+        // Await the raw value (adopts a promise's resolution), then wrap.
+        let step = with_host(|h| h.new_promise());
+        let sid = with_host(|h| h.promise_id(&step).unwrap());
+        let raw_p = promise_of(&raw);
+        let raw_id = with_host(|h| h.promise_id(&raw_p).unwrap());
+        subscribe_native(
+            raw_id,
+            Box::new(move |state, val| {
+                if state == PromiseState::Rejected {
+                    reject_promise_val(sid, val);
+                } else {
+                    let rec = with_host(|h| {
+                        let mut m = IndexMap::new();
+                        m.insert("value".to_string(), val.clone());
+                        m.insert("done".to_string(), Value::Bool(false));
+                        h.new_object(m)
+                    });
+                    resolve_promise_val(sid, rec);
+                }
+                Ok(())
+            }),
+        );
+        return Ok(step);
+    }
+    // Native async iterator: `iter.next()` returns the {value,done} promise.
+    let r = call_method(iterator, "next", Vec::new())?;
+    Ok(promise_of(&r))
 }
 
 /// If `v` has an own/inherited `Symbol.iterator` method (internal key

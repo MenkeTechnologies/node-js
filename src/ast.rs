@@ -101,11 +101,24 @@ pub enum Expr {
     True,
     False,
     Number(f64),
+    /// A `BigInt` literal as its canonical decimal digit string (`"123"` for
+    /// `123n`). Lowered to a heap `JsObj::BigInt`.
+    BigInt(String),
+    /// A regex literal: `(pattern, flags)`. Lowered to a `JsObj::RegExp`.
+    Regex(String, String),
     Str(String),
     /// A template literal: alternating literal quasis and interpolated exprs.
     /// `quasis.len() == exprs.len() + 1`.
     Template {
         quasis: Vec<String>,
+        exprs: Vec<Expr>,
+    },
+    /// A tagged template `` tag`a${x}b` ``: calls `tag(strings, ...values)` where
+    /// `strings` is the cooked-quasi array carrying a `.raw` array of `raws`.
+    TaggedTemplate {
+        tag: Box<Expr>,
+        quasis: Vec<String>,
+        raws: Vec<String>,
         exprs: Vec<Expr>,
     },
 
@@ -309,12 +322,13 @@ pub enum StmtKind {
         update: Option<Expr>,
         body: Box<Stmt>,
     },
-    /// `for (decl of iterable) body`.
+    /// `for (decl of iterable) body`. `is_await` marks `for await (…)`.
     ForOf {
         decl_kind: Option<DeclKind>,
         target: Expr,
         iter: Expr,
         body: Box<Stmt>,
+        is_await: bool,
     },
     /// `for (decl in object) body`.
     ForIn {

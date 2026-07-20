@@ -213,7 +213,14 @@ impl Compiler {
                 target,
                 iter,
                 body,
-            } => self.compile_for_of(b, decl_kind.is_some(), target, iter, body)?,
+                is_await,
+            } => {
+                if *is_await {
+                    self.compile_for_await(b, decl_kind.is_some(), target, iter, body)?
+                } else {
+                    self.compile_for_of(b, decl_kind.is_some(), target, iter, body)?
+                }
+            }
             StmtKind::ForIn {
                 decl_kind,
                 target,
@@ -524,6 +531,57 @@ impl Compiler {
         self.loop_over(b, declare, target, body)
     }
 
+    /// `for await (target of iterable) body`. Obtains an async iterator, then each
+    /// pass `await`s a `{value, done}` step (a native async iterator's promise, or
+    /// the sync fallback's per-value await). The iterator lives in a temp local.
+    fn compile_for_await(&mut self, b: &mut ChunkBuilder, declare: bool, target: &Expr, iter: &Expr, body: &Stmt) -> Result<(), String> {
+        let iter_tmp = self.tmp_name("aiter");
+        self.compile_expr(b, iter)?;
+        b.emit(Op::CallBuiltin(ops::GET_ASYNC_ITER, 1), 0); // [iterator]
+        self.name_const(b, &iter_tmp);
+        b.emit(Op::Swap, 0);
+        b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
+        b.emit(Op::Pop, 0);
+        let start = b.current_pos();
+        // step = await ASYNC_STEP(iterator)  -> {value, done}
+        self.load_local(b, &iter_tmp);
+        b.emit(Op::CallBuiltin(ops::ASYNC_STEP, 1), 0); // [stepPromise]
+        b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0); // [step]
+        let step_tmp = self.tmp_name("astep");
+        self.name_const(b, &step_tmp);
+        b.emit(Op::Swap, 0);
+        b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
+        b.emit(Op::Pop, 0);
+        // if (step.done) break
+        self.load_local(b, &step_tmp);
+        self.name_const(b, "done");
+        b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0);
+        b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+        let jdone = b.emit(Op::JumpIfTrue(0), 0);
+        // target = step.value
+        self.load_local(b, &step_tmp);
+        self.name_const(b, "value");
+        b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [value]
+        self.compile_bind(b, target, declare)?;
+        self.loops.push(LoopCtx {
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            catches_continue: true,
+        });
+        self.compile_stmt(b, body)?;
+        b.emit(Op::Jump(start), 0);
+        let ctx = self.loops.pop().unwrap();
+        for c in ctx.continues {
+            b.patch_jump(c, start);
+        }
+        let end = b.current_pos();
+        b.patch_jump(jdone, end);
+        for br in ctx.breaks {
+            b.patch_jump(br, end);
+        }
+        Ok(())
+    }
+
     /// Shared loop tail for for-of / for-in: iterator on TOS.
     fn loop_over(&mut self, b: &mut ChunkBuilder, declare: bool, target: &Expr, body: &Stmt) -> Result<(), String> {
         let start = b.current_pos();
@@ -546,7 +604,9 @@ impl Compiler {
         b.emit(Op::Pop, 0); // drop iterator
         let jafter = b.emit(Op::Jump(0), 0);
         let break_target = b.current_pos();
-        b.emit(Op::Pop, 0); // drop iterator on break
+        // `break` out of a for-of closes the iterator (runs a generator's pending
+        // `finally` / calls a user iterator's `.return()`), then drops it.
+        b.emit(Op::CallBuiltin(ops::ITER_CLOSE, 1), 0);
         let end = b.current_pos();
         b.patch_jump(jafter, end);
         for br in ctx.breaks {
@@ -905,8 +965,25 @@ impl Compiler {
             Expr::Number(n) => {
                 b.emit(Op::LoadFloat(*n), 0);
             }
+            Expr::BigInt(digits) => {
+                // The canonical decimal digit string travels as a native constant;
+                // MKBIGINT parses it into a heap BigInt at runtime.
+                let k = b.add_constant(Value::str(digits));
+                b.emit(Op::LoadConst(k), 0);
+                b.emit(Op::CallBuiltin(ops::MKBIGINT, 1), 0);
+            }
+            Expr::Regex(pat, flags) => {
+                let kp = b.add_constant(Value::str(pat));
+                b.emit(Op::LoadConst(kp), 0);
+                let kf = b.add_constant(Value::str(flags));
+                b.emit(Op::LoadConst(kf), 0);
+                b.emit(Op::CallBuiltin(ops::MKREGEX, 2), 0);
+            }
             Expr::Str(s) => self.strlit(b, s),
             Expr::Template { quasis, exprs } => self.compile_template(b, quasis, exprs)?,
+            Expr::TaggedTemplate { tag, quasis, raws, exprs } => {
+                self.compile_tagged_template(b, tag, quasis, raws, exprs)?
+            }
             Expr::Ident(n) => self.load_local(b, n),
             Expr::This => {
                 b.emit(Op::CallBuiltin(ops::THIS, 0), 0);
@@ -994,6 +1071,35 @@ impl Compiler {
             }
         }
         b.emit(Op::CallBuiltin(ops::MKSTR, argc(n)?), 0);
+        Ok(())
+    }
+
+    /// Lower a tagged template to `TAG_TMPL`. Operand layout (matching
+    /// `builtins::b_tag_tmpl`): `[tag, n, m, cooked×n, raw×n, values×m]`, where
+    /// `n = quasis.len()` and `m = exprs.len()` (`n == m + 1`).
+    fn compile_tagged_template(
+        &mut self,
+        b: &mut ChunkBuilder,
+        tag: &Expr,
+        quasis: &[String],
+        raws: &[String],
+        exprs: &[Expr],
+    ) -> Result<(), String> {
+        self.compile_expr(b, tag)?;
+        let n = quasis.len();
+        let m = exprs.len();
+        b.emit(Op::LoadInt(n as i64), 0);
+        b.emit(Op::LoadInt(m as i64), 0);
+        for q in quasis {
+            self.strlit(b, q); // cooked strings (heap)
+        }
+        for r in raws {
+            self.strlit(b, r); // raw strings (heap)
+        }
+        for e in exprs {
+            self.compile_expr(b, e)?; // substitution values
+        }
+        b.emit(Op::CallBuiltin(ops::TAG_TMPL, argc(3 + 2 * n + m)?), 0);
         Ok(())
     }
 
@@ -1217,28 +1323,23 @@ impl Compiler {
     }
 
     fn compile_update(&mut self, b: &mut ChunkBuilder, op: UpdateOp, prefix: bool, target: &Expr) -> Result<(), String> {
-        // Desugar to `target = target +/- 1`, yielding the pre/post value.
-        let one = Expr::Number(1.0);
-        let bin = if matches!(op, UpdateOp::Inc) { BinOp::Add } else { BinOp::Sub };
+        // `NUM_STEP(tag, old)` computes `ToNumeric(old)` and `old ± 1` preserving
+        // the operand's numeric type — so `x++` on a BigInt stays a BigInt
+        // (`+old`/`old + 1` would throw the mix error). It pushes the coerced old
+        // value and returns the new value: stack `[tag, old]` → `[oldN, new]`.
+        let tag = if matches!(op, UpdateOp::Inc) { 1 } else { -1 };
+        b.emit(Op::LoadInt(tag), 0);
+        self.compile_expr(b, target)?; // [tag, old]
+        b.emit(Op::CallBuiltin(ops::NUM_STEP, 2), 0); // [oldN, new]
         if prefix {
-            // ++x: compute new, store, yield new.
-            let newv = Expr::Binary(bin, Box::new(target.clone()), Box::new(one));
-            self.compile_expr(b, &newv)?;
-            b.emit(Op::Dup, 0);
-            self.compile_bind(b, target, false)?;
+            // ++x: discard oldN, store new, yield new.
+            b.emit(Op::Swap, 0); // [new, oldN]
+            b.emit(Op::Pop, 0); // [new]
+            b.emit(Op::Dup, 0); // [new, new]
+            self.compile_bind(b, target, false)?; // stores new -> [new]
         } else {
-            // x++: yield old (as number), store new.
-            // Push old coerced to number (+old), keep a copy, add 1, store.
-            b.emit(Op::LoadInt(unop::POS), 0);
-            self.compile_expr(b, target)?;
-            b.emit(Op::CallBuiltin(ops::UNARY, 2), 0); // [oldNum]
-            b.emit(Op::Dup, 0); // [oldNum, oldNum]
-            b.emit(Op::LoadFloat(1.0), 0);
-            match op {
-                UpdateOp::Inc => b.emit(Op::Add, 0),
-                UpdateOp::Dec => b.emit(Op::Sub, 0),
-            };
-            self.compile_bind(b, target, false)?; // stores new -> [oldNum]
+            // x++: store new, yield oldN.
+            self.compile_bind(b, target, false)?; // stores new -> [oldN]
         }
         Ok(())
     }

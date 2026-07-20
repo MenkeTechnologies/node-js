@@ -14,8 +14,42 @@ constructs below. Each is a genuine gap, not something the harness hides.
 ## Implemented since the original object-model work (now fuzzed, not gaps)
 
 These were previously listed as unimplemented and are now covered — with
-dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`) that
-track the surface:
+dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
+`bigint`, `regex`) that track the surface:
+
+- **`BigInt`** — the `10n`/`0xffn`/`0o..n`/`0b..n` literal, a heap
+  `JsObj::BigInt(num_bigint::BigInt)` with `typeof === "bigint"`. Arithmetic
+  `+ - * / % **` (division/`%` truncate toward zero), bitwise `& | ^ << >>`
+  (arbitrary width; `>>>` throws as in JS), comparisons (`<`/`>` numeric, `==`
+  loose-coerces across Number, `===` false across types). **Mixing a BigInt with
+  a Number in arithmetic throws the exact Node `TypeError: Cannot mix BigInt and
+  other types, use explicit conversions`;** unary `+` on a BigInt throws;
+  `x++`/`x--` stay BigInt (type-preserving). Formatting: `String(10n) === "10"`,
+  `console.log(10n)` → `10n`, `(255n).toString(16)`, `JSON.stringify(1n)` throws.
+  The `BigInt(x)` constructor + `BigInt.asIntN`/`asUintN`. BigInt is a valid
+  Map/Set key.
+- **Regular expressions** — `/pat/flags` literals (with the regex-vs-divide
+  disambiguation) and `new RegExp(source[, flags])`, backed by the Rust `regex`
+  crate. `re.test`/`re.exec` (with `.index`/capture groups/named `.groups`/
+  `lastIndex` under `g`/`y`), and the String methods `match`/`matchAll`/`replace`/
+  `replaceAll`(with `$1`/`$&`/`` $` ``/`$'`/`$<name>`/`$$` + function replacers)/
+  `split`/`search`. Flags `g`/`i`/`m`/`s`/`u`/`y`/`d`. **Rust `regex` is NOT a JS
+  superset** — the exact supported subset and known divergences are in the
+  dedicated section below.
+- **Tagged templates** — `` tag`a${x}b` `` calls `tag(strings, ...values)` where
+  `strings` is the cooked-quasi array carrying a `.raw` array; `String.raw`.
+- **`for await (… of …)`** — async iteration over a `Symbol.asyncIterator`
+  object (whose `.next()` returns a promise of `{value,done}`) or, as the sync
+  fallback, over any iterable with each yielded value awaited.
+- **`generator.return()` / `.throw()` run `finally`** — `.return(v)` and
+  `.throw(e)` resume the suspended coroutine with an injected completion so a
+  pending `try { … } finally { … }` executes (and a `try/catch` in the body can
+  handle a `.throw`). A for-of `break` likewise closes the iterator (runs the
+  generator's `finally` / calls a user iterator's `.return()`).
+- **`util.inspect` array grouping** — `console.log` of an array with >6 elements
+  uses Node's multi-column, right-aligned (for all-numeric/BigInt) grid, a
+  faithful port of Node's `groupArrayElements` + single-line/one-per-line
+  decision (`breakLength` 80, `compact` 3).
 
 - **ES6 classes** — `class`/`extends`/`super(...)`/`super.method()`, constructor,
   instance + static methods, instance + static fields, `get`/`set` accessors,
@@ -53,34 +87,58 @@ track the surface:
 These are absent from the lexer/parser/compiler; a program using them fails
 loudly rather than producing a wrong result. The fuzzer does not generate them.
 
-- **Regular-expression literals** (`/pat/flags`) and the `RegExp` object. String
-  `replace`/`replaceAll`/`split` take only string arguments, not regexes.
-- **`BigInt`** — the `10n` literal and bigint arithmetic. All numbers are IEEE-754
-  `f64` (JS's single number type for non-bigint values).
-- **Async generators / async iteration** — `async function*` parses (the `async`
-  prefix is accepted) but `for await (…)` and the async-iterator protocol are not
-  modeled; a plain generator is produced.
-- **Tagged template literals** (`` tag`...` ``) and `String.raw`.
 - **Labeled statements** (`outer: for (...)` with `break outer`). Labels are
   parsed after `break`/`continue` but not bound to a target.
+- **`-x ** y`** — JS makes an unparenthesized unary minus directly before `**` a
+  `SyntaxError` (`(-x) ** y` or `-(x ** y)` is required). node-js's parser accepts
+  it and evaluates `-(x ** y)`. Applies to both Number and BigInt; the fuzzer
+  parenthesizes the base to avoid generating this ambiguous form.
+
+## Regular expressions — supported subset and known divergences
+
+node-js translates the **overlapping** subset of JS regex that the Rust `regex`
+crate can represent and **rejects the rest at RegExp-construction time** with a
+`SyntaxError` — it never silently mis-executes a pattern.
+
+**Supported:** character classes (`[a-z]`, `[^0-9]`), the predefined classes
+`\d \w \s \D \W \S` and word-boundary `\b`/`\B`, quantifiers (`* + ? {n} {n,}
+{n,m}` + lazy `?`), anchors `^ $`, capturing/non-capturing/named groups
+(`(...)`, `(?:...)`, `(?<name>...)`), alternation `|`, escapes, `\uXXXX`/`\u{...}`
+(translated to Rust `\x{...}`), and the flags `g` (global), `i` (ignoreCase), `m`
+(multiline), `s` (dotAll), `u`, `y` (sticky), `d` (accepted; indices ignored).
+`test`/`exec`/`match`/`matchAll`/`replace`/`replaceAll`/`split`/`search` and the
+`$1`/`$&`/`` $` ``/`$'`/`$<name>`/`$$` replacement patterns + function replacers.
+
+**Rejected (construction throws `SyntaxError`, never a wrong match):**
+
+- **Backreferences** (`\1`, `\k<name>`) — Rust `regex` has none.
+- **Lookahead / lookbehind** (`(?=)`, `(?!)`, `(?<=)`, `(?<!)`) — Rust `regex`
+  has no zero-width assertions of this kind.
+
+**Known behavioral divergences within the supported subset:**
+
+- **Unicode class semantics.** Rust `regex` runs in Unicode mode, so `\d`/`\w`/
+  `\s` match Unicode digit/word/space code points, whereas JS *without* the `u`
+  flag matches only the ASCII sets. Identical on ASCII input (the fuzzer's
+  `regex` mode uses ASCII inputs).
+- **`.index` on non-BMP input.** `exec`/`match` report the match position as a
+  Unicode *char* offset; JS uses UTF-16 code-unit offsets, so an astral-plane
+  character before the match shifts the index by one. Identical on BMP text.
+- **`exec`/non-global `match` result array display.** The result array carries
+  `.index`/`.input`/`.groups` own properties; `console.log` of the *raw* array
+  does not render those extra properties (Node does). Element access
+  (`m[0]`, `m.index`, `m.groups.x`) is correct — only the raw-array `util.inspect`
+  differs. The `regex` fuzzer mode accesses elements rather than printing the raw
+  array.
 
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
 
-- **`util.inspect` multi-line array grouping.** `console.log` of an array with
-  **more than 6 elements** is where node switches to its multi-column, multi-line
-  layout (`groupArrayElements`). node-js prints every array on a single line,
-  which matches node exactly for arrays of ≤6 elements but not beyond. Until the
-  grouping algorithm is ported, the fuzzer keeps generated arrays at ≤6 elements.
-  Nested-object/array width-based line breaking (breakLength 80) is likewise not
-  modelled.
-
-- **`generator.return()` / `.throw()` do not run `finally`.** Calling `.return(v)`
-  or `.throw(e)` on a suspended generator marks it done and reports the completion,
-  but does NOT resume the coroutine to execute a pending `try { … } finally { … }`
-  cleanup block (node runs the finalizer). The common `for-of` + `break` early-exit
-  path is unaffected (it simply abandons the iterator). The fuzzer does not
-  generate `.return()`/`.throw()` with a `finally`.
+- **Nested-object/array width-based line breaking.** `util.inspect` array
+  *grouping* (>6 elements) is ported faithfully, but the general `breakLength` 80
+  wrapping of nested objects — where a long single-line object/array is broken
+  onto multiple lines — is not modelled. A `>6`-element array nested inside an
+  object may also render at the wrong indentation. Top-level arrays match Node.
 
 - **`Number.prototype.toString(radix)` for a non-integer receiver.** The integer
   part is converted correctly for any radix 2..36; the **fractional** part is

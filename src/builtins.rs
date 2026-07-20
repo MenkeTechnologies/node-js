@@ -62,6 +62,130 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::AWAIT, b_await);
     vm.register_builtin(ops::DEF_ACCESSOR, b_def_accessor);
     vm.register_builtin(ops::DBG_LINE, b_dbg_line);
+    vm.register_builtin(ops::MKBIGINT, b_mkbigint);
+    vm.register_builtin(ops::MKREGEX, b_mkregex);
+    vm.register_builtin(ops::TAG_TMPL, b_tag_tmpl);
+    vm.register_builtin(ops::GET_ASYNC_ITER, b_get_async_iter);
+    vm.register_builtin(ops::ASYNC_STEP, b_async_step);
+    vm.register_builtin(ops::NUM_STEP, b_num_step);
+    vm.register_builtin(ops::ITER_CLOSE, b_iter_close);
+}
+
+/// `ITER_CLOSE`: close the iterator on the stack (a for-of `break`). A generator
+/// runs its pending `finally`; a user iterator object gets its `.return()` called
+/// if present; a plain materialized iterator just drops. Returns `undefined`.
+fn b_iter_close(vm: &mut VM, _: u8) -> Value {
+    let it = vm.pop();
+    if with_host(|h| h.is_generator_val(&it)) {
+        // Ignore the close outcome; a `finally` may print/yield but the loop is
+        // done. Preserve any error it raises (uncaught finally throw propagates).
+        if let Err(e) = host::gen_return(&it, Value::Undef) {
+            return abort(vm, e);
+        }
+        return Value::Undef;
+    }
+    // A user iterator object with a `.return()` method (iterator protocol close).
+    if matches!(with_host(|h| h.get(&it).cloned()), Some(JsObj::Object(_))) {
+        if let Some(f) = with_host(|h| host::lookup_chain(h, &it, "return")) {
+            if with_host(|h| host::is_callable(h, &f)) {
+                if let Err(e) = host::invoke(&f, Vec::new(), Some(it.clone())) {
+                    return abort(vm, e);
+                }
+            }
+        }
+    }
+    Value::Undef
+}
+
+/// `NUM_STEP`: the `++`/`--` core. Pops `old` and the step `tag` (`+1`/`-1`),
+/// pushes `ToNumeric(old)` (a BigInt stays a BigInt, else a Number), and returns
+/// `old ± 1` in the SAME numeric type — so `x++` on a BigInt neither coerces to
+/// Number nor throws the mix error.
+fn b_num_step(vm: &mut VM, _: u8) -> Value {
+    let old = vm.pop();
+    let tag = match vm.pop() {
+        Value::Int(n) => n,
+        Value::Float(f) => f as i64,
+        _ => 1,
+    };
+    if with_host(|h| h.is_bigint_val(&old)) {
+        let b = with_host(|h| h.as_bigint(&old)).unwrap();
+        let old_n = with_host(|h| h.new_bigint(b.clone()));
+        let new = with_host(|h| h.new_bigint(b + num_bigint::BigInt::from(tag)));
+        vm.push(old_n);
+        new
+    } else {
+        let n = with_host(|h| h.to_number(&old));
+        vm.push(Value::Float(n));
+        Value::Float(n + tag as f64)
+    }
+}
+
+/// `ASYNC_STEP`: one step of a `for await` loop — returns a Promise of the
+/// `{value, done}` record (see `host::async_step`).
+fn b_async_step(vm: &mut VM, _: u8) -> Value {
+    let iter = vm.pop();
+    let r = host::async_step(&iter);
+    finish(vm, r)
+}
+
+/// `MKBIGINT`: pop the canonical decimal digit string constant, allocate the heap
+/// BigInt. The lexer already validated the digits, so parsing cannot fail here.
+fn b_mkbigint(vm: &mut VM, _: u8) -> Value {
+    let digits = sval(&vm.pop());
+    match digits.parse::<num_bigint::BigInt>() {
+        Ok(b) => with_host(|h| h.new_bigint(b)),
+        Err(_) => abort(vm, host::type_error("invalid BigInt literal")),
+    }
+}
+
+/// `TAG_TMPL`: invoke a tagged template. The compiler emits the operands as
+/// `[tag, n, m, cooked×n, raw×n, values×m]` (see `compile_tagged_template`).
+/// Builds the `strings` array (carrying its `.raw` array) and calls
+/// `tag(strings, ...values)`.
+fn b_tag_tmpl(vm: &mut VM, argc: u8) -> Value {
+    let mut all = pop_n(vm, argc as usize);
+    let int_of = |v: &Value| match v {
+        Value::Int(n) => *n as usize,
+        Value::Float(f) => *f as usize,
+        _ => 0,
+    };
+    let tag = all.remove(0);
+    let n = int_of(&all.remove(0));
+    let mcount = int_of(&all.remove(0));
+    let cooked: Vec<Value> = all.drain(0..n.min(all.len())).collect();
+    let raw: Vec<Value> = all.drain(0..n.min(all.len())).collect();
+    let values: Vec<Value> = all.drain(0..mcount.min(all.len())).collect();
+    // strings = cooked array; strings.raw = raw array (frozen in JS; nothing here
+    // mutates it).
+    let strings = with_host(|h| h.new_array(cooked));
+    let raw_arr = with_host(|h| h.new_array(raw));
+    with_host(|h| h.set_fn_prop(&strings, "raw", raw_arr));
+    let mut call_args = vec![strings];
+    call_args.extend(values);
+    let r = host::invoke(&tag, call_args, None);
+    finish(vm, r)
+}
+
+/// `GET_ASYNC_ITER`: obtain an async iterator for `for await (… of …)`. If the
+/// value has a `Symbol.asyncIterator`, use it; otherwise fall back to its sync
+/// iterator (each yielded value is awaited). Returns the iterator object/handle.
+fn b_get_async_iter(vm: &mut VM, _: u8) -> Value {
+    let src = vm.pop();
+    let r = host::get_async_iterator(&src);
+    finish(vm, r)
+}
+
+/// `MKREGEX`: pop `(pattern, flags)`, translate the JS pattern to a Rust `regex`,
+/// and allocate a `RegExp`. A pattern using a JS feature Rust `regex` cannot
+/// express (backreference/lookaround) throws a `SyntaxError` here.
+fn b_mkregex(vm: &mut VM, _: u8) -> Value {
+    let flags = sval(&vm.pop());
+    let pattern = sval(&vm.pop());
+    match crate::regexp::build_regexp(&pattern, &flags) {
+        Ok(v) => v,
+        Err(e) => abort(vm, e),
+    }
 }
 
 /// DAP per-statement marker (`node --dap` only; the compiler emits this before
@@ -188,7 +312,15 @@ fn b_super_get(vm: &mut VM, _: u8) -> Value {
 fn b_yield(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
     match host::gen_yield(v) {
-        Ok(sent) => sent,
+        Ok(sent) => {
+            // A `.return()`/`.throw()` injected on resume sets a pending Return
+            // signal (or error); halt the chunk so the body unwinds through any
+            // enclosing `try/finally`, exactly like a source `return`/`throw`.
+            if with_host(|h| h.error.is_some() || h.signal.is_some()) {
+                vm.ip = vm.chunk.ops.len();
+            }
+            sent
+        }
         Err(e) => abort(vm, e),
     }
 }
@@ -396,6 +528,20 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
             "toString" => bound_method(recv, name),
             _ => Value::Undef,
         },
+        Some(JsObj::BigInt(_)) => {
+            if matches!(name, "toString" | "valueOf" | "toLocaleString" | "constructor") {
+                bound_method(recv, name)
+            } else {
+                Value::Undef
+            }
+        }
+        Some(JsObj::RegExp(r)) => crate::regexp::regexp_property(&r, name).unwrap_or_else(|| {
+            if crate::regexp::is_regexp_method(name) {
+                bound_method(recv, name)
+            } else {
+                Value::Undef
+            }
+        }),
         Some(JsObj::Map { entries, .. }) => match name {
             "size" => Value::Float(entries.len() as f64),
             "@@iterator" => bound_method(recv, name),
@@ -436,6 +582,10 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 items.get(i).cloned().unwrap_or(Value::Undef)
             } else if name == "@@iterator" || is_array_method(name) || is_object_method(name) {
                 bound_method(recv, name)
+            } else if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
+                // Extra own props attached to an array (e.g. `RegExp.exec` result's
+                // `.index`/`.input`/`.groups`).
+                v
             } else {
                 Value::Undef
             }
@@ -480,6 +630,8 @@ fn default_ctor_name(h: &host::JsHost, recv: &Value) -> Option<&'static str> {
         Some(JsObj::Promise { .. }) => Some("Promise"),
         Some(JsObj::Str(_)) => Some("String"),
         Some(JsObj::Symbol { .. }) => Some("Symbol"),
+        Some(JsObj::BigInt(_)) => Some("BigInt"),
+        Some(JsObj::RegExp(_)) => Some("RegExp"),
         Some(JsObj::Iter { .. }) => Some("Iterator"),
         Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => {
             Some("Function")
@@ -723,6 +875,9 @@ fn namespace_property(ns: &str, name: &str) -> Value {
     if ns == "Symbol" && name == "iterator" {
         return with_host(|h| h.well_known_iterator());
     }
+    if ns == "Symbol" && name == "asyncIterator" {
+        return with_host(|h| h.well_known_async_iterator());
+    }
     // Non-function constants on a stdlib namespace (`path.sep`, `os.EOL`,
     // `buffer.Buffer`, `url.URL`).
     if let Some(v) = crate::stdlib::constant(ns, name) {
@@ -763,6 +918,28 @@ fn set_property(recv: &Value, name: &str, val: Value) {
         with_host(|h| h.get(recv).cloned()),
         Some(JsObj::Func(_)) | Some(JsObj::Class(_))
     ) {
+        with_host(|h| h.set_fn_prop(recv, name, val));
+        return;
+    }
+    // `re.lastIndex = n` on a RegExp advances/resets its match cursor.
+    if name == "lastIndex" {
+        if let Some(n) = with_host(|h| match h.get(recv) {
+            Some(JsObj::RegExp(_)) => Some(h.to_number(&val)),
+            _ => None,
+        }) {
+            with_host(|h| {
+                if let Some(JsObj::RegExp(r)) = h.get_mut(recv) {
+                    r.last_index = if n.is_finite() && n >= 0.0 { n as usize } else { 0 };
+                }
+            });
+            return;
+        }
+    }
+    // An arbitrary own prop on an array (e.g. exec-result `.index`/`.input`).
+    if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Array(_)))
+        && name != "length"
+        && name.parse::<usize>().is_err()
+    {
         with_host(|h| h.set_fn_prop(recv, name, val));
         return;
     }
@@ -982,7 +1159,8 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n,
         _ => 0,
     };
-    with_host(|h| h.bitwise(tag, &a, &b))
+    let r = with_host(|h| h.bitwise(tag, &a, &b));
+    finish(vm, r)
 }
 
 fn b_unary(vm: &mut VM, _: u8) -> Value {
@@ -991,6 +1169,19 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n,
         _ => 0,
     };
+    // Unary `+`/`~` on a BigInt: `+` is a hard TypeError in JS; `~x` is `-x - 1`
+    // computed in arbitrary precision.
+    if with_host(|h| h.is_bigint_val(&v)) {
+        return match tag {
+            host::unop::POS => abort(vm, host::type_error("Cannot convert a BigInt value to a number")),
+            host::unop::BITNOT => {
+                let b = with_host(|h| h.as_bigint(&v)).unwrap();
+                let r = -(b + num_bigint::BigInt::from(1));
+                with_host(|h| h.new_bigint(r))
+            }
+            _ => Value::Undef,
+        };
+    }
     with_host(|h| match tag {
         host::unop::POS => Value::Float(h.to_number(&v)),
         host::unop::BITNOT => {
@@ -1374,6 +1565,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "EvalError",
     "URIError",
     "BigInt",
+    "RegExp",
     "queueMicrotask",
     "setTimeout",
     "setInterval",
@@ -1439,8 +1631,11 @@ const NS_METHODS: &[&str] = &[
     "Number.parseFloat",
     "String.fromCharCode",
     "String.fromCodePoint",
+    "String.raw",
     "Symbol.for",
     "Symbol.keyFor",
+    "BigInt.asIntN",
+    "BigInt.asUintN",
     "Reflect.ownKeys",
     "Reflect.has",
     "Reflect.get",
@@ -1500,6 +1695,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             }
         }
         "Number" => Ok(Value::Float(if args.is_empty() { 0.0 } else { with_host(|h| h.to_number(&args[0])) })),
+        "BigInt" => bigint_ctor(&arg0(&args)),
+        "RegExp" => regexp_ctor(&args),
+        "BigInt.asIntN" | "BigInt.asUintN" => bigint_as_n(name.ends_with("asUintN"), &args),
         "Boolean" => Ok(Value::Bool(with_host(|h| h.truthy(&arg0(&args))))),
         "String.fromCharCode" => Ok(with_host(|h| {
             let s: String = args
@@ -1508,6 +1706,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 .collect();
             h.new_str(s)
         })),
+        "String.raw" => string_raw(&args),
         "Array" | "Array.of" => Ok(with_host(|h| h.new_array(args))),
         "Array.isArray" => Ok(Value::Bool(matches!(with_host(|h| h.get(&arg0(&args)).cloned()), Some(JsObj::Array(_))))),
         "Array.from" => array_from(args),
@@ -1613,6 +1812,119 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
     }
 }
 
+/// `BigInt(x)`: convert a boolean/number/string/bigint to a BigInt. A
+/// non-integer number is a `RangeError`; an unparseable string a `SyntaxError`
+/// (matching Node's messages).
+fn bigint_ctor(v: &Value) -> Result<Value, String> {
+    use num_bigint::BigInt;
+    let big = match v {
+        Value::Bool(b) => BigInt::from(*b as i64),
+        Value::Int(n) => BigInt::from(*n),
+        Value::Float(f) => {
+            if !f.is_finite() || f.fract() != 0.0 {
+                let disp = with_host(|h| h.str_of(v));
+                return Err(format!(
+                    "RangeError: The number {disp} cannot be converted to a BigInt because it is not an integer"
+                ));
+            }
+            // Exact for the integer f64 range; larger integers round-trip via the
+            // decimal string.
+            match BigInt::parse_bytes(host::fmt_number(*f).as_bytes(), 10) {
+                Some(b) => b,
+                None => return Err(host::type_error("Cannot convert value to a BigInt")),
+            }
+        }
+        Value::Str(s) => match host::parse_bigint_str(s) {
+            Some(b) => b,
+            None => return Err(format!("SyntaxError: Cannot convert {s} to a BigInt")),
+        },
+        Value::Obj(_) => match with_host(|h| h.get(v).cloned()) {
+            Some(JsObj::BigInt(b)) => b,
+            Some(JsObj::Str(s)) => match host::parse_bigint_str(&s) {
+                Some(b) => b,
+                None => return Err(format!("SyntaxError: Cannot convert {s} to a BigInt")),
+            },
+            _ => return Err(host::type_error("Cannot convert value to a BigInt")),
+        },
+        _ => return Err(host::type_error("Cannot convert value to a BigInt")),
+    };
+    Ok(with_host(|h| h.new_bigint(big)))
+}
+
+/// `new RegExp(source[, flags])` / `RegExp(...)`. A first `RegExp` argument copies
+/// its source (and flags, unless new ones are given).
+fn regexp_ctor(args: &[Value]) -> Result<Value, String> {
+    let (source, existing_flags) = match with_host(|h| h.get(&arg0(args)).cloned()) {
+        Some(JsObj::RegExp(r)) => (r.source.clone(), Some(r.flags.clone())),
+        _ => {
+            let a0 = arg0(args);
+            let src = if matches!(a0, Value::Undef) {
+                String::new()
+            } else {
+                with_host(|h| h.str_of(&a0))
+            };
+            (src, None)
+        }
+    };
+    let flags = match args.get(1) {
+        Some(v) if !matches!(v, Value::Undef) => with_host(|h| h.str_of(v)),
+        _ => existing_flags.unwrap_or_default(),
+    };
+    // An empty source compiles as the JS canonical `(?:)`.
+    let src = if source.is_empty() { "(?:)".to_string() } else { source };
+    crate::regexp::build_regexp(&src, &flags)
+}
+
+/// `BigInt.asIntN(bits, x)` / `BigInt.asUintN(bits, x)`: wrap `x` to a `bits`-wide
+/// two's-complement (signed) or unsigned integer.
+fn bigint_as_n(unsigned: bool, args: &[Value]) -> Result<Value, String> {
+    use num_bigint::BigInt;
+    use num_traits::Signed;
+    let bits = with_host(|h| h.to_number(&arg0(args))) as i64;
+    if bits < 0 {
+        return Err("RangeError: Invalid value: not (convertible to) a safe integer".into());
+    }
+    let x = match with_host(|h| h.as_bigint(&args.get(1).cloned().unwrap_or(Value::Undef))) {
+        Some(b) => b,
+        None => return Err(host::type_error("Cannot convert to a BigInt")),
+    };
+    let bits = bits as u32;
+    if bits == 0 {
+        return Ok(with_host(|h| h.new_bigint(BigInt::from(0))));
+    }
+    let modulus = BigInt::from(1) << bits; // 2^bits
+    // Reduce into [0, 2^bits); for the signed form fold the top half negative.
+    let mut r = &x % &modulus;
+    if r.is_negative() {
+        r += &modulus;
+    }
+    if !unsigned {
+        let half = BigInt::from(1) << (bits - 1);
+        if r >= half {
+            r -= &modulus;
+        }
+    }
+    Ok(with_host(|h| h.new_bigint(r)))
+}
+
+/// `String.raw(callSite, ...subs)`: concatenate the raw quasis (`callSite.raw`)
+/// interleaved with the substitutions.
+fn string_raw(args: &[Value]) -> Result<Value, String> {
+    let call_site = arg0(args);
+    let raw = get_property(&call_site, "raw")?;
+    let raws = with_host(|h| h.iter_vec(&raw)).unwrap_or_default();
+    let mut out = String::new();
+    for (i, r) in raws.iter().enumerate() {
+        out.push_str(&with_host(|h| h.str_of(r)));
+        if i + 1 < raws.len() {
+            if let Some(sub) = args.get(i + 1) {
+                out.push_str(&with_host(|h| h.str_of(sub)));
+            }
+        }
+    }
+    Ok(with_host(|h| h.new_str(out)))
+}
+
 /// `Object(x)`: box/pass-through — for our model, non-object args just return a
 /// fresh object; objects pass through.
 fn object_call(args: Vec<Value>) -> Value {
@@ -1669,6 +1981,8 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
             Ok(s)
         }
         "Promise" => new_promise(arg0(&args)),
+        "RegExp" => regexp_ctor(&args),
+        "BigInt" => Err(host::type_error("BigInt is not a constructor")),
         "Error" => Ok(make_error(name, &args)),
         n if host::ERROR_NAMES.contains(&n) => Ok(make_error(name, &args)),
         _ => Err(host::type_error(&format!("{name} is not a constructor"))),
@@ -2007,6 +2321,11 @@ fn array_like_items(src: &Value) -> Vec<Value> {
 
 fn json_stringify(args: Vec<Value>) -> Result<Value, String> {
     let v = arg0(&args);
+    // A BigInt anywhere in a serializable position is a TypeError (JSON has no
+    // bigint form), matching Node's exact message.
+    if with_host(|h| json_has_bigint(h, &v)) {
+        return Err(host::type_error("Do not know how to serialize a BigInt"));
+    }
     let indent = match args.get(2) {
         Some(Value::Float(f)) => " ".repeat((*f as usize).min(10)),
         Some(other) => with_host(|h| h.as_str(other)).unwrap_or_default(),
@@ -2016,6 +2335,20 @@ fn json_stringify(args: Vec<Value>) -> Result<Value, String> {
     match s {
         Some(s) => Ok(with_host(|h| h.new_str(s))),
         None => Ok(Value::Undef),
+    }
+}
+
+/// Whether a value tree contains a `BigInt` in a position `JSON.stringify` would
+/// try to serialize (a value in an array/object) — such a value throws.
+fn json_has_bigint(h: &host::JsHost, v: &Value) -> bool {
+    match h.get(v) {
+        Some(JsObj::BigInt(_)) => true,
+        Some(JsObj::Array(items)) => items.iter().any(|x| json_has_bigint(h, x)),
+        Some(JsObj::Object(props)) => props
+            .iter()
+            .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
+            .any(|(_, val)| json_has_bigint(h, val)),
+        _ => false,
     }
 }
 
@@ -2282,7 +2615,40 @@ fn is_string_method(name: &str) -> bool {
             | "lastIndexOf" | "includes" | "slice" | "substring" | "substr" | "split" | "trim"
             | "trimStart" | "trimEnd" | "replace" | "replaceAll" | "repeat" | "startsWith"
             | "endsWith" | "padStart" | "padEnd" | "concat" | "at" | "toString" | "valueOf"
+            | "match" | "matchAll" | "search" | "normalize" | "localeCompare"
     )
+}
+
+/// Whether `v` is a `RegExp` value (drives the regex path of `match`/`replace`/…).
+fn is_regexp_arg(v: &Value) -> bool {
+    matches!(with_host(|h| h.get(v).cloned()), Some(JsObj::RegExp(_)))
+}
+
+/// `str.replace(strPattern, fn)` — a function replacer against a literal (string)
+/// pattern: replace the first (or all) occurrence, calling `fn(match, offset, s)`.
+fn replace_str_fn(s: &str, pat: &str, repl: &Value, all: bool) -> Result<String, String> {
+    if pat.is_empty() {
+        return Ok(s.to_string());
+    }
+    let mut out = String::new();
+    let mut rest = s;
+    let mut base = 0usize;
+    while let Some(pos) = rest.find(pat) {
+        out.push_str(&rest[..pos]);
+        let offset = base + pos;
+        let m = with_host(|h| h.new_str(pat.to_string()));
+        let str_arg = with_host(|h| h.new_str(s.to_string()));
+        let r = host::invoke(repl, vec![m, Value::Float(offset as f64), str_arg], None)?;
+        out.push_str(&with_host(|h| h.str_of(&r)));
+        let consumed = pos + pat.len();
+        base += consumed;
+        rest = &rest[consumed..];
+        if !all {
+            break;
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 fn is_number_method(name: &str) -> bool {
     matches!(name, "toFixed" | "toString" | "toPrecision" | "valueOf")
@@ -2300,6 +2666,8 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
         Some(JsObj::Promise { .. }) => promise_method(recv, name, args),
         Some(JsObj::Iter { .. }) => iter_method(recv, name, args),
         Some(JsObj::Symbol { .. }) => symbol_method(recv, name, args),
+        Some(JsObj::BigInt(b)) => bigint_method(&b, name, args),
+        Some(JsObj::RegExp(_)) => crate::regexp::regexp_method(recv, name, args),
         Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => {
             match function_builtin_method(recv, name, &args)? {
                 Some(v) => Ok(v),
@@ -2810,17 +3178,53 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         }
         "padStart" => Ok(new_s(pad(s, &args, true))),
         "padEnd" => Ok(new_s(pad(s, &args, false))),
+        // Regex-taking string methods: dispatch to the regexp module when the
+        // argument is a RegExp; otherwise keep the plain-string behavior.
+        "match" => crate::regexp::str_match(s, &arg0(&args)),
+        "matchAll" => crate::regexp::str_match_all(s, &arg0(&args)),
+        "search" => {
+            if is_regexp_arg(&arg0(&args)) {
+                crate::regexp::str_search(s, &arg0(&args))
+            } else {
+                // A string arg is coerced to a (literal) regex; we approximate with
+                // a plain substring search, which agrees for non-metacharacter
+                // needles.
+                let needle = with_host(|h| h.str_of(&arg0(&args)));
+                Ok(Value::Float(byte_to_char_index(s, s.find(&needle))))
+            }
+        }
         "replace" => {
-            let from = with_host(|h| h.str_of(&arg0(&args)));
-            let to = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            Ok(new_s(s.replacen(&from, &to, 1)))
+            let pat = arg0(&args);
+            let repl = args.get(1).cloned().unwrap_or(Value::Undef);
+            if is_regexp_arg(&pat) {
+                crate::regexp::str_replace_regex(s, &pat, &repl, false)
+            } else if with_host(|h| host::is_callable(h, &repl)) {
+                Ok(new_s(replace_str_fn(s, &with_host(|h| h.str_of(&pat)), &repl, false)?))
+            } else {
+                let from = with_host(|h| h.str_of(&pat));
+                let to = with_host(|h| h.str_of(&repl));
+                Ok(new_s(s.replacen(&from, &to, 1)))
+            }
         }
         "replaceAll" => {
-            let from = with_host(|h| h.str_of(&arg0(&args)));
-            let to = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            Ok(new_s(s.replace(&from, &to)))
+            let pat = arg0(&args);
+            let repl = args.get(1).cloned().unwrap_or(Value::Undef);
+            if is_regexp_arg(&pat) {
+                crate::regexp::str_replace_regex(s, &pat, &repl, true)
+            } else if with_host(|h| host::is_callable(h, &repl)) {
+                Ok(new_s(replace_str_fn(s, &with_host(|h| h.str_of(&pat)), &repl, true)?))
+            } else {
+                let from = with_host(|h| h.str_of(&pat));
+                let to = with_host(|h| h.str_of(&repl));
+                Ok(new_s(s.replace(&from, &to)))
+            }
         }
         "split" => {
+            if is_regexp_arg(&arg0(&args)) {
+                let limit = args.get(1).filter(|v| !matches!(v, Value::Undef))
+                    .map(|v| with_host(|h| h.to_number(v)) as usize);
+                return crate::regexp::str_split_regex(s, &arg0(&args), limit);
+            }
             let parts: Vec<Value> = if args.is_empty() || matches!(args[0], Value::Undef) {
                 vec![new_s(s.to_string())]
             } else {
@@ -2869,6 +3273,22 @@ fn pad(s: &str, args: &[Value], start: bool) -> String {
         format!("{padding}{s}")
     } else {
         format!("{s}{padding}")
+    }
+}
+
+/// `BigInt.prototype` methods: `toString([radix])`, `valueOf`, `toLocaleString`.
+fn bigint_method(b: &num_bigint::BigInt, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "toString" => {
+            let radix = args.first().map(|_| arg_num(&args, 0) as u32).unwrap_or(10);
+            if !(2..=36).contains(&radix) {
+                return Err("RangeError: toString() radix must be between 2 and 36".into());
+            }
+            Ok(new_s(b.to_str_radix(radix)))
+        }
+        "toLocaleString" => Ok(new_s(b.to_string())),
+        "valueOf" => Ok(with_host(|h| h.new_bigint(b.clone()))),
+        _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
 }
 
@@ -3210,14 +3630,21 @@ fn generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value,
             }
         }
         "return" => {
-            host::gen_close(recv);
-            Ok(iter_result(arg0(&args), true))
+            // Resume with an injected return so any pending `finally` runs; the
+            // completion may itself be a `finally` yield (not-done) or the value.
+            match host::gen_return(recv, arg0(&args))? {
+                host::GenStep::Yield(v) => Ok(iter_result(v, false)),
+                host::GenStep::Done(v) => Ok(iter_result(v, true)),
+            }
         }
         "throw" => {
-            // Minimal: closing the generator and propagating the thrown value.
-            host::gen_close(recv);
-            with_host(|h| h.exc = Some(arg0(&args)));
-            Err(with_host(|h| error_display(h, &arg0(&args))).replace("Uncaught ", ""))
+            // Inject a throw at the suspension point: an enclosing `try/catch` in
+            // the body can handle it (and any `finally` runs); otherwise it
+            // propagates to the caller.
+            match host::gen_throw(recv, arg0(&args))? {
+                host::GenStep::Yield(v) => Ok(iter_result(v, false)),
+                host::GenStep::Done(v) => Ok(iter_result(v, true)),
+            }
         }
         _ => Err(host::type_error(&format!("generator.{name} is not a function"))),
     }

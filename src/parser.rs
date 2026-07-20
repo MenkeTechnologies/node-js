@@ -519,6 +519,8 @@ impl Parser {
 
     fn parse_for(&mut self) -> Result<StmtKind, String> {
         self.advance();
+        // `for await (… of …)` — the async-iteration form (valid in an async body).
+        let is_await = self.eat_kw("await");
         self.expect_punct("(")?;
         // Optional declaration or expression init.
         let decl_kind = match self.tok() {
@@ -544,6 +546,7 @@ impl Parser {
                 target: first_target,
                 iter,
                 body,
+                is_await,
             });
         }
         if self.eat_kw("in") {
@@ -933,11 +936,35 @@ impl Parser {
                     args,
                     optional: false,
                 };
+            } else if matches!(self.tok(), Tok::Template { .. }) {
+                // A template literal immediately after a callee is a *tagged*
+                // template: `` tag`...` `` → `tag(strings, ...values)`.
+                e = self.parse_tagged_template(e)?;
             } else {
                 break;
             }
         }
         Ok(e)
+    }
+
+    /// Parse `` tag`a${x}b` `` into a `TaggedTemplate` node (the tag expression is
+    /// already parsed as `tag`, and the current token is the template).
+    fn parse_tagged_template(&mut self, tag: Expr) -> Result<Expr, String> {
+        let (quasis, raws, exprs_src) = match self.tok().clone() {
+            Tok::Template { quasis, raws, exprs } => (quasis, raws, exprs),
+            _ => unreachable!(),
+        };
+        self.advance();
+        let mut exprs = Vec::new();
+        for src in &exprs_src {
+            exprs.push(parse_expr_source(src)?);
+        }
+        Ok(Expr::TaggedTemplate {
+            tag: Box::new(tag),
+            quasis,
+            raws,
+            exprs,
+        })
     }
 
     /// Member chain without a trailing call — the `new X.Y` callee grammar.
@@ -991,11 +1018,19 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Number(n))
             }
+            Tok::BigInt(s) => {
+                self.advance();
+                Ok(Expr::BigInt(s))
+            }
+            Tok::Regex(pat, flags) => {
+                self.advance();
+                Ok(Expr::Regex(pat, flags))
+            }
             Tok::Str(s) => {
                 self.advance();
                 Ok(Expr::Str(s))
             }
-            Tok::Template { quasis, exprs } => {
+            Tok::Template { quasis, raws: _, exprs } => {
                 self.advance();
                 let mut parsed = Vec::new();
                 for src in &exprs {

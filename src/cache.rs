@@ -22,8 +22,11 @@ use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering / the shard layout.
 /// v1: initial JS bytecode cache — a Chunk/func/try layout change here must miss
-/// cleanly so an older cached `.js` never loads incompatible bytecode.
-const SCHEMA: u64 = 1;
+///     cleanly so an older cached `.js` never loads incompatible bytecode.
+/// v2: BigInt/RegExp/tagged-template/for-await lowering — new builtin ops
+///     (MKBIGINT/MKREGEX/NUM_STEP/TAG_TMPL/…) and the type-preserving `++`/`--`
+///     codegen; old cached bytecode would run the stale POS-based increment.
+const SCHEMA: u64 = 2;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
