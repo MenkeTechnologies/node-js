@@ -2716,7 +2716,16 @@ fn json_stringify(args: Vec<Value>) -> Result<Value, String> {
         Some(other) => with_host(|h| h.as_str(other)).unwrap_or_default(),
         None => String::new(),
     };
-    let s = with_host(|h| json_str(h, &v, &indent, 0));
+    // A replacer array (args[1]) restricts which object keys are serialized.
+    let keys: Option<Vec<String>> = args.get(1).and_then(|r| {
+        with_host(|h| match h.get(r) {
+            Some(JsObj::Array(items)) => {
+                Some(items.iter().map(|k| h.str_of(k)).collect::<Vec<_>>())
+            }
+            _ => None,
+        })
+    });
+    let s = with_host(|h| json_str(h, &v, &indent, 0, keys.as_deref()));
     match s {
         Some(s) => Ok(with_host(|h| h.new_str(s))),
         None => Ok(Value::Undef),
@@ -2737,7 +2746,8 @@ fn json_has_bigint(h: &host::JsHost, v: &Value) -> bool {
     }
 }
 
-fn json_str(h: &host::JsHost, v: &Value, indent: &str, depth: usize) -> Option<String> {
+fn json_str(h: &host::JsHost, v: &Value, indent: &str, depth: usize, keys: Option<&[String]>) -> Option<String> {
+    let sep = if indent.is_empty() { ":" } else { ": " };
     match v {
         Value::Undef => None,
         Value::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
@@ -2763,21 +2773,31 @@ fn json_str(h: &host::JsHost, v: &Value, indent: &str, depth: usize) -> Option<S
                 }
                 let parts: Vec<String> = items
                     .iter()
-                    .map(|x| json_str(h, x, indent, depth + 1).unwrap_or_else(|| "null".into()))
+                    .map(|x| json_str(h, x, indent, depth + 1, keys).unwrap_or_else(|| "null".into()))
                     .collect();
                 Some(wrap(&parts, "[", "]", indent, depth))
             }
             Some(JsObj::Object(props)) => {
-                let parts: Vec<String> = props
-                    .iter()
-                    .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
-                    .filter_map(|(k, val)| {
-                        json_str(h, val, indent, depth + 1).map(|vs| {
-                            let sep = if indent.is_empty() { ":" } else { ": " };
-                            format!("{}{sep}{vs}", json_quote(k))
+                // A replacer array restricts (and orders) which keys are emitted.
+                let parts: Vec<String> = match keys {
+                    Some(allow) => allow
+                        .iter()
+                        .filter_map(|k| {
+                            props.get(k).and_then(|val| {
+                                json_str(h, val, indent, depth + 1, keys)
+                                    .map(|vs| format!("{}{sep}{vs}", json_quote(k)))
+                            })
                         })
-                    })
-                    .collect();
+                        .collect(),
+                    None => props
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
+                        .filter_map(|(k, val)| {
+                            json_str(h, val, indent, depth + 1, keys)
+                                .map(|vs| format!("{}{sep}{vs}", json_quote(k)))
+                        })
+                        .collect(),
+                };
                 if parts.is_empty() {
                     return Some("{}".into());
                 }
@@ -2822,7 +2842,55 @@ fn json_parse(args: Vec<Value>) -> Result<Value, String> {
     p.skip_ws();
     let v = p.parse_value()?;
     p.skip_ws();
+    // Optional reviver: walk bottom-up, transforming each (key, value).
+    if let Some(reviver) = args.get(1).filter(|r| with_host(|h| host::is_callable(h, r))).cloned() {
+        return json_revive("", v, &reviver);
+    }
     Ok(v)
+}
+
+/// `JSON.parse` reviver walk: recurse into children first, then call
+/// `reviver(key, value)`; a returned `undefined` drops the property.
+fn json_revive(key: &str, val: Value, reviver: &Value) -> Result<Value, String> {
+    match with_host(|h| h.get(&val).cloned()) {
+        Some(JsObj::Array(items)) => {
+            for i in 0..items.len() {
+                let elem = with_host(|h| match h.get(&val) {
+                    Some(JsObj::Array(it)) => it[i].clone(),
+                    _ => Value::Undef,
+                });
+                let nv = json_revive(&i.to_string(), elem, reviver)?;
+                with_host(|h| {
+                    if let Some(JsObj::Array(it)) = h.get_mut(&val) {
+                        it[i] = nv;
+                    }
+                });
+            }
+        }
+        Some(JsObj::Object(props)) => {
+            let keys: Vec<String> =
+                props.keys().filter(|k| !k.starts_with("@@")).cloned().collect();
+            for k in keys {
+                let elem = with_host(|h| match h.get(&val) {
+                    Some(JsObj::Object(p)) => p.get(&k).cloned().unwrap_or(Value::Undef),
+                    _ => Value::Undef,
+                });
+                let nv = json_revive(&k, elem, reviver)?;
+                with_host(|h| {
+                    if let Some(JsObj::Object(p)) = h.get_mut(&val) {
+                        if matches!(nv, Value::Undef) {
+                            p.shift_remove(&k);
+                        } else {
+                            p.insert(k.clone(), nv);
+                        }
+                    }
+                });
+            }
+        }
+        _ => {}
+    }
+    let kv = with_host(|h| h.new_str(key.to_string()));
+    host::invoke(reviver, vec![kv, val], None)
 }
 
 struct JsonParser {
@@ -3550,6 +3618,28 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         }
         "toUpperCase" => Ok(new_s(s.to_uppercase())),
         "toLowerCase" => Ok(new_s(s.to_lowercase())),
+        // Locale comparison (ASCII approximation of ICU collation): primary by
+        // case-folded order, then lowercase sorts before uppercase at a tie.
+        "localeCompare" => {
+            let other = with_host(|h| h.str_of(&arg0(&args)));
+            let (la, lb) = (s.to_lowercase(), other.to_lowercase());
+            let r = match la.cmp(&lb) {
+                std::cmp::Ordering::Less => -1.0,
+                std::cmp::Ordering::Greater => 1.0,
+                std::cmp::Ordering::Equal => {
+                    let mut t = 0.0;
+                    for (ca, cb) in s.chars().zip(other.chars()) {
+                        if ca != cb {
+                            t = if ca.is_lowercase() { -1.0 } else { 1.0 };
+                            break;
+                        }
+                    }
+                    t
+                }
+            };
+            Ok(Value::Float(r))
+        }
+        "normalize" => Ok(new_s(s.to_string())),
         "trim" => Ok(new_s(s.trim().to_string())),
         "trimStart" => Ok(new_s(s.trim_start().to_string())),
         "trimEnd" => Ok(new_s(s.trim_end().to_string())),
