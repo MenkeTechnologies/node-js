@@ -142,7 +142,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// Space-join every argument through the shared console formatter (identical to
 /// the global `console.log` path in `builtins::print_line`).
 fn format_args(args: &[Value]) -> String {
-    with_host(|h| args.iter().map(|a| h.console_format(a)).collect::<Vec<_>>().join(" "))
+    // console.log(...args) === util.format(...args): printf substitution when the
+    // first arg is a format string, else inspect-and-join.
+    super::util::format(args)
 }
 
 /// The label argument (`args[0]`) as a string, or `fallback` when absent.

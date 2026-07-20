@@ -106,6 +106,11 @@ pub fn format(args: &[Value]) -> String {
     if args.is_empty() {
         return String::new();
     }
+    // Node: a single argument is returned as-is (no specifier processing) —
+    // `util.format("100%% done")` === "100%% done".
+    if args.len() == 1 {
+        return with_host(|h| h.console_format(&args[0]));
+    }
     let fmt = with_host(|h| h.str_of(&args[0]));
     // A non-string first argument: inspect everything, space-joined.
     if !matches!(args[0], Value::Str(_)) && !with_host(|h| matches!(h.get(&args[0]), Some(JsObj::Str(_)))) {
@@ -137,7 +142,14 @@ pub fn format(args: &[Value]) -> String {
         let arg = &args[ai];
         ai += 1;
         match spec {
-            's' => out.push_str(&with_host(|h| h.str_of(arg))),
+            // Node's %s renders a BigInt with the trailing `n` (unlike String()).
+            's' => {
+                let s = with_host(|h| match h.get(arg) {
+                    Some(JsObj::BigInt(b)) => format!("{b}n"),
+                    _ => h.str_of(arg),
+                });
+                out.push_str(&s);
+            }
             'd' | 'i' => {
                 let n = with_host(|h| h.to_number(arg));
                 out.push_str(&if n.is_nan() { "NaN".into() } else { (n.trunc() as i64).to_string() });

@@ -1809,6 +1809,7 @@ const NS_METHODS: &[&str] = &[
     "Object.entries",
     "Object.assign",
     "Object.freeze",
+    "Object.is",
     "Object.fromEntries",
     "Object.getPrototypeOf",
     "Object.setPrototypeOf",
@@ -1977,6 +1978,30 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.entries" => object_keys(args, 2),
         "Object.assign" => object_assign(args),
         "Object.freeze" => Ok(arg0(&args)),
+        // Object.is — SameValue: like `===` but NaN is equal to NaN and +0 is
+        // distinct from -0.
+        "Object.is" => {
+            let a = arg0(&args);
+            let b = args.get(1).cloned().unwrap_or(Value::Undef);
+            let num = |v: &Value| match v {
+                Value::Int(n) => Some(*n as f64),
+                Value::Float(f) => Some(*f),
+                _ => None,
+            };
+            let r = match (num(&a), num(&b)) {
+                (Some(x), Some(y)) => {
+                    if x.is_nan() && y.is_nan() {
+                        true
+                    } else if x == 0.0 && y == 0.0 {
+                        x.is_sign_negative() == y.is_sign_negative()
+                    } else {
+                        x == y
+                    }
+                }
+                _ => with_host(|h| h.strict_eq(&a, &b)),
+            };
+            Ok(Value::Bool(r))
+        }
         "Object.fromEntries" => object_from_entries(args),
         "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => Ok(with_host(|h| h.proto_of(&arg0(&args)).unwrap_or_else(|| h.null()))),
         "Object.setPrototypeOf" => {
@@ -2282,9 +2307,9 @@ fn make_error(name: &str, args: &[Value]) -> Value {
 }
 
 fn print_line(args: &[Value], stderr: bool) {
-    let line: String = with_host(|h| {
-        args.iter().map(|a| h.console_format(a)).collect::<Vec<_>>().join(" ")
-    });
+    // Node's console.log(...args) === util.format(...args): printf-style
+    // substitution when the first arg is a format string, else inspect-and-join.
+    let line: String = crate::stdlib::util::format(args);
     if stderr {
         eprintln!("{line}");
     } else {
@@ -3139,9 +3164,15 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             Ok(Value::Float(idx.map(|i| i as f64).unwrap_or(-1.0)))
         }
         "includes" => {
+            // Array.includes uses SameValueZero: unlike `===`, NaN matches NaN.
             let items = array_items(recv);
             let target = arg0(&args);
-            Ok(Value::Bool(with_host(|h| items.iter().any(|x| h.strict_eq(x, &target)))))
+            let tnan = matches!(target, Value::Float(f) if f.is_nan());
+            Ok(Value::Bool(with_host(|h| {
+                items.iter().any(|x| {
+                    (tnan && matches!(x, Value::Float(f) if f.is_nan())) || h.strict_eq(x, &target)
+                })
+            })))
         }
         "slice" => {
             let items = array_items(recv);
@@ -3659,7 +3690,7 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                     .map(|v| with_host(|h| h.to_number(v)) as usize);
                 return crate::regexp::str_split_regex(s, &arg0(&args), limit);
             }
-            let parts: Vec<Value> = if args.is_empty() || matches!(args[0], Value::Undef) {
+            let mut parts: Vec<Value> = if args.is_empty() || matches!(args[0], Value::Undef) {
                 vec![new_s(s.to_string())]
             } else {
                 let sep = with_host(|h| h.str_of(&args[0]));
@@ -3669,6 +3700,13 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                     s.split(&sep as &str).map(|p| new_s(p.to_string())).collect()
                 }
             };
+            // Optional limit: keep at most `limit` substrings.
+            if let Some(lim) = args.get(1).filter(|v| !matches!(v, Value::Undef)) {
+                let n = with_host(|h| h.to_number(lim));
+                if n.is_finite() && n >= 0.0 {
+                    parts.truncate(n as usize);
+                }
+            }
             Ok(with_host(|h| h.new_array(parts)))
         }
         _ => Err(host::type_error(&format!("{name} is not a function"))),

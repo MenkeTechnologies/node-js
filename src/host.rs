@@ -1080,10 +1080,27 @@ impl JsHost {
             Value::Obj(_) => match self.get(v) {
                 Some(JsObj::Str(_)) => "string",
                 Some(JsObj::Func(_))
-                | Some(JsObj::Builtin(_))
                 | Some(JsObj::BoundMethod { .. })
                 | Some(JsObj::BoundFunc { .. })
                 | Some(JsObj::Class(_)) => "function",
+                // A Builtin is a callable (`Array`, `parseInt`, `Math.floor`) —
+                // `typeof === "function"` — EXCEPT the non-callable namespace
+                // objects (`Math`, `JSON`, `require('fs')`, …) which are "object".
+                Some(JsObj::Builtin(n)) => {
+                    const NON_CALLABLE_NS: &[&str] = &[
+                        "Math", "JSON", "console", "Reflect", "process", "Atomics",
+                        "performance", "fs", "path", "os", "util", "crypto", "querystring",
+                        "events", "stream", "timers", "perf_hooks", "async_hooks",
+                        "diagnostics_channel", "v8", "dns", "punycode", "child_process",
+                        "tty", "url", "zlib", "string_decoder", "assert", "http", "net",
+                        "buffer",
+                    ];
+                    if NON_CALLABLE_NS.contains(&n.as_str()) {
+                        "object"
+                    } else {
+                        "function"
+                    }
+                }
                 Some(JsObj::Symbol { .. }) => "symbol",
                 Some(JsObj::BigInt(_)) => "bigint",
                 _ => "object", // arrays, objects, null, Map/Set, generators
@@ -1790,6 +1807,12 @@ fn str_to_number(s: &str) -> f64 {
     }
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         return i64::from_str_radix(hex, 16).map(|n| n as f64).unwrap_or(f64::NAN);
+    }
+    if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        return i64::from_str_radix(oct, 8).map(|n| n as f64).unwrap_or(f64::NAN);
+    }
+    if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        return i64::from_str_radix(bin, 2).map(|n| n as f64).unwrap_or(f64::NAN);
     }
     match t {
         "Infinity" | "+Infinity" => f64::INFINITY,

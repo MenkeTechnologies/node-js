@@ -174,9 +174,19 @@ fn remove(recv: &Value, name: &str, f: Option<Value>) {
                     _ => None,
                 };
                 if let Some(a) = arr {
-                    if let Some(JsObj::Array(items)) = h.get_mut(&a) {
+                    let now_empty = if let Some(JsObj::Array(items)) = h.get_mut(&a) {
                         if let Some(pos) = items.iter().position(|x| x == &f) {
                             items.remove(pos);
+                        }
+                        items.is_empty()
+                    } else {
+                        false
+                    };
+                    // Node drops an event key once its last listener is removed,
+                    // so `eventNames()` no longer lists it.
+                    if now_empty {
+                        if let Some(JsObj::Object(p)) = h.get_mut(&map) {
+                            p.shift_remove(name);
                         }
                     }
                 }
