@@ -27,6 +27,22 @@ reads a script from standard input and runs it.
 .B \-e \fISRC\fR, \-\-eval \fISRC\fR
 Evaluate a one\-liner instead of a file.
 .TP
+.B \-\-dump\-tokens
+Print the lexer token stream for
+.I FILE
+(one \fIline\fR and token per line) and exit, instead of running it.
+.TP
+.B \-\-dump\-ast
+Print the parsed AST for
+.I FILE
+and exit, instead of running it.
+.TP
+.B \-\-disasm
+Print a fusevm bytecode disassembly listing for
+.I FILE
+(the main chunk, every user function's chunk, and every try block) and exit,
+instead of running it.
+.TP
 .B \-h, \-\-help
 Print help and exit.
 .TP

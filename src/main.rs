@@ -36,6 +36,15 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e),
             };
         }
+        if cli.dump_tokens {
+            return finish(dump_tokens(&file));
+        }
+        if cli.dump_ast {
+            return finish(dump_ast(&file));
+        }
+        if cli.disasm {
+            return finish(disasm(&file));
+        }
         if cli.build {
             return match nodejs::aot::build(&file) {
                 Ok(msg) => {
@@ -81,6 +90,51 @@ fn dump(file: &str) -> Result<(), String> {
         println!("== try #{i} ==\n{:#?}", t.block.ops);
     }
     Ok(())
+}
+
+/// `--dump-tokens`: print the lexer token stream, one `line\tTok` per line.
+fn dump_tokens(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    for t in nodejs::lexer::lex(&src)? {
+        println!("{}\t{:?}", t.line, t.tok);
+    }
+    Ok(())
+}
+
+/// `--dump-ast`: print the parsed JS AST.
+fn dump_ast(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let stmts = nodejs::parser::parse(&src)?;
+    println!("{stmts:#?}");
+    Ok(())
+}
+
+/// `--disasm`: print a fusevm bytecode disassembly of the main chunk, every
+/// compiled function, and every try block, via the shared
+/// `fusevm::Chunk::disassemble` (distinct from `--dump-bytecode`'s raw `.ops`).
+fn disasm(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let prog = nodejs::compile(&src)?;
+    println!("; node fusevm — main\n{}", prog.main.disassemble());
+    for (name, f) in &prog.functions {
+        let params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        println!(
+            "; node fusevm — function {name} ({})\n{}",
+            params.join(", "),
+            f.chunk.disassemble()
+        );
+    }
+    for (i, t) in prog.tries.iter().enumerate() {
+        println!("; node fusevm — try #{i}\n{}", t.block.disassemble());
+    }
+    Ok(())
+}
+
+fn finish(r: Result<(), String>) -> ExitCode {
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
 }
 
 fn atty_stdin() -> bool {

@@ -3,6 +3,9 @@
 _node() {
   _arguments -s \
     '(-e --eval)'{-e,--eval}'[evaluate a one-liner instead of a file]:source' \
+    '--dump-tokens[print the lexer token stream for the script and exit]' \
+    '--dump-ast[print the parsed AST for the script and exit]' \
+    '--disasm[print a fusevm bytecode disassembly listing and exit]' \
     '(-h --help)'{-h,--help}'[show help]' \
     '(-V --version)'{-V,--version}'[show version]' \
     '*:JavaScript file:_files -g "*.js"'
