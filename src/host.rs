@@ -18,6 +18,15 @@ use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
+
+/// A unit of I/O work handed from a background I/O thread to the main-thread
+/// event loop. It is a boxed closure so `host.rs` stays agnostic of `net`/`http`:
+/// the I/O thread captures only plain `Send` data (bytes, ids, `TcpStream`s) and
+/// the closure runs the JS-touching dispatch on the main thread (where the
+/// thread-local host lives). I/O threads NEVER touch the host directly.
+pub type IoTask = Box<dyn FnOnce() -> Result<(), String> + Send>;
 
 /// Builtin ids emitted by the compiler and registered on every VM. The compiler
 /// (`compiler.rs`) and the handler table (`builtins.rs::install`) must agree on
@@ -398,6 +407,18 @@ pub struct JsHost {
     pub macrotasks: Vec<Timer>,
     /// Monotonic timer-id source.
     next_timer: u64,
+    /// Cloned by I/O worker threads to post `IoTask`s back to the main-thread
+    /// event loop. Kept alive for the host's lifetime so the loop's `recv` never
+    /// sees a spurious `Disconnected` while a server is running.
+    io_tx: Sender<IoTask>,
+    /// Owned by the event loop (taken out for the blocking `recv`). Receives the
+    /// `IoTask`s posted by I/O threads.
+    io_rx: Option<Receiver<IoTask>>,
+    /// Ref-count of "things keeping the process alive": open listeners, live
+    /// sockets, ref'd handles. The loop exits only when this is `0` AND both task
+    /// queues are empty. A pure script never touches it, so it exits exactly as
+    /// before.
+    open_handles: usize,
 }
 
 /// A queued unit of work: either a JS callback invocation (`queueMicrotask`,
@@ -425,6 +446,10 @@ pub struct Timer {
     pub callback: Value,
     pub args: Vec<Value>,
     pub cancelled: bool,
+    /// Real wall-clock deadline (`now + delay`), used only on the blocking I/O
+    /// path (`open_handles > 0`). With no open handles the loop stays on the
+    /// deterministic virtual clock and ignores this.
+    pub deadline: Instant,
 }
 
 /// One suspended generator. `coro` is `None` only while actively running (taken
@@ -492,6 +517,7 @@ impl Default for JsHost {
 impl JsHost {
     pub fn new() -> JsHost {
         let module_env = new_env(None);
+        let (io_tx, io_rx) = std::sync::mpsc::channel();
         let mut h = JsHost {
             heap: Vec::new(),
             funcs: Vec::new(),
@@ -524,6 +550,9 @@ impl JsHost {
             nextticks: std::collections::VecDeque::new(),
             macrotasks: Vec::new(),
             next_timer: 1,
+            io_tx,
+            io_rx: Some(io_rx),
+            open_handles: 0,
         };
         h.null_val = h.alloc(JsObj::Null);
         // `Object.prototype`: the chain root, its own `[[Prototype]]` is null.
@@ -3071,6 +3100,9 @@ impl JsHost {
     pub fn add_timer(&mut self, delay: f64, callback: Value, args: Vec<Value>) -> u64 {
         let id = self.next_timer;
         self.next_timer += 1;
+        // Real deadline for the blocking I/O path; `setImmediate` (delay < 0) is
+        // clamped to "now". Virtual-clock ordering still uses `delay`/`seq`.
+        let deadline = Instant::now() + Duration::from_millis(delay.max(0.0) as u64);
         self.macrotasks.push(Timer {
             id,
             delay,
@@ -3078,8 +3110,47 @@ impl JsHost {
             callback,
             args,
             cancelled: false,
+            deadline,
         });
         id
+    }
+    /// Clone the I/O sender for a background I/O thread.
+    pub fn io_sender(&self) -> Sender<IoTask> {
+        self.io_tx.clone()
+    }
+    /// Register a live handle (listener/socket/ref'd resource) keeping the loop
+    /// alive.
+    pub fn incr_handle(&mut self) {
+        self.open_handles += 1;
+    }
+    /// Release a handle; the loop exits once this reaches `0` with empty queues.
+    pub fn decr_handle(&mut self) {
+        self.open_handles = self.open_handles.saturating_sub(1);
+    }
+    pub fn open_handles(&self) -> usize {
+        self.open_handles
+    }
+    /// Pop the earliest timer whose real deadline is at or before `now` (I/O
+    /// path). Ties break by `seq`.
+    fn pop_due_timer(&mut self, now: Instant) -> Option<Timer> {
+        let idx = self
+            .macrotasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.cancelled && t.deadline <= now)
+            .min_by(|(_, a), (_, b)| a.deadline.cmp(&b.deadline).then(a.seq.cmp(&b.seq)))
+            .map(|(i, _)| i);
+        idx.map(|i| self.macrotasks.remove(i))
+    }
+    /// Time until the earliest pending timer's deadline (I/O path blocking bound),
+    /// or `None` if no timers are pending. Clamped to `0` for already-due timers.
+    fn next_timer_timeout(&self, now: Instant) -> Option<Duration> {
+        self.macrotasks
+            .iter()
+            .filter(|t| !t.cancelled)
+            .map(|t| t.deadline)
+            .min()
+            .map(|d| d.saturating_duration_since(now))
     }
     pub fn cancel_timer(&mut self, id: u64) {
         for t in &mut self.macrotasks {
@@ -3113,28 +3184,74 @@ impl JsHost {
     }
 }
 
-/// Drive the event loop to quiescence: drain all microtasks, then fire the
-/// earliest timer, then drain microtasks again, until both queues are empty.
-/// Errors thrown by a task/timer abort the loop (uncaught → surfaced).
+/// Drive the event loop to quiescence.
+///
+/// Two regimes, selected per iteration by `open_handles`:
+///
+/// - **No open handles (pure script / timers only):** the original deterministic
+///   virtual clock — drain microtasks, fire the earliest `(delay, seq)` timer
+///   immediately (no real waiting), repeat until both queues empty, then EXIT.
+///   Parity output and test speed are unchanged.
+/// - **Open handles (a server is listening / sockets are live):** drain
+///   microtasks, fire every timer whose real deadline has passed, then BLOCK on
+///   the I/O channel (`recv_timeout` bounded by the next timer's real deadline,
+///   or unbounded `recv` if no timers) and run the received `IoTask` on the main
+///   thread. The host keeps its own `Sender`, so `recv` never disconnects while
+///   the process should stay alive.
+///
+/// Errors thrown by a task/timer/I/O dispatch abort the loop (uncaught → surfaced).
 pub fn run_event_loop() -> Result<(), String> {
+    // Own the receiver for the loop's duration (blocking `recv` cannot hold a
+    // host borrow); restore it afterward so a re-entrant run reuses the channel.
+    let rx = with_host(|h| h.io_rx.take());
+    let result = drive_event_loop(rx.as_ref());
+    with_host(|h| h.io_rx = rx);
+    result
+}
+
+fn drive_event_loop(rx: Option<&Receiver<IoTask>>) -> Result<(), String> {
     loop {
         // 1) Exhaust the microtask queue (nextTick before promise reactions).
         while let Some(task) = with_host(|h| h.next_microtask()) {
             task.run()?;
         }
-        // 2) One macrotask (timer), then back to microtasks.
-        match with_host(|h| h.pop_next_timer()) {
-            Some(t) => {
-                invoke(&t.callback, t.args, None)?;
-            }
-            None => {
-                if !with_host(|h| h.has_microtasks()) {
-                    break;
+
+        if with_host(|h| h.open_handles()) == 0 {
+            // ── virtual-clock regime (unchanged behavior) ────────────────────
+            match with_host(|h| h.pop_next_timer()) {
+                Some(t) => {
+                    invoke(&t.callback, t.args, None)?;
+                }
+                None => {
+                    if !with_host(|h| h.has_microtasks()) {
+                        break;
+                    }
                 }
             }
+            if !with_host(|h| h.has_microtasks() || h.has_macrotasks()) {
+                break;
+            }
+            continue;
         }
-        if !with_host(|h| h.has_microtasks() || h.has_macrotasks()) {
-            break;
+
+        // ── real-clock / blocking-I/O regime ─────────────────────────────────
+        let now = Instant::now();
+        if let Some(t) = with_host(|h| h.pop_due_timer(now)) {
+            invoke(&t.callback, t.args, None)?;
+            continue; // re-drain microtasks, re-check deadlines
+        }
+        // Nothing due and no pending microtasks: block for the next I/O event,
+        // bounded by the soonest timer deadline so due timers still fire on time.
+        let rx = rx.expect("blocking-I/O regime requires the I/O receiver");
+        let timeout = with_host(|h| h.next_timer_timeout(now));
+        let recv = match timeout {
+            Some(d) => rx.recv_timeout(d),
+            None => rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match recv {
+            Ok(task) => task()?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {} // a timer is now due
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // no senders left
         }
     }
     Ok(())

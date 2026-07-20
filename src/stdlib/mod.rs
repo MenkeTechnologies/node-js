@@ -23,8 +23,11 @@ pub mod buffer;
 pub mod crypto;
 pub mod events;
 pub mod fs;
+pub mod http;
+pub mod net;
 pub mod os;
 pub mod path;
+pub mod stream;
 pub mod url;
 pub mod util;
 
@@ -41,6 +44,9 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "buffer" => Some("buffer"),
         "url" => Some("url"),
         "process" => Some("process"),
+        "net" => Some("net"),
+        "http" => Some("http"),
+        "stream" => Some("stream"),
         // The `events` module's export IS the EventEmitter constructor, so
         // `require('events')` yields the ctor namespace directly.
         "events" => Some("EventEmitter"),
@@ -64,6 +70,8 @@ pub fn is_method(qualified: &str) -> bool {
         "Buffer" => buffer::STATIC_METHODS.contains(&m),
         "buffer" => m == "Buffer",
         "url" => url::MODULE_METHODS.contains(&m) || m == "URL",
+        "net" => net::MODULE_METHODS.contains(&m),
+        "http" => http::MODULE_METHODS.contains(&m),
         "EventEmitter" => m == "EventEmitter",
         _ => false,
     }
@@ -88,6 +96,8 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "buffer" if m == "Buffer" => Ok(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into())))),
         "url" if m == "URL" => Ok(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
         "url" => url::call(m, args)?,
+        "net" => net::call(m, args)?,
+        "http" => http::call(m, args)?,
         "EventEmitter" if m == "EventEmitter" => {
             Ok(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
         }
@@ -105,6 +115,7 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
             Some(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into()))))
         }
         "url" if name == "URL" => Some(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
+        "stream" => stream::constant(name),
         "EventEmitter" if name == "EventEmitter" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
         }
@@ -120,6 +131,7 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "URL" => Some(url::construct(args)),
         "EventEmitter" => Some(Ok(events::new_emitter())),
         "Buffer" => Some(buffer::static_call("from", args).unwrap_or(Ok(Value::Undef))),
+        n if stream::is_class(n) => Some(Ok(stream::construct(n))),
         _ => None,
     }
 }
@@ -143,6 +155,9 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "EventEmitter" => events::instance_call(recv, method, args),
         "URL" => url::instance_call(recv, method, &args),
         "Stats" => fs::stats_call(recv, method),
+        "Server" | "Socket" => net::instance_call(tag, recv, method, args),
+        "IncomingMessage" | "ServerResponse" => http::instance_call(tag, recv, method, args),
+        "Readable" | "Writable" | "Duplex" | "Transform" => stream::instance_call(tag, recv, method, args),
         _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
     }
 }
