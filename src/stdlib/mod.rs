@@ -50,6 +50,11 @@ pub mod v8;
 pub mod fs_promises;
 pub mod readline;
 pub mod vm;
+pub mod dgram;
+pub mod https;
+pub mod repl;
+pub mod tls;
+pub mod worker_threads;
 
 /// Native-heavy core modules that node-js does not yet implement (TLS handshakes,
 /// HTTP/2 framing, OS worker threads sharing the thread-local heap, UDP sockets,
@@ -58,8 +63,7 @@ pub mod vm;
 /// a method throws `Error: <mod>.<method> is not implemented in node-js`. This is
 /// an honest not-yet-built surface, never a silent fake.
 pub const UNIMPLEMENTED_MODULES: &[&str] = &[
-    "tls", "http2", "https", "worker_threads", "cluster", "dgram", "inspector",
-    "wasi", "trace_events", "domain", "repl", "dns/promises",
+    "http2", "cluster", "inspector", "wasi", "trace_events", "domain", "dns/promises",
 ];
 
 /// True if `ns` is a known-but-unimplemented core module (see `UNIMPLEMENTED_MODULES`).
@@ -108,6 +112,11 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "readline" => Some("readline"),
         "vm" => Some("vm"),
         "fs/promises" => Some("fs/promises"),
+        "dgram" => Some("dgram"),
+        "worker_threads" => Some("worker_threads"),
+        "tls" => Some("tls"),
+        "https" => Some("https"),
+        "repl" => Some("repl"),
         other => UNIMPLEMENTED_MODULES.iter().copied().find(|&m| m == other),
     }
 }
@@ -152,6 +161,10 @@ pub fn is_method(qualified: &str) -> bool {
         "readline" => readline::METHODS.contains(&m),
         "vm" => vm::METHODS.contains(&m),
         "fs/promises" => fs_promises::METHODS.contains(&m),
+        "dgram" => dgram::MODULE_METHODS.contains(&m),
+        "tls" => tls::MODULE_METHODS.contains(&m),
+        "https" => https::MODULE_METHODS.contains(&m),
+        "repl" => repl::METHODS.contains(&m),
         // Any method on an unimplemented namespace routes to `call`, which throws
         // an honest "not implemented" error (so `mod.foo()` fails clearly rather
         // than silently returning undefined).
@@ -204,6 +217,10 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "readline" => readline::call(m, args)?,
         "vm" => vm::call(m, args)?,
         "fs/promises" => fs_promises::call(m, args)?,
+        "dgram" => dgram::call(m, args)?,
+        "tls" => tls::call(m, args)?,
+        "https" => https::call(m, args)?,
+        "repl" => repl::call(m, args)?,
         _ if is_unimplemented(ns) => {
             Err(format!("Error: {ns}.{m} is not implemented in node-js"))
         }
@@ -248,6 +265,8 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "fs" if name == "promises" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("fs/promises".into()))))
         }
+        "worker_threads" => worker_threads::constant(name),
+        "https" => https::constant(name),
         "util" if name == "types" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("util/types".into()))))
         }
@@ -273,6 +292,7 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "AsyncLocalStorage" | "AsyncResource" => async_hooks::construct(name, args),
         "Script" => Some(vm::construct(args)),
         "URLSearchParams" => Some(url::construct_search_params(args)),
+        "Worker" => Some(worker_threads::construct_worker(args)),
         _ => None,
     }
 }
@@ -325,12 +345,21 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "Interface" => readline::INTERFACE_METHODS,
         "Script" => vm::SCRIPT_METHODS,
         "URLSearchParams" => url::SEARCH_PARAMS_METHODS,
+        "UdpSocket" => dgram::SOCKET_METHODS,
+        "Worker" => worker_threads::WORKER_METHODS,
+        "MessagePort" => worker_threads::PORT_METHODS,
+        "TLSServer" => tls::SERVER_METHODS,
+        "TLSSocket" => tls::SOCKET_METHODS,
+        "HTTPSServerResponse" => https::RESPONSE_METHODS,
+        "HTTPSClientRequest" => https::CLIENT_REQUEST_METHODS,
+        "REPLServer" => repl::REPLSERVER_METHODS,
         _ => &[],
     };
     let is_emitter = matches!(
         tag,
         "Server" | "Socket" | "ServerResponse" | "IncomingMessage" | "EventEmitter" | "Readable"
-            | "Writable" | "Duplex" | "Transform"
+            | "Writable" | "Duplex" | "Transform" | "UdpSocket" | "Worker" | "MessagePort"
+            | "TLSServer" | "TLSSocket" | "HTTPSServerResponse" | "HTTPSClientRequest"
     );
     base.contains(&name) || (is_emitter && EMITTER.contains(&name))
 }
@@ -352,6 +381,11 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "Interface" => readline::instance_call(recv, method, args),
         "Script" => vm::instance_call(recv, method, args),
         "URLSearchParams" => url::search_params_call(recv, method, &args),
+        "UdpSocket" => dgram::instance_call(recv, method, args),
+        "Worker" | "MessagePort" => worker_threads::instance_call(tag, recv, method, args),
+        "TLSServer" | "TLSSocket" => tls::instance_call(tag, recv, method, args),
+        "HTTPSServerResponse" | "HTTPSClientRequest" => https::instance_call(tag, recv, method, args),
+        "REPLServer" => repl::instance_call(recv, method, args),
         "EventEmitter" => events::instance_call(recv, method, args),
         "URL" => url::instance_call(recv, method, &args),
         "Stats" => fs::stats_call(recv, method),

@@ -104,6 +104,12 @@ sha2 = "0.10"
 hmac = "0.12"
 getrandom = "0.2"
 flate2 = "1"
+# Pure-Rust TLS for the `tls`/`https` modules (blocking rustls::Stream over a
+# std TcpStream); rustls-pemfile parses cert/key PEMs; webpki-roots is the client
+# trust anchor set.
+rustls = "0.23"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 
 # Arbitrary-precision integers backing JS `BigInt` (the `10n` literal + bigint
 # arithmetic). Same crates/versions pythonrs uses for its bignum path.
