@@ -203,6 +203,11 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// `buffer.Buffer`, `url.URL`), reachable via `namespace_property`.
 pub fn constant(ns: &str, name: &str) -> Option<Value> {
     match ns {
+        // `path.posix` is our POSIX path itself; expose it (and `path.win32` as a
+        // best-effort alias) as a nested namespace so `path.posix.join(...)` works.
+        "path" if name == "posix" || name == "win32" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("path".into()))))
+        }
         "path" => path::constant(name),
         "os" => os::constant(name),
         "buffer" if name == "Buffer" => {
@@ -293,6 +298,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "AsyncLocalStorage" => async_hooks::ALS_METHODS,
         "AsyncHook" => async_hooks::HOOK_METHODS,
         "Channel" => &["subscribe", "unsubscribe", "publish"],
+        "WriteStream" => &["write", "end", "on", "once", "removeListener", "cork", "uncork", "setEncoding"],
         _ => &[],
     };
     let is_emitter = matches!(
@@ -324,6 +330,7 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "Readable" | "Writable" | "Duplex" | "Transform" => stream::instance_call(tag, recv, method, args),
         "AsyncLocalStorage" | "AsyncHook" => async_hooks::instance_call(tag, recv, method, args),
         "Channel" => diagnostics_channel::instance_call(recv, method, &args),
+        "WriteStream" => process::stream_instance_call(recv, method, &args),
         _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
     }
 }

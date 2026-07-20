@@ -129,6 +129,7 @@ fn versions() -> Value {
 fn std_stream(fd: i32) -> Value {
     with_host(|h| {
         let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str("WriteStream"));
         m.insert("fd".into(), Value::Float(fd as f64));
         // SAFETY: isatty is a pure query on the fd number.
         let is_tty = unsafe { libc::isatty(fd) == 1 };
@@ -137,6 +138,33 @@ fn std_stream(fd: i32) -> Value {
         m.insert("readable".into(), Value::Bool(fd == 0));
         h.new_object(m)
     })
+}
+
+/// Instance methods of a `process.stdout`/`stderr` `WriteStream`: `write`/`end`
+/// emit the chunk raw (no newline) to the stream's fd, so ordering interleaves
+/// correctly with `console.log`.
+pub fn stream_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    match method {
+        "write" | "end" => {
+            let fd = with_host(|h| match h.get(recv) {
+                Some(JsObj::Object(p)) => p.get("fd").map(|v| h.to_number(v)).unwrap_or(1.0),
+                _ => 1.0,
+            });
+            let chunk = super::arg_str(args, 0);
+            use std::io::Write as _;
+            if fd == 2.0 {
+                let _ = std::io::stderr().write_all(chunk.as_bytes());
+                let _ = std::io::stderr().flush();
+            } else {
+                let _ = std::io::stdout().write_all(chunk.as_bytes());
+                let _ = std::io::stdout().flush();
+            }
+            Ok(Value::Bool(true))
+        }
+        // A no-op stream surface so `.on('data')`/`.once`/`.end()` chaining loads.
+        "on" | "once" | "removeListener" | "cork" | "uncork" | "setEncoding" => Ok(recv.clone()),
+        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+    }
 }
 
 fn hrtime(args: &[Value]) -> Value {
