@@ -719,6 +719,7 @@ fn is_builtin_ctor(name: &str) -> bool {
             | "EventEmitter"
             | "Buffer"
             | "URL"
+            | "URLSearchParams"
     ) || host::ERROR_NAMES.contains(&name)
 }
 
@@ -1708,6 +1709,7 @@ fn is_namespace(name: &str) -> bool {
             | "process"
             | "Buffer"
             | "URL"
+            | "URLSearchParams"
     )
 }
 

@@ -47,6 +47,9 @@ pub mod punycode;
 pub mod timers;
 pub mod util_types;
 pub mod v8;
+pub mod fs_promises;
+pub mod readline;
+pub mod vm;
 
 /// Native-heavy core modules that node-js does not yet implement (TLS handshakes,
 /// HTTP/2 framing, OS worker threads sharing the thread-local heap, UDP sockets,
@@ -56,7 +59,7 @@ pub mod v8;
 /// an honest not-yet-built surface, never a silent fake.
 pub const UNIMPLEMENTED_MODULES: &[&str] = &[
     "tls", "http2", "https", "worker_threads", "cluster", "dgram", "inspector",
-    "wasi", "trace_events", "domain", "repl", "vm", "dns/promises", "readline",
+    "wasi", "trace_events", "domain", "repl", "dns/promises",
 ];
 
 /// True if `ns` is a known-but-unimplemented core module (see `UNIMPLEMENTED_MODULES`).
@@ -102,6 +105,9 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "util/types" => Some("util/types"),
         "diagnostics_channel" => Some("diagnostics_channel"),
         "v8" => Some("v8"),
+        "readline" => Some("readline"),
+        "vm" => Some("vm"),
+        "fs/promises" => Some("fs/promises"),
         other => UNIMPLEMENTED_MODULES.iter().copied().find(|&m| m == other),
     }
 }
@@ -143,6 +149,9 @@ pub fn is_method(qualified: &str) -> bool {
         "util/types" => util_types::METHODS.contains(&m),
         "diagnostics_channel" => diagnostics_channel::METHODS.contains(&m),
         "v8" => v8::METHODS.contains(&m),
+        "readline" => readline::METHODS.contains(&m),
+        "vm" => vm::METHODS.contains(&m),
+        "fs/promises" => fs_promises::METHODS.contains(&m),
         // Any method on an unimplemented namespace routes to `call`, which throws
         // an honest "not implemented" error (so `mod.foo()` fails clearly rather
         // than silently returning undefined).
@@ -192,6 +201,9 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "util/types" => util_types::call(m, args)?,
         "diagnostics_channel" => diagnostics_channel::call(m, args)?,
         "v8" => v8::call(m, args)?,
+        "readline" => readline::call(m, args)?,
+        "vm" => vm::call(m, args)?,
+        "fs/promises" => fs_promises::call(m, args)?,
         _ if is_unimplemented(ns) => {
             Err(format!("Error: {ns}.{m} is not implemented in node-js"))
         }
@@ -229,6 +241,13 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "async_hooks" if matches!(name, "AsyncLocalStorage" | "AsyncResource") => {
             Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
         }
+        "vm" if name == "Script" => Some(with_host(|h| h.alloc(JsObj::Builtin("Script".into())))),
+        "url" if name == "URLSearchParams" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("URLSearchParams".into()))))
+        }
+        "fs" if name == "promises" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("fs/promises".into()))))
+        }
         "util" if name == "types" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("util/types".into()))))
         }
@@ -252,6 +271,8 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         n if typedarray::is_ctor(n) => Some(typedarray::construct(n, args)),
         n if stream::is_class(n) => Some(Ok(stream::construct(n))),
         "AsyncLocalStorage" | "AsyncResource" => async_hooks::construct(name, args),
+        "Script" => Some(vm::construct(args)),
+        "URLSearchParams" => Some(url::construct_search_params(args)),
         _ => None,
     }
 }
@@ -300,6 +321,10 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "AsyncHook" => async_hooks::HOOK_METHODS,
         "Channel" => &["subscribe", "unsubscribe", "publish"],
         "WriteStream" => &["write", "end", "on", "once", "removeListener", "cork", "uncork", "setEncoding"],
+        "Hmac" => &["update", "digest"],
+        "Interface" => readline::INTERFACE_METHODS,
+        "Script" => vm::SCRIPT_METHODS,
+        "URLSearchParams" => url::SEARCH_PARAMS_METHODS,
         _ => &[],
     };
     let is_emitter = matches!(
@@ -323,6 +348,10 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "TextDecoder" => typedarray::text_decoder_call(recv, method, &args),
         "TypedArray" => typedarray::instance_call(recv, method, &args),
         "Hash" => crypto::instance_call(recv, method, &args),
+        "Hmac" => crypto::hmac_instance_call(recv, method, &args),
+        "Interface" => readline::instance_call(recv, method, args),
+        "Script" => vm::instance_call(recv, method, args),
+        "URLSearchParams" => url::search_params_call(recv, method, &args),
         "EventEmitter" => events::instance_call(recv, method, args),
         "URL" => url::instance_call(recv, method, &args),
         "Stats" => fs::stats_call(recv, method),

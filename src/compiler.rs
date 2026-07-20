@@ -107,6 +107,32 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     })
 }
 
+/// Compile leaving the value of the final top-level expression statement on the
+/// stack (the program's completion value), for `eval`/`vm.runInThisContext`. A
+/// non-expression final statement leaves nothing (→ `undefined`).
+pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
+    let mut c = Compiler {
+        debug,
+        ..Default::default()
+    };
+    let mut b = ChunkBuilder::new();
+    c.hoist_funcs(&mut b, stmts)?;
+    if let Some((last, rest)) = stmts.split_last() {
+        c.compile_stmts(&mut b, rest)?;
+        if let StmtKind::Expr(e) = &last.kind {
+            // The final expression's value is NOT popped — it is the completion.
+            c.compile_expr(&mut b, e)?;
+        } else {
+            c.compile_stmt(&mut b, last)?;
+        }
+    }
+    Ok(Program {
+        main: b.build(),
+        functions: c.functions,
+        tries: c.tries,
+    })
+}
+
 fn argc(n: usize) -> Result<u8, String> {
     u8::try_from(n).map_err(|_| "too many arguments (>255) for one call".to_string())
 }

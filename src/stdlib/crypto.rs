@@ -1,23 +1,36 @@
-//! Node `crypto` module: `createHash(algo)` → a `Hash` instance
-//! (`update(...).digest(enc)`), backed by the `md-5`/`sha1`/`sha2` crates.
-//! The `Hash` is a plain object tagged `@@native = "Hash"` accumulating input in
-//! a hidden `@@data` byte array until `digest` finalizes it.
+//! Node `crypto` module.
+//!
+//! * `createHash(algo)` → a `Hash` instance (`update(...).digest(enc)`), backed
+//!   by the `md-5`/`sha1`/`sha2` crates.
+//! * `createHmac(algo, key)` → an `Hmac` instance (`update(...).digest(enc)`),
+//!   backed by the `hmac` crate over the same digests.
+//! * `randomBytes`, `randomUUID`, `randomInt` — CSPRNG output via `getrandom`.
+//!
+//! `Hash`/`Hmac` are plain objects tagged `@@native = "Hash"` / `"Hmac"`
+//! accumulating input in a hidden `@@data` byte array until `digest` finalizes.
 
 use super::{arg_str, to_base64, to_hex};
-use crate::host::{with_host, JsObj};
+use crate::host::{is_callable, with_host, JsObj};
 use fusevm::Value;
+use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
 use md5::{Digest as _, Md5};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 
-pub const METHODS: &[&str] = &["createHash"];
+pub const METHODS: &[&str] = &[
+    "createHash",
+    "createHmac",
+    "randomBytes",
+    "randomUUID",
+    "randomInt",
+];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "createHash" => {
             let algo = arg_str(args, 0).to_ascii_lowercase();
-            if !matches!(algo.as_str(), "md5" | "sha1" | "sha256" | "sha512") {
+            if !supported(&algo) {
                 return Some(Err(format!("Error: Digest method not supported: {algo}")));
             }
             Ok(with_host(|h| {
@@ -29,12 +42,97 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 h.new_object(m)
             }))
         }
+        "createHmac" => {
+            let algo = arg_str(args, 0).to_ascii_lowercase();
+            if !supported(&algo) {
+                return Some(Err(format!("Error: Digest method not supported: {algo}")));
+            }
+            // Key may be a Buffer (raw bytes) or a string (utf8 by default).
+            let key = key_bytes(args.get(1));
+            Ok(with_host(|h| {
+                let data = h.new_array(Vec::new());
+                let keyv = h.new_array(key.iter().map(|b| Value::Float(*b as f64)).collect());
+                let mut m = IndexMap::new();
+                m.insert("@@native".into(), h.new_str("Hmac"));
+                m.insert("@@algo".into(), h.new_str(algo));
+                m.insert("@@key".into(), keyv);
+                m.insert("@@data".into(), data);
+                h.new_object(m)
+            }))
+        }
+        "randomBytes" => {
+            let n = super::arg_num(args, 0).max(0.0) as usize;
+            let mut buf = vec![0u8; n];
+            if let Err(e) = getrandom::getrandom(&mut buf) {
+                return Some(Err(format!("Error: failed to generate random bytes: {e}")));
+            }
+            // Callback form: randomBytes(n, (err, buf) => ...). Build the Buffer,
+            // release the host borrow, then queue the callback with (null, buf).
+            let cb = args.get(1).cloned().filter(|v| with_host(|h| is_callable(h, v)));
+            if let Some(cb) = cb {
+                let bufv = super::buffer::from_bytes(&buf);
+                with_host(|h| {
+                    let nullv = h.null();
+                    h.queue_micro(cb, vec![nullv, bufv]);
+                });
+                Ok(Value::Undef)
+            } else {
+                Ok(super::buffer::from_bytes(&buf))
+            }
+        }
+        "randomUUID" => {
+            let mut b = [0u8; 16];
+            if let Err(e) = getrandom::getrandom(&mut b) {
+                return Some(Err(format!("Error: failed to generate random bytes: {e}")));
+            }
+            // RFC 4122 v4: version nibble = 4, variant nibble ∈ [8..b].
+            b[6] = (b[6] & 0x0f) | 0x40;
+            b[8] = (b[8] & 0x3f) | 0x80;
+            let h = to_hex(&b);
+            let uuid = format!(
+                "{}-{}-{}-{}-{}",
+                &h[0..8],
+                &h[8..12],
+                &h[12..16],
+                &h[16..20],
+                &h[20..32],
+            );
+            Ok(with_host(|host| host.new_str(uuid)))
+        }
+        "randomInt" => {
+            // randomInt([min, ]max) — uniform integer in [min, max).
+            let (min, max) = if args.len() >= 2 {
+                (super::arg_num(args, 0), super::arg_num(args, 1))
+            } else {
+                (0.0, super::arg_num(args, 0))
+            };
+            let (min, max) = (min as i64, max as i64);
+            if max <= min {
+                return Some(Err("Error: The value of \"max\" is out of range. It must be greater than the value of \"min\".".into()));
+            }
+            let range = (max - min) as u64;
+            match random_below(range) {
+                Ok(r) => Ok(Value::Float((min + r as i64) as f64)),
+                Err(e) => Err(format!("Error: failed to generate random bytes: {e}")),
+            }
+        }
         _ => return None,
     })
 }
 
 /// `Hash` instance methods: `update` (chainable) and `digest`.
 pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    hashlike_call("Hash", recv, method, args)
+}
+
+/// `Hmac` instance methods: `update` (chainable) and `digest`.
+pub fn hmac_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    hashlike_call("Hmac", recv, method, args)
+}
+
+/// Shared `update`/`digest` for `Hash` and `Hmac` (both accumulate into `@@data`;
+/// `digest` finalizes via a plain digest or an HMAC keyed by `@@key`).
+fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         "update" => {
             let enc = if args.len() > 1 { arg_str(args, 1) } else { "utf8".into() };
@@ -51,27 +149,38 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             Ok(recv.clone())
         }
         "digest" => {
-            let (algo, data) = with_host(|h| {
-                let (mut algo, mut data) = (String::new(), Vec::new());
+            let (algo, key, data) = with_host(|h| {
+                let (mut algo, mut key, mut data) = (String::new(), Vec::new(), Vec::new());
                 if let Some(JsObj::Object(p)) = h.get(recv) {
                     algo = p.get("@@algo").map(|v| h.str_of(v)).unwrap_or_default();
                     if let Some(JsObj::Array(items)) = p.get("@@data").and_then(|v| h.get(v)) {
                         data = items.iter().map(|v| h.to_number(v) as u8).collect();
                     }
+                    if let Some(JsObj::Array(items)) = p.get("@@key").and_then(|v| h.get(v)) {
+                        key = items.iter().map(|v| h.to_number(v) as u8).collect();
+                    }
                 }
-                (algo, data)
+                (algo, key, data)
             });
-            let digest = digest(&algo, &data);
+            let out = if kind == "Hmac" {
+                hmac_digest(&algo, &key, &data)
+            } else {
+                digest(&algo, &data)
+            };
             let enc = if args.is_empty() { None } else { Some(arg_str(args, 0)) };
             Ok(match enc.as_deref() {
-                Some("hex") => with_host(|h| h.new_str(to_hex(&digest))),
-                Some("base64") | Some("base64url") => with_host(|h| h.new_str(to_base64(&digest))),
-                Some("latin1") | Some("binary") => with_host(|h| h.new_str(digest.iter().map(|b| *b as char).collect::<String>())),
-                _ => super::buffer::from_bytes(&digest),
+                Some("hex") => with_host(|h| h.new_str(to_hex(&out))),
+                Some("base64") | Some("base64url") => with_host(|h| h.new_str(to_base64(&out))),
+                Some("latin1") | Some("binary") => with_host(|h| h.new_str(out.iter().map(|b| *b as char).collect::<String>())),
+                _ => super::buffer::from_bytes(&out),
             })
         }
-        _ => Err(crate::host::type_error(&format!("hash.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!("{}.{method} is not a function", kind.to_ascii_lowercase()))),
     }
+}
+
+fn supported(algo: &str) -> bool {
+    matches!(algo, "md5" | "sha1" | "sha256" | "sha512")
 }
 
 fn digest(algo: &str, data: &[u8]) -> Vec<u8> {
@@ -95,6 +204,63 @@ fn digest(algo: &str, data: &[u8]) -> Vec<u8> {
             let mut h = Sha256::new();
             h.update(data);
             h.finalize().to_vec()
+        }
+    }
+}
+
+fn hmac_digest(algo: &str, key: &[u8], data: &[u8]) -> Vec<u8> {
+    // HMAC accepts any key length, so `new_from_slice` never fails here.
+    match algo {
+        "md5" => {
+            let mut m = Hmac::<Md5>::new_from_slice(key).expect("HMAC accepts any key length");
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        }
+        "sha1" => {
+            let mut m = Hmac::<Sha1>::new_from_slice(key).expect("HMAC accepts any key length");
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        }
+        "sha512" => {
+            let mut m = Hmac::<Sha512>::new_from_slice(key).expect("HMAC accepts any key length");
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        }
+        _ => {
+            let mut m = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        }
+    }
+}
+
+/// The `createHmac` key argument as raw bytes: a Buffer's bytes, else the value's
+/// utf8 string encoding.
+fn key_bytes(v: Option<&Value>) -> Vec<u8> {
+    let Some(v) = v else { return Vec::new() };
+    if super::native_tag(v).as_deref() == Some("Buffer") {
+        return with_host(|h| match h.get(v) {
+            Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
+                Some(JsObj::Array(items)) => items.iter().map(|x| h.to_number(x) as u8).collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        });
+    }
+    with_host(|h| h.str_of(v)).into_bytes()
+}
+
+/// A uniform random `u64` in `[0, range)` via rejection sampling over 8 CSPRNG
+/// bytes (discards the biased tail so the distribution stays exactly uniform).
+fn random_below(range: u64) -> Result<u64, getrandom::Error> {
+    // Largest multiple of `range` that fits in u64; values at/above it are biased.
+    let limit = u64::MAX - (u64::MAX % range);
+    loop {
+        let mut b = [0u8; 8];
+        getrandom::getrandom(&mut b)?;
+        let n = u64::from_le_bytes(b);
+        if n < limit {
+            return Ok(n % range);
         }
     }
 }

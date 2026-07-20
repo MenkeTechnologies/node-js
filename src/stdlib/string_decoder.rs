@@ -82,8 +82,13 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 buf.extend(bytes_of(v));
             }
             set_pending(recv, &[]);
-            // Flush everything, replacing any dangling bytes lossily.
-            let (decoded, _) = decode(&enc, &buf);
+            // Flush the completed head; a dangling incomplete multibyte sequence
+            // becomes a single U+FFFD replacement char (matching Node, which emits
+            // one replacement for the whole held-back sequence, not one per byte).
+            let (mut decoded, tail) = decode(&enc, &buf);
+            if !tail.is_empty() {
+                decoded.push('\u{FFFD}');
+            }
             Ok(with_host(|h| h.new_str(decoded)))
         }
         _ => Err(crate::host::type_error(&format!("{method} is not a function"))),

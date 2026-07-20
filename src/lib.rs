@@ -34,6 +34,13 @@ pub fn compile(src: &str) -> Result<compiler::Program, String> {
     compiler::compile(&stmts, false)
 }
 
+/// Compile leaving the final top-level expression as the program's completion
+/// value (for `vm.runInThisContext` / `eval`).
+pub fn compile_completion(src: &str) -> Result<compiler::Program, String> {
+    let stmts = parser::parse(src)?;
+    compiler::compile_completion(&stmts, false)
+}
+
 /// Compile with per-statement DAP line markers enabled (`node --dap`).
 pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
