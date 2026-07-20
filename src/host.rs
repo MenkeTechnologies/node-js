@@ -1169,7 +1169,23 @@ impl JsHost {
                         .collect();
                     parts.join(",")
                 }
-                Some(JsObj::Object(_)) => "[object Object]".into(),
+                Some(JsObj::Object(props)) => {
+                    // A native `Buffer` stringifies to its decoded (utf-8)
+                    // contents, matching `buf.toString()` — needed for `'' + buf`,
+                    // template interpolation, and `data += chunk` (the pattern
+                    // Express/body-parser use to read a request body).
+                    if props.get("@@native").map(|t| self.str_of(t)).as_deref() == Some("Buffer") {
+                        let bytes: Vec<u8> = match props.get("@@bytes").and_then(|b| self.get(b)) {
+                            Some(JsObj::Array(items)) => {
+                                items.iter().map(|x| self.to_number(x) as u8).collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    } else {
+                        "[object Object]".into()
+                    }
+                }
                 Some(JsObj::Func(f)) => {
                     let name = self.funcs.get(f.def_id).map(|d| d.name.clone()).unwrap_or_default();
                     format!("function {name}() {{ [code] }}")

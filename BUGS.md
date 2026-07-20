@@ -1,5 +1,17 @@
 # node-js — known gaps and unimplemented behavior
 
+## Express (real npm package) — runs and serves HTTP; body-parsing gap
+The real `express` 5.2.1 + its 65-package dependency tree loads and serves HTTP:
+`app.get`/routing/route params/query, `res.send`/`res.json`/`res.status`, and
+`app.listen` all match `node` byte-for-byte (verified via curl). Remaining gap:
+`express.json()` / `express.urlencoded()` **request-body parsing** fails inside
+`iconv-lite`, because node-js's `Buffer` is a plain `@@native` object rather than
+a real **`Uint8Array` subclass** — so `buf instanceof Uint8Array` is `false` and
+`iconv`/`safer-buffer`'s Buffer-static copy loop misses `isBuffer`. Making
+`Buffer` a genuine `Uint8Array` subclass (and enumerating builtin-namespace
+static keys) is the next chunk of work. GET/response-side Express is unaffected.
+
+
 node-js is JavaScript lowered to fusevm (bytecode VM + Cranelift JIT), with a
 JsHost object heap. It runs a real subset of JavaScript correctly, verified
 byte-for-byte against system `node` on the example corpus (`tests/parity.rs`) and

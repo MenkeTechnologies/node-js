@@ -642,7 +642,23 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
 fn default_ctor_name(h: &host::JsHost, recv: &Value) -> Option<&'static str> {
     match h.get(recv) {
         Some(JsObj::Array(_)) => Some("Array"),
-        Some(JsObj::Object(_)) => Some("Object"),
+        Some(JsObj::Object(props)) => {
+            // A native instance reports its own constructor, not Object — e.g.
+            // `qs` does `buf.constructor.isBuffer(buf)`, so a Buffer's
+            // `.constructor` must be `Buffer` (which carries `isBuffer`). Read
+            // the `@@native` tag off the already-borrowed host (calling
+            // `native_tag`, which re-enters `with_host`, would double-borrow).
+            match props.get("@@native").map(|t| h.str_of(t)).as_deref() {
+                Some("Buffer") => Some("Buffer"),
+                Some("URL") => Some("URL"),
+                Some("Date") => Some("Date"),
+                Some("WeakRef") => Some("WeakRef"),
+                Some("TextEncoder") => Some("TextEncoder"),
+                Some("TextDecoder") => Some("TextDecoder"),
+                Some("EventEmitter") => Some("EventEmitter"),
+                _ => Some("Object"),
+            }
+        }
         Some(JsObj::Map { weak, .. }) => Some(if *weak { "WeakMap" } else { "Map" }),
         Some(JsObj::Set { weak, .. }) => Some(if *weak { "WeakSet" } else { "Set" }),
         Some(JsObj::Promise { .. }) => Some("Promise"),
@@ -701,6 +717,8 @@ fn is_builtin_ctor(name: &str) -> bool {
             | "IncomingMessage"
             | "ServerResponse"
             | "EventEmitter"
+            | "Buffer"
+            | "URL"
     ) || host::ERROR_NAMES.contains(&name)
 }
 
