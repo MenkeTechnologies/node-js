@@ -29,9 +29,11 @@ struct Parser {
     in_async: bool,
 }
 
-/// Parse a complete JS program into a statement list.
+/// Parse a complete JS program into a statement list. Inline `rust { ... }` FFI
+/// blocks are desugared to `__rust_compile(...)` calls before lexing.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
-    let toks = lex(src)?;
+    let src = crate::rust_ffi::desugar(src);
+    let toks = lex(&src)?;
     let mut p = Parser { toks, pos: 0, in_generator: false, in_async: false };
     let mut out = Vec::new();
     while !p.at_eof() {
