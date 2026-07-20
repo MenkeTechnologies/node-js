@@ -28,13 +28,7 @@ use fusevm::Value;
 use indexmap::IndexMap;
 use std::process::{Command, Stdio};
 
-pub const METHODS: &[&str] = &[
-    "execSync",
-    "spawnSync",
-    "execFileSync",
-    "exec",
-    "spawn",
-];
+pub const METHODS: &[&str] = &["execSync", "spawnSync", "execFileSync", "exec", "spawn"];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
@@ -56,14 +50,25 @@ struct Run {
     pid: u32,
 }
 
-/// Spawn `program` with `args`, capture both pipes, and wait for exit.
-fn run(program: &str, args: &[String]) -> std::io::Result<Run> {
-    let child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+/// Spawn `program` with `args`, capture both pipes, optionally feed `input` to
+/// stdin, and wait for exit.
+fn run(program: &str, args: &[String], input: Option<&[u8]>) -> std::io::Result<Run> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    });
+    let mut child = cmd.spawn()?;
     let pid = child.id();
+    if let Some(bytes) = input {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            let _ = stdin.write_all(bytes);
+            // Drop stdin to send EOF so the child (e.g. `cat`/`wc`) can finish.
+        }
+    }
     let out = child.wait_with_output()?;
     Ok(Run {
         status: out.status.code(),
@@ -73,13 +78,27 @@ fn run(program: &str, args: &[String]) -> std::io::Result<Run> {
     })
 }
 
+/// The `opts.input` (stdin) bytes for a *Sync call, if provided.
+fn opts_input(args: &[Value], idx: usize) -> Option<Vec<u8>> {
+    let opts = args.get(idx)?;
+    match crate::builtins::get_property(opts, "input") {
+        Ok(Value::Undef) => None,
+        Ok(v) => Some(super::arg_str(&[v], 0).into_bytes()),
+        Err(_) => None,
+    }
+}
+
 /// `execSync(command[, options])` — run `sh -c <command>`, return stdout, and
 /// throw when the command exits non-zero (matching Node's `execSync`).
 fn exec_sync(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     let enc = opts_encoding(args, 1);
-    let r = run("sh", &["-c".to_string(), cmd.clone()])
-        .map_err(|e| format!("Error: {e}"))?;
+    let r = run(
+        "sh",
+        &["-c".to_string(), cmd.clone()],
+        opts_input(args, 1).as_deref(),
+    )
+    .map_err(|e| format!("Error: {e}"))?;
     if r.status != Some(0) {
         let tail = String::from_utf8_lossy(&r.stderr);
         return Err(format!("Error: Command failed: {cmd}\n{tail}"));
@@ -93,7 +112,7 @@ fn spawn_sync(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     let cmd_args = arg_array(args, 1);
     let enc = opts_encoding(args, 2);
-    match run(&cmd, &cmd_args) {
+    match run(&cmd, &cmd_args, opts_input(args, 2).as_deref()) {
         Ok(r) => {
             // Build the stdout/stderr values FIRST (each allocates via its own
             // `with_host`); inserting them inside the outer `with_host` below would
@@ -105,7 +124,9 @@ fn spawn_sync(args: &[Value]) -> Result<Value, String> {
                 m.insert("pid".into(), Value::Float(r.pid as f64));
                 m.insert(
                     "status".into(),
-                    r.status.map(|c| Value::Float(c as f64)).unwrap_or_else(|| h.null()),
+                    r.status
+                        .map(|c| Value::Float(c as f64))
+                        .unwrap_or_else(|| h.null()),
                 );
                 // A signal name is not recovered here; report null (as when the
                 // child exited normally).
@@ -136,7 +157,8 @@ fn exec_file_sync(args: &[Value]) -> Result<Value, String> {
     let file = arg_str(args, 0);
     let cmd_args = arg_array(args, 1);
     let enc = opts_encoding(args, 2);
-    let r = run(&file, &cmd_args).map_err(|e| format!("Error: spawn {file} {e}"))?;
+    let r = run(&file, &cmd_args, opts_input(args, 2).as_deref())
+        .map_err(|e| format!("Error: spawn {file} {e}"))?;
     if r.status != Some(0) {
         let tail = String::from_utf8_lossy(&r.stderr);
         return Err(format!("Error: Command failed: {file}\n{tail}"));
@@ -150,8 +172,10 @@ fn exec_file_sync(args: &[Value]) -> Result<Value, String> {
 fn exec(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     // Callback is the last function-shaped argument.
-    let Some(cb) = args.last().cloned() else { return Ok(Value::Undef) };
-    let (err, out, errout) = match run("sh", &["-c".to_string(), cmd.clone()]) {
+    let Some(cb) = args.last().cloned() else {
+        return Ok(Value::Undef);
+    };
+    let (err, out, errout) = match run("sh", &["-c".to_string(), cmd.clone()], None) {
         Ok(r) => {
             let stdout = String::from_utf8_lossy(&r.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&r.stderr).into_owned();
@@ -183,7 +207,7 @@ fn exec(args: &[Value]) -> Result<Value, String> {
 fn spawn(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     let cmd_args = arg_array(args, 1);
-    match run(&cmd, &cmd_args) {
+    match run(&cmd, &cmd_args, None) {
         Ok(r) => {
             // Allocate the Buffers before the outer `with_host` (from_bytes borrows
             // the host itself — nesting would panic).
@@ -194,7 +218,9 @@ fn spawn(args: &[Value]) -> Result<Value, String> {
                 m.insert("pid".into(), Value::Float(r.pid as f64));
                 m.insert(
                     "exitCode".into(),
-                    r.status.map(|c| Value::Float(c as f64)).unwrap_or_else(|| h.null()),
+                    r.status
+                        .map(|c| Value::Float(c as f64))
+                        .unwrap_or_else(|| h.null()),
                 );
                 m.insert("signalCode".into(), h.null());
                 m.insert("killed".into(), Value::Bool(false));
@@ -232,9 +258,10 @@ fn arg_array(args: &[Value], i: usize) -> Vec<String> {
 /// non-empty string.
 fn opts_encoding(args: &[Value], i: usize) -> Option<String> {
     with_host(|h| match args.get(i).and_then(|v| h.get(v)) {
-        Some(crate::host::JsObj::Object(p)) => {
-            p.get("encoding").map(|v| h.str_of(v)).filter(|s| !s.is_empty() && s != "undefined" && s != "null")
-        }
+        Some(crate::host::JsObj::Object(p)) => p
+            .get("encoding")
+            .map(|v| h.str_of(v))
+            .filter(|s| !s.is_empty() && s != "undefined" && s != "null"),
         _ => None,
     })
 }

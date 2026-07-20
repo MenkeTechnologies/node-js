@@ -33,6 +33,51 @@ pub fn constant(name: &str) -> Option<Value> {
     match name {
         "EOL" => Some(with_host(|h| h.new_str("\n"))),
         "devNull" => Some(with_host(|h| h.new_str("/dev/null"))),
+        // os.constants.signals (POSIX signal numbers) + priority levels.
+        "constants" => Some(with_host(|h| {
+            let mut signals = indexmap::IndexMap::new();
+            for (k, v) in [
+                ("SIGHUP", 1),
+                ("SIGINT", 2),
+                ("SIGQUIT", 3),
+                ("SIGILL", 4),
+                ("SIGTRAP", 5),
+                ("SIGABRT", 6),
+                ("SIGBUS", 10),
+                ("SIGFPE", 8),
+                ("SIGKILL", 9),
+                ("SIGUSR1", 30),
+                ("SIGSEGV", 11),
+                ("SIGUSR2", 31),
+                ("SIGPIPE", 13),
+                ("SIGALRM", 14),
+                ("SIGTERM", 15),
+                ("SIGCHLD", 20),
+                ("SIGCONT", 19),
+                ("SIGSTOP", 17),
+                ("SIGTSTP", 18),
+                ("SIGWINCH", 28),
+            ] {
+                signals.insert(k.to_string(), Value::Float(v as f64));
+            }
+            let sig = h.new_object(signals);
+            let mut priority = indexmap::IndexMap::new();
+            for (k, v) in [
+                ("PRIORITY_LOW", 19),
+                ("PRIORITY_BELOW_NORMAL", 10),
+                ("PRIORITY_NORMAL", 0),
+                ("PRIORITY_ABOVE_NORMAL", -7),
+                ("PRIORITY_HIGH", -14),
+                ("PRIORITY_HIGHEST", -20),
+            ] {
+                priority.insert(k.to_string(), Value::Float(v as f64));
+            }
+            let prio = h.new_object(priority);
+            let mut m = indexmap::IndexMap::new();
+            m.insert("signals".to_string(), sig);
+            m.insert("priority".to_string(), prio);
+            h.new_object(m)
+        })),
         _ => None,
     }
 }
@@ -70,9 +115,15 @@ pub fn call(method: &str, _args: &[Value]) -> Option<Result<Value, String>> {
         "release" => s(""),
         "version" => s(""),
         "hostname" => s(&hostname()),
-        "homedir" => s(&dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()),
+        "homedir" => s(&dirs::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()),
         "tmpdir" => s(std::env::temp_dir().to_string_lossy().trim_end_matches('/')),
-        "endianness" => s(if cfg!(target_endian = "big") { "BE" } else { "LE" }),
+        "endianness" => s(if cfg!(target_endian = "big") {
+            "BE"
+        } else {
+            "LE"
+        }),
         "totalmem" => Ok(Value::Float(0.0)),
         "freemem" => Ok(Value::Float(0.0)),
         "uptime" => Ok(Value::Float(0.0)),
@@ -96,8 +147,12 @@ fn hostname() -> String {
 fn user_info() -> Value {
     with_host(|h| {
         let mut m = IndexMap::new();
-        let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
-        let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_default();
+        let home = dirs::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let shell = std::env::var("SHELL").unwrap_or_default();
         m.insert("username".into(), h.new_str(user));
         m.insert("homedir".into(), h.new_str(home));
