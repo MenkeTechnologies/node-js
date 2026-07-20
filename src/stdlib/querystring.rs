@@ -13,8 +13,15 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "parse" | "decode" => Ok(parse(&super::arg_str(args, 0), args)),
         "stringify" | "encode" => Ok(stringify(args)),
-        "escape" => Ok(with_host(|h| h.new_str(escape(&super::arg_str(args, 0))))),
-        "unescape" => Ok(with_host(|h| h.new_str(unescape(&super::arg_str(args, 0))))),
+        "escape" => {
+            // arg_str borrows the host; compute it BEFORE the new_str with_host.
+            let s = super::arg_str(args, 0);
+            Ok(with_host(|h| h.new_str(escape(&s))))
+        }
+        "unescape" => {
+            let s = super::arg_str(args, 0);
+            Ok(with_host(|h| h.new_str(unescape(&s))))
+        }
         _ => return None,
     })
 }
@@ -95,15 +102,13 @@ fn stringify(args: &[Value]) -> Value {
     with_host(|h| h.new_str(parts.join(&sep)))
 }
 
-/// Percent-encode for `application/x-www-form-urlencoded` (space → `+`).
+/// `querystring.escape` — percent-encode (space → `%20`, like Node; NOT `+`).
 fn escape(s: &str) -> String {
     const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         if UNRESERVED.contains(&b) {
             out.push(b as char);
-        } else if b == b' ' {
-            out.push('+');
         } else {
             out.push('%');
             out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());

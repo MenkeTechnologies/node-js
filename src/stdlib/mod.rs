@@ -289,7 +289,8 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "IncomingMessage" => &["pause", "resume", "setEncoding", "destroy"],
         "Buffer" => &[
             "toString", "toJSON", "equals", "slice", "subarray", "readUInt8", "includes",
-            "indexOf", "write", "copy", "fill",
+            "indexOf", "lastIndexOf", "write", "copy", "fill", "compare", "readUInt16BE",
+            "readUInt16LE", "writeUInt8", "writeUInt16BE", "writeUInt16LE",
         ],
         "Readable" | "Writable" | "Duplex" | "Transform" => {
             &["read", "write", "end", "pipe", "pause", "resume", "setEncoding", "destroy", "push"]
