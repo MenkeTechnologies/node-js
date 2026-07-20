@@ -27,6 +27,11 @@ struct Parser {
     in_generator: bool,
     /// True while parsing an async body — enables `await` as an operator.
     in_async: bool,
+    /// True while parsing a `for` init in LHS position — suppresses `in` as a
+    /// relational operator so `for (x in obj)` (no declaration keyword) parses
+    /// the `in` as the loop separator, not a binary expression. Cleared inside
+    /// any parenthesised/bracketed sub-expression, where `in` is legal again.
+    no_in: bool,
 }
 
 /// Parse a complete JS program into a statement list. Inline `rust { ... }` FFI
@@ -34,7 +39,7 @@ struct Parser {
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
     let src = crate::rust_ffi::desugar(src);
     let toks = lex(&src)?;
-    let mut p = Parser { toks, pos: 0, in_generator: false, in_async: false };
+    let mut p = Parser { toks, pos: 0, in_generator: false, in_async: false, no_in: false };
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.parse_stmt()?);
@@ -581,7 +586,18 @@ impl Parser {
             }
             StmtKind::Decl { kind: k, decls }
         } else {
-            StmtKind::Expr(first_target)
+            // A non-declaration C-style init may be a comma sequence
+            // (`for (i = 0, n = a.length; …)`) — extend past the first assignment.
+            let init = if self.is_punct(",") {
+                let mut items = vec![first_target];
+                while self.eat_punct(",") {
+                    items.push(self.parse_expr_no_in()?);
+                }
+                Expr::Sequence(items)
+            } else {
+                first_target
+            };
+            StmtKind::Expr(init)
         };
         self.parse_c_for(Some(Stmt::from(init_stmt)))
     }
@@ -689,7 +705,21 @@ impl Parser {
     fn parse_expr_no_in(&mut self) -> Result<Expr, String> {
         // For simplicity the no-in variant only parses an assignment/LHS chain,
         // which is sufficient for `for (x in ...)` / `for (x of ...)` heads.
-        self.parse_assign()
+        let saved = self.no_in;
+        self.no_in = true;
+        let r = self.parse_assign();
+        self.no_in = saved;
+        r
+    }
+
+    /// Run `f` with `in` re-enabled (inside a parenthesised/bracketed sub-
+    /// expression of a `for` LHS, where the no-in restriction does not apply).
+    fn allow_in<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        let saved = self.no_in;
+        self.no_in = false;
+        let r = f(self);
+        self.no_in = saved;
+        r
     }
 
     fn parse_assign(&mut self) -> Result<Expr, String> {
@@ -784,7 +814,14 @@ impl Parser {
     fn bin_info(&self) -> Option<(u8, bool, Option<LogicalOp>, Option<BinOp>)> {
         let p = match self.tok() {
             Tok::Punct(p) => p.as_str(),
-            Tok::Ident(s) if s == "in" => "in",
+            // In a `for` LHS (no-in) context, `in` is the loop separator, not a
+            // relational operator.
+            Tok::Ident(s) if s == "in" => {
+                if self.no_in {
+                    return None;
+                }
+                "in"
+            }
             Tok::Ident(s) if s == "instanceof" => "instanceof",
             _ => return None,
         };
@@ -907,7 +944,7 @@ impl Parser {
                     };
                 } else if self.is_punct("[") {
                     self.advance();
-                    let index = self.parse_expr()?;
+                    let index = self.allow_in(|p| p.parse_expr())?;
                     self.expect_punct("]")?;
                     e = Expr::Index {
                         object: Box::new(e),
@@ -924,7 +961,7 @@ impl Parser {
                 }
             } else if self.is_punct("[") {
                 self.advance();
-                let index = self.parse_expr()?;
+                let index = self.allow_in(|p| p.parse_expr())?;
                 self.expect_punct("]")?;
                 e = Expr::Index {
                     object: Box::new(e),
@@ -982,7 +1019,7 @@ impl Parser {
                 };
             } else if self.is_punct("[") {
                 self.advance();
-                let index = self.parse_expr()?;
+                let index = self.allow_in(|p| p.parse_expr())?;
                 self.expect_punct("]")?;
                 e = Expr::Index {
                     object: Box::new(e),
@@ -998,18 +1035,23 @@ impl Parser {
 
     fn parse_args(&mut self) -> Result<Vec<Expr>, String> {
         self.expect_punct("(")?;
-        let mut args = Vec::new();
-        while !self.is_punct(")") {
-            if self.eat_punct("...") {
-                let e = self.parse_assign()?;
-                args.push(Expr::Spread(Box::new(e)));
-            } else {
-                args.push(self.parse_assign()?);
+        // Inside a call-argument list `in` is always a relational operator, even
+        // in a `for` LHS.
+        let args = self.allow_in(|p| {
+            let mut args = Vec::new();
+            while !p.is_punct(")") {
+                if p.eat_punct("...") {
+                    let e = p.parse_assign()?;
+                    args.push(Expr::Spread(Box::new(e)));
+                } else {
+                    args.push(p.parse_assign()?);
+                }
+                if !p.eat_punct(",") {
+                    break;
+                }
             }
-            if !self.eat_punct(",") {
-                break;
-            }
-        }
+            Ok(args)
+        })?;
         self.expect_punct(")")?;
         Ok(args)
     }
@@ -1393,7 +1435,7 @@ impl Parser {
 /// Parse a template-literal `${...}` field's raw source into an expression.
 fn parse_expr_source(src: &str) -> Result<Expr, String> {
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0, in_generator: false, in_async: false };
+    let mut p = Parser { toks, pos: 0, in_generator: false, in_async: false, no_in: false };
     let e = p.parse_expr()?;
     Ok(e)
 }

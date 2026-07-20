@@ -19,6 +19,7 @@ pub mod dap;
 pub mod host;
 pub mod lexer;
 pub mod lsp;
+pub mod module;
 pub mod parser;
 pub mod regexp;
 pub mod repl;
@@ -92,6 +93,10 @@ pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
 /// Parse/load, compile, and run a JS source string on a fresh host (rkyv-cached).
 pub fn eval_str(src: &str) -> Result<Value, String> {
     host::reset_host();
+    // `node -e` resolves top-level `require` from the current working directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        module::set_entry_dir(cwd);
+    }
     run_compiled(compile_or_load(src)?)
 }
 
@@ -99,6 +104,15 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
 pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     host::reset_host();
+    // Top-level `require` in `node app.js` resolves from the entry file's dir.
+    let dir = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    module::set_entry_dir(dir);
     run_compiled(compile_or_load(&src)?)
 }
 

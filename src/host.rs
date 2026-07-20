@@ -380,6 +380,12 @@ pub struct JsHost {
     /// Accessor (getter/setter) properties per owning object, by heap index then
     /// key: `(get, set)`. Class `get x()`/`set x()` install here on the prototype.
     accessors: HashMap<u32, IndexMap<String, Accessor>>,
+    /// User-assigned static properties on a builtin namespace/constructor, keyed
+    /// by namespace name then property (`Error` → `prepareStackTrace`,
+    /// `stackTraceLimit`). Each bare `Error` reference allocates a fresh
+    /// `Builtin` handle, so these cannot live in `fn_props` (which is per-heap-
+    /// index); this stable side table lets `Error.prepareStackTrace = fn` persist.
+    builtin_statics: HashMap<String, IndexMap<String, Value>>,
     /// The shared well-known `Object.prototype` object (chain root for objects).
     object_proto: Value,
     /// Class name of each class `prototype` object, by heap index — lets an
@@ -506,6 +512,8 @@ pub fn with_host<R>(f: impl FnOnce(&mut JsHost) -> R) -> R {
 /// Reset the host to a clean slate (fresh module frame).
 pub fn reset_host() {
     with_host(|h| *h = JsHost::new());
+    // Drop any cached module handles / factory closure — they index the old heap.
+    crate::module::reset();
 }
 
 impl Default for JsHost {
@@ -538,6 +546,7 @@ impl JsHost {
             protos: HashMap::new(),
             fn_props: HashMap::new(),
             accessors: HashMap::new(),
+            builtin_statics: HashMap::new(),
             object_proto: Value::Undef,
             proto_class: HashMap::new(),
             class_registry: HashMap::new(),
@@ -641,6 +650,15 @@ impl JsHost {
         if let Value::Obj(i) = v {
             self.fn_props.entry(*i).or_default().insert(name.to_string(), val);
         }
+    }
+    /// A user-assigned static on a builtin namespace (`Error.prepareStackTrace`).
+    pub fn builtin_static(&self, ns: &str, name: &str) -> Option<Value> {
+        self.builtin_statics.get(ns).and_then(|m| m.get(name).cloned())
+    }
+    /// Assign a static on a builtin namespace (persists across fresh `Builtin`
+    /// handles for the same namespace).
+    pub fn set_builtin_static(&mut self, ns: &str, name: &str, val: Value) {
+        self.builtin_statics.entry(ns.to_string()).or_default().insert(name.to_string(), val);
     }
     pub fn fn_prop_keys(&self, v: &Value) -> Vec<String> {
         if let Value::Obj(i) = v {
@@ -2070,6 +2088,12 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
 pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result<Value, String> {
     let obj = with_host(|h| h.get(callable).cloned());
     match obj {
+        // A builtin-prototype method thunk (`Object.prototype.toString`): dispatch
+        // against the invoke-time `this` (supplied by `.call`/`.apply`).
+        Some(JsObj::Builtin(name)) if name.starts_with("@proto:") => {
+            let recv = this.unwrap_or(Value::Undef);
+            crate::builtins::proto_method(&recv, &name["@proto:".len()..], args)
+        }
         Some(JsObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args),
         Some(JsObj::Func(fv)) => run_user_func(&fv, args, this),
         Some(JsObj::BoundMethod { recv, name }) => call_method(&recv, &name, args),

@@ -27,7 +27,9 @@ pub mod http;
 pub mod net;
 pub mod os;
 pub mod path;
+pub mod process;
 pub mod stream;
+pub mod tty;
 pub mod url;
 pub mod util;
 
@@ -47,6 +49,7 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "net" => Some("net"),
         "http" => Some("http"),
         "stream" => Some("stream"),
+        "tty" => Some("tty"),
         // The `events` module's export IS the EventEmitter constructor, so
         // `require('events')` yields the ctor namespace directly.
         "events" => Some("EventEmitter"),
@@ -72,6 +75,8 @@ pub fn is_method(qualified: &str) -> bool {
         "url" => url::MODULE_METHODS.contains(&m) || m == "URL",
         "net" => net::MODULE_METHODS.contains(&m),
         "http" => http::MODULE_METHODS.contains(&m),
+        "tty" => tty::METHODS.contains(&m),
+        "process" => process::METHODS.contains(&m),
         "EventEmitter" => m == "EventEmitter",
         _ => false,
     }
@@ -98,6 +103,8 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "url" => url::call(m, args)?,
         "net" => net::call(m, args)?,
         "http" => http::call(m, args)?,
+        "tty" => tty::call(m, args)?,
+        "process" => process::call(m, args)?,
         "EventEmitter" if m == "EventEmitter" => {
             Ok(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
         }
@@ -116,6 +123,7 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         }
         "url" if name == "URL" => Some(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
         "stream" => stream::constant(name),
+        "process" => process::constant(name),
         "EventEmitter" if name == "EventEmitter" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
         }

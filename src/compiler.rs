@@ -1422,8 +1422,11 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(3 + args.len())?), 0);
                 return Ok(());
             }
-            Expr::Member { object, property, .. } => {
+            Expr::Member { object, property, optional } => {
                 self.compile_expr(b, object)?;
+                // `obj?.method(...)`: if `obj` is nullish, short-circuit the whole
+                // call to `undefined` (skip the method name, args, and dispatch).
+                let jshort = if *optional { Some(self.emit_optional_guard(b)) } else { None };
                 self.name_const(b, property);
                 if has_spread {
                     self.compile_spread_args(b, args)?; // [recv, name, argsArray]
@@ -1434,10 +1437,16 @@ impl Compiler {
                     }
                     b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
                 }
+                if let Some(j) = jshort {
+                    let end = b.current_pos();
+                    b.patch_jump(j, end);
+                }
             }
-            Expr::Index { object, index, .. } => {
+            Expr::Index { object, index, optional } => {
                 // recv[expr](args) — evaluate as a method via computed name.
                 self.compile_expr(b, object)?; // [recv]
+                // `recv?.[expr](...)`: short-circuit to `undefined` when nullish.
+                let jshort = if *optional { Some(self.emit_optional_guard(b)) } else { None };
                 b.emit(Op::Dup, 0); // [recv, recv]
                 self.compile_expr(b, index)?; // [recv, recv, idx]
                 b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0); // [recv, fn]
@@ -1453,6 +1462,10 @@ impl Compiler {
                         self.compile_expr(b, a)?;
                     }
                     b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
+                }
+                if let Some(j) = jshort {
+                    let end = b.current_pos();
+                    b.patch_jump(j, end);
                 }
             }
             Expr::Ident(n) => {

@@ -5,7 +5,10 @@ use fusevm::Value;
 
 pub const METHODS: &[&str] = &[
     "format",
+    "formatWithOptions",
     "inspect",
+    "deprecate",
+    "inherits",
     "types",
     "types.isMap",
     "types.isSet",
@@ -28,10 +31,25 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let s = format(args);
             Ok(with_host(|h| h.new_str(s)))
         }
+        // `formatWithOptions(inspectOptions, fmt, ...args)`: the options object
+        // only tunes `inspect` styling, which we do not vary — drop it and format
+        // the remaining arguments exactly like `format`.
+        "formatWithOptions" => {
+            let s = format(args.get(1..).unwrap_or(&[]));
+            Ok(with_host(|h| h.new_str(s)))
+        }
         "inspect" => Ok(with_host(|h| {
             let s = h.inspect(&args.first().cloned().unwrap_or(Value::Undef));
             h.new_str(s)
         })),
+        // `deprecate(fn, msg)`: return a callable that behaves like `fn`. The
+        // house rule is no deprecation nags, so no warning is emitted — the
+        // original function is handed back unchanged.
+        "deprecate" => Ok(args.first().cloned().unwrap_or(Value::Undef)),
+        // `inherits(ctor, superCtor)`: modern Node semantics — set `ctor.super_`
+        // and re-link `ctor.prototype`'s `[[Prototype]]` to `superCtor.prototype`
+        // (methods already on `ctor.prototype` are preserved).
+        "inherits" => Ok(inherits(args)),
         // Bare `util.types` accessed then called is not meaningful; return the
         // namespace value so a stray call is a harmless undefined.
         "types" => Ok(Value::Undef),
@@ -42,6 +60,34 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         ))),
         _ => return None,
     })
+}
+
+/// `util.inherits(ctor, superCtor)`.
+fn inherits(args: &[Value]) -> Value {
+    let ctor = args.first().cloned().unwrap_or(Value::Undef);
+    let sup = args.get(1).cloned().unwrap_or(Value::Undef);
+    with_host(|h| {
+        // Get-or-create `superCtor.prototype` and store it, so a later
+        // `superCtor.prototype` read returns the same object identity (`===`).
+        let sup_proto = h.fn_prop(&sup, "prototype").unwrap_or_else(|| {
+            let mut props = indexmap::IndexMap::new();
+            props.insert("constructor".to_string(), sup.clone());
+            let p = h.new_object(props);
+            h.set_fn_prop(&sup, "prototype", p.clone());
+            p
+        });
+        // Get-or-create `ctor.prototype` (with a `constructor` back-link).
+        let ctor_proto = h.fn_prop(&ctor, "prototype").unwrap_or_else(|| {
+            let mut props = indexmap::IndexMap::new();
+            props.insert("constructor".to_string(), ctor.clone());
+            let p = h.new_object(props);
+            h.set_fn_prop(&ctor, "prototype", p.clone());
+            p
+        });
+        h.set_proto(&ctor_proto, sup_proto);
+        h.set_fn_prop(&ctor, "super_", sup);
+    });
+    Value::Undef
 }
 
 fn type_predicate(pred: &str, v: Option<&Value>) -> bool {

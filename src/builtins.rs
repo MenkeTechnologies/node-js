@@ -883,11 +883,67 @@ fn namespace_property(ns: &str, name: &str) -> Value {
     if let Some(v) = crate::stdlib::constant(ns, name) {
         return v;
     }
+    // `Ctor.prototype` on a builtin constructor (`Object.prototype`,
+    // `Array.prototype`, …): a prototype namespace whose methods are callable
+    // thunks (`Object.prototype.toString.call(x)` is a load-time idiom in the
+    // `get-intrinsic`/`function-bind` family).
+    if name == "prototype" && is_builtin_ctor(ns) {
+        return with_host(|h| h.alloc(JsObj::Builtin(format!("{ns}.prototype"))));
+    }
+    // A method read off a builtin prototype namespace (`Array.prototype.slice`):
+    // a `@proto:<Ctor>:<method>` thunk that, when invoked (typically via
+    // `.call`/`.apply`), dispatches `method` against the invoke-time `this`.
+    if let Some(ctor) = ns.strip_suffix(".prototype") {
+        return with_host(|h| h.alloc(JsObj::Builtin(format!("@proto:{ctor}:{name}"))));
+    }
     let qualified = format!("{ns}.{name}");
     if is_known_builtin(&qualified) {
         return with_host(|h| h.alloc(JsObj::Builtin(qualified)));
     }
+    // A property the user stuck on this builtin namespace (`Error.prepareStackTrace`).
+    if let Some(v) = with_host(|h| h.builtin_static(ns, name)) {
+        return v;
+    }
     Value::Undef
+}
+
+/// Dispatch a `@proto:<Ctor>:<method>` thunk (a method read off a builtin
+/// prototype, e.g. `Object.prototype.toString`) against `recv` (its invoke-time
+/// `this`). `Object.prototype.toString` yields the `[object Tag]` brand string
+/// libraries type-check on; every other method routes through normal method
+/// dispatch on `recv`.
+pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result<Value, String> {
+    let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
+    if ctor == "Object" && method == "toString" {
+        return Ok(with_host(|h| h.new_str(object_tag(h, recv))));
+    }
+    host::call_method(recv, method, args)
+}
+
+/// The `Object.prototype.toString` brand tag for `v` (`[object Array]` etc.).
+fn object_tag(h: &host::JsHost, v: &Value) -> String {
+    let tag = match v {
+        Value::Undef => "Undefined",
+        Value::Bool(_) => "Boolean",
+        Value::Int(_) | Value::Float(_) => "Number",
+        Value::Str(_) => "String",
+        Value::Obj(_) => match h.get(v) {
+            Some(JsObj::Null) => "Null",
+            Some(JsObj::Str(_)) => "String",
+            Some(JsObj::Array(_)) => "Array",
+            Some(JsObj::Func(_))
+            | Some(JsObj::Class(_))
+            | Some(JsObj::Builtin(_))
+            | Some(JsObj::BoundFunc { .. })
+            | Some(JsObj::BoundMethod { .. }) => "Function",
+            Some(JsObj::RegExp(_)) => "RegExp",
+            _ => "Object",
+        },
+        // node-js only produces the Value variants above; fusevm's shell-oriented
+        // variants never arise here.
+        _ => "Object",
+    };
+    format!("[object {tag}]")
 }
 
 fn b_setattr(vm: &mut VM, _: u8) -> Value {
@@ -919,6 +975,13 @@ fn set_property(recv: &Value, name: &str, val: Value) {
         Some(JsObj::Func(_)) | Some(JsObj::Class(_))
     ) {
         with_host(|h| h.set_fn_prop(recv, name, val));
+        return;
+    }
+    // Writing a static onto a builtin namespace/ctor (`Error.prepareStackTrace`).
+    // Each bare reference is a fresh `Builtin` handle, so route to the stable
+    // per-namespace side table rather than the per-index `fn_props`.
+    if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(recv).cloned()) {
+        with_host(|h| h.set_builtin_static(&ns, name, val));
         return;
     }
     // `re.lastIndex = n` on a RegExp advances/resets its match cursor.
@@ -1574,6 +1637,10 @@ const GLOBAL_FUNCS: &[&str] = &[
     "clearInterval",
     "structuredClone",
     "require",
+    // CommonJS loader dispatch targets referenced by per-module `require`
+    // closures (see `module.rs`); never written by user code.
+    "__cjs_require",
+    "__cjs_resolve",
 ];
 
 const NS_METHODS: &[&str] = &[
@@ -1648,6 +1715,8 @@ const NS_METHODS: &[&str] = &[
     "Promise.race",
     "Promise.any",
     "process.nextTick",
+    "Error.captureStackTrace",
+    "require.resolve",
 ];
 
 pub fn is_known_builtin(name: &str) -> bool {
@@ -1656,13 +1725,64 @@ pub fn is_known_builtin(name: &str) -> bool {
 
 /// Call a resolved builtin function (global or `namespace.method`).
 pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, String> {
-    // `require(spec)`: resolve a supported core module to its namespace value.
+    // `require(spec)`: the ENTRY script's top-level require — core module first,
+    // else the CommonJS loader resolving from the entry file's directory.
     if name == "require" {
         let spec = with_host(|h| h.str_of(&arg0(&args)));
-        return match crate::stdlib::resolve(&spec) {
-            Some(ns) => Ok(with_host(|h| h.alloc(JsObj::Builtin(ns.to_string())))),
+        return crate::module::require(&spec, &crate::module::entry_dir());
+    }
+    // `__cjs_require(spec, fromDir)`: a per-module `require` closure's dispatch
+    // into the loader, resolving `spec` against the module's own directory.
+    if name == "__cjs_require" {
+        let spec = with_host(|h| h.str_of(&arg0(&args)));
+        let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
+        return crate::module::require(&spec, std::path::Path::new(&from));
+    }
+    // `require.resolve(spec)` at the ENTRY level: resolve from the entry dir.
+    if name == "require.resolve" {
+        let spec = with_host(|h| h.str_of(&arg0(&args)));
+        if crate::stdlib::resolve(&spec).is_some() {
+            return Ok(with_host(|h| h.new_str(spec)));
+        }
+        return match crate::module::resolve(&spec, &crate::module::entry_dir()) {
+            Some(p) => Ok(with_host(|h| h.new_str(p.to_string_lossy().to_string()))),
             None => Err(format!("Error: Cannot find module '{spec}'")),
         };
+    }
+    // `__cjs_resolve(spec, fromDir)`: `require.resolve` — the resolved absolute
+    // path (core modules resolve to the bare specifier, as in Node).
+    if name == "__cjs_resolve" {
+        let spec = with_host(|h| h.str_of(&arg0(&args)));
+        let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
+        if crate::stdlib::resolve(&spec).is_some() {
+            return Ok(with_host(|h| h.new_str(spec)));
+        }
+        return match crate::module::resolve(&spec, std::path::Path::new(&from)) {
+            Some(p) => Ok(with_host(|h| h.new_str(p.to_string_lossy().to_string()))),
+            None => Err(format!("Error: Cannot find module '{spec}'")),
+        };
+    }
+    // `Error.captureStackTrace(target[, ctor])`: V8's stack capture. Sets
+    // `target.stack`; when a custom `Error.prepareStackTrace` is installed (the
+    // stack-introspection pattern used by `depd`), it is called with a synthetic
+    // CallSite array and its result becomes `.stack`, else `.stack` is a string.
+    if name == "Error.captureStackTrace" {
+        let target = arg0(&args);
+        let prep = with_host(|h| h.builtin_static("Error", "prepareStackTrace"));
+        let stack = match prep {
+            Some(f)
+                if matches!(
+                    with_host(|h| h.get(&f).cloned()),
+                    Some(JsObj::Func(_)) | Some(JsObj::Builtin(_)) | Some(JsObj::BoundFunc { .. })
+                ) =>
+            {
+                let sites = crate::module::callsite_stack(10)?;
+                host::invoke(&f, vec![target.clone(), sites], None)?
+            }
+            _ => with_host(|h| h.new_str("")),
+        };
+        set_property(&target, "stack", stack);
+        return Ok(Value::Undef);
     }
     // Native stdlib module methods (path/os/fs/util/assert/crypto/buffer/url).
     if let Some(r) = crate::stdlib::call(name, &args) {
