@@ -31,7 +31,15 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
-pub const METHODS: &[&str] = &["runInThisContext", "runInNewContext", "createContext", "isContext"];
+pub const METHODS: &[&str] = &[
+    "runInThisContext",
+    "runInNewContext",
+    "runInContext",
+    "createContext",
+    "createScript",
+    "compileFunction",
+    "isContext",
+];
 
 /// Methods dispatched on an `@@native = "Script"` object (reported to the parent
 /// for `instance_has_method` wiring).
@@ -41,6 +49,14 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "runInThisContext" => run_code(&super::arg_str(args, 0)),
         "runInNewContext" => run_in_context(&super::arg_str(args, 0), args.get(1)),
+        // `runInContext(code, contextifiedObject[, options])` — node-js has one
+        // shared context, so it behaves exactly like `runInNewContext`: the
+        // context object's own props are merged into the global scope, the code
+        // runs, and mutated keys are copied back (see `run_in_context`).
+        "runInContext" => run_in_context(&super::arg_str(args, 0), args.get(1)),
+        // `createScript` is the legacy factory form of `new vm.Script(code)`.
+        "createScript" => construct(args),
+        "compileFunction" => compile_function(args),
         // Contextify passthrough: return the sandbox (or a fresh object). node-js
         // has one global context, so there is nothing to isolate.
         "createContext" => Ok(match args.first() {
@@ -90,6 +106,30 @@ fn run_code(code: &str) -> Result<Value, String> {
     let prog = crate::compile_completion(code)?;
     let main = crate::load_merged(prog);
     crate::host::run_chunk_on(main)
+}
+
+/// `vm.compileFunction(code, params[, options])` — REAL: wrap `code` in a
+/// function literal with the requested parameter names and run it, returning the
+/// resulting callable (a genuine JS function value on the heap, invocable like any
+/// other). This reuses the same compile→run path as the rest of the module.
+///
+/// Scope note: the `options.parsingContext` / `contextExtensions` isolation knobs
+/// are ignored (node-js has one shared context, same limitation as
+/// `runInNewContext`); the produced function closes over the shared globals.
+fn compile_function(args: &[Value]) -> Result<Value, String> {
+    let code = super::arg_str(args, 0);
+    // `params` is an array of parameter-name strings (absent → no params).
+    let params = match args.get(1) {
+        Some(v) => with_host(|h| match h.get(v) {
+            Some(JsObj::Array(items)) => {
+                items.iter().map(|it| h.str_of(it)).collect::<Vec<_>>().join(", ")
+            }
+            _ => String::new(),
+        }),
+        None => String::new(),
+    };
+    let src = format!("(function anonymous({params}\n) {{\n{code}\n}})");
+    run_code(&src)
 }
 
 /// `runInNewContext`/Script.runInNewContext: NOT isolated. Merge the sandbox's

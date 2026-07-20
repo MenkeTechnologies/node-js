@@ -7,7 +7,8 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
-pub const METHODS: &[&str] = &["parse", "stringify", "escape", "unescape", "encode", "decode"];
+pub const METHODS: &[&str] =
+    &["parse", "stringify", "escape", "unescape", "encode", "decode", "unescapeBuffer"];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
@@ -21,6 +22,14 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "unescape" => {
             let s = super::arg_str(args, 0);
             Ok(with_host(|h| h.new_str(unescape(&s))))
+        }
+        // `querystring.unescapeBuffer(str[, decodeSpaces])` → a Buffer of the raw
+        // decoded bytes. `+` is decoded to a space only when `decodeSpaces` is true
+        // (Node's default is false).
+        "unescapeBuffer" => {
+            let s = super::arg_str(args, 0);
+            let decode_spaces = matches!(args.get(1), Some(Value::Bool(true)));
+            Ok(super::buffer::from_bytes(&unescape_buffer(&s, decode_spaces)))
         }
         _ => return None,
     })
@@ -100,6 +109,41 @@ fn stringify(args: &[Value]) -> Value {
         }
     }
     with_host(|h| h.new_str(parts.join(&sep)))
+}
+
+/// `querystring.unescapeBuffer` core — decode `%XX` to raw bytes (and `+` to a
+/// space when `decode_spaces`), leaving malformed escapes literal.
+fn unescape_buffer(s: &str, decode_spaces: bool) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' if decode_spaces => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let hi = (b[i + 1] as char).to_digit(16);
+                let lo = (b[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// `querystring.escape` — percent-encode (space → `%20`, like Node; NOT `+`).

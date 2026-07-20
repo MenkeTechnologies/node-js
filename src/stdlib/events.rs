@@ -4,7 +4,7 @@
 //! invokes each so callbacks can re-enter the host.
 
 use super::arg_str;
-use crate::host::{invoke, with_host, JsObj};
+use crate::host::{call_method, invoke, with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
@@ -161,7 +161,188 @@ fn emit(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     for f in to_call {
         invoke(&f, args.to_vec(), Some(recv.clone()))?;
     }
+    // Settle any `events.once(emitter, name)` promise waiters for this event.
+    resolve_waiters(recv, name, args);
     Ok(Value::Bool(had))
+}
+
+// ── `events.once` promise waiters ───────────────────────────────────────────
+//
+// `once(emitter, name)` returns a real Promise. We cannot register a Rust
+// closure as a JS listener (listeners must be callable Values), so instead a
+// pending promise is parked under the emitter's hidden `@@waiters` map keyed by
+// event name; `emit` (above) settles them. On `error`, waiters of every other
+// event reject with the error, mirroring Node's `once` semantics.
+
+/// Park `promise` to be resolved when `name` next fires on `recv`.
+fn add_waiter(recv: &Value, name: &str, promise: Value) {
+    with_host(|h| {
+        let map = match waiter_map(h, recv) {
+            Some(m) => m,
+            None => {
+                let m = h.new_object(IndexMap::new());
+                if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                    p.insert("@@waiters".into(), m.clone());
+                }
+                m
+            }
+        };
+        let existing = match h.get(&map) {
+            Some(JsObj::Object(p)) => p.get(name).cloned(),
+            _ => None,
+        };
+        let arr = match existing {
+            Some(a) if matches!(h.get(&a), Some(JsObj::Array(_))) => a,
+            _ => {
+                let a = h.new_array(Vec::new());
+                if let Some(JsObj::Object(p)) = h.get_mut(&map) {
+                    p.insert(name.to_string(), a.clone());
+                }
+                a
+            }
+        };
+        if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
+            items.push(promise);
+        }
+    });
+}
+
+fn waiter_map(h: &crate::host::JsHost, recv: &Value) -> Option<Value> {
+    match h.get(recv) {
+        Some(JsObj::Object(p)) => p.get("@@waiters").cloned(),
+        _ => None,
+    }
+}
+
+/// Remove and return the promises parked on `name`.
+fn take_waiters(recv: &Value, name: &str) -> Vec<Value> {
+    with_host(|h| {
+        let Some(map) = waiter_map(h, recv) else { return Vec::new() };
+        let arr = match h.get_mut(&map) {
+            Some(JsObj::Object(p)) => p.shift_remove(name),
+            _ => None,
+        };
+        let Some(arr) = arr else { return Vec::new() };
+        match h.get(&arr) {
+            Some(JsObj::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        }
+    })
+}
+
+/// Remove and return every parked promise except those on `keep`.
+fn take_waiters_except(recv: &Value, keep: &str) -> Vec<Value> {
+    with_host(|h| {
+        let Some(map) = waiter_map(h, recv) else { return Vec::new() };
+        let keys: Vec<String> = match h.get(&map) {
+            Some(JsObj::Object(p)) => p.keys().filter(|k| k.as_str() != keep).cloned().collect(),
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        for k in keys {
+            let arr = match h.get_mut(&map) {
+                Some(JsObj::Object(p)) => p.shift_remove(&k),
+                _ => None,
+            };
+            if let Some(arr) = arr {
+                if let Some(JsObj::Array(items)) = h.get(&arr) {
+                    out.extend(items.iter().cloned());
+                }
+            }
+        }
+        out
+    })
+}
+
+fn resolve_waiters(recv: &Value, name: &str, args: &[Value]) {
+    let waiting = take_waiters(recv, name);
+    if !waiting.is_empty() {
+        let arr = with_host(|h| h.new_array(args.to_vec()));
+        for p in &waiting {
+            if let Some(id) = with_host(|h| h.promise_id(p)) {
+                crate::host::resolve_promise_val(id, arr.clone());
+            }
+        }
+    }
+    if name == "error" {
+        let err = args.first().cloned().unwrap_or(Value::Undef);
+        for p in take_waiters_except(recv, "error") {
+            if let Some(id) = with_host(|h| h.promise_id(&p)) {
+                crate::host::reject_promise_val(id, err.clone());
+            }
+        }
+    }
+}
+
+// ── static module functions (`require('events').once`, `.listenerCount`, …) ──
+
+/// Static functions on the `events` module namespace. `EventEmitter` (the
+/// self-ref ctor) and `EventEmitterAsyncResource` are handled by the parent;
+/// `on` (async iterator) is deferred (see module docs / final report).
+pub const STATIC_METHODS: &[&str] = &[
+    "once",
+    "listenerCount",
+    "getEventListeners",
+    "getMaxListeners",
+    "setMaxListeners",
+    "addAbortListener",
+    "init",
+];
+
+/// Dispatch a static `events.<method>(...)`. Returns `None` for names this
+/// module does not own (e.g. `EventEmitter`) so the parent's specific arm wins.
+pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let emitter = args.first().cloned().unwrap_or(Value::Undef);
+    Some(match method {
+        "once" => Ok(once_static(emitter, &arg_str(args, 1))),
+        "listenerCount" => Ok(Value::Float(listeners(&emitter, &arg_str(args, 1)).len() as f64)),
+        "getEventListeners" => Ok(with_host(|h| h.new_array(listeners(&emitter, &arg_str(args, 1))))),
+        // No per-emitter cap is tracked; report Node's default and accept sets.
+        "getMaxListeners" => Ok(Value::Float(10.0)),
+        "setMaxListeners" => Ok(Value::Undef),
+        "addAbortListener" => Ok(add_abort_listener(args)),
+        "init" => Ok(init_emitter(emitter)),
+        _ => return None,
+    })
+}
+
+/// `events.once(emitter, name)` → a Promise resolving with the event args (or
+/// rejecting with the error if `error` fires first).
+fn once_static(emitter: Value, name: &str) -> Value {
+    let p = with_host(|h| h.new_promise());
+    add_waiter(&emitter, name, p.clone());
+    p
+}
+
+/// `EventEmitter.init(emitter)` — ensure the hidden emitter maps exist on
+/// `emitter` (used when mixing the emitter surface into a plain object).
+fn init_emitter(emitter: Value) -> Value {
+    with_host(|h| {
+        let has = matches!(h.get(&emitter), Some(JsObj::Object(p)) if p.contains_key("@@on"));
+        if !has {
+            let on = h.new_object(IndexMap::new());
+            let once = h.new_object(IndexMap::new());
+            let native = h.new_str("EventEmitter");
+            if let Some(JsObj::Object(p)) = h.get_mut(&emitter) {
+                p.entry("@@native".to_string()).or_insert(native);
+                p.insert("@@on".to_string(), on);
+                p.insert("@@once".to_string(), once);
+            }
+        }
+    });
+    emitter
+}
+
+/// `events.addAbortListener(signal, listener)` — best-effort: register a
+/// one-time `abort` listener if `signal` is emitter-like. `AbortSignal` is not
+/// modeled natively, so this is a no-op for plain signals. Returns a disposable
+/// placeholder object.
+fn add_abort_listener(args: &[Value]) -> Value {
+    let signal = args.first().cloned().unwrap_or(Value::Undef);
+    let listener = args.get(1).cloned().unwrap_or(Value::Undef);
+    let name = with_host(|h| h.new_str("abort"));
+    let _ = call_method(&signal, "once", vec![name, listener]);
+    with_host(|h| h.new_object(IndexMap::new()))
 }
 
 fn remove(recv: &Value, name: &str, f: Option<Value>) {

@@ -63,6 +63,12 @@ pub const METHODS: &[&str] = &[
     "isBigIntObject",
     "isModuleNamespaceObject",
     "isExternal",
+    "isArrayBufferView",
+    "isCryptoKey",
+    "isKeyObject",
+    "isFloat16Array",
+    "isMapIterator",
+    "isSetIterator",
 ];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
@@ -123,6 +129,20 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // `arguments` is a plain array here (indistinguishable from any array),
         // and there are no module-namespace / external (N-API) objects.
         "isArgumentsObject" | "isModuleNamespaceObject" | "isExternal" => b(false),
+
+        // A "view" over an `ArrayBuffer`: any typed array (a `Buffer` counts, being
+        // a `Uint8Array` subclass). node-js has no `DataView`, so views == typed
+        // arrays exactly.
+        "isArrayBufferView" => b(ta_kind(&v).is_some()),
+        // node-js has no `Float16Array` kind (no `@@kind` ever reports it).
+        "isFloat16Array" => b(ta_kind(&v).as_deref() == Some("Float16Array")),
+        // No WebCrypto `CryptoKey` / `KeyObject` heap kinds exist here.
+        "isCryptoKey" | "isKeyObject" => b(false),
+        // node-js iterators are a single generic `JsObj::Iter` with no Map/Set
+        // brand, so a genuine `map.entries()` cannot be told apart from any other
+        // iterator. Reporting `false` avoids false positives on array/string
+        // iterators (the common case); the positive case is a known limitation.
+        "isMapIterator" | "isSetIterator" => b(false),
 
         _ => None,
     }

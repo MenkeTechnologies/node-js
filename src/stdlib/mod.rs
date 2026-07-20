@@ -102,6 +102,9 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         // `path/posix` is exactly our POSIX `path`; `assert/strict` is `assert`
         // (our assert is already strict-equality based).
         "path/posix" => Some("path"),
+        "path/win32" => Some("path"),
+        // `sys` is the long-deprecated alias for `util`.
+        "sys" => Some("util"),
         "assert/strict" => Some("assert"),
         "child_process" => Some("child_process"),
         "dns" => Some("dns"),
@@ -142,20 +145,23 @@ pub fn is_method(qualified: &str) -> bool {
         "os" => os::METHODS.contains(&m),
         "util" => util::METHODS.contains(&m),
         "assert" => assert::METHODS.contains(&m),
+        "assertStrict" => assert::METHODS.contains(&m),
         "crypto" => crypto::METHODS.contains(&m),
         "Buffer" => buffer::STATIC_METHODS.contains(&m),
-        "buffer" => m == "Buffer",
+        "buffer" => m == "Buffer" || buffer::MODULE_METHODS.contains(&m),
         "Date" => date::STATIC_METHODS.contains(&m),
         "TextEncoder" | "TextDecoder" => false,
         n if typedarray::is_ctor(n) => typedarray::STATIC_METHODS.contains(&m),
         "url" => url::MODULE_METHODS.contains(&m) || m == "URL",
         "net" => net::MODULE_METHODS.contains(&m),
         "http" => http::MODULE_METHODS.contains(&m),
+        "stream" => stream::METHODS.contains(&m),
+        "worker_threads" => worker_threads::METHODS.contains(&m),
         "zlib" => zlib::MODULE_METHODS.contains(&m),
         "querystring" => querystring::METHODS.contains(&m),
         "tty" => tty::METHODS.contains(&m),
         "process" => process::METHODS.contains(&m),
-        "EventEmitter" => m == "EventEmitter",
+        "EventEmitter" => m == "EventEmitter" || events::STATIC_METHODS.contains(&m),
         "console" => console::METHODS.contains(&m),
         "child_process" => child_process::METHODS.contains(&m),
         "dns" => dns::METHODS.contains(&m),
@@ -171,7 +177,14 @@ pub fn is_method(qualified: &str) -> bool {
         "vm" => vm::METHODS.contains(&m),
         "fs/promises" => fs_promises::METHODS.contains(&m),
         "dgram" => dgram::MODULE_METHODS.contains(&m),
-        "dns/promises" => matches!(m, "lookup" | "resolve" | "resolve4" | "resolve6"),
+        "dns/promises" => matches!(
+            m,
+            "lookup" | "lookupService" | "resolve" | "resolve4" | "resolve6" | "resolveMx"
+                | "resolveTxt" | "resolveCname" | "resolveNs" | "resolvePtr" | "resolveSrv"
+                | "resolveSoa" | "resolveNaptr" | "resolveCaa" | "resolveTlsa" | "resolveAny"
+                | "reverse" | "getServers" | "setServers" | "getDefaultResultOrder"
+                | "setDefaultResultOrder"
+        ),
         "tls" => tls::MODULE_METHODS.contains(&m),
         "https" => https::MODULE_METHODS.contains(&m),
         "repl" => repl::METHODS.contains(&m),
@@ -201,15 +214,19 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "os" => os::call(m, args)?,
         "util" => util::call(m, args)?,
         "assert" => assert::call(m, args)?,
+        "assertStrict" => assert::strict_call(m, args)?,
         "crypto" => crypto::call(m, args)?,
         "Buffer" => buffer::static_call(m, args)?,
         "buffer" if m == "Buffer" => Ok(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into())))),
+        "buffer" => buffer::module_call(m, args)?,
         "Date" => date::static_call(m, args)?,
         n if typedarray::is_ctor(n) => typedarray::static_call(n, m, args)?,
         "url" if m == "URL" => Ok(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
         "url" => url::call(m, args)?,
         "net" => net::call(m, args)?,
         "http" => http::call(m, args)?,
+        "stream" => stream::call(m, args)?,
+        "worker_threads" => worker_threads::call(m, args)?,
         "zlib" => zlib::call(m, args)?,
         "querystring" => querystring::call(m, args)?,
         "tty" => tty::call(m, args)?,
@@ -217,6 +234,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "EventEmitter" if m == "EventEmitter" => {
             Ok(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
         }
+        "EventEmitter" => events::static_call(m, args)?,
         "console" => console::call(m, args)?,
         "child_process" => child_process::call(m, args)?,
         "dns" => dns::call(m, args)?,
@@ -232,16 +250,22 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "vm" => vm::call(m, args)?,
         "fs/promises" => fs_promises::call(m, args)?,
         "dgram" => dgram::call(m, args)?,
-        // dns/promises maps the promise-returning dns methods to their Node names.
-        "dns/promises" => {
-            let pm = match m {
-                "lookup" => "promiseLookup",
-                "resolve" | "resolve4" => "promiseResolve4",
-                "resolve6" => "promiseResolve6",
-                _ => return None,
-            };
-            dns::call(pm, args)?
-        }
+        // dns/promises: getServers/setServers/get|setDefaultResultOrder are shared
+        // sync fns; every other method maps to dns's `promise<Cap>` variant.
+        "dns/promises" => match m {
+            "getServers" | "setServers" | "getDefaultResultOrder" | "setDefaultResultOrder" => {
+                dns::call(m, args)?
+            }
+            _ => {
+                let mut pm = String::from("promise");
+                let mut cs = m.chars();
+                if let Some(c) = cs.next() {
+                    pm.extend(c.to_uppercase());
+                    pm.push_str(cs.as_str());
+                }
+                dns::call(&pm, args)?
+            }
+        },
         "tls" => tls::call(m, args)?,
         "https" => https::call(m, args)?,
         "repl" => repl::call(m, args)?,
@@ -270,7 +294,25 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "buffer" if name == "Buffer" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into()))))
         }
+        "buffer" if matches!(name, "Blob" | "File") => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
+        }
         "url" if name == "URL" => Some(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
+        "net" => net::constant(name),
+        "tty" => tty::constant(name),
+        "repl" => repl::constant(name),
+        "readline" => readline::constant(name),
+        "diagnostics_channel" => diagnostics_channel::constant(name),
+        "v8" => v8::constant(name),
+        "console" if name == "Console" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("Console".into()))))
+        }
+        "assert" if name == "AssertionError" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("AssertionError".into()))))
+        }
+        "assert" if name == "strict" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("assertStrict".into()))))
+        }
         "stream" => stream::constant(name),
         "http" => http::constant(name),
         "string_decoder" if name == "StringDecoder" => {
@@ -326,6 +368,23 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "Worker" => Some(worker_threads::construct_worker(args)),
         "Domain" => Some(domain::construct(args)),
         "Tracing" => Some(trace_events::construct(args)),
+        "Blob" => Some(buffer::construct_blob(args)),
+        "File" => Some(buffer::construct_file(args)),
+        "AssertionError" => Some(Ok(assert::construct_assertion_error(args))),
+        "Resolver" => Some(Ok(dns::construct_resolver(args))),
+        "ReadStream" | "WriteStream" => Some(Ok(tty::construct(name, args))),
+        "MessageChannel" => Some(worker_threads::construct_message_channel(args)),
+        "BroadcastChannel" => Some(worker_threads::construct_broadcast_channel(args)),
+        "PerformanceObserver" => Some(perf_hooks::construct(name, args)),
+        "REPLServer" | "Recoverable" => Some(repl::construct(name, args)),
+        "Interface" => Some(readline::construct(args)),
+        "Console" => Some(console::construct(args)),
+        "Serializer" | "DefaultSerializer" | "Deserializer" | "DefaultDeserializer" => {
+            Some(v8::construct(name, args))
+        }
+        // net/http constructors: their `construct` already returns Option<Result>.
+        "Socket" | "Stream" | "Server" | "SocketAddress" | "BlockList" => net::construct(name, args),
+        "Agent" | "http.Server" => http::construct(name, args),
         _ => None,
     }
 }
@@ -366,7 +425,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
             "indexOf", "lastIndexOf", "write", "copy", "fill", "compare", "readUInt16BE",
             "readUInt16LE", "writeUInt8", "writeUInt16BE", "writeUInt16LE",
         ],
-        "Readable" | "Writable" | "Duplex" | "Transform" => {
+        "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" => {
             &["read", "write", "end", "pipe", "pause", "resume", "setEncoding", "destroy", "push"]
         }
         "URL" => &["toString", "toJSON"],
@@ -392,14 +451,34 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "Http2Server" => http2::SERVER_METHODS,
         "Http2Stream" => http2::STREAM_METHODS,
         "Http2Session" => http2::SESSION_METHODS,
+        "Cipheriv" | "Decipheriv" => &["update", "final", "setAutoPadding"],
+        "BlockList" => net::BLOCKLIST_METHODS,
+        "ClientRequest" => http::CLIENT_REQUEST_METHODS,
+        "Agent" => &["destroy", "getName"],
+        "Blob" | "File" => buffer::BLOB_METHODS,
+        "ReadStream" => tty::READ_STREAM_METHODS,
+        "Dirent" => fs::DIRENT_METHODS,
+        "Dir" => fs::DIR_METHODS,
+        "FSReadStream" => fs::READ_STREAM_METHODS,
+        "FSWriteStream" => fs::WRITE_STREAM_METHODS,
+        "Resolver" => dns::RESOLVER_METHODS,
+        "Histogram" => perf_hooks::HISTOGRAM_METHODS,
+        "PerformanceObserver" => perf_hooks::PERFORMANCE_OBSERVER_METHODS,
+        "PerformanceObserverEntryList" => perf_hooks::OBSERVER_ENTRY_LIST_METHODS,
+        "BroadcastChannel" => worker_threads::BROADCAST_CHANNEL_METHODS,
+        "TracingChannel" => diagnostics_channel::TRACING_CHANNEL_METHODS,
+        "Serializer" => v8::SERIALIZER_METHODS,
+        "Deserializer" => v8::DESERIALIZER_METHODS,
+        "Console" => console::CONSOLE_METHODS,
         _ => &[],
     };
     let is_emitter = matches!(
         tag,
         "Server" | "Socket" | "ServerResponse" | "IncomingMessage" | "EventEmitter" | "Readable"
-            | "Writable" | "Duplex" | "Transform" | "UdpSocket" | "Worker" | "MessagePort"
-            | "TLSServer" | "TLSSocket" | "HTTPSServerResponse" | "HTTPSClientRequest"
-            | "ClusterWorker" | "Domain" | "Http2Server" | "Http2Stream" | "Http2Session"
+            | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" | "UdpSocket"
+            | "Worker" | "MessagePort" | "TLSServer" | "TLSSocket" | "HTTPSServerResponse"
+            | "HTTPSClientRequest" | "ClusterWorker" | "Domain" | "Http2Server" | "Http2Stream"
+            | "Http2Session" | "ClientRequest" | "FSReadStream" | "FSWriteStream"
     );
     base.contains(&name) || (is_emitter && EMITTER.contains(&name))
 }
@@ -422,7 +501,9 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "Script" => vm::instance_call(recv, method, args),
         "URLSearchParams" => url::search_params_call(recv, method, &args),
         "UdpSocket" => dgram::instance_call(recv, method, args),
-        "Worker" | "MessagePort" => worker_threads::instance_call(tag, recv, method, args),
+        "Worker" | "MessagePort" | "BroadcastChannel" => {
+            worker_threads::instance_call(tag, recv, method, args)
+        }
         "TLSServer" | "TLSSocket" => tls::instance_call(tag, recv, method, args),
         "HTTPSServerResponse" | "HTTPSClientRequest" => https::instance_call(tag, recv, method, args),
         "REPLServer" => repl::instance_call(recv, method, args),
@@ -433,9 +514,27 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "EventEmitter" => events::instance_call(recv, method, args),
         "URL" => url::instance_call(recv, method, &args),
         "Stats" => fs::stats_call(recv, method),
-        "Server" | "Socket" => net::instance_call(tag, recv, method, args),
-        "IncomingMessage" | "ServerResponse" => http::instance_call(tag, recv, method, args),
-        "Readable" | "Writable" | "Duplex" | "Transform" => stream::instance_call(tag, recv, method, args),
+        "Dirent" => fs::dirent_call(recv, method),
+        "Dir" => fs::dir_call(recv, method, args),
+        "FSReadStream" => fs::read_stream_call(recv, method, args),
+        "FSWriteStream" => fs::write_stream_call(recv, method, args),
+        "Server" | "Socket" | "BlockList" => net::instance_call(tag, recv, method, args),
+        "IncomingMessage" | "ServerResponse" | "ClientRequest" | "Agent" => {
+            http::instance_call(tag, recv, method, args)
+        }
+        "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" => {
+            stream::instance_call(tag, recv, method, args)
+        }
+        "Cipheriv" | "Decipheriv" => crypto::cipher_instance_call(tag, recv, method, &args),
+        "Blob" | "File" => buffer::blob_call(recv, method, &args),
+        "ReadStream" => tty::instance_call(recv, method, &args),
+        "Resolver" => dns::resolver_instance_call(recv, method, args),
+        "Histogram" => perf_hooks::histogram_instance_call(recv, method, &args),
+        "PerformanceObserver" => perf_hooks::observer_instance_call(recv, method, &args),
+        "PerformanceObserverEntryList" => perf_hooks::entry_list_instance_call(recv, method, &args),
+        "TracingChannel" => diagnostics_channel::tracing_instance_call(recv, method, &args),
+        "Serializer" | "Deserializer" => v8::instance_call(tag, recv, method, args),
+        "Console" => console::instance_call(recv, method, args),
         "AsyncLocalStorage" | "AsyncHook" => async_hooks::instance_call(tag, recv, method, args),
         "Channel" => diagnostics_channel::instance_call(recv, method, &args),
         "WriteStream" => process::stream_instance_call(recv, method, &args),

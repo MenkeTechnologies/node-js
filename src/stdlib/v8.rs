@@ -18,7 +18,7 @@
 //!   - `setFlagsFromString` is a no-op (there are no V8 flags to set).
 //!   - `getHeapSnapshot` throws: node-js cannot produce a V8 heap snapshot.
 
-use crate::host::with_host;
+use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
@@ -30,7 +30,22 @@ pub const METHODS: &[&str] = &[
     "deserialize",
     "setFlagsFromString",
     "getHeapSnapshot",
+    "cachedDataVersionTag",
 ];
+
+/// A FIXED compatibility tag returned by `v8.cachedDataVersionTag()`. Node derives
+/// this from the V8 version + build flags; node-js has no V8, so a single stable
+/// constant is returned (callers use it only to invalidate a code cache when the
+/// runtime changes — a constant is honest for a runtime that never emits V8 code
+/// cache data in the first place).
+const CACHED_DATA_VERSION_TAG: f64 = 3_527_742_766.0;
+
+/// Methods dispatched on an `@@native = "Serializer"` object (JSON-backed shim;
+/// reported to the parent for `instance_has_method` / `instance_call` wiring).
+pub const SERIALIZER_METHODS: &[&str] = &["writeHeader", "writeValue", "releaseBuffer"];
+
+/// Methods dispatched on an `@@native = "Deserializer"` object.
+pub const DESERIALIZER_METHODS: &[&str] = &["readHeader", "readValue"];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
@@ -45,8 +60,93 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "getHeapSnapshot" => Err(crate::host::type_error(
             "v8.getHeapSnapshot is not supported: node-js does not run on V8",
         )),
+        "cachedDataVersionTag" => Ok(Value::Float(CACHED_DATA_VERSION_TAG)),
         _ => return None,
     })
+}
+
+/// Non-function members of the `v8` namespace, exposed as constructor values so
+/// `require('v8').Serializer` (etc.) resolve and `new` reaches `construct`.
+/// Requires the parent to route `"v8"` into `stdlib::constant`.
+pub fn constant(name: &str) -> Option<Value> {
+    match name {
+        "Serializer" | "Deserializer" | "DefaultSerializer" | "DefaultDeserializer" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
+        }
+        _ => None,
+    }
+}
+
+/// `new v8.Serializer()` / `new v8.Deserializer(buffer)` (and the `Default*`
+/// aliases). node-js has no V8 structured-clone binary format, so these are
+/// JSON-backed shims: a `Serializer` accumulates ONE `writeValue`d value as JSON
+/// and hands it back from `releaseBuffer` as a UTF-8 Buffer; a `Deserializer`
+/// parses that JSON back with `readValue`. The granular byte writers/readers
+/// (`writeUint32`/`writeDouble`/`writeRawBytes`/…) are NOT modeled — they only
+/// make sense against the real binary layout (see the report's deferred list).
+pub fn construct(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "Serializer" | "DefaultSerializer" => Ok(with_host(|h| {
+            let mut m = IndexMap::new();
+            m.insert("@@native".into(), h.new_str("Serializer"));
+            m.insert("@@json".into(), Value::Undef);
+            h.new_object(m)
+        })),
+        "Deserializer" | "DefaultDeserializer" => {
+            // Decode the incoming Buffer's bytes as UTF-8 JSON text.
+            let json = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
+            Ok(with_host(|h| {
+                let jv = h.new_str(json);
+                let mut m = IndexMap::new();
+                m.insert("@@native".into(), h.new_str("Deserializer"));
+                m.insert("@@json".into(), jv);
+                h.new_object(m)
+            }))
+        }
+        _ => Err(crate::host::type_error(&format!("v8.{name} is not a constructor"))),
+    }
+}
+
+/// Dispatch a method on a `Serializer`/`Deserializer` instance.
+pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    match (tag, method) {
+        // Serializer: `writeHeader` is a no-op (no binary header to emit).
+        ("Serializer", "writeHeader") => Ok(Value::Undef),
+        ("Serializer", "writeValue") => {
+            let json = crate::builtins::call_builtin_function(
+                "JSON.stringify",
+                vec![args.first().cloned().unwrap_or(Value::Undef)],
+            )?;
+            let s = with_host(|h| h.str_of(&json));
+            with_host(|h| {
+                let sv = h.new_str(s);
+                if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                    p.insert("@@json".into(), sv);
+                }
+            });
+            Ok(Value::Bool(true))
+        }
+        ("Serializer", "releaseBuffer") => {
+            let s = with_host(|h| match h.get(recv) {
+                Some(JsObj::Object(p)) => match p.get("@@json") {
+                    Some(Value::Undef) | None => String::new(),
+                    Some(v) => h.str_of(v),
+                },
+                _ => String::new(),
+            });
+            Ok(super::buffer::from_bytes(s.as_bytes()))
+        }
+        // Deserializer: `readHeader` is a no-op; `readValue` parses the JSON back.
+        ("Deserializer", "readHeader") => Ok(Value::Undef),
+        ("Deserializer", "readValue") => {
+            let sv = with_host(|h| match h.get(recv) {
+                Some(JsObj::Object(p)) => p.get("@@json").cloned().unwrap_or(Value::Undef),
+                _ => Value::Undef,
+            });
+            crate::builtins::call_builtin_function("JSON.parse", vec![sv])
+        }
+        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+    }
 }
 
 /// `v8.getHeapStatistics()` — the full key set Node returns, all zeroed. These are

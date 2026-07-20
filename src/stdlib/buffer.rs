@@ -9,6 +9,206 @@ use indexmap::IndexMap;
 
 pub const STATIC_METHODS: &[&str] = &["from", "alloc", "allocUnsafe", "concat", "isBuffer", "byteLength"];
 
+/// Free functions of the `buffer` module itself (`require('buffer').atob`, …), as
+/// opposed to the `Buffer` constructor's static methods above. Needs the parent
+/// `"buffer"` routing arm (see final report).
+pub const MODULE_METHODS: &[&str] = &["atob", "btoa", "isAscii", "isUtf8", "transcode"];
+
+/// Dispatch a `require('buffer').<method>` free function.
+pub fn module_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    Some(match method {
+        // atob: base64 → a binary (latin1) string.
+        "atob" => {
+            let s = arg_str(args, 0);
+            let bytes = from_base64(&s);
+            let bin: String = bytes.iter().map(|b| *b as char).collect();
+            Ok(with_host(|h| h.new_str(bin)))
+        }
+        // btoa: a binary string → base64 (each char's low byte is one octet).
+        "btoa" => {
+            let s = arg_str(args, 0);
+            let bytes: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
+            let b64 = to_base64(&bytes);
+            Ok(with_host(|h| h.new_str(b64)))
+        }
+        "isAscii" => {
+            let bytes = input_bytes(args.first());
+            Ok(Value::Bool(bytes.iter().all(|b| *b < 0x80)))
+        }
+        "isUtf8" => {
+            let bytes = input_bytes(args.first());
+            Ok(Value::Bool(std::str::from_utf8(&bytes).is_ok()))
+        }
+        // transcode(source, fromEnc, toEnc): re-encode bytes between utf8/latin1/
+        // ascii/utf16le (best-effort; hex/base64 are not transcode encodings).
+        "transcode" => {
+            let src = input_bytes(args.first());
+            let from = arg_str(args, 1);
+            let to = arg_str(args, 2);
+            let s = bytes_to_string(&src, &from);
+            let out = string_to_bytes(&s, &to);
+            Ok(from_bytes(&out))
+        }
+        _ => return None,
+    })
+}
+
+/// Raw bytes of a Buffer/Blob arg, or the UTF-8 bytes of a string arg.
+fn input_bytes(v: Option<&Value>) -> Vec<u8> {
+    match v {
+        None => Vec::new(),
+        Some(v) => {
+            if let Some(s) = with_host(|h| h.as_str(v)) {
+                s.into_bytes()
+            } else {
+                bytes_of(v)
+            }
+        }
+    }
+}
+
+/// Interpret bytes under `enc` as a Rust string (for `transcode`).
+fn bytes_to_string(bytes: &[u8], enc: &str) -> String {
+    match enc.to_ascii_lowercase().as_str() {
+        "ascii" | "latin1" | "binary" => bytes.iter().map(|b| *b as char).collect(),
+        "utf16le" | "utf-16le" | "ucs2" | "ucs-2" => {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Encode a Rust string into `enc` bytes (for `transcode`).
+fn string_to_bytes(s: &str, enc: &str) -> Vec<u8> {
+    match enc.to_ascii_lowercase().as_str() {
+        "ascii" | "latin1" | "binary" => s.chars().map(|c| c as u32 as u8).collect(),
+        "utf16le" | "utf-16le" | "ucs2" | "ucs-2" => {
+            s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+        }
+        _ => s.as_bytes().to_vec(),
+    }
+}
+
+// ── Blob / File ──────────────────────────────────────────────────────────────
+//
+// A `Blob` is a native object tagged `@@native = "Blob"` (a `File` is `"File"`)
+// whose bytes live in `@@bytes`, with `size`/`type` (and `File`'s `name`/
+// `lastModified`) as readable data properties. Needs parent construct/instance
+// wiring (see final report).
+
+/// Concatenate one Blob-part's bytes: a string contributes its UTF-8 bytes, a
+/// Buffer/Blob its raw bytes.
+fn part_bytes(v: &Value) -> Vec<u8> {
+    match with_host(|h| h.as_str(v)) {
+        Some(s) => s.into_bytes(),
+        None => bytes_of(v),
+    }
+}
+
+/// Gather the byte payload from a `BlobPart[]` (the first constructor argument).
+fn gather_parts(parts: &Value) -> Vec<u8> {
+    let items = with_host(|h| match h.get(parts) {
+        Some(JsObj::Array(it)) => it.clone(),
+        _ => Vec::new(),
+    });
+    let mut out = Vec::new();
+    for it in &items {
+        out.extend(part_bytes(it));
+    }
+    out
+}
+
+/// The `type` string from an options bag (`{ type }`), or "".
+fn opt_type(opts: Option<&Value>) -> String {
+    match opts {
+        Some(v) => with_host(|h| match h.get(v) {
+            Some(JsObj::Object(p)) => p.get("type").map(|x| h.str_of(x)).unwrap_or_default(),
+            _ => String::new(),
+        }),
+        None => String::new(),
+    }
+}
+
+/// Build a `Blob`/`File` native object with the shared `@@bytes`/`size`/`type`
+/// fields; `File` adds `name`/`lastModified`.
+fn build_blob(tag: &str, bytes: &[u8], typ: &str, extra: IndexMap<String, Value>) -> Value {
+    with_host(|h| {
+        let arr = h.new_array(bytes.iter().map(|b| Value::Float(*b as f64)).collect());
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str(tag.to_string()));
+        m.insert("@@bytes".into(), arr);
+        m.insert("size".into(), Value::Float(bytes.len() as f64));
+        m.insert("type".into(), h.new_str(typ.to_string()));
+        for (k, v) in extra {
+            m.insert(k, v);
+        }
+        h.new_object(m)
+    })
+}
+
+/// `new Blob(parts[, options])`.
+pub fn construct_blob(args: &[Value]) -> Result<Value, String> {
+    let bytes = gather_parts(&args.first().cloned().unwrap_or(Value::Undef));
+    let typ = opt_type(args.get(1));
+    Ok(build_blob("Blob", &bytes, &typ, IndexMap::new()))
+}
+
+/// `new File(parts, name[, options])`.
+pub fn construct_file(args: &[Value]) -> Result<Value, String> {
+    let bytes = gather_parts(&args.first().cloned().unwrap_or(Value::Undef));
+    let name = arg_str(args, 1);
+    let typ = opt_type(args.get(2));
+    // lastModified: options.lastModified or 0.
+    let last_modified = args
+        .get(2)
+        .map(|v| {
+            with_host(|h| match h.get(v) {
+                Some(JsObj::Object(p)) => p.get("lastModified").map(|x| h.to_number(x)).unwrap_or(0.0),
+                _ => 0.0,
+            })
+        })
+        .unwrap_or(0.0);
+    let extra = with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("name".to_string(), h.new_str(name));
+        m.insert("lastModified".to_string(), Value::Float(last_modified));
+        m
+    });
+    Ok(build_blob("File", &bytes, &typ, extra))
+}
+
+/// Method names for `Blob`/`File` instances (parent `instance_has_method`).
+pub const BLOB_METHODS: &[&str] = &["text", "arrayBuffer", "bytes", "slice"];
+
+/// `Blob`/`File` instance methods. `text`/`arrayBuffer`/`bytes` return already-
+/// resolved Promises (Node's async accessors); `slice` returns a new `Blob`.
+/// `arrayBuffer`/`bytes` resolve with a `Buffer` (this runtime's byte container)
+/// rather than a bare `ArrayBuffer`/`Uint8Array`.
+pub fn blob_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    let bytes = bytes_of(recv);
+    match method {
+        "text" => {
+            let s = String::from_utf8_lossy(&bytes).into_owned();
+            let sv = with_host(|h| h.new_str(s));
+            Ok(crate::host::promise_of(&sv))
+        }
+        "arrayBuffer" | "bytes" => {
+            let buf = from_bytes(&bytes);
+            Ok(crate::host::promise_of(&buf))
+        }
+        "slice" => {
+            let (s, e) = slice_bounds(args, bytes.len());
+            let typ = if args.len() > 2 { arg_str(args, 2) } else { String::new() };
+            Ok(build_blob("Blob", &bytes[s..e], &typ, IndexMap::new()))
+        }
+        _ => Err(crate::host::type_error(&format!("blob.{method} is not a function"))),
+    }
+}
+
 /// Build a Buffer value from raw bytes.
 pub fn from_bytes(bytes: &[u8]) -> Value {
     with_host(|h| {

@@ -49,6 +49,14 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 
 /// Methods of the `timers/promises` module (its namespace name carries no `.`, so
 /// `stdlib::is_method` treats the whole `"timers/promises"` as the namespace).
+///
+/// `setInterval(delay[, value])` (an async iterator) is NOT implemented: the
+/// `for await` machinery finds a native object's async iterator only via
+/// `host::user_async_iterator_fn`, which needs a *callable* `@@asyncIterator`
+/// stored property discoverable by `lookup_chain` — native-tagged objects
+/// dispatch methods through the parent `instance_call` table, not stored
+/// properties, so there is no way to expose it without editing `builtins.rs`/
+/// `host.rs` (out of scope here).
 pub const PROMISES_METHODS: &[&str] = &["setTimeout", "setImmediate"];
 
 /// Dispatch a `timers/promises.<method>` call.

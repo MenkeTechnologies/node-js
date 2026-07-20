@@ -26,6 +26,9 @@ pub const METHODS: &[&str] = &[
     "networkInterfaces",
     "version",
     "machine",
+    "availableParallelism",
+    "getPriority",
+    "setPriority",
 ];
 
 /// `os.EOL` constant.
@@ -100,7 +103,7 @@ pub fn arch() -> &'static str {
     }
 }
 
-pub fn call(method: &str, _args: &[Value]) -> Option<Result<Value, String>> {
+pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let s = |v: &str| Ok(with_host(|h| h.new_str(v)));
     Some(match method {
         "platform" => s(platform()),
@@ -128,9 +131,44 @@ pub fn call(method: &str, _args: &[Value]) -> Option<Result<Value, String>> {
         "freemem" => Ok(Value::Float(0.0)),
         "uptime" => Ok(Value::Float(0.0)),
         "cpus" => Ok(with_host(|h| h.new_array(Vec::new()))),
-        "loadavg" => Ok(with_host(|h| h.new_array(vec![Value::Float(0.0); 3]))),
+        // Real 1/5/15-minute load averages via `getloadavg(3)`.
+        "loadavg" => {
+            let mut avg = [0f64; 3];
+            // SAFETY: writes at most 3 doubles into a 3-element buffer.
+            let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
+            let items: Vec<Value> = if n == 3 {
+                avg.iter().map(|v| Value::Float(*v)).collect()
+            } else {
+                vec![Value::Float(0.0); 3]
+            };
+            Ok(with_host(|h| h.new_array(items)))
+        }
         "networkInterfaces" => Ok(with_host(|h| h.new_object(IndexMap::new()))),
         "userInfo" => Ok(user_info()),
+        // Logical CPU count (Node uses libuv's available parallelism).
+        "availableParallelism" => {
+            let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            Ok(Value::Float(n as f64))
+        }
+        // `os.getPriority([pid])` — the nice value of `pid` (0 = current process).
+        "getPriority" => {
+            let pid = if args.is_empty() { 0 } else { super::arg_num(args, 0) as i32 };
+            // SAFETY: pure query; PRIO_PROCESS with a pid.
+            let prio = unsafe { libc::getpriority(libc::PRIO_PROCESS as _, pid as _) };
+            Ok(Value::Float(prio as f64))
+        }
+        // `os.setPriority([pid, ]priority)` — best-effort (needs privilege to lower
+        // the nice value); returns undefined.
+        "setPriority" => {
+            let (pid, prio) = if args.len() >= 2 {
+                (super::arg_num(args, 0) as i32, super::arg_num(args, 1) as i32)
+            } else {
+                (0, super::arg_num(args, 0) as i32)
+            };
+            // SAFETY: PRIO_PROCESS with a pid and nice value; failure returns -1.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS as _, pid as _, prio as _); }
+            Ok(Value::Undef)
+        }
         _ => return None,
     })
 }

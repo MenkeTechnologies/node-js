@@ -37,6 +37,7 @@ pub const METHODS: &[&str] = &[
     "clearScreenDown",
     "cursorTo",
     "moveCursor",
+    "emitKeypressEvents",
 ];
 
 /// Methods dispatched on an `@@native = "Interface"` object (reported to the
@@ -83,8 +84,30 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             write_stdout("\x1b[0J");
             Ok(Value::Bool(true))
         }
+        // `readline.emitKeypressEvents(stream)` normally attaches an input decoder
+        // that makes `stream` emit `'keypress'` events. node-js has no background
+        // TTY reader driving async input events (see the module docs), so there is
+        // nothing to attach: an honest no-op rather than a fake key stream.
+        "emitKeypressEvents" => Ok(Value::Undef),
         _ => return None,
     })
+}
+
+/// `new readline.Interface(options | input[, output])` — the class form of
+/// `createInterface`, producing the same `@@native = "Interface"` object.
+/// Requires the parent to route `"Interface"` construction into this fn.
+pub fn construct(args: &[Value]) -> Result<Value, String> {
+    Ok(create_interface(args))
+}
+
+/// A non-function member of the `readline` namespace (reachable via
+/// `namespace_property` IF the parent routes `"readline"` into `stdlib::constant`).
+/// `readline.Interface` is the interface constructor.
+pub fn constant(name: &str) -> Option<Value> {
+    match name {
+        "Interface" => Some(with_host(|h| h.alloc(JsObj::Builtin("Interface".into())))),
+        _ => None,
+    }
 }
 
 /// `readline.createInterface(options | input[, output])` → an Interface object.

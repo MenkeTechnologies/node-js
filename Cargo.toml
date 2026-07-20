@@ -113,6 +113,24 @@ webpki-roots = "0.26"
 # HPACK header compression for a minimal real HTTP/2 server (`http2`).
 hpack = "0.3"
 
+# ── Full-stdlib round: additional native backends ────────────────────────────
+# zlib: Brotli + Zstd codecs and a CRC-32 (flate2 already covers deflate/gzip).
+brotli = "7"
+zstd = "0.13"
+crc32fast = "1.4"
+# crypto: real KDFs + symmetric ciphers + constant-time compare for the `crypto`
+# module surface (pbkdf2/scrypt/hkdf, createCipheriv AES-CBC/CTR, timingSafeEqual).
+pbkdf2 = "0.12"
+scrypt = "0.11"
+hkdf = "0.12"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+cipher = "0.4"
+subtle = "2.6"
+# dns: real recursive/system-config DNS resolution (resolve4/6/Mx/Txt/Cname/…).
+hickory-resolver = "0.24"
+
 # Arbitrary-precision integers backing JS `BigInt` (the `10n` literal + bigint
 # arithmetic). Same crates/versions pythonrs uses for its bignum path.
 num-bigint = "0.4"

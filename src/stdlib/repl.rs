@@ -33,7 +33,7 @@ use fusevm::Value;
 use indexmap::IndexMap;
 use std::io::{self, Write};
 
-pub const METHODS: &[&str] = &["start"];
+pub const METHODS: &[&str] = &["start", "isValidSyntax"];
 
 /// Methods dispatched on an `@@native = "REPLServer"` object (reported to the
 /// parent for `instance_has_method` / `instance_call` wiring). Without that
@@ -53,8 +53,38 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             crate::repl::run();
             Ok(new_repl_server(&opts))
         }
+        // `repl.isValidSyntax(code)` → whether `code` compiles cleanly. Real: it
+        // runs `code` through node-js's own front end (`crate::compile`, the same
+        // parser+compiler the module loader uses) and reports success/failure.
+        "isValidSyntax" => Ok(Value::Bool(crate::compile(&super::arg_str(args, 0)).is_ok())),
         _ => return None,
     })
+}
+
+/// `new repl.REPLServer([options])` / `new repl.Recoverable(err)`.
+///
+/// * `REPLServer` — same object `start()` produces (see `new_repl_server`); the
+///   constructor form does NOT auto-start the interactive loop (Node's does), so
+///   this is a best-effort holder for the resolved options.
+/// * `Recoverable` — Node wraps a syntax error the REPL should treat as "keep
+///   reading more lines". We build a real `Error` (so `instanceof Error` holds)
+///   carrying the original error as `.err`, matching Node's public shape.
+pub fn construct(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "REPLServer" => Ok(new_repl_server(&args.first().cloned().unwrap_or(Value::Undef))),
+        "Recoverable" => {
+            let inner = args.first().cloned().unwrap_or(Value::Undef);
+            let msg = with_host(|h| h.str_of(&inner));
+            let err = crate::builtins::construct_builtin("Error", vec![with_host(|h| h.new_str(msg))])?;
+            with_host(|h| {
+                if let Some(JsObj::Object(p)) = h.get_mut(&err) {
+                    p.insert("err".into(), inner);
+                }
+            });
+            Ok(err)
+        }
+        _ => Err(crate::host::type_error(&format!("repl.{name} is not a constructor"))),
+    }
 }
 
 /// A non-function member of the `repl` namespace, reachable via
@@ -63,11 +93,17 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// * `repl.REPLServer` — the server class. node-js has no first-class exposed
 ///   REPLServer constructor (the server object is produced by `start()`), so
 ///   this is documented-only and returns `None`; use `repl.start()`.
-/// * `repl.writer` — Node's default output formatter (`util.inspect`). node-js
-///   formats REPL results through the same inspector the loop already uses; a
-///   standalone `writer` function value is not exposed here (returns `None`).
-pub fn constant(_name: &str) -> Option<Value> {
-    None
+/// * `repl.writer` — Node's default output formatter (`util.inspect`). We expose
+///   it as the `util.inspect` builtin so `repl.writer(value)` formats identically
+///   to the REPL's own result rendering.
+///
+/// Requires the parent to route `"repl"` into `stdlib::constant`.
+pub fn constant(name: &str) -> Option<Value> {
+    match name {
+        "REPLServer" | "Recoverable" => Some(with_host(|h| h.alloc(JsObj::Builtin(name.into())))),
+        "writer" => Some(with_host(|h| h.alloc(JsObj::Builtin("util.inspect".into())))),
+        _ => None,
+    }
 }
 
 /// Build the REPLServer object returned by `start()`. Plain object with a

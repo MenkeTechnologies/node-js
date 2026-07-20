@@ -8,7 +8,18 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
-pub const MODULE_METHODS: &[&str] = &["parse", "format"];
+pub const MODULE_METHODS: &[&str] = &[
+    "parse",
+    "format",
+    "fileURLToPath",
+    "fileURLToPathBuffer",
+    "pathToFileURL",
+    "domainToASCII",
+    "domainToUnicode",
+    "urlToHttpOptions",
+    "resolve",
+    "resolveObject",
+];
 
 /// Parsed URL components.
 struct Parts {
@@ -174,6 +185,33 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             };
             h.new_str(s)
         })),
+        // `url.fileURLToPath(url)` — a `file:` URL/string → a filesystem path
+        // (percent-decoded). POSIX best-effort: any authority (host) is accepted
+        // but not re-prefixed; Windows drive/UNC rewriting is not modeled.
+        "fileURLToPath" => file_url_to_path(args).map(|s| with_host(|h| h.new_str(s))),
+        // Same, but returns the path as a `Buffer`.
+        "fileURLToPathBuffer" => file_url_to_path(args).map(|s| super::buffer::from_bytes(s.as_bytes())),
+        // `url.pathToFileURL(path)` → a `URL` instance with a `file:` href.
+        "pathToFileURL" => Ok(path_to_file_url(&arg_str(args, 0))),
+        // `url.domainToASCII` / `url.domainToUnicode` — delegate to the punycode
+        // codec; an ASCII-only domain passes through unchanged, an invalid domain
+        // yields "" (matching Node, which never throws here).
+        "domainToASCII" => Ok(punycode_domain(args, true)),
+        "domainToUnicode" => Ok(punycode_domain(args, false)),
+        // `url.urlToHttpOptions(URL)` → an options object for http/https.request.
+        "urlToHttpOptions" => Ok(url_to_http_options(&args.first().cloned().unwrap_or(Value::Undef))),
+        // Legacy `url.resolve(from, to)` — RFC 3986 §5 reference resolution.
+        "resolve" => {
+            let from = arg_str(args, 0);
+            let to = arg_str(args, 1);
+            Ok(with_host(|h| h.new_str(legacy_resolve(&from, &to))))
+        }
+        // Legacy `url.resolveObject(from, to)` — the resolved URL as a parsed object.
+        "resolveObject" => {
+            let from = arg_str(args, 0);
+            let to = arg_str(args, 1);
+            Ok(legacy_parse(&legacy_resolve(&from, &to)))
+        }
         _ => return None,
     })
 }
@@ -236,6 +274,302 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
         })),
         _ => Err(crate::host::type_error(&format!("url.{method} is not a function"))),
     }
+}
+
+// ── file:/legacy URL helpers ─────────────────────────────────────────────────
+
+/// The `href` string of a value: for a native `URL` its stored `href`, else the
+/// value coerced to a string (so both `URL` objects and strings are accepted).
+fn url_href(v: &Value) -> String {
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Object(p)) => match p.get("@@native").map(|x| h.str_of(x)).as_deref() {
+            Some("URL") => p.get("href").map(|x| h.str_of(x)).unwrap_or_default(),
+            _ => h.str_of(v),
+        },
+        _ => h.str_of(v),
+    })
+}
+
+/// `fileURLToPath` core: `file://[host]/path` → decoded `/path`.
+fn file_url_to_path(args: &[Value]) -> Result<String, String> {
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let href = url_href(&v);
+    let rest = href
+        .strip_prefix("file://")
+        .ok_or_else(|| crate::host::type_error("The URL must be of scheme file"))?;
+    // The authority runs up to the first '/'; the remainder is the path.
+    let path = match rest.find('/') {
+        Some(0) => rest,
+        Some(i) => &rest[i..],
+        None => "/",
+    };
+    Ok(percent_decode(path))
+}
+
+/// `pathToFileURL(path)` → a `URL` instance whose href is `file://` + the
+/// percent-encoded (path-set) path.
+fn path_to_file_url(path: &str) -> Value {
+    let enc = encode_path_component(path);
+    let pathname = if enc.starts_with('/') { enc } else { format!("/{enc}") };
+    let parts = Parts {
+        protocol: "file:".into(),
+        username: String::new(),
+        password: String::new(),
+        hostname: String::new(),
+        port: String::new(),
+        pathname,
+        search: String::new(),
+        hash: String::new(),
+    };
+    build(&parts)
+}
+
+/// `domainToASCII` (`ascii = true`) / `domainToUnicode` — via the punycode codec.
+fn punycode_domain(args: &[Value], ascii: bool) -> Value {
+    let method = if ascii { "toASCII" } else { "toUnicode" };
+    match super::punycode::call(method, args) {
+        Some(Ok(v)) => v,
+        _ => with_host(|h| h.new_str("")),
+    }
+}
+
+/// `urlToHttpOptions(URL)` → `{ protocol, hostname, hash, search, pathname, path,
+/// href[, port][, auth] }`, mirroring Node's field set and IPv6 bracket-stripping.
+fn url_to_http_options(v: &Value) -> Value {
+    let get = |key: &str| -> String {
+        with_host(|h| match h.get(v) {
+            Some(JsObj::Object(p)) => p.get(key).map(|x| h.str_of(x)).unwrap_or_default(),
+            _ => String::new(),
+        })
+    };
+    let protocol = get("protocol");
+    let mut hostname = get("hostname");
+    if hostname.starts_with('[') && hostname.ends_with(']') && hostname.len() >= 2 {
+        hostname = hostname[1..hostname.len() - 1].to_string();
+    }
+    let hash = get("hash");
+    let search = get("search");
+    let pathname = get("pathname");
+    let href = get("href");
+    let port = get("port");
+    let username = get("username");
+    let password = get("password");
+    let path = format!("{pathname}{search}");
+    let auth = if username.is_empty() && password.is_empty() {
+        None
+    } else {
+        Some(format!("{}:{}", percent_decode(&username), percent_decode(&password)))
+    };
+    let port_num = if port.is_empty() { None } else { port.parse::<f64>().ok() };
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("protocol".into(), h.new_str(protocol));
+        m.insert("hostname".into(), h.new_str(hostname));
+        m.insert("hash".into(), h.new_str(hash));
+        m.insert("search".into(), h.new_str(search));
+        m.insert("pathname".into(), h.new_str(pathname));
+        m.insert("path".into(), h.new_str(path));
+        m.insert("href".into(), h.new_str(href));
+        if let Some(n) = port_num {
+            m.insert("port".into(), Value::Float(n));
+        }
+        if let Some(a) = auth {
+            m.insert("auth".into(), h.new_str(a));
+        }
+        h.new_object(m)
+    })
+}
+
+/// Percent-decode a URL component (`%XX` → byte, then UTF-8 lossy). Unlike the
+/// form decoder this leaves `+` literal (a file path may legitimately contain it).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encode a path for a `file:` URL: keep the unreserved + sub-delim set
+/// and `/ : @`, encode everything else (space, `# ? %` `< > "` etc.).
+fn encode_path_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'('
+                    | b')' | b'*' | b'+' | b',' | b';' | b'=' | b':' | b'@'
+            );
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(hex_upper(b >> 4));
+            out.push(hex_upper(b & 0x0f));
+        }
+    }
+    out
+}
+
+// ── legacy url.resolve — RFC 3986 §5 reference resolution ─────────────────────
+
+/// A URI split into its five RFC-3986 components.
+struct UriRef {
+    scheme: Option<String>,
+    authority: Option<String>,
+    path: String,
+    query: Option<String>,
+    fragment: Option<String>,
+}
+
+/// Split a URI reference into its components (RFC 3986 Appendix B), by hand.
+fn split_uri(input: &str) -> UriRef {
+    let mut rest = input;
+    // scheme: leading ALPHA *(ALPHA/DIGIT/+/-/.) then ':' — but only if that ':'
+    // precedes the first '/', '?' or '#'.
+    let mut scheme = None;
+    if let Some(colon) = rest.find(':') {
+        let cand = &rest[..colon];
+        let scheme_ok = !cand.is_empty()
+            && cand.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && cand.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            && cand.find(['/', '?', '#']).is_none();
+        if scheme_ok {
+            scheme = Some(cand.to_string());
+            rest = &rest[colon + 1..];
+        }
+    }
+    let mut fragment = None;
+    if let Some(h) = rest.find('#') {
+        fragment = Some(rest[h + 1..].to_string());
+        rest = &rest[..h];
+    }
+    let mut query = None;
+    if let Some(q) = rest.find('?') {
+        query = Some(rest[q + 1..].to_string());
+        rest = &rest[..q];
+    }
+    let mut authority = None;
+    if let Some(r) = rest.strip_prefix("//") {
+        let end = r.find('/').unwrap_or(r.len());
+        authority = Some(r[..end].to_string());
+        rest = &r[end..];
+    }
+    UriRef { scheme, authority, path: rest.to_string(), query, fragment }
+}
+
+/// Merge a relative path onto a base (RFC 3986 §5.2.3).
+fn merge_paths(base: &UriRef, ref_path: &str) -> String {
+    if base.authority.is_some() && base.path.is_empty() {
+        format!("/{ref_path}")
+    } else {
+        match base.path.rfind('/') {
+            Some(i) => format!("{}{ref_path}", &base.path[..=i]),
+            None => ref_path.to_string(),
+        }
+    }
+}
+
+/// Drop the last path segment of `output` (used by `..` handling).
+fn remove_last_segment(output: &mut String) {
+    match output.rfind('/') {
+        Some(pos) => output.truncate(pos),
+        None => output.clear(),
+    }
+}
+
+/// Remove `.`/`..` dot-segments from a path (RFC 3986 §5.2.4).
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path.to_string();
+    let mut output = String::new();
+    while !input.is_empty() {
+        if let Some(r) = input.strip_prefix("../") {
+            input = r.to_string();
+        } else if let Some(r) = input.strip_prefix("./") {
+            input = r.to_string();
+        } else if let Some(r) = input.strip_prefix("/./") {
+            input = format!("/{r}");
+        } else if input == "/." {
+            input = "/".to_string();
+        } else if let Some(r) = input.strip_prefix("/../") {
+            input = format!("/{r}");
+            remove_last_segment(&mut output);
+        } else if input == "/.." {
+            input = "/".to_string();
+            remove_last_segment(&mut output);
+        } else if input == "." || input == ".." {
+            input.clear();
+        } else {
+            let start = usize::from(input.starts_with('/'));
+            let end = input[start..].find('/').map(|i| start + i).unwrap_or(input.len());
+            output.push_str(&input[..end]);
+            input.drain(..end);
+        }
+    }
+    output
+}
+
+/// RFC 3986 §5.2.2 transform-references: resolve `r` against `base`.
+fn resolve_ref(base: &UriRef, r: &UriRef) -> UriRef {
+    if r.scheme.is_some() {
+        return UriRef {
+            scheme: r.scheme.clone(),
+            authority: r.authority.clone(),
+            path: remove_dot_segments(&r.path),
+            query: r.query.clone(),
+            fragment: r.fragment.clone(),
+        };
+    }
+    let (authority, path, query) = if r.authority.is_some() {
+        (r.authority.clone(), remove_dot_segments(&r.path), r.query.clone())
+    } else if r.path.is_empty() {
+        let q = if r.query.is_some() { r.query.clone() } else { base.query.clone() };
+        (base.authority.clone(), base.path.clone(), q)
+    } else if r.path.starts_with('/') {
+        (base.authority.clone(), remove_dot_segments(&r.path), r.query.clone())
+    } else {
+        (base.authority.clone(), remove_dot_segments(&merge_paths(base, &r.path)), r.query.clone())
+    };
+    UriRef { scheme: base.scheme.clone(), authority, path, query, fragment: r.fragment.clone() }
+}
+
+/// Recompose a URI from its components (RFC 3986 §5.3).
+fn recompose(u: &UriRef) -> String {
+    let mut s = String::new();
+    if let Some(sc) = &u.scheme {
+        s.push_str(sc);
+        s.push(':');
+    }
+    if let Some(a) = &u.authority {
+        s.push_str("//");
+        s.push_str(a);
+    }
+    s.push_str(&u.path);
+    if let Some(q) = &u.query {
+        s.push('?');
+        s.push_str(q);
+    }
+    if let Some(f) = &u.fragment {
+        s.push('#');
+        s.push_str(f);
+    }
+    s
+}
+
+/// Legacy `url.resolve(from, to)` — RFC 3986 reference resolution end-to-end.
+fn legacy_resolve(from: &str, to: &str) -> String {
+    recompose(&resolve_ref(&split_uri(from), &split_uri(to)))
 }
 
 // ── URLSearchParams ──────────────────────────────────────────────────────────
