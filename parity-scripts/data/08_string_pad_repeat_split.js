@@ -1,0 +1,20 @@
+// padStart/padEnd/repeat/split/replaceAll.
+console.log("5".padStart(3, "0"));
+console.log("5".padEnd(3, "0"));
+console.log("42".padStart(6));
+console.log("ab".repeat(4));
+console.log("-".repeat(20));
+console.log("".repeat(3) === "");
+console.log("a,b,c,d".split(","));
+console.log("a,b,c,d".split(",", 2));
+console.log("one two three".split(" "));
+console.log("abc".split(""));
+console.log("a1b2c3".split(/\d/));
+console.log("2026-07-20".split("-").map(Number));
+console.log("foo bar foo baz foo".replaceAll("foo", "X"));
+console.log("aaa".replaceAll("a", "bb"));
+console.log("hello".replace(/l/g, "L"));
+console.log(["a", "b", "c"].join("-"));
+console.log([1, 2, 3].join());
+console.log("x".repeat(0).length);
+console.log("CSV,val,3".split(",").join(" | "));

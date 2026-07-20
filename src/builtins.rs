@@ -1789,6 +1789,8 @@ const NS_METHODS: &[&str] = &[
     "Math.cbrt",
     "Math.random",
     "Math.hypot",
+    "Math.clz32",
+    "Math.fround",
     "Math.log",
     "Math.log2",
     "Math.log10",
@@ -2534,6 +2536,13 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
                 m
             }
         }
+        // Count leading zero bits of ToUint32(x) (Math.clz32(1) === 31).
+        "clz32" => {
+            let u = if x.is_finite() { x.trunc().rem_euclid(4294967296.0) as u32 } else { 0 };
+            u.leading_zeros() as f64
+        }
+        // Round to the nearest single-precision float.
+        "fround" => (x as f32) as f64,
         _ => return Err(host::type_error(&format!("Math.{fname} is not a function"))),
     };
     Ok(Value::Float(r))
@@ -2954,7 +2963,8 @@ fn is_array_method(name: &str) -> bool {
         "push" | "pop" | "shift" | "unshift" | "map" | "filter" | "forEach" | "join" | "slice"
             | "indexOf" | "lastIndexOf" | "includes" | "reduce" | "concat" | "reverse" | "sort"
             | "find" | "findIndex" | "some" | "every" | "flat" | "fill" | "splice" | "keys"
-            | "values" | "entries" | "flatMap" | "at" | "toString"
+            | "values" | "entries" | "flatMap" | "at" | "toString" | "reduceRight" | "findLast"
+            | "findLastIndex" | "copyWithin"
     )
 }
 fn is_string_method(name: &str) -> bool {
@@ -3157,11 +3167,40 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             Ok(recv.clone())
         }
         "fill" => {
+            // fill(value[, start[, end]]) — negative indices count from the end.
             let val = arg0(&args);
+            let len = array_items(recv).len() as i64;
+            let norm = |v: i64| -> usize {
+                (if v < 0 { (len + v).max(0) } else { v.min(len) }) as usize
+            };
+            let start = if args.len() >= 2 { norm(arg_num(&args, 1) as i64) } else { 0 };
+            let end = if args.len() >= 3 { norm(arg_num(&args, 2) as i64) } else { len as usize };
             with_host(|h| {
                 if let Some(JsObj::Array(items)) = h.get_mut(recv) {
-                    for it in items.iter_mut() {
+                    for it in items.iter_mut().take(end).skip(start) {
                         *it = val.clone();
+                    }
+                }
+            });
+            Ok(recv.clone())
+        }
+        "copyWithin" => {
+            // copyWithin(target, start[, end]) — copy a slice within the array.
+            let items = array_items(recv);
+            let len = items.len() as i64;
+            let norm = |v: i64| -> usize {
+                (if v < 0 { (len + v).max(0) } else { v.min(len) }) as usize
+            };
+            let target = norm(arg_num(&args, 0) as i64);
+            let start = if args.len() >= 2 { norm(arg_num(&args, 1) as i64) } else { 0 };
+            let end = if args.len() >= 3 { norm(arg_num(&args, 2) as i64) } else { len as usize };
+            let slice: Vec<Value> = items[start..end.max(start)].to_vec();
+            with_host(|h| {
+                if let Some(JsObj::Array(a)) = h.get_mut(recv) {
+                    for (k, v) in slice.into_iter().enumerate() {
+                        if target + k < a.len() {
+                            a[target + k] = v;
+                        }
                     }
                 }
             });
@@ -3282,6 +3321,52 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 acc = host::invoke(&cb, vec![acc, it.clone(), Value::Float(i as f64), recv.clone()], None)?;
             }
             Ok(acc)
+        }
+        "reduceRight" => {
+            let items = array_items(recv);
+            let cb = arg0(&args);
+            let n = items.len();
+            let mut acc;
+            let mut i = n; // one past the next index to process (walking down)
+            if args.len() >= 2 {
+                acc = args[1].clone();
+            } else if n > 0 {
+                acc = items[n - 1].clone();
+                i = n - 1;
+            } else {
+                return Err(host::type_error("Reduce of empty array with no initial value"));
+            }
+            while i > 0 {
+                i -= 1;
+                acc = host::invoke(
+                    &cb,
+                    vec![acc, items[i].clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
+            }
+            Ok(acc)
+        }
+        "findLast" => {
+            let items = array_items(recv);
+            let cb = arg0(&args);
+            for i in (0..items.len()).rev() {
+                let m = host::invoke(&cb, vec![items[i].clone(), Value::Float(i as f64), recv.clone()], None)?;
+                if with_host(|h| h.truthy(&m)) {
+                    return Ok(items[i].clone());
+                }
+            }
+            Ok(Value::Undef)
+        }
+        "findLastIndex" => {
+            let items = array_items(recv);
+            let cb = arg0(&args);
+            for i in (0..items.len()).rev() {
+                let m = host::invoke(&cb, vec![items[i].clone(), Value::Float(i as f64), recv.clone()], None)?;
+                if with_host(|h| h.truthy(&m)) {
+                    return Ok(Value::Float(i as f64));
+                }
+            }
+            Ok(Value::Float(-1.0))
         }
         "sort" => {
             let mut items = array_items(recv);

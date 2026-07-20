@@ -1,0 +1,20 @@
+// Deterministic Math operations and rounding.
+console.log(Math.floor(3.7), Math.ceil(3.2), Math.round(3.5), Math.round(2.5));
+console.log(Math.round(-2.5), Math.round(-3.5));
+console.log(Math.trunc(4.9), Math.trunc(-4.9));
+console.log(Math.abs(-7), Math.sign(-3), Math.sign(0), Math.sign(5));
+console.log(Math.max(1, 5, 3), Math.min(4, 2, 8));
+console.log(Math.pow(2, 10), 2 ** 10);
+console.log(Math.sqrt(144), Math.cbrt(27));
+console.log(Math.hypot(3, 4));
+console.log(Math.log2(8), Math.log10(1000));
+console.log(Math.floor(Math.log2(1000)));
+console.log(7 % 3, -7 % 3, 7 % -3);
+console.log(2 ** 0.5);
+console.log(Math.PI.toFixed(5), Math.E.toFixed(5));
+console.log(Math.round(1234.5678 * 100) / 100);
+console.log(Math.floor(3.14159 * 1000) / 1000);
+console.log([1.4, 1.5, 1.6, 2.5, -1.5].map(Math.round).join(","));
+console.log(Math.min(...[5, 2, 8, 1]), Math.max(...[5, 2, 8, 1]));
+console.log(Math.clz32(1), Math.clz32(1000));
+console.log(Math.fround(1.1));
