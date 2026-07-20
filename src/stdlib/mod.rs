@@ -55,6 +55,10 @@ pub mod https;
 pub mod repl;
 pub mod tls;
 pub mod worker_threads;
+pub mod cluster;
+pub mod domain;
+pub mod http2;
+pub mod trace_events;
 
 /// Native-heavy core modules that node-js does not yet implement (TLS handshakes,
 /// HTTP/2 framing, OS worker threads sharing the thread-local heap, UDP sockets,
@@ -63,7 +67,7 @@ pub mod worker_threads;
 /// a method throws `Error: <mod>.<method> is not implemented in node-js`. This is
 /// an honest not-yet-built surface, never a silent fake.
 pub const UNIMPLEMENTED_MODULES: &[&str] = &[
-    "http2", "cluster", "inspector", "wasi", "trace_events", "domain", "dns/promises",
+    "inspector", "wasi",
 ];
 
 /// True if `ns` is a known-but-unimplemented core module (see `UNIMPLEMENTED_MODULES`).
@@ -113,10 +117,15 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "vm" => Some("vm"),
         "fs/promises" => Some("fs/promises"),
         "dgram" => Some("dgram"),
+        "dns/promises" => Some("dns/promises"),
         "worker_threads" => Some("worker_threads"),
         "tls" => Some("tls"),
         "https" => Some("https"),
         "repl" => Some("repl"),
+        "cluster" => Some("cluster"),
+        "domain" => Some("domain"),
+        "http2" => Some("http2"),
+        "trace_events" => Some("trace_events"),
         other => UNIMPLEMENTED_MODULES.iter().copied().find(|&m| m == other),
     }
 }
@@ -162,9 +171,14 @@ pub fn is_method(qualified: &str) -> bool {
         "vm" => vm::METHODS.contains(&m),
         "fs/promises" => fs_promises::METHODS.contains(&m),
         "dgram" => dgram::MODULE_METHODS.contains(&m),
+        "dns/promises" => matches!(m, "lookup" | "resolve" | "resolve4" | "resolve6"),
         "tls" => tls::MODULE_METHODS.contains(&m),
         "https" => https::MODULE_METHODS.contains(&m),
         "repl" => repl::METHODS.contains(&m),
+        "cluster" => cluster::METHODS.contains(&m),
+        "domain" => domain::METHODS.contains(&m),
+        "http2" => http2::METHODS.contains(&m),
+        "trace_events" => trace_events::METHODS.contains(&m),
         // Any method on an unimplemented namespace routes to `call`, which throws
         // an honest "not implemented" error (so `mod.foo()` fails clearly rather
         // than silently returning undefined).
@@ -218,9 +232,23 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "vm" => vm::call(m, args)?,
         "fs/promises" => fs_promises::call(m, args)?,
         "dgram" => dgram::call(m, args)?,
+        // dns/promises maps the promise-returning dns methods to their Node names.
+        "dns/promises" => {
+            let pm = match m {
+                "lookup" => "promiseLookup",
+                "resolve" | "resolve4" => "promiseResolve4",
+                "resolve6" => "promiseResolve6",
+                _ => return None,
+            };
+            dns::call(pm, args)?
+        }
         "tls" => tls::call(m, args)?,
         "https" => https::call(m, args)?,
         "repl" => repl::call(m, args)?,
+        "cluster" => cluster::call(m, args)?,
+        "domain" => domain::call(m, args)?,
+        "http2" => http2::call(m, args)?,
+        "trace_events" => trace_events::call(m, args)?,
         _ if is_unimplemented(ns) => {
             Err(format!("Error: {ns}.{m} is not implemented in node-js"))
         }
@@ -267,6 +295,9 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         }
         "worker_threads" => worker_threads::constant(name),
         "https" => https::constant(name),
+        "cluster" => cluster::constant(name),
+        "domain" => domain::constant(name),
+        "http2" => http2::constant(name),
         "util" if name == "types" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("util/types".into()))))
         }
@@ -293,6 +324,8 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "Script" => Some(vm::construct(args)),
         "URLSearchParams" => Some(url::construct_search_params(args)),
         "Worker" => Some(worker_threads::construct_worker(args)),
+        "Domain" => Some(domain::construct(args)),
+        "Tracing" => Some(trace_events::construct(args)),
         _ => None,
     }
 }
@@ -353,6 +386,12 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "HTTPSServerResponse" => https::RESPONSE_METHODS,
         "HTTPSClientRequest" => https::CLIENT_REQUEST_METHODS,
         "REPLServer" => repl::REPLSERVER_METHODS,
+        "ClusterWorker" => cluster::WORKER_METHODS,
+        "Domain" => domain::DOMAIN_METHODS,
+        "Tracing" => trace_events::TRACING_METHODS,
+        "Http2Server" => http2::SERVER_METHODS,
+        "Http2Stream" => http2::STREAM_METHODS,
+        "Http2Session" => http2::SESSION_METHODS,
         _ => &[],
     };
     let is_emitter = matches!(
@@ -360,6 +399,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "Server" | "Socket" | "ServerResponse" | "IncomingMessage" | "EventEmitter" | "Readable"
             | "Writable" | "Duplex" | "Transform" | "UdpSocket" | "Worker" | "MessagePort"
             | "TLSServer" | "TLSSocket" | "HTTPSServerResponse" | "HTTPSClientRequest"
+            | "ClusterWorker" | "Domain" | "Http2Server" | "Http2Stream" | "Http2Session"
     );
     base.contains(&name) || (is_emitter && EMITTER.contains(&name))
 }
@@ -386,6 +426,10 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "TLSServer" | "TLSSocket" => tls::instance_call(tag, recv, method, args),
         "HTTPSServerResponse" | "HTTPSClientRequest" => https::instance_call(tag, recv, method, args),
         "REPLServer" => repl::instance_call(recv, method, args),
+        "ClusterWorker" => cluster::instance_call(recv, method, args),
+        "Domain" => domain::instance_call(recv, method, args),
+        "Tracing" => trace_events::instance_call(recv, method, args),
+        "Http2Server" | "Http2Stream" | "Http2Session" => http2::instance_call(tag, recv, method, args),
         "EventEmitter" => events::instance_call(recv, method, args),
         "URL" => url::instance_call(recv, method, &args),
         "Stats" => fs::stats_call(recv, method),

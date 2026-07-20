@@ -110,6 +110,8 @@ flate2 = "1"
 rustls = "0.23"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
+# HPACK header compression for a minimal real HTTP/2 server (`http2`).
+hpack = "0.3"
 
 # Arbitrary-precision integers backing JS `BigInt` (the `10n` literal + bigint
 # arithmetic). Same crates/versions pythonrs uses for its bignum path.
