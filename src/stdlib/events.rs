@@ -21,8 +21,32 @@ pub fn new_emitter() -> Value {
     })
 }
 
+/// The EventEmitter method names, exposed so `EventEmitter.prototype` can be
+/// enumerated / copied (express does `mixin(app, EventEmitter.prototype)` to make
+/// its `app` *function* an emitter).
+pub const METHODS: &[&str] = &[
+    "on",
+    "addListener",
+    "prependListener",
+    "once",
+    "prependOnceListener",
+    "emit",
+    "removeListener",
+    "off",
+    "removeAllListeners",
+    "listenerCount",
+    "listeners",
+    "eventNames",
+    "setMaxListeners",
+    "getMaxListeners",
+];
+
 pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     match method {
+        "listeners" => Ok(with_host(|h| h.new_array(listeners(recv, &arg_str(&args, 0))))),
+        // A no-op accessor pair kept for API completeness; the emitter has no cap.
+        "setMaxListeners" => Ok(recv.clone()),
+        "getMaxListeners" => Ok(Value::Float(10.0)),
         "on" | "addListener" | "prependListener" => {
             add(recv, "@@on", &arg_str(&args, 0), args.get(1).cloned().unwrap_or(Value::Undef));
             Ok(recv.clone())
@@ -56,16 +80,40 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
     }
 }
 
+/// Read a hidden emitter field (`@@on`/`@@once`). Works for a plain emitter
+/// object AND for a function/class receiver (express's `app` is a function whose
+/// emitter maps live in the fn-prop side table).
 fn named_map(h: &crate::host::JsHost, recv: &Value, which: &str) -> Option<Value> {
     match h.get(recv) {
         Some(JsObj::Object(p)) => p.get(which).cloned(),
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => h.fn_prop(recv, which),
         _ => None,
+    }
+}
+
+/// Store a hidden emitter field, routing to props or the fn-prop table.
+fn set_named_map(h: &mut crate::host::JsHost, recv: &Value, which: &str, val: Value) {
+    match h.get(recv) {
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => h.set_fn_prop(recv, which, val),
+        _ => {
+            if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                p.insert(which.to_string(), val);
+            }
+        }
     }
 }
 
 fn add(recv: &Value, which: &str, name: &str, f: Value) {
     with_host(|h| {
-        let Some(map) = named_map(h, recv, which) else { return };
+        // Lazily create the listener map (a mixed-in function emitter has none).
+        let map = match named_map(h, recv, which) {
+            Some(m) => m,
+            None => {
+                let m = h.new_object(IndexMap::new());
+                set_named_map(h, recv, which, m.clone());
+                m
+            }
+        };
         // Ensure `map[name]` is an array, then push.
         let arr = match h.get(&map) {
             Some(JsObj::Object(p)) => p.get(name).cloned(),

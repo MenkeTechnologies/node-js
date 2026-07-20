@@ -17,6 +17,75 @@ use std::collections::HashMap;
 /// `http` module functions routed through `stdlib::call`.
 pub const MODULE_METHODS: &[&str] = &["createServer"];
 
+/// The HTTP request methods Node exposes as `http.METHODS` (router derives its
+/// per-verb helpers by lowercasing this list).
+const METHODS: &[&str] = &[
+    "ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD", "LINK", "LOCK",
+    "M-SEARCH", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL", "MOVE", "NOTIFY", "OPTIONS",
+    "PATCH", "POST", "PROPFIND", "PROPPATCH", "PURGE", "PUT", "QUERY", "REBIND", "REPORT",
+    "SEARCH", "SOURCE", "SUBSCRIBE", "TRACE", "UNBIND", "UNLINK", "UNLOCK", "UNSUBSCRIBE",
+];
+
+/// Non-function `http` module constants (`http.METHODS`, `http.STATUS_CODES`),
+/// reachable via `namespace_property` → `stdlib::constant`.
+pub fn constant(name: &str) -> Option<Value> {
+    match name {
+        "METHODS" => Some(with_host(|h| {
+            let items = METHODS.iter().map(|m| h.new_str(*m)).collect();
+            h.new_array(items)
+        })),
+        "STATUS_CODES" => Some(with_host(|h| {
+            let mut m = IndexMap::new();
+            for (code, msg) in crate::stdlib::http::status_table() {
+                m.insert(code.to_string(), h.new_str(*msg));
+            }
+            h.new_object(m)
+        })),
+        // The request/response constructors express augments
+        // (`Object.create(http.IncomingMessage.prototype)`): exposed as builtin
+        // ctor namespaces so `.prototype` resolves.
+        "IncomingMessage" => Some(with_host(|h| h.alloc(JsObj::Builtin("IncomingMessage".into())))),
+        "ServerResponse" => Some(with_host(|h| h.alloc(JsObj::Builtin("ServerResponse".into())))),
+        _ => None,
+    }
+}
+
+/// The status-code → reason-phrase table shared by `STATUS_CODES` and response
+/// serialization.
+pub fn status_table() -> &'static [(u16, &'static str)] {
+    &[
+        (200, "OK"),
+        (201, "Created"),
+        (202, "Accepted"),
+        (204, "No Content"),
+        (301, "Moved Permanently"),
+        (302, "Found"),
+        (303, "See Other"),
+        (304, "Not Modified"),
+        (307, "Temporary Redirect"),
+        (308, "Permanent Redirect"),
+        (400, "Bad Request"),
+        (401, "Unauthorized"),
+        (403, "Forbidden"),
+        (404, "Not Found"),
+        (405, "Method Not Allowed"),
+        (406, "Not Acceptable"),
+        (409, "Conflict"),
+        (410, "Gone"),
+        (411, "Length Required"),
+        (413, "Payload Too Large"),
+        (414, "URI Too Long"),
+        (415, "Unsupported Media Type"),
+        (422, "Unprocessable Entity"),
+        (429, "Too Many Requests"),
+        (500, "Internal Server Error"),
+        (501, "Not Implemented"),
+        (502, "Bad Gateway"),
+        (503, "Service Unavailable"),
+        (504, "Gateway Timeout"),
+    ]
+}
+
 // ── per-connection parse state ───────────────────────────────────────────────
 
 /// Main-thread state for one live HTTP connection, keyed by the `net` socket id.

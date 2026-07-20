@@ -69,6 +69,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::ASYNC_STEP, b_async_step);
     vm.register_builtin(ops::NUM_STEP, b_num_step);
     vm.register_builtin(ops::ITER_CLOSE, b_iter_close);
+    vm.register_builtin(ops::TYPEOF_NAME, b_typeof_name);
 }
 
 /// `ITER_CLOSE`: close the iterator on the stack (a for-of `break`). A generator
@@ -504,6 +505,16 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
     let obj = with_host(|h| h.get(recv).cloned());
     Ok(match obj {
         Some(JsObj::Object(props)) => {
+            // Typed-array element read (`ta[i]`): elements live in a hidden
+            // `@@elems`, not as own numeric props, so intercept integer keys.
+            if !name.is_empty()
+                && name.bytes().all(|b| b.is_ascii_digit())
+                && matches!(props.get("@@native"), Some(v) if with_host(|h| h.str_of(v)) == "TypedArray")
+            {
+                if let Some(v) = crate::stdlib::typedarray::elem_get(recv, name) {
+                    return Ok(v);
+                }
+            }
             if let Some(v) = props.get(name) {
                 v.clone()
             } else if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
@@ -511,6 +522,13 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 v
             } else if name == "__proto__" {
                 with_host(|h| h.proto_of(recv)).unwrap_or_else(|| with_host(|h| h.null()))
+            } else if crate::stdlib::native_tag(recv)
+                .map(|tag| crate::stdlib::instance_has_method(&tag, name))
+                .unwrap_or(false)
+            {
+                // A native instance method read as a property (`server.listen`) →
+                // a bound method, dispatched via `instance_call` when invoked.
+                bound_method(recv, name)
             } else if is_object_method(name) {
                 bound_method(recv, name)
             } else {
@@ -665,6 +683,24 @@ fn is_builtin_ctor(name: &str) -> bool {
             | "Promise"
             | "BigInt"
             | "Iterator"
+            | "RegExp"
+            | "Date"
+            | "ArrayBuffer"
+            | "Uint8Array"
+            | "Int8Array"
+            | "Uint8ClampedArray"
+            | "Int16Array"
+            | "Uint16Array"
+            | "Int32Array"
+            | "Uint32Array"
+            | "Float32Array"
+            | "Float64Array"
+            | "WeakRef"
+            | "TextEncoder"
+            | "TextDecoder"
+            | "IncomingMessage"
+            | "ServerResponse"
+            | "EventEmitter"
     ) || host::ERROR_NAMES.contains(&name)
 }
 
@@ -697,6 +733,11 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
     match name {
         "hasOwnProperty" => {
             let k = with_host(|h| h.property_key(&arg0(&args)));
+            // A builtin namespace/prototype receiver (`Map.prototype`) reports
+            // ownership via `has_property` (its methods resolve as thunks).
+            if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Builtin(_))) {
+                return Ok(Value::Bool(has_property(recv, &k)));
+            }
             let has = with_host(|h| match h.get(recv) {
                 Some(JsObj::Object(p)) => p.contains_key(&k),
                 Some(JsObj::Array(items)) => {
@@ -800,6 +841,12 @@ fn function_property(recv: &Value, name: &str) -> Value {
             return v;
         }
     } else if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
+        return v;
+    }
+    // A method inherited via the function's [[Prototype]] chain (set with
+    // `Object.setPrototypeOf(fn, proto)` — the `router` package makes each router
+    // *function* inherit `route`/`use`/`get`/… from `Router.prototype` this way).
+    if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
         return v;
     }
     match name {
@@ -917,6 +964,12 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     if ctor == "Object" && method == "toString" {
         return Ok(with_host(|h| h.new_str(object_tag(h, recv))));
     }
+    // `EventEmitter.prototype.<m>` mixed onto a receiver (express's `app`): run the
+    // emitter method directly against `recv` (routing back through `call_method`
+    // would re-resolve the mixed-in thunk and recurse).
+    if ctor == "EventEmitter" {
+        return crate::stdlib::events::instance_call(recv, method, args);
+    }
     host::call_method(recv, method, args)
 }
 
@@ -995,6 +1048,16 @@ fn set_property(recv: &Value, name: &str, val: Value) {
                     r.last_index = if n.is_finite() && n >= 0.0 { n as usize } else { 0 };
                 }
             });
+            return;
+        }
+    }
+    // Typed-array element write (`ta[i] = v`): coerce + store into `@@elems`.
+    if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+        let is_ta = matches!(
+            with_host(|h| h.get(recv).cloned()),
+            Some(JsObj::Object(ref p)) if p.get("@@native").map(|v| with_host(|h| h.str_of(v))).as_deref() == Some("TypedArray")
+        );
+        if is_ta && crate::stdlib::typedarray::elem_set(recv, name, &val) {
             return;
         }
     }
@@ -1190,6 +1253,33 @@ fn b_typeof(vm: &mut VM, _: u8) -> Value {
         let t = h.type_of(&v);
         h.new_str(t)
     })
+}
+
+/// `typeof <bare ident>`: read the name like `b_getlocal` but return "undefined"
+/// (never a ReferenceError) when the name is unbound — JS `typeof` semantics.
+fn b_typeof_name(vm: &mut VM, _: u8) -> Value {
+    let name = sval(&vm.pop());
+    // Bound name (user variable) → typeof its value.
+    if let Some(v) = with_host(|h| h.read_name(&name)) {
+        return with_host(|h| {
+            let t = h.type_of(&v);
+            h.new_str(t)
+        });
+    }
+    // Lazily-bound globals mirror `b_getlocal`: resolve to the same value it
+    // would produce, then take its type (so object-namespaces like `console`/
+    // `Math`/`JSON`/`process` report "object", constructors report "function").
+    let t = match name.as_str() {
+        "undefined" => "undefined".to_string(),
+        "NaN" | "Infinity" => "number".to_string(),
+        "globalThis" => "object".to_string(),
+        n if is_namespace(n) || is_known_builtin(n) => {
+            let v = with_host(|h| h.alloc(JsObj::Builtin(name.clone())));
+            with_host(|h| h.type_of(&v)).to_string()
+        }
+        _ => "undefined".to_string(), // genuinely unbound → JS returns "undefined"
+    };
+    with_host(|h| h.new_str(t))
 }
 
 fn b_strict_eq(vm: &mut VM, _: u8) -> Value {
@@ -1608,6 +1698,11 @@ const GLOBAL_FUNCS: &[&str] = &[
     "parseFloat",
     "isNaN",
     "isFinite",
+    "encodeURIComponent",
+    "decodeURIComponent",
+    "encodeURI",
+    "decodeURI",
+    "eval",
     "String",
     "Number",
     "Boolean",
@@ -1629,6 +1724,20 @@ const GLOBAL_FUNCS: &[&str] = &[
     "URIError",
     "BigInt",
     "RegExp",
+    "Date",
+    "ArrayBuffer",
+    "Uint8Array",
+    "Int8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+    "WeakRef",
+    "TextEncoder",
+    "TextDecoder",
     "queueMicrotask",
     "setTimeout",
     "setInterval",
@@ -1687,6 +1796,7 @@ const NS_METHODS: &[&str] = &[
     "Object.getOwnPropertyNames",
     "Object.defineProperty",
     "Object.getOwnPropertyDescriptor",
+    "Object.hasOwn",
     "Array.isArray",
     "Array.from",
     "Array.of",
@@ -1801,6 +1911,17 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "parseFloat" | "Number.parseFloat" => Ok(Value::Float(parse_float(&args))),
         "isNaN" => Ok(Value::Bool(arg_num(&args, 0).is_nan())),
         "isFinite" => Ok(Value::Bool(arg_num(&args, 0).is_finite())),
+        "encodeURIComponent" => uri_encode(&with_host(|h| h.str_of(&arg0(&args))), false),
+        "encodeURI" => uri_encode(&with_host(|h| h.str_of(&arg0(&args))), true),
+        "decodeURIComponent" => uri_decode(&with_host(|h| h.str_of(&arg0(&args))), false),
+        "decodeURI" => uri_decode(&with_host(|h| h.str_of(&arg0(&args))), true),
+        // `eval` exists as a global (libraries like get-intrinsic capture it as an
+        // intrinsic) but node-js has no runtime source evaluator; calling it is
+        // unsupported. A non-string argument is returned unchanged, as in JS.
+        "eval" => match arg0(&args) {
+            v @ (Value::Undef | Value::Bool(_) | Value::Int(_) | Value::Float(_)) => Ok(v),
+            _ => Err(host::type_error("eval is not supported in node-js")),
+        },
         "Number.isInteger" => Ok(Value::Bool(is_integer(arg0(&args)))),
         "Number.isSafeInteger" => Ok(Value::Bool(is_safe_integer(arg0(&args)))),
         "Number.isNaN" => Ok(Value::Bool(matches!(arg0(&args), Value::Float(f) if f.is_nan()))),
@@ -1846,6 +1967,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Object.create" => object_create(args),
         "Object.getOwnPropertyNames" => object_keys(args, 0),
+        // `Object.hasOwn(obj, key)` — the static form of `hasOwnProperty`.
+        "Object.hasOwn" => {
+            let obj = arg0(&args);
+            let key = args.get(1).cloned().unwrap_or(Value::Undef);
+            object_builtin_method(&obj, "hasOwnProperty", vec![key])
+        }
         "Object.defineProperty" => object_define_property(args),
         "Object.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
         "Symbol" => Ok(with_host(|h| {
@@ -2167,6 +2294,66 @@ fn is_safe_integer(v: Value) -> bool {
     }
 }
 
+/// `encodeURI`/`encodeURIComponent`: percent-encode `s`'s UTF-8 bytes, leaving
+/// the unreserved set unescaped. `encodeURI` additionally preserves the reserved
+/// URI characters (`;,/?:@&=+$#`) that delimit a URI's structure.
+fn uri_encode(s: &str, uri: bool) -> Result<Value, String> {
+    // Always-unescaped (`encodeURIComponent`'s unreserved set), per the spec.
+    const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
+    // Reserved characters `encodeURI` leaves intact on top of the unreserved set.
+    const RESERVED: &[u8] = b";,/?:@&=+$#";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if UNRESERVED.contains(&b) || (uri && RESERVED.contains(&b)) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+        }
+    }
+    Ok(with_host(|h| h.new_str(out)))
+}
+
+/// `decodeURI`/`decodeURIComponent`: reverse `%XX` escapes back to UTF-8 text.
+/// For `decodeURI`, escapes of the reserved delimiters are left as-is (the spec's
+/// asymmetry with `encodeURI`). Throws `URIError` on a malformed escape.
+fn uri_decode(s: &str, uri: bool) -> Result<Value, String> {
+    const RESERVED: &[u8] = b";,/?:@&=+$#";
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("URIError: URI malformed".into());
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            match (hi, lo) {
+                (Some(h), Some(l)) => {
+                    let byte = (h * 16 + l) as u8;
+                    // decodeURI keeps reserved-delimiter escapes literal.
+                    if uri && RESERVED.contains(&byte) {
+                        out.extend_from_slice(&bytes[i..i + 3]);
+                    } else {
+                        out.push(byte);
+                    }
+                    i += 3;
+                }
+                _ => return Err("URIError: URI malformed".into()),
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    match String::from_utf8(out) {
+        Ok(decoded) => Ok(with_host(|h| h.new_str(decoded))),
+        Err(_) => Err("URIError: URI malformed".into()),
+    }
+}
+
 fn parse_int(args: &[Value]) -> f64 {
     let s = with_host(|h| h.str_of(&arg0(args)));
     let radix = args.get(1).map(|r| with_host(|h| h.to_number(r)) as u32).filter(|r| (2..=36).contains(r));
@@ -2353,6 +2540,30 @@ fn pseudo_random() -> f64 {
 
 fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
     let v = arg0(&args);
+    // A builtin prototype namespace that exposes enumerable methods for copying
+    // (`Object.getOwnPropertyNames(EventEmitter.prototype)` — express's mixin).
+    if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(&v).cloned()) {
+        if let Some(names) = builtin_proto_method_names(&ns) {
+            return Ok(with_host(|h| {
+                let out: Vec<Value> = names
+                    .iter()
+                    .map(|name| match mode {
+                        1 => h.alloc(JsObj::Builtin(format!("@proto:{}:{name}", ns.trim_end_matches(".prototype")))),
+                        2 => {
+                            let ks = h.new_str(*name);
+                            let val = h.alloc(JsObj::Builtin(format!(
+                                "@proto:{}:{name}",
+                                ns.trim_end_matches(".prototype")
+                            )));
+                            h.new_array(vec![ks, val])
+                        }
+                        _ => h.new_str(*name),
+                    })
+                    .collect();
+                h.new_array(out)
+            }));
+        }
+    }
     let entries: Vec<(String, Value)> = with_host(|h| match h.get(&v) {
         Some(JsObj::Object(props)) => props
             .iter()
@@ -3846,6 +4057,16 @@ fn object_create(args: Vec<Value>) -> Result<Value, String> {
     Ok(obj)
 }
 
+/// The enumerable method names of a builtin `<Ctor>.prototype` namespace that
+/// supports being copied via `mixin`/`getOwnPropertyNames`. Currently only
+/// `EventEmitter.prototype` (the one express mixes onto its app function).
+fn builtin_proto_method_names(ns: &str) -> Option<&'static [&'static str]> {
+    match ns {
+        "EventEmitter.prototype" => Some(crate::stdlib::events::METHODS),
+        _ => None,
+    }
+}
+
 fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
     let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
@@ -3863,17 +4084,43 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
     if get.is_some() || set.is_some() {
         with_host(|h| h.set_accessor(obj, key, get, set));
     } else if let Some(v) = value {
-        with_host(|h| {
-            if let Some(JsObj::Object(p)) = h.get_mut(obj) {
-                p.insert(key.to_string(), v);
-            }
-        });
+        // A function/class receiver stores its own props in the fn-prop side table
+        // (express `mixin(app, proto)` defines methods onto the `app` *function*).
+        if matches!(with_host(|h| h.get(obj).cloned()), Some(JsObj::Func(_)) | Some(JsObj::Class(_))) {
+            with_host(|h| h.set_fn_prop(obj, key, v));
+        } else {
+            with_host(|h| {
+                if let Some(JsObj::Object(p)) = h.get_mut(obj) {
+                    p.insert(key.to_string(), v);
+                }
+            });
+        }
     }
 }
 
 fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
     let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+    // A method read off an enumerable builtin prototype (`EventEmitter.prototype`)
+    // yields a `{ value: <method thunk> }` data descriptor so `mixin` can copy it.
+    if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(&obj).cloned()) {
+        if let Some(names) = builtin_proto_method_names(&ns) {
+            if names.contains(&key.as_str()) {
+                return Ok(with_host(|h| {
+                    let thunk = h.alloc(JsObj::Builtin(format!(
+                        "@proto:{}:{key}",
+                        ns.trim_end_matches(".prototype")
+                    )));
+                    let mut m: IndexMap<String, Value> = IndexMap::new();
+                    m.insert("value".into(), thunk);
+                    m.insert("writable".into(), Value::Bool(true));
+                    m.insert("enumerable".into(), Value::Bool(true));
+                    m.insert("configurable".into(), Value::Bool(true));
+                    h.new_object(m)
+                }));
+            }
+        }
+    }
     // Accessor descriptor?
     if let Some((get, set)) = with_host(|h| h.own_accessor(&obj, &key)) {
         return Ok(with_host(|h| {
@@ -3887,6 +4134,8 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     }
     let val = with_host(|h| match h.get(&obj) {
         Some(JsObj::Object(p)) => p.get(&key).cloned(),
+        // A function/class own prop lives in the fn-prop side table.
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => h.fn_prop(&obj, &key),
         _ => None,
     });
     match val {
@@ -3904,6 +4153,14 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
 
 /// `key in obj` respecting the prototype chain.
 pub fn has_property(obj: &Value, key: &str) -> bool {
+    // `key in <builtin namespace/prototype>`: membership matches what a property
+    // read would yield. `String.prototype.indexOf` (and the rest of the builtin
+    // prototype methods) resolve as callable thunks via `namespace_property`, so
+    // `'indexOf' in String.prototype` must report true (get-intrinsic probes this
+    // with the `in` operator before reading the intrinsic).
+    if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(obj).cloned()) {
+        return !matches!(namespace_property(&ns, key), Value::Undef);
+    }
     if with_host(|h| host::lookup_chain(h, obj, key)).is_some() {
         return true;
     }

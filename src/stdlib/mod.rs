@@ -21,6 +21,9 @@ use fusevm::Value;
 pub mod assert;
 pub mod buffer;
 pub mod crypto;
+pub mod date;
+pub mod string_decoder;
+pub mod typedarray;
 pub mod events;
 pub mod fs;
 pub mod http;
@@ -28,10 +31,12 @@ pub mod net;
 pub mod os;
 pub mod path;
 pub mod process;
+pub mod querystring;
 pub mod stream;
 pub mod tty;
 pub mod url;
 pub mod util;
+pub mod zlib;
 
 /// Canonical namespace name a `require(spec)` resolves to (after stripping an
 /// optional `node:` prefix), or `None` for an unsupported module.
@@ -53,6 +58,9 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         // The `events` module's export IS the EventEmitter constructor, so
         // `require('events')` yields the ctor namespace directly.
         "events" => Some("EventEmitter"),
+        "string_decoder" => Some("string_decoder"),
+        "zlib" => Some("zlib"),
+        "querystring" => Some("querystring"),
         _ => None,
     }
 }
@@ -72,9 +80,14 @@ pub fn is_method(qualified: &str) -> bool {
         "crypto" => crypto::METHODS.contains(&m),
         "Buffer" => buffer::STATIC_METHODS.contains(&m),
         "buffer" => m == "Buffer",
+        "Date" => date::STATIC_METHODS.contains(&m),
+        "TextEncoder" | "TextDecoder" => false,
+        n if typedarray::is_ctor(n) => typedarray::STATIC_METHODS.contains(&m),
         "url" => url::MODULE_METHODS.contains(&m) || m == "URL",
         "net" => net::MODULE_METHODS.contains(&m),
         "http" => http::MODULE_METHODS.contains(&m),
+        "zlib" => zlib::MODULE_METHODS.contains(&m),
+        "querystring" => querystring::METHODS.contains(&m),
         "tty" => tty::METHODS.contains(&m),
         "process" => process::METHODS.contains(&m),
         "EventEmitter" => m == "EventEmitter",
@@ -99,10 +112,14 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "crypto" => crypto::call(m, args)?,
         "Buffer" => buffer::static_call(m, args)?,
         "buffer" if m == "Buffer" => Ok(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into())))),
+        "Date" => date::static_call(m, args)?,
+        n if typedarray::is_ctor(n) => typedarray::static_call(n, m, args)?,
         "url" if m == "URL" => Ok(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
         "url" => url::call(m, args)?,
         "net" => net::call(m, args)?,
         "http" => http::call(m, args)?,
+        "zlib" => zlib::call(m, args)?,
+        "querystring" => querystring::call(m, args)?,
         "tty" => tty::call(m, args)?,
         "process" => process::call(m, args)?,
         "EventEmitter" if m == "EventEmitter" => {
@@ -123,6 +140,10 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         }
         "url" if name == "URL" => Some(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
         "stream" => stream::constant(name),
+        "http" => http::constant(name),
+        "string_decoder" if name == "StringDecoder" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("StringDecoder".into()))))
+        }
         "process" => process::constant(name),
         "EventEmitter" if name == "EventEmitter" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
@@ -139,6 +160,12 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "URL" => Some(url::construct(args)),
         "EventEmitter" => Some(Ok(events::new_emitter())),
         "Buffer" => Some(buffer::static_call("from", args).unwrap_or(Ok(Value::Undef))),
+        "Date" => Some(date::construct(args)),
+        "StringDecoder" => Some(string_decoder::construct(args)),
+        "WeakRef" => Some(typedarray::construct_weakref(args)),
+        "TextEncoder" => Some(typedarray::construct_text_encoder()),
+        "TextDecoder" => Some(typedarray::construct_text_decoder(args)),
+        n if typedarray::is_ctor(n) => Some(typedarray::construct(n, args)),
         n if stream::is_class(n) => Some(Ok(stream::construct(n))),
         _ => None,
     }
@@ -153,12 +180,58 @@ pub fn native_tag(recv: &Value) -> Option<String> {
     })
 }
 
+/// Whether `name` is a method of a native instance tagged `tag`. Used by
+/// `get_property` so a method *read* (`server.listen.apply(...)`, the express
+/// listen path) yields a bound method rather than `undefined` — the method is
+/// still dispatched through `instance_call` when the bound method is invoked.
+pub fn instance_has_method(tag: &str, name: &str) -> bool {
+    // Shared EventEmitter surface for the emitter-backed instances.
+    const EMITTER: &[&str] = &[
+        "on", "once", "emit", "addListener", "prependListener", "prependOnceListener",
+        "removeListener", "off", "removeAllListeners", "listeners", "listenerCount",
+        "eventNames", "setMaxListeners", "getMaxListeners",
+    ];
+    let base: &[&str] = match tag {
+        "Server" => &["listen", "close", "address"],
+        "Socket" => &[
+            "write", "end", "destroy", "pause", "resume", "setEncoding", "setKeepAlive",
+            "setNoDelay", "setTimeout", "ref", "unref", "connect",
+        ],
+        "ServerResponse" => &[
+            "writeHead", "setHeader", "getHeader", "getHeaderNames", "getHeaders", "hasHeader",
+            "removeHeader", "write", "end", "flushHeaders",
+        ],
+        "IncomingMessage" => &["pause", "resume", "setEncoding", "destroy"],
+        "Buffer" => &[
+            "toString", "toJSON", "equals", "slice", "subarray", "readUInt8", "includes",
+            "indexOf", "write", "copy", "fill",
+        ],
+        "Readable" | "Writable" | "Duplex" | "Transform" => {
+            &["read", "write", "end", "pipe", "pause", "resume", "setEncoding", "destroy", "push"]
+        }
+        "URL" => &["toString", "toJSON"],
+        _ => &[],
+    };
+    let is_emitter = matches!(
+        tag,
+        "Server" | "Socket" | "ServerResponse" | "IncomingMessage" | "EventEmitter" | "Readable"
+            | "Writable" | "Duplex" | "Transform"
+    );
+    base.contains(&name) || (is_emitter && EMITTER.contains(&name))
+}
+
 /// Dispatch a method call on a native stdlib instance (`recv` carries a
 /// `@@native` tag). Called from `host::call_method` before the generic object
 /// method resolution.
 pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     match tag {
         "Buffer" => buffer::instance_call(recv, method, &args),
+        "Date" => date::instance_call(recv, method, &args),
+        "StringDecoder" => string_decoder::instance_call(recv, method, &args),
+        "WeakRef" => typedarray::weakref_call(recv, method),
+        "TextEncoder" => typedarray::text_encoder_call(recv, method, &args),
+        "TextDecoder" => typedarray::text_decoder_call(recv, method, &args),
+        "TypedArray" => typedarray::instance_call(recv, method, &args),
         "Hash" => crypto::instance_call(recv, method, &args),
         "EventEmitter" => events::instance_call(recv, method, args),
         "URL" => url::instance_call(recv, method, &args),

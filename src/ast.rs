@@ -342,6 +342,13 @@ pub enum StmtKind {
         cases: Vec<SwitchCase>,
     },
 
+    /// `label: stmt` — a labeled statement (typically a loop), targetable by
+    /// `break label` / `continue label`.
+    Labeled {
+        label: String,
+        body: Box<Stmt>,
+    },
+
     Return(Option<Expr>),
     Break(Option<String>),
     Continue(Option<String>),

@@ -72,6 +72,9 @@ struct LoopCtx {
     continues: Vec<usize>,
     /// Whether `continue` binds here (true for loops, false for `switch`).
     catches_continue: bool,
+    /// The source label attached to this loop/block, if any (`outer: for …`),
+    /// so labeled `break outer` / `continue outer` can target it directly.
+    label: Option<String>,
 }
 
 #[derive(Default)]
@@ -80,6 +83,9 @@ pub struct Compiler {
     tries: Vec<TryDef>,
     loops: Vec<LoopCtx>,
     tmp: usize,
+    /// A label seen immediately before a loop, consumed by that loop's `LoopCtx`
+    /// (`outer: for (…)`); `None` once claimed.
+    pending_label: Option<String>,
     /// Emit per-statement `DBG_LINE` markers for the DAP debugger (`node --dap`).
     debug: bool,
 }
@@ -237,23 +243,40 @@ impl Compiler {
                 }
                 b.emit(Op::CallBuiltin(ops::SIG_RETURN, 1), line);
             }
-            StmtKind::Break(_) => {
+            StmtKind::Labeled { label, body } => self.compile_labeled(b, label, body)?,
+            StmtKind::Break(label) => {
                 let j = b.emit(Op::Jump(0), line);
-                self.loops
-                    .last_mut()
-                    .ok_or("SyntaxError: 'break' outside loop")?
-                    .breaks
-                    .push(j);
+                let ctx = match label {
+                    // `break outer`: the nearest enclosing context carrying that label.
+                    Some(name) => self
+                        .loops
+                        .iter_mut()
+                        .rev()
+                        .find(|c| c.label.as_deref() == Some(name.as_str()))
+                        .ok_or_else(|| format!("SyntaxError: Undefined label '{name}'"))?,
+                    None => self.loops.last_mut().ok_or("SyntaxError: 'break' outside loop")?,
+                };
+                ctx.breaks.push(j);
             }
-            StmtKind::Continue(_) => {
+            StmtKind::Continue(label) => {
                 let j = b.emit(Op::Jump(0), line);
-                self.loops
-                    .iter_mut()
-                    .rev()
-                    .find(|c| c.catches_continue)
-                    .ok_or("SyntaxError: 'continue' outside loop")?
-                    .continues
-                    .push(j);
+                let ctx = match label {
+                    // `continue outer`: the labeled loop (a label on a non-loop
+                    // cannot catch `continue`).
+                    Some(name) => self
+                        .loops
+                        .iter_mut()
+                        .rev()
+                        .find(|c| c.catches_continue && c.label.as_deref() == Some(name.as_str()))
+                        .ok_or_else(|| format!("SyntaxError: Undefined label '{name}' for continue"))?,
+                    None => self
+                        .loops
+                        .iter_mut()
+                        .rev()
+                        .find(|c| c.catches_continue)
+                        .ok_or("SyntaxError: 'continue' outside loop")?,
+                };
+                ctx.continues.push(j);
             }
             StmtKind::Throw(e) => {
                 self.compile_expr(b, e)?;
@@ -428,6 +451,39 @@ impl Compiler {
         Ok(())
     }
 
+    /// `label: stmt`. If the body is a loop, the label rides into that loop's
+    /// `LoopCtx` (so labeled `break`/`continue` target it); otherwise a break-only
+    /// context spans the body so `break label` can jump past it.
+    fn compile_labeled(&mut self, b: &mut ChunkBuilder, label: &str, body: &Stmt) -> Result<(), String> {
+        if matches!(
+            body.kind,
+            StmtKind::While { .. }
+                | StmtKind::DoWhile { .. }
+                | StmtKind::For { .. }
+                | StmtKind::ForOf { .. }
+                | StmtKind::ForIn { .. }
+        ) {
+            self.pending_label = Some(label.to_string());
+            self.compile_stmt(b, body)?;
+            // The loop claimed it; clear any residue defensively.
+            self.pending_label = None;
+        } else {
+            self.loops.push(LoopCtx {
+                breaks: Vec::new(),
+                continues: Vec::new(),
+                catches_continue: false,
+                label: Some(label.to_string()),
+            });
+            self.compile_stmt(b, body)?;
+            let ctx = self.loops.pop().unwrap();
+            let end = b.current_pos();
+            for br in ctx.breaks {
+                b.patch_jump(br, end);
+            }
+        }
+        Ok(())
+    }
+
     fn compile_while(&mut self, b: &mut ChunkBuilder, test: &Expr, body: &Stmt) -> Result<(), String> {
         let start = b.current_pos();
         self.compile_condition(b, test)?;
@@ -436,6 +492,7 @@ impl Compiler {
             breaks: Vec::new(),
             continues: Vec::new(),
             catches_continue: true,
+            label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
         b.emit(Op::Jump(start), 0);
@@ -457,6 +514,7 @@ impl Compiler {
             breaks: Vec::new(),
             continues: Vec::new(),
             catches_continue: true,
+            label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
         let cont_target = b.current_pos();
@@ -496,6 +554,7 @@ impl Compiler {
             breaks: Vec::new(),
             continues: Vec::new(),
             catches_continue: true,
+            label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
         let cont_target = b.current_pos();
@@ -567,6 +626,7 @@ impl Compiler {
             breaks: Vec::new(),
             continues: Vec::new(),
             catches_continue: true,
+            label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
         b.emit(Op::Jump(start), 0);
@@ -592,6 +652,7 @@ impl Compiler {
             breaks: Vec::new(),
             continues: Vec::new(),
             catches_continue: true,
+            label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
         b.emit(Op::Jump(start), 0);
@@ -646,6 +707,7 @@ impl Compiler {
             breaks: Vec::new(),
             continues: Vec::new(),
             catches_continue: false,
+            label: None,
         });
         let mut body_starts: Vec<usize> = Vec::new();
         for case in cases {
@@ -1119,11 +1181,24 @@ impl Compiler {
                 }
             }
             b.emit(Op::CallBuiltin(ops::BUILD_ARGS, argc(items.len() * 2)?), 0);
-        } else {
+        } else if items.len() <= u8::MAX as usize {
             for it in items {
                 self.compile_expr(b, it)?;
             }
             b.emit(Op::CallBuiltin(ops::MKARR, argc(items.len())?), 0);
+        } else {
+            // A literal larger than one CallBuiltin's u8 arg count can hold (the
+            // generated data tables in iconv-lite hit this): start from an empty
+            // array and append each element with an indexed store, keeping the
+            // array on the stack across iterations.
+            b.emit(Op::CallBuiltin(ops::MKARR, 0), 0); // [arr]
+            for (i, it) in items.iter().enumerate() {
+                b.emit(Op::Dup, 0); // [arr, arr]
+                b.emit(Op::LoadInt(i as i64), 0); // [arr, arr, i]
+                self.compile_expr(b, it)?; // [arr, arr, i, val]
+                b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0); // -> [arr, val]
+                b.emit(Op::Pop, 0); // [arr]
+            }
         }
         Ok(())
     }
@@ -1135,6 +1210,26 @@ impl Compiler {
             .iter()
             .filter(|p| !matches!(p, Prop::Accessor { .. }))
             .collect();
+        let has_spread = data.iter().any(|p| matches!(p, Prop::Spread(_)));
+        // A spread-free literal with more triples than one CallBuiltin's u8 arg
+        // count can hold (iconv-lite's generated codepage tables are 150+ keys)
+        // is built incrementally: start empty, store each key, keeping the object
+        // on the stack. Spread merges need the single-shot MKOBJ tag path, so
+        // large-with-spread stays on it (a rare, genuine limitation).
+        if data.len() * 3 > u8::MAX as usize && !has_spread {
+            b.emit(Op::CallBuiltin(ops::MKOBJ, 0), 0); // [obj]
+            for p in &data {
+                if let Prop::KeyValue { key, value, .. } = p {
+                    b.emit(Op::Dup, 0); // [obj, obj]
+                    self.compile_expr(b, key)?;
+                    b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0); // [obj, obj, key]
+                    self.compile_expr(b, value)?; // [obj, obj, key, val]
+                    b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0); // -> [obj, val]
+                    b.emit(Op::Pop, 0); // [obj]
+                }
+            }
+            return self.compile_object_accessors(b, props);
+        }
         for p in &data {
             match p {
                 Prop::KeyValue { key, value, .. } => {
@@ -1154,7 +1249,12 @@ impl Compiler {
             }
         }
         b.emit(Op::CallBuiltin(ops::MKOBJ, argc(data.len() * 3)?), 0); // [obj]
-        // Install any getters/setters, keeping the object on the stack.
+        self.compile_object_accessors(b, props)
+    }
+
+    /// Install any getter/setter accessors of an object literal onto the object
+    /// left on the stack (shared by the single-shot and incremental build paths).
+    fn compile_object_accessors(&mut self, b: &mut ChunkBuilder, props: &[Prop]) -> Result<(), String> {
         for p in props {
             if let Prop::Accessor { key, computed, is_getter, func } = p {
                 if *computed {
@@ -1215,8 +1315,16 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::UNARY, 2), 0);
             }
             UnOp::TypeOf => {
-                self.compile_expr(b, e)?;
-                b.emit(Op::CallBuiltin(ops::TYPEOF, 1), 0);
+                // `typeof <bare ident>` must NOT throw when the name is unbound —
+                // JS returns "undefined". Route a plain identifier through a
+                // non-throwing name read; any other operand evaluates normally.
+                if let Expr::Ident(n) = e {
+                    self.name_const(b, n);
+                    b.emit(Op::CallBuiltin(ops::TYPEOF_NAME, 1), 0);
+                } else {
+                    self.compile_expr(b, e)?;
+                    b.emit(Op::CallBuiltin(ops::TYPEOF, 1), 0);
+                }
             }
             UnOp::Void => {
                 self.compile_expr(b, e)?;

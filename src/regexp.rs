@@ -1,21 +1,50 @@
-//! JavaScript `RegExp` on top of the Rust `regex` crate.
+//! JavaScript `RegExp` on top of the [`fancy_regex`] crate.
 //!
-//! **Rust `regex` is NOT a superset of JavaScript's regex grammar.** It has no
-//! backreferences and no lookaround, and a few escapes differ. node-js therefore
-//! translates the *overlapping* subset (character classes, quantifiers, anchors,
-//! groups, alternation, `\d\w\s\b`, the flags `i`/`m`/`s`) into Rust syntax and
-//! **rejects at construction time** any pattern using a JS feature Rust cannot
-//! express — a loud `SyntaxError`, never a silently-wrong match. The exact
-//! supported subset and the known divergences are documented in BUGS.md.
+//! `fancy-regex` wraps the linear Rust `regex` engine and layers a backtracking
+//! matcher on top, so it can express the JS constructs plain `regex` cannot:
+//! lookahead (`(?=)`/`(?!)`), lookbehind (`(?<=)`/`(?<!)`), and backreferences
+//! (`\1`, `\k<name>`). node-js therefore accepts a near-superset of the JS regex
+//! grammar; the small residue fancy-regex still cannot represent is documented
+//! in BUGS.md and rejected loudly at construction time (never a silently-wrong
+//! match).
 //!
-//! Flags: `i` (ignoreCase) and `m` (multiline) and `s` (dotAll) map onto Rust's
-//! inline flags; `g` (global) and `y` (sticky) are implemented here (Rust has no
-//! global flag — we drive iteration and `lastIndex` ourselves); `u`/`d` are
-//! accepted and otherwise ignored.
+//! What `translate` still has to do (fancy-regex/regex differ from JS here):
+//!   * `\uXXXX` / `\u{...}` → `\x{...}` (regex spells fixed code points that
+//!     way), with lone-surrogate escapes (`\uD800`..`\uDFFF`) mapped into a
+//!     Plane-15 private-use block — surrogate code points are not valid Unicode
+//!     scalar values, so `\x{D800}` will not compile; a valid UTF-8 `&str` can
+//!     never contain a lone surrogate anyway, so those alternatives stay dead
+//!     (correct for all valid input, e.g. encodeurl's unmatched-surrogate scan).
+//!   * `\/` in a literal → a plain `/` (regex rejects the redundant escape).
+//!
+//! Everything else — including `(?<name>...)`, `(?=)`/`(?!)`, `(?<=)`/`(?<!)`,
+//! and `\1`/`\k<name>` — passes through verbatim; fancy-regex parses it natively.
+//!
+//! Flags: `i`/`m`/`s` map onto inline flags; `g`/`y` drive iteration and
+//! `lastIndex` here (fancy-regex has no global flag); `u`/`d` are accepted.
 
 use crate::host::{self, with_host, JsObj, RegExpObj};
+use fancy_regex::{Captures, Regex};
 use fusevm::Value;
 use indexmap::IndexMap;
+
+/// Lone-surrogate code points are not valid Unicode scalar values, so they can
+/// never appear in a Rust `&str` and `regex` refuses to compile `\x{D800}`. Map
+/// the 2048-code-point surrogate block bijectively into Plane-15 PUA-B, which is
+/// valid, contiguous (so class ranges stay ranges), and never occurs in normal
+/// text — the surrogate alternatives thus compile and stay inert on valid input.
+const SURROGATE_LO: u32 = 0xD800;
+const SURROGATE_HI: u32 = 0xDFFF;
+const SURROGATE_PUA_BASE: u32 = 0xF_0000;
+
+/// Remap a surrogate code point into the inert PUA block; pass others through.
+fn remap_surrogate(cp: u32) -> u32 {
+    if (SURROGATE_LO..=SURROGATE_HI).contains(&cp) {
+        SURROGATE_PUA_BASE + (cp - SURROGATE_LO)
+    } else {
+        cp
+    }
+}
 
 /// Build a `RegExp` value from a JS `pattern` + `flags`, or a `SyntaxError` if the
 /// pattern uses an unsupported construct or is otherwise invalid.
@@ -36,7 +65,7 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     let unicode = flags.contains('u');
 
     let rust_pat = translate(pattern)?;
-    // Assemble the inline-flag prefix Rust understands.
+    // Assemble the inline-flag prefix fancy-regex (via the regex layer) understands.
     let mut prefixed = String::new();
     if ignore_case || multiline || dot_all {
         prefixed.push_str("(?");
@@ -53,8 +82,8 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     }
     prefixed.push_str(&rust_pat);
 
-    let re = regex::Regex::new(&prefixed).map_err(|e| {
-        // Collapse Rust's multi-line error to one line for a JS-shaped message.
+    let re = Regex::new(&prefixed).map_err(|e| {
+        // Collapse the multi-line error to one line for a JS-shaped message.
         let msg = e.to_string().lines().collect::<Vec<_>>().join(" ");
         format!("SyntaxError: Invalid regular expression: /{pattern}/: {msg}")
     })?;
@@ -74,52 +103,92 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     Ok(with_host(|h| h.alloc(JsObj::RegExp(Box::new(obj)))))
 }
 
-/// Translate a JS regex source into Rust `regex` syntax, rejecting constructs Rust
-/// cannot represent. Returns a `SyntaxError` string for the unsupported cases.
+/// Translate a JS regex source into fancy-regex syntax. The rewrites needed are
+/// the `\u`→`\x{}` code-point spelling (with surrogate remapping), the redundant
+/// `\/` escape, and escaping a bare `[` inside a character class — JS treats it
+/// as a literal, but the `regex` layer parses it as a (nested) class open and
+/// errors ("Invalid character class"). lookaround/backrefs/named groups pass
+/// through verbatim.
 fn translate(pat: &str) -> Result<String, String> {
     let chars: Vec<char> = pat.chars().collect();
     let mut out = String::new();
     let mut i = 0;
+    // Track whether we're inside a `[...]` class. `class_pos` is how many chars
+    // into the current class we are, so we can spot the `]` that would close an
+    // empty class (`[]` / `[^]`) vs. a literal leading `]`.
     let mut in_class = false;
+    let mut class_pos = 0usize;
     while i < chars.len() {
         let c = chars[i];
+        // Character-class bookkeeping. A `\` escape is handled below and never
+        // toggles class state (it consumes its own two chars).
+        if c != '\\' {
+            if !in_class && c == '[' {
+                in_class = true;
+                class_pos = 0;
+                out.push('[');
+                i += 1;
+                // A leading `^` is the negation, not the first member.
+                if chars.get(i) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                continue;
+            }
+            if in_class {
+                // The first char of a class, if `]`, is a literal `]` in JS; a
+                // later bare `[` must be escaped for the regex layer.
+                if c == ']' && class_pos > 0 {
+                    in_class = false;
+                    out.push(']');
+                    i += 1;
+                    continue;
+                }
+                if c == '[' {
+                    out.push_str("\\[");
+                    class_pos += 1;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
         match c {
             '\\' => {
-                let n = chars.get(i + 1).copied();
-                match n {
-                    // Backreference `\1`..`\9` (outside a class) — unsupported.
-                    Some(d) if d.is_ascii_digit() && d != '0' && !in_class => {
-                        return Err(unsupported("backreferences"));
-                    }
-                    // Named backreference `\k<name>` — unsupported.
-                    Some('k') if !in_class => return Err(unsupported("named backreferences")),
-                    // `\uXXXX` / `\u{...}` → Rust `\x{...}`.
+                class_pos += 1;
+                match chars.get(i + 1).copied() {
+                    // `\uXXXX` / `\u{...}` → `\x{...}` (surrogates remapped).
                     Some('u') => {
                         i += 2;
+                        let cp_hex: String;
                         if chars.get(i) == Some(&'{') {
-                            out.push_str("\\x{");
                             i += 1;
+                            let mut hex = String::new();
                             while i < chars.len() && chars[i] != '}' {
-                                out.push(chars[i]);
+                                hex.push(chars[i]);
                                 i += 1;
                             }
-                            out.push('}');
                             i += 1; // consume '}'
+                            cp_hex = hex;
                         } else {
                             // Exactly four hex digits.
-                            let hex: String = chars[i..(i + 4).min(chars.len())].iter().collect();
-                            out.push_str(&format!("\\x{{{hex}}}"));
+                            cp_hex = chars[i..(i + 4).min(chars.len())].iter().collect();
                             i += 4;
+                        }
+                        match u32::from_str_radix(cp_hex.trim(), 16) {
+                            Ok(cp) => out.push_str(&format!("\\x{{{:X}}}", remap_surrogate(cp))),
+                            // Not valid hex — emit the code point literally so the
+                            // engine surfaces its own error rather than us guessing.
+                            Err(_) => out.push_str(&format!("\\x{{{cp_hex}}}")),
                         }
                         continue;
                     }
-                    // `\/` in a JS literal → a plain slash (Rust rejects `\/`).
+                    // `\/` in a JS literal → a plain slash (regex rejects `\/`).
                     Some('/') => {
                         out.push('/');
                         i += 2;
                         continue;
                     }
-                    // Everything else (`\d \w \s \b \n \. \\` …) passes through.
+                    // Everything else (`\d \w \s \b \1 \k \n \. \\` …) passes through.
                     Some(other) => {
                         out.push('\\');
                         out.push(other);
@@ -132,57 +201,16 @@ fn translate(pat: &str) -> Result<String, String> {
                     }
                 }
             }
-            '[' if !in_class => {
-                in_class = true;
-                out.push('[');
-                i += 1;
-            }
-            ']' if in_class => {
-                in_class = false;
-                out.push(']');
-                i += 1;
-            }
-            '(' if !in_class => {
-                // Distinguish `(?<name>` (named group → `(?P<name>`) from
-                // `(?<=` / `(?<!` (lookbehind → unsupported) and `(?=`/`(?!`
-                // (lookahead → unsupported).
-                if chars.get(i + 1) == Some(&'?') {
-                    match chars.get(i + 2) {
-                        Some('=') | Some('!') => return Err(unsupported("lookahead assertions")),
-                        Some('<') => match chars.get(i + 3) {
-                            Some('=') | Some('!') => {
-                                return Err(unsupported("lookbehind assertions"))
-                            }
-                            _ => {
-                                out.push_str("(?P<");
-                                i += 3;
-                                continue;
-                            }
-                        },
-                        _ => {
-                            out.push('(');
-                            i += 1;
-                        }
-                    }
-                } else {
-                    out.push('(');
-                    i += 1;
-                }
-            }
             _ => {
+                if in_class {
+                    class_pos += 1;
+                }
                 out.push(c);
                 i += 1;
             }
         }
     }
     Ok(out)
-}
-
-fn unsupported(feature: &str) -> String {
-    format!(
-        "SyntaxError: node-js regex does not support {feature} (Rust `regex` backend); \
-         see BUGS.md for the supported subset"
-    )
 }
 
 /// A `RegExp` own data property (`source`/`flags`/`global`/…/`lastIndex`), or
@@ -228,7 +256,7 @@ pub fn regexp_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value
 }
 
 /// Snapshot the fields we need without holding the host borrow across a match.
-fn regexp_snapshot(recv: &Value) -> Option<(regex::Regex, bool, bool, usize)> {
+fn regexp_snapshot(recv: &Value) -> Option<(Regex, bool, bool, usize)> {
     with_host(|h| match h.get(recv) {
         Some(JsObj::RegExp(r)) => Some((r.re.clone(), r.global, r.sticky, r.last_index)),
         _ => None,
@@ -265,8 +293,10 @@ pub fn regexp_test(recv: &Value, s: &str) -> bool {
         return false;
     }
     let start_byte = byte_of_char(s, start_char);
-    match re.find_at(s, start_byte) {
-        Some(m) if !sticky || m.start() == start_byte => {
+    // A backtracking match can fail (catastrophic backtracking guard); treat an
+    // engine error as "no match" so a pathological pattern never panics the VM.
+    match re.find_from_pos(s, start_byte) {
+        Ok(Some(m)) if !sticky || m.start() == start_byte => {
             if global || sticky {
                 set_last_index(recv, char_of_byte(s, m.end()));
             }
@@ -295,7 +325,7 @@ pub fn regexp_exec(recv: &Value, s: &str) -> Result<Value, String> {
         return Ok(with_host(|h| h.null()));
     }
     let start_byte = byte_of_char(s, start_char);
-    let caps = re.captures_at(s, start_byte);
+    let caps = re.captures_from_pos(s, start_byte).ok().flatten();
     let caps = match caps {
         Some(c) if !sticky || c.get(0).map(|m| m.start()) == Some(start_byte) => c,
         _ => {
@@ -314,7 +344,7 @@ pub fn regexp_exec(recv: &Value, s: &str) -> Result<Value, String> {
 
 /// Build the JS match-result array from a `Captures`, attaching `.index`,
 /// `.input`, and (named-group) `.groups`.
-fn build_match_array(re: &regex::Regex, caps: &regex::Captures, s: &str) -> Value {
+fn build_match_array(re: &Regex, caps: &Captures, s: &str) -> Value {
     let mut items: Vec<Value> = Vec::with_capacity(caps.len());
     for i in 0..caps.len() {
         items.push(match caps.get(i) {
@@ -367,6 +397,7 @@ pub fn str_match(s: &str, re_val: &Value) -> Result<Value, String> {
     }
     let matches: Vec<Value> = re
         .find_iter(s)
+        .filter_map(|m| m.ok())
         .map(|m| with_host(|h| h.new_str(m.as_str().to_string())))
         .collect();
     if matches.is_empty() {
@@ -377,8 +408,8 @@ pub fn str_match(s: &str, re_val: &Value) -> Result<Value, String> {
 }
 
 /// Non-global exec searching from offset 0 (for `str.match` without `g`).
-fn regexp_exec_from_zero(re: &regex::Regex, s: &str) -> Result<Value, String> {
-    match re.captures(s) {
+fn regexp_exec_from_zero(re: &Regex, s: &str) -> Result<Value, String> {
+    match re.captures(s).ok().flatten() {
         Some(caps) => Ok(build_match_array(re, &caps, s)),
         None => Ok(with_host(|h| h.null())),
     }
@@ -391,7 +422,7 @@ pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
         return Ok(with_host(|h| h.new_array(Vec::new())));
     };
     let mut items = Vec::new();
-    for caps in re.captures_iter(s) {
+    for caps in re.captures_iter(s).flatten() {
         items.push(build_match_array(&re, &caps, s));
     }
     // Return a live iterator so `for-of`/spread/`Array.from` all work.
@@ -403,7 +434,7 @@ pub fn str_search(s: &str, re_val: &Value) -> Result<Value, String> {
     let Some((re, _, _, _)) = regexp_snapshot(re_val) else {
         return Ok(Value::Float(-1.0));
     };
-    Ok(match re.find(s) {
+    Ok(match re.find(s).ok().flatten() {
         Some(m) => Value::Float(char_of_byte(s, m.start()) as f64),
         None => Value::Float(-1.0),
     })
@@ -417,7 +448,7 @@ pub fn str_split_regex(s: &str, re_val: &Value, limit: Option<usize>) -> Result<
     };
     let mut out: Vec<Value> = Vec::new();
     let mut last_end = 0usize;
-    for caps in re.captures_iter(s) {
+    for caps in re.captures_iter(s).flatten() {
         let m = caps.get(0).unwrap();
         // Zero-width match at the very start is skipped (matches JS closely).
         if m.start() == m.end() && m.start() == last_end && last_end == 0 {
@@ -458,7 +489,7 @@ pub fn str_replace_regex(s: &str, re_val: &Value, repl: &Value, all: bool) -> Re
     let mut out = String::new();
     let mut last = 0usize;
     let mut count = 0;
-    for caps in re.captures_iter(s) {
+    for caps in re.captures_iter(s).flatten() {
         let m = caps.get(0).unwrap();
         out.push_str(&s[last..m.start()]);
         if is_fn {
@@ -489,7 +520,7 @@ pub fn str_replace_regex(s: &str, re_val: &Value, repl: &Value, all: bool) -> Re
 }
 
 /// Expand a replacement template's `$` patterns against a match.
-fn expand_replacement(templ: &str, caps: &regex::Captures, s: &str) -> String {
+fn expand_replacement(templ: &str, caps: &Captures, s: &str) -> String {
     let chars: Vec<char> = templ.chars().collect();
     let mut out = String::new();
     let mut i = 0;

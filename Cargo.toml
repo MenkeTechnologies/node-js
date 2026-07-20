@@ -106,9 +106,14 @@ num-bigint = "0.4"
 num-integer = "0.1"
 num-traits = "0.2"
 
-# JS regular-expression literals (`/pat/flags`) + `RegExp`. Rust `regex` is NOT a
-# superset of JS regex (no backreferences/lookaround) — node-js translates the
-# overlapping subset and rejects the rest at RegExp-construction time. See BUGS.md.
+# JS regular-expression literals (`/pat/flags`) + `RegExp`. `fancy-regex` wraps
+# the Rust `regex` crate for the linear fast path and adds a backtracking engine
+# for lookaround (`(?=)`/`(?!)`/`(?<=)`/`(?<!)`) and backreferences (`\1`,
+# `\k<name>`) — the JS constructs Rust `regex` alone cannot express. node-js
+# translates the JS source into fancy-regex syntax (see src/regexp.rs).
+fancy-regex = "0.18"
+# Still used directly for the `regex`-native escape/quote helpers and re-exported
+# types; fancy-regex builds on top of it.
 regex = "1"
 
 [dev-dependencies]

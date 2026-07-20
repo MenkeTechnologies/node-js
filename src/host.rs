@@ -92,6 +92,7 @@ pub mod ops {
     pub const ASYNC_STEP: u16 = 58; // [asyncIterator] -> Promise of {value, done}
     pub const NUM_STEP: u16 = 59; // [tag(±1), old] -> pushes ToNumeric(old), returns old±1 (type-preserving; BigInt-aware ++/--)
     pub const ITER_CLOSE: u16 = 60; // [iterator] -> close it (for-of break: run a generator's finally / call .return())
+    pub const TYPEOF_NAME: u16 = 61; // [name] -> str; `typeof <ident>` reads the name WITHOUT throwing (unbound -> "undefined")
 }
 
 /// `DEF_MEMBER` member-kind tags.
@@ -215,14 +216,16 @@ pub enum JsObj {
     RegExp(Box<RegExpObj>),
 }
 
-/// A `RegExp` object: the compiled Rust `regex::Regex` plus the JS-visible source,
-/// flag booleans, and the mutable `lastIndex` cursor (used by `g`/`y` matching).
+/// A `RegExp` object: the compiled `fancy_regex::Regex` plus the JS-visible
+/// source, flag booleans, and the mutable `lastIndex` cursor (used by `g`/`y`
+/// matching). fancy-regex adds lookaround + backreferences on top of the Rust
+/// `regex` fast path, so the JS grammar node-js can accept is a near-superset.
 #[derive(Clone)]
 pub struct RegExpObj {
-    /// The translated Rust regex. `None` means the pattern used a JS feature Rust
-    /// `regex` cannot express (backreference/lookaround) — construction of such a
-    /// RegExp throws, so a live `RegExpObj` always has `Some`.
-    pub re: regex::Regex,
+    /// The translated regex. Construction of a pattern fancy-regex still cannot
+    /// express (documented in BUGS.md) throws at `RegExp` build time, so a live
+    /// `RegExpObj` always holds a compiled engine.
+    pub re: fancy_regex::Regex,
     pub source: String,
     pub flags: String,
     pub global: bool,
@@ -945,6 +948,9 @@ pub fn type_error(msg: &str) -> String {
 }
 pub fn ref_error(name: &str) -> String {
     format!("ReferenceError: {name} is not defined")
+}
+pub fn range_error(msg: &str) -> String {
+    format!("RangeError: {msg}")
 }
 
 // ── the fusevm run plumbing ──────────────────────────────────────────────────
@@ -2063,7 +2069,11 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
     // on the function object.
     if matches!(
         with_host(|h| h.get(recv).cloned()),
-        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) | Some(JsObj::Builtin(_))
+        Some(JsObj::Func(_))
+            | Some(JsObj::Class(_))
+            | Some(JsObj::BoundFunc { .. })
+            | Some(JsObj::BoundMethod { .. })
+            | Some(JsObj::Builtin(_))
     ) {
         if let Some(r) = crate::builtins::function_builtin_method(recv, name, &args)? {
             return Ok(r);
@@ -2078,6 +2088,22 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
             if with_host(|h| is_callable(h, &f)) {
                 return invoke(&f, args, Some(recv.clone()));
             }
+        }
+        // A method inherited via the function's [[Prototype]] chain (set with
+        // `Object.setPrototypeOf(fn, proto)`) — the `router` package's router
+        // functions inherit `route`/`use`/`get`/… from `Router.prototype`.
+        if let Some(f) = with_host(|h| lookup_chain(h, recv, name)) {
+            if with_host(|h| is_callable(h, &f)) {
+                return invoke(&f, args, Some(recv.clone()));
+            }
+        }
+        // An `Object.prototype` method invoked with a builtin namespace/prototype
+        // as `this` (`hasOwnProperty.call(Map.prototype, 'get')`, the get-intrinsic
+        // ownership probe) — dispatch it against the builtin receiver.
+        if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Builtin(_)))
+            && crate::builtins::is_object_builtin_method(name)
+        {
+            return crate::builtins::object_builtin_method(recv, name, args);
         }
     }
     // Type methods (array/string/number, Map/Set/Symbol/generator methods).
@@ -2243,10 +2269,22 @@ pub fn construct_nt(ctor: &Value, args: Vec<Value>, new_target: Value) -> Result
     }
 }
 
+/// Whether a constructor's return value is an object (so `new` yields it instead
+/// of the fresh instance). In JS "object" includes functions — the `router`
+/// package's constructor `return router` (a function) must be honored, or the
+/// returned router loses its callable identity.
 fn returns_object(r: &Value) -> bool {
     matches!(
         with_host(|h| h.get(r).cloned()),
-        Some(JsObj::Object(_)) | Some(JsObj::Array(_)) | Some(JsObj::Map { .. }) | Some(JsObj::Set { .. })
+        Some(JsObj::Object(_))
+            | Some(JsObj::Array(_))
+            | Some(JsObj::Map { .. })
+            | Some(JsObj::Set { .. })
+            | Some(JsObj::Func(_))
+            | Some(JsObj::Class(_))
+            | Some(JsObj::BoundFunc { .. })
+            | Some(JsObj::BoundMethod { .. })
+            | Some(JsObj::RegExp(_))
     )
 }
 
@@ -2952,10 +2990,21 @@ pub fn lookup_chain(h: &JsHost, recv: &Value, key: &str) -> Option<Value> {
     }
     let mut cur = h.proto_of(recv);
     while let Some(p) = cur {
-        if let Some(JsObj::Object(props)) = h.get(&p) {
-            if let Some(v) = props.get(key) {
-                return Some(v.clone());
+        // A chain link may be a plain object OR a function/class (the `router`
+        // package sets `Router.prototype = function(){}` and hangs its methods off
+        // that function, so the methods live in the fn-prop side table).
+        match h.get(&p) {
+            Some(JsObj::Object(props)) => {
+                if let Some(v) = props.get(key) {
+                    return Some(v.clone());
+                }
             }
+            Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => {
+                if let Some(v) = h.fn_prop(&p, key) {
+                    return Some(v);
+                }
+            }
+            _ => {}
         }
         cur = h.proto_of(&p);
     }

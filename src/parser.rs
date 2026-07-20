@@ -202,6 +202,18 @@ impl Parser {
                 StmtKind::Throw(e)
             }
             Tok::Ident(kw) if kw == "try" => self.parse_try()?,
+            // `label: stmt` — a bare identifier immediately followed by `:` at
+            // statement position is a label (never an expression; the reserved
+            // control keywords are all matched above, and switch `case`/`default`
+            // labels are parsed inside `parse_switch`).
+            Tok::Ident(name)
+                if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == ":") =>
+            {
+                self.advance(); // the label identifier
+                self.advance(); // the ':'
+                let body = Box::new(self.parse_stmt()?);
+                StmtKind::Labeled { label: name, body }
+            }
             _ => {
                 let e = self.parse_expr()?;
                 self.semicolon()?;
