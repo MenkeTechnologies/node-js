@@ -32,7 +32,7 @@ execution and codegen live in `fusevm` — the same engine behind
 
 The binary is `node`.
 
-### [`Read the Docs`](https://menketechnologies.github.io/node-js/) &middot; [`Engineering Report`](https://menketechnologies.github.io/node-js/report.html) &middot; [`fusevm`](https://github.com/MenkeTechnologies/fusevm)
+### [`Read the Docs`](https://menketechnologies.github.io/node-js/) &middot; [`Engineering Report`](https://menketechnologies.github.io/node-js/report.html) &middot; [`Builtin Reference`](https://menketechnologies.github.io/node-js/reference.html) &middot; [`fusevm`](https://github.com/MenkeTechnologies/fusevm)
 
 ---
 
@@ -175,6 +175,7 @@ walking up to the meta parent). `fusevm` is pulled from crates.io with the `jit`
 ## [0x07] DOCUMENTATION
 
 - **Docs hub** — <https://menketechnologies.github.io/node-js/>
+- **Builtin reference** — <https://menketechnologies.github.io/node-js/reference.html>
 - **Engineering report** — <https://menketechnologies.github.io/node-js/report.html>
 - **fusevm** — <https://github.com/MenkeTechnologies/fusevm> (the shared VM)
 - **Source** — <https://github.com/MenkeTechnologies/node-js>
