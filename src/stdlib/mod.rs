@@ -48,6 +48,22 @@ pub mod timers;
 pub mod util_types;
 pub mod v8;
 
+/// Native-heavy core modules that node-js does not yet implement (TLS handshakes,
+/// HTTP/2 framing, OS worker threads sharing the thread-local heap, UDP sockets,
+/// V8 inspector, etc.). `require`ing them succeeds and yields a namespace so that
+/// programs which import-then-conditionally-use them still load; ACTUALLY calling
+/// a method throws `Error: <mod>.<method> is not implemented in node-js`. This is
+/// an honest not-yet-built surface, never a silent fake.
+pub const UNIMPLEMENTED_MODULES: &[&str] = &[
+    "tls", "http2", "https", "worker_threads", "cluster", "dgram", "inspector",
+    "wasi", "trace_events", "domain", "repl", "vm", "dns/promises", "readline",
+];
+
+/// True if `ns` is a known-but-unimplemented core module (see `UNIMPLEMENTED_MODULES`).
+pub fn is_unimplemented(ns: &str) -> bool {
+    UNIMPLEMENTED_MODULES.contains(&ns)
+}
+
 /// Canonical namespace name a `require(spec)` resolves to (after stripping an
 /// optional `node:` prefix), or `None` for an unsupported module.
 pub fn resolve(spec: &str) -> Option<&'static str> {
@@ -72,6 +88,10 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "zlib" => Some("zlib"),
         "querystring" => Some("querystring"),
         "console" => Some("console"),
+        // `path/posix` is exactly our POSIX `path`; `assert/strict` is `assert`
+        // (our assert is already strict-equality based).
+        "path/posix" => Some("path"),
+        "assert/strict" => Some("assert"),
         "child_process" => Some("child_process"),
         "dns" => Some("dns"),
         "punycode" => Some("punycode"),
@@ -82,7 +102,7 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "util/types" => Some("util/types"),
         "diagnostics_channel" => Some("diagnostics_channel"),
         "v8" => Some("v8"),
-        _ => None,
+        other => UNIMPLEMENTED_MODULES.iter().copied().find(|&m| m == other),
     }
 }
 
@@ -123,6 +143,10 @@ pub fn is_method(qualified: &str) -> bool {
         "util/types" => util_types::METHODS.contains(&m),
         "diagnostics_channel" => diagnostics_channel::METHODS.contains(&m),
         "v8" => v8::METHODS.contains(&m),
+        // Any method on an unimplemented namespace routes to `call`, which throws
+        // an honest "not implemented" error (so `mod.foo()` fails clearly rather
+        // than silently returning undefined).
+        _ if is_unimplemented(ns) => true,
         _ => false,
     }
 }
@@ -168,6 +192,9 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "util/types" => util_types::call(m, args)?,
         "diagnostics_channel" => diagnostics_channel::call(m, args)?,
         "v8" => v8::call(m, args)?,
+        _ if is_unimplemented(ns) => {
+            Err(format!("Error: {ns}.{m} is not implemented in node-js"))
+        }
         _ => return None,
     })
 }

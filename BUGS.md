@@ -1,5 +1,24 @@
 # node-js — known gaps and unimplemented behavior
 
+## Node core-module coverage
+Implemented natively (verified vs node v26): `assert`(+`/strict`), `buffer`,
+`child_process` (exec/spawnSync/execSync; `spawn` is sync-backed, not a live
+streaming ChildProcess), `console`, `crypto` (hashes/hmac), `dns` (lookup/resolve
+via std), `diagnostics_channel`, `events`, `fs`, `http`, `net`, `os`, `path`
+(+`/posix`), `perf_hooks`, `process`, `punycode`, `querystring`, `stream`,
+`string_decoder`, `timers`(+`/promises`), `tty`, `url`, `util`(+`/types`), `v8`
+(serialize = JSON, not V8 binary; heap stats are a shim), `async_hooks`
+(AsyncLocalStorage sync-only; hooks are no-ops), `zlib`.
+
+Known-but-UNIMPLEMENTED (require() returns a namespace so import-then-conditional
+code loads; calling a method throws `Error: <mod>.<method> is not implemented in
+node-js` — honest, never a silent fake): `tls`, `http2`, `https`, `worker_threads`,
+`cluster`, `dgram`, `inspector`, `wasi`, `trace_events`, `domain`, `repl`, `vm`,
+`readline`, `dns/promises` (use `require('dns').promises`). These need real
+TLS/HTTP2/OS-threads/sandboxing substrate. `fs/promises`, `stream/consumers`,
+`path/win32` not yet aliased.
+
+
 ## Express (real npm package) — runs and serves HTTP; body-parsing gap
 The real `express` 5.2.1 + its 65-package dependency tree loads and serves HTTP:
 `app.get`/routing/route params/query, `res.send`/`res.json`/`res.status`, and
