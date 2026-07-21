@@ -118,7 +118,10 @@ fn build_elems(kind: &str, args: &[Value]) -> Result<Vec<f64>, String> {
             }
             // A plain array or arraylike → coerce each entry.
             let items = crate::host::iter_all(v).unwrap_or_default();
-            Ok(items.iter().map(|x| coerce(kind, with_host(|h| h.to_number(x)))).collect())
+            Ok(items
+                .iter()
+                .map(|x| coerce(kind, with_host(|h| h.to_number(x))))
+                .collect())
         }
     }
 }
@@ -126,7 +129,12 @@ fn build_elems(kind: &str, args: &[Value]) -> Result<Vec<f64>, String> {
 /// `Uint8Array.from(iterable[, mapFn])` / `Uint8Array.of(...items)`.
 pub fn static_call(kind: &str, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
-        "of" => Ok(make(kind, args.iter().map(|x| coerce(kind, with_host(|h| h.to_number(x)))).collect())),
+        "of" => Ok(make(
+            kind,
+            args.iter()
+                .map(|x| coerce(kind, with_host(|h| h.to_number(x))))
+                .collect(),
+        )),
         "from" => from(kind, args),
         _ => return None,
     })
@@ -134,7 +142,10 @@ pub fn static_call(kind: &str, method: &str, args: &[Value]) -> Option<Result<Va
 
 fn from(kind: &str, args: &[Value]) -> Result<Value, String> {
     let src = args.first().cloned().unwrap_or(Value::Undef);
-    let map_fn = args.get(1).cloned().filter(|f| with_host(|h| crate::host::is_callable(h, f)));
+    let map_fn = args
+        .get(1)
+        .cloned()
+        .filter(|f| with_host(|h| crate::host::is_callable(h, f)));
     let items = if let Some(e) = elems_of(&src) {
         e.into_iter().map(Value::Float).collect()
     } else {
@@ -171,7 +182,10 @@ fn elems_of(v: &Value) -> Option<Vec<f64>> {
 /// The `@@kind` of a typed-array receiver (defaults to `Uint8Array`).
 fn kind_of(recv: &Value) -> String {
     with_host(|h| match h.get(recv) {
-        Some(JsObj::Object(p)) => p.get("@@kind").map(|v| h.str_of(v)).unwrap_or_else(|| "Uint8Array".into()),
+        Some(JsObj::Object(p)) => p
+            .get("@@kind")
+            .map(|v| h.str_of(v))
+            .unwrap_or_else(|| "Uint8Array".into()),
         _ => "Uint8Array".into(),
     })
 }
@@ -219,8 +233,13 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
     let elems = elems_of(recv).unwrap_or_default();
     match method {
         "toString" | "join" => {
-            let sep = if method == "join" && !args.is_empty() { super::arg_str(args, 0) } else { ",".into() };
-            let parts: Vec<String> = with_host(|h| elems.iter().map(|n| h.str_of(&Value::Float(*n))).collect());
+            let sep = if method == "join" && !args.is_empty() {
+                super::arg_str(args, 0)
+            } else {
+                ",".into()
+            };
+            let parts: Vec<String> =
+                with_host(|h| elems.iter().map(|n| h.str_of(&Value::Float(*n))).collect());
             Ok(with_host(|h| h.new_str(parts.join(&sep))))
         }
         "slice" | "subarray" => {
@@ -232,13 +251,27 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                     (n as usize).min(len)
                 }
             };
-            let s = if args.is_empty() { 0 } else { norm(super::arg_num(args, 0)) };
-            let e = if args.len() < 2 { len } else { norm(super::arg_num(args, 1)) };
+            let s = if args.is_empty() {
+                0
+            } else {
+                norm(super::arg_num(args, 0))
+            };
+            let e = if args.len() < 2 {
+                len
+            } else {
+                norm(super::arg_num(args, 1))
+            };
             Ok(make(&kind, elems[s.min(e)..e.max(s)].to_vec()))
         }
         "indexOf" => {
             let needle = super::arg_num(args, 0);
-            Ok(Value::Float(elems.iter().position(|x| *x == needle).map(|p| p as f64).unwrap_or(-1.0)))
+            Ok(Value::Float(
+                elems
+                    .iter()
+                    .position(|x| *x == needle)
+                    .map(|p| p as f64)
+                    .unwrap_or(-1.0),
+            ))
         }
         "includes" => {
             let needle = super::arg_num(args, 0);
@@ -251,7 +284,15 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         "set" => {
             // `ta.set(src[, offset])` — write `src`'s values in place.
             let src = elems_of(&args.first().cloned().unwrap_or(Value::Undef))
-                .or_else(|| Some(crate::host::iter_all(&args.first().cloned().unwrap_or(Value::Undef)).ok()?.iter().map(|x| with_host(|h| h.to_number(x))).collect()))
+                .or_else(|| {
+                    Some(
+                        crate::host::iter_all(&args.first().cloned().unwrap_or(Value::Undef))
+                            .ok()?
+                            .iter()
+                            .map(|x| with_host(|h| h.to_number(x)))
+                            .collect(),
+                    )
+                })
                 .unwrap_or_default();
             let off = super::arg_num(args, 1).max(0.0) as usize;
             with_host(|h| {
@@ -269,7 +310,9 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             });
             Ok(Value::Undef)
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -291,7 +334,9 @@ pub fn weakref_call(recv: &Value, method: &str) -> Result<Value, String> {
             Some(JsObj::Object(p)) => p.get("@@target").cloned().unwrap_or(Value::Undef),
             _ => Value::Undef,
         })),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -311,14 +356,23 @@ pub fn text_encoder_call(_recv: &Value, method: &str, args: &[Value]) -> Result<
         // `encode(str)` → a Uint8Array of the UTF-8 bytes.
         "encode" => {
             let s = super::arg_str(args, 0);
-            Ok(make("Uint8Array", s.as_bytes().iter().map(|b| *b as f64).collect()))
+            Ok(make(
+                "Uint8Array",
+                s.as_bytes().iter().map(|b| *b as f64).collect(),
+            ))
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
 pub fn construct_text_decoder(args: &[Value]) -> Result<Value, String> {
-    let label = if args.is_empty() { "utf-8".to_string() } else { super::arg_str(args, 0) };
+    let label = if args.is_empty() {
+        "utf-8".to_string()
+    } else {
+        super::arg_str(args, 0)
+    };
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("TextDecoder"));
@@ -337,7 +391,10 @@ pub fn text_decoder_call(recv: &Value, method: &str, args: &[Value]) -> Result<V
                 .map(|n| *n as u8)
                 .collect();
             let enc = with_host(|h| match h.get(recv) {
-                Some(JsObj::Object(p)) => p.get("encoding").map(|v| h.str_of(v)).unwrap_or_else(|| "utf-8".into()),
+                Some(JsObj::Object(p)) => p
+                    .get("encoding")
+                    .map(|v| h.str_of(v))
+                    .unwrap_or_else(|| "utf-8".into()),
                 _ => "utf-8".into(),
             });
             let s = match enc.as_str() {
@@ -346,6 +403,8 @@ pub fn text_decoder_call(recv: &Value, method: &str, args: &[Value]) -> Result<V
             };
             Ok(with_host(|h| h.new_str(s)))
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }

@@ -77,11 +77,21 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match method {
         "isDate" => b(super::native_tag(&v).as_deref() == Some("Date")),
         "isRegExp" => b(with_host(|h| matches!(h.get(&v), Some(JsObj::RegExp(_))))),
-        "isMap" => b(with_host(|h| matches!(h.get(&v), Some(JsObj::Map { weak: false, .. })))),
-        "isSet" => b(with_host(|h| matches!(h.get(&v), Some(JsObj::Set { weak: false, .. })))),
-        "isWeakMap" => b(with_host(|h| matches!(h.get(&v), Some(JsObj::Map { weak: true, .. })))),
-        "isWeakSet" => b(with_host(|h| matches!(h.get(&v), Some(JsObj::Set { weak: true, .. })))),
-        "isPromise" => b(with_host(|h| matches!(h.get(&v), Some(JsObj::Promise { .. })))),
+        "isMap" => b(with_host(|h| {
+            matches!(h.get(&v), Some(JsObj::Map { weak: false, .. }))
+        })),
+        "isSet" => b(with_host(|h| {
+            matches!(h.get(&v), Some(JsObj::Set { weak: false, .. }))
+        })),
+        "isWeakMap" => b(with_host(|h| {
+            matches!(h.get(&v), Some(JsObj::Map { weak: true, .. }))
+        })),
+        "isWeakSet" => b(with_host(|h| {
+            matches!(h.get(&v), Some(JsObj::Set { weak: true, .. }))
+        })),
+        "isPromise" => b(with_host(|h| {
+            matches!(h.get(&v), Some(JsObj::Promise { .. }))
+        })),
 
         // `ArrayBuffer` is a `@@native`-tagged byte container; node-js has no
         // `SharedArrayBuffer`, so `isAnyArrayBuffer` collapses onto it.
@@ -109,7 +119,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 
         "isAsyncFunction" => b(func_flag(&v, FuncFlag::Async)),
         "isGeneratorFunction" => b(func_flag(&v, FuncFlag::Generator)),
-        "isGeneratorObject" => b(with_host(|h| matches!(h.get(&v), Some(JsObj::Generator { .. })))),
+        "isGeneratorObject" => b(with_host(|h| {
+            matches!(h.get(&v), Some(JsObj::Generator { .. }))
+        })),
 
         // No Proxy in node-js; there is nothing that could report `true`.
         "isProxy" => b(false),
@@ -119,12 +131,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 
         // node-js never boxes primitives, so every wrapper-object predicate is
         // structurally `false`.
-        "isBoxedPrimitive"
-        | "isNumberObject"
-        | "isStringObject"
-        | "isBooleanObject"
-        | "isSymbolObject"
-        | "isBigIntObject" => b(false),
+        "isBoxedPrimitive" | "isNumberObject" | "isStringObject" | "isBooleanObject"
+        | "isSymbolObject" | "isBigIntObject" => b(false),
 
         // `arguments` is a plain array here (indistinguishable from any array),
         // and there are no module-namespace / external (N-API) objects.

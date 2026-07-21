@@ -50,8 +50,15 @@ pub const METHODS: &[&str] = &[
 /// Methods dispatched on an `@@native = "Histogram"` object (from
 /// `createHistogram()` / `monitorEventLoopDelay()`; reported to the parent for
 /// `instance_has_method` / `instance_call` wiring).
-pub const HISTOGRAM_METHODS: &[&str] =
-    &["record", "recordDelta", "reset", "percentile", "add", "enable", "disable"];
+pub const HISTOGRAM_METHODS: &[&str] = &[
+    "record",
+    "recordDelta",
+    "reset",
+    "percentile",
+    "add",
+    "enable",
+    "disable",
+];
 
 /// Methods dispatched on an `@@native = "PerformanceObserver"` object.
 pub const PERFORMANCE_OBSERVER_METHODS: &[&str] = &["observe", "disconnect", "takeRecords"];
@@ -250,7 +257,9 @@ pub fn construct(name: &str, args: &[Value]) -> Result<Value, String> {
                 h.new_object(m)
             }))
         }
-        _ => Err(crate::host::type_error(&format!("perf_hooks.{name} is not a constructor"))),
+        _ => Err(crate::host::type_error(&format!(
+            "perf_hooks.{name} is not a constructor"
+        ))),
     }
 }
 
@@ -259,7 +268,12 @@ pub fn construct(name: &str, args: &[Value]) -> Result<Value, String> {
 fn mark(args: &[Value]) -> Value {
     let name = super::arg_str(args, 0);
     let start = now_ms();
-    let e = Entry { name, entry_type: "mark", start_time: start, duration: 0.0 };
+    let e = Entry {
+        name,
+        entry_type: "mark",
+        start_time: start,
+        duration: 0.0,
+    };
     if let Ok(mut buf) = entries().lock() {
         buf.push(e.clone());
     }
@@ -279,7 +293,12 @@ fn measure(args: &[Value]) -> Value {
             Some(n) => entries()
                 .lock()
                 .ok()
-                .and_then(|b| b.iter().rev().find(|e| e.entry_type == "mark" && &e.name == n).map(|e| e.start_time))
+                .and_then(|b| {
+                    b.iter()
+                        .rev()
+                        .find(|e| e.entry_type == "mark" && &e.name == n)
+                        .map(|e| e.start_time)
+                })
                 .unwrap_or(default),
             None => default,
         }
@@ -367,7 +386,11 @@ fn new_histogram() -> Value {
 }
 
 /// Dispatch a method on a `Histogram` instance (`@@native = "Histogram"`).
-pub fn histogram_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+pub fn histogram_instance_call(
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     match method {
         "record" => {
             let n = super::arg_num(args, 0);
@@ -416,7 +439,9 @@ pub fn histogram_instance_call(recv: &Value, method: &str, args: &[Value]) -> Re
         // Interval-form controls: no background sampler to toggle (see the
         // `monitorEventLoopDelay` note). Accepted for compatibility.
         "enable" | "disable" => Ok(Value::Bool(true)),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -604,7 +629,9 @@ pub fn observer_instance_call(recv: &Value, method: &str, args: &[Value]) -> Res
             });
             Ok(with_host(|h| h.new_array(taken)))
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -682,7 +709,11 @@ fn entry_list_object(items: Vec<Value>) -> Value {
 }
 
 /// Dispatch a method on a `PerformanceObserverEntryList` instance.
-pub fn entry_list_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+pub fn entry_list_instance_call(
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     let items: Vec<Value> = with_host(|h| match h.get(recv) {
         Some(JsObj::Object(p)) => match p.get("@@entries").and_then(|a| h.get(a)) {
             Some(JsObj::Array(v)) => v.clone(),
@@ -690,10 +721,12 @@ pub fn entry_list_instance_call(recv: &Value, method: &str, args: &[Value]) -> R
         },
         _ => Vec::new(),
     });
-    let prop = |v: &Value, key: &str| with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => p.get(key).map(|x| h.str_of(x)),
-        _ => None,
-    });
+    let prop = |v: &Value, key: &str| {
+        with_host(|h| match h.get(v) {
+            Some(JsObj::Object(p)) => p.get(key).map(|x| h.str_of(x)),
+            _ => None,
+        })
+    };
     match method {
         "getEntries" => Ok(with_host(|h| h.new_array(items))),
         "getEntriesByName" => {
@@ -706,7 +739,8 @@ pub fn entry_list_instance_call(recv: &Value, method: &str, args: &[Value]) -> R
                 .into_iter()
                 .filter(|it| {
                     prop(it, "name").as_deref() == Some(name.as_str())
-                        && ty.as_deref()
+                        && ty
+                            .as_deref()
                             .map(|t| prop(it, "entryType").as_deref() == Some(t))
                             .unwrap_or(true)
                 })
@@ -721,7 +755,9 @@ pub fn entry_list_instance_call(recv: &Value, method: &str, args: &[Value]) -> R
                 .collect();
             Ok(with_host(|h| h.new_array(filtered)))
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 

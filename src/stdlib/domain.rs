@@ -23,8 +23,16 @@ pub const METHODS: &[&str] = &["create", "createDomain"];
 
 /// Instance methods carried by a `Domain` beyond the shared EventEmitter surface
 /// (which `instance_has_method` adds via the emitter set).
-pub const DOMAIN_METHODS: &[&str] =
-    &["run", "add", "remove", "bind", "intercept", "enter", "exit", "dispose"];
+pub const DOMAIN_METHODS: &[&str] = &[
+    "run",
+    "add",
+    "remove",
+    "bind",
+    "intercept",
+    "enter",
+    "exit",
+    "dispose",
+];
 
 thread_local! {
     /// The stack of entered domains; the top is `domain.active`. `.run`/`.enter`
@@ -90,10 +98,16 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             }
             Ok(Value::Undef)
         }
-        "bind" => Ok(make_wrapper(recv, args.into_iter().next().unwrap_or(Value::Undef), "@@bound")),
-        "intercept" => {
-            Ok(make_wrapper(recv, args.into_iter().next().unwrap_or(Value::Undef), "@@intercept"))
-        }
+        "bind" => Ok(make_wrapper(
+            recv,
+            args.into_iter().next().unwrap_or(Value::Undef),
+            "@@bound",
+        )),
+        "intercept" => Ok(make_wrapper(
+            recv,
+            args.into_iter().next().unwrap_or(Value::Undef),
+            "@@intercept",
+        )),
         "enter" => {
             enter(recv);
             Ok(Value::Undef)
@@ -167,7 +181,12 @@ fn make_wrapper(domain: &Value, f: Value, kind: &str) -> Value {
     extra.insert("@@boundFn".to_string(), f);
     extra.insert("@@boundDomain".to_string(), domain.clone());
     let holder = super::net::new_emitter_object("Domain", extra);
-    with_host(|h| h.alloc(JsObj::BoundMethod { recv: holder, name: kind.to_string() }))
+    with_host(|h| {
+        h.alloc(JsObj::BoundMethod {
+            recv: holder,
+            name: kind.to_string(),
+        })
+    })
 }
 
 // ── domain stack (`enter`/`exit`/`active`) ───────────────────────────────────
@@ -225,11 +244,20 @@ fn get_prop(recv: &Value, key: &str) -> Option<Value> {
 /// EventEmitter method delegation (shared shape with `net`/`http` emitters).
 fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match method {
-        "on" | "once" | "emit" | "addListener" | "prependListener" | "prependOnceListener"
-        | "removeListener" | "off" | "removeAllListeners" | "listeners" | "listenerCount"
-        | "eventNames" | "setMaxListeners" | "getMaxListeners" => {
-            Some(super::events::instance_call(recv, method, args.to_vec()))
-        }
+        "on"
+        | "once"
+        | "emit"
+        | "addListener"
+        | "prependListener"
+        | "prependOnceListener"
+        | "removeListener"
+        | "off"
+        | "removeAllListeners"
+        | "listeners"
+        | "listenerCount"
+        | "eventNames"
+        | "setMaxListeners"
+        | "getMaxListeners" => Some(super::events::instance_call(recv, method, args.to_vec())),
         _ => None,
     }
 }

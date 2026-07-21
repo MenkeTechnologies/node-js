@@ -7,7 +7,14 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
-pub const STATIC_METHODS: &[&str] = &["from", "alloc", "allocUnsafe", "concat", "isBuffer", "byteLength"];
+pub const STATIC_METHODS: &[&str] = &[
+    "from",
+    "alloc",
+    "allocUnsafe",
+    "concat",
+    "isBuffer",
+    "byteLength",
+];
 
 /// Free functions of the `buffer` module itself (`require('buffer').atob`, …), as
 /// opposed to the `Buffer` constructor's static methods above. Needs the parent
@@ -167,7 +174,9 @@ pub fn construct_file(args: &[Value]) -> Result<Value, String> {
         .get(2)
         .map(|v| {
             with_host(|h| match h.get(v) {
-                Some(JsObj::Object(p)) => p.get("lastModified").map(|x| h.to_number(x)).unwrap_or(0.0),
+                Some(JsObj::Object(p)) => {
+                    p.get("lastModified").map(|x| h.to_number(x)).unwrap_or(0.0)
+                }
                 _ => 0.0,
             })
         })
@@ -202,10 +211,16 @@ pub fn blob_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, St
         }
         "slice" => {
             let (s, e) = slice_bounds(args, bytes.len());
-            let typ = if args.len() > 2 { arg_str(args, 2) } else { String::new() };
+            let typ = if args.len() > 2 {
+                arg_str(args, 2)
+            } else {
+                String::new()
+            };
             Ok(build_blob("Blob", &bytes[s..e], &typ, IndexMap::new()))
         }
-        _ => Err(crate::host::type_error(&format!("blob.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "blob.{method} is not a function"
+        ))),
     }
 }
 
@@ -237,7 +252,11 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         "alloc" => {
             let n = super::arg_num(args, 0).max(0.0) as usize;
             // A string fill repeats to length n; a numeric fill is a single byte.
-            let pat = if args.len() > 1 { fill_pattern(args, 1) } else { vec![0] };
+            let pat = if args.len() > 1 {
+                fill_pattern(args, 1)
+            } else {
+                vec![0]
+            };
             let bytes: Vec<u8> = if pat.is_empty() {
                 vec![0u8; n]
             } else {
@@ -245,12 +264,23 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
             };
             Ok(from_bytes(&bytes))
         }
-        "allocUnsafe" => Ok(from_bytes(&vec![0u8; super::arg_num(args, 0).max(0.0) as usize])),
+        "allocUnsafe" => Ok(from_bytes(&vec![
+            0u8;
+            super::arg_num(args, 0).max(0.0) as usize
+        ])),
         "concat" => concat(args),
-        "isBuffer" => Ok(Value::Bool(super::native_tag(&args.first().cloned().unwrap_or(Value::Undef)).as_deref() == Some("Buffer"))),
+        "isBuffer" => Ok(Value::Bool(
+            super::native_tag(&args.first().cloned().unwrap_or(Value::Undef)).as_deref()
+                == Some("Buffer"),
+        )),
         "byteLength" => {
-            let enc = args.get(1).map(|_| arg_str(args, 1)).unwrap_or_else(|| "utf8".into());
-            Ok(Value::Float(decode_str(&arg_str(args, 0), &enc).len() as f64))
+            let enc = args
+                .get(1)
+                .map(|_| arg_str(args, 1))
+                .unwrap_or_else(|| "utf8".into());
+            Ok(Value::Float(
+                decode_str(&arg_str(args, 0), &enc).len() as f64
+            ))
         }
         _ => return None,
     })
@@ -260,7 +290,12 @@ fn from(args: &[Value]) -> Result<Value, String> {
     let v = args.first().cloned().unwrap_or(Value::Undef);
     // Array of byte values.
     let arr = with_host(|h| match h.get(&v) {
-        Some(JsObj::Array(items)) => Some(items.iter().map(|x| h.to_number(x) as u8).collect::<Vec<u8>>()),
+        Some(JsObj::Array(items)) => Some(
+            items
+                .iter()
+                .map(|x| h.to_number(x) as u8)
+                .collect::<Vec<u8>>(),
+        ),
         _ => None,
     });
     if let Some(bytes) = arr {
@@ -271,15 +306,21 @@ fn from(args: &[Value]) -> Result<Value, String> {
         return Ok(from_bytes(&bytes_of(&v)));
     }
     // String with an optional encoding.
-    let enc = if args.len() > 1 { arg_str(args, 1) } else { "utf8".into() };
+    let enc = if args.len() > 1 {
+        arg_str(args, 1)
+    } else {
+        "utf8".into()
+    };
     Ok(from_bytes(&decode_str(&arg_str(args, 0), &enc)))
 }
 
 fn concat(args: &[Value]) -> Result<Value, String> {
-    let list = with_host(|h| match h.get(&args.first().cloned().unwrap_or(Value::Undef)) {
-        Some(JsObj::Array(items)) => items.clone(),
-        _ => Vec::new(),
-    });
+    let list = with_host(
+        |h| match h.get(&args.first().cloned().unwrap_or(Value::Undef)) {
+            Some(JsObj::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        },
+    );
     let mut out = Vec::new();
     for b in &list {
         out.extend(bytes_of(b));
@@ -292,7 +333,11 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
     let bytes = bytes_of(recv);
     match method {
         "toString" => {
-            let enc = if args.is_empty() { "utf8".into() } else { arg_str(args, 0) };
+            let enc = if args.is_empty() {
+                "utf8".into()
+            } else {
+                arg_str(args, 0)
+            };
             Ok(with_host(|h| h.new_str(encode_bytes(&bytes, &enc))))
         }
         "toJSON" => Ok(with_host(|h| {
@@ -318,11 +363,19 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let needle = decode_str(&arg_str(args, 0), "utf8");
             // An empty needle matches at 0 (indexOf) / len (lastIndexOf), like Node.
             let pos = if needle.is_empty() {
-                Some(if method == "lastIndexOf" { bytes.len() } else { 0 })
+                Some(if method == "lastIndexOf" {
+                    bytes.len()
+                } else {
+                    0
+                })
             } else if method == "lastIndexOf" {
-                bytes.windows(needle.len()).rposition(|w| w == needle.as_slice())
+                bytes
+                    .windows(needle.len())
+                    .rposition(|w| w == needle.as_slice())
             } else {
-                bytes.windows(needle.len()).position(|w| w == needle.as_slice())
+                bytes
+                    .windows(needle.len())
+                    .position(|w| w == needle.as_slice())
             };
             if method == "includes" {
                 Ok(Value::Bool(pos.is_some()))
@@ -342,12 +395,14 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         // Big-endian / little-endian integer reads.
         "readUInt16BE" => {
             let i = super::arg_num(args, 0).max(0.0) as usize;
-            let v = ((*bytes.get(i).unwrap_or(&0) as u16) << 8) | *bytes.get(i + 1).unwrap_or(&0) as u16;
+            let v = ((*bytes.get(i).unwrap_or(&0) as u16) << 8)
+                | *bytes.get(i + 1).unwrap_or(&0) as u16;
             Ok(Value::Float(v as f64))
         }
         "readUInt16LE" => {
             let i = super::arg_num(args, 0).max(0.0) as usize;
-            let v = (*bytes.get(i).unwrap_or(&0) as u16) | ((*bytes.get(i + 1).unwrap_or(&0) as u16) << 8);
+            let v = (*bytes.get(i).unwrap_or(&0) as u16)
+                | ((*bytes.get(i + 1).unwrap_or(&0) as u16) << 8);
             Ok(Value::Float(v as f64))
         }
         // In-place writes: mutate the backing `@@bytes`, return the next offset.
@@ -365,7 +420,11 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let val = super::arg_num(args, 0) as u16;
             let off = super::arg_num(args, 1).max(0.0) as usize;
             let (hi, lo) = ((val >> 8) as u8, (val & 0xff) as u8);
-            let (b0, b1) = if method == "writeUInt16BE" { (hi, lo) } else { (lo, hi) };
+            let (b0, b1) = if method == "writeUInt16BE" {
+                (hi, lo)
+            } else {
+                (lo, hi)
+            };
             if off + 1 < b.len() {
                 b[off] = b0;
                 b[off + 1] = b1;
@@ -377,7 +436,11 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         "write" => {
             let mut b = bytes.clone();
             let src = decode_str(&arg_str(args, 0), "utf8");
-            let off = if args.len() > 1 { super::arg_num(args, 1).max(0.0) as usize } else { 0 };
+            let off = if args.len() > 1 {
+                super::arg_num(args, 1).max(0.0) as usize
+            } else {
+                0
+            };
             let mut n = 0;
             for (k, &byte) in src.iter().enumerate() {
                 if off + k < b.len() {
@@ -392,8 +455,16 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         "fill" => {
             let mut b = bytes.clone();
             let len = b.len();
-            let start = if args.len() > 1 { super::arg_num(args, 1).max(0.0) as usize } else { 0 };
-            let end = if args.len() > 2 { (super::arg_num(args, 2) as usize).min(len) } else { len };
+            let start = if args.len() > 1 {
+                super::arg_num(args, 1).max(0.0) as usize
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                (super::arg_num(args, 2) as usize).min(len)
+            } else {
+                len
+            };
             let pat = fill_pattern(args, 0);
             if !pat.is_empty() {
                 for (k, slot) in b[start..end.max(start)].iter_mut().enumerate() {
@@ -407,9 +478,21 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         "copy" => {
             let target = args.first().cloned().unwrap_or(Value::Undef);
             let mut tb = bytes_of(&target);
-            let tstart = if args.len() > 1 { super::arg_num(args, 1).max(0.0) as usize } else { 0 };
-            let sstart = if args.len() > 2 { super::arg_num(args, 2).max(0.0) as usize } else { 0 };
-            let send = if args.len() > 3 { (super::arg_num(args, 3) as usize).min(bytes.len()) } else { bytes.len() };
+            let tstart = if args.len() > 1 {
+                super::arg_num(args, 1).max(0.0) as usize
+            } else {
+                0
+            };
+            let sstart = if args.len() > 2 {
+                super::arg_num(args, 2).max(0.0) as usize
+            } else {
+                0
+            };
+            let send = if args.len() > 3 {
+                (super::arg_num(args, 3) as usize).min(bytes.len())
+            } else {
+                bytes.len()
+            };
             let mut n = 0;
             for (k, &byte) in bytes[sstart..send.max(sstart)].iter().enumerate() {
                 if tstart + k < tb.len() {
@@ -420,7 +503,9 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             set_bytes(&target, &tb);
             Ok(Value::Float(n as f64))
         }
-        _ => Err(crate::host::type_error(&format!("buffer.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "buffer.{method} is not a function"
+        ))),
     }
 }
 
@@ -463,8 +548,16 @@ fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
             (n as usize).min(len)
         }
     };
-    let s = if args.is_empty() { 0 } else { norm(super::arg_num(args, 0)) };
-    let e = if args.len() < 2 { len } else { norm(super::arg_num(args, 1)) };
+    let s = if args.is_empty() {
+        0
+    } else {
+        norm(super::arg_num(args, 0))
+    };
+    let e = if args.len() < 2 {
+        len
+    } else {
+        norm(super::arg_num(args, 1))
+    };
     (s.min(e), e.max(s))
 }
 

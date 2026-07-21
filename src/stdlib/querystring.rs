@@ -7,8 +7,15 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
-pub const METHODS: &[&str] =
-    &["parse", "stringify", "escape", "unescape", "encode", "decode", "unescapeBuffer"];
+pub const METHODS: &[&str] = &[
+    "parse",
+    "stringify",
+    "escape",
+    "unescape",
+    "encode",
+    "decode",
+    "unescapeBuffer",
+];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
@@ -29,7 +36,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "unescapeBuffer" => {
             let s = super::arg_str(args, 0);
             let decode_spaces = matches!(args.get(1), Some(Value::Bool(true)));
-            Ok(super::buffer::from_bytes(&unescape_buffer(&s, decode_spaces)))
+            Ok(super::buffer::from_bytes(&unescape_buffer(
+                &s,
+                decode_spaces,
+            )))
         }
         _ => return None,
     })
@@ -38,8 +48,16 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// `querystring.parse(str[, sep[, eq]])` → an object of decoded key/value pairs.
 /// A repeated key collects its values into an array, matching Node.
 fn parse(s: &str, args: &[Value]) -> Value {
-    let sep = args.get(1).map(|_| super::arg_str(args, 1)).filter(|s| !s.is_empty()).unwrap_or_else(|| "&".into());
-    let eq = args.get(2).map(|_| super::arg_str(args, 2)).filter(|s| !s.is_empty()).unwrap_or_else(|| "=".into());
+    let sep = args
+        .get(1)
+        .map(|_| super::arg_str(args, 1))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "&".into());
+    let eq = args
+        .get(2)
+        .map(|_| super::arg_str(args, 2))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "=".into());
     let mut map: IndexMap<String, Value> = IndexMap::new();
     if !s.is_empty() {
         for pair in s.split(&sep) {
@@ -78,8 +96,16 @@ fn parse(s: &str, args: &[Value]) -> Value {
 /// `querystring.stringify(obj[, sep[, eq]])`.
 fn stringify(args: &[Value]) -> Value {
     let obj = args.first().cloned().unwrap_or(Value::Undef);
-    let sep = args.get(1).map(|_| super::arg_str(args, 1)).filter(|s| !s.is_empty()).unwrap_or_else(|| "&".into());
-    let eq = args.get(2).map(|_| super::arg_str(args, 2)).filter(|s| !s.is_empty()).unwrap_or_else(|| "=".into());
+    let sep = args
+        .get(1)
+        .map(|_| super::arg_str(args, 1))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "&".into());
+    let eq = args
+        .get(2)
+        .map(|_| super::arg_str(args, 2))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "=".into());
     let entries = with_host(|h| match h.get(&obj) {
         Some(JsObj::Object(p)) => p
             .iter()
@@ -93,7 +119,9 @@ fn stringify(args: &[Value]) -> Value {
         let ek = escape(&k);
         // An array value emits one `key=elem` pair per element.
         let elems = with_host(|h| match h.get(&v) {
-            Some(JsObj::Array(items)) => Some(items.iter().map(|x| h.str_of(x)).collect::<Vec<_>>()),
+            Some(JsObj::Array(items)) => {
+                Some(items.iter().map(|x| h.str_of(x)).collect::<Vec<_>>())
+            }
             _ => None,
         });
         match elems {
@@ -148,15 +176,24 @@ fn unescape_buffer(s: &str, decode_spaces: bool) -> Vec<u8> {
 
 /// `querystring.escape` — percent-encode (space → `%20`, like Node; NOT `+`).
 fn escape(s: &str) -> String {
-    const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
+    const UNRESERVED: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         if UNRESERVED.contains(&b) {
             out.push(b as char);
         } else {
             out.push('%');
-            out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+            out.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((b & 0xf) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
         }
     }
     out

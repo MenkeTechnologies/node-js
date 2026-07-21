@@ -194,7 +194,11 @@ fn find_package_json(args: &[Value]) -> Value {
             p.to_path_buf()
         } else if let Some(b) = base.as_deref() {
             let bp = Path::new(b);
-            let bdir = if bp.is_dir() { bp } else { bp.parent().unwrap_or(bp) };
+            let bdir = if bp.is_dir() {
+                bp
+            } else {
+                bp.parent().unwrap_or(bp)
+            };
             bdir.join(&spec)
         } else {
             std::env::current_dir().unwrap_or_default().join(&spec)

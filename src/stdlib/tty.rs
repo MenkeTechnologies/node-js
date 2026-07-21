@@ -49,9 +49,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// constructible builtins (the parent routes `new`/instance calls by tag).
 pub fn constant(name: &str) -> Option<Value> {
     match name {
-        "ReadStream" | "WriteStream" => {
-            Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
-        }
+        "ReadStream" | "WriteStream" => Some(with_host(|h| h.alloc(JsObj::Builtin(name.into())))),
         _ => None,
     }
 }
@@ -60,7 +58,13 @@ pub fn constant(name: &str) -> Option<Value> {
 pub fn construct(name: &str, args: &[Value]) -> Value {
     let fd = {
         let n = super::arg_num(args, 0);
-        if n.is_finite() { n as i32 } else if name == "WriteStream" { 1 } else { 0 }
+        if n.is_finite() {
+            n as i32
+        } else if name == "WriteStream" {
+            1
+        } else {
+            0
+        }
     };
     match name {
         "ReadStream" => read_stream(fd),
@@ -117,9 +121,11 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             Ok(recv.clone())
         }
         "read" => Ok(Value::Undef),
-        "on" | "once" | "removeListener" | "pause" | "resume" | "setEncoding" | "ref"
-        | "unref" | "destroy" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        "on" | "once" | "removeListener" | "pause" | "resume" | "setEncoding" | "ref" | "unref"
+        | "destroy" => Ok(recv.clone()),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -129,7 +135,9 @@ pub fn window_size(fd: i32) -> Option<(u16, u16)> {
     // SAFETY: `ws` is zeroed then filled by the kernel; a failed ioctl returns -1.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws as *mut libc::winsize) == 0 && ws.ws_col > 0 {
+        if libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws as *mut libc::winsize) == 0
+            && ws.ws_col > 0
+        {
             Some((ws.ws_col, ws.ws_row))
         } else {
             None

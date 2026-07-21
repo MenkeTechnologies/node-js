@@ -40,10 +40,16 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "dirname" => s(dirname(&first(&parts))),
         "extname" => s(extname(&first(&parts))),
         "isAbsolute" => Ok(Value::Bool(first(&parts).starts_with('/'))),
-        "relative" => s(relative(&first(&parts), parts.get(1).cloned().unwrap_or_default().as_str())),
+        "relative" => s(relative(
+            &first(&parts),
+            parts.get(1).cloned().unwrap_or_default().as_str(),
+        )),
         "parse" => Ok(parse(&first(&parts))),
         "format" => s(format(args.first())),
-        "matchesGlob" => Ok(Value::Bool(matches_glob(&first(&parts), parts.get(1).map(|x| x.as_str()).unwrap_or("")))),
+        "matchesGlob" => Ok(Value::Bool(matches_glob(
+            &first(&parts),
+            parts.get(1).map(|x| x.as_str()).unwrap_or(""),
+        ))),
         // POSIX `toNamespacedPath` is the identity (Windows-only namespacing).
         "toNamespacedPath" => s(first(&parts)),
         _ => return None,
@@ -55,7 +61,11 @@ fn first(parts: &[String]) -> String {
 }
 
 fn join(parts: &[String]) -> String {
-    let joined: Vec<&str> = parts.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+    let joined: Vec<&str> = parts
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
     if joined.is_empty() {
         return ".".into();
     }
@@ -102,7 +112,12 @@ fn normalize(p: &str) -> String {
 }
 
 fn basename(p: &str, ext: Option<&str>) -> String {
-    let base = p.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+    let base = p
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
     match ext {
         Some(e) if base.ends_with(e) && base != *e => base[..base.len() - e.len()].to_string(),
         _ => base,
@@ -133,19 +148,33 @@ fn resolve(parts: &[String]) -> String {
         if p.is_empty() {
             continue;
         }
-        resolved = if resolved.is_empty() { p.clone() } else { format!("{p}/{resolved}") };
+        resolved = if resolved.is_empty() {
+            p.clone()
+        } else {
+            format!("{p}/{resolved}")
+        };
         if p.starts_with('/') {
             is_abs = true;
             break;
         }
     }
     if !is_abs {
-        let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
-        resolved = if resolved.is_empty() { cwd } else { format!("{cwd}/{resolved}") };
+        let cwd = std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".into());
+        resolved = if resolved.is_empty() {
+            cwd
+        } else {
+            format!("{cwd}/{resolved}")
+        };
     }
     let n = normalize(&resolved);
     // resolve never keeps a trailing slash (except root).
-    if n.len() > 1 { n.trim_end_matches('/').to_string() } else { n }
+    if n.len() > 1 {
+        n.trim_end_matches('/').to_string()
+    } else {
+        n
+    }
 }
 
 fn relative(from: &str, to: &str) -> String {
@@ -156,7 +185,11 @@ fn relative(from: &str, to: &str) -> String {
     let common = fs.iter().zip(ts.iter()).take_while(|(a, b)| a == b).count();
     let mut out: Vec<String> = vec!["..".into(); fs.len() - common];
     out.extend(ts[common..].iter().map(|s| s.to_string()));
-    if out.is_empty() { String::new() } else { out.join("/") }
+    if out.is_empty() {
+        String::new()
+    } else {
+        out.join("/")
+    }
 }
 
 fn parse(p: &str) -> Value {
@@ -178,10 +211,14 @@ fn parse(p: &str) -> Value {
 
 fn format(obj: Option<&Value>) -> String {
     let Some(obj) = obj else { return String::new() };
-    let get = |k: &str| with_host(|h| match h.get(obj) {
-        Some(crate::host::JsObj::Object(p)) => p.get(k).map(|v| h.str_of(v)).unwrap_or_default(),
-        _ => String::new(),
-    });
+    let get = |k: &str| {
+        with_host(|h| match h.get(obj) {
+            Some(crate::host::JsObj::Object(p)) => {
+                p.get(k).map(|v| h.str_of(v)).unwrap_or_default()
+            }
+            _ => String::new(),
+        })
+    };
     let dir = get("dir");
     let root = get("root");
     let base = if !get("base").is_empty() {
@@ -233,7 +270,9 @@ fn expand_braces(pattern: &str) -> Vec<String> {
                 _ => {}
             }
         }
-        let (Some(close), false) = (close, commas.is_empty()) else { continue };
+        let (Some(close), false) = (close, commas.is_empty()) else {
+            continue;
+        };
         let prefix: String = chars[..i].iter().collect();
         let suffix: String = chars[close + 1..].iter().collect();
         let mut bounds = vec![i];

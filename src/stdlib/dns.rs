@@ -245,7 +245,9 @@ fn promises_object() -> Value {
 fn lookup(args: &[Value]) -> Result<Value, String> {
     let hostname = arg_str(args, 0);
     let want = opt_family(args);
-    let Some(cb) = args.last().cloned() else { return Ok(Value::Undef) };
+    let Some(cb) = args.last().cloned() else {
+        return Ok(Value::Undef);
+    };
     match pick_addr(&hostname, want) {
         Some(ip) => {
             let family = if ip.is_ipv4() { 4.0 } else { 6.0 };
@@ -277,7 +279,9 @@ fn promise_lookup(args: &[Value]) -> Result<Value, String> {
             });
             crate::host::resolve_promise_val(id, obj);
         }
-        None => crate::host::reject_promise_val(id, dns_error("ENOTFOUND", "getaddrinfo", &hostname)),
+        None => {
+            crate::host::reject_promise_val(id, dns_error("ENOTFOUND", "getaddrinfo", &hostname))
+        }
     }
     Ok(p)
 }
@@ -315,7 +319,9 @@ fn opt_family(args: &[Value]) -> Option<u8> {
 fn lookup_service(args: &[Value]) -> Result<Value, String> {
     let addr = arg_str(args, 0);
     let port = super::arg_num(args, 1);
-    let Some(cb) = args.last().cloned() else { return Ok(Value::Undef) };
+    let Some(cb) = args.last().cloned() else {
+        return Ok(Value::Undef);
+    };
     let servers = module_servers();
     with_host(|h| h.incr_handle());
     let tx = with_host(|h| h.io_sender());
@@ -326,7 +332,8 @@ fn lookup_service(args: &[Value]) -> Result<Value, String> {
             with_host(|h| h.decr_handle());
             let call_args = match result {
                 Ok((host, service)) => {
-                    let (n, hv, sv) = with_host(|h| (h.null(), h.new_str(host), h.new_str(service)));
+                    let (n, hv, sv) =
+                        with_host(|h| (h.null(), h.new_str(host), h.new_str(service)));
                     vec![n, hv, sv]
                 }
                 Err(code) => vec![dns_error(&code, "getnameinfo", &label)],
@@ -364,7 +371,9 @@ fn promise_lookup_service(args: &[Value]) -> Result<Value, String> {
                     });
                     crate::host::resolve_promise_val(id, obj);
                 }
-                Err(code) => crate::host::reject_promise_val(id, dns_error(&code, "getnameinfo", &label)),
+                Err(code) => {
+                    crate::host::reject_promise_val(id, dns_error(&code, "getnameinfo", &label))
+                }
             }
             Ok(())
         }));
@@ -372,10 +381,16 @@ fn promise_lookup_service(args: &[Value]) -> Result<Value, String> {
     Ok(p)
 }
 
-fn run_lookup_service(addr: &str, port: f64, servers: Option<&[String]>) -> Result<(String, String), String> {
+fn run_lookup_service(
+    addr: &str,
+    port: f64,
+    servers: Option<&[String]>,
+) -> Result<(String, String), String> {
     let ip: IpAddr = addr.parse().map_err(|_| "EINVAL".to_string())?;
     let resolver = build_resolver(servers)?;
-    let lookup = resolver.reverse_lookup(ip).map_err(|e| err_code(&e).to_string())?;
+    let lookup = resolver
+        .reverse_lookup(ip)
+        .map_err(|e| err_code(&e).to_string())?;
     let host = lookup
         .iter()
         .next()
@@ -495,7 +510,9 @@ fn query_of(rrtype: &str) -> Option<Query> {
 
 fn cb_query(q: Query, args: &[Value]) -> Result<Value, String> {
     let name = arg_str(args, 0);
-    let Some(cb) = args.last().cloned() else { return Ok(Value::Undef) };
+    let Some(cb) = args.last().cloned() else {
+        return Ok(Value::Undef);
+    };
     start_query(q, name, module_servers(), cb);
     Ok(Value::Undef)
 }
@@ -508,8 +525,14 @@ fn promise_query(q: Query, args: &[Value]) -> Result<Value, String> {
 /// `dns.resolve(hostname[, rrtype], cb)`.
 fn resolve_cb(args: &[Value]) -> Result<Value, String> {
     let name = arg_str(args, 0);
-    let Some(cb) = args.last().cloned() else { return Ok(Value::Undef) };
-    let rrtype = if args.len() > 2 { arg_str(args, 1) } else { "A".into() };
+    let Some(cb) = args.last().cloned() else {
+        return Ok(Value::Undef);
+    };
+    let rrtype = if args.len() > 2 {
+        arg_str(args, 1)
+    } else {
+        "A".into()
+    };
     let q = query_of(&rrtype).unwrap_or(Query::A);
     start_query(q, name, module_servers(), cb);
     Ok(Value::Undef)
@@ -518,7 +541,11 @@ fn resolve_cb(args: &[Value]) -> Result<Value, String> {
 /// `dns.promises.resolve(hostname[, rrtype])`.
 fn resolve_promise(args: &[Value]) -> Result<Value, String> {
     let name = arg_str(args, 0);
-    let rrtype = if args.len() > 1 { arg_str(args, 1) } else { "A".into() };
+    let rrtype = if args.len() > 1 {
+        arg_str(args, 1)
+    } else {
+        "A".into()
+    };
     let q = query_of(&rrtype).unwrap_or(Query::A);
     Ok(start_promise_query(q, name, module_servers()))
 }
@@ -561,7 +588,9 @@ fn start_promise_query(q: Query, name: String, servers: Option<Vec<String>>) -> 
             with_host(|h| h.decr_handle());
             match res {
                 Ok(data) => crate::host::resolve_promise_val(id, dns_to_value(data)),
-                Err(code) => crate::host::reject_promise_val(id, dns_error(&code, q.syscall(), &label)),
+                Err(code) => {
+                    crate::host::reject_promise_val(id, dns_error(&code, q.syscall(), &label))
+                }
             }
             Ok(())
         }));
@@ -570,7 +599,13 @@ fn start_promise_query(q: Query, name: String, servers: Option<Vec<String>>) -> 
 }
 
 /// Callback-vs-Promise dispatch used by `Resolver` instance methods.
-fn run_or_promise(q: Query, name: String, servers: Option<Vec<String>>, cb: Option<Value>, promises: bool) -> Value {
+fn run_or_promise(
+    q: Query,
+    name: String,
+    servers: Option<Vec<String>>,
+    cb: Option<Value>,
+    promises: bool,
+) -> Value {
     if promises {
         start_promise_query(q, name, servers)
     } else if let Some(cb) = cb {
@@ -656,21 +691,34 @@ fn run_query(q: Query, name: &str, servers: Option<&[String]>) -> Result<DnsResu
     match q {
         Query::A => {
             let l = r.ipv4_lookup(name).map_err(ec)?;
-            Ok(DnsResult::Strings(l.iter().map(|a| a.to_string()).collect()))
+            Ok(DnsResult::Strings(
+                l.iter().map(|a| a.to_string()).collect(),
+            ))
         }
         Query::Aaaa => {
             let l = r.ipv6_lookup(name).map_err(ec)?;
-            Ok(DnsResult::Strings(l.iter().map(|a| a.to_string()).collect()))
+            Ok(DnsResult::Strings(
+                l.iter().map(|a| a.to_string()).collect(),
+            ))
         }
         Query::Mx => {
             let l = r.mx_lookup(name).map_err(ec)?;
-            Ok(DnsResult::Mx(l.iter().map(|m| (m.preference(), name_str(m.exchange()))).collect()))
+            Ok(DnsResult::Mx(
+                l.iter()
+                    .map(|m| (m.preference(), name_str(m.exchange())))
+                    .collect(),
+            ))
         }
         Query::Txt => {
             let l = r.txt_lookup(name).map_err(ec)?;
             let entries = l
                 .iter()
-                .map(|t| t.txt_data().iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect())
+                .map(|t| {
+                    t.txt_data()
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .collect()
+                })
                 .collect();
             Ok(DnsResult::Txt(entries))
         }
@@ -840,9 +888,12 @@ fn any_rec(rec: &hickory_resolver::proto::rr::Record) -> Option<AnyRec> {
         RData::MX(m) => AnyRec::Mx(m.preference(), name_str(m.exchange())),
         RData::NS(n) => AnyRec::Ns(name_str(n)),
         RData::PTR(p) => AnyRec::Ptr(name_str(p)),
-        RData::TXT(t) => {
-            AnyRec::Txt(t.txt_data().iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect())
-        }
+        RData::TXT(t) => AnyRec::Txt(
+            t.txt_data()
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect(),
+        ),
         RData::SRV(s) => AnyRec::Srv(srv_rec(s)),
         RData::SOA(s) => AnyRec::Soa(soa_rec(s)),
         RData::NAPTR(n) => AnyRec::Naptr(naptr_rec(n)),
@@ -1178,7 +1229,11 @@ fn make_resolver_obj(promises: bool) -> Value {
 }
 
 /// Dispatch an instance method on a `dns.Resolver` receiver.
-pub fn resolver_instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn resolver_instance_call(
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     let promises = recv_promises(recv);
     let servers = recv_servers(recv);
 
@@ -1201,8 +1256,16 @@ pub fn resolver_instance_call(recv: &Value, method: &str, args: Vec<Value>) -> R
 
     if method == "resolve" {
         let name = super::arg_str(&args, 0);
-        let has_rrtype = if promises { args.len() > 1 } else { args.len() > 2 };
-        let rrtype = if has_rrtype { super::arg_str(&args, 1) } else { "A".to_string() };
+        let has_rrtype = if promises {
+            args.len() > 1
+        } else {
+            args.len() > 2
+        };
+        let rrtype = if has_rrtype {
+            super::arg_str(&args, 1)
+        } else {
+            "A".to_string()
+        };
         let q = query_of(&rrtype).unwrap_or(Query::A);
         let cb = if promises { None } else { args.last().cloned() };
         return Ok(run_or_promise(q, name, servers, cb, promises));
@@ -1248,9 +1311,13 @@ fn recv_promises(recv: &Value) -> bool {
 
 fn recv_servers(recv: &Value) -> Option<Vec<String>> {
     with_host(|h| {
-        let JsObj::Object(p) = h.get(recv)? else { return None };
+        let JsObj::Object(p) = h.get(recv)? else {
+            return None;
+        };
         let arr = p.get("@@servers")?;
-        let JsObj::Array(items) = h.get(arr)? else { return None };
+        let JsObj::Array(items) = h.get(arr)? else {
+            return None;
+        };
         let list: Vec<String> = items.iter().map(|x| h.str_of(x)).collect();
         if list.is_empty() {
             None

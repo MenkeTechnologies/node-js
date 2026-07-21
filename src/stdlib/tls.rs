@@ -51,33 +51,85 @@ pub const MODULE_METHODS: &[&str] = &[
 /// `tls.getCiphers()`, matching Node v26's fixed list (TLS 1.2 suites plus the
 /// `tls_*` TLS 1.3 suites). A fixed protocol constant, not a runtime value.
 const CIPHERS: &[&str] = &[
-    "aes128-gcm-sha256", "aes128-sha", "aes128-sha256", "aes256-gcm-sha384", "aes256-sha",
-    "aes256-sha256", "dhe-psk-aes128-cbc-sha", "dhe-psk-aes128-cbc-sha256",
-    "dhe-psk-aes128-gcm-sha256", "dhe-psk-aes256-cbc-sha", "dhe-psk-aes256-cbc-sha384",
-    "dhe-psk-aes256-gcm-sha384", "dhe-psk-chacha20-poly1305", "dhe-rsa-aes128-gcm-sha256",
-    "dhe-rsa-aes128-sha", "dhe-rsa-aes128-sha256", "dhe-rsa-aes256-gcm-sha384", "dhe-rsa-aes256-sha",
-    "dhe-rsa-aes256-sha256", "dhe-rsa-chacha20-poly1305", "ecdhe-ecdsa-aes128-gcm-sha256",
-    "ecdhe-ecdsa-aes128-sha", "ecdhe-ecdsa-aes128-sha256", "ecdhe-ecdsa-aes256-gcm-sha384",
-    "ecdhe-ecdsa-aes256-sha", "ecdhe-ecdsa-aes256-sha384", "ecdhe-ecdsa-chacha20-poly1305",
-    "ecdhe-psk-aes128-cbc-sha", "ecdhe-psk-aes128-cbc-sha256", "ecdhe-psk-aes256-cbc-sha",
-    "ecdhe-psk-aes256-cbc-sha384", "ecdhe-psk-chacha20-poly1305", "ecdhe-rsa-aes128-gcm-sha256",
-    "ecdhe-rsa-aes128-sha", "ecdhe-rsa-aes128-sha256", "ecdhe-rsa-aes256-gcm-sha384",
-    "ecdhe-rsa-aes256-sha", "ecdhe-rsa-aes256-sha384", "ecdhe-rsa-chacha20-poly1305",
-    "psk-aes128-cbc-sha", "psk-aes128-cbc-sha256", "psk-aes128-gcm-sha256", "psk-aes256-cbc-sha",
-    "psk-aes256-cbc-sha384", "psk-aes256-gcm-sha384", "psk-chacha20-poly1305", "rsa-psk-aes128-cbc-sha",
-    "rsa-psk-aes128-cbc-sha256", "rsa-psk-aes128-gcm-sha256", "rsa-psk-aes256-cbc-sha",
-    "rsa-psk-aes256-cbc-sha384", "rsa-psk-aes256-gcm-sha384", "rsa-psk-chacha20-poly1305",
-    "srp-aes-128-cbc-sha", "srp-aes-256-cbc-sha", "srp-rsa-aes-128-cbc-sha", "srp-rsa-aes-256-cbc-sha",
-    "tls_aes_128_ccm_8_sha256", "tls_aes_128_ccm_sha256", "tls_aes_128_gcm_sha256",
-    "tls_aes_256_gcm_sha384", "tls_chacha20_poly1305_sha256",
+    "aes128-gcm-sha256",
+    "aes128-sha",
+    "aes128-sha256",
+    "aes256-gcm-sha384",
+    "aes256-sha",
+    "aes256-sha256",
+    "dhe-psk-aes128-cbc-sha",
+    "dhe-psk-aes128-cbc-sha256",
+    "dhe-psk-aes128-gcm-sha256",
+    "dhe-psk-aes256-cbc-sha",
+    "dhe-psk-aes256-cbc-sha384",
+    "dhe-psk-aes256-gcm-sha384",
+    "dhe-psk-chacha20-poly1305",
+    "dhe-rsa-aes128-gcm-sha256",
+    "dhe-rsa-aes128-sha",
+    "dhe-rsa-aes128-sha256",
+    "dhe-rsa-aes256-gcm-sha384",
+    "dhe-rsa-aes256-sha",
+    "dhe-rsa-aes256-sha256",
+    "dhe-rsa-chacha20-poly1305",
+    "ecdhe-ecdsa-aes128-gcm-sha256",
+    "ecdhe-ecdsa-aes128-sha",
+    "ecdhe-ecdsa-aes128-sha256",
+    "ecdhe-ecdsa-aes256-gcm-sha384",
+    "ecdhe-ecdsa-aes256-sha",
+    "ecdhe-ecdsa-aes256-sha384",
+    "ecdhe-ecdsa-chacha20-poly1305",
+    "ecdhe-psk-aes128-cbc-sha",
+    "ecdhe-psk-aes128-cbc-sha256",
+    "ecdhe-psk-aes256-cbc-sha",
+    "ecdhe-psk-aes256-cbc-sha384",
+    "ecdhe-psk-chacha20-poly1305",
+    "ecdhe-rsa-aes128-gcm-sha256",
+    "ecdhe-rsa-aes128-sha",
+    "ecdhe-rsa-aes128-sha256",
+    "ecdhe-rsa-aes256-gcm-sha384",
+    "ecdhe-rsa-aes256-sha",
+    "ecdhe-rsa-aes256-sha384",
+    "ecdhe-rsa-chacha20-poly1305",
+    "psk-aes128-cbc-sha",
+    "psk-aes128-cbc-sha256",
+    "psk-aes128-gcm-sha256",
+    "psk-aes256-cbc-sha",
+    "psk-aes256-cbc-sha384",
+    "psk-aes256-gcm-sha384",
+    "psk-chacha20-poly1305",
+    "rsa-psk-aes128-cbc-sha",
+    "rsa-psk-aes128-cbc-sha256",
+    "rsa-psk-aes128-gcm-sha256",
+    "rsa-psk-aes256-cbc-sha",
+    "rsa-psk-aes256-cbc-sha384",
+    "rsa-psk-aes256-gcm-sha384",
+    "rsa-psk-chacha20-poly1305",
+    "srp-aes-128-cbc-sha",
+    "srp-aes-256-cbc-sha",
+    "srp-rsa-aes-128-cbc-sha",
+    "srp-rsa-aes-256-cbc-sha",
+    "tls_aes_128_ccm_8_sha256",
+    "tls_aes_128_ccm_sha256",
+    "tls_aes_128_gcm_sha256",
+    "tls_aes_256_gcm_sha384",
+    "tls_chacha20_poly1305_sha256",
 ];
 
 /// Instance method names for the two `@@native` tags this module owns, exposed to
 /// `stdlib::instance_has_method` (property reads that yield a bound method).
 pub const SERVER_METHODS: &[&str] = &["listen", "close", "address"];
 pub const SOCKET_METHODS: &[&str] = &[
-    "write", "end", "destroy", "setEncoding", "setKeepAlive", "setNoDelay", "setTimeout",
-    "ref", "unref", "pause", "resume",
+    "write",
+    "end",
+    "destroy",
+    "setEncoding",
+    "setKeepAlive",
+    "setNoDelay",
+    "setTimeout",
+    "ref",
+    "unref",
+    "pause",
+    "resume",
 ];
 
 /// A native-thread hook run on the main thread for each freshly-handshaked
@@ -164,11 +216,20 @@ fn u64_prop(recv: &Value, key: &str) -> Option<u64> {
 /// Delegate the EventEmitter surface to `events`; `None` for a non-emitter method.
 fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match method {
-        "on" | "addListener" | "prependListener" | "once" | "prependOnceListener" | "emit"
-        | "removeListener" | "off" | "removeAllListeners" | "listenerCount" | "eventNames"
-        | "setMaxListeners" | "getMaxListeners" | "listeners" => {
-            Some(super::events::instance_call(recv, method, args.to_vec()))
-        }
+        "on"
+        | "addListener"
+        | "prependListener"
+        | "once"
+        | "prependOnceListener"
+        | "emit"
+        | "removeListener"
+        | "off"
+        | "removeAllListeners"
+        | "listenerCount"
+        | "eventNames"
+        | "setMaxListeners"
+        | "getMaxListeners"
+        | "listeners" => Some(super::events::instance_call(recv, method, args.to_vec())),
         _ => None,
     }
 }
@@ -177,7 +238,8 @@ fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result
 /// shared with the option-reading path for `key`/`cert` Buffers.
 fn value_bytes(v: Option<&Value>) -> Vec<u8> {
     let Some(v) = v else { return Vec::new() };
-    let is_buffer = with_host(|h| matches!(h.get(v), Some(JsObj::Object(p)) if p.contains_key("@@bytes")));
+    let is_buffer =
+        with_host(|h| matches!(h.get(v), Some(JsObj::Object(p)) if p.contains_key("@@bytes")));
     if is_buffer {
         return with_host(|h| match h.get(v) {
             Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
@@ -419,7 +481,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
     fn verify_tls13_signature(
         &self,
@@ -427,7 +494,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
@@ -489,11 +561,14 @@ pub fn connect(args: &[Value]) -> Result<Value, String> {
                 port = with_host(|h| h.to_number(&p)) as u16;
             }
             for key in ["host", "hostname"] {
-                if let Some(hv) = get_prop(a, key).filter(|v| with_host(|h| h.as_str(v)).is_some()) {
+                if let Some(hv) = get_prop(a, key).filter(|v| with_host(|h| h.as_str(v)).is_some())
+                {
                     host = with_host(|h| h.str_of(&hv));
                 }
             }
-            if let Some(sv) = get_prop(a, "servername").filter(|v| with_host(|h| h.as_str(v)).is_some()) {
+            if let Some(sv) =
+                get_prop(a, "servername").filter(|v| with_host(|h| h.as_str(v)).is_some())
+            {
                 servername = Some(with_host(|h| h.str_of(&sv)));
             }
             if let Some(rv) = get_prop(a, "rejectUnauthorized") {
@@ -512,12 +587,22 @@ pub fn connect(args: &[Value]) -> Result<Value, String> {
     extra.insert("encrypted".into(), Value::Bool(true));
     let socket = new_emitter_object("TLSSocket", extra);
     TLS.with(|s| {
-        s.borrow_mut().sockets.insert(sock_id, TlsSocketRec { emitter: socket.clone(), tx });
+        s.borrow_mut().sockets.insert(
+            sock_id,
+            TlsSocketRec {
+                emitter: socket.clone(),
+                tx,
+            },
+        );
     });
     with_host(|h| h.incr_handle());
     // `tls.connect(opts, cb)` registers `cb` as a one-shot `secureConnect` listener.
     if let Some(cb) = cb {
-        super::events::instance_call(&socket, "once", vec![with_host(|h| h.new_str("secureConnect")), cb])?;
+        super::events::instance_call(
+            &socket,
+            "once",
+            vec![with_host(|h| h.new_str("secureConnect")), cb],
+        )?;
     }
 
     let io_tx = with_host(|h| h.io_sender());
@@ -531,14 +616,22 @@ pub fn connect(args: &[Value]) -> Result<Value, String> {
         let server_name = match ServerName::try_from(servername.clone()) {
             Ok(n) => n,
             Err(_) => {
-                post_socket_error(&io_tx, sock_id, format!("Error: tls: invalid servername '{servername}'"));
+                post_socket_error(
+                    &io_tx,
+                    sock_id,
+                    format!("Error: tls: invalid servername '{servername}'"),
+                );
                 return;
             }
         };
         let mut sock = match TcpStream::connect((host.as_str(), port)) {
             Ok(s) => s,
             Err(e) => {
-                post_socket_error(&io_tx, sock_id, format!("Error: connect ECONNREFUSED {host}:{port}: {e}"));
+                post_socket_error(
+                    &io_tx,
+                    sock_id,
+                    format!("Error: connect ECONNREFUSED {host}:{port}: {e}"),
+                );
                 return;
             }
         };
@@ -566,7 +659,11 @@ pub fn connect(args: &[Value]) -> Result<Value, String> {
 fn on_secure_connect(sock_id: u64) -> Result<(), String> {
     let socket = TLS.with(|s| s.borrow().sockets.get(&sock_id).map(|r| r.emitter.clone()));
     if let Some(socket) = socket {
-        super::events::instance_call(&socket, "emit", vec![with_host(|h| h.new_str("secureConnect"))])?;
+        super::events::instance_call(
+            &socket,
+            "emit",
+            vec![with_host(|h| h.new_str("secureConnect"))],
+        )?;
     }
     Ok(())
 }
@@ -581,7 +678,11 @@ fn post_socket_error(io_tx: &Sender<IoTask>, sock_id: u64, msg: String) {
                 m.insert("message".into(), h.new_str(msg.clone()));
                 h.new_object(m)
             });
-            super::events::instance_call(&socket, "emit", vec![with_host(|h| h.new_str("error")), err])?;
+            super::events::instance_call(
+                &socket,
+                "emit",
+                vec![with_host(|h| h.new_str("error")), err],
+            )?;
         }
         on_socket_close(sock_id)
     }));
@@ -608,7 +709,9 @@ pub fn create_server(args: &[Value]) -> Result<Value, String> {
     let cert = value_bytes(get_prop(&opts, "cert").as_ref());
     let key = value_bytes(get_prop(&opts, "key").as_ref());
     if cert.is_empty() || key.is_empty() {
-        return Err(crate::host::type_error("tls.createServer requires `key` and `cert`"));
+        return Err(crate::host::type_error(
+            "tls.createServer requires `key` and `cert`",
+        ));
     }
     let config = build_server_config(&cert, &key)?;
 
@@ -624,7 +727,11 @@ pub fn create_server(args: &[Value]) -> Result<Value, String> {
 /// Build a TLS server backed by a caller-supplied per-connection hook (used by
 /// `https::create_server`). Returns the `TLSServer` emitter; the caller stores its
 /// `requestListener` and registers the hook.
-pub fn create_server_with_config(config: Arc<ServerConfig>, hook: ConnHook, request_listener: Value) -> Value {
+pub fn create_server_with_config(
+    config: Arc<ServerConfig>,
+    hook: ConnHook,
+    request_listener: Value,
+) -> Value {
     let mut extra = IndexMap::new();
     extra.insert("@@requestListener".into(), request_listener);
     let server = new_emitter_object("TLSServer", extra);
@@ -636,23 +743,34 @@ pub fn create_server_with_config(config: Arc<ServerConfig>, hook: ConnHook, requ
 fn take_pending_config(server: &Value) -> Option<Arc<ServerConfig>> {
     PENDING_CONFIGS.with(|p| {
         let mut p = p.borrow_mut();
-        p.iter().position(|(s, _)| s == server).map(|pos| p.remove(pos).1)
+        p.iter()
+            .position(|(s, _)| s == server)
+            .map(|pos| p.remove(pos).1)
     })
 }
 fn take_pending_hook(server: &Value) -> Option<ConnHook> {
     PENDING_HOOKS.with(|p| {
         let mut p = p.borrow_mut();
-        p.iter().position(|(s, _)| s == server).map(|pos| p.remove(pos).1)
+        p.iter()
+            .position(|(s, _)| s == server)
+            .map(|pos| p.remove(pos).1)
     })
 }
 
 // ── instance dispatch (TLSServer / TLSSocket) ────────────────────────────────
 
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match tag {
         "TLSServer" => server_call(recv, method, args),
         "TLSSocket" => socket_call(recv, method, args),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -664,7 +782,9 @@ fn server_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
         "listen" => server_listen(recv, &args),
         "close" => server_close(recv, &args),
         "address" => Ok(get_prop(recv, "@@address").unwrap_or(Value::Undef)),
-        _ => Err(crate::host::type_error(&format!("server.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "server.{method} is not a function"
+        ))),
     }
 }
 
@@ -693,8 +813,14 @@ fn server_listen(recv: &Value, args: &[Value]) -> Result<Value, String> {
     if let Some(addr) = local {
         let mut a = IndexMap::new();
         a.insert("port".into(), Value::Float(addr.port() as f64));
-        a.insert("address".into(), with_host(|h| h.new_str(addr.ip().to_string())));
-        a.insert("family".into(), with_host(|h| h.new_str(if addr.is_ipv6() { "IPv6" } else { "IPv4" })));
+        a.insert(
+            "address".into(),
+            with_host(|h| h.new_str(addr.ip().to_string())),
+        );
+        a.insert(
+            "family".into(),
+            with_host(|h| h.new_str(if addr.is_ipv6() { "IPv6" } else { "IPv4" })),
+        );
         let addr_obj = with_host(|h| h.new_object(a));
         set_prop(recv, "@@address", addr_obj);
     }
@@ -705,7 +831,12 @@ fn server_listen(recv: &Value, args: &[Value]) -> Result<Value, String> {
     TLS.with(|s| {
         s.borrow_mut().servers.insert(
             id,
-            TlsServerRec { emitter: recv.clone(), stop: stop.clone(), conn_hook, listener: plain_listener },
+            TlsServerRec {
+                emitter: recv.clone(),
+                stop: stop.clone(),
+                conn_hook,
+                listener: plain_listener,
+            },
         );
     });
     // Preserve the https request listener where the hook can find it (already on
@@ -748,7 +879,12 @@ fn server_listen(recv: &Value, args: &[Value]) -> Result<Value, String> {
 
 /// A background per-connection thread: complete the server handshake, then post an
 /// `IoTask` that surfaces the socket to JS, and finally become its owner loop.
-fn accept_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConfig>, io_tx: Sender<IoTask>) {
+fn accept_connection(
+    server_id: u64,
+    mut sock: TcpStream,
+    config: Arc<ServerConfig>,
+    io_tx: Sender<IoTask>,
+) {
     let mut conn = match ServerConnection::new(config) {
         Ok(c) => c,
         Err(_) => return,
@@ -759,7 +895,9 @@ fn accept_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConf
     let sock_id = next_tls_id();
     let (tx, rx) = std::sync::mpsc::channel::<WriteCmd>();
     let tx_for_main = tx;
-    let _ = io_tx.send(Box::new(move || on_server_connection(server_id, sock_id, tx_for_main)));
+    let _ = io_tx.send(Box::new(move || {
+        on_server_connection(server_id, sock_id, tx_for_main)
+    }));
     let stream = StreamOwned::new(conn, sock);
     owner_loop(stream, sock_id, rx, io_tx);
 }
@@ -767,7 +905,12 @@ fn accept_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConf
 /// Main-thread handler for a newly-handshaked server connection: build the
 /// `TLSSocket`, register it, run the server's hook/listener, emit events.
 fn on_server_connection(server_id: u64, sock_id: u64, tx: Sender<WriteCmd>) -> Result<(), String> {
-    let server = TLS.with(|s| s.borrow().servers.get(&server_id).map(|r| r.emitter.clone()));
+    let server = TLS.with(|s| {
+        s.borrow()
+            .servers
+            .get(&server_id)
+            .map(|r| r.emitter.clone())
+    });
     let Some(server) = server else { return Ok(()) };
 
     let mut extra = IndexMap::new();
@@ -775,20 +918,44 @@ fn on_server_connection(server_id: u64, sock_id: u64, tx: Sender<WriteCmd>) -> R
     extra.insert("encrypted".into(), Value::Bool(true));
     let socket = new_emitter_object("TLSSocket", extra);
     TLS.with(|s| {
-        s.borrow_mut().sockets.insert(sock_id, TlsSocketRec { emitter: socket.clone(), tx });
+        s.borrow_mut().sockets.insert(
+            sock_id,
+            TlsSocketRec {
+                emitter: socket.clone(),
+                tx,
+            },
+        );
     });
     with_host(|h| h.incr_handle());
 
     // `secureConnection` is the tls server event; also emit `connection` for parity.
-    super::events::instance_call(&server, "emit", vec![with_host(|h| h.new_str("secureConnection")), socket.clone()])?;
-    super::events::instance_call(&server, "emit", vec![with_host(|h| h.new_str("connection")), socket.clone()])?;
+    super::events::instance_call(
+        &server,
+        "emit",
+        vec![with_host(|h| h.new_str("secureConnection")), socket.clone()],
+    )?;
+    super::events::instance_call(
+        &server,
+        "emit",
+        vec![with_host(|h| h.new_str("connection")), socket.clone()],
+    )?;
 
     // https attaches a request-parser hook; a plain tls server runs its listener.
-    let hook = TLS.with(|s| s.borrow().servers.get(&server_id).and_then(|r| r.conn_hook.clone()));
+    let hook = TLS.with(|s| {
+        s.borrow()
+            .servers
+            .get(&server_id)
+            .and_then(|r| r.conn_hook.clone())
+    });
     if let Some(hook) = hook {
         hook(&server, &socket, sock_id)?;
     } else {
-        let listener = TLS.with(|s| s.borrow().servers.get(&server_id).and_then(|r| r.listener.clone()));
+        let listener = TLS.with(|s| {
+            s.borrow()
+                .servers
+                .get(&server_id)
+                .and_then(|r| r.listener.clone())
+        });
         if let Some(cb) = listener {
             invoke(&cb, vec![socket.clone()], None)?;
         }
@@ -805,7 +972,10 @@ fn server_close(recv: &Value, args: &[Value]) -> Result<Value, String> {
             let _ = with_host(|h| h.io_sender()).send(Box::new(|| Ok(())));
         }
     }
-    if let Some(cb) = args.first().filter(|v| with_host(|h| crate::host::is_callable(h, v))) {
+    if let Some(cb) = args
+        .first()
+        .filter(|v| with_host(|h| crate::host::is_callable(h, v)))
+    {
         invoke(cb, Vec::new(), None)?;
     }
     super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))])?;
@@ -840,10 +1010,11 @@ fn socket_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
             }
             Ok(recv.clone())
         }
-        "setEncoding" | "setTimeout" | "setNoDelay" | "setKeepAlive" | "ref" | "unref" | "pause" | "resume" => {
-            Ok(recv.clone())
-        }
-        _ => Err(crate::host::type_error(&format!("socket.{method} is not a function"))),
+        "setEncoding" | "setTimeout" | "setNoDelay" | "setKeepAlive" | "ref" | "unref"
+        | "pause" | "resume" => Ok(recv.clone()),
+        _ => Err(crate::host::type_error(&format!(
+            "socket.{method} is not a function"
+        ))),
     }
 }
 
@@ -871,8 +1042,12 @@ pub fn socket_end(sock_id: u64) {
 /// `data`/`end`/`close` `IoTask`s to the main thread. Generic over client/server
 /// connections (both deref to `ConnectionCommon`), mirroring `StreamOwned`'s
 /// bounds.
-fn owner_loop<C, S>(mut stream: StreamOwned<C, TcpStream>, sock_id: u64, rx: Receiver<WriteCmd>, io_tx: Sender<IoTask>)
-where
+fn owner_loop<C, S>(
+    mut stream: StreamOwned<C, TcpStream>,
+    sock_id: u64,
+    rx: Receiver<WriteCmd>,
+    io_tx: Sender<IoTask>,
+) where
     C: DerefMut + Deref<Target = ConnectionCommon<S>>,
     S: SideData,
 {
@@ -887,7 +1062,11 @@ where
         loop {
             match rx.try_recv() {
                 Ok(WriteCmd::Data(bytes)) => {
-                    if stream.write_all(&bytes).and_then(|_| stream.flush()).is_err() {
+                    if stream
+                        .write_all(&bytes)
+                        .and_then(|_| stream.flush())
+                        .is_err()
+                    {
                         let _ = io_tx.send(Box::new(move || on_socket_close(sock_id)));
                         return;
                     }
@@ -914,7 +1093,10 @@ where
                 let _ = io_tx.send(Box::new(move || on_socket_data(sock_id, bytes)));
             }
             Err(ref e)
-                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
             {
                 // No plaintext ready; loop to service writes again.
                 continue;
@@ -935,7 +1117,11 @@ fn on_socket_data(sock_id: u64, bytes: Vec<u8>) -> Result<(), String> {
     // Feed the https request parser first (no-op unless this is an https conn).
     super::https::feed(sock_id, &socket, &bytes)?;
     let chunk = super::buffer::from_bytes(&bytes);
-    super::events::instance_call(&socket, "emit", vec![with_host(|h| h.new_str("data")), chunk])?;
+    super::events::instance_call(
+        &socket,
+        "emit",
+        vec![with_host(|h| h.new_str("data")), chunk],
+    )?;
     Ok(())
 }
 
@@ -951,7 +1137,11 @@ fn on_socket_close(sock_id: u64) -> Result<(), String> {
     let rec = TLS.with(|s| s.borrow_mut().sockets.remove(&sock_id));
     super::https::drop_conn(sock_id);
     if let Some(rec) = rec {
-        super::events::instance_call(&rec.emitter, "emit", vec![with_host(|h| h.new_str("close"))])?;
+        super::events::instance_call(
+            &rec.emitter,
+            "emit",
+            vec![with_host(|h| h.new_str("close"))],
+        )?;
         with_host(|h| h.decr_handle());
         let _ = with_host(|h| h.io_sender()).send(Box::new(|| Ok(())));
     }

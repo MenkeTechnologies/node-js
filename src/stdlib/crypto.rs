@@ -154,7 +154,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             }
             // Callback form: randomBytes(n, (err, buf) => ...). Build the Buffer,
             // release the host borrow, then queue the callback with (null, buf).
-            let cb = args.get(1).cloned().filter(|v| with_host(|h| is_callable(h, v)));
+            let cb = args
+                .get(1)
+                .cloned()
+                .filter(|v| with_host(|h| is_callable(h, v)));
             if let Some(cb) = cb {
                 let bufv = super::buffer::from_bytes(&buf);
                 with_host(|h| {
@@ -205,38 +208,72 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // ── Key derivation ──────────────────────────────────────────────
         "pbkdf2Sync" => {
             let digest = arg_str(args, 4).to_ascii_lowercase();
-            match pbkdf2_derive(&digest, &val_bytes_at(args, 0), &val_bytes_at(args, 1), super::arg_num(args, 2) as u32, super::arg_num(args, 3).max(0.0) as usize) {
+            match pbkdf2_derive(
+                &digest,
+                &val_bytes_at(args, 0),
+                &val_bytes_at(args, 1),
+                super::arg_num(args, 2) as u32,
+                super::arg_num(args, 3).max(0.0) as usize,
+            ) {
                 Ok(out) => Ok(super::buffer::from_bytes(&out)),
                 Err(e) => Err(e),
             }
         }
         "pbkdf2" => {
             let digest = arg_str(args, 4).to_ascii_lowercase();
-            let res = pbkdf2_derive(&digest, &val_bytes_at(args, 0), &val_bytes_at(args, 1), super::arg_num(args, 2) as u32, super::arg_num(args, 3).max(0.0) as usize);
+            let res = pbkdf2_derive(
+                &digest,
+                &val_bytes_at(args, 0),
+                &val_bytes_at(args, 1),
+                super::arg_num(args, 2) as u32,
+                super::arg_num(args, 3).max(0.0) as usize,
+            );
             deliver_async(args.get(5).cloned(), res)
         }
         "scryptSync" => {
             let keylen = super::arg_num(args, 2).max(0.0) as usize;
-            match scrypt_derive(&val_bytes_at(args, 0), &val_bytes_at(args, 1), keylen, opts_object(args, 3)) {
+            match scrypt_derive(
+                &val_bytes_at(args, 0),
+                &val_bytes_at(args, 1),
+                keylen,
+                opts_object(args, 3),
+            ) {
                 Ok(out) => Ok(super::buffer::from_bytes(&out)),
                 Err(e) => Err(e),
             }
         }
         "scrypt" => {
             let keylen = super::arg_num(args, 2).max(0.0) as usize;
-            let res = scrypt_derive(&val_bytes_at(args, 0), &val_bytes_at(args, 1), keylen, opts_object(args, 3));
+            let res = scrypt_derive(
+                &val_bytes_at(args, 0),
+                &val_bytes_at(args, 1),
+                keylen,
+                opts_object(args, 3),
+            );
             deliver_async(trailing_cb(args), res)
         }
         "hkdfSync" => {
             let digest = arg_str(args, 0).to_ascii_lowercase();
-            match hkdf_derive(&digest, &val_bytes_at(args, 1), &val_bytes_at(args, 2), &val_bytes_at(args, 3), super::arg_num(args, 4).max(0.0) as usize) {
+            match hkdf_derive(
+                &digest,
+                &val_bytes_at(args, 1),
+                &val_bytes_at(args, 2),
+                &val_bytes_at(args, 3),
+                super::arg_num(args, 4).max(0.0) as usize,
+            ) {
                 Ok(out) => Ok(super::buffer::from_bytes(&out)),
                 Err(e) => Err(e),
             }
         }
         "hkdf" => {
             let digest = arg_str(args, 0).to_ascii_lowercase();
-            let res = hkdf_derive(&digest, &val_bytes_at(args, 1), &val_bytes_at(args, 2), &val_bytes_at(args, 3), super::arg_num(args, 4).max(0.0) as usize);
+            let res = hkdf_derive(
+                &digest,
+                &val_bytes_at(args, 1),
+                &val_bytes_at(args, 2),
+                &val_bytes_at(args, 3),
+                super::arg_num(args, 4).max(0.0) as usize,
+            );
             deliver_async(args.get(5).cloned(), res)
         }
         // ── Symmetric ciphers ───────────────────────────────────────────
@@ -268,7 +305,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let a = val_bytes_at(args, 0);
             let b = val_bytes_at(args, 1);
             if a.len() != b.len() {
-                return Some(Err("Error: Input buffers must have the same byte length".into()));
+                return Some(Err(
+                    "Error: Input buffers must have the same byte length".into()
+                ));
             }
             Ok(Value::Bool(a.ct_eq(&b).into()))
         }
@@ -295,7 +334,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             if let Err(e) = getrandom::getrandom(&mut buf) {
                 return Some(Err(format!("Error: failed to generate random bytes: {e}")));
             }
-            let cb = args.get(1).cloned().filter(|v| with_host(|h| is_callable(h, v)));
+            let cb = args
+                .get(1)
+                .cloned()
+                .filter(|v| with_host(|h| is_callable(h, v)));
             if let Some(cb) = cb {
                 let bufv = super::buffer::from_bytes(&buf);
                 with_host(|h| {
@@ -317,7 +359,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let data = val_bytes_at(args, 1);
             // args[2] is the output encoding (default "hex"); "buffer" yields a Buffer.
             let out = digest(&algo, &data);
-            let out_enc = if args.len() > 2 { arg_str(args, 2) } else { "hex".into() };
+            let out_enc = if args.len() > 2 {
+                arg_str(args, 2)
+            } else {
+                "hex".into()
+            };
             Ok(if out_enc == "buffer" {
                 super::buffer::from_bytes(&out)
             } else {
@@ -327,7 +373,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // ── time-ordered UUID v7 ────────────────────────────────────────
         "randomUUIDv7" => uuid_v7(),
         // ── Asymmetric key generation ───────────────────────────────────
-        "generateKeyPairSync" => generate_key_pair(&arg_str(args, 0).to_ascii_lowercase(), args.get(1)),
+        "generateKeyPairSync" => {
+            generate_key_pair(&arg_str(args, 0).to_ascii_lowercase(), args.get(1))
+        }
         "generateKeyPair" => {
             let cb = trailing_cb(args);
             let res = generate_key_pair(&arg_str(args, 0).to_ascii_lowercase(), args.get(1));
@@ -408,7 +456,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 None => Ok(Value::Bool(ok)),
             }
         }
-        "generatePrimeSync" => generate_prime(super::arg_num(args, 0) as usize, opts_object(args, 1)),
+        "generatePrimeSync" => {
+            generate_prime(super::arg_num(args, 0) as usize, opts_object(args, 1))
+        }
         "generatePrime" => {
             let res = generate_prime(super::arg_num(args, 0) as usize, opts_object(args, 1));
             let cb = trailing_cb(args);
@@ -433,7 +483,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             Ok(out) => Ok(super::buffer::from_bytes(&out)),
             Err(e) => Err(e),
         },
-        "argon2" => deliver_async(trailing_cb(args), argon2_hash(&arg_str(args, 0), args.get(1))),
+        "argon2" => deliver_async(
+            trailing_cb(args),
+            argon2_hash(&arg_str(args, 0), args.get(1)),
+        ),
         // ── WebCrypto getRandomValues ───────────────────────────────────
         "getRandomValues" => get_random_values(args.first()),
         _ => return None,
@@ -455,7 +508,12 @@ pub fn hmac_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<
 /// `final` (CBC needs the full block/padding stream, so `update` returns empty
 /// and `final` returns the whole result — the standard `update()+final()`
 /// concatenation is byte-identical to node).
-pub fn cipher_instance_call(tag: &str, recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+pub fn cipher_instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     match method {
         "update" => {
             let bytes = cipher_input_bytes(args);
@@ -468,12 +526,17 @@ pub fn cipher_instance_call(tag: &str, recv: &Value, method: &str, args: &[Value
                     }
                 }
             });
-            let out_enc = if args.len() > 2 { Some(arg_str(args, 2)) } else { None };
+            let out_enc = if args.len() > 2 {
+                Some(arg_str(args, 2))
+            } else {
+                None
+            };
             Ok(encode_out(&[], out_enc.as_deref()))
         }
         "final" => {
             let (algo, key, iv, data) = with_host(|h| {
-                let (mut algo, mut key, mut iv, mut data) = (String::new(), Vec::new(), Vec::new(), Vec::new());
+                let (mut algo, mut key, mut iv, mut data) =
+                    (String::new(), Vec::new(), Vec::new(), Vec::new());
                 if let Some(JsObj::Object(p)) = h.get(recv) {
                     algo = p.get("@@algo").map(|v| h.str_of(v)).unwrap_or_default();
                     if let Some(JsObj::Array(it)) = p.get("@@key").and_then(|v| h.get(v)) {
@@ -489,11 +552,18 @@ pub fn cipher_instance_call(tag: &str, recv: &Value, method: &str, args: &[Value
                 (algo, key, iv, data)
             });
             let out = cipher_crypt(&algo, &key, &iv, &data, tag == "Cipheriv")?;
-            let out_enc = if args.is_empty() { None } else { Some(arg_str(args, 0)) };
+            let out_enc = if args.is_empty() {
+                None
+            } else {
+                Some(arg_str(args, 0))
+            };
             Ok(encode_out(&out, out_enc.as_deref()))
         }
         "setAutoPadding" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("{}.{method} is not a function", tag.to_ascii_lowercase()))),
+        _ => Err(crate::host::type_error(&format!(
+            "{}.{method} is not a function",
+            tag.to_ascii_lowercase()
+        ))),
     }
 }
 
@@ -502,7 +572,11 @@ pub fn cipher_instance_call(tag: &str, recv: &Value, method: &str, args: &[Value
 fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         "update" => {
-            let enc = if args.len() > 1 { arg_str(args, 1) } else { "utf8".into() };
+            let enc = if args.len() > 1 {
+                arg_str(args, 1)
+            } else {
+                "utf8".into()
+            };
             let bytes = decode(&arg_str(args, 0), &enc);
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get(recv).cloned() {
@@ -534,15 +608,24 @@ fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Resu
             } else {
                 digest(&algo, &data)
             };
-            let enc = if args.is_empty() { None } else { Some(arg_str(args, 0)) };
+            let enc = if args.is_empty() {
+                None
+            } else {
+                Some(arg_str(args, 0))
+            };
             Ok(match enc.as_deref() {
                 Some("hex") => with_host(|h| h.new_str(to_hex(&out))),
                 Some("base64") | Some("base64url") => with_host(|h| h.new_str(to_base64(&out))),
-                Some("latin1") | Some("binary") => with_host(|h| h.new_str(out.iter().map(|b| *b as char).collect::<String>())),
+                Some("latin1") | Some("binary") => {
+                    with_host(|h| h.new_str(out.iter().map(|b| *b as char).collect::<String>()))
+                }
                 _ => super::buffer::from_bytes(&out),
             })
         }
-        _ => Err(crate::host::type_error(&format!("{}.{method} is not a function", kind.to_ascii_lowercase()))),
+        _ => Err(crate::host::type_error(&format!(
+            "{}.{method} is not a function",
+            kind.to_ascii_lowercase()
+        ))),
     }
 }
 
@@ -629,7 +712,9 @@ fn val_bytes_at(args: &[Value], i: usize) -> Vec<u8> {
 
 /// The trailing argument if it is a callback (async form detection).
 fn trailing_cb(args: &[Value]) -> Option<Value> {
-    args.last().cloned().filter(|v| with_host(|h| is_callable(h, v)))
+    args.last()
+        .cloned()
+        .filter(|v| with_host(|h| is_callable(h, v)))
 }
 
 /// The arg at index `i` if it is a plain (non-callable) options object.
@@ -662,7 +747,13 @@ fn deliver_async(cb: Option<Value>, res: Result<Vec<u8>, String>) -> Result<Valu
 }
 
 /// PBKDF2-HMAC derivation over a supported digest.
-fn pbkdf2_derive(digest: &str, pass: &[u8], salt: &[u8], iters: u32, keylen: usize) -> Result<Vec<u8>, String> {
+fn pbkdf2_derive(
+    digest: &str,
+    pass: &[u8],
+    salt: &[u8],
+    iters: u32,
+    keylen: usize,
+) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; keylen];
     match digest {
         "sha1" => pbkdf2::pbkdf2_hmac::<Sha1>(pass, salt, iters, &mut out),
@@ -676,7 +767,12 @@ fn pbkdf2_derive(digest: &str, pass: &[u8], salt: &[u8], iters: u32, keylen: usi
 
 /// scrypt derivation. Reads node's `N`/`cost`, `r`/`blockSize`, `p`/
 /// `parallelization` options (defaults 16384/8/1).
-fn scrypt_derive(pass: &[u8], salt: &[u8], keylen: usize, opts: Option<Value>) -> Result<Vec<u8>, String> {
+fn scrypt_derive(
+    pass: &[u8],
+    salt: &[u8],
+    keylen: usize,
+    opts: Option<Value>,
+) -> Result<Vec<u8>, String> {
     let (mut n, mut r, mut p) = (16384.0f64, 8.0f64, 1.0f64);
     if let Some(o) = opts {
         n = opt_num(&o, &["N", "cost"], n);
@@ -695,7 +791,13 @@ fn scrypt_derive(pass: &[u8], salt: &[u8], keylen: usize, opts: Option<Value>) -
 }
 
 /// HKDF (extract + expand) over a supported digest.
-fn hkdf_derive(digest: &str, ikm: &[u8], salt: &[u8], info: &[u8], keylen: usize) -> Result<Vec<u8>, String> {
+fn hkdf_derive(
+    digest: &str,
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
+    keylen: usize,
+) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; keylen];
     let ok = match digest {
         "sha1" => Hkdf::<Sha1>::new(Some(salt), ikm).expand(info, &mut out),
@@ -761,35 +863,66 @@ fn cipher_input_bytes(args: &[Value]) -> Vec<u8> {
     if super::native_tag(args.first().unwrap_or(&Value::Undef)).as_deref() == Some("Buffer") {
         return val_bytes_at(args, 0);
     }
-    let enc = if args.len() > 1 { arg_str(args, 1) } else { "utf8".into() };
+    let enc = if args.len() > 1 {
+        arg_str(args, 1)
+    } else {
+        "utf8".into()
+    };
     decode(&arg_str(args, 0), &enc)
 }
 
 /// AES-CBC (Pkcs7) / AES-CTR transform. `encrypt` selects direction (CTR is
 /// symmetric so the flag is unused there).
-fn cipher_crypt(algo: &str, key: &[u8], iv: &[u8], data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
+fn cipher_crypt(
+    algo: &str,
+    key: &[u8],
+    iv: &[u8],
+    data: &[u8],
+    encrypt: bool,
+) -> Result<Vec<u8>, String> {
     const KEYERR: &str = "Error: Invalid key length";
     const DECERR: &str = "Error: error:1C800064:Provider routines::bad decrypt";
     match (algo, encrypt) {
-        ("aes-128-cbc", true) => Ok(cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.encrypt_padded_vec_mut::<Pkcs7>(data)),
-        ("aes-192-cbc", true) => Ok(cbc::Encryptor::<aes::Aes192>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.encrypt_padded_vec_mut::<Pkcs7>(data)),
-        ("aes-256-cbc", true) => Ok(cbc::Encryptor::<aes::Aes256>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.encrypt_padded_vec_mut::<Pkcs7>(data)),
-        ("aes-128-cbc", false) => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.decrypt_padded_vec_mut::<Pkcs7>(data).map_err(|_| DECERR.to_string()),
-        ("aes-192-cbc", false) => cbc::Decryptor::<aes::Aes192>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.decrypt_padded_vec_mut::<Pkcs7>(data).map_err(|_| DECERR.to_string()),
-        ("aes-256-cbc", false) => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.decrypt_padded_vec_mut::<Pkcs7>(data).map_err(|_| DECERR.to_string()),
+        ("aes-128-cbc", true) => Ok(cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv)
+            .map_err(|_| KEYERR.to_string())?
+            .encrypt_padded_vec_mut::<Pkcs7>(data)),
+        ("aes-192-cbc", true) => Ok(cbc::Encryptor::<aes::Aes192>::new_from_slices(key, iv)
+            .map_err(|_| KEYERR.to_string())?
+            .encrypt_padded_vec_mut::<Pkcs7>(data)),
+        ("aes-256-cbc", true) => Ok(cbc::Encryptor::<aes::Aes256>::new_from_slices(key, iv)
+            .map_err(|_| KEYERR.to_string())?
+            .encrypt_padded_vec_mut::<Pkcs7>(data)),
+        ("aes-128-cbc", false) => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv)
+            .map_err(|_| KEYERR.to_string())?
+            .decrypt_padded_vec_mut::<Pkcs7>(data)
+            .map_err(|_| DECERR.to_string()),
+        ("aes-192-cbc", false) => cbc::Decryptor::<aes::Aes192>::new_from_slices(key, iv)
+            .map_err(|_| KEYERR.to_string())?
+            .decrypt_padded_vec_mut::<Pkcs7>(data)
+            .map_err(|_| DECERR.to_string()),
+        ("aes-256-cbc", false) => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv)
+            .map_err(|_| KEYERR.to_string())?
+            .decrypt_padded_vec_mut::<Pkcs7>(data)
+            .map_err(|_| DECERR.to_string()),
         ("aes-128-ctr", _) => {
             let mut buf = data.to_vec();
-            ctr::Ctr128BE::<aes::Aes128>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.apply_keystream(&mut buf);
+            ctr::Ctr128BE::<aes::Aes128>::new_from_slices(key, iv)
+                .map_err(|_| KEYERR.to_string())?
+                .apply_keystream(&mut buf);
             Ok(buf)
         }
         ("aes-192-ctr", _) => {
             let mut buf = data.to_vec();
-            ctr::Ctr128BE::<aes::Aes192>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.apply_keystream(&mut buf);
+            ctr::Ctr128BE::<aes::Aes192>::new_from_slices(key, iv)
+                .map_err(|_| KEYERR.to_string())?
+                .apply_keystream(&mut buf);
             Ok(buf)
         }
         ("aes-256-ctr", _) => {
             let mut buf = data.to_vec();
-            ctr::Ctr128BE::<aes::Aes256>::new_from_slices(key, iv).map_err(|_| KEYERR.to_string())?.apply_keystream(&mut buf);
+            ctr::Ctr128BE::<aes::Aes256>::new_from_slices(key, iv)
+                .map_err(|_| KEYERR.to_string())?
+                .apply_keystream(&mut buf);
             Ok(buf)
         }
         _ => Err(format!("Error: Unsupported cipher: {algo}")),
@@ -812,8 +945,12 @@ fn encode_out(bytes: &[u8], enc: Option<&str>) -> Value {
     match enc {
         Some("hex") => with_host(|h| h.new_str(to_hex(bytes))),
         Some("base64") | Some("base64url") => with_host(|h| h.new_str(to_base64(bytes))),
-        Some("latin1") | Some("binary") => with_host(|h| h.new_str(bytes.iter().map(|b| *b as char).collect::<String>())),
-        Some("utf8") | Some("utf-8") => with_host(|h| h.new_str(String::from_utf8_lossy(bytes).into_owned())),
+        Some("latin1") | Some("binary") => {
+            with_host(|h| h.new_str(bytes.iter().map(|b| *b as char).collect::<String>()))
+        }
+        Some("utf8") | Some("utf-8") => {
+            with_host(|h| h.new_str(String::from_utf8_lossy(bytes).into_owned()))
+        }
         _ => super::buffer::from_bytes(bytes),
     }
 }
@@ -831,7 +968,11 @@ fn cipher_info(algo: &str) -> Result<Value, String> {
         "aes-192-ctr" => 905,
         _ => 906,
     };
-    let (mode, block) = if algo.ends_with("ctr") { ("ctr", 1) } else { ("cbc", 16) };
+    let (mode, block) = if algo.ends_with("ctr") {
+        ("ctr", 1)
+    } else {
+        ("cbc", 16)
+    };
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("mode".into(), h.new_str(mode));
@@ -853,9 +994,17 @@ fn random_fill(args: &[Value]) -> Result<Value, String> {
     }
     let cur = val_bytes(&buf);
     let len = cur.len();
-    let offset = if args.len() > 1 { super::arg_num(args, 1).max(0.0) as usize } else { 0 };
+    let offset = if args.len() > 1 {
+        super::arg_num(args, 1).max(0.0) as usize
+    } else {
+        0
+    };
     let offset = offset.min(len);
-    let size = if args.len() > 2 { super::arg_num(args, 2).max(0.0) as usize } else { len - offset };
+    let size = if args.len() > 2 {
+        super::arg_num(args, 2).max(0.0) as usize
+    } else {
+        len - offset
+    };
     let end = (offset + size).min(len);
     let mut rnd = vec![0u8; end.saturating_sub(offset)];
     if let Err(e) = getrandom::getrandom(&mut rnd) {
@@ -892,7 +1041,14 @@ fn uuid_v7() -> Result<Value, String> {
     b[6] = (b[6] & 0x0f) | 0x70;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h = to_hex(&b);
-    let uuid = format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]);
+    let uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    );
     Ok(with_host(|host| host.new_str(uuid)))
 }
 
@@ -964,10 +1120,7 @@ fn pem_wrap(label: &str, der: &[u8]) -> String {
 
 /// Extract the DER bytes from a single PEM block (any label).
 fn pem_body(pem: &str) -> Vec<u8> {
-    let body: String = pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .collect();
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
     super::from_base64(&body)
 }
 
@@ -1004,11 +1157,19 @@ fn x25519_raw(pem: &str) -> Option<[u8; 32]> {
 /// The options object at `args[1]` for key generation.
 fn keygen_encoding(opts: Option<&Value>, priv_side: bool) -> Option<String> {
     let o = opts?;
-    let field = if priv_side { "privateKeyEncoding" } else { "publicKeyEncoding" };
+    let field = if priv_side {
+        "privateKeyEncoding"
+    } else {
+        "publicKeyEncoding"
+    };
     with_host(|h| {
-        let JsObj::Object(p) = h.get(o)? else { return None };
+        let JsObj::Object(p) = h.get(o)? else {
+            return None;
+        };
         let enc = p.get(field)?;
-        let JsObj::Object(e) = h.get(enc)? else { return None };
+        let JsObj::Object(e) = h.get(enc)? else {
+            return None;
+        };
         e.get("format").map(|v| h.str_of(v))
     })
 }
@@ -1023,8 +1184,13 @@ fn generate_key_pair(kind: &str, opts: Option<&Value>) -> Result<Value, String> 
             let bits = opt_num(opts.unwrap_or(&Value::Undef), &["modulusLength"], 2048.0) as usize;
             let sk = rsa::RsaPrivateKey::new(&mut rng, bits).map_err(|e| format!("Error: {e}"))?;
             let pk = rsa::RsaPublicKey::from(&sk);
-            let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))?.to_string();
-            let pub_pem = pk.to_public_key_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))?;
+            let priv_pem = sk
+                .to_pkcs8_pem(LineEnding::LF)
+                .map_err(|e| format!("Error: {e}"))?
+                .to_string();
+            let pub_pem = pk
+                .to_public_key_pem(LineEnding::LF)
+                .map_err(|e| format!("Error: {e}"))?;
             ("rsa", priv_pem, pub_pem)
         }
         "ec" => {
@@ -1032,14 +1198,26 @@ fn generate_key_pair(kind: &str, opts: Option<&Value>) -> Result<Value, String> 
             match ec_curve_id(&curve) {
                 Some("p256") => {
                     let sk = p256::SecretKey::random(&mut rng);
-                    let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))?.to_string();
-                    let pub_pem = sk.public_key().to_public_key_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))?;
+                    let priv_pem = sk
+                        .to_pkcs8_pem(LineEnding::LF)
+                        .map_err(|e| format!("Error: {e}"))?
+                        .to_string();
+                    let pub_pem = sk
+                        .public_key()
+                        .to_public_key_pem(LineEnding::LF)
+                        .map_err(|e| format!("Error: {e}"))?;
                     ("ec", priv_pem, pub_pem)
                 }
                 Some("p384") => {
                     let sk = p384::SecretKey::random(&mut rng);
-                    let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))?.to_string();
-                    let pub_pem = sk.public_key().to_public_key_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))?;
+                    let priv_pem = sk
+                        .to_pkcs8_pem(LineEnding::LF)
+                        .map_err(|e| format!("Error: {e}"))?
+                        .to_string();
+                    let pub_pem = sk
+                        .public_key()
+                        .to_public_key_pem(LineEnding::LF)
+                        .map_err(|e| format!("Error: {e}"))?;
                     ("ec", priv_pem, pub_pem)
                 }
                 _ => return Err(format!("Error: Unsupported EC curve: {curve}")),
@@ -1047,8 +1225,14 @@ fn generate_key_pair(kind: &str, opts: Option<&Value>) -> Result<Value, String> 
         }
         "ed25519" => {
             let sk = ed25519_dalek::SigningKey::generate(&mut rng);
-            let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))?.to_string();
-            let pub_pem = sk.verifying_key().to_public_key_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))?;
+            let priv_pem = sk
+                .to_pkcs8_pem(LineEnding::LF)
+                .map_err(|e| format!("Error: {e}"))?
+                .to_string();
+            let pub_pem = sk
+                .verifying_key()
+                .to_public_key_pem(LineEnding::LF)
+                .map_err(|e| format!("Error: {e}"))?;
             ("ed25519", priv_pem, pub_pem)
         }
         "x25519" => {
@@ -1102,21 +1286,37 @@ fn opt_str(obj: &Value, key: &str) -> String {
 /// Detect the asymmetric type of a private-key PEM/DER by trial parsing.
 fn detect_private(bytes: &[u8]) -> Option<&'static str> {
     let pem = std::str::from_utf8(bytes).ok();
-    if pem.map(|p| rsa::RsaPrivateKey::from_pkcs8_pem(p).is_ok() || rsa::RsaPrivateKey::from_pkcs1_pem(p).is_ok()).unwrap_or(false)
+    if pem
+        .map(|p| {
+            rsa::RsaPrivateKey::from_pkcs8_pem(p).is_ok()
+                || rsa::RsaPrivateKey::from_pkcs1_pem(p).is_ok()
+        })
+        .unwrap_or(false)
         || rsa::RsaPrivateKey::from_pkcs8_der(bytes).is_ok()
     {
         return Some("rsa");
     }
-    if pem.map(|p| p256::SecretKey::from_pkcs8_pem(p).is_ok()).unwrap_or(false) {
+    if pem
+        .map(|p| p256::SecretKey::from_pkcs8_pem(p).is_ok())
+        .unwrap_or(false)
+    {
         return Some("ec");
     }
-    if pem.map(|p| p384::SecretKey::from_pkcs8_pem(p).is_ok()).unwrap_or(false) {
+    if pem
+        .map(|p| p384::SecretKey::from_pkcs8_pem(p).is_ok())
+        .unwrap_or(false)
+    {
         return Some("ec");
     }
-    if pem.map(|p| ed25519_dalek::SigningKey::from_pkcs8_pem(p).is_ok()).unwrap_or(false) {
+    if pem
+        .map(|p| ed25519_dalek::SigningKey::from_pkcs8_pem(p).is_ok())
+        .unwrap_or(false)
+    {
         return Some("ed25519");
     }
-    if pem.map(|p| p.contains("PRIVATE KEY")).unwrap_or(false) && x25519_raw(pem.unwrap_or("")).is_some() {
+    if pem.map(|p| p.contains("PRIVATE KEY")).unwrap_or(false)
+        && x25519_raw(pem.unwrap_or("")).is_some()
+    {
         // X25519 PKCS#8 is a fixed 48-byte structure; distinguish by OID byte.
         let der = pem_body(pem.unwrap_or(""));
         if der.len() == 48 && der[9..12] == [0x2b, 0x65, 0x6e] {
@@ -1129,16 +1329,28 @@ fn detect_private(bytes: &[u8]) -> Option<&'static str> {
 /// Detect the asymmetric type of a public-key PEM/DER by trial parsing.
 fn detect_public(bytes: &[u8]) -> Option<&'static str> {
     let pem = std::str::from_utf8(bytes).ok();
-    if pem.map(|p| rsa::RsaPublicKey::from_public_key_pem(p).is_ok()).unwrap_or(false) {
+    if pem
+        .map(|p| rsa::RsaPublicKey::from_public_key_pem(p).is_ok())
+        .unwrap_or(false)
+    {
         return Some("rsa");
     }
-    if pem.map(|p| p256::PublicKey::from_public_key_pem(p).is_ok()).unwrap_or(false) {
+    if pem
+        .map(|p| p256::PublicKey::from_public_key_pem(p).is_ok())
+        .unwrap_or(false)
+    {
         return Some("ec");
     }
-    if pem.map(|p| p384::PublicKey::from_public_key_pem(p).is_ok()).unwrap_or(false) {
+    if pem
+        .map(|p| p384::PublicKey::from_public_key_pem(p).is_ok())
+        .unwrap_or(false)
+    {
         return Some("ec");
     }
-    if pem.map(|p| ed25519_dalek::VerifyingKey::from_public_key_pem(p).is_ok()).unwrap_or(false) {
+    if pem
+        .map(|p| ed25519_dalek::VerifyingKey::from_public_key_pem(p).is_ok())
+        .unwrap_or(false)
+    {
         return Some("ed25519");
     }
     if let Some(p) = pem {
@@ -1184,23 +1396,38 @@ fn public_pem_from_private(bytes: &[u8], asym: &str) -> Result<String, String> {
                 .and_then(|p| rsa::RsaPrivateKey::from_pkcs8_pem(p).ok())
                 .or_else(|| rsa::RsaPrivateKey::from_pkcs8_der(bytes).ok())
                 .ok_or_else(err)?;
-            rsa::RsaPublicKey::from(&sk).to_public_key_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))
+            rsa::RsaPublicKey::from(&sk)
+                .to_public_key_pem(LineEnding::LF)
+                .map_err(|e| format!("Error: {e}"))
         }
         "ec" => {
             if let Some(sk) = pem.and_then(|p| p256::SecretKey::from_pkcs8_pem(p).ok()) {
-                return sk.public_key().to_public_key_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"));
+                return sk
+                    .public_key()
+                    .to_public_key_pem(LineEnding::LF)
+                    .map_err(|e| format!("Error: {e}"));
             }
-            let sk = pem.and_then(|p| p384::SecretKey::from_pkcs8_pem(p).ok()).ok_or_else(err)?;
-            sk.public_key().to_public_key_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))
+            let sk = pem
+                .and_then(|p| p384::SecretKey::from_pkcs8_pem(p).ok())
+                .ok_or_else(err)?;
+            sk.public_key()
+                .to_public_key_pem(LineEnding::LF)
+                .map_err(|e| format!("Error: {e}"))
         }
         "ed25519" => {
-            let sk = pem.and_then(|p| ed25519_dalek::SigningKey::from_pkcs8_pem(p).ok()).ok_or_else(err)?;
-            sk.verifying_key().to_public_key_pem(LineEnding::LF).map_err(|e| format!("Error: {e}"))
+            let sk = pem
+                .and_then(|p| ed25519_dalek::SigningKey::from_pkcs8_pem(p).ok())
+                .ok_or_else(err)?;
+            sk.verifying_key()
+                .to_public_key_pem(LineEnding::LF)
+                .map_err(|e| format!("Error: {e}"))
         }
         "x25519" => {
             let raw = pem.and_then(x25519_raw).ok_or_else(err)?;
             let sk = x25519_dalek::StaticSecret::from(raw);
-            Ok(x25519_public_pem(x25519_dalek::PublicKey::from(&sk).as_bytes()))
+            Ok(x25519_public_pem(
+                x25519_dalek::PublicKey::from(&sk).as_bytes(),
+            ))
         }
         _ => Err(err()),
     }
@@ -1276,10 +1503,20 @@ fn sign_data(key: &[u8], algo: &str, data: &[u8]) -> Result<Vec<u8>, String> {
 /// RSA PKCS#1 v1.5 signature over `data` for the selected digest.
 fn rsa_sign(sk: &rsa::RsaPrivateKey, digest: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     let sig = match digest {
-        "sha256" => rsa::pkcs1v15::SigningKey::<Sha256>::new(sk.clone()).sign(data).to_vec(),
-        "sha384" => rsa::pkcs1v15::SigningKey::<Sha384>::new(sk.clone()).sign(data).to_vec(),
-        "sha512" => rsa::pkcs1v15::SigningKey::<Sha512>::new(sk.clone()).sign(data).to_vec(),
-        _ => return Err(format!("Error: Unsupported digest for RSA signing: {digest}")),
+        "sha256" => rsa::pkcs1v15::SigningKey::<Sha256>::new(sk.clone())
+            .sign(data)
+            .to_vec(),
+        "sha384" => rsa::pkcs1v15::SigningKey::<Sha384>::new(sk.clone())
+            .sign(data)
+            .to_vec(),
+        "sha512" => rsa::pkcs1v15::SigningKey::<Sha512>::new(sk.clone())
+            .sign(data)
+            .to_vec(),
+        _ => {
+            return Err(format!(
+                "Error: Unsupported digest for RSA signing: {digest}"
+            ))
+        }
     };
     Ok(sig)
 }
@@ -1291,27 +1528,39 @@ fn verify_data(key: &[u8], algo: &str, data: &[u8], sig: &[u8]) -> Result<bool, 
     if let Some(pk) = pem
         .and_then(|p| rsa::RsaPublicKey::from_public_key_pem(p).ok())
         .or_else(|| pem.and_then(|p| rsa::RsaPublicKey::from_pkcs1_pem(p).ok()))
-        .or_else(|| pem.and_then(|p| rsa::RsaPrivateKey::from_pkcs8_pem(p).ok()).map(|s| rsa::RsaPublicKey::from(&s)))
+        .or_else(|| {
+            pem.and_then(|p| rsa::RsaPrivateKey::from_pkcs8_pem(p).ok())
+                .map(|s| rsa::RsaPublicKey::from(&s))
+        })
     {
         return rsa_verify(&pk, &d, data, sig);
     }
     if let Some(vk) = pem
         .and_then(|p| p256::ecdsa::VerifyingKey::from_public_key_pem(p).ok())
-        .or_else(|| pem.and_then(|p| p256::ecdsa::SigningKey::from_pkcs8_pem(p).ok()).map(|s| *s.verifying_key()))
+        .or_else(|| {
+            pem.and_then(|p| p256::ecdsa::SigningKey::from_pkcs8_pem(p).ok())
+                .map(|s| *s.verifying_key())
+        })
     {
         let s = p256::ecdsa::Signature::from_der(sig).map_err(|e| format!("Error: {e}"))?;
         return Ok(vk.verify(data, &s).is_ok());
     }
     if let Some(vk) = pem
         .and_then(|p| p384::ecdsa::VerifyingKey::from_public_key_pem(p).ok())
-        .or_else(|| pem.and_then(|p| p384::ecdsa::SigningKey::from_pkcs8_pem(p).ok()).map(|s| *s.verifying_key()))
+        .or_else(|| {
+            pem.and_then(|p| p384::ecdsa::SigningKey::from_pkcs8_pem(p).ok())
+                .map(|s| *s.verifying_key())
+        })
     {
         let s = p384::ecdsa::Signature::from_der(sig).map_err(|e| format!("Error: {e}"))?;
         return Ok(vk.verify(data, &s).is_ok());
     }
     if let Some(vk) = pem
         .and_then(|p| ed25519_dalek::VerifyingKey::from_public_key_pem(p).ok())
-        .or_else(|| pem.and_then(|p| ed25519_dalek::SigningKey::from_pkcs8_pem(p).ok()).map(|s| s.verifying_key()))
+        .or_else(|| {
+            pem.and_then(|p| ed25519_dalek::SigningKey::from_pkcs8_pem(p).ok())
+                .map(|s| s.verifying_key())
+        })
     {
         let s = ed25519_dalek::Signature::from_slice(sig).map_err(|e| format!("Error: {e}"))?;
         return Ok(vk.verify(data, &s).is_ok());
@@ -1320,26 +1569,52 @@ fn verify_data(key: &[u8], algo: &str, data: &[u8], sig: &[u8]) -> Result<bool, 
 }
 
 /// RSA PKCS#1 v1.5 verify for the selected digest.
-fn rsa_verify(pk: &rsa::RsaPublicKey, digest: &str, data: &[u8], sig: &[u8]) -> Result<bool, String> {
+fn rsa_verify(
+    pk: &rsa::RsaPublicKey,
+    digest: &str,
+    data: &[u8],
+    sig: &[u8],
+) -> Result<bool, String> {
     let signature = match rsa::pkcs1v15::Signature::try_from(sig) {
         Ok(s) => s,
         Err(_) => return Ok(false),
     };
     let ok = match digest {
-        "sha256" => rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pk.clone()).verify(data, &signature).is_ok(),
-        "sha384" => rsa::pkcs1v15::VerifyingKey::<Sha384>::new(pk.clone()).verify(data, &signature).is_ok(),
-        "sha512" => rsa::pkcs1v15::VerifyingKey::<Sha512>::new(pk.clone()).verify(data, &signature).is_ok(),
-        _ => return Err(format!("Error: Unsupported digest for RSA verifying: {digest}")),
+        "sha256" => rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pk.clone())
+            .verify(data, &signature)
+            .is_ok(),
+        "sha384" => rsa::pkcs1v15::VerifyingKey::<Sha384>::new(pk.clone())
+            .verify(data, &signature)
+            .is_ok(),
+        "sha512" => rsa::pkcs1v15::VerifyingKey::<Sha512>::new(pk.clone())
+            .verify(data, &signature)
+            .is_ok(),
+        _ => {
+            return Err(format!(
+                "Error: Unsupported digest for RSA verifying: {digest}"
+            ))
+        }
     };
     Ok(ok)
 }
 
 /// `Sign`/`Verify` instance dispatch.
-pub fn sign_verify_instance_call(tag: &str, recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+pub fn sign_verify_instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     match method {
         "update" => {
-            let enc = if args.len() > 1 { arg_str(args, 1) } else { "utf8".into() };
-            let bytes = if super::native_tag(args.first().unwrap_or(&Value::Undef)).as_deref() == Some("Buffer") {
+            let enc = if args.len() > 1 {
+                arg_str(args, 1)
+            } else {
+                "utf8".into()
+            };
+            let bytes = if super::native_tag(args.first().unwrap_or(&Value::Undef)).as_deref()
+                == Some("Buffer")
+            {
                 val_bytes_at(args, 0)
             } else {
                 decode(&arg_str(args, 0), &enc)
@@ -1359,7 +1634,11 @@ pub fn sign_verify_instance_call(tag: &str, recv: &Value, method: &str, args: &[
             let (algo, data) = sign_verify_state(recv);
             let key = key_material(args.first().unwrap_or(&Value::Undef));
             let sig = sign_data(&key, &algo, &data)?;
-            let out_enc = if args.len() > 1 { Some(arg_str(args, 1)) } else { None };
+            let out_enc = if args.len() > 1 {
+                Some(arg_str(args, 1))
+            } else {
+                None
+            };
             Ok(encode_out(&sig, out_enc.as_deref()))
         }
         "verify" => {
@@ -1372,7 +1651,10 @@ pub fn sign_verify_instance_call(tag: &str, recv: &Value, method: &str, args: &[
             };
             Ok(Value::Bool(verify_data(&key, &algo, &data, &sig)?))
         }
-        _ => Err(crate::host::type_error(&format!("{}.{method} is not a function", tag.to_ascii_lowercase()))),
+        _ => Err(crate::host::type_error(&format!(
+            "{}.{method} is not a function",
+            tag.to_ascii_lowercase()
+        ))),
     }
 }
 
@@ -1395,7 +1677,11 @@ fn rsa_padding(v: &Value) -> (i64, String) {
     let padding = opt_num(v, &["padding"], 4.0) as i64; // RSA_PKCS1_OAEP_PADDING
     let oaep = {
         let h = opt_str(v, "oaepHash");
-        if h.is_empty() { "sha1".to_string() } else { h.to_ascii_lowercase() }
+        if h.is_empty() {
+            "sha1".to_string()
+        } else {
+            h.to_ascii_lowercase()
+        }
     };
     (padding, oaep)
 }
@@ -1406,7 +1692,10 @@ fn parse_rsa_public(key: &[u8]) -> Result<rsa::RsaPublicKey, String> {
     pem.and_then(|p| rsa::RsaPublicKey::from_public_key_pem(p).ok())
         .or_else(|| pem.and_then(|p| rsa::RsaPublicKey::from_pkcs1_pem(p).ok()))
         .or_else(|| rsa::RsaPublicKey::from_public_key_der(key).ok())
-        .or_else(|| pem.and_then(|p| rsa::RsaPrivateKey::from_pkcs8_pem(p).ok()).map(|s| rsa::RsaPublicKey::from(&s)))
+        .or_else(|| {
+            pem.and_then(|p| rsa::RsaPrivateKey::from_pkcs8_pem(p).ok())
+                .map(|s| rsa::RsaPublicKey::from(&s))
+        })
         .ok_or_else(|| "Error: Failed to parse RSA public key".into())
 }
 
@@ -1578,7 +1867,11 @@ pub fn dh_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Va
     let enc = |args: &[Value], i: usize| -> Option<String> {
         if args.len() > i {
             let s = arg_str(args, i);
-            if s.is_empty() { None } else { Some(s) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         } else {
             None
         }
@@ -1594,7 +1887,10 @@ pub fn dh_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Va
             Ok(encode_out(&pub_key.to_bytes_be(), enc(args, 0).as_deref()))
         }
         "computeSecret" => {
-            let other = if args.len() > 1 && !arg_str(args, 1).is_empty() && !matches!(args.first(), Some(v) if super::native_tag(v).as_deref() == Some("Buffer")) {
+            let other = if args.len() > 1
+                && !arg_str(args, 1).is_empty()
+                && !matches!(args.first(), Some(v) if super::native_tag(v).as_deref() == Some("Buffer"))
+            {
                 decode(&arg_str(args, 0), &arg_str(args, 1))
             } else {
                 val_bytes_at(args, 0)
@@ -1606,10 +1902,22 @@ pub fn dh_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Va
             let out_enc = if args.len() > 2 { enc(args, 2) } else { None };
             Ok(encode_out(&secret.to_bytes_be(), out_enc.as_deref()))
         }
-        "getPrime" => Ok(encode_out(&obj_bytes(recv, "@@prime"), enc(args, 0).as_deref())),
-        "getGenerator" => Ok(encode_out(&obj_bytes(recv, "@@gen"), enc(args, 0).as_deref())),
-        "getPublicKey" => Ok(encode_out(&obj_bytes(recv, "@@pub"), enc(args, 0).as_deref())),
-        "getPrivateKey" => Ok(encode_out(&obj_bytes(recv, "@@priv"), enc(args, 0).as_deref())),
+        "getPrime" => Ok(encode_out(
+            &obj_bytes(recv, "@@prime"),
+            enc(args, 0).as_deref(),
+        )),
+        "getGenerator" => Ok(encode_out(
+            &obj_bytes(recv, "@@gen"),
+            enc(args, 0).as_deref(),
+        )),
+        "getPublicKey" => Ok(encode_out(
+            &obj_bytes(recv, "@@pub"),
+            enc(args, 0).as_deref(),
+        )),
+        "getPrivateKey" => Ok(encode_out(
+            &obj_bytes(recv, "@@priv"),
+            enc(args, 0).as_deref(),
+        )),
         "setPublicKey" => {
             set_obj_bytes(recv, "@@pub", &val_bytes_at(args, 0));
             Ok(recv.clone())
@@ -1618,7 +1926,9 @@ pub fn dh_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Va
             set_obj_bytes(recv, "@@priv", &val_bytes_at(args, 0));
             Ok(recv.clone())
         }
-        _ => Err(crate::host::type_error(&format!("dh.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "dh.{method} is not a function"
+        ))),
     }
 }
 
@@ -1654,25 +1964,45 @@ pub fn ecdh_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<
             let (priv_b, pub_b) = ecdh_generate(&curve)?;
             set_obj_bytes(recv, "@@priv", &priv_b);
             set_obj_bytes(recv, "@@pub", &pub_b);
-            let out_enc = if args.len() > 1 { Some(arg_str(args, 1)) } else { None };
+            let out_enc = if args.len() > 1 {
+                Some(arg_str(args, 1))
+            } else {
+                None
+            };
             Ok(encode_out(&pub_b, out_enc.as_deref()))
         }
         "computeSecret" => {
-            let other = if args.len() > 1 && !arg_str(args, 1).is_empty() && super::native_tag(args.first().unwrap_or(&Value::Undef)).as_deref() != Some("Buffer") {
+            let other = if args.len() > 1
+                && !arg_str(args, 1).is_empty()
+                && super::native_tag(args.first().unwrap_or(&Value::Undef)).as_deref()
+                    != Some("Buffer")
+            {
                 decode(&arg_str(args, 0), &arg_str(args, 1))
             } else {
                 val_bytes_at(args, 0)
             };
             let secret = ecdh_compute(&curve, &obj_bytes(recv, "@@priv"), &other)?;
-            let out_enc = if args.len() > 2 { Some(arg_str(args, 2)) } else { None };
+            let out_enc = if args.len() > 2 {
+                Some(arg_str(args, 2))
+            } else {
+                None
+            };
             Ok(encode_out(&secret, out_enc.as_deref()))
         }
         "getPublicKey" => {
-            let out_enc = if args.len() > 1 { Some(arg_str(args, 1)) } else { None };
+            let out_enc = if args.len() > 1 {
+                Some(arg_str(args, 1))
+            } else {
+                None
+            };
             Ok(encode_out(&obj_bytes(recv, "@@pub"), out_enc.as_deref()))
         }
         "getPrivateKey" => {
-            let out_enc = if !args.is_empty() { Some(arg_str(args, 0)) } else { None };
+            let out_enc = if !args.is_empty() {
+                Some(arg_str(args, 0))
+            } else {
+                None
+            };
             Ok(encode_out(&obj_bytes(recv, "@@priv"), out_enc.as_deref()))
         }
         "setPrivateKey" => {
@@ -1682,7 +2012,9 @@ pub fn ecdh_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<
             set_obj_bytes(recv, "@@pub", &pub_b);
             Ok(recv.clone())
         }
-        _ => Err(crate::host::type_error(&format!("ecdh.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "ecdh.{method} is not a function"
+        ))),
     }
 }
 
@@ -1767,17 +2099,31 @@ fn diffie_hellman_oneshot(opts: Option<&Value>) -> Result<Value, String> {
     let secret = match asym {
         "ec" => {
             if let Some(sk) = priv_pem.and_then(|p| p256::SecretKey::from_pkcs8_pem(p).ok()) {
-                let pk = pub_pem.and_then(|p| p256::PublicKey::from_public_key_pem(p).ok()).ok_or("Error: bad public key")?;
-                p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine()).raw_secret_bytes().to_vec()
+                let pk = pub_pem
+                    .and_then(|p| p256::PublicKey::from_public_key_pem(p).ok())
+                    .ok_or("Error: bad public key")?;
+                p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine())
+                    .raw_secret_bytes()
+                    .to_vec()
             } else {
-                let sk = priv_pem.and_then(|p| p384::SecretKey::from_pkcs8_pem(p).ok()).ok_or("Error: bad private key")?;
-                let pk = pub_pem.and_then(|p| p384::PublicKey::from_public_key_pem(p).ok()).ok_or("Error: bad public key")?;
-                p384::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine()).raw_secret_bytes().to_vec()
+                let sk = priv_pem
+                    .and_then(|p| p384::SecretKey::from_pkcs8_pem(p).ok())
+                    .ok_or("Error: bad private key")?;
+                let pk = pub_pem
+                    .and_then(|p| p384::PublicKey::from_public_key_pem(p).ok())
+                    .ok_or("Error: bad public key")?;
+                p384::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine())
+                    .raw_secret_bytes()
+                    .to_vec()
             }
         }
         "x25519" => {
-            let sraw = priv_pem.and_then(x25519_raw).ok_or("Error: bad private key")?;
-            let praw = pub_pem.and_then(x25519_raw).ok_or("Error: bad public key")?;
+            let sraw = priv_pem
+                .and_then(x25519_raw)
+                .ok_or("Error: bad private key")?;
+            let praw = pub_pem
+                .and_then(x25519_raw)
+                .ok_or("Error: bad public key")?;
             let sk = x25519_dalek::StaticSecret::from(sraw);
             let pk = x25519_dalek::PublicKey::from(praw);
             sk.diffie_hellman(&pk).as_bytes().to_vec()
@@ -1791,7 +2137,9 @@ fn diffie_hellman_oneshot(opts: Option<&Value>) -> Result<Value, String> {
 
 /// A key/number argument as a `BigUint` (BigInt, Buffer big-endian, or number).
 fn arg_biguint(v: Option<&Value>) -> BigUint {
-    let Some(v) = v else { return BigUint::from(0u32) };
+    let Some(v) = v else {
+        return BigUint::from(0u32);
+    };
     if let Some(b) = with_host(|h| match h.get(v) {
         Some(JsObj::BigInt(b)) => b.to_biguint(),
         _ => None,
@@ -1818,7 +2166,9 @@ fn generate_prime(bits: usize, opts: Option<Value>) -> Result<Value, String> {
         .map(|o| with_host(|h| matches!(h.get(&o), Some(JsObj::Object(m)) if m.get("bigint").map(|v| h.truthy(v)).unwrap_or(false))))
         .unwrap_or(false);
     if want_bigint {
-        Ok(with_host(|h| h.alloc(JsObj::BigInt(num_bigint::BigInt::from(p)))))
+        Ok(with_host(|h| {
+            h.alloc(JsObj::BigInt(num_bigint::BigInt::from(p)))
+        }))
     } else {
         // Node returns an ArrayBuffer; this runtime's ArrayBuffer carries no
         // backing bytes, so a Buffer (also a byte view) is returned instead.
@@ -1840,7 +2190,8 @@ fn gen_prime(bits: usize) -> Result<BigUint, String> {
     let last = nbytes - 1;
     buf[last] |= 1;
     let start = BigUint::from_bytes_be(&buf);
-    num_prime::nt_funcs::next_prime(&start, None).ok_or_else(|| "Error: prime generation failed".into())
+    num_prime::nt_funcs::next_prime(&start, None)
+        .ok_or_else(|| "Error: prime generation failed".into())
 }
 
 // ── argon2 ──────────────────────────────────────────────────────────────
@@ -1860,14 +2211,17 @@ fn argon2_hash(algo: &str, opts: Option<&Value>) -> Result<Vec<u8>, String> {
         "argon2i" => argon2::Algorithm::Argon2i,
         _ => argon2::Algorithm::Argon2id,
     };
-    let params = argon2::Params::new(mem, passes, par, Some(taglen)).map_err(|e| format!("Error: {e}"))?;
+    let params =
+        argon2::Params::new(mem, passes, par, Some(taglen)).map_err(|e| format!("Error: {e}"))?;
     let ctx = if secret.is_empty() {
         argon2::Argon2::new(algorithm, argon2::Version::V0x13, params)
     } else {
-        argon2::Argon2::new_with_secret(&secret, algorithm, argon2::Version::V0x13, params).map_err(|e| format!("Error: {e}"))?
+        argon2::Argon2::new_with_secret(&secret, algorithm, argon2::Version::V0x13, params)
+            .map_err(|e| format!("Error: {e}"))?
     };
     let mut out = vec![0u8; taglen];
-    ctx.hash_password_into(&msg, &salt, &mut out).map_err(|e| format!("Error: {e}"))?;
+    ctx.hash_password_into(&msg, &salt, &mut out)
+        .map_err(|e| format!("Error: {e}"))?;
     Ok(out)
 }
 
@@ -1884,7 +2238,9 @@ fn prop_bytes(obj: &Value, key: &str) -> Vec<u8> {
 
 /// `getRandomValues(typedArray)` — fill in place with CSPRNG bytes, return it.
 fn get_random_values(v: Option<&Value>) -> Result<Value, String> {
-    let ta = v.cloned().ok_or("Error: argument must be an integer-type TypedArray")?;
+    let ta = v
+        .cloned()
+        .ok_or("Error: argument must be an integer-type TypedArray")?;
     let tag = super::native_tag(&ta);
     if tag.as_deref() == Some("Buffer") {
         let len = val_bytes(&ta).len();
@@ -1968,7 +2324,11 @@ fn set_obj_bytes_named(recv: &Value, key: &str, bytes: &[u8]) {
 // ── KeyObject instance methods ──────────────────────────────────────────
 
 /// `KeyObject` instance dispatch (`export({type,format})`, `equals`).
-pub fn key_object_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+pub fn key_object_instance_call(
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     match method {
         "export" => {
             // Secret key: raw bytes (Buffer) unless format 'jwk' (unsupported).
@@ -1993,7 +2353,9 @@ pub fn key_object_instance_call(recv: &Value, method: &str, args: &[Value]) -> R
             let mine = obj_str(recv, "@@pem").into_bytes();
             Ok(Value::Bool(mine == other))
         }
-        _ => Err(crate::host::type_error(&format!("keyObject.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "keyObject.{method} is not a function"
+        ))),
     }
 }
 
@@ -2013,16 +2375,30 @@ pub fn construct_x509(args: &[Value]) -> Result<Value, String> {
     let der = cert.to_der().map_err(|e| format!("Error: {e}"))?;
     let fp = {
         let d = digest("sha1", &der);
-        d.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+        d.iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
     };
     let subject = x509_name_node(&cert.tbs_certificate.subject.to_string());
     let issuer = x509_name_node(&cert.tbs_certificate.issuer.to_string());
     let not_before = x509_time(&cert.tbs_certificate.validity.not_before);
     let not_after = x509_time(&cert.tbs_certificate.validity.not_after);
-    let serial = cert.tbs_certificate.serial_number.as_bytes().iter().map(|b| format!("{b:02X}")).collect::<String>();
-    let spki_der = cert.tbs_certificate.subject_public_key_info.to_der().map_err(|e| format!("Error: {e}"))?;
+    let serial = cert
+        .tbs_certificate
+        .serial_number
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<String>();
+    let spki_der = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|e| format!("Error: {e}"))?;
     let pub_pem = pem_wrap("PUBLIC KEY", &spki_der);
-    let pub_key = create_public_key(Some(&with_host(|h| h.new_str(pub_pem)))).unwrap_or(Value::Undef);
+    let pub_key =
+        create_public_key(Some(&with_host(|h| h.new_str(pub_pem)))).unwrap_or(Value::Undef);
     let cert_pem = pem_wrap("CERTIFICATE", &der);
     let raw = super::buffer::from_bytes(&der);
     Ok(with_host(|h| {
@@ -2045,21 +2421,33 @@ pub fn construct_x509(args: &[Value]) -> Result<Value, String> {
 pub fn x509_instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
     match method {
         "toString" => Ok(with_host(|h| h.new_str(obj_str(recv, "@@pem")))),
-        _ => Err(crate::host::type_error(&format!("x509Certificate.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "x509Certificate.{method} is not a function"
+        ))),
     }
 }
 
 /// Convert an RFC 4514 name string ("O=Org,CN=Name") to Node's newline,
 /// most-significant-last form ("CN=Name\nO=Org").
 fn x509_name_node(rfc4514: &str) -> String {
-    rfc4514.split(',').map(|s| s.trim()).rev().collect::<Vec<_>>().join("\n")
+    rfc4514
+        .split(',')
+        .map(|s| s.trim())
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Render an X.509 time in OpenSSL's `%b %e %H:%M:%S %Y GMT` form.
 fn x509_time(t: &x509_cert::time::Time) -> String {
-    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let dt = t.to_date_time();
-    let mon = MON.get(dt.month().saturating_sub(1) as usize).copied().unwrap_or("Jan");
+    let mon = MON
+        .get(dt.month().saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("Jan");
     format!(
         "{} {:2} {:02}:{:02}:{:02} {} GMT",
         mon,
@@ -2080,4 +2468,3 @@ const MODP15: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A
 const MODP16: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199FFFFFFFFFFFFFFFF";
 const MODP17: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C93402849236C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BDF8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1BDB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F323A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AACC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE32806A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55CDA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE12BF2D5B0B7474D6E694F91E6DCC4024FFFFFFFFFFFFFFFF";
 const MODP18: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C93402849236C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BDF8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1BDB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F323A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AACC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE32806A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55CDA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE12BF2D5B0B7474D6E694F91E6DBE115974A3926F12FEE5E438777CB6A932DF8CD8BEC4D073B931BA3BC832B68D9DD300741FA7BF8AFC47ED2576F6936BA424663AAB639C5AE4F5683423B4742BF1C978238F16CBE39D652DE3FDB8BEFC848AD922222E04A4037C0713EB57A81A23F0C73473FC646CEA306B4BCBC8862F8385DDFA9D4B7FA2C087E879683303ED5BDD3A062B3CF5B3A278A66D2A13F83F44F82DDF310EE074AB6A364597E899A0255DC164F31CC50846851DF9AB48195DED7EA1B1D510BD7EE74D73FAF36BC31ECFA268359046F4EB879F924009438B481C6CD7889A002ED5EE382BC9190DA6FC026E479558E4475677E9AA9E3050E2765694DFC81F56E880B96E7160C980DD98EDD3DFFFFFFFFFFFFFFFFF";
-

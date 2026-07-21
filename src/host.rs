@@ -185,11 +185,17 @@ pub enum JsObj {
     Builtin(String),
     /// A bound method value (`obj.method` captured then called): dispatches
     /// through `call_method(recv, name, args)` when invoked.
-    BoundMethod { recv: Value, name: String },
+    BoundMethod {
+        recv: Value,
+        name: String,
+    },
     /// The single canonical `null`.
     Null,
     /// A live iterator over a sequence, with a cursor.
-    Iter { items: Vec<Value>, idx: usize },
+    Iter {
+        items: Vec<Value>,
+        idx: usize,
+    },
     /// A bound function (`fn.bind(thisArg, ...preargs)`).
     BoundFunc {
         target: Value,
@@ -200,16 +206,29 @@ pub enum JsObj {
     Class(ClassVal),
     /// A `Symbol` — a unique property key. `registered` marks a `Symbol.for`
     /// key (shared) vs a fresh `Symbol()`.
-    Symbol { desc: Option<String>, id: u64 },
+    Symbol {
+        desc: Option<String>,
+        id: u64,
+    },
     /// A `Map` (or `WeakMap` when `weak`): insertion-ordered key→value entries.
-    Map { entries: IndexMap<MapKey, (Value, Value)>, weak: bool },
+    Map {
+        entries: IndexMap<MapKey, (Value, Value)>,
+        weak: bool,
+    },
     /// A `Set` (or `WeakSet` when `weak`): insertion-ordered unique values.
-    Set { entries: IndexMap<MapKey, Value>, weak: bool },
+    Set {
+        entries: IndexMap<MapKey, Value>,
+        weak: bool,
+    },
     /// A live generator, backed by a stackful `corosensei` coroutine in
     /// `JsHost.generators`.
-    Generator { id: u32 },
+    Generator {
+        id: u32,
+    },
     /// A Promise, backed by a `PromiseCell` in `JsHost.promises`.
-    Promise { id: u32 },
+    Promise {
+        id: u32,
+    },
     /// An arbitrary-precision `BigInt` (`typeof === "bigint"`).
     BigInt(num_bigint::BigInt),
     /// A compiled regular expression (`/pat/flags` or `new RegExp(...)`).
@@ -651,30 +670,52 @@ impl JsHost {
     }
     pub fn set_fn_prop(&mut self, v: &Value, name: &str, val: Value) {
         if let Value::Obj(i) = v {
-            self.fn_props.entry(*i).or_default().insert(name.to_string(), val);
+            self.fn_props
+                .entry(*i)
+                .or_default()
+                .insert(name.to_string(), val);
         }
     }
     /// A user-assigned static on a builtin namespace (`Error.prepareStackTrace`).
     pub fn builtin_static(&self, ns: &str, name: &str) -> Option<Value> {
-        self.builtin_statics.get(ns).and_then(|m| m.get(name).cloned())
+        self.builtin_statics
+            .get(ns)
+            .and_then(|m| m.get(name).cloned())
     }
     /// Assign a static on a builtin namespace (persists across fresh `Builtin`
     /// handles for the same namespace).
     pub fn set_builtin_static(&mut self, ns: &str, name: &str, val: Value) {
-        self.builtin_statics.entry(ns.to_string()).or_default().insert(name.to_string(), val);
+        self.builtin_statics
+            .entry(ns.to_string())
+            .or_default()
+            .insert(name.to_string(), val);
     }
     pub fn fn_prop_keys(&self, v: &Value) -> Vec<String> {
         if let Value::Obj(i) = v {
-            self.fn_props.get(i).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+            self.fn_props
+                .get(i)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
         } else {
             Vec::new()
         }
     }
 
     /// Install an accessor `(get, set)` for `key` on the object `owner`.
-    pub fn set_accessor(&mut self, owner: &Value, key: &str, get: Option<Value>, set: Option<Value>) {
+    pub fn set_accessor(
+        &mut self,
+        owner: &Value,
+        key: &str,
+        get: Option<Value>,
+        set: Option<Value>,
+    ) {
         if let Value::Obj(i) = owner {
-            let slot = self.accessors.entry(*i).or_default().entry(key.to_string()).or_insert((None, None));
+            let slot = self
+                .accessors
+                .entry(*i)
+                .or_default()
+                .entry(key.to_string())
+                .or_insert((None, None));
             if get.is_some() {
                 slot.0 = get;
             }
@@ -868,14 +909,23 @@ impl JsHost {
         if self.frames.len() == 1 {
             self.globals.insert(name.to_string(), val);
         } else {
-            self.cur_env().borrow_mut().vars.insert(name.to_string(), val);
+            self.cur_env()
+                .borrow_mut()
+                .vars
+                .insert(name.to_string(), val);
         }
     }
     pub fn set_global(&mut self, name: &str, val: Value) {
         self.globals.insert(name.to_string(), val);
     }
     pub fn del_name(&mut self, name: &str) {
-        if self.cur_env().borrow_mut().vars.shift_remove(name).is_some() {
+        if self
+            .cur_env()
+            .borrow_mut()
+            .vars
+            .shift_remove(name)
+            .is_some()
+        {
             return;
         }
         self.globals.shift_remove(name);
@@ -909,10 +959,12 @@ impl JsHost {
     /// Resolve `super.name` to either the parent-prototype getter (to be invoked
     /// by the caller, outside any host borrow) or a directly-usable value.
     pub fn super_resolve(&self, name: &str) -> SuperRef {
-        let parent = match self.current_home_class().and_then(|cv| match self.get(&cv) {
-            Some(JsObj::Class(c)) => c.parent.clone(),
-            _ => None,
-        }) {
+        let parent = match self
+            .current_home_class()
+            .and_then(|cv| match self.get(&cv) {
+                Some(JsObj::Class(c)) => c.parent.clone(),
+                _ => None,
+            }) {
             Some(p) => p,
             None => return SuperRef::Data(Value::Undef),
         };
@@ -1088,11 +1140,36 @@ impl JsHost {
                 // objects (`Math`, `JSON`, `require('fs')`, …) which are "object".
                 Some(JsObj::Builtin(n)) => {
                     const NON_CALLABLE_NS: &[&str] = &[
-                        "Math", "JSON", "console", "Reflect", "process", "Atomics",
-                        "performance", "fs", "path", "os", "util", "crypto", "querystring",
-                        "events", "stream", "timers", "perf_hooks", "async_hooks",
-                        "diagnostics_channel", "v8", "dns", "punycode", "child_process",
-                        "tty", "url", "zlib", "string_decoder", "assert", "http", "net",
+                        "Math",
+                        "JSON",
+                        "console",
+                        "Reflect",
+                        "process",
+                        "Atomics",
+                        "performance",
+                        "fs",
+                        "path",
+                        "os",
+                        "util",
+                        "crypto",
+                        "querystring",
+                        "events",
+                        "stream",
+                        "timers",
+                        "perf_hooks",
+                        "async_hooks",
+                        "diagnostics_channel",
+                        "v8",
+                        "dns",
+                        "punycode",
+                        "child_process",
+                        "tty",
+                        "url",
+                        "zlib",
+                        "string_decoder",
+                        "assert",
+                        "http",
+                        "net",
                         "buffer",
                     ];
                     if NON_CALLABLE_NS.contains(&n.as_str()) {
@@ -1204,7 +1281,11 @@ impl JsHost {
                     }
                 }
                 Some(JsObj::Func(f)) => {
-                    let name = self.funcs.get(f.def_id).map(|d| d.name.clone()).unwrap_or_default();
+                    let name = self
+                        .funcs
+                        .get(f.def_id)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default();
                     format!("function {name}() {{ [code] }}")
                 }
                 Some(JsObj::Builtin(n)) => format!("function {n}() {{ [native code] }}"),
@@ -1267,8 +1348,10 @@ impl JsHost {
                     if indent > 2 * inspect_max_depth() {
                         return "[Array]".into();
                     }
-                    let inner: Vec<String> =
-                        items.iter().map(|x| self.inspect_lvl(x, indent + 2)).collect();
+                    let inner: Vec<String> = items
+                        .iter()
+                        .map(|x| self.inspect_lvl(x, indent + 2))
+                        .collect();
                     self.render_array(&inner, items, indent)
                 }
                 Some(JsObj::Object(props)) => {
@@ -1279,8 +1362,10 @@ impl JsHost {
                         n => format!("{n} "),
                     };
                     // Skip internal symbol-keyed props (`@@…`) in the display.
-                    let shown: Vec<(&String, &Value)> =
-                        props.iter().filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#')).collect();
+                    let shown: Vec<(&String, &Value)> = props
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
+                        .collect();
                     if shown.is_empty() {
                         return format!("{prefix}{{}}");
                     }
@@ -1295,7 +1380,9 @@ impl JsHost {
                     }
                     let inner: Vec<String> = shown
                         .iter()
-                        .map(|(k, val)| format!("{}: {}", fmt_key(k), self.inspect_lvl(val, indent + 2)))
+                        .map(|(k, val)| {
+                            format!("{}: {}", fmt_key(k), self.inspect_lvl(val, indent + 2))
+                        })
                         .collect();
                     format!("{prefix}{{ {} }}", inner.join(", "))
                 }
@@ -1336,7 +1423,9 @@ impl JsHost {
                 Some(JsObj::Promise { id }) => match self.promises.get(*id as usize) {
                     Some(c) => match c.state {
                         PromiseState::Pending => "Promise { <pending> }".into(),
-                        PromiseState::Fulfilled => format!("Promise {{ {} }}", self.inspect(&c.value)),
+                        PromiseState::Fulfilled => {
+                            format!("Promise {{ {} }}", self.inspect(&c.value))
+                        }
                         PromiseState::Rejected => {
                             format!("Promise {{ <rejected> {} }}", self.inspect(&c.value))
                         }
@@ -1344,7 +1433,11 @@ impl JsHost {
                     None => "Promise { <pending> }".into(),
                 },
                 Some(JsObj::Func(f)) => {
-                    let name = self.funcs.get(f.def_id).map(|d| d.name.clone()).unwrap_or_default();
+                    let name = self
+                        .funcs
+                        .get(f.def_id)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default();
                     if name.is_empty() {
                         "[Function (anonymous)]".into()
                     } else {
@@ -1404,10 +1497,16 @@ impl JsHost {
             return self.str_of(&n);
         }
         match self.get(v) {
-            Some(JsObj::Func(f)) => self.funcs.get(f.def_id).map(|d| d.name.clone()).unwrap_or_default(),
+            Some(JsObj::Func(f)) => self
+                .funcs
+                .get(f.def_id)
+                .map(|d| d.name.clone())
+                .unwrap_or_default(),
             Some(JsObj::Class(c)) => c.name.clone(),
             Some(JsObj::Builtin(n)) => n.rsplit('.').next().unwrap_or(n).to_string(),
-            Some(JsObj::BoundFunc { target, .. }) => format!("bound {}", self.callable_name(target)),
+            Some(JsObj::BoundFunc { target, .. }) => {
+                format!("bound {}", self.callable_name(target))
+            }
             _ => String::new(),
         }
     }
@@ -1578,7 +1677,10 @@ impl JsHost {
             // A BigInt's `ToPrimitive` is the bigint itself (numeric), NOT a string,
             // so `1n + 2n` is bigint addition, not concatenation. `null` has no
             // string primitive either.
-            Value::Obj(_) => !matches!(self.get(v), Some(JsObj::Null) | Some(JsObj::BigInt(_)) | None),
+            Value::Obj(_) => !matches!(
+                self.get(v),
+                Some(JsObj::Null) | Some(JsObj::BigInt(_)) | None
+            ),
             _ => false,
         }
     }
@@ -1662,9 +1764,11 @@ impl JsHost {
         let (x, y) = match (self.as_bigint(a), self.as_bigint(b)) {
             (Some(x), Some(y)) => (x, y),
             // Exactly one side is a BigInt → the other is a Number/Boolean: illegal.
-            _ => return Err(type_error(
-                "Cannot mix BigInt and other types, use explicit conversions",
-            )),
+            _ => {
+                return Err(type_error(
+                    "Cannot mix BigInt and other types, use explicit conversions",
+                ))
+            }
         };
         let r = match op {
             Add => x + y,
@@ -1700,9 +1804,11 @@ impl JsHost {
     fn bigint_bitwise(&mut self, tag: i64, a: &Value, b: &Value) -> Result<Value, String> {
         let (x, y) = match (self.as_bigint(a), self.as_bigint(b)) {
             (Some(x), Some(y)) => (x, y),
-            _ => return Err(type_error(
-                "Cannot mix BigInt and other types, use explicit conversions",
-            )),
+            _ => {
+                return Err(type_error(
+                    "Cannot mix BigInt and other types, use explicit conversions",
+                ))
+            }
         };
         let r = match tag {
             binop::BITAND => x & y,
@@ -1710,11 +1816,19 @@ impl JsHost {
             binop::BITXOR => x ^ y,
             binop::SHL => {
                 let n = num_traits::ToPrimitive::to_i64(&y).unwrap_or(0);
-                if n >= 0 { x << (n as usize) } else { x >> ((-n) as usize) }
+                if n >= 0 {
+                    x << (n as usize)
+                } else {
+                    x >> ((-n) as usize)
+                }
             }
             binop::SHR => {
                 let n = num_traits::ToPrimitive::to_i64(&y).unwrap_or(0);
-                if n >= 0 { x >> (n as usize) } else { x << ((-n) as usize) }
+                if n >= 0 {
+                    x >> (n as usize)
+                } else {
+                    x << ((-n) as usize)
+                }
             }
             binop::USHR => {
                 return Err(type_error(
@@ -1835,13 +1949,19 @@ fn str_to_number(s: &str) -> f64 {
         return 0.0;
     }
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return i64::from_str_radix(hex, 16).map(|n| n as f64).unwrap_or(f64::NAN);
+        return i64::from_str_radix(hex, 16)
+            .map(|n| n as f64)
+            .unwrap_or(f64::NAN);
     }
     if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return i64::from_str_radix(oct, 8).map(|n| n as f64).unwrap_or(f64::NAN);
+        return i64::from_str_radix(oct, 8)
+            .map(|n| n as f64)
+            .unwrap_or(f64::NAN);
     }
     if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return i64::from_str_radix(bin, 2).map(|n| n as f64).unwrap_or(f64::NAN);
+        return i64::from_str_radix(bin, 2)
+            .map(|n| n as f64)
+            .unwrap_or(f64::NAN);
     }
     match t {
         "Infinity" | "+Infinity" => f64::INFINITY,
@@ -1908,7 +2028,8 @@ fn group_array_elements(
     let biased_max = (actual_max as f64 - 3.0 - average_bias).max(1.0);
     // Ideally a square grid; capped by break length, compact*4, and 15 columns.
     let columns = [
-        ((approx_char_heights * biased_max * output_length as f64).sqrt() / biased_max).round() as i64,
+        ((approx_char_heights * biased_max * output_length as f64).sqrt() / biased_max).round()
+            as i64,
         ((BREAK_LENGTH - indentation_lvl) as f64 / actual_max as f64).floor() as i64,
         (COMPACT * 4) as i64,
         15,
@@ -2001,8 +2122,12 @@ fn quote_str(s: &str) -> String {
 /// Render an object key: bare if it is a valid identifier, quoted otherwise.
 fn fmt_key(k: &str) -> String {
     let ok = !k.is_empty()
-        && k.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$').unwrap_or(false)
-        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        && k.chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+            .unwrap_or(false)
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
     if ok {
         k.to_string()
     } else {
@@ -2028,7 +2153,10 @@ impl JsHost {
             Some(JsObj::Map { entries, .. }) => {
                 // Map iterates as `[key, value]` pairs.
                 let pairs: Vec<(Value, Value)> = entries.values().cloned().collect();
-                Ok(pairs.into_iter().map(|(k, v)| self.new_array(vec![k, v])).collect())
+                Ok(pairs
+                    .into_iter()
+                    .map(|(k, v)| self.new_array(vec![k, v]))
+                    .collect())
             }
             _ => Err(type_error(&format!("{} is not iterable", self.type_of(v)))),
         }
@@ -2038,7 +2166,11 @@ impl JsHost {
     /// symbol-keyed props (`@@…`) are not enumerable.
     pub fn enum_keys(&mut self, v: &Value) -> Vec<Value> {
         let keys: Vec<String> = match self.get(v) {
-            Some(JsObj::Object(props)) => props.keys().filter(|k| !k.starts_with("@@") && !k.starts_with('#')).cloned().collect(),
+            Some(JsObj::Object(props)) => props
+                .keys()
+                .filter(|k| !k.starts_with("@@") && !k.starts_with('#'))
+                .cloned()
+                .collect(),
             Some(JsObj::Array(items)) => (0..items.len()).map(|i| i.to_string()).collect(),
             _ => Vec::new(),
         };
@@ -2203,7 +2335,11 @@ pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result
         Some(JsObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args),
         Some(JsObj::Func(fv)) => run_user_func(&fv, args, this),
         Some(JsObj::BoundMethod { recv, name }) => call_method(&recv, &name, args),
-        Some(JsObj::BoundFunc { target, this: bthis, args: pre }) => {
+        Some(JsObj::BoundFunc {
+            target,
+            this: bthis,
+            args: pre,
+        }) => {
             let mut all = pre;
             all.extend(args);
             invoke(&target, all, Some(bthis))
@@ -2237,15 +2373,16 @@ pub fn run_user_func_nt(
     // prologue (compiled ahead of the user statements).
     bind_params(&env, &def, args);
     // Arrow functions capture `this` lexically; regular functions receive it.
-    let this_val = if fv.is_arrow {
-        fv.this.clone()
-    } else {
-        this
-    };
+    let this_val = if fv.is_arrow { fv.this.clone() } else { this };
     // A generator function does not run its body on call — it returns a suspended
     // generator over the already-bound frame.
     if def.is_generator {
-        return Ok(make_generator(def.chunk.clone(), env, this_val, fv.home_class.clone()));
+        return Ok(make_generator(
+            def.chunk.clone(),
+            env,
+            this_val,
+            fv.home_class.clone(),
+        ));
     }
     // An async function runs on a coroutine and returns a Promise: it executes
     // synchronously up to the first `await`, then continues via microtasks.
@@ -2340,12 +2477,17 @@ pub fn construct_nt(ctor: &Value, args: Vec<Value>, new_target: Value) -> Result
             }
         }
         Some(JsObj::Builtin(name)) => crate::builtins::construct_builtin(&name, args),
-        Some(JsObj::BoundFunc { target, args: pre, .. }) => {
+        Some(JsObj::BoundFunc {
+            target, args: pre, ..
+        }) => {
             let mut all = pre;
             all.extend(args);
             construct_nt(&target, all, new_target)
         }
-        _ => Err(type_error(&format!("{} is not a constructor", with_host(|h| h.str_of(ctor))))),
+        _ => Err(type_error(&format!(
+            "{} is not a constructor",
+            with_host(|h| h.str_of(ctor))
+        ))),
     }
 }
 
@@ -2370,7 +2512,11 @@ fn returns_object(r: &Value) -> bool {
 
 /// Construct a `class` instance: allocate the object linked to `C.prototype`,
 /// run field initializers + the constructor (which may call `super(...)`).
-fn construct_class(class_val: &Value, args: Vec<Value>, new_target: Value) -> Result<Value, String> {
+fn construct_class(
+    class_val: &Value,
+    args: Vec<Value>,
+    new_target: Value,
+) -> Result<Value, String> {
     let cv = match with_host(|h| h.get(class_val).cloned()) {
         Some(JsObj::Class(c)) => c,
         _ => return Err(type_error("not a class")),
@@ -2489,7 +2635,11 @@ pub fn super_construct(
 /// are installed afterward by `DEF_MEMBER`/`DEF_FIELD`.
 pub fn build_class(name: &str, parent: Value, ctor: Value) -> Value {
     with_host(|h| {
-        let parent_opt = if matches!(parent, Value::Undef) { None } else { Some(parent.clone()) };
+        let parent_opt = if matches!(parent, Value::Undef) {
+            None
+        } else {
+            Some(parent.clone())
+        };
         // The class prototype delegates to the parent's prototype (or
         // Object.prototype for a base class). Extending a builtin error links to
         // that error's prototype so `instanceof Error` holds for the subclass.
@@ -2502,13 +2652,19 @@ pub fn build_class(name: &str, parent: Value, ctor: Value) -> Value {
                         .or_else(|| h.fn_prop(p, "prototype"))
                         .unwrap_or_else(|| h.object_proto())
                 }
-                _ => h.fn_prop(p, "prototype").unwrap_or_else(|| h.object_proto()),
+                _ => h
+                    .fn_prop(p, "prototype")
+                    .unwrap_or_else(|| h.object_proto()),
             },
             None => h.object_proto(),
         };
         let proto = h.new_object(IndexMap::new());
         h.set_proto(&proto, parent_proto);
-        let ctor_opt = if matches!(ctor, Value::Undef) { None } else { Some(ctor.clone()) };
+        let ctor_opt = if matches!(ctor, Value::Undef) {
+            None
+        } else {
+            Some(ctor.clone())
+        };
         // Give the constructor closure its home class (for `super.method()`), and
         // record its `.name`.
         if let Some(cf) = &ctor_opt {
@@ -2608,11 +2764,16 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
     let ctor_callable = with_host(|h| {
         matches!(
             h.get(ctor),
-            Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::Builtin(_)) | Some(JsObj::BoundFunc { .. })
+            Some(JsObj::Func(_))
+                | Some(JsObj::Class(_))
+                | Some(JsObj::Builtin(_))
+                | Some(JsObj::BoundFunc { .. })
         )
     });
     if !ctor_callable {
-        return Err(type_error("Right-hand side of 'instanceof' is not callable"));
+        return Err(type_error(
+            "Right-hand side of 'instanceof' is not callable",
+        ));
     }
     // Builtin constructors whose instances aren't prototype-linked in our model
     // (arrays/plain objects/functions) get a structural instanceof.
@@ -2626,14 +2787,21 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
                 // Object instance.
                 let is_obj = matches!(
                     kind,
-                    Some(JsObj::Object(_)) | Some(JsObj::Array(_)) | Some(JsObj::Func(_))
-                        | Some(JsObj::Class(_)) | Some(JsObj::Map { .. }) | Some(JsObj::Set { .. })
-                        | Some(JsObj::Promise { .. }) | Some(JsObj::Generator { .. })
+                    Some(JsObj::Object(_))
+                        | Some(JsObj::Array(_))
+                        | Some(JsObj::Func(_))
+                        | Some(JsObj::Class(_))
+                        | Some(JsObj::Map { .. })
+                        | Some(JsObj::Set { .. })
+                        | Some(JsObj::Promise { .. })
+                        | Some(JsObj::Generator { .. })
                 );
                 if is_obj {
                     // A null-prototype object created via Object.create(null) is
                     // NOT an Object instance.
-                    if matches!(kind, Some(JsObj::Object(_))) && with_host(|h| h.proto_of(obj)).is_none() {
+                    if matches!(kind, Some(JsObj::Object(_)))
+                        && with_host(|h| h.proto_of(obj)).is_none()
+                    {
                         // Distinguish an ordinary object (no explicit proto but
                         // conceptually Object.prototype) from Object.create(null):
                         // we can't, so treat a bare object as an Object instance.
@@ -2676,16 +2844,27 @@ impl JsHost {
         matches!(self.get(v), Some(JsObj::Generator { .. }))
     }
     pub fn gen_done(&self, id: u32) -> bool {
-        self.generators.get(id as usize).map(|g| g.done).unwrap_or(true)
+        self.generators
+            .get(id as usize)
+            .map(|g| g.done)
+            .unwrap_or(true)
     }
     fn gen_started(&self, id: u32) -> bool {
-        self.generators.get(id as usize).map(|g| g.started).unwrap_or(false)
+        self.generators
+            .get(id as usize)
+            .map(|g| g.started)
+            .unwrap_or(false)
     }
 }
 
 /// Build a suspended generator whose body is `chunk`, run in a frame with the
 /// already-bound `env`. Nothing executes until the first `gen_resume`.
-fn make_generator(chunk: Chunk, env: Env, this_val: Option<Value>, home_class: Option<String>) -> Value {
+fn make_generator(
+    chunk: Chunk,
+    env: Env,
+    this_val: Option<Value>,
+    home_class: Option<String>,
+) -> Value {
     let home = home_class
         .as_ref()
         .and_then(|n| with_host(|h| h.class_registry.get(n).cloned()));
@@ -3092,7 +3271,11 @@ pub fn lookup_chain(h: &JsHost, recv: &Value, key: &str) -> Option<Value> {
 }
 
 /// Find a getter/setter accessor for `key` on `recv` or up its prototype chain.
-pub fn lookup_accessor(h: &JsHost, recv: &Value, key: &str) -> Option<(Option<Value>, Option<Value>)> {
+pub fn lookup_accessor(
+    h: &JsHost,
+    recv: &Value,
+    key: &str,
+) -> Option<(Option<Value>, Option<Value>)> {
     if let Some(a) = h.own_accessor(recv, key) {
         return Some(a);
     }
@@ -3182,7 +3365,11 @@ impl JsHost {
             _ => None,
         };
         match def_id.and_then(|id| self.funcs.get(id)) {
-            Some(def) => def.params.iter().take_while(|p| !p.rest && !p.has_default).count(),
+            Some(def) => def
+                .params
+                .iter()
+                .take_while(|p| !p.rest && !p.has_default)
+                .count(),
             None => 0,
         }
     }
@@ -3320,14 +3507,19 @@ impl JsHost {
             .enumerate()
             .filter(|(_, t)| !t.cancelled)
             .min_by(|(_, a), (_, b)| {
-                a.delay.partial_cmp(&b.delay).unwrap_or(std::cmp::Ordering::Equal).then(a.seq.cmp(&b.seq))
+                a.delay
+                    .partial_cmp(&b.delay)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.seq.cmp(&b.seq))
             })
             .map(|(i, _)| i);
         idx.map(|i| self.macrotasks.remove(i))
     }
     fn next_microtask(&mut self) -> Option<Task> {
         // nextTick drains before promise microtasks (Node ordering).
-        self.nextticks.pop_front().or_else(|| self.microtasks.pop_front())
+        self.nextticks
+            .pop_front()
+            .or_else(|| self.microtasks.pop_front())
     }
     fn has_microtasks(&self) -> bool {
         !self.nextticks.is_empty() || !self.microtasks.is_empty()
@@ -3399,7 +3591,9 @@ fn drive_event_loop(rx: Option<&Receiver<IoTask>>) -> Result<(), String> {
         let timeout = with_host(|h| h.next_timer_timeout(now));
         let recv = match timeout {
             Some(d) => rx.recv_timeout(d),
-            None => rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+            None => rx
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
         };
         match recv {
             Ok(task) => task()?,
@@ -3433,7 +3627,11 @@ fn drive_async(gen: Value, rid: u32, send: Value) {
                 Box::new(move |state, val| {
                     // Resume the coroutine with a `[tag, value]` packet the AWAIT
                     // op unwraps (tag 1 ⇒ the awaited promise rejected → throw).
-                    let tag = if state == PromiseState::Rejected { 1.0 } else { 0.0 };
+                    let tag = if state == PromiseState::Rejected {
+                        1.0
+                    } else {
+                        0.0
+                    };
                     let packet = with_host(|h| h.new_array(vec![Value::Float(tag), val]));
                     drive_async(gen2, rid, packet);
                     Ok(())
@@ -3453,7 +3651,10 @@ fn drive_async(gen: Value, rid: u32, send: Value) {
 pub fn await_value(awaited: Value) -> Result<Value, String> {
     let packet = gen_yield(awaited)?;
     let items = with_host(|h| h.iter_vec(&packet)).unwrap_or_default();
-    let tag = items.first().map(|v| with_host(|h| h.to_number(v))).unwrap_or(0.0);
+    let tag = items
+        .first()
+        .map(|v| with_host(|h| h.to_number(v)))
+        .unwrap_or(0.0);
     let val = items.get(1).cloned().unwrap_or(Value::Undef);
     if tag == 1.0 {
         with_host(|h| h.exc = Some(val.clone()));
@@ -3496,7 +3697,9 @@ pub fn resolve_promise_val(id: u32, value: Value) {
     if let Some(vid) = with_host(|h| h.promise_id(&value)) {
         if vid == id {
             // Resolving a promise with itself → reject with a TypeError.
-            let e = with_host(|h| crate::builtins::synth_error(h, "TypeError: Chaining cycle detected"));
+            let e = with_host(|h| {
+                crate::builtins::synth_error(h, "TypeError: Chaining cycle detected")
+            });
             reject_promise_val(id, e);
             return;
         }
@@ -3533,7 +3736,11 @@ fn schedule_reactions(id: u32) {
             PromiseReaction::Native(f) => {
                 with_host(|h| h.queue_micro_native(Box::new(move || f(state, value))));
             }
-            PromiseReaction::Js { on_ful, on_rej, result } => {
+            PromiseReaction::Js {
+                on_ful,
+                on_rej,
+                result,
+            } => {
                 with_host(|h| {
                     h.queue_micro_native(Box::new(move || {
                         run_js_reaction(state, value, on_ful, on_rej, result)
@@ -3546,12 +3753,22 @@ fn schedule_reactions(id: u32) {
 
 /// Run a `.then` reaction: call the appropriate handler and settle the result
 /// promise with its outcome (or pass through if there is no handler).
-fn run_js_reaction(state: PromiseState, value: Value, on_ful: Value, on_rej: Value, result: Value) -> Result<(), String> {
+fn run_js_reaction(
+    state: PromiseState,
+    value: Value,
+    on_ful: Value,
+    on_rej: Value,
+    result: Value,
+) -> Result<(), String> {
     let rid = match with_host(|h| h.promise_id(&result)) {
         Some(i) => i,
         None => return Ok(()),
     };
-    let handler = if state == PromiseState::Rejected { on_rej } else { on_ful };
+    let handler = if state == PromiseState::Rejected {
+        on_rej
+    } else {
+        on_ful
+    };
     if with_host(|h| is_callable(h, &handler)) {
         match invoke(&handler, vec![value], None) {
             Ok(r) => resolve_promise_val(rid, r),
@@ -3570,7 +3787,9 @@ fn run_js_reaction(state: PromiseState, value: Value, on_ful: Value, on_rej: Val
 pub fn take_exc_or_error(e: &str) -> Value {
     with_host(|h| {
         h.error.take();
-        h.exc.take().unwrap_or_else(|| crate::builtins::synth_error(h, e))
+        h.exc
+            .take()
+            .unwrap_or_else(|| crate::builtins::synth_error(h, e))
     })
 }
 
@@ -3592,7 +3811,12 @@ pub fn promise_then(p: &Value, on_ful: Value, on_rej: Value) -> Value {
         with_host(|h| h.add_reaction(id, reaction));
     } else {
         let value = with_host(|h| h.promise_value(id));
-        if let PromiseReaction::Js { on_ful, on_rej, result } = reaction {
+        if let PromiseReaction::Js {
+            on_ful,
+            on_rej,
+            result,
+        } = reaction
+        {
             with_host(|h| {
                 h.queue_micro_native(Box::new(move || {
                     run_js_reaction(state, value, on_ful, on_rej, result)

@@ -74,7 +74,8 @@ pub const COMPRESSION_STREAM_TAG: &str = "CompressionStream";
 pub const DECOMPRESSION_STREAM_TAG: &str = "DecompressionStream";
 
 // Instance-method lists (for `instance_has_method` wiring in mod.rs).
-pub const READABLE_STREAM_METHODS: &[&str] = &["getReader", "cancel", "tee", "pipeTo", "pipeThrough"];
+pub const READABLE_STREAM_METHODS: &[&str] =
+    &["getReader", "cancel", "tee", "pipeTo", "pipeThrough"];
 pub const RS_DEFAULT_READER_METHODS: &[&str] = &["read", "releaseLock", "cancel"];
 pub const RS_BYOB_READER_METHODS: &[&str] = &["read", "releaseLock", "cancel"];
 pub const RS_DEFAULT_CONTROLLER_METHODS: &[&str] = &["enqueue", "close", "error"];
@@ -152,7 +153,9 @@ fn state_of(stream: &Value) -> String {
 }
 
 fn is_locked(stream: &Value) -> bool {
-    get_prop(stream, "locked").map(|v| with_host(|h| h.truthy(&v))).unwrap_or(false)
+    get_prop(stream, "locked")
+        .map(|v| with_host(|h| h.truthy(&v)))
+        .unwrap_or(false)
 }
 
 fn is_callable_val(v: &Value) -> bool {
@@ -217,7 +220,12 @@ fn chunk_bytes(v: &Value) -> Vec<u8> {
                 None
             };
             field.and_then(|f| match p.get(f).and_then(|a| h.get(a)) {
-                Some(JsObj::Array(items)) => Some(items.iter().map(|x| h.to_number(x) as u8).collect::<Vec<u8>>()),
+                Some(JsObj::Array(items)) => Some(
+                    items
+                        .iter()
+                        .map(|x| h.to_number(x) as u8)
+                        .collect::<Vec<u8>>(),
+                ),
                 _ => None,
             })
         }
@@ -315,7 +323,11 @@ fn new_readable_shell() -> Value {
 
 /// A default (or byte) controller wired back to `stream`.
 fn new_readable_controller(stream: &Value, byte: bool) -> Value {
-    let tag = if byte { RS_BYTE_CONTROLLER_TAG } else { RS_DEFAULT_CONTROLLER_TAG };
+    let tag = if byte {
+        RS_BYTE_CONTROLLER_TAG
+    } else {
+        RS_DEFAULT_CONTROLLER_TAG
+    };
     let ctrl = with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(tag));
@@ -383,7 +395,8 @@ fn stream_error(stream: &Value, err: Value) {
 fn try_immediate_read(stream: &Value) -> Option<Value> {
     match state_of(stream).as_str() {
         "errored" => {
-            let e = get_prop(stream, "@@stored_error").unwrap_or_else(|| synth("TypeError: stream errored"));
+            let e = get_prop(stream, "@@stored_error")
+                .unwrap_or_else(|| synth("TypeError: stream errored"));
             Some(rejected(e))
         }
         _ if arr_len(stream, "@@queue") > 0 => {
@@ -477,12 +490,12 @@ fn get_reader(stream: &Value, args: &[Value]) -> Result<Value, String> {
     if is_locked(stream) {
         return Err(crate::host::type_error("ReadableStream is locked"));
     }
-    let byob = args
-        .first()
-        .and_then(|o| get_str(o, "mode"))
-        .as_deref()
-        == Some("byob");
-    let tag = if byob { RS_BYOB_READER_TAG } else { RS_DEFAULT_READER_TAG };
+    let byob = args.first().and_then(|o| get_str(o, "mode")).as_deref() == Some("byob");
+    let tag = if byob {
+        RS_BYOB_READER_TAG
+    } else {
+        RS_DEFAULT_READER_TAG
+    };
 
     // The reader's `closed` promise reflects the stream's terminal state.
     let closed = new_pending();
@@ -490,7 +503,8 @@ fn get_reader(stream: &Value, args: &[Value]) -> Result<Value, String> {
         "closed" => settle(&closed, Value::Undef),
         "errored" => settle_reject(
             &closed,
-            get_prop(stream, "@@stored_error").unwrap_or_else(|| synth("TypeError: stream errored")),
+            get_prop(stream, "@@stored_error")
+                .unwrap_or_else(|| synth("TypeError: stream errored")),
         ),
         _ => {}
     }
@@ -686,7 +700,10 @@ fn get_writer(ws: &Value) -> Result<Value, String> {
     if state_of(ws) == "closed" {
         settle(&closed, Value::Undef);
     } else if state_of(ws) == "errored" {
-        settle_reject(&closed, get_prop(ws, "@@stored_error").unwrap_or(Value::Undef));
+        settle_reject(
+            &closed,
+            get_prop(ws, "@@stored_error").unwrap_or(Value::Undef),
+        );
     }
     let writer = with_host(|h| {
         let mut m = IndexMap::new();
@@ -784,7 +801,11 @@ fn build_codec_stream(tag: &str, kind: &str, extra: Vec<(&str, Value)>) -> Value
 
 pub fn construct_text_encoder_stream() -> Result<Value, String> {
     let enc = with_host(|h| h.new_str("utf-8"));
-    Ok(build_codec_stream(TEXT_ENCODER_STREAM_TAG, "textencode", vec![("encoding", enc)]))
+    Ok(build_codec_stream(
+        TEXT_ENCODER_STREAM_TAG,
+        "textencode",
+        vec![("encoding", enc)],
+    ))
 }
 
 pub fn construct_text_decoder_stream(args: &[Value]) -> Result<Value, String> {
@@ -800,21 +821,31 @@ pub fn construct_text_decoder_stream(args: &[Value]) -> Result<Value, String> {
             ("ignoreBOM", Value::Bool(false)),
         ]
     });
-    Ok(build_codec_stream(TEXT_DECODER_STREAM_TAG, "textdecode", extra))
+    Ok(build_codec_stream(
+        TEXT_DECODER_STREAM_TAG,
+        "textdecode",
+        extra,
+    ))
 }
 
 /// `new CompressionStream(format)` — `format` ∈ {gzip, deflate, deflate-raw}.
 pub fn construct_compression(args: &[Value], decompress: bool) -> Result<Value, String> {
     let format = super::arg_str(args, 0);
     if !matches!(format.as_str(), "gzip" | "deflate" | "deflate-raw") {
-        return Err(crate::host::type_error(&format!("Unsupported compression format: '{format}'")));
+        return Err(crate::host::type_error(&format!(
+            "Unsupported compression format: '{format}'"
+        )));
     }
     let (tag, prefix) = if decompress {
         (DECOMPRESSION_STREAM_TAG, "decompress")
     } else {
         (COMPRESSION_STREAM_TAG, "compress")
     };
-    Ok(build_codec_stream(tag, &format!("{prefix}:{format}"), Vec::new()))
+    Ok(build_codec_stream(
+        tag,
+        &format!("{prefix}:{format}"),
+        Vec::new(),
+    ))
 }
 
 /// Run a buffered codec over `data` (called on stream close).
@@ -851,7 +882,9 @@ fn run_codec(kind: &str, data: &[u8]) -> Result<Vec<u8>, String> {
         }
         "decompress:deflate-raw" => {
             let mut out = Vec::new();
-            DeflateDecoder::new(data).read_to_end(&mut out).map_err(io)?;
+            DeflateDecoder::new(data)
+                .read_to_end(&mut out)
+                .map_err(io)?;
             Ok(out)
         }
         _ => Err(crate::host::type_error("unknown codec")),
@@ -928,15 +961,21 @@ fn byob_read(reader: &Value, args: &[Value]) -> Value {
 /// Native pull for a tee branch: serve from the shared buffer at the branch's
 /// cursor, pulling one more chunk from the source when the cursor runs ahead.
 fn tee_pull(branch: &Value) {
-    let Some(shared) = get_prop(branch, "@@tee_shared") else { return };
-    let idx = get_prop(branch, "@@tee_index").map(|v| with_host(|h| h.to_number(&v)) as usize).unwrap_or(0);
+    let Some(shared) = get_prop(branch, "@@tee_shared") else {
+        return;
+    };
+    let idx = get_prop(branch, "@@tee_index")
+        .map(|v| with_host(|h| h.to_number(&v)) as usize)
+        .unwrap_or(0);
 
     if let Some(chunk) = arr_get(&shared, "@@buf", idx) {
         set_prop(branch, "@@tee_index", Value::Float((idx + 1) as f64));
         stream_enqueue(branch, chunk);
         return;
     }
-    let done = get_prop(&shared, "@@done").map(|v| with_host(|h| h.truthy(&v))).unwrap_or(false);
+    let done = get_prop(&shared, "@@done")
+        .map(|v| with_host(|h| h.truthy(&v)))
+        .unwrap_or(false);
     if done {
         stream_close(branch);
         return;
@@ -1064,27 +1103,43 @@ fn bare(tag: &str) -> Value {
 // ── instance dispatch ─────────────────────────────────────────────────────────
 
 /// Method dispatch for every `stream/web` native instance.
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match tag {
         READABLE_STREAM_TAG => match method {
             "getReader" => get_reader(recv, &args),
-            "cancel" => Ok(stream_cancel(recv, args.first().cloned().unwrap_or(Value::Undef))),
+            "cancel" => Ok(stream_cancel(
+                recv,
+                args.first().cloned().unwrap_or(Value::Undef),
+            )),
             "tee" => Ok(tee(recv)),
-            "pipeTo" => Ok(pipe_to(recv, &args.first().cloned().unwrap_or(Value::Undef))),
+            "pipeTo" => Ok(pipe_to(
+                recv,
+                &args.first().cloned().unwrap_or(Value::Undef),
+            )),
             "pipeThrough" => pipe_through(recv, &args),
             _ => unknown(tag, method),
         },
         RS_DEFAULT_READER_TAG => match method {
             "read" => match get_prop(recv, "@@stream") {
                 Some(stream) => Ok(stream_read(&stream)),
-                None => Ok(rejected(synth("TypeError: reader has no associated stream"))),
+                None => Ok(rejected(synth(
+                    "TypeError: reader has no associated stream",
+                ))),
             },
             "releaseLock" => {
                 reader_release(recv);
                 Ok(Value::Undef)
             }
             "cancel" => match get_prop(recv, "@@stream") {
-                Some(stream) => Ok(stream_cancel(&stream, args.first().cloned().unwrap_or(Value::Undef))),
+                Some(stream) => Ok(stream_cancel(
+                    &stream,
+                    args.first().cloned().unwrap_or(Value::Undef),
+                )),
                 None => Ok(resolved(Value::Undef)),
             },
             _ => unknown(tag, method),
@@ -1096,7 +1151,10 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
                 Ok(Value::Undef)
             }
             "cancel" => match get_prop(recv, "@@stream") {
-                Some(stream) => Ok(stream_cancel(&stream, args.first().cloned().unwrap_or(Value::Undef))),
+                Some(stream) => Ok(stream_cancel(
+                    &stream,
+                    args.first().cloned().unwrap_or(Value::Undef),
+                )),
                 None => Ok(resolved(Value::Undef)),
             },
             _ => unknown(tag, method),
@@ -1142,7 +1200,9 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
             match method {
                 "write" => {
                     if state_of(&ws) == "errored" {
-                        return Ok(rejected(get_prop(&ws, "@@stored_error").unwrap_or(Value::Undef)));
+                        return Ok(rejected(
+                            get_prop(&ws, "@@stored_error").unwrap_or(Value::Undef),
+                        ));
                     }
                     match ws_accept_chunk(&ws, args.first().cloned().unwrap_or(Value::Undef)) {
                         Ok(()) => Ok(resolved(Value::Undef)),
@@ -1195,7 +1255,9 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
             }
         }
         BYTE_LENGTH_STRATEGY_TAG => match method {
-            "size" => Ok(Value::Float(chunk_byte_length(&args.first().cloned().unwrap_or(Value::Undef)))),
+            "size" => Ok(Value::Float(chunk_byte_length(
+                &args.first().cloned().unwrap_or(Value::Undef),
+            ))),
             _ => unknown(tag, method),
         },
         COUNT_STRATEGY_TAG => match method {
@@ -1207,5 +1269,7 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
 }
 
 fn unknown(tag: &str, method: &str) -> Result<Value, String> {
-    Err(crate::host::type_error(&format!("{tag}.{method} is not a function")))
+    Err(crate::host::type_error(&format!(
+        "{tag}.{method} is not a function"
+    )))
 }

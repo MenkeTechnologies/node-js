@@ -43,29 +43,51 @@ pub const METHODS: &[&str] = &[
 
 pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     match method {
-        "listeners" => Ok(with_host(|h| h.new_array(listeners(recv, &arg_str(&args, 0))))),
+        "listeners" => Ok(with_host(|h| {
+            h.new_array(listeners(recv, &arg_str(&args, 0)))
+        })),
         // A no-op accessor pair kept for API completeness; the emitter has no cap.
         "setMaxListeners" => Ok(recv.clone()),
         "getMaxListeners" => Ok(Value::Float(10.0)),
         "on" | "addListener" | "prependListener" => {
-            add(recv, "@@on", &arg_str(&args, 0), args.get(1).cloned().unwrap_or(Value::Undef));
+            add(
+                recv,
+                "@@on",
+                &arg_str(&args, 0),
+                args.get(1).cloned().unwrap_or(Value::Undef),
+            );
             Ok(recv.clone())
         }
         "once" | "prependOnceListener" => {
-            add(recv, "@@once", &arg_str(&args, 0), args.get(1).cloned().unwrap_or(Value::Undef));
+            add(
+                recv,
+                "@@once",
+                &arg_str(&args, 0),
+                args.get(1).cloned().unwrap_or(Value::Undef),
+            );
             Ok(recv.clone())
         }
-        "emit" => emit(recv, &arg_str(&args, 0), &args.get(1..).map(|s| s.to_vec()).unwrap_or_default()),
+        "emit" => emit(
+            recv,
+            &arg_str(&args, 0),
+            &args.get(1..).map(|s| s.to_vec()).unwrap_or_default(),
+        ),
         "removeListener" | "off" => {
             remove(recv, &arg_str(&args, 0), args.get(1).cloned());
             Ok(recv.clone())
         }
         "removeAllListeners" => {
-            let name = if args.is_empty() { None } else { Some(arg_str(&args, 0)) };
+            let name = if args.is_empty() {
+                None
+            } else {
+                Some(arg_str(&args, 0))
+            };
             remove_all(recv, name.as_deref());
             Ok(recv.clone())
         }
-        "listenerCount" => Ok(Value::Float(listeners(recv, &arg_str(&args, 0)).len() as f64)),
+        "listenerCount" => Ok(Value::Float(
+            listeners(recv, &arg_str(&args, 0)).len() as f64
+        )),
         "eventNames" => Ok(with_host(|h| {
             let mut keys: Vec<String> = Vec::new();
             for map in ["@@on", "@@once"] {
@@ -76,7 +98,9 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             let names: Vec<Value> = keys.into_iter().map(|k| h.new_str(k)).collect();
             h.new_array(names)
         })),
-        _ => Err(crate::host::type_error(&format!("emitter.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "emitter.{method} is not a function"
+        ))),
     }
 }
 
@@ -217,7 +241,9 @@ fn waiter_map(h: &crate::host::JsHost, recv: &Value) -> Option<Value> {
 /// Remove and return the promises parked on `name`.
 fn take_waiters(recv: &Value, name: &str) -> Vec<Value> {
     with_host(|h| {
-        let Some(map) = waiter_map(h, recv) else { return Vec::new() };
+        let Some(map) = waiter_map(h, recv) else {
+            return Vec::new();
+        };
         let arr = match h.get_mut(&map) {
             Some(JsObj::Object(p)) => p.shift_remove(name),
             _ => None,
@@ -233,7 +259,9 @@ fn take_waiters(recv: &Value, name: &str) -> Vec<Value> {
 /// Remove and return every parked promise except those on `keep`.
 fn take_waiters_except(recv: &Value, keep: &str) -> Vec<Value> {
     with_host(|h| {
-        let Some(map) = waiter_map(h, recv) else { return Vec::new() };
+        let Some(map) = waiter_map(h, recv) else {
+            return Vec::new();
+        };
         let keys: Vec<String> = match h.get(&map) {
             Some(JsObj::Object(p)) => p.keys().filter(|k| k.as_str() != keep).cloned().collect(),
             _ => Vec::new(),
@@ -295,8 +323,12 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
     let emitter = args.first().cloned().unwrap_or(Value::Undef);
     Some(match method {
         "once" => Ok(once_static(emitter, &arg_str(args, 1))),
-        "listenerCount" => Ok(Value::Float(listeners(&emitter, &arg_str(args, 1)).len() as f64)),
-        "getEventListeners" => Ok(with_host(|h| h.new_array(listeners(&emitter, &arg_str(args, 1))))),
+        "listenerCount" => Ok(Value::Float(
+            listeners(&emitter, &arg_str(args, 1)).len() as f64
+        )),
+        "getEventListeners" => Ok(with_host(|h| {
+            h.new_array(listeners(&emitter, &arg_str(args, 1)))
+        })),
         // No per-emitter cap is tracked; report Node's default and accept sets.
         "getMaxListeners" => Ok(Value::Float(10.0)),
         "setMaxListeners" => Ok(Value::Undef),

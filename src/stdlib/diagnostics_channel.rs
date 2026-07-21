@@ -27,8 +27,14 @@ thread_local! {
     static CHANNELS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
-pub const METHODS: &[&str] =
-    &["channel", "subscribe", "unsubscribe", "hasSubscribers", "tracingChannel", "boundedChannel"];
+pub const METHODS: &[&str] = &[
+    "channel",
+    "subscribe",
+    "unsubscribe",
+    "hasSubscribers",
+    "tracingChannel",
+    "boundedChannel",
+];
 
 /// Methods dispatched on an `@@native = "TracingChannel"` object (reported to the
 /// parent for `instance_has_method` / `instance_call` wiring).
@@ -50,7 +56,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         }
         "unsubscribe" => {
             let ch = get_or_create(&name);
-            Ok(Value::Bool(remove_sub(&ch, &args.get(1).cloned().unwrap_or(Value::Undef))))
+            Ok(Value::Bool(remove_sub(
+                &ch,
+                &args.get(1).cloned().unwrap_or(Value::Undef),
+            )))
         }
         "hasSubscribers" => Ok(Value::Bool(sub_count(&get_or_create(&name)) > 0)),
         // `tracingChannel(name)` groups five sub-channels (start/end/asyncStart/
@@ -86,7 +95,12 @@ pub fn constant(name: &str) -> Option<Value> {
 fn tracing_channel(name: &str) -> Value {
     let subs: Vec<(String, Value)> = TRACING_SUBS
         .iter()
-        .map(|s| ((*s).to_string(), get_or_create(&format!("tracing:{name}:{s}"))))
+        .map(|s| {
+            (
+                (*s).to_string(),
+                get_or_create(&format!("tracing:{name}:{s}")),
+            )
+        })
         .collect();
     with_host(|h| {
         let mut m = IndexMap::new();
@@ -112,7 +126,9 @@ pub fn tracing_instance_call(recv: &Value, method: &str, args: &[Value]) -> Resu
                     Some(JsObj::Object(p)) => p.get(*sub).cloned(),
                     _ => None,
                 });
-                let (Some(cb), Some(ch)) = (cb, sub_channel(recv, sub)) else { continue };
+                let (Some(cb), Some(ch)) = (cb, sub_channel(recv, sub)) else {
+                    continue;
+                };
                 if method == "subscribe" {
                     add_sub(&ch, cb);
                 } else {
@@ -150,7 +166,9 @@ pub fn tracing_instance_call(recv: &Value, method: &str, args: &[Value]) -> Resu
                 }
             }
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -169,9 +187,14 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             add_sub(recv, args.first().cloned().unwrap_or(Value::Undef));
             Ok(Value::Undef)
         }
-        "unsubscribe" => Ok(Value::Bool(remove_sub(recv, &args.first().cloned().unwrap_or(Value::Undef)))),
+        "unsubscribe" => Ok(Value::Bool(remove_sub(
+            recv,
+            &args.first().cloned().unwrap_or(Value::Undef),
+        ))),
         "publish" => publish(recv, args.first().cloned().unwrap_or(Value::Undef)),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 

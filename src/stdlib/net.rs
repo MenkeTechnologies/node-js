@@ -36,8 +36,7 @@ pub const MODULE_METHODS: &[&str] = &[
 
 /// Instance methods of a `net.BlockList` (parent wires the `BlockList` tag to
 /// `block_list_call` via `native_tag`/`instance_call`).
-pub const BLOCKLIST_METHODS: &[&str] =
-    &["addAddress", "addRange", "addSubnet", "check"];
+pub const BLOCKLIST_METHODS: &[&str] = &["addAddress", "addRange", "addSubnet", "check"];
 
 /// A native-thread hook run on the main thread for each new connection. Set by
 /// `http` to attach its request parser; `None` for a plain `net` server (which
@@ -125,10 +124,17 @@ fn u64_prop(recv: &Value, key: &str) -> Option<u64> {
 /// `None` for a non-emitter method so the caller can handle it.
 fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match method {
-        "on" | "addListener" | "prependListener" | "once" | "prependOnceListener" | "emit"
-        | "removeListener" | "off" | "removeAllListeners" | "listenerCount" | "eventNames" => {
-            Some(super::events::instance_call(recv, method, args.to_vec()))
-        }
+        "on"
+        | "addListener"
+        | "prependListener"
+        | "once"
+        | "prependOnceListener"
+        | "emit"
+        | "removeListener"
+        | "off"
+        | "removeAllListeners"
+        | "listenerCount"
+        | "eventNames" => Some(super::events::instance_call(recv, method, args.to_vec())),
         _ => None,
     }
 }
@@ -143,11 +149,12 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "isIP" => Some(Ok(Value::Float(is_ip(&arg_string(args, 0)) as f64))),
         "isIPv4" => Some(Ok(Value::Bool(is_ip(&arg_string(args, 0)) == 4))),
         "isIPv6" => Some(Ok(Value::Bool(is_ip(&arg_string(args, 0)) == 6))),
-        "getDefaultAutoSelectFamily" => {
-            Some(Ok(Value::Bool(AUTO_SELECT_FAMILY.with(|c| c.get()))))
-        }
+        "getDefaultAutoSelectFamily" => Some(Ok(Value::Bool(AUTO_SELECT_FAMILY.with(|c| c.get())))),
         "setDefaultAutoSelectFamily" => {
-            let v = args.first().map(|a| with_host(|h| h.truthy(a))).unwrap_or(false);
+            let v = args
+                .first()
+                .map(|a| with_host(|h| h.truthy(a)))
+                .unwrap_or(false);
             AUTO_SELECT_FAMILY.with(|c| c.set(v));
             Some(Ok(Value::Undef))
         }
@@ -155,7 +162,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             Some(Ok(Value::Float(AUTO_SELECT_TIMEOUT.with(|c| c.get()))))
         }
         "setDefaultAutoSelectFamilyAttemptTimeout" => {
-            let v = args.first().map(|a| with_host(|h| h.to_number(a))).unwrap_or(f64::NAN);
+            let v = args
+                .first()
+                .map(|a| with_host(|h| h.to_number(a)))
+                .unwrap_or(f64::NAN);
             if v.is_finite() && v >= 1.0 {
                 AUTO_SELECT_TIMEOUT.with(|c| c.set(v));
             }
@@ -313,7 +323,13 @@ fn on_connect(sock_id: u64, socket: Value, stream: TcpStream) -> Result<(), Stri
     };
     let write = Arc::new(Mutex::new(stream));
     NET.with(|s| {
-        s.borrow_mut().sockets.insert(sock_id, SocketRec { emitter: socket.clone(), write });
+        s.borrow_mut().sockets.insert(
+            sock_id,
+            SocketRec {
+                emitter: socket.clone(),
+                write,
+            },
+        );
     });
     set_prop(&socket, "connecting", Value::Bool(false));
     // The reader gets its own handle registration via `on_socket_close`'s
@@ -335,7 +351,11 @@ fn on_connect_error(socket: Value, msg: String) -> Result<(), String> {
         m.insert("code".into(), h.new_str("ECONNREFUSED"));
         h.new_object(m)
     });
-    super::events::instance_call(&socket, "emit", vec![with_host(|h| h.new_str("error")), err])?;
+    super::events::instance_call(
+        &socket,
+        "emit",
+        vec![with_host(|h| h.new_str("error")), err],
+    )?;
     Ok(())
 }
 
@@ -347,7 +367,9 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
         "Socket" | "Stream" => Some(Ok(new_socket())),
         "Server" => Some(Ok(create_server(
-            args.first().cloned().filter(|v| with_host(|h| crate::host::is_callable(h, v))),
+            args.first()
+                .cloned()
+                .filter(|v| with_host(|h| crate::host::is_callable(h, v))),
         ))),
         "SocketAddress" => Some(Ok(socket_address(args))),
         "BlockList" => Some(Ok(new_block_list())),
@@ -365,10 +387,12 @@ fn socket_address(args: &[Value]) -> Value {
     let mut port = 0f64;
     let mut flowlabel = 0f64;
     if matches!(opts, Value::Obj(_)) {
-        if let Some(v) = get_prop(&opts, "address").filter(|v| with_host(|h| h.as_str(v)).is_some()) {
+        if let Some(v) = get_prop(&opts, "address").filter(|v| with_host(|h| h.as_str(v)).is_some())
+        {
             address = with_host(|h| h.str_of(&v));
         }
-        if let Some(v) = get_prop(&opts, "family").filter(|v| with_host(|h| h.as_str(v)).is_some()) {
+        if let Some(v) = get_prop(&opts, "family").filter(|v| with_host(|h| h.as_str(v)).is_some())
+        {
             family = with_host(|h| h.str_of(&v)).to_ascii_lowercase();
             have_family = true;
         }
@@ -412,7 +436,11 @@ enum BlockRule {
     /// Inclusive `[start, end]` range (family-tagged).
     Range { v6: bool, start: u128, end: u128 },
     /// CIDR subnet: `network`/`prefix` (family-tagged).
-    Subnet { v6: bool, network: u128, prefix: u32 },
+    Subnet {
+        v6: bool,
+        network: u128,
+        prefix: u32,
+    },
 }
 
 thread_local! {
@@ -470,7 +498,11 @@ pub fn block_list_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<V
             if let (Some((v6, s)), Some((_, e))) = (ip_to_u128(&start), ip_to_u128(&end)) {
                 BLOCK_LISTS.with(|b| {
                     if let Some(rules) = b.borrow_mut().get_mut(&id) {
-                        rules.push(BlockRule::Range { v6, start: s.min(e), end: s.max(e) });
+                        rules.push(BlockRule::Range {
+                            v6,
+                            start: s.min(e),
+                            end: s.max(e),
+                        });
                     }
                 });
             }
@@ -478,11 +510,16 @@ pub fn block_list_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<V
         }
         "addSubnet" => {
             let net = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
-            let prefix = with_host(|h| h.to_number(&args.get(1).cloned().unwrap_or(Value::Undef))) as u32;
+            let prefix =
+                with_host(|h| h.to_number(&args.get(1).cloned().unwrap_or(Value::Undef))) as u32;
             if let Some((v6, network)) = ip_to_u128(&net) {
                 BLOCK_LISTS.with(|b| {
                     if let Some(rules) = b.borrow_mut().get_mut(&id) {
-                        rules.push(BlockRule::Subnet { v6, network, prefix });
+                        rules.push(BlockRule::Subnet {
+                            v6,
+                            network,
+                            prefix,
+                        });
                     }
                 });
             }
@@ -490,13 +527,20 @@ pub fn block_list_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<V
         }
         "check" => {
             let addr = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
-            let Some((v6, val)) = ip_to_u128(&addr) else { return Ok(Value::Bool(false)) };
+            let Some((v6, val)) = ip_to_u128(&addr) else {
+                return Ok(Value::Bool(false));
+            };
             let blocked = BLOCK_LISTS.with(|b| {
-                b.borrow().get(&id).map(|rules| rules.iter().any(|r| rule_matches(r, v6, val))).unwrap_or(false)
+                b.borrow()
+                    .get(&id)
+                    .map(|rules| rules.iter().any(|r| rule_matches(r, v6, val)))
+                    .unwrap_or(false)
             });
             Ok(Value::Bool(blocked))
         }
-        _ => Err(crate::host::type_error(&format!("blocklist.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "blocklist.{method} is not a function"
+        ))),
     }
 }
 
@@ -505,7 +549,11 @@ fn rule_matches(rule: &BlockRule, q_v6: bool, q_val: u128) -> bool {
     match rule {
         BlockRule::Addr { v6, val } => *v6 == q_v6 && *val == q_val,
         BlockRule::Range { v6, start, end } => *v6 == q_v6 && q_val >= *start && q_val <= *end,
-        BlockRule::Subnet { v6, network, prefix } => {
+        BlockRule::Subnet {
+            v6,
+            network,
+            prefix,
+        } => {
             if *v6 != q_v6 {
                 return false;
             }
@@ -539,18 +587,27 @@ thread_local! {
 fn take_pending_hook(server: &Value) -> Option<ConnHook> {
     PENDING_HOOKS.with(|p| {
         let mut p = p.borrow_mut();
-        p.iter().position(|(s, _)| s == server).map(|pos| p.remove(pos).1)
+        p.iter()
+            .position(|(s, _)| s == server)
+            .map(|pos| p.remove(pos).1)
     })
 }
 
 // ── instance methods (Server / Socket) ───────────────────────────────────────
 
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match tag {
         "Server" => server_call(recv, method, args),
         "Socket" => socket_call(recv, method, args),
         "BlockList" => block_list_call(recv, method, args),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -562,7 +619,9 @@ fn server_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
         "listen" => server_listen(recv, &args),
         "close" => server_close(recv, &args),
         "address" => Ok(get_prop(recv, "@@address").unwrap_or(Value::Undef)),
-        _ => Err(crate::host::type_error(&format!("server.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "server.{method} is not a function"
+        ))),
     }
 }
 
@@ -592,8 +651,14 @@ fn server_listen(recv: &Value, args: &[Value]) -> Result<Value, String> {
     if let Some(addr) = local {
         let mut a = IndexMap::new();
         a.insert("port".into(), Value::Float(addr.port() as f64));
-        a.insert("address".into(), with_host(|h| h.new_str(addr.ip().to_string())));
-        a.insert("family".into(), with_host(|h| h.new_str(if addr.is_ipv6() { "IPv6" } else { "IPv4" })));
+        a.insert(
+            "address".into(),
+            with_host(|h| h.new_str(addr.ip().to_string())),
+        );
+        a.insert(
+            "family".into(),
+            with_host(|h| h.new_str(if addr.is_ipv6() { "IPv6" } else { "IPv4" })),
+        );
         let addr_obj = with_host(|h| h.new_object(a));
         set_prop(recv, "@@address", addr_obj);
     }
@@ -602,7 +667,11 @@ fn server_listen(recv: &Value, args: &[Value]) -> Result<Value, String> {
     NET.with(|s| {
         s.borrow_mut().servers.insert(
             id,
-            ServerRec { emitter: recv.clone(), stop: stop.clone(), conn_hook },
+            ServerRec {
+                emitter: recv.clone(),
+                stop: stop.clone(),
+                conn_hook,
+            },
         );
     });
     with_host(|h| h.incr_handle());
@@ -610,21 +679,19 @@ fn server_listen(recv: &Value, args: &[Value]) -> Result<Value, String> {
     // Spawn the accept loop. Non-blocking + short poll so `close` can stop it.
     let tx = with_host(|h| h.io_sender());
     listener.set_nonblocking(true).ok();
-    std::thread::spawn(move || {
-        loop {
-            if stop.load(Ordering::Acquire) {
-                break;
+    std::thread::spawn(move || loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let tx2 = tx.clone();
+                let _ = tx.send(Box::new(move || on_connection(id, stream, tx2)));
             }
-            match listener.accept() {
-                Ok((stream, _addr)) => {
-                    let tx2 = tx.clone();
-                    let _ = tx.send(Box::new(move || on_connection(id, stream, tx2)));
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(_) => break,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            Err(_) => break,
         }
     });
 
@@ -652,7 +719,10 @@ fn server_close(recv: &Value, args: &[Value]) -> Result<Value, String> {
         }
     }
     // `close` callback registers as a one-shot `close` listener in Node.
-    if let Some(cb) = args.first().filter(|v| with_host(|h| crate::host::is_callable(h, v))) {
+    if let Some(cb) = args
+        .first()
+        .filter(|v| with_host(|h| crate::host::is_callable(h, v)))
+    {
         invoke(cb, Vec::new(), None)?;
     }
     super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))])?;
@@ -690,11 +760,14 @@ fn socket_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
             Ok(recv.clone())
         }
         "address" => Ok(get_prop(recv, "@@address").unwrap_or(Value::Undef)),
-        "setEncoding" | "setTimeout" | "setNoDelay" | "setKeepAlive" | "ref" | "unref" | "pause" | "resume" => {
+        "setEncoding" | "setTimeout" | "setNoDelay" | "setKeepAlive" | "ref" | "unref"
+        | "pause" | "resume" => {
             // Accepted no-ops for M1 (curl needs none of these).
             Ok(recv.clone())
         }
-        _ => Err(crate::host::type_error(&format!("socket.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "socket.{method} is not a function"
+        ))),
     }
 }
 
@@ -702,7 +775,8 @@ fn socket_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
 fn value_bytes(v: Option<&Value>) -> Vec<u8> {
     let Some(v) = v else { return Vec::new() };
     // Buffer instance: read its `@@bytes` array.
-    let is_buffer = with_host(|h| matches!(h.get(v), Some(JsObj::Object(p)) if p.contains_key("@@bytes")));
+    let is_buffer =
+        with_host(|h| matches!(h.get(v), Some(JsObj::Object(p)) if p.contains_key("@@bytes")));
     if is_buffer {
         return with_host(|h| match h.get(v) {
             Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
@@ -720,9 +794,18 @@ fn value_bytes(v: Option<&Value>) -> Vec<u8> {
 /// A newly accepted connection: build the `Socket`, register it, spawn its
 /// reader, then emit `connection` and run the server's listener/hook. Runs on the
 /// main thread.
-fn on_connection(server_id: u64, stream: TcpStream, tx: std::sync::mpsc::Sender<crate::host::IoTask>) -> Result<(), String> {
+fn on_connection(
+    server_id: u64,
+    stream: TcpStream,
+    tx: std::sync::mpsc::Sender<crate::host::IoTask>,
+) -> Result<(), String> {
     // Server gone (closed before this event drained): drop the connection.
-    let server = NET.with(|s| s.borrow().servers.get(&server_id).map(|r| r.emitter.clone()));
+    let server = NET.with(|s| {
+        s.borrow()
+            .servers
+            .get(&server_id)
+            .map(|r| r.emitter.clone())
+    });
     let Some(server) = server else { return Ok(()) };
 
     // Reader gets an independent handle; writes go through the original stream.
@@ -737,7 +820,13 @@ fn on_connection(server_id: u64, stream: TcpStream, tx: std::sync::mpsc::Sender<
     extra.insert("@@netid".into(), Value::Float(sock_id as f64));
     let socket = new_emitter_object("Socket", extra);
     NET.with(|s| {
-        s.borrow_mut().sockets.insert(sock_id, SocketRec { emitter: socket.clone(), write });
+        s.borrow_mut().sockets.insert(
+            sock_id,
+            SocketRec {
+                emitter: socket.clone(),
+                write,
+            },
+        );
     });
     with_host(|h| h.incr_handle());
 
@@ -746,7 +835,12 @@ fn on_connection(server_id: u64, stream: TcpStream, tx: std::sync::mpsc::Sender<
 
     // Emit `connection` + run the server's connection handling.
     super::events::instance_call(&server, "emit", vec![with_host(|_h| socket.clone())])?;
-    let hook = NET.with(|s| s.borrow().servers.get(&server_id).and_then(|r| r.conn_hook.clone()));
+    let hook = NET.with(|s| {
+        s.borrow()
+            .servers
+            .get(&server_id)
+            .and_then(|r| r.conn_hook.clone())
+    });
     if let Some(hook) = hook {
         hook(&server, &socket)?;
     } else if let Some(cb) = get_prop(&server, "@@connListener") {
@@ -756,7 +850,11 @@ fn on_connection(server_id: u64, stream: TcpStream, tx: std::sync::mpsc::Sender<
 }
 
 /// Background reader: blocking `read` loop posting `data`/`end`/`close` events.
-fn reader_loop(mut stream: TcpStream, sock_id: u64, tx: std::sync::mpsc::Sender<crate::host::IoTask>) {
+fn reader_loop(
+    mut stream: TcpStream,
+    sock_id: u64,
+    tx: std::sync::mpsc::Sender<crate::host::IoTask>,
+) {
     let mut buf = [0u8; 8192];
     loop {
         match stream.read(&mut buf) {
@@ -783,7 +881,11 @@ fn on_socket_data(sock_id: u64, bytes: Vec<u8>) -> Result<(), String> {
     super::http::feed(sock_id, &socket, &bytes)?;
     // Then emit `data` to any JS listeners (as a Buffer, like Node).
     let chunk = super::buffer::from_bytes(&bytes);
-    super::events::instance_call(&socket, "emit", vec![with_host(|h| h.new_str("data")), chunk])?;
+    super::events::instance_call(
+        &socket,
+        "emit",
+        vec![with_host(|h| h.new_str("data")), chunk],
+    )?;
     Ok(())
 }
 
@@ -799,7 +901,11 @@ fn on_socket_close(sock_id: u64) -> Result<(), String> {
     let rec = NET.with(|s| s.borrow_mut().sockets.remove(&sock_id));
     super::http::drop_conn(sock_id);
     if let Some(rec) = rec {
-        super::events::instance_call(&rec.emitter, "emit", vec![with_host(|h| h.new_str("close"))])?;
+        super::events::instance_call(
+            &rec.emitter,
+            "emit",
+            vec![with_host(|h| h.new_str("close"))],
+        )?;
         with_host(|h| h.decr_handle());
         // Wake the loop so a closed last handle lets it exit.
         let _ = with_host(|h| h.io_sender()).send(Box::new(|| Ok(())));

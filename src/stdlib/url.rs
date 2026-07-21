@@ -70,7 +70,11 @@ impl Parts {
 /// Parse an absolute URL. Returns `None` if there is no `scheme://`.
 fn parse_absolute(input: &str) -> Option<Parts> {
     let (scheme, rest) = input.split_once("://")?;
-    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
         return None;
     }
     // authority is up to the first '/', '?' or '#'.
@@ -107,7 +111,11 @@ fn parse_absolute(input: &str) -> Option<Parts> {
         }
         None => String::new(),
     };
-    let pathname = if tail.is_empty() { "/".to_string() } else { tail.to_string() };
+    let pathname = if tail.is_empty() {
+        "/".to_string()
+    } else {
+        tail.to_string()
+    };
 
     Some(Parts {
         protocol: format!("{scheme}:"),
@@ -190,7 +198,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // but not re-prefixed; Windows drive/UNC rewriting is not modeled.
         "fileURLToPath" => file_url_to_path(args).map(|s| with_host(|h| h.new_str(s))),
         // Same, but returns the path as a `Buffer`.
-        "fileURLToPathBuffer" => file_url_to_path(args).map(|s| super::buffer::from_bytes(s.as_bytes())),
+        "fileURLToPathBuffer" => {
+            file_url_to_path(args).map(|s| super::buffer::from_bytes(s.as_bytes()))
+        }
         // `url.pathToFileURL(path)` → a `URL` instance with a `file:` href.
         "pathToFileURL" => Ok(path_to_file_url(&arg_str(args, 0))),
         // `url.domainToASCII` / `url.domainToUnicode` — delegate to the punycode
@@ -199,7 +209,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "domainToASCII" => Ok(punycode_domain(args, true)),
         "domainToUnicode" => Ok(punycode_domain(args, false)),
         // `url.urlToHttpOptions(URL)` → an options object for http/https.request.
-        "urlToHttpOptions" => Ok(url_to_http_options(&args.first().cloned().unwrap_or(Value::Undef))),
+        "urlToHttpOptions" => Ok(url_to_http_options(
+            &args.first().cloned().unwrap_or(Value::Undef),
+        )),
         // Legacy `url.resolve(from, to)` — RFC 3986 §5 reference resolution.
         "resolve" => {
             let from = arg_str(args, 0);
@@ -223,7 +235,13 @@ fn legacy_parse(input: &str) -> Value {
     with_host(|h| {
         let mut m = IndexMap::new();
         let null = h.null();
-        let opt = |h: &mut crate::host::JsHost, s: &str| if s.is_empty() { h.null() } else { h.new_str(s) };
+        let opt = |h: &mut crate::host::JsHost, s: &str| {
+            if s.is_empty() {
+                h.null()
+            } else {
+                h.new_str(s)
+            }
+        };
         match p {
             Some(p) => {
                 let auth = if p.username.is_empty() {
@@ -243,7 +261,10 @@ fn legacy_parse(input: &str) -> Value {
                 m.insert("search".into(), opt(h, &p.search));
                 m.insert("query".into(), opt(h, p.search.trim_start_matches('?')));
                 m.insert("pathname".into(), h.new_str(p.pathname.clone()));
-                m.insert("path".into(), h.new_str(format!("{}{}", p.pathname, p.search)));
+                m.insert(
+                    "path".into(),
+                    h.new_str(format!("{}{}", p.pathname, p.search)),
+                );
                 m.insert("href".into(), h.new_str(p.href()));
             }
             None => {
@@ -272,7 +293,9 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             Some(JsObj::Object(p)) => p.get("href").cloned().unwrap_or(Value::Undef),
             _ => Value::Undef,
         })),
-        _ => Err(crate::host::type_error(&format!("url.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "url.{method} is not a function"
+        ))),
     }
 }
 
@@ -310,7 +333,11 @@ fn file_url_to_path(args: &[Value]) -> Result<String, String> {
 /// percent-encoded (path-set) path.
 fn path_to_file_url(path: &str) -> Value {
     let enc = encode_path_component(path);
-    let pathname = if enc.starts_with('/') { enc } else { format!("/{enc}") };
+    let pathname = if enc.starts_with('/') {
+        enc
+    } else {
+        format!("/{enc}")
+    };
     let parts = Parts {
         protocol: "file:".into(),
         username: String::new(),
@@ -358,9 +385,17 @@ fn url_to_http_options(v: &Value) -> Value {
     let auth = if username.is_empty() && password.is_empty() {
         None
     } else {
-        Some(format!("{}:{}", percent_decode(&username), percent_decode(&password)))
+        Some(format!(
+            "{}:{}",
+            percent_decode(&username),
+            percent_decode(&password)
+        ))
     };
-    let port_num = if port.is_empty() { None } else { port.parse::<f64>().ok() };
+    let port_num = if port.is_empty() {
+        None
+    } else {
+        port.parse::<f64>().ok()
+    };
     with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("protocol".into(), h.new_str(protocol));
@@ -408,8 +443,23 @@ fn encode_path_component(s: &str) -> String {
         let keep = b.is_ascii_alphanumeric()
             || matches!(
                 b,
-                b'/' | b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'('
-                    | b')' | b'*' | b'+' | b',' | b';' | b'=' | b':' | b'@'
+                b'/' | b'-'
+                    | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
             );
         if keep {
             out.push(b as char);
@@ -443,7 +493,9 @@ fn split_uri(input: &str) -> UriRef {
         let cand = &rest[..colon];
         let scheme_ok = !cand.is_empty()
             && cand.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-            && cand.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            && cand
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
             && cand.find(['/', '?', '#']).is_none();
         if scheme_ok {
             scheme = Some(cand.to_string());
@@ -466,7 +518,13 @@ fn split_uri(input: &str) -> UriRef {
         authority = Some(r[..end].to_string());
         rest = &r[end..];
     }
-    UriRef { scheme, authority, path: rest.to_string(), query, fragment }
+    UriRef {
+        scheme,
+        authority,
+        path: rest.to_string(),
+        query,
+        fragment,
+    }
 }
 
 /// Merge a relative path onto a base (RFC 3986 §5.2.3).
@@ -512,7 +570,10 @@ fn remove_dot_segments(path: &str) -> String {
             input.clear();
         } else {
             let start = usize::from(input.starts_with('/'));
-            let end = input[start..].find('/').map(|i| start + i).unwrap_or(input.len());
+            let end = input[start..]
+                .find('/')
+                .map(|i| start + i)
+                .unwrap_or(input.len());
             output.push_str(&input[..end]);
             input.drain(..end);
         }
@@ -532,16 +593,38 @@ fn resolve_ref(base: &UriRef, r: &UriRef) -> UriRef {
         };
     }
     let (authority, path, query) = if r.authority.is_some() {
-        (r.authority.clone(), remove_dot_segments(&r.path), r.query.clone())
+        (
+            r.authority.clone(),
+            remove_dot_segments(&r.path),
+            r.query.clone(),
+        )
     } else if r.path.is_empty() {
-        let q = if r.query.is_some() { r.query.clone() } else { base.query.clone() };
+        let q = if r.query.is_some() {
+            r.query.clone()
+        } else {
+            base.query.clone()
+        };
         (base.authority.clone(), base.path.clone(), q)
     } else if r.path.starts_with('/') {
-        (base.authority.clone(), remove_dot_segments(&r.path), r.query.clone())
+        (
+            base.authority.clone(),
+            remove_dot_segments(&r.path),
+            r.query.clone(),
+        )
     } else {
-        (base.authority.clone(), remove_dot_segments(&merge_paths(base, &r.path)), r.query.clone())
+        (
+            base.authority.clone(),
+            remove_dot_segments(&merge_paths(base, &r.path)),
+            r.query.clone(),
+        )
     };
-    UriRef { scheme: base.scheme.clone(), authority, path, query, fragment: r.fragment.clone() }
+    UriRef {
+        scheme: base.scheme.clone(),
+        authority,
+        path,
+        query,
+        fragment: r.fragment.clone(),
+    }
 }
 
 /// Recompose a URI from its components (RFC 3986 §5.3).
@@ -582,8 +665,19 @@ fn legacy_resolve(from: &str, to: &str) -> String {
 /// Method names dispatched through `search_params_call` (for `instance_has_method`
 /// wiring in `stdlib::mod`; `@@iterator` makes `[...params]` / `for..of` work).
 pub const SEARCH_PARAMS_METHODS: &[&str] = &[
-    "get", "getAll", "has", "set", "append", "delete", "keys", "values", "entries",
-    "forEach", "toString", "sort", "@@iterator",
+    "get",
+    "getAll",
+    "has",
+    "set",
+    "append",
+    "delete",
+    "keys",
+    "values",
+    "entries",
+    "forEach",
+    "toString",
+    "sort",
+    "@@iterator",
 ];
 
 /// Build a `URLSearchParams` native object from ordered key/value pairs.
@@ -690,7 +784,10 @@ fn pairs_from_init(v: &Value) -> Vec<(String, String)> {
                 .filter(|(k, _)| !k.starts_with("@@"))
                 .map(|(k, val)| (k.clone(), val.clone()))
                 .collect();
-            entries.into_iter().map(|(k, val)| (k, h.str_of(&val))).collect()
+            entries
+                .into_iter()
+                .map(|(k, val)| (k, h.str_of(&val)))
+                .collect()
         }
         _ => Vec::new(),
     })

@@ -27,24 +27,98 @@ use std::time::{Duration, UNIX_EPOCH};
 
 pub const METHODS: &[&str] = &[
     // path — sync
-    "readFileSync", "writeFileSync", "appendFileSync", "existsSync", "readdirSync", "mkdirSync",
-    "rmdirSync", "unlinkSync", "rmSync", "statSync", "lstatSync", "statfsSync", "accessSync",
-    "chmodSync", "chownSync", "lchownSync", "copyFileSync", "cpSync", "linkSync", "symlinkSync",
-    "readlinkSync", "realpathSync", "renameSync", "truncateSync", "utimesSync", "lutimesSync",
-    "mkdtempSync", "opendirSync", "globSync",
+    "readFileSync",
+    "writeFileSync",
+    "appendFileSync",
+    "existsSync",
+    "readdirSync",
+    "mkdirSync",
+    "rmdirSync",
+    "unlinkSync",
+    "rmSync",
+    "statSync",
+    "lstatSync",
+    "statfsSync",
+    "accessSync",
+    "chmodSync",
+    "chownSync",
+    "lchownSync",
+    "copyFileSync",
+    "cpSync",
+    "linkSync",
+    "symlinkSync",
+    "readlinkSync",
+    "realpathSync",
+    "renameSync",
+    "truncateSync",
+    "utimesSync",
+    "lutimesSync",
+    "mkdtempSync",
+    "opendirSync",
+    "globSync",
     // fd — sync
-    "openSync", "closeSync", "readSync", "writeSync", "readvSync", "writevSync", "fstatSync",
-    "fchmodSync", "fchownSync", "ftruncateSync", "futimesSync", "fsyncSync", "fdatasyncSync",
+    "openSync",
+    "closeSync",
+    "readSync",
+    "writeSync",
+    "readvSync",
+    "writevSync",
+    "fstatSync",
+    "fchmodSync",
+    "fchownSync",
+    "ftruncateSync",
+    "futimesSync",
+    "fsyncSync",
+    "fdatasyncSync",
     // path — async (callback)
-    "readFile", "writeFile", "appendFile", "readdir", "mkdir", "rmdir", "rm", "unlink", "stat",
-    "lstat", "statfs", "access", "chmod", "chown", "lchown", "copyFile", "cp", "link", "symlink",
-    "readlink", "realpath", "rename", "truncate", "utimes", "lutimes", "mkdtemp", "opendir", "glob",
+    "readFile",
+    "writeFile",
+    "appendFile",
+    "readdir",
+    "mkdir",
+    "rmdir",
+    "rm",
+    "unlink",
+    "stat",
+    "lstat",
+    "statfs",
+    "access",
+    "chmod",
+    "chown",
+    "lchown",
+    "copyFile",
+    "cp",
+    "link",
+    "symlink",
+    "readlink",
+    "realpath",
+    "rename",
+    "truncate",
+    "utimes",
+    "lutimes",
+    "mkdtemp",
+    "opendir",
+    "glob",
     "exists",
     // fd — async (callback)
-    "open", "close", "read", "write", "readv", "writev", "fstat", "fchmod", "fchown", "ftruncate",
-    "futimes", "fsync", "fdatasync",
+    "open",
+    "close",
+    "read",
+    "write",
+    "readv",
+    "writev",
+    "fstat",
+    "fchmod",
+    "fchown",
+    "ftruncate",
+    "futimes",
+    "fsync",
+    "fdatasync",
     // watchers + streams
-    "watchFile", "unwatchFile", "createReadStream", "createWriteStream",
+    "watchFile",
+    "unwatchFile",
+    "createReadStream",
+    "createWriteStream",
 ];
 
 // ── file-descriptor table ────────────────────────────────────────────────────
@@ -187,7 +261,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// `cb(err)` (an error string, matching the existing `readFile`/`writeFile`
 /// callbacks) on failure. Always returns `undefined` (the method's own result).
 fn async_cb(args: &[Value], result: Result<Value, String>) -> Result<Value, String> {
-    let Some(cb) = args.last().cloned().filter(is_fn) else { return Ok(Value::Undef) };
+    let Some(cb) = args.last().cloned().filter(is_fn) else {
+        return Ok(Value::Undef);
+    };
     match result {
         Ok(v) => with_host(|h| {
             let n = h.null();
@@ -203,7 +279,9 @@ fn async_cb(args: &[Value], result: Result<Value, String>) -> Result<Value, Stri
 
 /// `read`/`write` callbacks carry a third argument: `cb(err, count, buffer)`.
 fn read_write_async(args: &[Value], result: Result<usize, String>) -> Result<Value, String> {
-    let Some(cb) = args.last().cloned().filter(is_fn) else { return Ok(Value::Undef) };
+    let Some(cb) = args.last().cloned().filter(is_fn) else {
+        return Ok(Value::Undef);
+    };
     let buffer = args.get(1).cloned().unwrap_or(Value::Undef);
     match result {
         Ok(n) => with_host(|h| {
@@ -261,8 +339,14 @@ fn append_file_impl(args: &[Value]) -> Result<Value, String> {
 
 fn read_file_async(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
-    let Some(cb) = args.last().cloned().filter(is_fn) else { return Ok(Value::Undef) };
-    let enc = if args.len() >= 3 { encoding_arg(args, 1) } else { None };
+    let Some(cb) = args.last().cloned().filter(is_fn) else {
+        return Ok(Value::Undef);
+    };
+    let enc = if args.len() >= 3 {
+        encoding_arg(args, 1)
+    } else {
+        None
+    };
     let (err, data) = match std::fs::read(&path) {
         Ok(bytes) => (
             with_host(|h| h.null()),
@@ -271,7 +355,10 @@ fn read_file_async(args: &[Value]) -> Result<Value, String> {
                 None => super::buffer::from_bytes(&bytes),
             },
         ),
-        Err(e) => (with_host(|h| h.new_str(err_str("readFile", &path, &e))), Value::Undef),
+        Err(e) => (
+            with_host(|h| h.new_str(err_str("readFile", &path, &e))),
+            Value::Undef,
+        ),
     };
     with_host(|h| h.queue_micro(cb, vec![err, data]));
     Ok(Value::Undef)
@@ -279,7 +366,9 @@ fn read_file_async(args: &[Value]) -> Result<Value, String> {
 
 fn exists_async(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
-    let Some(cb) = args.last().cloned().filter(is_fn) else { return Ok(Value::Undef) };
+    let Some(cb) = args.last().cloned().filter(is_fn) else {
+        return Ok(Value::Undef);
+    };
     let ex = Path::new(&path).exists();
     with_host(|h| h.queue_micro(cb, vec![Value::Bool(ex)]));
     Ok(Value::Undef)
@@ -290,7 +379,11 @@ fn exists_async(args: &[Value]) -> Result<Value, String> {
 fn mkdir_impl(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
     let recursive = opt_flag(args, "recursive");
-    let r = if recursive { std::fs::create_dir_all(&path) } else { std::fs::create_dir(&path) };
+    let r = if recursive {
+        std::fs::create_dir_all(&path)
+    } else {
+        std::fs::create_dir(&path)
+    };
     match r {
         Ok(_) => Ok(Value::Undef),
         Err(e) => Err(err_str("mkdir", &path, &e)),
@@ -302,7 +395,11 @@ fn rm_impl(op: &str, args: &[Value]) -> Result<Value, String> {
     let p = Path::new(&path);
     let force = opt_flag(args, "force");
     let r = if p.is_dir() {
-        if opt_flag(args, "recursive") { std::fs::remove_dir_all(p) } else { std::fs::remove_dir(p) }
+        if opt_flag(args, "recursive") {
+            std::fs::remove_dir_all(p)
+        } else {
+            std::fs::remove_dir(p)
+        }
     } else {
         std::fs::remove_file(p)
     };
@@ -350,7 +447,11 @@ fn collect_dir(
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
-        let rel = if rel_prefix.is_empty() { name.clone() } else { format!("{rel_prefix}/{name}") };
+        let rel = if rel_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
         let ft = e.file_type()?;
         out.push((rel.clone(), parent.to_string(), ft));
         if recursive && ft.is_dir() {
@@ -367,7 +468,11 @@ fn opendir_impl(args: &[Value]) -> Result<Value, String> {
     let rd = std::fs::read_dir(&path).map_err(|e| err_str("opendir", &path, &e))?;
     let mut entries: Vec<(String, std::fs::FileType)> = rd
         .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_type().ok().map(|ft| (e.file_name().to_string_lossy().into_owned(), ft)))
+        .filter_map(|e| {
+            e.file_type()
+                .ok()
+                .map(|ft| (e.file_name().to_string_lossy().into_owned(), ft))
+        })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(with_host(|h| {
@@ -410,14 +515,21 @@ fn chown_impl(args: &[Value], follow: bool) -> Result<Value, String> {
     let gid = arg_num(args, 2) as libc::gid_t;
     let c = cpath(&path, "chown")?;
     let rc = unsafe {
-        if follow { libc::chown(c.as_ptr(), uid, gid) } else { libc::lchown(c.as_ptr(), uid, gid) }
+        if follow {
+            libc::chown(c.as_ptr(), uid, gid)
+        } else {
+            libc::lchown(c.as_ptr(), uid, gid)
+        }
     };
     ok_or_errno(rc, "chown", &path)
 }
 
 fn utimes_impl(args: &[Value], follow: bool) -> Result<Value, String> {
     let path = arg_str(args, 0);
-    let times = [to_timeval(time_secs(args, 1)), to_timeval(time_secs(args, 2))];
+    let times = [
+        to_timeval(time_secs(args, 1)),
+        to_timeval(time_secs(args, 2)),
+    ];
     let c = cpath(&path, "utimes")?;
     let rc = unsafe {
         if follow {
@@ -438,7 +550,9 @@ fn copy_file_impl(args: &[Value]) -> Result<Value, String> {
     let dest = arg_str(args, 1);
     let mode = arg_num(args, 2);
     if !mode.is_nan() && (mode as u32) & COPYFILE_EXCL != 0 && Path::new(&dest).exists() {
-        return Err(format!("Error: EEXIST: file already exists, copyfile '{src}' -> '{dest}'"));
+        return Err(format!(
+            "Error: EEXIST: file already exists, copyfile '{src}' -> '{dest}'"
+        ));
     }
     match std::fs::copy(&src, &dest) {
         Ok(_) => Ok(Value::Undef),
@@ -524,7 +638,10 @@ fn truncate_impl(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
     let len = arg_num(args, 1);
     let len = if len.is_nan() { 0 } else { len as u64 };
-    let r = std::fs::OpenOptions::new().write(true).open(&path).and_then(|f| f.set_len(len));
+    let r = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_len(len));
     match r {
         Ok(_) => Ok(Value::Undef),
         Err(e) => Err(err_str("truncate", &path, &e)),
@@ -541,7 +658,9 @@ fn mkdtemp_impl(args: &[Value]) -> Result<Value, String> {
             Err(e) => return Err(err_str("mkdtemp", &prefix, &e)),
         }
     }
-    Err(format!("Error: EEXIST: file already exists, mkdtemp '{prefix}'"))
+    Err(format!(
+        "Error: EEXIST: file already exists, mkdtemp '{prefix}'"
+    ))
 }
 
 /// Six random `[0-9A-Za-z]` characters — Node's `mkdtemp` suffix alphabet.
@@ -554,9 +673,19 @@ fn random_suffix() -> String {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        raw = nanos.to_le_bytes().iter().cycle().take(6).copied().collect::<Vec<_>>().try_into().unwrap();
+        raw = nanos
+            .to_le_bytes()
+            .iter()
+            .cycle()
+            .take(6)
+            .copied()
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
     }
-    raw.iter().map(|b| CHARS[(*b as usize) % 62] as char).collect()
+    raw.iter()
+        .map(|b| CHARS[(*b as usize) % 62] as char)
+        .collect()
 }
 
 // ── file descriptors ─────────────────────────────────────────────────────────
@@ -658,9 +787,15 @@ fn write_impl(args: &[Value]) -> Result<usize, String> {
         let offset = num_or(args, 2, 0.0) as usize;
         let length = num_or(args, 3, (all.len().saturating_sub(offset)) as f64) as usize;
         let end = (offset + length).min(all.len());
-        (all[offset.min(all.len())..end].to_vec(), position_arg(args, 4))
+        (
+            all[offset.min(all.len())..end].to_vec(),
+            position_arg(args, 4),
+        )
     } else {
-        (with_host(|h| h.str_of(&src)).into_bytes(), position_arg(args, 2))
+        (
+            with_host(|h| h.str_of(&src)).into_bytes(),
+            position_arg(args, 2),
+        )
     };
     let r = with_file(fd, |file| {
         let mut fr: &File = file;
@@ -750,14 +885,21 @@ fn fchown_impl(args: &[Value]) -> Result<Value, String> {
     let fd = arg_num(args, 0) as i32;
     let uid = arg_num(args, 1) as libc::uid_t;
     let gid = arg_num(args, 2) as libc::gid_t;
-    let rc = with_file(fd, |file| unsafe { libc::fchown(file.as_raw_fd(), uid, gid) });
+    let rc = with_file(fd, |file| unsafe {
+        libc::fchown(file.as_raw_fd(), uid, gid)
+    });
     fd_result(rc, "fchown")
 }
 
 fn futimes_impl(args: &[Value]) -> Result<Value, String> {
     let fd = arg_num(args, 0) as i32;
-    let times = [to_timeval(time_secs(args, 1)), to_timeval(time_secs(args, 2))];
-    let rc = with_file(fd, |file| unsafe { libc::futimes(file.as_raw_fd(), times.as_ptr()) });
+    let times = [
+        to_timeval(time_secs(args, 1)),
+        to_timeval(time_secs(args, 2)),
+    ];
+    let rc = with_file(fd, |file| unsafe {
+        libc::futimes(file.as_raw_fd(), times.as_ptr())
+    });
     fd_result(rc, "futimes")
 }
 
@@ -775,7 +917,13 @@ fn ftruncate_impl(args: &[Value]) -> Result<Value, String> {
 fn fsync_impl(args: &[Value], data_only: bool) -> Result<Value, String> {
     let fd = arg_num(args, 0) as i32;
     let op = if data_only { "fdatasync" } else { "fsync" };
-    let r = with_file(fd, |file| if data_only { file.sync_data() } else { file.sync_all() });
+    let r = with_file(fd, |file| {
+        if data_only {
+            file.sync_data()
+        } else {
+            file.sync_all()
+        }
+    });
     match r {
         Some(Ok(_)) => Ok(Value::Undef),
         Some(Err(e)) => Err(err_str(op, "", &e)),
@@ -797,7 +945,11 @@ fn fd_result(rc: Option<libc::c_int>, op: &str) -> Result<Value, String> {
 
 fn stat_impl(op: &str, args: &[Value], follow: bool) -> Result<Value, String> {
     let path = arg_str(args, 0);
-    let md = if follow { std::fs::metadata(&path) } else { std::fs::symlink_metadata(&path) };
+    let md = if follow {
+        std::fs::metadata(&path)
+    } else {
+        std::fs::symlink_metadata(&path)
+    };
     match md {
         Ok(md) => Ok(with_host(|h| build_stats(h, &md))),
         Err(e) => Err(err_str(op, &path, &e)),
@@ -877,7 +1029,9 @@ fn build_stats(h: &mut crate::host::JsHost, md: &std::fs::Metadata) -> Value {
 
 fn watch_file(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
-    let Some(listener) = args.last().cloned().filter(is_fn) else { return Ok(Value::Undef) };
+    let Some(listener) = args.last().cloned().filter(is_fn) else {
+        return Ok(Value::Undef);
+    };
     let interval = interval_opt(args).unwrap_or(5007.0).max(1.0) as u64;
     let abs = std::fs::canonicalize(&path)
         .map(|p| p.to_string_lossy().into_owned())
@@ -890,7 +1044,12 @@ fn watch_file(args: &[Value]) -> Result<Value, String> {
         v
     });
     WATCHERS.with(|w| {
-        w.borrow_mut().push(WatchEntry { id, path: abs.clone(), listener: listener.clone(), stop: stop.clone() });
+        w.borrow_mut().push(WatchEntry {
+            id,
+            path: abs.clone(),
+            listener: listener.clone(),
+            stop: stop.clone(),
+        });
     });
     with_host(|h| h.incr_handle());
 
@@ -937,7 +1096,8 @@ fn unwatch_file(args: &[Value]) -> Result<Value, String> {
         let mut w = w.borrow_mut();
         let mut count = 0;
         w.retain(|e| {
-            let matches = e.path == abs && listener.as_ref().map(|l| *l == e.listener).unwrap_or(true);
+            let matches =
+                e.path == abs && listener.as_ref().map(|l| *l == e.listener).unwrap_or(true);
             if matches {
                 e.stop.store(true, Ordering::Release);
                 count += 1;
@@ -959,7 +1119,11 @@ fn unwatch_file(args: &[Value]) -> Result<Value, String> {
 /// A file's watch-relevant state: `(exists, mtime_ms, size)`.
 fn stat_parts(path: &str) -> (bool, i64, u64) {
     match std::fs::metadata(path) {
-        Ok(md) => (true, md.mtime() * 1000 + md.mtime_nsec() / 1_000_000, md.len()),
+        Ok(md) => (
+            true,
+            md.mtime() * 1000 + md.mtime_nsec() / 1_000_000,
+            md.len(),
+        ),
         Err(_) => (false, 0, 0),
     }
 }
@@ -977,7 +1141,10 @@ fn stats_from_parts(h: &mut crate::host::JsHost, exists: bool, mtime_ms: i64, si
     m.insert("@@isFile".into(), Value::Bool(exists));
     m.insert("@@isDir".into(), Value::Bool(false));
     m.insert("@@isSymlink".into(), Value::Bool(false));
-    m.insert("size".into(), Value::Float(if exists { size as f64 } else { 0.0 }));
+    m.insert(
+        "size".into(),
+        Value::Float(if exists { size as f64 } else { 0.0 }),
+    );
     m.insert("atimeMs".into(), Value::Float(ms));
     m.insert("mtimeMs".into(), Value::Float(ms));
     m.insert("ctimeMs".into(), Value::Float(ms));
@@ -1023,13 +1190,19 @@ fn read_stream_pump(recv: &Value, path: &str) {
         Ok(b) => b,
         Err(e) => {
             let ev = with_host(|h| crate::builtins::synth_error(h, &err_str("open", path, &e)));
-            let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("error")), ev]);
+            let _ = super::events::instance_call(
+                recv,
+                "emit",
+                vec![with_host(|h| h.new_str("error")), ev],
+            );
             return;
         }
     };
     let enc = get_prop(recv, "@@encoding").map(|v| with_host(|h| h.str_of(&v)));
     let chunk = match enc.as_deref() {
-        Some(e) if e != "buffer" => with_host(|h| h.new_str(String::from_utf8_lossy(&bytes).into_owned())),
+        Some(e) if e != "buffer" => {
+            with_host(|h| h.new_str(String::from_utf8_lossy(&bytes).into_owned()))
+        }
         _ => super::buffer::from_bytes(&bytes),
     };
     if let Some(dest) = get_prop(recv, "@@pipeDest") {
@@ -1043,8 +1216,15 @@ fn read_stream_pump(recv: &Value, path: &str) {
     let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
 }
 
-pub const READ_STREAM_METHODS: &[&str] =
-    &["pipe", "pause", "resume", "setEncoding", "destroy", "close", "read"];
+pub const READ_STREAM_METHODS: &[&str] = &[
+    "pipe",
+    "pause",
+    "resume",
+    "setEncoding",
+    "destroy",
+    "close",
+    "read",
+];
 
 /// `fs.ReadStream` instance dispatch (tag `FSReadStream`). Emitter methods are
 /// handled by the parent's shared emitter routing; this covers the stream-only
@@ -1060,15 +1240,22 @@ pub fn read_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<
             }
         }
         "setEncoding" => {
-            set_prop(recv, "@@encoding", with_host(|h| h.new_str(super::arg_str(&args, 0))));
+            set_prop(
+                recv,
+                "@@encoding",
+                with_host(|h| h.new_str(super::arg_str(&args, 0))),
+            );
             Ok(recv.clone())
         }
         "pause" | "resume" | "read" => Ok(recv.clone()),
         "destroy" | "close" => {
-            let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
+            let _ =
+                super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
             Ok(recv.clone())
         }
-        _ => Err(crate::host::type_error(&format!("stream.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "stream.{method} is not a function"
+        ))),
     }
 }
 
@@ -1094,16 +1281,28 @@ fn create_write_stream(args: &[Value]) -> Result<Value, String> {
     let recv = stream.clone();
     with_host(|h| {
         h.queue_micro_native(Box::new(move || {
-            let _ = super::events::instance_call(&recv, "emit", vec![with_host(|h| h.new_str("open"))]);
-            let _ = super::events::instance_call(&recv, "emit", vec![with_host(|h| h.new_str("ready"))]);
+            let _ =
+                super::events::instance_call(&recv, "emit", vec![with_host(|h| h.new_str("open"))]);
+            let _ = super::events::instance_call(
+                &recv,
+                "emit",
+                vec![with_host(|h| h.new_str("ready"))],
+            );
             Ok(())
         }))
     });
     Ok(stream)
 }
 
-pub const WRITE_STREAM_METHODS: &[&str] =
-    &["write", "end", "destroy", "close", "cork", "uncork", "setDefaultEncoding"];
+pub const WRITE_STREAM_METHODS: &[&str] = &[
+    "write",
+    "end",
+    "destroy",
+    "close",
+    "cork",
+    "uncork",
+    "setDefaultEncoding",
+];
 
 /// `fs.WriteStream` instance dispatch (tag `FSWriteStream`).
 pub fn write_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
@@ -1116,14 +1315,23 @@ pub fn write_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result
             Ok(Value::Bool(true))
         }
         "end" => {
-            if let Some(chunk) = args.first().filter(|v| !matches!(v, Value::Undef) && !is_fn(v)) {
+            if let Some(chunk) = args
+                .first()
+                .filter(|v| !matches!(v, Value::Undef) && !is_fn(v))
+            {
                 write_stream_bytes(recv, Some(chunk));
             }
-            if let Some(fd) = get_prop(recv, "@@wfd").map(|v| with_host(|h| h.to_number(&v)) as i32) {
+            if let Some(fd) = get_prop(recv, "@@wfd").map(|v| with_host(|h| h.to_number(&v)) as i32)
+            {
                 close_fd(fd);
             }
-            let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("finish"))]);
-            let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
+            let _ = super::events::instance_call(
+                recv,
+                "emit",
+                vec![with_host(|h| h.new_str("finish"))],
+            );
+            let _ =
+                super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
             with_host(|h| h.decr_handle());
             if let Some(cb) = args.iter().find(|v| is_fn(v)).cloned() {
                 let _ = invoke(&cb, vec![], None);
@@ -1131,15 +1339,19 @@ pub fn write_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result
             Ok(recv.clone())
         }
         "destroy" | "close" => {
-            if let Some(fd) = get_prop(recv, "@@wfd").map(|v| with_host(|h| h.to_number(&v)) as i32) {
+            if let Some(fd) = get_prop(recv, "@@wfd").map(|v| with_host(|h| h.to_number(&v)) as i32)
+            {
                 close_fd(fd);
             }
-            let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
+            let _ =
+                super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
             with_host(|h| h.decr_handle());
             Ok(recv.clone())
         }
         "cork" | "uncork" | "setDefaultEncoding" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("stream.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "stream.{method} is not a function"
+        ))),
     }
 }
 
@@ -1152,7 +1364,9 @@ fn write_stream_bytes(recv: &Value, chunk: Option<&Value>) {
             fr.write(&data).unwrap_or(0)
         })
         .unwrap_or(0);
-        let prev = get_prop(recv, "bytesWritten").map(|v| with_host(|h| h.to_number(&v))).unwrap_or(0.0);
+        let prev = get_prop(recv, "bytesWritten")
+            .map(|v| with_host(|h| h.to_number(&v)))
+            .unwrap_or(0.0);
         set_prop(recv, "bytesWritten", Value::Float(prev + written as f64));
     }
 }
@@ -1165,7 +1379,12 @@ pub fn stats_call(recv: &Value, method: &str) -> Result<Value, String> {
 }
 
 pub const DIRENT_METHODS: &[&str] = &[
-    "isFile", "isDirectory", "isSymbolicLink", "isBlockDevice", "isCharacterDevice", "isFIFO",
+    "isFile",
+    "isDirectory",
+    "isSymbolicLink",
+    "isBlockDevice",
+    "isCharacterDevice",
+    "isFIFO",
     "isSocket",
 ];
 
@@ -1190,7 +1409,9 @@ fn type_test(recv: &Value, method: &str, what: &str) -> Result<Value, String> {
         "isDirectory" => Ok(Value::Bool(read("@@isDir"))),
         "isSymbolicLink" => Ok(Value::Bool(read("@@isSymlink"))),
         "isBlockDevice" | "isCharacterDevice" | "isFIFO" | "isSocket" => Ok(Value::Bool(false)),
-        _ => Err(crate::host::type_error(&format!("{what}.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{what}.{method} is not a function"
+        ))),
     }
 }
 
@@ -1224,7 +1445,9 @@ pub fn dir_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
                 Ok(settled_ok(Value::Undef))
             }
         }
-        _ => Err(crate::host::type_error(&format!("dir.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "dir.{method} is not a function"
+        ))),
     }
 }
 
@@ -1251,7 +1474,12 @@ fn dir_next(recv: &Value) -> Value {
     })
 }
 
-fn build_dirent(h: &mut crate::host::JsHost, name: String, parent: &str, ft: std::fs::FileType) -> Value {
+fn build_dirent(
+    h: &mut crate::host::JsHost,
+    name: String,
+    parent: &str,
+    ft: std::fs::FileType,
+) -> Value {
     let mut m = IndexMap::new();
     m.insert("@@native".into(), h.new_str("Dirent"));
     m.insert("name".into(), h.new_str(name));
@@ -1274,9 +1502,17 @@ fn glob_impl(args: &[Value]) -> Result<Value, String> {
     } else {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     };
-    let segs: Vec<String> = pattern.split('/').filter(|s| !s.is_empty()).map(String::from).collect();
+    let segs: Vec<String> = pattern
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
     let mut out: Vec<String> = Vec::new();
-    let prefix = if absolute { "/".to_string() } else { String::new() };
+    let prefix = if absolute {
+        "/".to_string()
+    } else {
+        String::new()
+    };
     glob_walk(&base, &segs, 0, &prefix, &mut out);
     out.sort();
     out.dedup();
@@ -1420,7 +1656,9 @@ fn buf_len(v: &Value) -> usize {
 /// Write `data` into a Buffer's backing byte array at `offset`; returns the count
 /// actually written (bounded by the buffer capacity).
 fn write_into_buffer(buf: &Value, offset: usize, data: &[u8]) -> usize {
-    let Some(arr) = get_prop(buf, "@@bytes") else { return 0 };
+    let Some(arr) = get_prop(buf, "@@bytes") else {
+        return 0;
+    };
     with_host(|h| {
         if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
             let mut n = 0;
@@ -1525,7 +1763,10 @@ fn time_secs(args: &[Value], i: usize) -> f64 {
 fn to_timeval(secs: f64) -> libc::timeval {
     let s = secs.floor();
     let us = ((secs - s) * 1_000_000.0).round();
-    libc::timeval { tv_sec: s as libc::time_t, tv_usec: us as libc::suseconds_t }
+    libc::timeval {
+        tv_sec: s as libc::time_t,
+        tv_usec: us as libc::suseconds_t,
+    }
 }
 
 fn cpath(path: &str, op: &str) -> Result<CString, String> {

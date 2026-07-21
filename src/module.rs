@@ -134,7 +134,9 @@ fn pkg_entry(pkg: &Path) -> Option<String> {
     if let Some(e) = exports_main(json.get("exports")) {
         return Some(strip_dot_slash(&e));
     }
-    json.get("main").and_then(|m| m.as_str()).map(strip_dot_slash)
+    json.get("main")
+        .and_then(|m| m.as_str())
+        .map(strip_dot_slash)
 }
 
 /// Resolve the `"exports"` field down to a single relative path for the `"."`
@@ -196,7 +198,8 @@ fn resolve_bare(spec: &str, from_dir: &Path) -> Option<PathBuf> {
 /// Resolve `spec` relative to `from_dir` to an absolute file path, or `None` if
 /// no file matches (core modules are handled earlier, by the caller).
 pub fn resolve(spec: &str, from_dir: &Path) -> Option<PathBuf> {
-    let is_relative = spec.starts_with("./") || spec.starts_with("../") || spec == "." || spec == "..";
+    let is_relative =
+        spec.starts_with("./") || spec.starts_with("../") || spec == "." || spec == "..";
     let is_absolute = spec.starts_with('/');
     if is_relative || is_absolute {
         let base = if is_absolute {
@@ -220,8 +223,8 @@ pub fn require(spec: &str, from_dir: &Path) -> Result<Value, String> {
     if let Some(ns) = crate::stdlib::resolve(spec) {
         return Ok(with_host(|h| h.alloc(JsObj::Builtin(ns.to_string()))));
     }
-    let path = resolve(spec, from_dir)
-        .ok_or_else(|| format!("Error: Cannot find module '{spec}'"))?;
+    let path =
+        resolve(spec, from_dir).ok_or_else(|| format!("Error: Cannot find module '{spec}'"))?;
     // A canonical absolute key so the same file required via different relative
     // specifiers shares one cache entry.
     let path = std::fs::canonicalize(&path).unwrap_or(path);

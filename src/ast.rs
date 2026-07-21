@@ -20,17 +20,17 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
-    EqEqEq,   // ===
-    NeEqEq,   // !==
-    EqEq,     // ==  (loose, coercing)
-    NeEq,     // !=
+    EqEqEq, // ===
+    NeEqEq, // !==
+    EqEq,   // ==  (loose, coercing)
+    NeEq,   // !=
     // Bitwise / shift
     BitAnd,
     BitOr,
     BitXor,
-    Shl,      // <<
-    Shr,      // >>
-    UShr,     // >>>
+    Shl,  // <<
+    Shr,  // >>
+    UShr, // >>>
     // `in` / `instanceof`
     In,
     InstanceOf,
@@ -39,8 +39,8 @@ pub enum BinOp {
 /// A short-circuiting logical operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicalOp {
-    And, // &&
-    Or,  // ||
+    And,     // &&
+    Or,      // ||
     Nullish, // ??
 }
 

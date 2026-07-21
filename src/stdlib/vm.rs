@@ -65,7 +65,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         }),
         // Everything shares the single global context.
         "isContext" => Ok(Value::Bool(with_host(|h| {
-            matches!(h.get(args.first().unwrap_or(&Value::Undef)), Some(JsObj::Object(_)))
+            matches!(
+                h.get(args.first().unwrap_or(&Value::Undef)),
+                Some(JsObj::Object(_))
+            )
         }))),
         _ => return None,
     })
@@ -92,7 +95,9 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
     match method {
         "runInThisContext" => run_code(&code),
         "runInNewContext" | "runInContext" => run_in_context(&code, args.first()),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -121,9 +126,11 @@ fn compile_function(args: &[Value]) -> Result<Value, String> {
     // `params` is an array of parameter-name strings (absent → no params).
     let params = match args.get(1) {
         Some(v) => with_host(|h| match h.get(v) {
-            Some(JsObj::Array(items)) => {
-                items.iter().map(|it| h.str_of(it)).collect::<Vec<_>>().join(", ")
-            }
+            Some(JsObj::Array(items)) => items
+                .iter()
+                .map(|it| h.str_of(it))
+                .collect::<Vec<_>>()
+                .join(", "),
             _ => String::new(),
         }),
         None => String::new(),

@@ -84,7 +84,11 @@ fn dump(file: &str) -> Result<(), String> {
     println!("== main ==\n{:#?}", prog.main.ops);
     for (name, f) in &prog.functions {
         let params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
-        println!("== function {name} ({}) ==\n{:#?}", params.join(", "), f.chunk.ops);
+        println!(
+            "== function {name} ({}) ==\n{:#?}",
+            params.join(", "),
+            f.chunk.ops
+        );
     }
     for (i, t) in prog.tries.iter().enumerate() {
         println!("== try #{i} ==\n{:#?}", t.block.ops);

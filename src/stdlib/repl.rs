@@ -39,9 +39,21 @@ pub const METHODS: &[&str] = &["start", "isValidSyntax"];
 /// parent for `instance_has_method` / `instance_call` wiring). Without that
 /// wiring a property read of these names yields `undefined`.
 pub const REPLSERVER_METHODS: &[&str] = &[
-    "close", "on", "once", "addListener", "prependListener", "removeListener",
-    "off", "removeAllListeners", "write", "setPrompt", "displayPrompt",
-    "defineCommand", "clearBufferedCommand", "pause", "resume",
+    "close",
+    "on",
+    "once",
+    "addListener",
+    "prependListener",
+    "removeListener",
+    "off",
+    "removeAllListeners",
+    "write",
+    "setPrompt",
+    "displayPrompt",
+    "defineCommand",
+    "clearBufferedCommand",
+    "pause",
+    "resume",
 ];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
@@ -56,7 +68,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // `repl.isValidSyntax(code)` → whether `code` compiles cleanly. Real: it
         // runs `code` through node-js's own front end (`crate::compile`, the same
         // parser+compiler the module loader uses) and reports success/failure.
-        "isValidSyntax" => Ok(Value::Bool(crate::compile(&super::arg_str(args, 0)).is_ok())),
+        "isValidSyntax" => Ok(Value::Bool(
+            crate::compile(&super::arg_str(args, 0)).is_ok(),
+        )),
         _ => return None,
     })
 }
@@ -71,11 +85,14 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 ///   carrying the original error as `.err`, matching Node's public shape.
 pub fn construct(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
-        "REPLServer" => Ok(new_repl_server(&args.first().cloned().unwrap_or(Value::Undef))),
+        "REPLServer" => Ok(new_repl_server(
+            &args.first().cloned().unwrap_or(Value::Undef),
+        )),
         "Recoverable" => {
             let inner = args.first().cloned().unwrap_or(Value::Undef);
             let msg = with_host(|h| h.str_of(&inner));
-            let err = crate::builtins::construct_builtin("Error", vec![with_host(|h| h.new_str(msg))])?;
+            let err =
+                crate::builtins::construct_builtin("Error", vec![with_host(|h| h.new_str(msg))])?;
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get_mut(&err) {
                     p.insert("err".into(), inner);
@@ -83,7 +100,9 @@ pub fn construct(name: &str, args: &[Value]) -> Result<Value, String> {
             });
             Ok(err)
         }
-        _ => Err(crate::host::type_error(&format!("repl.{name} is not a constructor"))),
+        _ => Err(crate::host::type_error(&format!(
+            "repl.{name} is not a constructor"
+        ))),
     }
 }
 
@@ -101,7 +120,9 @@ pub fn construct(name: &str, args: &[Value]) -> Result<Value, String> {
 pub fn constant(name: &str) -> Option<Value> {
     match name {
         "REPLServer" | "Recoverable" => Some(with_host(|h| h.alloc(JsObj::Builtin(name.into())))),
-        "writer" => Some(with_host(|h| h.alloc(JsObj::Builtin("util.inspect".into())))),
+        "writer" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("util.inspect".into()))
+        })),
         _ => None,
     }
 }
@@ -167,7 +188,9 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         // Accept a custom command definition without erroring (no live loop to
         // register it against). Returns the server for chaining.
         "defineCommand" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -177,7 +200,9 @@ fn emit(recv: &Value, event: &str, cb_args: &[Value]) -> Result<(), String> {
         Some(JsObj::Object(p)) => p.get("@@listeners").cloned(),
         _ => None,
     });
-    let Some(listeners) = listeners else { return Ok(()) };
+    let Some(listeners) = listeners else {
+        return Ok(());
+    };
     // Snapshot the callbacks (release the host before invoking).
     let cbs: Vec<Value> = with_host(|h| match h.get(&listeners) {
         Some(JsObj::Object(p)) => match p.get(event).map(|a| h.get(a)) {

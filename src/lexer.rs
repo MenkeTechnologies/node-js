@@ -152,14 +152,29 @@ impl Lexer {
     fn regex_allowed(&self) -> bool {
         match self.out.last().map(|t| &t.tok) {
             None => true, // program start
-            Some(Tok::Num(_)) | Some(Tok::BigInt(_)) | Some(Tok::Str(_))
-            | Some(Tok::Template { .. }) | Some(Tok::Regex(..)) => false,
+            Some(Tok::Num(_))
+            | Some(Tok::BigInt(_))
+            | Some(Tok::Str(_))
+            | Some(Tok::Template { .. })
+            | Some(Tok::Regex(..)) => false,
             Some(Tok::Ident(s)) => matches!(
                 s.as_str(),
                 // Keywords that precede an expression → regex; a plain variable
                 // name (or a value keyword like `this`/`true`) → division.
-                "return" | "typeof" | "instanceof" | "in" | "of" | "new" | "delete"
-                    | "void" | "do" | "else" | "case" | "throw" | "yield" | "await"
+                "return"
+                    | "typeof"
+                    | "instanceof"
+                    | "in"
+                    | "of"
+                    | "new"
+                    | "delete"
+                    | "void"
+                    | "do"
+                    | "else"
+                    | "case"
+                    | "throw"
+                    | "yield"
+                    | "await"
             ),
             Some(Tok::Punct(p)) => !matches!(p.as_str(), ")" | "]" | "}" | "++" | "--"),
             Some(Tok::Eof) => true,
@@ -234,10 +249,16 @@ impl Lexer {
             return self.scan_name();
         }
         // Private class member (`#name`): scanned as an identifier keeping the `#`.
-        if c == '#' && self.peek_at(1).map(|d| d.is_ascii_alphabetic() || d == '_' || d == '$').unwrap_or(false) {
+        if c == '#'
+            && self
+                .peek_at(1)
+                .map(|d| d.is_ascii_alphabetic() || d == '_' || d == '$')
+                .unwrap_or(false)
+        {
             return self.scan_name();
         }
-        if c.is_ascii_digit() || (c == '.' && self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false))
+        if c.is_ascii_digit()
+            || (c == '.' && self.peek_at(1).map(|d| d.is_ascii_digit()).unwrap_or(false))
         {
             return self.scan_number();
         }
@@ -268,7 +289,12 @@ impl Lexer {
         let mut raw = String::new();
         loop {
             match self.peek() {
-                None => return Err(format!("SyntaxError: unterminated string (line {})", self.line)),
+                None => {
+                    return Err(format!(
+                        "SyntaxError: unterminated string (line {})",
+                        self.line
+                    ))
+                }
                 Some(c) if c == quote => {
                     self.bump();
                     break;
@@ -307,7 +333,12 @@ impl Lexer {
         let mut cur_raw = String::new();
         loop {
             match self.peek() {
-                None => return Err(format!("SyntaxError: unterminated template (line {})", self.line)),
+                None => {
+                    return Err(format!(
+                        "SyntaxError: unterminated template (line {})",
+                        self.line
+                    ))
+                }
                 Some('`') => {
                     self.bump();
                     break;
@@ -387,7 +418,11 @@ impl Lexer {
         }
         quasis.push(cur);
         raws.push(cur_raw);
-        self.push(Tok::Template { quasis, raws, exprs });
+        self.push(Tok::Template {
+            quasis,
+            raws,
+            exprs,
+        });
         Ok(())
     }
 
@@ -420,7 +455,9 @@ impl Lexer {
                     if self.peek() == Some('n') {
                         self.pos += 1;
                         let big = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
-                            .ok_or_else(|| format!("SyntaxError: bad bigint (line {})", self.line))?;
+                            .ok_or_else(|| {
+                                format!("SyntaxError: bad bigint (line {})", self.line)
+                            })?;
                         self.push(Tok::BigInt(big.to_string()));
                         return Ok(());
                     }

@@ -19,50 +19,50 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 
 pub mod assert;
+pub mod async_hooks;
 pub mod buffer;
+pub mod child_process;
+pub mod cluster;
+pub mod console;
 pub mod crypto;
 pub mod date;
-pub mod string_decoder;
-pub mod typedarray;
-pub mod events;
-pub mod fs;
-pub mod http;
-pub mod net;
-pub mod os;
-pub mod path;
-pub mod process;
-pub mod querystring;
-pub mod stream;
-pub mod tty;
-pub mod url;
-pub mod util;
-pub mod zlib;
-pub mod async_hooks;
-pub mod child_process;
-pub mod console;
+pub mod dgram;
 pub mod diagnostics_channel;
 pub mod dns;
-pub mod perf_hooks;
-pub mod punycode;
-pub mod timers;
-pub mod util_types;
-pub mod v8;
-pub mod fs_promises;
-pub mod readline;
-pub mod vm;
-pub mod dgram;
-pub mod https;
-pub mod repl;
-pub mod tls;
-pub mod worker_threads;
-pub mod cluster;
 pub mod domain;
+pub mod events;
+pub mod fs;
+pub mod fs_promises;
+pub mod http;
 pub mod http2;
-pub mod trace_events;
+pub mod https;
+pub mod net;
 pub mod node_module;
+pub mod os;
+pub mod path;
+pub mod perf_hooks;
+pub mod process;
+pub mod punycode;
+pub mod querystring;
+pub mod readline;
+pub mod repl;
+pub mod stream;
 pub mod stream_consumers;
 pub mod stream_promises;
 pub mod stream_web;
+pub mod string_decoder;
+pub mod timers;
+pub mod tls;
+pub mod trace_events;
+pub mod tty;
+pub mod typedarray;
+pub mod url;
+pub mod util;
+pub mod util_types;
+pub mod v8;
+pub mod vm;
+pub mod worker_threads;
+pub mod zlib;
 
 /// Native-heavy core modules that node-js does not yet implement (TLS handshakes,
 /// HTTP/2 framing, OS worker threads sharing the thread-local heap, UDP sockets,
@@ -70,9 +70,7 @@ pub mod stream_web;
 /// programs which import-then-conditionally-use them still load; ACTUALLY calling
 /// a method throws `Error: <mod>.<method> is not implemented in node-js`. This is
 /// an honest not-yet-built surface, never a silent fake.
-pub const UNIMPLEMENTED_MODULES: &[&str] = &[
-    "inspector", "wasi",
-];
+pub const UNIMPLEMENTED_MODULES: &[&str] = &["inspector", "wasi"];
 
 /// True if `ns` is a known-but-unimplemented core module (see `UNIMPLEMENTED_MODULES`).
 pub fn is_unimplemented(ns: &str) -> bool {
@@ -187,10 +185,26 @@ pub fn is_method(qualified: &str) -> bool {
         "dgram" => dgram::MODULE_METHODS.contains(&m),
         "dns/promises" => matches!(
             m,
-            "lookup" | "lookupService" | "resolve" | "resolve4" | "resolve6" | "resolveMx"
-                | "resolveTxt" | "resolveCname" | "resolveNs" | "resolvePtr" | "resolveSrv"
-                | "resolveSoa" | "resolveNaptr" | "resolveCaa" | "resolveTlsa" | "resolveAny"
-                | "reverse" | "getServers" | "setServers" | "getDefaultResultOrder"
+            "lookup"
+                | "lookupService"
+                | "resolve"
+                | "resolve4"
+                | "resolve6"
+                | "resolveMx"
+                | "resolveTxt"
+                | "resolveCname"
+                | "resolveNs"
+                | "resolvePtr"
+                | "resolveSrv"
+                | "resolveSoa"
+                | "resolveNaptr"
+                | "resolveCaa"
+                | "resolveTlsa"
+                | "resolveAny"
+                | "reverse"
+                | "getServers"
+                | "setServers"
+                | "getDefaultResultOrder"
                 | "setDefaultResultOrder"
         ),
         "tls" => tls::MODULE_METHODS.contains(&m),
@@ -243,9 +257,9 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "querystring" => querystring::call(m, args)?,
         "tty" => tty::call(m, args)?,
         "process" => process::call(m, args)?,
-        "EventEmitter" if m == "EventEmitter" => {
-            Ok(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
-        }
+        "EventEmitter" if m == "EventEmitter" => Ok(with_host(|h| {
+            h.alloc(JsObj::Builtin("EventEmitter".into()))
+        })),
         "EventEmitter" => events::static_call(m, args)?,
         "console" => console::call(m, args)?,
         "child_process" => child_process::call(m, args)?,
@@ -289,9 +303,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "Module" => node_module::static_call(m, args)?,
         "stream/consumers" => stream_consumers::call(m, args)?,
         "stream/promises" => stream_promises::call(m, args)?,
-        _ if is_unimplemented(ns) => {
-            Err(format!("Error: {ns}.{m} is not implemented in node-js"))
-        }
+        _ if is_unimplemented(ns) => Err(format!("Error: {ns}.{m} is not implemented in node-js")),
         _ => return None,
     })
 }
@@ -323,21 +335,21 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "console" if name == "Console" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("Console".into()))))
         }
-        "assert" if name == "AssertionError" => {
-            Some(with_host(|h| h.alloc(JsObj::Builtin("AssertionError".into()))))
-        }
-        "assert" if name == "strict" => {
-            Some(with_host(|h| h.alloc(JsObj::Builtin("assertStrict".into()))))
-        }
+        "assert" if name == "AssertionError" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("AssertionError".into()))
+        })),
+        "assert" if name == "strict" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("assertStrict".into()))
+        })),
         "stream" => stream::constant(name),
         "http" => http::constant(name),
-        "string_decoder" if name == "StringDecoder" => {
-            Some(with_host(|h| h.alloc(JsObj::Builtin("StringDecoder".into()))))
-        }
+        "string_decoder" if name == "StringDecoder" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("StringDecoder".into()))
+        })),
         "process" => process::constant(name),
-        "EventEmitter" if name == "EventEmitter" => {
-            Some(with_host(|h| h.alloc(JsObj::Builtin("EventEmitter".into()))))
-        }
+        "EventEmitter" if name == "EventEmitter" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("EventEmitter".into()))
+        })),
         "perf_hooks" | "performance" => perf_hooks::constant(name),
         "dns" => dns::constant(name),
         "punycode" => punycode::constant(name),
@@ -345,9 +357,9 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
             Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
         }
         "vm" if name == "Script" => Some(with_host(|h| h.alloc(JsObj::Builtin("Script".into())))),
-        "url" if name == "URLSearchParams" => {
-            Some(with_host(|h| h.alloc(JsObj::Builtin("URLSearchParams".into()))))
-        }
+        "url" if name == "URLSearchParams" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("URLSearchParams".into()))
+        })),
         "fs" if name == "promises" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("fs/promises".into()))))
         }
@@ -366,8 +378,16 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "crypto"
             if matches!(
                 name,
-                "Sign" | "Verify" | "KeyObject" | "DiffieHellman" | "ECDH" | "X509Certificate"
-                    | "Hash" | "Hmac" | "Cipheriv" | "Decipheriv"
+                "Sign"
+                    | "Verify"
+                    | "KeyObject"
+                    | "DiffieHellman"
+                    | "ECDH"
+                    | "X509Certificate"
+                    | "Hash"
+                    | "Hmac"
+                    | "Cipheriv"
+                    | "Decipheriv"
             ) =>
         {
             Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
@@ -415,7 +435,9 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
             Some(v8::construct(name, args))
         }
         // net/http constructors: their `construct` already returns Option<Result>.
-        "Socket" | "Stream" | "Server" | "SocketAddress" | "BlockList" => net::construct(name, args),
+        "Socket" | "Stream" | "Server" | "SocketAddress" | "BlockList" => {
+            net::construct(name, args)
+        }
         "Agent" | "http.Server" => http::construct(name, args),
         // stream/web WHATWG classes (its `construct` returns Option<Result>).
         n if stream_web::is_class(n) => stream_web::construct(n, args),
@@ -439,34 +461,95 @@ pub fn native_tag(recv: &Value) -> Option<String> {
 pub fn instance_has_method(tag: &str, name: &str) -> bool {
     // Shared EventEmitter surface for the emitter-backed instances.
     const EMITTER: &[&str] = &[
-        "on", "once", "emit", "addListener", "prependListener", "prependOnceListener",
-        "removeListener", "off", "removeAllListeners", "listeners", "listenerCount",
-        "eventNames", "setMaxListeners", "getMaxListeners",
+        "on",
+        "once",
+        "emit",
+        "addListener",
+        "prependListener",
+        "prependOnceListener",
+        "removeListener",
+        "off",
+        "removeAllListeners",
+        "listeners",
+        "listenerCount",
+        "eventNames",
+        "setMaxListeners",
+        "getMaxListeners",
     ];
     let base: &[&str] = match tag {
         "Server" => &["listen", "close", "address"],
         "Socket" => &[
-            "write", "end", "destroy", "pause", "resume", "setEncoding", "setKeepAlive",
-            "setNoDelay", "setTimeout", "ref", "unref", "connect",
+            "write",
+            "end",
+            "destroy",
+            "pause",
+            "resume",
+            "setEncoding",
+            "setKeepAlive",
+            "setNoDelay",
+            "setTimeout",
+            "ref",
+            "unref",
+            "connect",
         ],
         "ServerResponse" => &[
-            "writeHead", "setHeader", "getHeader", "getHeaderNames", "getHeaders", "hasHeader",
-            "removeHeader", "write", "end", "flushHeaders",
+            "writeHead",
+            "setHeader",
+            "getHeader",
+            "getHeaderNames",
+            "getHeaders",
+            "hasHeader",
+            "removeHeader",
+            "write",
+            "end",
+            "flushHeaders",
         ],
         "IncomingMessage" => &["pause", "resume", "setEncoding", "destroy"],
         "Buffer" => &[
-            "toString", "toJSON", "equals", "slice", "subarray", "readUInt8", "includes",
-            "indexOf", "lastIndexOf", "write", "copy", "fill", "compare", "readUInt16BE",
-            "readUInt16LE", "writeUInt8", "writeUInt16BE", "writeUInt16LE",
+            "toString",
+            "toJSON",
+            "equals",
+            "slice",
+            "subarray",
+            "readUInt8",
+            "includes",
+            "indexOf",
+            "lastIndexOf",
+            "write",
+            "copy",
+            "fill",
+            "compare",
+            "readUInt16BE",
+            "readUInt16LE",
+            "writeUInt8",
+            "writeUInt16BE",
+            "writeUInt16LE",
         ],
-        "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" => {
-            &["read", "write", "end", "pipe", "pause", "resume", "setEncoding", "destroy", "push"]
-        }
+        "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" => &[
+            "read",
+            "write",
+            "end",
+            "pipe",
+            "pause",
+            "resume",
+            "setEncoding",
+            "destroy",
+            "push",
+        ],
         "URL" => &["toString", "toJSON"],
         "AsyncLocalStorage" => async_hooks::ALS_METHODS,
         "AsyncHook" => async_hooks::HOOK_METHODS,
         "Channel" => &["subscribe", "unsubscribe", "publish"],
-        "WriteStream" => &["write", "end", "on", "once", "removeListener", "cork", "uncork", "setEncoding"],
+        "WriteStream" => &[
+            "write",
+            "end",
+            "on",
+            "once",
+            "removeListener",
+            "cork",
+            "uncork",
+            "setEncoding",
+        ],
         "Hmac" => &["update", "digest"],
         "Interface" => readline::INTERFACE_METHODS,
         "Script" => vm::SCRIPT_METHODS,
@@ -509,10 +592,22 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "Verify" => &["update", "verify"],
         "KeyObject" => &["export", "equals"],
         "DiffieHellman" => &[
-            "generateKeys", "computeSecret", "getPrime", "getGenerator", "getPublicKey",
-            "getPrivateKey", "setPublicKey", "setPrivateKey",
+            "generateKeys",
+            "computeSecret",
+            "getPrime",
+            "getGenerator",
+            "getPublicKey",
+            "getPrivateKey",
+            "setPublicKey",
+            "setPrivateKey",
         ],
-        "ECDH" => &["generateKeys", "computeSecret", "getPublicKey", "getPrivateKey", "setPrivateKey"],
+        "ECDH" => &[
+            "generateKeys",
+            "computeSecret",
+            "getPublicKey",
+            "getPrivateKey",
+            "setPrivateKey",
+        ],
         "X509Certificate" => &["toString"],
         "MIMEType" => util::MIME_TYPE_METHODS,
         "MIMEParams" => util::MIME_PARAMS_METHODS,
@@ -521,11 +616,33 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
     };
     let is_emitter = matches!(
         tag,
-        "Server" | "Socket" | "ServerResponse" | "IncomingMessage" | "EventEmitter" | "Readable"
-            | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" | "UdpSocket"
-            | "Worker" | "MessagePort" | "TLSServer" | "TLSSocket" | "HTTPSServerResponse"
-            | "HTTPSClientRequest" | "ClusterWorker" | "Domain" | "Http2Server" | "Http2Stream"
-            | "Http2Session" | "ClientRequest" | "FSReadStream" | "FSWriteStream" | "ChildProcess"
+        "Server"
+            | "Socket"
+            | "ServerResponse"
+            | "IncomingMessage"
+            | "EventEmitter"
+            | "Readable"
+            | "Writable"
+            | "Duplex"
+            | "Transform"
+            | "PassThrough"
+            | "Stream"
+            | "UdpSocket"
+            | "Worker"
+            | "MessagePort"
+            | "TLSServer"
+            | "TLSSocket"
+            | "HTTPSServerResponse"
+            | "HTTPSClientRequest"
+            | "ClusterWorker"
+            | "Domain"
+            | "Http2Server"
+            | "Http2Stream"
+            | "Http2Session"
+            | "ClientRequest"
+            | "FSReadStream"
+            | "FSWriteStream"
+            | "ChildProcess"
     );
     base.contains(&name) || (is_emitter && EMITTER.contains(&name))
 }
@@ -533,7 +650,12 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
 /// Dispatch a method call on a native stdlib instance (`recv` carries a
 /// `@@native` tag). Called from `host::call_method` before the generic object
 /// method resolution.
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match tag {
         "Buffer" => buffer::instance_call(recv, method, &args),
         "Date" => date::instance_call(recv, method, &args),
@@ -552,12 +674,16 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
             worker_threads::instance_call(tag, recv, method, args)
         }
         "TLSServer" | "TLSSocket" => tls::instance_call(tag, recv, method, args),
-        "HTTPSServerResponse" | "HTTPSClientRequest" => https::instance_call(tag, recv, method, args),
+        "HTTPSServerResponse" | "HTTPSClientRequest" => {
+            https::instance_call(tag, recv, method, args)
+        }
         "REPLServer" => repl::instance_call(recv, method, args),
         "ClusterWorker" => cluster::instance_call(recv, method, args),
         "Domain" => domain::instance_call(recv, method, args),
         "Tracing" => trace_events::instance_call(recv, method, args),
-        "Http2Server" | "Http2Stream" | "Http2Session" => http2::instance_call(tag, recv, method, args),
+        "Http2Server" | "Http2Stream" | "Http2Session" => {
+            http2::instance_call(tag, recv, method, args)
+        }
         "EventEmitter" => events::instance_call(recv, method, args),
         "URL" => url::instance_call(recv, method, &args),
         "Stats" => fs::stats_call(recv, method),
@@ -594,7 +720,9 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "AsyncLocalStorage" | "AsyncHook" => async_hooks::instance_call(tag, recv, method, args),
         "Channel" => diagnostics_channel::instance_call(recv, method, &args),
         "WriteStream" => process::stream_instance_call(recv, method, &args),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -622,8 +750,15 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 
 /// Decode a hex string to bytes (ignoring a trailing odd nibble, like Node).
 pub(crate) fn from_hex(s: &str) -> Vec<u8> {
-    let digits: Vec<u8> = s.bytes().filter_map(|c| (c as char).to_digit(16).map(|d| d as u8)).collect();
-    digits.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0] << 4) | c[1]).collect()
+    let digits: Vec<u8> = s
+        .bytes()
+        .filter_map(|c| (c as char).to_digit(16).map(|d| d as u8))
+        .collect();
+    digits
+        .chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| (c[0] << 4) | c[1])
+        .collect()
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -640,8 +775,16 @@ pub(crate) fn to_base64(bytes: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
         out.push(B64[((n >> 18) & 63) as usize] as char);
         out.push(B64[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { B64[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

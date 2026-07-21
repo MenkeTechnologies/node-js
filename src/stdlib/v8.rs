@@ -103,12 +103,19 @@ pub fn construct(name: &str, args: &[Value]) -> Result<Value, String> {
                 h.new_object(m)
             }))
         }
-        _ => Err(crate::host::type_error(&format!("v8.{name} is not a constructor"))),
+        _ => Err(crate::host::type_error(&format!(
+            "v8.{name} is not a constructor"
+        ))),
     }
 }
 
 /// Dispatch a method on a `Serializer`/`Deserializer` instance.
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match (tag, method) {
         // Serializer: `writeHeader` is a no-op (no binary header to emit).
         ("Serializer", "writeHeader") => Ok(Value::Undef),
@@ -145,7 +152,9 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
             });
             crate::builtins::call_builtin_function("JSON.parse", vec![sv])
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 

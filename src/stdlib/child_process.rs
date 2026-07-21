@@ -39,8 +39,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-pub const METHODS: &[&str] =
-    &["execSync", "spawnSync", "execFileSync", "exec", "execFile", "spawn", "fork"];
+pub const METHODS: &[&str] = &[
+    "execSync",
+    "spawnSync",
+    "execFileSync",
+    "exec",
+    "execFile",
+    "spawn",
+    "fork",
+];
 
 /// Instance method names for the `ChildProcess` `@@native` tag, exposed to
 /// `stdlib::instance_has_method` (property reads that yield a bound method).
@@ -259,7 +266,9 @@ fn spawn(args: &[Value]) -> Result<Value, String> {
             m.insert("pid".into(), Value::Float(r.pid as f64));
             m.insert(
                 "exitCode".into(),
-                r.status.map(|c| Value::Float(c as f64)).unwrap_or_else(|| null.clone()),
+                r.status
+                    .map(|c| Value::Float(c as f64))
+                    .unwrap_or_else(|| null.clone()),
             );
             m.insert("signalCode".into(), null);
             m.insert("killed".into(), Value::Bool(false));
@@ -298,7 +307,9 @@ fn exec_file(args: &[Value]) -> Result<Value, String> {
                     null.clone()
                 } else {
                     let code = r.status.unwrap_or(-1);
-                    with_host(|h| h.new_str(format!("Error: Command failed: {file}\nexit code {code}")))
+                    with_host(|h| {
+                        h.new_str(format!("Error: Command failed: {file}\nexit code {code}"))
+                    })
                 };
                 with_host(|h| {
                     let so = h.new_str(so);
@@ -310,7 +321,9 @@ fn exec_file(args: &[Value]) -> Result<Value, String> {
             m.insert("pid".into(), Value::Float(r.pid as f64));
             m.insert(
                 "exitCode".into(),
-                r.status.map(|c| Value::Float(c as f64)).unwrap_or_else(|| null.clone()),
+                r.status
+                    .map(|c| Value::Float(c as f64))
+                    .unwrap_or_else(|| null.clone()),
             );
             m.insert("signalCode".into(), null);
             m.insert("killed".into(), Value::Bool(false));
@@ -348,8 +361,12 @@ fn fork(args: &[Value]) -> Result<Value, String> {
 
     let mut cmd = Command::new(exe);
     cmd.arg(&module).args(&extra_args);
-    cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    let child = cmd.spawn().map_err(|e| format!("Error: fork {module} {e}"))?;
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Error: fork {module} {e}"))?;
     let pid = child.id();
 
     let id = NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed);
@@ -364,7 +381,13 @@ fn fork(args: &[Value]) -> Result<Value, String> {
     extra.insert("signalCode".into(), with_host(|h| h.null()));
     let emitter = child_object(extra);
     CHILDREN.with(|c| {
-        c.borrow_mut().insert(id, ChildRec { emitter: emitter.clone(), handle: handle.clone() });
+        c.borrow_mut().insert(
+            id,
+            ChildRec {
+                emitter: emitter.clone(),
+                handle: handle.clone(),
+            },
+        );
     });
     with_host(|h| h.incr_handle());
 
@@ -411,9 +434,13 @@ fn wait_child(id: u64, handle: Arc<Mutex<Option<Child>>>, io_tx: Sender<IoTask>)
 /// release its event-loop handle, and drop its registry record.
 fn on_child_exit(id: u64, code: Option<i32>) -> Result<(), String> {
     let emitter = CHILDREN.with(|c| c.borrow().get(&id).map(|r| r.emitter.clone()));
-    let Some(emitter) = emitter else { return Ok(()) };
+    let Some(emitter) = emitter else {
+        return Ok(());
+    };
     let (code_val, null1, null2) = with_host(|h| {
-        let cv = code.map(|c| Value::Float(c as f64)).unwrap_or_else(|| h.null());
+        let cv = code
+            .map(|c| Value::Float(c as f64))
+            .unwrap_or_else(|| h.null());
         (cv, h.null(), h.null())
     });
     set_prop(&emitter, "exitCode", code_val.clone());
@@ -444,11 +471,20 @@ fn set_prop(recv: &Value, key: &str, val: Value) {
 /// exited, so `kill` is a no-op there).
 pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     match method {
-        "on" | "addListener" | "prependListener" | "once" | "prependOnceListener" | "emit"
-        | "removeListener" | "off" | "removeAllListeners" | "listenerCount" | "eventNames"
-        | "setMaxListeners" | "getMaxListeners" | "listeners" => {
-            super::events::instance_call(recv, method, args)
-        }
+        "on"
+        | "addListener"
+        | "prependListener"
+        | "once"
+        | "prependOnceListener"
+        | "emit"
+        | "removeListener"
+        | "off"
+        | "removeAllListeners"
+        | "listenerCount"
+        | "eventNames"
+        | "setMaxListeners"
+        | "getMaxListeners"
+        | "listeners" => super::events::instance_call(recv, method, args),
         "kill" => Ok(Value::Bool(kill_child(recv))),
         // IPC is not implemented (see `fork` doc): `send` cannot deliver a message.
         "send" => Ok(Value::Bool(false)),
@@ -457,7 +493,9 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             Ok(Value::Undef)
         }
         "ref" | "unref" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("child.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "child.{method} is not a function"
+        ))),
     }
 }
 

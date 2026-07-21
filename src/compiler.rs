@@ -280,7 +280,10 @@ impl Compiler {
                         .rev()
                         .find(|c| c.label.as_deref() == Some(name.as_str()))
                         .ok_or_else(|| format!("SyntaxError: Undefined label '{name}'"))?,
-                    None => self.loops.last_mut().ok_or("SyntaxError: 'break' outside loop")?,
+                    None => self
+                        .loops
+                        .last_mut()
+                        .ok_or("SyntaxError: 'break' outside loop")?,
                 };
                 ctx.breaks.push(j);
             }
@@ -294,7 +297,9 @@ impl Compiler {
                         .iter_mut()
                         .rev()
                         .find(|c| c.catches_continue && c.label.as_deref() == Some(name.as_str()))
-                        .ok_or_else(|| format!("SyntaxError: Undefined label '{name}' for continue"))?,
+                        .ok_or_else(|| {
+                            format!("SyntaxError: Undefined label '{name}' for continue")
+                        })?,
                     None => self
                         .loops
                         .iter_mut()
@@ -320,7 +325,12 @@ impl Compiler {
     // ── binding / assignment ─────────────────────────────────────────────
     /// Store the value on top of the stack into `target`. `declare` chooses
     /// `DECLARE` (new binding) vs `SETLOCAL` (existing binding / global).
-    fn compile_bind(&mut self, b: &mut ChunkBuilder, target: &Expr, declare: bool) -> Result<(), String> {
+    fn compile_bind(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        declare: bool,
+    ) -> Result<(), String> {
         match target {
             Expr::Ident(_) => {
                 if declare {
@@ -370,7 +380,9 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
                 b.emit(Op::Pop, 0);
             }
-            Expr::Member { object, property, .. } => {
+            Expr::Member {
+                object, property, ..
+            } => {
                 self.compile_expr(b, object)?; // [value, recv]
                 self.name_const(b, property); // [value, recv, name]
                 b.emit(Op::Rot, 0); // [recv, name, value]
@@ -389,7 +401,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn destructure_array(&mut self, b: &mut ChunkBuilder, items: &[Expr], declare: bool) -> Result<(), String> {
+    fn destructure_array(
+        &mut self,
+        b: &mut ChunkBuilder,
+        items: &[Expr],
+        declare: bool,
+    ) -> Result<(), String> {
         let star_idx = items
             .iter()
             .position(|e| matches!(e, Expr::Spread(_)))
@@ -410,7 +427,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn destructure_object(&mut self, b: &mut ChunkBuilder, props: &[Prop], declare: bool) -> Result<(), String> {
+    fn destructure_object(
+        &mut self,
+        b: &mut ChunkBuilder,
+        props: &[Prop],
+        declare: bool,
+    ) -> Result<(), String> {
         // Object value on TOS; keep it, read each key, bind, then drop.
         let obj_tmp = self.tmp_name("destr");
         self.name_const(b, &obj_tmp);
@@ -459,7 +481,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_if(&mut self, b: &mut ChunkBuilder, test: &Expr, cons: &Stmt, alt: &Option<Box<Stmt>>) -> Result<(), String> {
+    fn compile_if(
+        &mut self,
+        b: &mut ChunkBuilder,
+        test: &Expr,
+        cons: &Stmt,
+        alt: &Option<Box<Stmt>>,
+    ) -> Result<(), String> {
         self.compile_condition(b, test)?;
         let jfalse = b.emit(Op::JumpIfFalse(0), 0);
         self.compile_stmt(b, cons)?;
@@ -480,7 +508,12 @@ impl Compiler {
     /// `label: stmt`. If the body is a loop, the label rides into that loop's
     /// `LoopCtx` (so labeled `break`/`continue` target it); otherwise a break-only
     /// context spans the body so `break label` can jump past it.
-    fn compile_labeled(&mut self, b: &mut ChunkBuilder, label: &str, body: &Stmt) -> Result<(), String> {
+    fn compile_labeled(
+        &mut self,
+        b: &mut ChunkBuilder,
+        label: &str,
+        body: &Stmt,
+    ) -> Result<(), String> {
         if matches!(
             body.kind,
             StmtKind::While { .. }
@@ -510,7 +543,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_while(&mut self, b: &mut ChunkBuilder, test: &Expr, body: &Stmt) -> Result<(), String> {
+    fn compile_while(
+        &mut self,
+        b: &mut ChunkBuilder,
+        test: &Expr,
+        body: &Stmt,
+    ) -> Result<(), String> {
         let start = b.current_pos();
         self.compile_condition(b, test)?;
         let jfalse = b.emit(Op::JumpIfFalse(0), 0);
@@ -534,7 +572,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_do_while(&mut self, b: &mut ChunkBuilder, body: &Stmt, test: &Expr) -> Result<(), String> {
+    fn compile_do_while(
+        &mut self,
+        b: &mut ChunkBuilder,
+        body: &Stmt,
+        test: &Expr,
+    ) -> Result<(), String> {
         let start = b.current_pos();
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
@@ -603,13 +646,27 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_for_of(&mut self, b: &mut ChunkBuilder, declare: bool, target: &Expr, iter: &Expr, body: &Stmt) -> Result<(), String> {
+    fn compile_for_of(
+        &mut self,
+        b: &mut ChunkBuilder,
+        declare: bool,
+        target: &Expr,
+        iter: &Expr,
+        body: &Stmt,
+    ) -> Result<(), String> {
         self.compile_expr(b, iter)?;
         b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
         self.loop_over(b, declare, target, body)
     }
 
-    fn compile_for_in(&mut self, b: &mut ChunkBuilder, declare: bool, target: &Expr, object: &Expr, body: &Stmt) -> Result<(), String> {
+    fn compile_for_in(
+        &mut self,
+        b: &mut ChunkBuilder,
+        declare: bool,
+        target: &Expr,
+        object: &Expr,
+        body: &Stmt,
+    ) -> Result<(), String> {
         self.compile_expr(b, object)?;
         b.emit(Op::CallBuiltin(ops::FORIN_KEYS, 1), 0); // [keys_array]
         b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
@@ -619,7 +676,14 @@ impl Compiler {
     /// `for await (target of iterable) body`. Obtains an async iterator, then each
     /// pass `await`s a `{value, done}` step (a native async iterator's promise, or
     /// the sync fallback's per-value await). The iterator lives in a temp local.
-    fn compile_for_await(&mut self, b: &mut ChunkBuilder, declare: bool, target: &Expr, iter: &Expr, body: &Stmt) -> Result<(), String> {
+    fn compile_for_await(
+        &mut self,
+        b: &mut ChunkBuilder,
+        declare: bool,
+        target: &Expr,
+        iter: &Expr,
+        body: &Stmt,
+    ) -> Result<(), String> {
         let iter_tmp = self.tmp_name("aiter");
         self.compile_expr(b, iter)?;
         b.emit(Op::CallBuiltin(ops::GET_ASYNC_ITER, 1), 0); // [iterator]
@@ -669,7 +733,13 @@ impl Compiler {
     }
 
     /// Shared loop tail for for-of / for-in: iterator on TOS.
-    fn loop_over(&mut self, b: &mut ChunkBuilder, declare: bool, target: &Expr, body: &Stmt) -> Result<(), String> {
+    fn loop_over(
+        &mut self,
+        b: &mut ChunkBuilder,
+        declare: bool,
+        target: &Expr,
+        body: &Stmt,
+    ) -> Result<(), String> {
         let start = b.current_pos();
         b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next]
         let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next
@@ -702,7 +772,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_switch(&mut self, b: &mut ChunkBuilder, disc: &Expr, cases: &[SwitchCase]) -> Result<(), String> {
+    fn compile_switch(
+        &mut self,
+        b: &mut ChunkBuilder,
+        disc: &Expr,
+        cases: &[SwitchCase],
+    ) -> Result<(), String> {
         let disc_tmp = self.tmp_name("switch");
         self.compile_expr(b, disc)?;
         self.name_const(b, &disc_tmp);
@@ -828,7 +903,12 @@ impl Compiler {
         Ok(self.functions.len() - 1)
     }
 
-    fn build_arrow(&mut self, params: &[Param], body: &FnBody, is_async: bool) -> Result<usize, String> {
+    fn build_arrow(
+        &mut self,
+        params: &[Param],
+        body: &FnBody,
+        is_async: bool,
+    ) -> Result<usize, String> {
         let stmts = match body {
             FnBody::Block(b) => b.clone(),
             FnBody::Expr(e) => vec![Stmt::from(StmtKind::Return(Some((**e).clone())))],
@@ -853,7 +933,10 @@ impl Compiler {
                 b.emit(Op::LoadUndef, 0);
             }
         }
-        let ctor = node.members.iter().find(|m| m.kind == MemberKind::Constructor);
+        let ctor = node
+            .members
+            .iter()
+            .find(|m| m.kind == MemberKind::Constructor);
         match ctor {
             Some(m) => {
                 let def_id = self.build_function(&cname, &m.params, &m.body, false, false)?;
@@ -902,12 +985,25 @@ impl Compiler {
                         _ => member::METHOD,
                     };
                     b.emit(Op::LoadInt(kind), 0);
-                    b.emit(if m.is_static { Op::LoadTrue } else { Op::LoadFalse }, 0);
+                    b.emit(
+                        if m.is_static {
+                            Op::LoadTrue
+                        } else {
+                            Op::LoadFalse
+                        },
+                        0,
+                    );
                     let mname = match &m.key {
                         Expr::Str(s) if !m.computed => s.clone(),
                         _ => String::new(),
                     };
-                    let def_id = self.build_function(&mname, &m.params, &m.body, m.is_generator, m.is_async)?;
+                    let def_id = self.build_function(
+                        &mname,
+                        &m.params,
+                        &m.body,
+                        m.is_generator,
+                        m.is_async,
+                    )?;
                     self.emit_mkfunc(b, def_id);
                     b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0);
                 }
@@ -919,10 +1015,8 @@ impl Compiler {
     /// If `init` is an anonymous function/arrow/class (value already on TOS), set
     /// its `.name` to `name` (JS binding name-inference). No-op otherwise.
     fn infer_name(&mut self, b: &mut ChunkBuilder, init: &Expr, name: &str) {
-        let anon = matches!(
-            init,
-            Expr::Function { name: None, .. } | Expr::Class(_)
-        ) && !matches!(init, Expr::Class(node) if node.name.is_some());
+        let anon = matches!(init, Expr::Function { name: None, .. } | Expr::Class(_))
+            && !matches!(init, Expr::Class(node) if node.name.is_some());
         if !anon {
             return;
         }
@@ -950,7 +1044,12 @@ impl Compiler {
     }
 
     // ── generators / yield ───────────────────────────────────────────────
-    fn compile_yield(&mut self, b: &mut ChunkBuilder, arg: &Option<Box<Expr>>, delegate: bool) -> Result<(), String> {
+    fn compile_yield(
+        &mut self,
+        b: &mut ChunkBuilder,
+        arg: &Option<Box<Expr>>,
+        delegate: bool,
+    ) -> Result<(), String> {
         if delegate {
             // `yield* iterable`: iterate, yielding each element.
             match arg {
@@ -1069,9 +1168,12 @@ impl Compiler {
             }
             Expr::Str(s) => self.strlit(b, s),
             Expr::Template { quasis, exprs } => self.compile_template(b, quasis, exprs)?,
-            Expr::TaggedTemplate { tag, quasis, raws, exprs } => {
-                self.compile_tagged_template(b, tag, quasis, raws, exprs)?
-            }
+            Expr::TaggedTemplate {
+                tag,
+                quasis,
+                raws,
+                exprs,
+            } => self.compile_tagged_template(b, tag, quasis, raws, exprs)?,
             Expr::Ident(n) => self.load_local(b, n),
             Expr::This => {
                 b.emit(Op::CallBuiltin(ops::THIS, 0), 0);
@@ -1099,15 +1201,30 @@ impl Compiler {
                 self.compile_bind(b, target, false)?;
             }
             Expr::Update { op, prefix, target } => self.compile_update(b, *op, *prefix, target)?,
-            Expr::Call { func, args, optional } => self.compile_call(b, func, args, *optional)?,
+            Expr::Call {
+                func,
+                args,
+                optional,
+            } => self.compile_call(b, func, args, *optional)?,
             Expr::New { callee, args } => self.compile_new(b, callee, args)?,
-            Expr::Member { object, property, optional } => {
-                self.compile_member(b, object, property, *optional)?
-            }
-            Expr::Index { object, index, optional } => {
-                self.compile_index(b, object, index, *optional)?
-            }
-            Expr::Function { params, body, is_arrow, name, is_generator, is_async } => {
+            Expr::Member {
+                object,
+                property,
+                optional,
+            } => self.compile_member(b, object, property, *optional)?,
+            Expr::Index {
+                object,
+                index,
+                optional,
+            } => self.compile_index(b, object, index, *optional)?,
+            Expr::Function {
+                params,
+                body,
+                is_arrow,
+                name,
+                is_generator,
+                is_async,
+            } => {
                 let def_id = if *is_arrow {
                     self.build_arrow(params, body, *is_async)?
                 } else {
@@ -1146,7 +1263,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_template(&mut self, b: &mut ChunkBuilder, quasis: &[String], exprs: &[Expr]) -> Result<(), String> {
+    fn compile_template(
+        &mut self,
+        b: &mut ChunkBuilder,
+        quasis: &[String],
+        exprs: &[Expr],
+    ) -> Result<(), String> {
         let mut n = 0;
         for (i, q) in quasis.iter().enumerate() {
             let k = b.add_constant(Value::str(q));
@@ -1280,9 +1402,19 @@ impl Compiler {
 
     /// Install any getter/setter accessors of an object literal onto the object
     /// left on the stack (shared by the single-shot and incremental build paths).
-    fn compile_object_accessors(&mut self, b: &mut ChunkBuilder, props: &[Prop]) -> Result<(), String> {
+    fn compile_object_accessors(
+        &mut self,
+        b: &mut ChunkBuilder,
+        props: &[Prop],
+    ) -> Result<(), String> {
         for p in props {
-            if let Prop::Accessor { key, computed, is_getter, func } = p {
+            if let Prop::Accessor {
+                key,
+                computed,
+                is_getter,
+                func,
+            } = p
+            {
                 if *computed {
                     self.compile_expr(b, key)?;
                     b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
@@ -1292,7 +1424,10 @@ impl Compiler {
                     self.compile_expr(b, key)?;
                     b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
                 }
-                b.emit(Op::LoadInt(if *is_getter { member::GET } else { member::SET }), 0);
+                b.emit(
+                    Op::LoadInt(if *is_getter { member::GET } else { member::SET }),
+                    0,
+                );
                 self.compile_expr(b, func)?;
                 b.emit(Op::CallBuiltin(ops::DEF_ACCESSOR, 4), 0);
             }
@@ -1300,7 +1435,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_logical(&mut self, b: &mut ChunkBuilder, op: LogicalOp, l: &Expr, r: &Expr) -> Result<(), String> {
+    fn compile_logical(
+        &mut self,
+        b: &mut ChunkBuilder,
+        op: LogicalOp,
+        l: &Expr,
+        r: &Expr,
+    ) -> Result<(), String> {
         self.compile_expr(b, l)?;
         b.emit(Op::Dup, 0);
         let test_op = match op {
@@ -1358,7 +1499,9 @@ impl Compiler {
                 b.emit(Op::LoadUndef, 0);
             }
             UnOp::Delete => match e {
-                Expr::Member { object, property, .. } => {
+                Expr::Member {
+                    object, property, ..
+                } => {
                     self.compile_expr(b, object)?;
                     self.name_const(b, property);
                     b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 2), 0);
@@ -1376,7 +1519,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_binary(&mut self, b: &mut ChunkBuilder, op: BinOp, l: &Expr, r: &Expr) -> Result<(), String> {
+    fn compile_binary(
+        &mut self,
+        b: &mut ChunkBuilder,
+        op: BinOp,
+        l: &Expr,
+        r: &Expr,
+    ) -> Result<(), String> {
         // Native fast path (JIT-traceable); the numeric hook supplies JS
         // semantics for non-number operands.
         macro_rules! native {
@@ -1448,7 +1597,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn emit_bitwise(&mut self, b: &mut ChunkBuilder, tag: i64, l: &Expr, r: &Expr) -> Result<(), String> {
+    fn emit_bitwise(
+        &mut self,
+        b: &mut ChunkBuilder,
+        tag: i64,
+        l: &Expr,
+        r: &Expr,
+    ) -> Result<(), String> {
         b.emit(Op::LoadInt(tag), 0);
         self.compile_expr(b, l)?;
         self.compile_expr(b, r)?;
@@ -1456,7 +1611,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_update(&mut self, b: &mut ChunkBuilder, op: UpdateOp, prefix: bool, target: &Expr) -> Result<(), String> {
+    fn compile_update(
+        &mut self,
+        b: &mut ChunkBuilder,
+        op: UpdateOp,
+        prefix: bool,
+        target: &Expr,
+    ) -> Result<(), String> {
         // `NUM_STEP(tag, old)` computes `ToNumeric(old)` and `old ± 1` preserving
         // the operand's numeric type — so `x++` on a BigInt stays a BigInt
         // (`+old`/`old + 1` would throw the mix error). It pushes the coerced old
@@ -1478,7 +1639,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_member(&mut self, b: &mut ChunkBuilder, object: &Expr, property: &str, optional: bool) -> Result<(), String> {
+    fn compile_member(
+        &mut self,
+        b: &mut ChunkBuilder,
+        object: &Expr,
+        property: &str,
+        optional: bool,
+    ) -> Result<(), String> {
         // `super.prop` — read a data/accessor property off the parent prototype.
         if matches!(object, Expr::Super) {
             self.name_const(b, property);
@@ -1499,7 +1666,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_index(&mut self, b: &mut ChunkBuilder, object: &Expr, index: &Expr, optional: bool) -> Result<(), String> {
+    fn compile_index(
+        &mut self,
+        b: &mut ChunkBuilder,
+        object: &Expr,
+        index: &Expr,
+        optional: bool,
+    ) -> Result<(), String> {
         self.compile_expr(b, object)?;
         if optional {
             let jshort = self.emit_optional_guard(b);
@@ -1520,7 +1693,7 @@ impl Compiler {
         b.emit(Op::Dup, 0);
         b.emit(Op::CallBuiltin(ops::NULLISH, 1), 0);
         let jnull = b.emit(Op::JumpIfFalse(0), 0); // not nullish -> continue access
-        // nullish: drop object, push undefined, jump to end.
+                                                   // nullish: drop object, push undefined, jump to end.
         b.emit(Op::Pop, 0);
         b.emit(Op::LoadUndef, 0);
         let jend = b.emit(Op::Jump(0), 0);
@@ -1529,7 +1702,13 @@ impl Compiler {
         jend
     }
 
-    fn compile_call(&mut self, b: &mut ChunkBuilder, func: &Expr, args: &[Expr], _optional: bool) -> Result<(), String> {
+    fn compile_call(
+        &mut self,
+        b: &mut ChunkBuilder,
+        func: &Expr,
+        args: &[Expr],
+        _optional: bool,
+    ) -> Result<(), String> {
         let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
         match func {
             // `super(...args)` — invoke the parent constructor on the current
@@ -1543,24 +1722,34 @@ impl Compiler {
             }
             // `super.method(...args)` — resolve the parent method, call it bound to
             // the current `this` via `method.call(this, ...args)`.
-            Expr::Member { object, property, .. } if matches!(**object, Expr::Super) => {
+            Expr::Member {
+                object, property, ..
+            } if matches!(**object, Expr::Super) => {
                 self.name_const(b, property);
                 b.emit(Op::CallBuiltin(ops::SUPER_GET, 1), 0); // [method]
                 self.name_const(b, "call"); // [method, "call"]
                 b.emit(Op::CallBuiltin(ops::THIS, 0), 0); // [method, "call", this]
-                // `method.call(this, ...args)`: compile args (spread expands into
-                // the flat run) and dispatch as a method call named "call".
+                                                          // `method.call(this, ...args)`: compile args (spread expands into
+                                                          // the flat run) and dispatch as a method call named "call".
                 for a in args {
                     self.compile_expr(b, a)?;
                 }
                 b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(3 + args.len())?), 0);
                 return Ok(());
             }
-            Expr::Member { object, property, optional } => {
+            Expr::Member {
+                object,
+                property,
+                optional,
+            } => {
                 self.compile_expr(b, object)?;
                 // `obj?.method(...)`: if `obj` is nullish, short-circuit the whole
                 // call to `undefined` (skip the method name, args, and dispatch).
-                let jshort = if *optional { Some(self.emit_optional_guard(b)) } else { None };
+                let jshort = if *optional {
+                    Some(self.emit_optional_guard(b))
+                } else {
+                    None
+                };
                 self.name_const(b, property);
                 if has_spread {
                     self.compile_spread_args(b, args)?; // [recv, name, argsArray]
@@ -1576,17 +1765,25 @@ impl Compiler {
                     b.patch_jump(j, end);
                 }
             }
-            Expr::Index { object, index, optional } => {
+            Expr::Index {
+                object,
+                index,
+                optional,
+            } => {
                 // recv[expr](args) — evaluate as a method via computed name.
                 self.compile_expr(b, object)?; // [recv]
-                // `recv?.[expr](...)`: short-circuit to `undefined` when nullish.
-                let jshort = if *optional { Some(self.emit_optional_guard(b)) } else { None };
+                                               // `recv?.[expr](...)`: short-circuit to `undefined` when nullish.
+                let jshort = if *optional {
+                    Some(self.emit_optional_guard(b))
+                } else {
+                    None
+                };
                 b.emit(Op::Dup, 0); // [recv, recv]
                 self.compile_expr(b, index)?; // [recv, recv, idx]
                 b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0); // [recv, fn]
                 b.emit(Op::Swap, 0); // [fn, recv]... but APPLY needs callable then this
-                // Fall back: call the function value with `this`=recv via CALL_VALUE
-                // (this-binding for computed method calls is approximated).
+                                     // Fall back: call the function value with `this`=recv via CALL_VALUE
+                                     // (this-binding for computed method calls is approximated).
                 b.emit(Op::Pop, 0); // drop recv; keep fn on stack: [fn]
                 if has_spread {
                     self.compile_spread_args(b, args)?;
@@ -1606,7 +1803,7 @@ impl Compiler {
                 self.name_const(b, n);
                 if has_spread {
                     self.compile_spread_args(b, args)?; // [name, argsArray]
-                    // Resolve name to a value, then APPLY.
+                                                        // Resolve name to a value, then APPLY.
                     b.emit(Op::Swap, 0); // [argsArray, name]
                     b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0); // [argsArray, fn]
                     b.emit(Op::Swap, 0); // [fn, argsArray]
@@ -1652,7 +1849,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_new(&mut self, b: &mut ChunkBuilder, callee: &Expr, args: &[Expr]) -> Result<(), String> {
+    fn compile_new(
+        &mut self,
+        b: &mut ChunkBuilder,
+        callee: &Expr,
+        args: &[Expr],
+    ) -> Result<(), String> {
         self.compile_expr(b, callee)?;
         for a in args {
             self.compile_expr(b, a)?;

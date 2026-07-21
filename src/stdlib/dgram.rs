@@ -103,7 +103,10 @@ fn u64_prop(recv: &Value, key: &str) -> Option<u64> {
 }
 
 fn is_udp6(recv: &Value) -> bool {
-    get_prop(recv, "@@udptype").map(|v| with_host(|h| h.str_of(&v))).as_deref() == Some("udp6")
+    get_prop(recv, "@@udptype")
+        .map(|v| with_host(|h| h.str_of(&v)))
+        .as_deref()
+        == Some("udp6")
 }
 
 /// The default bind/target host for this socket's address family.
@@ -134,7 +137,8 @@ fn is_str(v: &Value) -> bool {
 /// Raw bytes of a `send` message argument: a Buffer's `@@bytes`, else a string's
 /// UTF-8 (mirrors `net::value_bytes`).
 fn value_bytes(v: &Value) -> Vec<u8> {
-    let is_buffer = with_host(|h| matches!(h.get(v), Some(JsObj::Object(p)) if p.contains_key("@@bytes")));
+    let is_buffer =
+        with_host(|h| matches!(h.get(v), Some(JsObj::Object(p)) if p.contains_key("@@bytes")));
     if is_buffer {
         return with_host(|h| match h.get(v) {
             Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
@@ -150,11 +154,20 @@ fn value_bytes(v: &Value) -> Vec<u8> {
 /// Delegate the EventEmitter methods to `events`; `None` for a non-emitter method.
 fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match method {
-        "on" | "addListener" | "prependListener" | "once" | "prependOnceListener" | "emit"
-        | "removeListener" | "off" | "removeAllListeners" | "listeners" | "listenerCount"
-        | "eventNames" | "setMaxListeners" | "getMaxListeners" => {
-            Some(super::events::instance_call(recv, method, args.to_vec()))
-        }
+        "on"
+        | "addListener"
+        | "prependListener"
+        | "once"
+        | "prependOnceListener"
+        | "emit"
+        | "removeListener"
+        | "off"
+        | "removeAllListeners"
+        | "listeners"
+        | "listenerCount"
+        | "eventNames"
+        | "setMaxListeners"
+        | "getMaxListeners" => Some(super::events::instance_call(recv, method, args.to_vec())),
         _ => None,
     }
 }
@@ -191,7 +204,10 @@ pub fn create_socket(args: &[Value]) -> Value {
     let socket = super::net::new_emitter_object(SOCKET_TAG, extra);
 
     // A trailing callback becomes a `message` listener.
-    if let Some(cb) = args.get(1).filter(|v| with_host(|h| crate::host::is_callable(h, v))) {
+    if let Some(cb) = args
+        .get(1)
+        .filter(|v| with_host(|h| crate::host::is_callable(h, v)))
+    {
         let _ = super::events::instance_call(
             &socket,
             "on",
@@ -236,12 +252,22 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         // Accepted no-ops: multicast membership, buffer sizing, connect/disconnect,
         // ref counting. Documented as best-effort — std::net exposes no portable
         // API for most, and the datagram path does not need them.
-        "setMulticastLoopback" | "setMulticastInterface" | "addMembership" | "dropMembership"
-        | "addSourceSpecificMembership" | "dropSourceSpecificMembership" | "setRecvBufferSize"
-        | "setSendBufferSize" | "connect" | "disconnect" | "remoteAddress" | "ref" | "unref" => {
-            Ok(recv.clone())
-        }
-        _ => Err(crate::host::type_error(&format!("socket.{method} is not a function"))),
+        "setMulticastLoopback"
+        | "setMulticastInterface"
+        | "addMembership"
+        | "dropMembership"
+        | "addSourceSpecificMembership"
+        | "dropSourceSpecificMembership"
+        | "setRecvBufferSize"
+        | "setSendBufferSize"
+        | "connect"
+        | "disconnect"
+        | "remoteAddress"
+        | "ref"
+        | "unref" => Ok(recv.clone()),
+        _ => Err(crate::host::type_error(&format!(
+            "socket.{method} is not a function"
+        ))),
     }
 }
 
@@ -267,7 +293,9 @@ fn socket_bind(recv: &Value, args: &[Value]) -> Result<Value, String> {
     if let Some(first) = args.first() {
         if is_num(first) {
             port = with_host(|h| h.to_number(first)) as u16;
-        } else if with_host(|h| matches!(h.get(first), Some(JsObj::Object(p)) if !p.contains_key("@@native"))) {
+        } else if with_host(
+            |h| matches!(h.get(first), Some(JsObj::Object(p)) if !p.contains_key("@@native")),
+        ) {
             // Options object `{ port, address }`.
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get(first) {
@@ -295,7 +323,11 @@ fn socket_bind(recv: &Value, args: &[Value]) -> Result<Value, String> {
     let socket = recv.clone();
     let _ = with_host(|h| h.io_sender()).send(Box::new(move || {
         if let Some(cb) = cb {
-            super::events::instance_call(&socket, "once", vec![with_host(|h| h.new_str("listening")), cb])?;
+            super::events::instance_call(
+                &socket,
+                "once",
+                vec![with_host(|h| h.new_str("listening")), cb],
+            )?;
         }
         super::events::instance_call(&socket, "emit", vec![with_host(|h| h.new_str("listening"))])?;
         Ok(())
@@ -309,7 +341,8 @@ fn do_bind(recv: &Value, host: &str, port: u16) -> Result<Arc<UdpSocket>, String
     if let Some(sock) = live_socket(recv) {
         return Ok(sock);
     }
-    let socket = UdpSocket::bind((host, port)).map_err(|e| format!("Error: bind EADDRINUSE: {e}"))?;
+    let socket =
+        UdpSocket::bind((host, port)).map_err(|e| format!("Error: bind EADDRINUSE: {e}"))?;
     // A read timeout lets the recv loop re-check its stop flag on a quiet socket.
     socket.set_read_timeout(Some(POLL)).ok();
     let socket = Arc::new(socket);
@@ -320,7 +353,11 @@ fn do_bind(recv: &Value, host: &str, port: u16) -> Result<Arc<UdpSocket>, String
     DGRAM.with(|s| {
         s.borrow_mut().sockets.insert(
             id,
-            UdpRec { emitter: recv.clone(), socket: socket.clone(), stop: stop.clone() },
+            UdpRec {
+                emitter: recv.clone(),
+                socket: socket.clone(),
+                stop: stop.clone(),
+            },
         );
     });
     with_host(|h| h.incr_handle());
@@ -352,10 +389,15 @@ fn recv_loop(
                 let address = src.ip().to_string();
                 let port = src.port();
                 let family = if src.is_ipv6() { "IPv6" } else { "IPv4" };
-                let _ = tx.send(Box::new(move || on_message(id, bytes, address, port, family)));
+                let _ = tx.send(Box::new(move || {
+                    on_message(id, bytes, address, port, family)
+                }));
             }
             // A read-timeout (or non-blocking would-block) just re-checks `stop`.
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 continue;
             }
             Err(_) => break,
@@ -365,7 +407,13 @@ fn recv_loop(
 
 /// Main-thread delivery of one datagram: emit `message` with `(msg, rinfo)` where
 /// `rinfo = { address, family, port, size }` (matching Node).
-fn on_message(id: u64, bytes: Vec<u8>, address: String, port: u16, family: &'static str) -> Result<(), String> {
+fn on_message(
+    id: u64,
+    bytes: Vec<u8>,
+    address: String,
+    port: u16,
+    family: &'static str,
+) -> Result<(), String> {
     let socket = DGRAM.with(|s| s.borrow().sockets.get(&id).map(|r| r.emitter.clone()));
     let Some(socket) = socket else { return Ok(()) };
 
@@ -379,7 +427,11 @@ fn on_message(id: u64, bytes: Vec<u8>, address: String, port: u16, family: &'sta
         m.insert("size".into(), Value::Float(size as f64));
         h.new_object(m)
     });
-    super::events::instance_call(&socket, "emit", vec![with_host(|h| h.new_str("message")), msg, rinfo])?;
+    super::events::instance_call(
+        &socket,
+        "emit",
+        vec![with_host(|h| h.new_str("message")), msg, rinfo],
+    )?;
     Ok(())
 }
 
@@ -402,7 +454,11 @@ fn socket_send(recv: &Value, args: &[Value]) -> Result<Value, String> {
         i += 1;
     }
     let (offset, length, port) = if nums.len() >= 3 {
-        (nums[0].max(0.0) as usize, nums[1].max(0.0) as usize, nums[2] as u16)
+        (
+            nums[0].max(0.0) as usize,
+            nums[1].max(0.0) as usize,
+            nums[2] as u16,
+        )
     } else if let Some(p) = nums.first() {
         (0usize, full.len(), *p as u16)
     } else {
@@ -457,7 +513,10 @@ fn socket_close(recv: &Value, args: &[Value]) -> Result<Value, String> {
         }
     }
     // A `close` callback registers as a one-shot `close` listener in Node.
-    if let Some(cb) = args.first().filter(|v| with_host(|h| crate::host::is_callable(h, v))) {
+    if let Some(cb) = args
+        .first()
+        .filter(|v| with_host(|h| crate::host::is_callable(h, v)))
+    {
         invoke(cb, Vec::new(), None)?;
     }
     super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))])?;
@@ -467,12 +526,18 @@ fn socket_close(recv: &Value, args: &[Value]) -> Result<Value, String> {
 /// `socket.address()` → `{ address, family, port }` from `local_addr`. Throws if
 /// the socket is not bound (matching Node's `Not running` error).
 fn socket_address(recv: &Value) -> Result<Value, String> {
-    let socket = live_socket(recv).ok_or_else(|| "Error: getsockname EBADF: bad file descriptor".to_string())?;
-    let addr = socket.local_addr().map_err(|e| format!("Error: getsockname {e}"))?;
+    let socket = live_socket(recv)
+        .ok_or_else(|| "Error: getsockname EBADF: bad file descriptor".to_string())?;
+    let addr = socket
+        .local_addr()
+        .map_err(|e| format!("Error: getsockname {e}"))?;
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("address".into(), h.new_str(addr.ip().to_string()));
-        m.insert("family".into(), h.new_str(if addr.is_ipv6() { "IPv6" } else { "IPv4" }));
+        m.insert(
+            "family".into(),
+            h.new_str(if addr.is_ipv6() { "IPv6" } else { "IPv4" }),
+        );
         m.insert("port".into(), Value::Float(addr.port() as f64));
         h.new_object(m)
     }))

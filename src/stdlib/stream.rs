@@ -27,7 +27,14 @@ thread_local! {
 }
 
 /// The base classes exported by `require('stream')`.
-pub const CLASSES: &[&str] = &["Readable", "Writable", "Duplex", "Transform", "PassThrough", "Stream"];
+pub const CLASSES: &[&str] = &[
+    "Readable",
+    "Writable",
+    "Duplex",
+    "Transform",
+    "PassThrough",
+    "Stream",
+];
 
 /// The module free-functions exported by `require('stream')`.
 pub const METHODS: &[&str] = &[
@@ -89,7 +96,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 }
 
 fn get_default_hwm(args: &[Value]) -> Value {
-    let obj = args.first().map(|v| with_host(|h| h.truthy(v))).unwrap_or(false);
+    let obj = args
+        .first()
+        .map(|v| with_host(|h| h.truthy(v)))
+        .unwrap_or(false);
     let n = if obj {
         DEFAULT_HWM_OBJ.with(|c| c.get())
     } else {
@@ -99,7 +109,10 @@ fn get_default_hwm(args: &[Value]) -> Value {
 }
 
 fn set_default_hwm(args: &[Value]) -> Value {
-    let obj = args.first().map(|v| with_host(|h| h.truthy(v))).unwrap_or(false);
+    let obj = args
+        .first()
+        .map(|v| with_host(|h| h.truthy(v)))
+        .unwrap_or(false);
     let val = super::arg_num(args, 1);
     if obj {
         DEFAULT_HWM_OBJ.with(|c| c.set(val));
@@ -135,15 +148,19 @@ fn set_flag(recv: &Value, key: &str, v: Value) {
 
 fn is_readable(s: &Value) -> bool {
     let Some(t) = tag_of(s) else { return false };
-    matches!(t.as_str(), "Readable" | "Duplex" | "Transform" | "PassThrough")
-        && !flag(s, "@@destroyed")
+    matches!(
+        t.as_str(),
+        "Readable" | "Duplex" | "Transform" | "PassThrough"
+    ) && !flag(s, "@@destroyed")
         && !flag(s, "@@ended")
 }
 
 fn is_writable(s: &Value) -> bool {
     let Some(t) = tag_of(s) else { return false };
-    matches!(t.as_str(), "Writable" | "Duplex" | "Transform" | "PassThrough")
-        && !flag(s, "@@destroyed")
+    matches!(
+        t.as_str(),
+        "Writable" | "Duplex" | "Transform" | "PassThrough"
+    ) && !flag(s, "@@destroyed")
         && !flag(s, "@@finished")
 }
 
@@ -197,7 +214,11 @@ fn emit_event(recv: &Value, name: &str, extra: Vec<Value>) -> Result<Value, Stri
         "end" => set_flag(recv, "@@ended", Value::Bool(true)),
         "finish" => set_flag(recv, "@@finished", Value::Bool(true)),
         "close" => set_flag(recv, "@@destroyed", Value::Bool(true)),
-        "error" => set_flag(recv, "@@errored", extra.first().cloned().unwrap_or(Value::Bool(true))),
+        "error" => set_flag(
+            recv,
+            "@@errored",
+            extra.first().cloned().unwrap_or(Value::Bool(true)),
+        ),
         _ => {}
     }
     if matches!(name, "end" | "finish" | "close" | "error") {
@@ -241,9 +262,13 @@ fn finished(args: &[Value]) -> Value {
 /// the destination stream.
 fn pipeline(args: &[Value]) -> Result<Value, String> {
     if args.is_empty() {
-        return Err(crate::host::type_error("pipeline requires at least one stream"));
+        return Err(crate::host::type_error(
+            "pipeline requires at least one stream",
+        ));
     }
-    let cb_idx = args.iter().rposition(|v| with_host(|h| crate::host::is_callable(h, v)));
+    let cb_idx = args
+        .iter()
+        .rposition(|v| with_host(|h| crate::host::is_callable(h, v)));
     let (streams, cb) = match cb_idx {
         Some(i) if i == args.len() - 1 => (&args[..i], Some(args[i].clone())),
         _ => (args, None),
@@ -283,17 +308,32 @@ fn add_abort_signal(args: &[Value]) -> Value {
 
 /// Instance dispatch for a stream base class. EventEmitter methods are delegated
 /// to `events`; `emit` routes through `emit_event` for lifecycle tracking.
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     let _ = tag;
     if method == "emit" {
-        let name = args.first().map(|v| with_host(|h| h.str_of(v))).unwrap_or_default();
+        let name = args
+            .first()
+            .map(|v| with_host(|h| h.str_of(v)))
+            .unwrap_or_default();
         let extra = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
         return emit_event(recv, &name, extra);
     }
     if matches!(
         method,
-        "on" | "addListener" | "prependListener" | "once" | "prependOnceListener"
-            | "removeListener" | "off" | "removeAllListeners" | "listenerCount" | "eventNames"
+        "on" | "addListener"
+            | "prependListener"
+            | "once"
+            | "prependOnceListener"
+            | "removeListener"
+            | "off"
+            | "removeAllListeners"
+            | "listenerCount"
+            | "eventNames"
     ) {
         return super::events::instance_call(recv, method, args);
     }
@@ -369,7 +409,9 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
             Ok(recv.clone())
         }
         "setEncoding" | "pause" | "cork" | "uncork" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("stream.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "stream.{method} is not a function"
+        ))),
     }
 }
 

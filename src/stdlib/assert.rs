@@ -37,10 +37,38 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "notEqual" => check(!loose_eq(&a(), &b()), args, 2, "!=", &a(), &b()),
         "strictEqual" => check(strict(&a(), &b()), args, 2, "strictEqual", &a(), &b()),
         "notStrictEqual" => check(!strict(&a(), &b()), args, 2, "notStrictEqual", &a(), &b()),
-        "deepEqual" => check(deep_equal(&a(), &b(), false), args, 2, "deepEqual", &a(), &b()),
-        "notDeepEqual" => check(!deep_equal(&a(), &b(), false), args, 2, "notDeepEqual", &a(), &b()),
-        "deepStrictEqual" => check(deep_equal(&a(), &b(), true), args, 2, "deepStrictEqual", &a(), &b()),
-        "notDeepStrictEqual" => check(!deep_equal(&a(), &b(), true), args, 2, "notDeepStrictEqual", &a(), &b()),
+        "deepEqual" => check(
+            deep_equal(&a(), &b(), false),
+            args,
+            2,
+            "deepEqual",
+            &a(),
+            &b(),
+        ),
+        "notDeepEqual" => check(
+            !deep_equal(&a(), &b(), false),
+            args,
+            2,
+            "notDeepEqual",
+            &a(),
+            &b(),
+        ),
+        "deepStrictEqual" => check(
+            deep_equal(&a(), &b(), true),
+            args,
+            2,
+            "deepStrictEqual",
+            &a(),
+            &b(),
+        ),
+        "notDeepStrictEqual" => check(
+            !deep_equal(&a(), &b(), true),
+            args,
+            2,
+            "notDeepStrictEqual",
+            &a(),
+            &b(),
+        ),
         "throws" => throws(args, true),
         "doesNotThrow" => throws(args, false),
         "fail" => Err(fail_msg(args, 0, "Failed")),
@@ -100,10 +128,15 @@ fn if_error(v: &Value) -> Result<Value, String> {
         return Ok(Value::Undef);
     }
     let desc = with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => p.get("message").map(|m| h.str_of(m)).unwrap_or_else(|| h.inspect(v)),
+        Some(JsObj::Object(p)) => p
+            .get("message")
+            .map(|m| h.str_of(m))
+            .unwrap_or_else(|| h.inspect(v)),
         _ => h.inspect(v),
     });
-    Err(assertion_error(&format!("ifError got unwanted exception: {desc}")))
+    Err(assertion_error(&format!(
+        "ifError got unwanted exception: {desc}"
+    )))
 }
 
 /// `assert.partialDeepStrictEqual(actual, expected)` — passes when every leaf of
@@ -131,7 +164,9 @@ fn partial_deep(actual: &Value, expected: &Value) -> bool {
             }
             let (ea, ee) = with_host(|h| (object_of(h, actual), object_of(h, expected)));
             ee.iter().all(|(k, ve)| {
-                ea.iter().find(|(k2, _)| k2 == k).is_some_and(|(_, va)| partial_deep(va, ve))
+                ea.iter()
+                    .find(|(k2, _)| k2 == k)
+                    .is_some_and(|(_, va)| partial_deep(va, ve))
             })
         }
         Some(Kind::Array) => {
@@ -207,7 +242,9 @@ pub fn construct_assertion_error(args: &[Value]) -> Value {
         format!("{sa} {op} {se}")
     });
     let stack = format!("AssertionError [ERR_ASSERTION]: {msg}\n    at <anonymous>");
-    let op_val = operator.map(|o| with_host(|h| h.new_str(o))).unwrap_or(Value::Undef);
+    let op_val = operator
+        .map(|o| with_host(|h| h.new_str(o)))
+        .unwrap_or(Value::Undef);
     let name_v = with_host(|h| h.new_str("AssertionError"));
     let msg_v = with_host(|h| h.new_str(msg));
     let code_v = with_host(|h| h.new_str("ERR_ASSERTION"));
@@ -251,11 +288,22 @@ pub fn assert_ok(args: &[Value]) -> Result<Value, String> {
     if with_host(|h| h.truthy(&v)) {
         Ok(Value::Undef)
     } else {
-        Err(fail_msg(args, 1, "The expression evaluated to a falsy value"))
+        Err(fail_msg(
+            args,
+            1,
+            "The expression evaluated to a falsy value",
+        ))
     }
 }
 
-fn check(pass: bool, args: &[Value], msg_idx: usize, op: &str, a: &Value, b: &Value) -> Result<Value, String> {
+fn check(
+    pass: bool,
+    args: &[Value],
+    msg_idx: usize,
+    op: &str,
+    a: &Value,
+    b: &Value,
+) -> Result<Value, String> {
     if pass {
         return Ok(Value::Undef);
     }
@@ -318,7 +366,11 @@ pub fn deep_equal(a: &Value, b: &Value, strict_mode: bool) -> bool {
     match kinds {
         (Some(Kind::Array), Some(Kind::Array)) => {
             let (ia, ib) = with_host(|h| (array_of(h, a), array_of(h, b)));
-            ia.len() == ib.len() && ia.iter().zip(ib.iter()).all(|(x, y)| deep_equal(x, y, strict_mode))
+            ia.len() == ib.len()
+                && ia
+                    .iter()
+                    .zip(ib.iter())
+                    .all(|(x, y)| deep_equal(x, y, strict_mode))
         }
         (Some(Kind::Object), Some(Kind::Object)) => {
             let (ea, eb) = with_host(|h| (object_of(h, a), object_of(h, b)));
@@ -326,7 +378,9 @@ pub fn deep_equal(a: &Value, b: &Value, strict_mode: bool) -> bool {
                 return false;
             }
             ea.iter().all(|(k, va)| {
-                eb.iter().find(|(k2, _)| k2 == k).is_some_and(|(_, vb)| deep_equal(va, vb, strict_mode))
+                eb.iter()
+                    .find(|(k2, _)| k2 == k)
+                    .is_some_and(|(_, vb)| deep_equal(va, vb, strict_mode))
             })
         }
         _ => {
@@ -357,7 +411,11 @@ fn array_of(h: &crate::host::JsHost, v: &Value) -> Vec<Value> {
 }
 fn object_of(h: &crate::host::JsHost, v: &Value) -> Vec<(String, Value)> {
     match h.get(v) {
-        Some(JsObj::Object(p)) => p.iter().filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#')).map(|(k, v)| (k.clone(), v.clone())).collect(),
+        Some(JsObj::Object(p)) => p
+            .iter()
+            .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         _ => Vec::new(),
     }
 }

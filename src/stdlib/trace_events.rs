@@ -147,7 +147,9 @@ fn categories_of(recv: &Value) -> Vec<String> {
 fn read_categories(options: Option<&Value>) -> Vec<String> {
     with_host(|h| {
         let Some(o) = options else { return Vec::new() };
-        let Some(JsObj::Object(p)) = h.get(o) else { return Vec::new() };
+        let Some(JsObj::Object(p)) = h.get(o) else {
+            return Vec::new();
+        };
         match p.get("categories").and_then(|c| h.get(c)) {
             Some(JsObj::Array(items)) => items.iter().map(|v| h.str_of(v)).collect(),
             _ => Vec::new(),

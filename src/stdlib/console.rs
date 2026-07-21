@@ -78,7 +78,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // at this layer); the message content matches Node.
         "trace" => {
             let msg = format_args(args);
-            let line = if msg.is_empty() { "Trace".to_string() } else { format!("Trace: {msg}") };
+            let line = if msg.is_empty() {
+                "Trace".to_string()
+            } else {
+                format!("Trace: {msg}")
+            };
             emit(&line, true);
             Ok(Value::Undef)
         }
@@ -141,13 +145,20 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 Some(d) => {
                     let ms = d.as_secs_f64() * 1000.0;
                     // Any extra args after the label are appended, matching Node.
-                    let extra = if args.len() > 1 { format!(" {}", format_args(&args[1..])) } else { String::new() };
+                    let extra = if args.len() > 1 {
+                        format!(" {}", format_args(&args[1..]))
+                    } else {
+                        String::new()
+                    };
                     emit(&format!("{label}: {ms:.3}ms{extra}"), false);
                     if method == "timeEnd" {
                         TIMERS.with(|t| t.borrow_mut().remove(&label));
                     }
                 }
-                None => emit(&format!("Warning: No such label '{label}' for console.{method}()"), true),
+                None => emit(
+                    &format!("Warning: No such label '{label}' for console.{method}()"),
+                    true,
+                ),
             }
             Ok(Value::Undef)
         }
@@ -194,7 +205,11 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
         };
         (out, err)
     } else {
-        let err = args.get(1).cloned().filter(|v| !matches!(v, Value::Undef)).unwrap_or_else(|| first.clone());
+        let err = args
+            .get(1)
+            .cloned()
+            .filter(|v| !matches!(v, Value::Undef))
+            .unwrap_or_else(|| first.clone());
         (first, err)
     };
     Ok(with_host(|h| {
@@ -278,15 +293,18 @@ fn emit(line: &str, stderr: bool) {
 /// falls back to `console.log`.
 fn render_table(args: &[Value]) -> Option<String> {
     let data = args.first().cloned().unwrap_or(Value::Undef);
-    let restrict: Option<Vec<String>> = with_host(|h| match h.get(args.get(1).unwrap_or(&Value::Undef)) {
-        Some(JsObj::Array(items)) => Some(items.iter().map(|v| h.str_of(v)).collect()),
-        _ => None,
-    });
+    let restrict: Option<Vec<String>> =
+        with_host(|h| match h.get(args.get(1).unwrap_or(&Value::Undef)) {
+            Some(JsObj::Array(items)) => Some(items.iter().map(|v| h.str_of(v)).collect()),
+            _ => None,
+        });
     // (index label, row value) for each row.
     let entries: Vec<(String, Value)> = with_host(|h| match h.get(&data) {
-        Some(JsObj::Array(items)) => {
-            items.iter().enumerate().map(|(i, v)| (i.to_string(), v.clone())).collect()
-        }
+        Some(JsObj::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i.to_string(), v.clone()))
+            .collect(),
         Some(JsObj::Object(m)) => m
             .iter()
             .filter(|(k, _)| !k.starts_with("@@"))
@@ -339,7 +357,11 @@ fn render_table(args: &[Value]) -> Option<String> {
             }
         }
         if has_values {
-            row.push(if is_primitive { with_host(|h| h.inspect(val)) } else { String::new() });
+            row.push(if is_primitive {
+                with_host(|h| h.inspect(val))
+            } else {
+                String::new()
+            });
         }
         rows.push(row);
     }
@@ -362,7 +384,10 @@ fn row_keys(val: &Value) -> Option<Vec<String>> {
 /// Read column `key` from a row value, if present.
 fn row_get(val: &Value, key: &str) -> Option<Value> {
     with_host(|h| match h.get(val) {
-        Some(JsObj::Array(items)) => key.parse::<usize>().ok().and_then(|i| items.get(i).cloned()),
+        Some(JsObj::Array(items)) => key
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| items.get(i).cloned()),
         Some(JsObj::Object(m)) => m.get(key).cloned(),
         _ => None,
     })

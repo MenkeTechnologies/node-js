@@ -29,16 +29,56 @@ pub const MODULE_METHODS: &[&str] = &[
 
 /// Instance methods of a client `ClientRequest` (parent wires the `ClientRequest`
 /// tag via `native_tag`/`instance_call`).
-pub const CLIENT_REQUEST_METHODS: &[&str] =
-    &["write", "end", "setHeader", "getHeader", "removeHeader", "abort", "destroy", "setTimeout", "flushHeaders"];
+pub const CLIENT_REQUEST_METHODS: &[&str] = &[
+    "write",
+    "end",
+    "setHeader",
+    "getHeader",
+    "removeHeader",
+    "abort",
+    "destroy",
+    "setTimeout",
+    "flushHeaders",
+];
 
 /// The HTTP request methods Node exposes as `http.METHODS` (router derives its
 /// per-verb helpers by lowercasing this list).
 const METHODS: &[&str] = &[
-    "ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD", "LINK", "LOCK",
-    "M-SEARCH", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL", "MOVE", "NOTIFY", "OPTIONS",
-    "PATCH", "POST", "PROPFIND", "PROPPATCH", "PURGE", "PUT", "QUERY", "REBIND", "REPORT",
-    "SEARCH", "SOURCE", "SUBSCRIBE", "TRACE", "UNBIND", "UNLINK", "UNLOCK", "UNSUBSCRIBE",
+    "ACL",
+    "BIND",
+    "CHECKOUT",
+    "CONNECT",
+    "COPY",
+    "DELETE",
+    "GET",
+    "HEAD",
+    "LINK",
+    "LOCK",
+    "M-SEARCH",
+    "MERGE",
+    "MKACTIVITY",
+    "MKCALENDAR",
+    "MKCOL",
+    "MOVE",
+    "NOTIFY",
+    "OPTIONS",
+    "PATCH",
+    "POST",
+    "PROPFIND",
+    "PROPPATCH",
+    "PURGE",
+    "PUT",
+    "QUERY",
+    "REBIND",
+    "REPORT",
+    "SEARCH",
+    "SOURCE",
+    "SUBSCRIBE",
+    "TRACE",
+    "UNBIND",
+    "UNLINK",
+    "UNLOCK",
+    "UNSUBSCRIBE",
 ];
 
 /// Non-function `http` module constants (`http.METHODS`, `http.STATUS_CODES`),
@@ -59,16 +99,24 @@ pub fn constant(name: &str) -> Option<Value> {
         // The request/response constructors express augments
         // (`Object.create(http.IncomingMessage.prototype)`): exposed as builtin
         // ctor namespaces so `.prototype` resolves.
-        "IncomingMessage" => Some(with_host(|h| h.alloc(JsObj::Builtin("IncomingMessage".into())))),
-        "ServerResponse" => Some(with_host(|h| h.alloc(JsObj::Builtin("ServerResponse".into())))),
+        "IncomingMessage" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("IncomingMessage".into()))
+        })),
+        "ServerResponse" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("ServerResponse".into()))
+        })),
         // Client/server constructors exposed as builtin ctor namespaces so
         // `.prototype` resolves and `new http.X(...)` routes to `http::construct`.
         // `http.Server` uses a distinct builtin name to disambiguate from
         // `net.Server` in the shared `stdlib::construct`.
         "Agent" => Some(with_host(|h| h.alloc(JsObj::Builtin("Agent".into())))),
         "Server" => Some(with_host(|h| h.alloc(JsObj::Builtin("http.Server".into())))),
-        "ClientRequest" => Some(with_host(|h| h.alloc(JsObj::Builtin("ClientRequest".into())))),
-        "OutgoingMessage" => Some(with_host(|h| h.alloc(JsObj::Builtin("OutgoingMessage".into())))),
+        "ClientRequest" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("ClientRequest".into()))
+        })),
+        "OutgoingMessage" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("OutgoingMessage".into()))
+        })),
         "globalAgent" => Some(construct_agent(&[])),
         _ => None,
     }
@@ -80,7 +128,9 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "Agent" => Some(Ok(construct_agent(args))),
         // `new http.Server([requestListener])`.
         "http.Server" => Some(Ok(create_server(
-            args.first().cloned().filter(|v| with_host(|h| crate::host::is_callable(h, v))),
+            args.first()
+                .cloned()
+                .filter(|v| with_host(|h| crate::host::is_callable(h, v))),
         ))),
         _ => None,
     }
@@ -268,16 +318,22 @@ pub fn construct_agent(args: &[Value]) -> Value {
 pub fn create_server(request_listener: Option<Value>) -> Value {
     let server = super::net::create_server(None);
     let listener = request_listener.unwrap_or(Value::Undef);
-    let hook = std::rc::Rc::new(move |_server: &Value, socket: &Value| -> Result<(), String> {
-        let sock_id = socket_id_of(socket);
-        CONNS.with(|c| {
-            c.borrow_mut().insert(
-                sock_id,
-                HttpConn { socket: socket.clone(), listener: listener.clone(), buf: Vec::new() },
-            );
-        });
-        Ok(())
-    });
+    let hook = std::rc::Rc::new(
+        move |_server: &Value, socket: &Value| -> Result<(), String> {
+            let sock_id = socket_id_of(socket);
+            CONNS.with(|c| {
+                c.borrow_mut().insert(
+                    sock_id,
+                    HttpConn {
+                        socket: socket.clone(),
+                        listener: listener.clone(),
+                        buf: Vec::new(),
+                    },
+                );
+            });
+            Ok(())
+        },
+    );
     super::net::set_conn_hook(&server, hook);
     server
 }
@@ -305,7 +361,13 @@ pub fn feed(sock_id: u64, _socket: &Value, bytes: &[u8]) -> Result<(), String> {
     if !is_http {
         return Ok(());
     }
-    CONNS.with(|c| c.borrow_mut().get_mut(&sock_id).unwrap().buf.extend_from_slice(bytes));
+    CONNS.with(|c| {
+        c.borrow_mut()
+            .get_mut(&sock_id)
+            .unwrap()
+            .buf
+            .extend_from_slice(bytes)
+    });
 
     // Parse and dispatch every complete request currently buffered (pipelining).
     loop {
@@ -330,7 +392,11 @@ pub fn feed(sock_id: u64, _socket: &Value, bytes: &[u8]) -> Result<(), String> {
         // Body streaming: emit any request body then `end` for downstream readers.
         if !parsed.body.is_empty() {
             let chunk = super::buffer::from_bytes(&parsed.body);
-            super::events::instance_call(&req, "emit", vec![with_host(|h| h.new_str("data")), chunk])?;
+            super::events::instance_call(
+                &req,
+                "emit",
+                vec![with_host(|h| h.new_str("data")), chunk],
+            )?;
         }
         super::events::instance_call(&req, "emit", vec![with_host(|h| h.new_str("end"))])?;
         let _ = socket; // (kept for future keep-alive bookkeeping)
@@ -387,7 +453,13 @@ fn parse_request(buf: &[u8]) -> Option<(ParsedReq, usize)> {
     }
     let body = buf[body_start..body_start + content_length].to_vec();
     Some((
-        ParsedReq { method, url, http_version, headers, body },
+        ParsedReq {
+            method,
+            url,
+            http_version,
+            headers,
+            body,
+        },
         body_start + content_length,
     ))
 }
@@ -407,9 +479,15 @@ fn build_incoming(req: &ParsedReq) -> Value {
         h.new_object(m)
     });
     let mut extra = IndexMap::new();
-    extra.insert("method".into(), with_host(|h| h.new_str(req.method.clone())));
+    extra.insert(
+        "method".into(),
+        with_host(|h| h.new_str(req.method.clone())),
+    );
     extra.insert("url".into(), with_host(|h| h.new_str(req.url.clone())));
-    extra.insert("httpVersion".into(), with_host(|h| h.new_str(req.http_version.clone())));
+    extra.insert(
+        "httpVersion".into(),
+        with_host(|h| h.new_str(req.http_version.clone())),
+    );
     extra.insert("headers".into(), headers_obj);
     super::net::new_emitter_object("IncomingMessage", extra)
 }
@@ -421,7 +499,13 @@ fn build_response(sock_id: u64) -> Value {
     RESPONSES.with(|r| {
         r.borrow_mut().insert(
             resid,
-            ResState { sock_id, status: 200, message: None, headers: Vec::new(), body: Vec::new() },
+            ResState {
+                sock_id,
+                status: 200,
+                message: None,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
         );
     });
     let mut extra = IndexMap::new();
@@ -439,26 +523,45 @@ fn resid_of(res: &Value) -> Option<u64> {
 
 /// Instance dispatch for `IncomingMessage`/`ServerResponse` (EventEmitter methods
 /// handled by `net`'s shared emitter delegation via `stdlib::instance_call`).
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     // EventEmitter surface is shared with `net` sockets.
     if matches!(
         method,
-        "on" | "addListener" | "prependListener" | "once" | "prependOnceListener" | "emit"
-            | "removeListener" | "off" | "removeAllListeners" | "listenerCount" | "eventNames"
+        "on" | "addListener"
+            | "prependListener"
+            | "once"
+            | "prependOnceListener"
+            | "emit"
+            | "removeListener"
+            | "off"
+            | "removeAllListeners"
+            | "listenerCount"
+            | "eventNames"
     ) {
         return super::events::instance_call(recv, method, args);
     }
     match tag {
-        "IncomingMessage" => Err(crate::host::type_error(&format!("req.{method} is not a function"))),
+        "IncomingMessage" => Err(crate::host::type_error(&format!(
+            "req.{method} is not a function"
+        ))),
         "ServerResponse" => response_call(recv, method, args),
         "ClientRequest" => client_request_call(recv, method, args),
         // Minimal Agent: no live sockets to tear down.
         "Agent" => match method {
             "destroy" => Ok(Value::Undef),
             "getName" => Ok(with_host(|h| h.new_str("localhost:80:"))),
-            _ => Err(crate::host::type_error(&format!("agent.{method} is not a function"))),
+            _ => Err(crate::host::type_error(&format!(
+                "agent.{method} is not a function"
+            ))),
         },
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -468,7 +571,8 @@ fn response_call(res: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
     };
     match method {
         "writeHead" => {
-            let status = with_host(|h| args.first().map(|v| h.to_number(v)).unwrap_or(200.0)) as u16;
+            let status =
+                with_host(|h| args.first().map(|v| h.to_number(v)).unwrap_or(200.0)) as u16;
             // Second arg is either the status message (string) or the headers obj.
             let mut message: Option<String> = None;
             let mut headers_arg: Option<Value> = None;
@@ -509,13 +613,19 @@ fn response_call(res: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
             Ok(Value::Undef)
         }
         "getHeader" => {
-            let k = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef))).to_ascii_lowercase();
+            let k = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)))
+                .to_ascii_lowercase();
             let val = RESPONSES.with(|r| {
-                r.borrow()
-                    .get(&resid)
-                    .and_then(|st| st.headers.iter().find(|(hk, _)| hk.eq_ignore_ascii_case(&k)).map(|(_, v)| v.clone()))
+                r.borrow().get(&resid).and_then(|st| {
+                    st.headers
+                        .iter()
+                        .find(|(hk, _)| hk.eq_ignore_ascii_case(&k))
+                        .map(|(_, v)| v.clone())
+                })
             });
-            Ok(val.map(|v| with_host(|h| h.new_str(v))).unwrap_or(Value::Undef))
+            Ok(val
+                .map(|v| with_host(|h| h.new_str(v)))
+                .unwrap_or(Value::Undef))
         }
         "removeHeader" => {
             let k = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
@@ -547,7 +657,9 @@ fn response_call(res: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
             finish_response(res, resid)?;
             Ok(res.clone())
         }
-        _ => Err(crate::host::type_error(&format!("res.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "res.{method} is not a function"
+        ))),
     }
 }
 
@@ -573,14 +685,16 @@ fn finish_response(res: &Value, resid: u64) -> Result<(), String> {
 /// `Content-Length` and `Connection: keep-alive` if the user did not set framing
 /// headers), CRLFCRLF, then the body.
 fn serialize_response(st: &mut ResState) -> Vec<u8> {
-    let reason = st.message.clone().unwrap_or_else(|| status_text(st.status).to_string());
+    let reason = st
+        .message
+        .clone()
+        .unwrap_or_else(|| status_text(st.status).to_string());
     let mut out = format!("HTTP/1.1 {} {}\r\n", st.status, reason).into_bytes();
 
     let has = |name: &str| st.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
-    let chunked = st
-        .headers
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked"));
+    let chunked = st.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
 
     for (k, v) in &st.headers {
         out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
@@ -600,7 +714,10 @@ fn serialize_response(st: &mut ResState) -> Vec<u8> {
 
 /// Insert or replace a header (case-insensitive name match), preserving order.
 fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: String) {
-    if let Some(slot) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+    if let Some(slot) = headers
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    {
         slot.1 = value;
     } else {
         headers.push((name.to_string(), value));
@@ -632,7 +749,8 @@ fn set_res_prop(res: &Value, key: &str, val: Value) {
 /// Raw bytes of a `write`/`end` argument: a Buffer's bytes, or a string's UTF-8.
 fn value_bytes(v: Option<&Value>) -> Vec<u8> {
     let Some(v) = v else { return Vec::new() };
-    let is_buffer = with_host(|h| matches!(h.get(v), Some(JsObj::Object(p)) if p.contains_key("@@bytes")));
+    let is_buffer =
+        with_host(|h| matches!(h.get(v), Some(JsObj::Object(p)) if p.contains_key("@@bytes")));
     if is_buffer {
         return with_host(|h| match h.get(v) {
             Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
@@ -722,7 +840,8 @@ pub fn request(args: &[Value], is_get: bool) -> Result<Value, String> {
             if let Some(v) = get_prop(a, "path").filter(|v| with_host(|h| h.as_str(v)).is_some()) {
                 path = with_host(|h| h.str_of(&v));
             }
-            if let Some(v) = get_prop(a, "method").filter(|v| with_host(|h| h.as_str(v)).is_some()) {
+            if let Some(v) = get_prop(a, "method").filter(|v| with_host(|h| h.as_str(v)).is_some())
+            {
                 method = with_host(|h| h.str_of(&v));
             }
             if let Some(hv) = get_prop(a, "headers").filter(|v| matches!(v, Value::Obj(_))) {
@@ -744,12 +863,25 @@ pub fn request(args: &[Value], is_get: bool) -> Result<Value, String> {
     let request = super::net::new_emitter_object("ClientRequest", extra);
     // The `cb` is registered as the `response` listener (Node semantics).
     if let Some(cb) = cb {
-        super::events::instance_call(&request, "on", vec![with_host(|h| h.new_str("response")), cb])?;
+        super::events::instance_call(
+            &request,
+            "on",
+            vec![with_host(|h| h.new_str("response")), cb],
+        )?;
     }
     CLIENT_REQS.with(|c| {
         c.borrow_mut().insert(
             reqid,
-            ClientReq { host, port, method, path, headers, body: Vec::new(), request: request.clone(), sent: false },
+            ClientReq {
+                host,
+                port,
+                method,
+                path,
+                headers,
+                body: Vec::new(),
+                request: request.clone(),
+                sent: false,
+            },
         );
     });
     if is_get {
@@ -765,7 +897,11 @@ fn parse_url(url: &str, host: &mut String, port: &mut u16, path: &mut String) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    *path = if p.is_empty() { "/".to_string() } else { p.to_string() };
+    *path = if p.is_empty() {
+        "/".to_string()
+    } else {
+        p.to_string()
+    };
     if let Some((h, port_str)) = authority.rsplit_once(':') {
         *host = h.to_string();
         if let Ok(n) = port_str.parse::<u16>() {
@@ -818,15 +954,21 @@ fn client_request_call(req: &Value, method: &str, args: Vec<Value>) -> Result<Va
             Ok(Value::Undef)
         }
         "getHeader" => {
-            let k = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef))).to_ascii_lowercase();
+            let k = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)))
+                .to_ascii_lowercase();
             let val = reqid.and_then(|id| {
                 CLIENT_REQS.with(|c| {
-                    c.borrow()
-                        .get(&id)
-                        .and_then(|r| r.headers.iter().find(|(hk, _)| hk.eq_ignore_ascii_case(&k)).map(|(_, v)| v.clone()))
+                    c.borrow().get(&id).and_then(|r| {
+                        r.headers
+                            .iter()
+                            .find(|(hk, _)| hk.eq_ignore_ascii_case(&k))
+                            .map(|(_, v)| v.clone())
+                    })
                 })
             });
-            Ok(val.map(|v| with_host(|h| h.new_str(v))).unwrap_or(Value::Undef))
+            Ok(val
+                .map(|v| with_host(|h| h.new_str(v)))
+                .unwrap_or(Value::Undef))
         }
         "removeHeader" => {
             if let Some(id) = reqid {
@@ -840,7 +982,9 @@ fn client_request_call(req: &Value, method: &str, args: Vec<Value>) -> Result<Va
             Ok(Value::Undef)
         }
         "abort" | "destroy" | "setTimeout" | "flushHeaders" => Ok(req.clone()),
-        _ => Err(crate::host::type_error(&format!("req.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "req.{method} is not a function"
+        ))),
     }
 }
 
@@ -860,7 +1004,14 @@ fn dispatch_request(reqid: u64) -> Result<(), String> {
     let (host, port, method, path, headers, body) = CLIENT_REQS.with(|c| {
         let b = c.borrow();
         let r = b.get(&reqid).unwrap();
-        (r.host.clone(), r.port, r.method.clone(), r.path.clone(), r.headers.clone(), r.body.clone())
+        (
+            r.host.clone(),
+            r.port,
+            r.method.clone(),
+            r.path.clone(),
+            r.headers.clone(),
+            r.body.clone(),
+        )
     });
 
     let io_tx = with_host(|h| h.io_sender());
@@ -882,7 +1033,11 @@ fn dispatch_request(reqid: u64) -> Result<(), String> {
         }
         header_block.push_str(&format!("{k}: {v}\r\n"));
     }
-    let host_header = if port == 80 { host.clone() } else { format!("{host}:{port}") };
+    let host_header = if port == 80 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
     let mut request_bytes = format!("{method} {path} HTTP/1.1\r\n");
     if !has_host {
         request_bytes.push_str(&format!("Host: {host_header}\r\n"));
@@ -910,8 +1065,12 @@ fn dispatch_request(reqid: u64) -> Result<(), String> {
 fn do_client_exchange(host: &str, port: u16, request: &[u8]) -> Result<Vec<u8>, String> {
     let mut stream = TcpStream::connect((host, port))
         .map_err(|e| format!("Error: connect ECONNREFUSED {host}:{port}: {e}"))?;
-    stream.write_all(request).map_err(|e| format!("Error: http write: {e}"))?;
-    stream.flush().map_err(|e| format!("Error: http flush: {e}"))?;
+    stream
+        .write_all(request)
+        .map_err(|e| format!("Error: http write: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("Error: http flush: {e}"))?;
     let mut raw = Vec::new();
     let mut buf = [0u8; 16384];
     loop {
@@ -954,7 +1113,11 @@ fn deliver_response(reqid: u64, raw: Vec<u8>) -> Result<(), String> {
     extra.insert("headers".into(), headers_obj);
     let res = super::net::new_emitter_object("IncomingMessage", extra);
 
-    super::events::instance_call(&entry.request, "emit", vec![with_host(|h| h.new_str("response")), res.clone()])?;
+    super::events::instance_call(
+        &entry.request,
+        "emit",
+        vec![with_host(|h| h.new_str("response")), res.clone()],
+    )?;
     if !body.is_empty() {
         let chunk = super::buffer::from_bytes(&body);
         super::events::instance_call(&res, "emit", vec![with_host(|h| h.new_str("data")), chunk])?;
@@ -974,7 +1137,11 @@ fn deliver_error(reqid: u64, msg: String) -> Result<(), String> {
             m.insert("message".into(), h.new_str(msg.clone()));
             h.new_object(m)
         });
-        super::events::instance_call(&entry.request, "emit", vec![with_host(|h| h.new_str("error")), err])?;
+        super::events::instance_call(
+            &entry.request,
+            "emit",
+            vec![with_host(|h| h.new_str("error")), err],
+        )?;
     }
     Ok(())
 }
@@ -988,7 +1155,12 @@ fn parse_response(raw: &[u8]) -> (u16, String, String, Vec<(String, String)>, Ve
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let mut sp = status_line.splitn(3, ' ');
-    let version = sp.next().unwrap_or("HTTP/1.1").strip_prefix("HTTP/").unwrap_or("1.1").to_string();
+    let version = sp
+        .next()
+        .unwrap_or("HTTP/1.1")
+        .strip_prefix("HTTP/")
+        .unwrap_or("1.1")
+        .to_string();
     let status = sp.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
     let message = sp.next().unwrap_or("").to_string();
 
@@ -1008,7 +1180,11 @@ fn parse_response(raw: &[u8]) -> (u16, String, String, Vec<(String, String)>, Ve
         }
     }
     let raw_body = &raw[body_start..];
-    let body = if chunked { decode_chunked(raw_body) } else { raw_body.to_vec() };
+    let body = if chunked {
+        decode_chunked(raw_body)
+    } else {
+        raw_body.to_vec()
+    };
     (status, message, version, headers, body)
 }
 

@@ -20,10 +20,10 @@
 //! silently-wrong result.
 
 use crate::host::{with_host, JsObj};
-use fusevm::Value;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
 use flate2::Compression;
+use fusevm::Value;
 use std::io::{Read, Write};
 
 use super::buffer;
@@ -83,7 +83,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         let data = input_bytes(args);
         let init = {
             let n = super::arg_num(args, 1);
-            if n.is_nan() { 0 } else { n as i64 as u32 }
+            if n.is_nan() {
+                0
+            } else {
+                n as i64 as u32
+            }
         };
         return Some(Ok(Value::Float(crc32(&data, init) as f64)));
     }
@@ -121,7 +125,9 @@ fn is_async(method: &str) -> bool {
 
 /// Run `op` and invoke the trailing callback with `(err, buffer)`.
 fn run_async(op: &str, args: &[Value]) -> Result<Value, String> {
-    let Some(cb) = args.last().cloned() else { return Ok(Value::Undef) };
+    let Some(cb) = args.last().cloned() else {
+        return Ok(Value::Undef);
+    };
     let input = input_bytes(args);
     let (err, buf) = match oneshot(op, &input) {
         Ok(bytes) => (with_host(|h| h.null()), buffer::from_bytes(&bytes)),
@@ -175,7 +181,9 @@ fn gzip(input: &[u8]) -> Result<Vec<u8>, String> {
 
 fn gunzip(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    GzDecoder::new(input).read_to_end(&mut out).map_err(io_err)?;
+    GzDecoder::new(input)
+        .read_to_end(&mut out)
+        .map_err(io_err)?;
     Ok(out)
 }
 
@@ -187,7 +195,9 @@ fn deflate(input: &[u8]) -> Result<Vec<u8>, String> {
 
 fn inflate(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    ZlibDecoder::new(input).read_to_end(&mut out).map_err(io_err)?;
+    ZlibDecoder::new(input)
+        .read_to_end(&mut out)
+        .map_err(io_err)?;
     Ok(out)
 }
 
@@ -199,7 +209,9 @@ fn deflate_raw(input: &[u8]) -> Result<Vec<u8>, String> {
 
 fn inflate_raw(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    DeflateDecoder::new(input).read_to_end(&mut out).map_err(io_err)?;
+    DeflateDecoder::new(input)
+        .read_to_end(&mut out)
+        .map_err(io_err)?;
     Ok(out)
 }
 

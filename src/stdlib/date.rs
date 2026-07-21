@@ -17,8 +17,9 @@ pub const STATIC_METHODS: &[&str] = &["now", "parse", "UTC"];
 
 const MS_PER_DAY: f64 = 86_400_000.0;
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS: [&str; 12] =
-    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// Milliseconds since the Unix epoch, right now.
 fn now_ms() -> f64 {
@@ -67,14 +68,24 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
         // (year, month[, day, hours, minutes, seconds, ms]) — interpreted as UTC.
         _ => {
             let n = |i: usize, dflt: f64| {
-                args.get(i).map(|v| with_host(|h| h.to_number(v))).unwrap_or(dflt)
+                args.get(i)
+                    .map(|v| with_host(|h| h.to_number(v)))
+                    .unwrap_or(dflt)
             };
             let mut year = n(0, f64::NAN);
             // Years 0..99 map to 1900..1999 per the spec.
             if (0.0..=99.0).contains(&year) {
                 year += 1900.0;
             }
-            utc_from_fields(year, n(1, 0.0), n(2, 1.0), n(3, 0.0), n(4, 0.0), n(5, 0.0), n(6, 0.0))
+            utc_from_fields(
+                year,
+                n(1, 0.0),
+                n(2, 1.0),
+                n(3, 0.0),
+                n(4, 0.0),
+                n(5, 0.0),
+                n(6, 0.0),
+            )
         }
     };
     Ok(from_ms(ms))
@@ -87,14 +98,22 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         "parse" => Ok(Value::Float(parse_str(&super::arg_str(args, 0)))),
         "UTC" => {
             let n = |i: usize, dflt: f64| {
-                args.get(i).map(|v| with_host(|h| h.to_number(v))).unwrap_or(dflt)
+                args.get(i)
+                    .map(|v| with_host(|h| h.to_number(v)))
+                    .unwrap_or(dflt)
             };
             let mut year = n(0, f64::NAN);
             if (0.0..=99.0).contains(&year) {
                 year += 1900.0;
             }
             Ok(Value::Float(utc_from_fields(
-                year, n(1, 0.0), n(2, 1.0), n(3, 0.0), n(4, 0.0), n(5, 0.0), n(6, 0.0),
+                year,
+                n(1, 0.0),
+                n(2, 1.0),
+                n(3, 0.0),
+                n(4, 0.0),
+                n(5, 0.0),
+                n(6, 0.0),
             )))
         }
         _ => return None,
@@ -119,7 +138,13 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             }
         }
         "toUTCString" | "toGMTString" => with_host(|h| h.new_str(utc_string(ms))),
-        "toString" => with_host(|h| h.new_str(if ms.is_nan() { "Invalid Date".into() } else { utc_string(ms) })),
+        "toString" => with_host(|h| {
+            h.new_str(if ms.is_nan() {
+                "Invalid Date".into()
+            } else {
+                utc_string(ms)
+            })
+        }),
         "toDateString" => with_host(|h| h.new_str(date_string(ms))),
         "getFullYear" | "getUTCFullYear" => Value::Float(field(ms, Field::Year)),
         "getMonth" | "getUTCMonth" => Value::Float(field(ms, Field::Month)),
@@ -139,7 +164,11 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             });
             Value::Float(new_ms)
         }
-        _ => return Err(crate::host::type_error(&format!("date.{method} is not a function"))),
+        _ => {
+            return Err(crate::host::type_error(&format!(
+                "date.{method} is not a function"
+            )))
+        }
     })
 }
 
@@ -323,7 +352,13 @@ fn parse_iso(s: &str) -> Option<f64> {
         }
     }
     let days = days_from_civil(y, mo - 1, d);
-    Some(days as f64 * MS_PER_DAY + h as f64 * 3_600_000.0 + mi as f64 * 60_000.0 + sec as f64 * 1000.0 + milli as f64)
+    Some(
+        days as f64 * MS_PER_DAY
+            + h as f64 * 3_600_000.0
+            + mi as f64 * 60_000.0
+            + sec as f64 * 1000.0
+            + milli as f64,
+    )
 }
 
 /// RFC-1123 / IMF-fixdate: `Wed, 21 Oct 2015 07:28:00 GMT`.
@@ -348,5 +383,10 @@ fn parse_rfc1123(s: &str) -> Option<f64> {
     let mi: i64 = tp[1].parse().ok()?;
     let sec: i64 = tp.get(2).map(|v| v.parse().ok()).unwrap_or(Some(0))?;
     let days = days_from_civil(y, mo, d);
-    Some(days as f64 * MS_PER_DAY + h as f64 * 3_600_000.0 + mi as f64 * 60_000.0 + sec as f64 * 1000.0)
+    Some(
+        days as f64 * MS_PER_DAY
+            + h as f64 * 3_600_000.0
+            + mi as f64 * 60_000.0
+            + sec as f64 * 1000.0,
+    )
 }

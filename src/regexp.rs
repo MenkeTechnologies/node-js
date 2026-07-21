@@ -53,7 +53,9 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     let mut seen = String::new();
     for c in flags.chars() {
         if !"gimsuyd".contains(c) || seen.contains(c) {
-            return Err(format!("SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"));
+            return Err(format!(
+                "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
+            ));
         }
         seen.push(c);
     }
@@ -90,7 +92,11 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
 
     let obj = RegExpObj {
         re,
-        source: if pattern.is_empty() { "(?:)".to_string() } else { pattern.to_string() },
+        source: if pattern.is_empty() {
+            "(?:)".to_string()
+        } else {
+            pattern.to_string()
+        },
         flags: flags.to_string(),
         global,
         ignore_case,
@@ -479,7 +485,12 @@ pub fn str_split_regex(s: &str, re_val: &Value, limit: Option<usize>) -> Result<
 
 /// `str.replace(re, repl)` / `str.replaceAll(re, repl)`. `repl` is either a string
 /// (with `$1`/`$&`/`` $` ``/`$'`/`$<name>`/`$$` patterns) or a function replacer.
-pub fn str_replace_regex(s: &str, re_val: &Value, repl: &Value, all: bool) -> Result<Value, String> {
+pub fn str_replace_regex(
+    s: &str,
+    re_val: &Value,
+    repl: &Value,
+    all: bool,
+) -> Result<Value, String> {
     let Some((re, global, _, _)) = regexp_snapshot(re_val) else {
         return Ok(with_host(|h| h.new_str(s.to_string())));
     };

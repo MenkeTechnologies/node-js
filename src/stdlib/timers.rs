@@ -42,7 +42,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "clearImmediate" => "clearTimeout",
         _ => return None,
     };
-    Some(crate::builtins::call_builtin_function(global, args.to_vec()))
+    Some(crate::builtins::call_builtin_function(
+        global,
+        args.to_vec(),
+    ))
 }
 
 // ── timers/promises (Promise API) ────────────────────────────────────────────

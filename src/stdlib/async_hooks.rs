@@ -84,16 +84,25 @@ fn new_hook() -> Value {
 }
 
 /// Dispatch a method on a native `async_hooks` instance.
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match tag {
         // A createHook() result: enable/disable are no-ops returning `this` so
         // `createHook(...).enable()` chains work. No hook callbacks fire.
         "AsyncHook" => match method {
             "enable" | "disable" => Ok(recv.clone()),
-            _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+            _ => Err(crate::host::type_error(&format!(
+                "{method} is not a function"
+            ))),
         },
         "AsyncLocalStorage" => als_call(recv, method, args),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -110,7 +119,10 @@ fn als_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, Strin
     match method {
         // The current store (top of this instance's stack), or undefined.
         "getStore" => Ok(STORES.with(|s| {
-            s.borrow().get(&id).and_then(|v| v.last().cloned()).unwrap_or(Value::Undef)
+            s.borrow()
+                .get(&id)
+                .and_then(|v| v.last().cloned())
+                .unwrap_or(Value::Undef)
         })),
         // run(store, callback, ...args): set the store, call the callback with the
         // remaining args, restore the previous store, return the callback result.
@@ -141,7 +153,9 @@ fn als_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, Strin
             });
             Ok(Value::Undef)
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 

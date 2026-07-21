@@ -147,12 +147,18 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "userInfo" => Ok(user_info()),
         // Logical CPU count (Node uses libuv's available parallelism).
         "availableParallelism" => {
-            let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
             Ok(Value::Float(n as f64))
         }
         // `os.getPriority([pid])` — the nice value of `pid` (0 = current process).
         "getPriority" => {
-            let pid = if args.is_empty() { 0 } else { super::arg_num(args, 0) as i32 };
+            let pid = if args.is_empty() {
+                0
+            } else {
+                super::arg_num(args, 0) as i32
+            };
             // SAFETY: pure query; PRIO_PROCESS with a pid.
             let prio = unsafe { libc::getpriority(libc::PRIO_PROCESS as _, pid as _) };
             Ok(Value::Float(prio as f64))
@@ -161,12 +167,17 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // the nice value); returns undefined.
         "setPriority" => {
             let (pid, prio) = if args.len() >= 2 {
-                (super::arg_num(args, 0) as i32, super::arg_num(args, 1) as i32)
+                (
+                    super::arg_num(args, 0) as i32,
+                    super::arg_num(args, 1) as i32,
+                )
             } else {
                 (0, super::arg_num(args, 0) as i32)
             };
             // SAFETY: PRIO_PROCESS with a pid and nice value; failure returns -1.
-            unsafe { libc::setpriority(libc::PRIO_PROCESS as _, pid as _, prio as _); }
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS as _, pid as _, prio as _);
+            }
             Ok(Value::Undef)
         }
         _ => return None,

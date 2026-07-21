@@ -547,7 +547,10 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
             _ => Value::Undef,
         },
         Some(JsObj::BigInt(_)) => {
-            if matches!(name, "toString" | "valueOf" | "toLocaleString" | "constructor") {
+            if matches!(
+                name,
+                "toString" | "valueOf" | "toLocaleString" | "constructor"
+            ) {
                 bound_method(recv, name)
             } else {
                 Value::Undef
@@ -736,7 +739,12 @@ fn bound_method(recv: &Value, name: &str) -> Value {
 fn is_object_method(name: &str) -> bool {
     matches!(
         name,
-        "hasOwnProperty" | "isPrototypeOf" | "propertyIsEnumerable" | "toString" | "valueOf" | "constructor"
+        "hasOwnProperty"
+            | "isPrototypeOf"
+            | "propertyIsEnumerable"
+            | "toString"
+            | "valueOf"
+            | "constructor"
     )
 }
 
@@ -779,7 +787,8 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
         }
         "propertyIsEnumerable" => {
             let k = with_host(|h| h.str_of(&arg0(&args)));
-            let has = with_host(|h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key(&k)));
+            let has =
+                with_host(|h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key(&k)));
             Ok(Value::Bool(has))
         }
         "toString" => Ok(with_host(|h| {
@@ -796,7 +805,11 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
 /// `Function.prototype` methods (`call`/`apply`/`bind`) plus `Symbol.prototype`/
 /// generator handling done elsewhere. Returns `Ok(None)` if `name` is not one of
 /// these (so the caller can try statics).
-pub fn function_builtin_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+pub fn function_builtin_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Option<Value>, String> {
     match name {
         "call" => {
             let this = args.first().cloned();
@@ -888,7 +901,8 @@ fn ensure_fn_prototype(recv: &Value) -> Value {
         return p;
     }
     // Arrows / classes: no auto prototype (classes set their own).
-    let is_arrow = matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Func(f)) if f.is_arrow);
+    let is_arrow =
+        matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Func(f)) if f.is_arrow);
     if is_arrow {
         return Value::Undef;
     }
@@ -1028,7 +1042,8 @@ fn b_setattr(vm: &mut VM, _: u8) -> Value {
 
 fn set_property(recv: &Value, name: &str, val: Value) {
     // `obj.__proto__ = p` re-links the prototype.
-    if name == "__proto__" && matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Object(_))) {
+    if name == "__proto__" && matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Object(_)))
+    {
         with_host(|h| h.set_proto(recv, val));
         return;
     }
@@ -1064,7 +1079,11 @@ fn set_property(recv: &Value, name: &str, val: Value) {
         }) {
             with_host(|h| {
                 if let Some(JsObj::RegExp(r)) = h.get_mut(recv) {
-                    r.last_index = if n.is_finite() && n >= 0.0 { n as usize } else { 0 };
+                    r.last_index = if n.is_finite() && n >= 0.0 {
+                        n as usize
+                    } else {
+                        0
+                    };
                 }
             });
             return;
@@ -1192,7 +1211,10 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
         if spread {
             let src = flat[i + 1].clone();
             let entries = with_host(|h| match h.get(&src) {
-                Some(JsObj::Object(m)) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                Some(JsObj::Object(m)) => m
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
                 Some(JsObj::Array(items)) => items
                     .iter()
                     .enumerate()
@@ -1345,7 +1367,10 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
     // computed in arbitrary precision.
     if with_host(|h| h.is_bigint_val(&v)) {
         return match tag {
-            host::unop::POS => abort(vm, host::type_error("Cannot convert a BigInt value to a number")),
+            host::unop::POS => abort(
+                vm,
+                host::type_error("Cannot convert a BigInt value to a number"),
+            ),
             host::unop::BITNOT => {
                 let b = with_host(|h| h.as_bigint(&v)).unwrap();
                 let r = -(b + num_bigint::BigInt::from(1));
@@ -1358,7 +1383,11 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
         host::unop::POS => Value::Float(h.to_number(&v)),
         host::unop::BITNOT => {
             let n = h.to_number(&v);
-            let i = if n.is_finite() { n.trunc() as i64 as i32 } else { 0 };
+            let i = if n.is_finite() {
+                n.trunc() as i64 as i32
+            } else {
+                0
+            };
             Value::Float(!i as f64)
         }
         _ => Value::Undef,
@@ -1399,7 +1428,10 @@ fn b_throw(vm: &mut VM, _: u8) -> Value {
 
 fn error_display(h: &host::JsHost, v: &Value) -> String {
     if let Some(JsObj::Object(props)) = h.get(v) {
-        let name = props.get("name").map(|x| h.str_of(x)).unwrap_or_else(|| "Error".into());
+        let name = props
+            .get("name")
+            .map(|x| h.str_of(x))
+            .unwrap_or_else(|| "Error".into());
         if let Some(m) = props.get("message") {
             return format!("Uncaught {name}: {}", h.str_of(m));
         }
@@ -1425,9 +1457,8 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
             pending = Some(e);
         } else if let Some((bind, hbody)) = &td.handler {
             // Bind the thrown value (or a synthesized error) to the catch param.
-            let thrown = with_host(|h| h.exc.clone()).unwrap_or_else(|| {
-                with_host(|h| synth_error(h, &e))
-            });
+            let thrown =
+                with_host(|h| h.exc.clone()).unwrap_or_else(|| with_host(|h| synth_error(h, &e)));
             with_host(|h| {
                 h.error = None;
                 h.exc = None;
@@ -1556,7 +1587,9 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
     // A user iterator object with a `.next()` returning `{ value, done }`.
     match host::call_method(&it, "next", Vec::new()) {
         Ok(step) => {
-            let done = get_property(&step, "done").map(|d| with_host(|h| h.truthy(&d))).unwrap_or(true);
+            let done = get_property(&step, "done")
+                .map(|d| with_host(|h| h.truthy(&d)))
+                .unwrap_or(true);
             if done {
                 Value::Bool(false)
             } else {
@@ -1588,7 +1621,9 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
         Err(e) => return abort(vm, e),
     };
     let ordered: Vec<Value> = if star < 0 {
-        (0..count).map(|i| items.get(i).cloned().unwrap_or(Value::Undef)).collect()
+        (0..count)
+            .map(|i| items.get(i).cloned().unwrap_or(Value::Undef))
+            .collect()
     } else {
         let si = star as usize;
         let after = count.saturating_sub(si + 1);
@@ -1597,7 +1632,10 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
         for i in 0..si {
             out.push(items.get(i).cloned().unwrap_or(Value::Undef));
         }
-        let rest: Vec<Value> = items.get(si..rest_end).map(|s| s.to_vec()).unwrap_or_default();
+        let rest: Vec<Value> = items
+            .get(si..rest_end)
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
         out.push(with_host(|h| h.new_array(rest)));
         for j in 0..after {
             out.push(items.get(rest_end + j).cloned().unwrap_or(Value::Undef));
@@ -1853,7 +1891,10 @@ const NS_METHODS: &[&str] = &[
 ];
 
 pub fn is_known_builtin(name: &str) -> bool {
-    GLOBAL_FUNCS.contains(&name) || NS_METHODS.contains(&name) || is_namespace(name) || crate::stdlib::is_method(name)
+    GLOBAL_FUNCS.contains(&name)
+        || NS_METHODS.contains(&name)
+        || is_namespace(name)
+        || crate::stdlib::is_method(name)
 }
 
 /// Call a resolved builtin function (global or `namespace.method`).
@@ -1947,8 +1988,13 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         },
         "Number.isInteger" => Ok(Value::Bool(is_integer(arg0(&args)))),
         "Number.isSafeInteger" => Ok(Value::Bool(is_safe_integer(arg0(&args)))),
-        "Number.isNaN" => Ok(Value::Bool(matches!(arg0(&args), Value::Float(f) if f.is_nan()))),
-        "Number.isFinite" => Ok(Value::Bool(matches!(arg0(&args), Value::Float(f) if f.is_finite()) || matches!(arg0(&args), Value::Int(_)))),
+        "Number.isNaN" => Ok(Value::Bool(
+            matches!(arg0(&args), Value::Float(f) if f.is_nan()),
+        )),
+        "Number.isFinite" => Ok(Value::Bool(
+            matches!(arg0(&args), Value::Float(f) if f.is_finite())
+                || matches!(arg0(&args), Value::Int(_)),
+        )),
         "String" => {
             if args.is_empty() {
                 Ok(with_host(|h| h.new_str("")))
@@ -1958,7 +2004,11 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 host::to_string_value(&args[0])
             }
         }
-        "Number" => Ok(Value::Float(if args.is_empty() { 0.0 } else { with_host(|h| h.to_number(&args[0])) })),
+        "Number" => Ok(Value::Float(if args.is_empty() {
+            0.0
+        } else {
+            with_host(|h| h.to_number(&args[0]))
+        })),
         "BigInt" => bigint_ctor(&arg0(&args)),
         "RegExp" => regexp_ctor(&args),
         "BigInt.asIntN" | "BigInt.asUintN" => bigint_as_n(name.ends_with("asUintN"), &args),
@@ -1974,7 +2024,10 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `Array(5)` === `new Array(5)` (length-5 empty), but `Array.of(5)` is `[5]`.
         "Array" => construct_builtin("Array", args),
         "Array.of" => Ok(with_host(|h| h.new_array(args))),
-        "Array.isArray" => Ok(Value::Bool(matches!(with_host(|h| h.get(&arg0(&args)).cloned()), Some(JsObj::Array(_))))),
+        "Array.isArray" => Ok(Value::Bool(matches!(
+            with_host(|h| h.get(&arg0(&args)).cloned()),
+            Some(JsObj::Array(_))
+        ))),
         "Array.from" => array_from(args),
         "Object" => Ok(object_call(args)),
         "Object.keys" => object_keys(args, 0),
@@ -2007,7 +2060,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(Value::Bool(r))
         }
         "Object.fromEntries" => object_from_entries(args),
-        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => Ok(with_host(|h| h.proto_of(&arg0(&args)).unwrap_or_else(|| h.null()))),
+        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => Ok(with_host(|h| {
+            h.proto_of(&arg0(&args)).unwrap_or_else(|| h.null())
+        })),
         "Object.setPrototypeOf" => {
             let obj = arg0(&args);
             let proto = args.get(1).cloned().unwrap_or(Value::Undef);
@@ -2025,7 +2080,10 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.defineProperty" => object_define_property(args),
         "Object.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
         "Symbol" => Ok(with_host(|h| {
-            let desc = args.first().filter(|a| !matches!(a, Value::Undef)).map(|a| h.str_of(a));
+            let desc = args
+                .first()
+                .filter(|a| !matches!(a, Value::Undef))
+                .map(|a| h.str_of(a));
             h.new_symbol(desc)
         })),
         "Symbol.for" => Ok(with_host(|h| {
@@ -2033,7 +2091,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             h.symbol_for(&key)
         })),
         "Symbol.keyFor" => Ok(with_host(|h| match h.get(&arg0(&args)) {
-            Some(JsObj::Symbol { desc, .. }) => desc.clone().map(|d| h.new_str(d)).unwrap_or(Value::Undef),
+            Some(JsObj::Symbol { desc, .. }) => {
+                desc.clone().map(|d| h.new_str(d)).unwrap_or(Value::Undef)
+            }
             _ => Value::Undef,
         })),
         "Map" | "WeakMap" | "Set" | "WeakSet" | "Promise" => construct_builtin(name, args),
@@ -2167,7 +2227,11 @@ fn regexp_ctor(args: &[Value]) -> Result<Value, String> {
         _ => existing_flags.unwrap_or_default(),
     };
     // An empty source compiles as the JS canonical `(?:)`.
-    let src = if source.is_empty() { "(?:)".to_string() } else { source };
+    let src = if source.is_empty() {
+        "(?:)".to_string()
+    } else {
+        source
+    };
     crate::regexp::build_regexp(&src, &flags)
 }
 
@@ -2189,7 +2253,7 @@ fn bigint_as_n(unsigned: bool, args: &[Value]) -> Result<Value, String> {
         return Ok(with_host(|h| h.new_bigint(BigInt::from(0))));
     }
     let modulus = BigInt::from(1) << bits; // 2^bits
-    // Reduce into [0, 2^bits); for the signed form fold the top half negative.
+                                           // Reduce into [0, 2^bits); for the signed form fold the top half negative.
     let mut r = &x % &modulus;
     if r.is_negative() {
         r += &modulus;
@@ -2225,7 +2289,10 @@ fn string_raw(args: &[Value]) -> Result<Value, String> {
 /// fresh object; objects pass through.
 fn object_call(args: Vec<Value>) -> Value {
     let a = arg0(&args);
-    if matches!(with_host(|h| h.get(&a).cloned()), Some(JsObj::Object(_)) | Some(JsObj::Array(_))) {
+    if matches!(
+        with_host(|h| h.get(&a).cloned()),
+        Some(JsObj::Object(_)) | Some(JsObj::Array(_))
+    ) {
         a
     } else {
         with_host(|h| h.new_object(IndexMap::new()))
@@ -2253,8 +2320,16 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
         "Object" => Ok(object_call(args)),
         "Map" | "WeakMap" => {
             let weak = name == "WeakMap";
-            let m = with_host(|h| h.alloc(JsObj::Map { entries: indexmap::IndexMap::new(), weak }));
-            if let Some(init) = args.first().filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a))) {
+            let m = with_host(|h| {
+                h.alloc(JsObj::Map {
+                    entries: indexmap::IndexMap::new(),
+                    weak,
+                })
+            });
+            if let Some(init) = args
+                .first()
+                .filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a)))
+            {
                 let pairs = host::iter_all(init)?;
                 for p in pairs {
                     let kv = host::iter_all(&p)?;
@@ -2267,8 +2342,16 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
         }
         "Set" | "WeakSet" => {
             let weak = name == "WeakSet";
-            let s = with_host(|h| h.alloc(JsObj::Set { entries: indexmap::IndexMap::new(), weak }));
-            if let Some(init) = args.first().filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a))) {
+            let s = with_host(|h| {
+                h.alloc(JsObj::Set {
+                    entries: indexmap::IndexMap::new(),
+                    weak,
+                })
+            });
+            if let Some(init) = args
+                .first()
+                .filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a)))
+            {
                 let vals = host::iter_all(init)?;
                 for v in vals {
                     set_method(&s, "add", vec![v])?;
@@ -2289,7 +2372,10 @@ fn make_error(name: &str, args: &[Value]) -> Value {
     with_host(|h| {
         h.ensure_error_protos();
         let mut props: IndexMap<String, Value> = IndexMap::new();
-        let msg = args.first().filter(|a| !matches!(a, Value::Undef)).map(|a| h.str_of(a));
+        let msg = args
+            .first()
+            .filter(|a| !matches!(a, Value::Undef))
+            .map(|a| h.str_of(a));
         if let Some(m) = &msg {
             let mv = h.new_str(m.clone());
             props.insert("message".into(), mv);
@@ -2348,7 +2434,8 @@ fn is_safe_integer(v: Value) -> bool {
 /// URI characters (`;,/?:@&=+$#`) that delimit a URI's structure.
 fn uri_encode(s: &str, uri: bool) -> Result<Value, String> {
     // Always-unescaped (`encodeURIComponent`'s unreserved set), per the spec.
-    const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
+    const UNRESERVED: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
     // Reserved characters `encodeURI` leaves intact on top of the unreserved set.
     const RESERVED: &[u8] = b";,/?:@&=+$#";
     let mut out = String::with_capacity(s.len());
@@ -2357,8 +2444,16 @@ fn uri_encode(s: &str, uri: bool) -> Result<Value, String> {
             out.push(b as char);
         } else {
             out.push('%');
-            out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+            out.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((b & 0xf) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
         }
     }
     Ok(with_host(|h| h.new_str(out)))
@@ -2405,17 +2500,29 @@ fn uri_decode(s: &str, uri: bool) -> Result<Value, String> {
 
 fn parse_int(args: &[Value]) -> f64 {
     let s = with_host(|h| h.str_of(&arg0(args)));
-    let radix = args.get(1).map(|r| with_host(|h| h.to_number(r)) as u32).filter(|r| (2..=36).contains(r));
+    let radix = args
+        .get(1)
+        .map(|r| with_host(|h| h.to_number(r)) as u32)
+        .filter(|r| (2..=36).contains(r));
     let t = s.trim();
     let (neg, digits) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
     let (radix, digits) = match radix {
-        Some(16) => (16u32, digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")).unwrap_or(digits)),
+        Some(16) => (
+            16u32,
+            digits
+                .strip_prefix("0x")
+                .or_else(|| digits.strip_prefix("0X"))
+                .unwrap_or(digits),
+        ),
         Some(r) => (r, digits),
         None => {
-            if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+            if let Some(hex) = digits
+                .strip_prefix("0x")
+                .or_else(|| digits.strip_prefix("0X"))
+            {
                 (16, hex)
             } else {
                 (10, digits)
@@ -2426,7 +2533,9 @@ fn parse_int(args: &[Value]) -> f64 {
     if valid.is_empty() {
         return f64::NAN;
     }
-    let n = i64::from_str_radix(&valid, radix).map(|n| n as f64).unwrap_or(f64::NAN);
+    let n = i64::from_str_radix(&valid, radix)
+        .map(|n| n as f64)
+        .unwrap_or(f64::NAN);
     if neg {
         -n
     } else {
@@ -2438,7 +2547,10 @@ fn parse_float(args: &[Value]) -> f64 {
     let s = with_host(|h| h.str_of(&arg0(args)));
     let t = s.trim_start();
     // `Infinity` / `+Infinity` / `-Infinity` are valid parseFloat prefixes.
-    let inf_body = t.strip_prefix('+').or_else(|| t.strip_prefix('-')).unwrap_or(t);
+    let inf_body = t
+        .strip_prefix('+')
+        .or_else(|| t.strip_prefix('-'))
+        .unwrap_or(t);
     if inf_body.starts_with("Infinity") {
         return if t.starts_with('-') {
             f64::NEG_INFINITY
@@ -2567,7 +2679,11 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
         }
         // Count leading zero bits of ToUint32(x) (Math.clz32(1) === 31).
         "clz32" => {
-            let u = if x.is_finite() { x.trunc().rem_euclid(4294967296.0) as u32 } else { 0 };
+            let u = if x.is_finite() {
+                x.trunc().rem_euclid(4294967296.0) as u32
+            } else {
+                0
+            };
             u.leading_zeros() as f64
         }
         // Round to the nearest single-precision float.
@@ -2604,7 +2720,10 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
                 let out: Vec<Value> = names
                     .iter()
                     .map(|name| match mode {
-                        1 => h.alloc(JsObj::Builtin(format!("@proto:{}:{name}", ns.trim_end_matches(".prototype")))),
+                        1 => h.alloc(JsObj::Builtin(format!(
+                            "@proto:{}:{name}",
+                            ns.trim_end_matches(".prototype")
+                        ))),
                         2 => {
                             let ks = h.new_str(*name);
                             let val = h.alloc(JsObj::Builtin(format!(
@@ -2626,7 +2745,11 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
             .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
             .map(|(k, val)| (k.clone(), val.clone()))
             .collect(),
-        Some(JsObj::Array(items)) => items.iter().enumerate().map(|(i, val)| (i.to_string(), val.clone())).collect(),
+        Some(JsObj::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(i, val)| (i.to_string(), val.clone()))
+            .collect(),
         _ => Vec::new(),
     });
     Ok(with_host(|h| {
@@ -2695,7 +2818,10 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
 
 /// Items of an array-like `{ length, 0, 1, … }` object (for `Array.from`).
 fn array_like_items(src: &Value) -> Vec<Value> {
-    let len = get_property(src, "length").ok().map(|l| with_host(|h| h.to_number(&l))).unwrap_or(0.0);
+    let len = get_property(src, "length")
+        .ok()
+        .map(|l| with_host(|h| h.to_number(&l)))
+        .unwrap_or(0.0);
     if !len.is_finite() || len <= 0.0 {
         return Vec::new();
     }
@@ -2748,13 +2874,23 @@ fn json_has_bigint(h: &host::JsHost, v: &Value) -> bool {
     }
 }
 
-fn json_str(h: &host::JsHost, v: &Value, indent: &str, depth: usize, keys: Option<&[String]>) -> Option<String> {
+fn json_str(
+    h: &host::JsHost,
+    v: &Value,
+    indent: &str,
+    depth: usize,
+    keys: Option<&[String]>,
+) -> Option<String> {
     let sep = if indent.is_empty() { ":" } else { ": " };
     match v {
         Value::Undef => None,
         Value::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
         Value::Int(n) => Some(n.to_string()),
-        Value::Float(f) => Some(if f.is_finite() { host::fmt_number(*f) } else { "null".into() }),
+        Value::Float(f) => Some(if f.is_finite() {
+            host::fmt_number(*f)
+        } else {
+            "null".into()
+        }),
         Value::Str(s) => Some(json_quote(s)),
         Value::Obj(_) => match h.get(v) {
             Some(JsObj::Str(s)) => Some(json_quote(s)),
@@ -2775,7 +2911,9 @@ fn json_str(h: &host::JsHost, v: &Value, indent: &str, depth: usize, keys: Optio
                 }
                 let parts: Vec<String> = items
                     .iter()
-                    .map(|x| json_str(h, x, indent, depth + 1, keys).unwrap_or_else(|| "null".into()))
+                    .map(|x| {
+                        json_str(h, x, indent, depth + 1, keys).unwrap_or_else(|| "null".into())
+                    })
                     .collect();
                 Some(wrap(&parts, "[", "]", indent, depth))
             }
@@ -2817,7 +2955,10 @@ fn wrap(parts: &[String], open: &str, close: &str, indent: &str, depth: usize) -
     } else {
         let pad = indent.repeat(depth + 1);
         let pad_close = indent.repeat(depth);
-        format!("{open}\n{pad}{}\n{pad_close}{close}", parts.join(&format!(",\n{pad}")))
+        format!(
+            "{open}\n{pad}{}\n{pad_close}{close}",
+            parts.join(&format!(",\n{pad}"))
+        )
     }
 }
 
@@ -2840,12 +2981,19 @@ fn json_quote(s: &str) -> String {
 
 fn json_parse(args: Vec<Value>) -> Result<Value, String> {
     let s = with_host(|h| h.str_of(&arg0(&args)));
-    let mut p = JsonParser { chars: s.chars().collect(), pos: 0 };
+    let mut p = JsonParser {
+        chars: s.chars().collect(),
+        pos: 0,
+    };
     p.skip_ws();
     let v = p.parse_value()?;
     p.skip_ws();
     // Optional reviver: walk bottom-up, transforming each (key, value).
-    if let Some(reviver) = args.get(1).filter(|r| with_host(|h| host::is_callable(h, r))).cloned() {
+    if let Some(reviver) = args
+        .get(1)
+        .filter(|r| with_host(|h| host::is_callable(h, r)))
+        .cloned()
+    {
         return json_revive("", v, &reviver);
     }
     Ok(v)
@@ -2870,8 +3018,11 @@ fn json_revive(key: &str, val: Value, reviver: &Value) -> Result<Value, String> 
             }
         }
         Some(JsObj::Object(props)) => {
-            let keys: Vec<String> =
-                props.keys().filter(|k| !k.starts_with("@@")).cloned().collect();
+            let keys: Vec<String> = props
+                .keys()
+                .filter(|k| !k.starts_with("@@"))
+                .cloned()
+                .collect();
             for k in keys {
                 let elem = with_host(|h| match h.get(&val) {
                     Some(JsObj::Object(p)) => p.get(&k).cloned().unwrap_or(Value::Undef),
@@ -2904,7 +3055,10 @@ impl JsonParser {
         self.chars.get(self.pos).copied()
     }
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(' ') | Some('\n') | Some('\t') | Some('\r')) {
+        while matches!(
+            self.peek(),
+            Some(' ') | Some('\n') | Some('\t') | Some('\r')
+        ) {
             self.pos += 1;
         }
     }
@@ -2946,11 +3100,14 @@ impl JsonParser {
     }
     fn parse_number(&mut self) -> Result<Value, String> {
         let start = self.pos;
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') {
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')
+        {
             self.pos += 1;
         }
         let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>().map(Value::Float).map_err(|_| "SyntaxError: bad number in JSON".into())
+        s.parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| "SyntaxError: bad number in JSON".into())
     }
     fn parse_string(&mut self) -> Result<String, String> {
         self.pos += 1; // opening quote
@@ -2974,7 +3131,10 @@ impl JsonParser {
                         Some('b') => out.push('\u{08}'),
                         Some('f') => out.push('\u{0C}'),
                         Some('u') => {
-                            let h: String = self.chars[self.pos + 1..(self.pos + 5).min(self.chars.len())].iter().collect();
+                            let h: String = self.chars
+                                [self.pos + 1..(self.pos + 5).min(self.chars.len())]
+                                .iter()
+                                .collect();
                             if let Ok(n) = u32::from_str_radix(&h, 16) {
                                 if let Some(ch) = char::from_u32(n) {
                                     out.push(ch);
@@ -3057,21 +3217,75 @@ impl JsonParser {
 fn is_array_method(name: &str) -> bool {
     matches!(
         name,
-        "push" | "pop" | "shift" | "unshift" | "map" | "filter" | "forEach" | "join" | "slice"
-            | "indexOf" | "lastIndexOf" | "includes" | "reduce" | "concat" | "reverse" | "sort"
-            | "find" | "findIndex" | "some" | "every" | "flat" | "fill" | "splice" | "keys"
-            | "values" | "entries" | "flatMap" | "at" | "toString" | "reduceRight" | "findLast"
-            | "findLastIndex" | "copyWithin"
+        "push"
+            | "pop"
+            | "shift"
+            | "unshift"
+            | "map"
+            | "filter"
+            | "forEach"
+            | "join"
+            | "slice"
+            | "indexOf"
+            | "lastIndexOf"
+            | "includes"
+            | "reduce"
+            | "concat"
+            | "reverse"
+            | "sort"
+            | "find"
+            | "findIndex"
+            | "some"
+            | "every"
+            | "flat"
+            | "fill"
+            | "splice"
+            | "keys"
+            | "values"
+            | "entries"
+            | "flatMap"
+            | "at"
+            | "toString"
+            | "reduceRight"
+            | "findLast"
+            | "findLastIndex"
+            | "copyWithin"
     )
 }
 fn is_string_method(name: &str) -> bool {
     matches!(
         name,
-        "toUpperCase" | "toLowerCase" | "charAt" | "charCodeAt" | "codePointAt" | "indexOf"
-            | "lastIndexOf" | "includes" | "slice" | "substring" | "substr" | "split" | "trim"
-            | "trimStart" | "trimEnd" | "replace" | "replaceAll" | "repeat" | "startsWith"
-            | "endsWith" | "padStart" | "padEnd" | "concat" | "at" | "toString" | "valueOf"
-            | "match" | "matchAll" | "search" | "normalize" | "localeCompare"
+        "toUpperCase"
+            | "toLowerCase"
+            | "charAt"
+            | "charCodeAt"
+            | "codePointAt"
+            | "indexOf"
+            | "lastIndexOf"
+            | "includes"
+            | "slice"
+            | "substring"
+            | "substr"
+            | "split"
+            | "trim"
+            | "trimStart"
+            | "trimEnd"
+            | "replace"
+            | "replaceAll"
+            | "repeat"
+            | "startsWith"
+            | "endsWith"
+            | "padStart"
+            | "padEnd"
+            | "concat"
+            | "at"
+            | "toString"
+            | "valueOf"
+            | "match"
+            | "matchAll"
+            | "search"
+            | "normalize"
+            | "localeCompare"
     )
 }
 
@@ -3139,10 +3353,7 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
             } else if name == "toString" {
                 Ok(with_host(|h| h.new_str("[object Object]")))
             } else {
-                Err(host::type_error(&format!(
-                    "{} is not a function",
-                    name
-                )))
+                Err(host::type_error(&format!("{} is not a function", name)))
             }
         }
         _ => {
@@ -3273,11 +3484,18 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             // fill(value[, start[, end]]) — negative indices count from the end.
             let val = arg0(&args);
             let len = array_items(recv).len() as i64;
-            let norm = |v: i64| -> usize {
-                (if v < 0 { (len + v).max(0) } else { v.min(len) }) as usize
+            let norm =
+                |v: i64| -> usize { (if v < 0 { (len + v).max(0) } else { v.min(len) }) as usize };
+            let start = if args.len() >= 2 {
+                norm(arg_num(&args, 1) as i64)
+            } else {
+                0
             };
-            let start = if args.len() >= 2 { norm(arg_num(&args, 1) as i64) } else { 0 };
-            let end = if args.len() >= 3 { norm(arg_num(&args, 2) as i64) } else { len as usize };
+            let end = if args.len() >= 3 {
+                norm(arg_num(&args, 2) as i64)
+            } else {
+                len as usize
+            };
             with_host(|h| {
                 if let Some(JsObj::Array(items)) = h.get_mut(recv) {
                     for it in items.iter_mut().take(end).skip(start) {
@@ -3291,12 +3509,19 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             // copyWithin(target, start[, end]) — copy a slice within the array.
             let items = array_items(recv);
             let len = items.len() as i64;
-            let norm = |v: i64| -> usize {
-                (if v < 0 { (len + v).max(0) } else { v.min(len) }) as usize
-            };
+            let norm =
+                |v: i64| -> usize { (if v < 0 { (len + v).max(0) } else { v.min(len) }) as usize };
             let target = norm(arg_num(&args, 0) as i64);
-            let start = if args.len() >= 2 { norm(arg_num(&args, 1) as i64) } else { 0 };
-            let end = if args.len() >= 3 { norm(arg_num(&args, 2) as i64) } else { len as usize };
+            let start = if args.len() >= 2 {
+                norm(arg_num(&args, 1) as i64)
+            } else {
+                0
+            };
+            let end = if args.len() >= 3 {
+                norm(arg_num(&args, 2) as i64)
+            } else {
+                len as usize
+            };
             let slice: Vec<Value> = items[start..end.max(start)].to_vec();
             with_host(|h| {
                 if let Some(JsObj::Array(a)) = h.get_mut(recv) {
@@ -3326,7 +3551,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let cb = arg0(&args);
             let mut out = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
-                out.push(host::invoke(&cb, vec![it.clone(), Value::Float(i as f64), recv.clone()], None)?);
+                out.push(host::invoke(
+                    &cb,
+                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?);
             }
             Ok(with_host(|h| h.new_array(out)))
         }
@@ -3335,7 +3564,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let cb = arg0(&args);
             let mut out = Vec::new();
             for (i, it) in items.iter().enumerate() {
-                let r = host::invoke(&cb, vec![it.clone(), Value::Float(i as f64), recv.clone()], None)?;
+                let r = host::invoke(
+                    &cb,
+                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
                 match with_host(|h| h.get(&r).cloned()) {
                     Some(JsObj::Array(inner)) => out.extend(inner),
                     _ => out.push(r),
@@ -3348,7 +3581,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let cb = arg0(&args);
             let mut out = Vec::new();
             for (i, it) in items.iter().enumerate() {
-                let keep = host::invoke(&cb, vec![it.clone(), Value::Float(i as f64), recv.clone()], None)?;
+                let keep = host::invoke(
+                    &cb,
+                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
                 if with_host(|h| h.truthy(&keep)) {
                     out.push(it.clone());
                 }
@@ -3359,7 +3596,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let items = array_items(recv);
             let cb = arg0(&args);
             for (i, it) in items.iter().enumerate() {
-                host::invoke(&cb, vec![it.clone(), Value::Float(i as f64), recv.clone()], None)?;
+                host::invoke(
+                    &cb,
+                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
             }
             Ok(Value::Undef)
         }
@@ -3367,7 +3608,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let items = array_items(recv);
             let cb = arg0(&args);
             for (i, it) in items.iter().enumerate() {
-                let m = host::invoke(&cb, vec![it.clone(), Value::Float(i as f64), recv.clone()], None)?;
+                let m = host::invoke(
+                    &cb,
+                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(it.clone());
                 }
@@ -3378,7 +3623,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let items = array_items(recv);
             let cb = arg0(&args);
             for (i, it) in items.iter().enumerate() {
-                let m = host::invoke(&cb, vec![it.clone(), Value::Float(i as f64), recv.clone()], None)?;
+                let m = host::invoke(
+                    &cb,
+                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(Value::Float(i as f64));
                 }
@@ -3389,7 +3638,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let items = array_items(recv);
             let cb = arg0(&args);
             for (i, it) in items.iter().enumerate() {
-                let m = host::invoke(&cb, vec![it.clone(), Value::Float(i as f64), recv.clone()], None)?;
+                let m = host::invoke(
+                    &cb,
+                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(Value::Bool(true));
                 }
@@ -3400,7 +3653,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let items = array_items(recv);
             let cb = arg0(&args);
             for (i, it) in items.iter().enumerate() {
-                let m = host::invoke(&cb, vec![it.clone(), Value::Float(i as f64), recv.clone()], None)?;
+                let m = host::invoke(
+                    &cb,
+                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
                 if !with_host(|h| h.truthy(&m)) {
                     return Ok(Value::Bool(false));
                 }
@@ -3418,10 +3675,16 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 acc = items[0].clone();
                 start = 1;
             } else {
-                return Err(host::type_error("Reduce of empty array with no initial value"));
+                return Err(host::type_error(
+                    "Reduce of empty array with no initial value",
+                ));
             }
             for (i, it) in items.iter().enumerate().skip(start) {
-                acc = host::invoke(&cb, vec![acc, it.clone(), Value::Float(i as f64), recv.clone()], None)?;
+                acc = host::invoke(
+                    &cb,
+                    vec![acc, it.clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
             }
             Ok(acc)
         }
@@ -3437,7 +3700,9 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 acc = items[n - 1].clone();
                 i = n - 1;
             } else {
-                return Err(host::type_error("Reduce of empty array with no initial value"));
+                return Err(host::type_error(
+                    "Reduce of empty array with no initial value",
+                ));
             }
             while i > 0 {
                 i -= 1;
@@ -3453,7 +3718,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let items = array_items(recv);
             let cb = arg0(&args);
             for i in (0..items.len()).rev() {
-                let m = host::invoke(&cb, vec![items[i].clone(), Value::Float(i as f64), recv.clone()], None)?;
+                let m = host::invoke(
+                    &cb,
+                    vec![items[i].clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(items[i].clone());
                 }
@@ -3464,7 +3733,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             let items = array_items(recv);
             let cb = arg0(&args);
             for i in (0..items.len()).rev() {
-                let m = host::invoke(&cb, vec![items[i].clone(), Value::Float(i as f64), recv.clone()], None)?;
+                let m = host::invoke(
+                    &cb,
+                    vec![items[i].clone(), Value::Float(i as f64), recv.clone()],
+                    None,
+                )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(Value::Float(i as f64));
                 }
@@ -3481,7 +3754,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 while j > 0 {
                     let order = match &cmp {
                         Some(cb) => {
-                            match host::invoke(cb, vec![items[j - 1].clone(), items[j].clone()], None) {
+                            match host::invoke(
+                                cb,
+                                vec![items[j - 1].clone(), items[j].clone()],
+                                None,
+                            ) {
                                 Ok(v) => with_host(|h| h.to_number(&v)),
                                 Err(e) => {
                                     err = Some(e);
@@ -3550,7 +3827,12 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 .enumerate()
                 .map(|(i, v)| with_host(|h| h.new_array(vec![Value::Float(i as f64), v])))
                 .collect();
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items: pairs, idx: 0 })))
+            Ok(with_host(|h| {
+                h.alloc(JsObj::Iter {
+                    items: pairs,
+                    idx: 0,
+                })
+            }))
         }
         "splice" => array_splice(recv, args),
         "toString" => {
@@ -3648,7 +3930,9 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         "toString" | "valueOf" => Ok(new_s(s.to_string())),
         "charAt" => {
             let i = arg_num(&args, 0) as usize;
-            Ok(new_s(chars.get(i).map(|c| c.to_string()).unwrap_or_default()))
+            Ok(new_s(
+                chars.get(i).map(|c| c.to_string()).unwrap_or_default(),
+            ))
         }
         "at" => {
             let mut i = arg_num(&args, 0) as i64;
@@ -3758,7 +4042,12 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             if is_regexp_arg(&pat) {
                 crate::regexp::str_replace_regex(s, &pat, &repl, false)
             } else if with_host(|h| host::is_callable(h, &repl)) {
-                Ok(new_s(replace_str_fn(s, &with_host(|h| h.str_of(&pat)), &repl, false)?))
+                Ok(new_s(replace_str_fn(
+                    s,
+                    &with_host(|h| h.str_of(&pat)),
+                    &repl,
+                    false,
+                )?))
             } else {
                 let from = with_host(|h| h.str_of(&pat));
                 let to = with_host(|h| h.str_of(&repl));
@@ -3771,7 +4060,12 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             if is_regexp_arg(&pat) {
                 crate::regexp::str_replace_regex(s, &pat, &repl, true)
             } else if with_host(|h| host::is_callable(h, &repl)) {
-                Ok(new_s(replace_str_fn(s, &with_host(|h| h.str_of(&pat)), &repl, true)?))
+                Ok(new_s(replace_str_fn(
+                    s,
+                    &with_host(|h| h.str_of(&pat)),
+                    &repl,
+                    true,
+                )?))
             } else {
                 let from = with_host(|h| h.str_of(&pat));
                 let to = with_host(|h| h.str_of(&repl));
@@ -3780,7 +4074,9 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         }
         "split" => {
             if is_regexp_arg(&arg0(&args)) {
-                let limit = args.get(1).filter(|v| !matches!(v, Value::Undef))
+                let limit = args
+                    .get(1)
+                    .filter(|v| !matches!(v, Value::Undef))
                     .map(|v| with_host(|h| h.to_number(v)) as usize);
                 return crate::regexp::str_split_regex(s, &arg0(&args), limit);
             }
@@ -3791,7 +4087,9 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                 if sep.is_empty() {
                     chars.iter().map(|c| new_s(c.to_string())).collect()
                 } else {
-                    s.split(&sep as &str).map(|p| new_s(p.to_string())).collect()
+                    s.split(&sep as &str)
+                        .map(|p| new_s(p.to_string()))
+                        .collect()
                 }
             };
             // Optional limit: keep at most `limit` substrings.
@@ -3834,7 +4132,9 @@ fn pad(s: &str, args: &[Value], start: bool) -> String {
     }
     let need = target - cur;
     let fill_chars: Vec<char> = filler.chars().collect();
-    let padding: String = (0..need).map(|i| fill_chars[i % fill_chars.len()]).collect();
+    let padding: String = (0..need)
+        .map(|i| fill_chars[i % fill_chars.len()])
+        .collect();
     if start {
         format!("{padding}{s}")
     } else {
@@ -3916,7 +4216,11 @@ fn to_fixed(n: f64, f: usize) -> String {
 /// fractional digits, half away from zero, propagating carry across the point.
 fn round_decimal_string(s: &str, f: usize) -> String {
     let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
-    let mut digits: Vec<u8> = int_part.bytes().chain(frac_part.bytes()).map(|b| b - b'0').collect();
+    let mut digits: Vec<u8> = int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .map(|b| b - b'0')
+        .collect();
     let point = int_part.len(); // digits before the decimal point
     let keep = point + f; // number of leading digits to keep
 
@@ -3950,7 +4254,10 @@ fn assemble_decimal(digits: &[u8], point: usize, f: usize) -> String {
     if f == 0 {
         return int_str.to_string();
     }
-    let frac: String = digits[point..point + f].iter().map(|d| (d + b'0') as char).collect();
+    let frac: String = digits[point..point + f]
+        .iter()
+        .map(|d| (d + b'0') as char)
+        .collect();
     format!("{int_str}.{frac}")
 }
 
@@ -3977,7 +4284,11 @@ fn to_precision(n: f64, p: usize) -> String {
     let sci = format!("{a:.*e}", p - 1 + 25);
     let (mant, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
     let mut e: i32 = exp_str.parse().expect("LowerExp exponent is an integer");
-    let all: Vec<u8> = mant.chars().filter(|c| c.is_ascii_digit()).map(|c| c as u8 - b'0').collect();
+    let all: Vec<u8> = mant
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .map(|c| c as u8 - b'0')
+        .collect();
     let mut s: String = all[..p].iter().map(|d| (d + b'0') as char).collect();
     if all.get(p).map(|&d| d >= 5).unwrap_or(false) {
         // Round the p-digit mantissa up, propagating carry; a carry out of the
@@ -4060,7 +4371,10 @@ fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
         "get" => {
             let key = with_host(|h| host::map_key(h, &arg0(&args)));
             Ok(with_host(|h| match h.get(recv) {
-                Some(JsObj::Map { entries, .. }) => entries.get(&key).map(|(_, v)| v.clone()).unwrap_or(Value::Undef),
+                Some(JsObj::Map { entries, .. }) => entries
+                    .get(&key)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Value::Undef),
                 _ => Value::Undef,
             }))
         }
@@ -4077,7 +4391,9 @@ fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
         }
         "has" => {
             let key = with_host(|h| host::map_key(h, &arg0(&args)));
-            Ok(Value::Bool(with_host(|h| matches!(h.get(recv), Some(JsObj::Map { entries, .. }) if entries.contains_key(&key)))))
+            Ok(Value::Bool(with_host(
+                |h| matches!(h.get(recv), Some(JsObj::Map { entries, .. }) if entries.contains_key(&key)),
+            )))
         }
         "delete" => {
             let key = with_host(|h| host::map_key(h, &arg0(&args)));
@@ -4140,7 +4456,9 @@ fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
         }
         "has" => {
             let key = with_host(|h| host::map_key(h, &arg0(&args)));
-            Ok(Value::Bool(with_host(|h| matches!(h.get(recv), Some(JsObj::Set { entries, .. }) if entries.contains_key(&key)))))
+            Ok(Value::Bool(with_host(
+                |h| matches!(h.get(recv), Some(JsObj::Set { entries, .. }) if entries.contains_key(&key)),
+            )))
         }
         "delete" => {
             let key = with_host(|h| host::map_key(h, &arg0(&args)));
@@ -4175,7 +4493,9 @@ fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
                     _ => Vec::new(),
                 };
                 if name == "entries" {
-                    vals.into_iter().map(|v| h.new_array(vec![v.clone(), v])).collect()
+                    vals.into_iter()
+                        .map(|v| h.new_array(vec![v.clone(), v]))
+                        .collect()
                 } else {
                     vals
                 }
@@ -4212,7 +4532,9 @@ fn generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value,
                 host::GenStep::Done(v) => Ok(iter_result(v, true)),
             }
         }
-        _ => Err(host::type_error(&format!("generator.{name} is not a function"))),
+        _ => Err(host::type_error(&format!(
+            "generator.{name} is not a function"
+        ))),
     }
 }
 
@@ -4257,7 +4579,9 @@ fn iter_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         // An iterator is its own iterable.
         "@@iterator" => Ok(recv.clone()),
-        _ => Err(host::type_error(&format!("iterator.{name} is not a function"))),
+        _ => Err(host::type_error(&format!(
+            "iterator.{name} is not a function"
+        ))),
     }
 }
 
@@ -4267,7 +4591,9 @@ fn symbol_method(recv: &Value, name: &str, _args: Vec<Value>) -> Result<Value, S
             let s = h.str_of(recv);
             h.new_str(s)
         })),
-        _ => Err(host::type_error(&format!("symbol.{name} is not a function"))),
+        _ => Err(host::type_error(&format!(
+            "symbol.{name} is not a function"
+        ))),
     }
 }
 
@@ -4313,7 +4639,11 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
 /// Apply a `{ value | get | set }` descriptor object to `obj[key]`.
 fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
     let (value, get, set) = with_host(|h| match h.get(desc) {
-        Some(JsObj::Object(p)) => (p.get("value").cloned(), p.get("get").cloned(), p.get("set").cloned()),
+        Some(JsObj::Object(p)) => (
+            p.get("value").cloned(),
+            p.get("get").cloned(),
+            p.get("set").cloned(),
+        ),
         _ => (None, None, None),
     });
     if get.is_some() || set.is_some() {
@@ -4321,7 +4651,10 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
     } else if let Some(v) = value {
         // A function/class receiver stores its own props in the fn-prop side table
         // (express `mixin(app, proto)` defines methods onto the `app` *function*).
-        if matches!(with_host(|h| h.get(obj).cloned()), Some(JsObj::Func(_)) | Some(JsObj::Class(_))) {
+        if matches!(
+            with_host(|h| h.get(obj).cloned()),
+            Some(JsObj::Func(_)) | Some(JsObj::Class(_))
+        ) {
             with_host(|h| h.set_fn_prop(obj, key, v));
         } else {
             with_host(|h| {
@@ -4405,7 +4738,11 @@ pub fn has_property(obj: &Value, key: &str) -> bool {
     with_host(|h| match h.get(obj) {
         Some(JsObj::Object(p)) => p.contains_key(key),
         Some(JsObj::Array(items)) => {
-            key == "length" || key.parse::<usize>().map(|i| i < items.len()).unwrap_or(false)
+            key == "length"
+                || key
+                    .parse::<usize>()
+                    .map(|i| i < items.len())
+                    .unwrap_or(false)
         }
         _ => false,
     })
@@ -4419,8 +4756,10 @@ fn deep_clone(v: &Value) -> Value {
             with_host(|h| h.new_array(cloned))
         }
         Some(JsObj::Object(props)) => {
-            let cloned: IndexMap<String, Value> =
-                props.iter().map(|(k, val)| (k.clone(), deep_clone(val))).collect();
+            let cloned: IndexMap<String, Value> = props
+                .iter()
+                .map(|(k, val)| (k.clone(), deep_clone(val)))
+                .collect();
             with_host(|h| h.new_object(cloned))
         }
         _ => v.clone(),
@@ -4563,7 +4902,9 @@ fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
                         *r -= 1;
                         if *r == 0 {
                             // All rejected → AggregateError (simplified to an Error).
-                            let agg = with_host(|h| synth_error(h, "AggregateError: All promises were rejected"));
+                            let agg = with_host(|h| {
+                                synth_error(h, "AggregateError: All promises were rejected")
+                            });
                             host::reject_promise_val(rid, agg);
                         }
                     }
@@ -4602,7 +4943,9 @@ fn promise_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, S
             let throw = make_builtin(format!("@@finthrow:{i}"));
             Ok(host::promise_then(recv, pass, throw))
         }
-        _ => Err(host::type_error(&format!("promise.{name} is not a function"))),
+        _ => Err(host::type_error(&format!(
+            "promise.{name} is not a function"
+        ))),
     }
 }
 
@@ -4624,7 +4967,10 @@ fn schedule_timer(name: &str, args: Vec<Value>) -> Value {
     let delay = if name == "setImmediate" {
         -1.0 // before any 0ms timeout
     } else {
-        args.get(1).map(|d| with_host(|h| h.to_number(d))).unwrap_or(0.0).max(0.0)
+        args.get(1)
+            .map(|d| with_host(|h| h.to_number(d)))
+            .unwrap_or(0.0)
+            .max(0.0)
     };
     let extra = if name == "setImmediate" {
         args.get(1..).map(|s| s.to_vec()).unwrap_or_default()

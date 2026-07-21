@@ -18,9 +18,11 @@
 //! another thread. So a message can NEVER be a `Value`. Every message crosses
 //! the thread boundary as a plain `String` of JSON:
 //!
+//! ```text
 //!   sender thread:   value ─JSON.stringify([value])→ String  (on sender's heap)
 //!   channel:         String  (Send)
 //!   receiver thread: String ─JSON.parse(s)[0]→ value        (on receiver's heap)
+//! ```
 //!
 //! The value is wrapped in a one-element array before `JSON.stringify` so that
 //! top-level primitives AND `undefined` round-trip through a single always-valid
@@ -91,7 +93,12 @@ pub const METHODS: &[&str] = &[
 
 /// Instance methods on a `BroadcastChannel` object.
 pub const BROADCAST_CHANNEL_METHODS: &[&str] = &[
-    "postMessage", "close", "ref", "unref", "addEventListener", "removeEventListener",
+    "postMessage",
+    "close",
+    "ref",
+    "unref",
+    "addEventListener",
+    "removeEventListener",
 ];
 
 /// Instance methods on a `Worker` (main-side handle), beyond the shared
@@ -384,14 +391,27 @@ pub fn construct_worker(args: &[Value]) -> Result<Value, String> {
     let emitter = super::net::new_emitter_object("Worker", extra);
 
     WORKERS.with(|w| {
-        w.borrow_mut().insert(id, WorkerRec { emitter: emitter.clone(), to_worker: to_worker_tx });
+        w.borrow_mut().insert(
+            id,
+            WorkerRec {
+                emitter: emitter.clone(),
+                to_worker: to_worker_tx,
+            },
+        );
     });
     // Keep the MAIN loop alive while the worker runs.
     with_host(|h| h.incr_handle());
 
     let spawn_tx = main_tx.clone();
     std::thread::spawn(move || {
-        worker_thread_main(id, filename, is_eval, worker_data_json, spawn_tx, to_worker_rx);
+        worker_thread_main(
+            id,
+            filename,
+            is_eval,
+            worker_data_json,
+            spawn_tx,
+            to_worker_rx,
+        );
     });
 
     Ok(emitter)
@@ -450,7 +470,9 @@ fn post_to_main(main_tx: &Sender<IoTask>, id: u64, ev: MainEvent) {
 /// Run a worker→main event on the MAIN thread.
 fn dispatch_main(id: u64, ev: MainEvent) -> Result<(), String> {
     let emitter = WORKERS.with(|w| w.borrow().get(&id).map(|r| r.emitter.clone()));
-    let Some(emitter) = emitter else { return Ok(()) };
+    let Some(emitter) = emitter else {
+        return Ok(());
+    };
     match ev {
         MainEvent::Online => emit_event(&emitter, "online", vec![]),
         MainEvent::Message(json) => {
@@ -458,7 +480,8 @@ fn dispatch_main(id: u64, ev: MainEvent) -> Result<(), String> {
             emit_event(&emitter, "message", vec![v])
         }
         MainEvent::Error(msg) => {
-            let err = crate::builtins::construct_builtin("Error", vec![with_host(|h| h.new_str(msg))])?;
+            let err =
+                crate::builtins::construct_builtin("Error", vec![with_host(|h| h.new_str(msg))])?;
             emit_event(&emitter, "error", vec![err])
         }
         MainEvent::Exit(code) => {
@@ -529,17 +552,35 @@ fn parent_deliver(json: String) -> Result<(), String> {
 
 /// The shared EventEmitter method names delegated to `events`.
 const EMITTER_METHODS: &[&str] = &[
-    "on", "addListener", "prependListener", "once", "prependOnceListener", "emit",
-    "removeListener", "off", "removeAllListeners", "listenerCount", "listeners",
-    "eventNames", "setMaxListeners", "getMaxListeners",
+    "on",
+    "addListener",
+    "prependListener",
+    "once",
+    "prependOnceListener",
+    "emit",
+    "removeListener",
+    "off",
+    "removeAllListeners",
+    "listenerCount",
+    "listeners",
+    "eventNames",
+    "setMaxListeners",
+    "getMaxListeners",
 ];
 
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match tag {
         "Worker" => worker_call(recv, method, args),
         "MessagePort" => port_call(recv, method, args),
         "BroadcastChannel" => broadcast_call(recv, method, args),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -573,7 +614,9 @@ fn worker_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
             Ok(Value::Undef)
         }
         "ref" | "unref" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("worker.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "worker.{method} is not a function"
+        ))),
     }
 }
 
@@ -613,7 +656,9 @@ fn port_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(Value::Undef)
         }
         "close" | "ref" | "unref" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("port.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "port.{method} is not a function"
+        ))),
     }
 }
 
@@ -655,7 +700,12 @@ pub fn construct_message_channel(_args: &[Value]) -> Result<Value, String> {
 }
 
 /// Method dispatch for a `MessageChannel` port (identified by its `@@portid`).
-fn channel_port_call(recv: &Value, pid: u64, method: &str, args: Vec<Value>) -> Result<Value, String> {
+fn channel_port_call(
+    recv: &Value,
+    pid: u64,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     if EMITTER_METHODS.contains(&method) {
         let r = super::events::instance_call(recv, method, args.clone());
         // Adding a 'message' listener starts async delivery for this port.
@@ -687,14 +737,18 @@ fn channel_port_call(recv: &Value, pid: u64, method: &str, args: Vec<Value>) -> 
             Ok(Value::Undef)
         }
         "ref" | "unref" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("port.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "port.{method} is not a function"
+        ))),
     }
 }
 
 /// Enqueue a JSON message on `from`'s peer, and schedule async delivery if the
 /// peer has started listening.
 fn channel_post(from: u64, json: String) {
-    let Some(peer) = CH_PEER.with(|m| m.borrow().get(&from).copied()) else { return };
+    let Some(peer) = CH_PEER.with(|m| m.borrow().get(&from).copied()) else {
+        return;
+    };
     CH_QUEUE.with(|q| q.borrow_mut().entry(peer).or_default().push_back(json));
     if CH_STARTED.with(|s| s.borrow().contains(&peer)) {
         schedule_channel_delivery(peer);
@@ -745,8 +799,12 @@ fn channel_deliver(pid: u64) -> Result<(), String> {
 /// `worker.receiveMessageOnPort(port)` → `{ message }` draining one queued message
 /// from `port`, or `undefined` if none is queued.
 fn receive_message_on_port(port: Option<&Value>) -> Value {
-    let Some(port) = port else { return Value::Undef };
-    let Some(pid) = u64_prop(port, "@@portid") else { return Value::Undef };
+    let Some(port) = port else {
+        return Value::Undef;
+    };
+    let Some(pid) = u64_prop(port, "@@portid") else {
+        return Value::Undef;
+    };
     let json = CH_QUEUE.with(|q| q.borrow_mut().get_mut(&pid).and_then(|d| d.pop_front()));
     match json {
         Some(j) => match deserialize(&j) {
@@ -787,7 +845,12 @@ pub fn construct_broadcast_channel(args: &[Value]) -> Result<Value, String> {
         m.insert("onmessageerror".into(), h.null());
         h.new_object(m)
     });
-    BCAST.with(|b| b.borrow_mut().entry(name).or_default().push((id, obj.clone())));
+    BCAST.with(|b| {
+        b.borrow_mut()
+            .entry(name)
+            .or_default()
+            .push((id, obj.clone()))
+    });
     with_host(|h| h.incr_handle());
     Ok(obj)
 }
@@ -852,7 +915,9 @@ fn broadcast_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value,
             release_broadcast_ref(recv);
             Ok(recv.clone())
         }
-        _ => Err(crate::host::type_error(&format!("BroadcastChannel.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "BroadcastChannel.{method} is not a function"
+        ))),
     }
 }
 
@@ -914,7 +979,9 @@ fn broadcast_deliver(target: Value, json: String) -> Result<(), String> {
 
 /// The string value of a hidden own property of `recv`.
 fn str_prop(recv: &Value, key: &str) -> String {
-    get_prop(recv, key).map(|v| with_host(|h| h.str_of(&v))).unwrap_or_default()
+    get_prop(recv, key)
+        .map(|v| with_host(|h| h.str_of(&v)))
+        .unwrap_or_default()
 }
 
 /// Set a boolean own property on `recv`.

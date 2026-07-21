@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Callable module members. The EventEmitter surface is included so that
 /// `cluster.on('exit', …)` / `cluster.emit(…)` route through `stdlib::call`
-/// ("cluster.<method>") to the process-wide cluster emitter.
+/// (`cluster.<method>`) to the process-wide cluster emitter.
 pub const METHODS: &[&str] = &[
     "fork",
     "setupPrimary",
@@ -89,9 +89,20 @@ pub const WORKER_METHODS: &[&str] = &[
 
 /// The shared EventEmitter method names delegated to `events`.
 const EMITTER_METHODS: &[&str] = &[
-    "on", "addListener", "prependListener", "once", "prependOnceListener", "emit",
-    "removeListener", "off", "removeAllListeners", "listenerCount", "listeners",
-    "eventNames", "setMaxListeners", "getMaxListeners",
+    "on",
+    "addListener",
+    "prependListener",
+    "once",
+    "prependOnceListener",
+    "emit",
+    "removeListener",
+    "off",
+    "removeAllListeners",
+    "listenerCount",
+    "listeners",
+    "eventNames",
+    "setMaxListeners",
+    "getMaxListeners",
 ];
 
 /// Monotonic worker-id source (matches Node: ids start at 1 and count up).
@@ -380,8 +391,12 @@ fn self_worker() -> Value {
 
 /// `cluster.workers` — an object mapping id (string key) → live `Worker`.
 fn workers_object() -> Value {
-    let entries: Vec<(String, Value)> =
-        WORKERS.with(|w| w.borrow().iter().map(|(id, wk)| (id.to_string(), wk.clone())).collect());
+    let entries: Vec<(String, Value)> = WORKERS.with(|w| {
+        w.borrow()
+            .iter()
+            .map(|(id, wk)| (id.to_string(), wk.clone()))
+            .collect()
+    });
     with_host(|h| {
         let mut m = IndexMap::new();
         for (k, v) in entries {
@@ -419,10 +434,14 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         "isConnected" => Ok(Value::Bool(bool_prop(recv, "@@connected").unwrap_or(false))),
         "isDead" => {
             let id = pid_or_id(recv, "@@cwid");
-            let alive = id.map(|i| WORKERS.with(|w| w.borrow().contains_key(&i))).unwrap_or(false);
+            let alive = id
+                .map(|i| WORKERS.with(|w| w.borrow().contains_key(&i)))
+                .unwrap_or(false);
             Ok(Value::Bool(!alive))
         }
-        _ => Err(crate::host::type_error(&format!("worker.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "worker.{method} is not a function"
+        ))),
     }
 }
 
@@ -467,7 +486,11 @@ fn dispatch_exit(id: u64, code: i32) -> Result<(), String> {
         return Ok(());
     };
     let null_sig = with_host(|h| h.null());
-    emit_on(&worker, "exit", vec![Value::Float(code as f64), null_sig.clone()])?;
+    emit_on(
+        &worker,
+        "exit",
+        vec![Value::Float(code as f64), null_sig.clone()],
+    )?;
     emit_on(
         &cluster_emitter(),
         "exit",

@@ -96,7 +96,9 @@ pub fn constant(name: &str) -> Option<Value> {
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "cwd" => {
-            let d = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            let d = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
             Ok(with_host(|h| h.new_str(d)))
         }
         // `hrtime()` → `[seconds, nanoseconds]` since an arbitrary epoch (here the
@@ -130,7 +132,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "getegid" => Ok(Value::Float(unsafe { libc::getegid() } as f64)),
         "getgroups" => {
             let groups = supplementary_groups();
-            Ok(with_host(|h| h.new_array(groups.into_iter().map(Value::Float).collect())))
+            Ok(with_host(|h| {
+                h.new_array(groups.into_iter().map(Value::Float).collect())
+            }))
         }
 
         // POSIX identity mutation (libc; best-effort — silently ignored when the
@@ -154,7 +158,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "setgroups" => {
             let groups = gid_array(args.first());
             // SAFETY: `groups` is a valid gid buffer of the given length.
-            unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()); }
+            unsafe {
+                libc::setgroups(groups.len() as _, groups.as_ptr());
+            }
             Ok(Value::Undef)
         }
         "initgroups" => {
@@ -163,7 +169,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             if let Ok(c) = std::ffi::CString::new(user) {
                 let gid = if extra.is_finite() { extra as u32 } else { 0 };
                 // SAFETY: `c` is NUL-terminated; a failed call just returns -1.
-                unsafe { libc::initgroups(c.as_ptr(), gid as _); }
+                unsafe {
+                    libc::initgroups(c.as_ptr(), gid as _);
+                }
             }
             Ok(Value::Undef)
         }
@@ -237,7 +245,9 @@ fn argv() -> Value {
 }
 
 fn exec_path() -> String {
-    std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "node".into())
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "node".into())
 }
 
 /// `process.versions` — a small map; only `node` is commonly gated on.
@@ -306,13 +316,17 @@ pub fn stream_instance_call(recv: &Value, method: &str, args: &[Value]) -> Resul
         }
         "getWindowSize" => {
             let (c, r) = super::tty::window_size(stream_fd(recv) as i32).unwrap_or((80, 24));
-            Ok(with_host(|h| h.new_array(vec![Value::Float(c as f64), Value::Float(r as f64)])))
+            Ok(with_host(|h| {
+                h.new_array(vec![Value::Float(c as f64), Value::Float(r as f64)])
+            }))
         }
         // A truecolor terminal advertises 24-bit depth; hasColors(count) is true
         // for any request within that range.
         "getColorDepth" => Ok(Value::Float(24.0)),
         "hasColors" => Ok(Value::Bool(true)),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -474,7 +488,10 @@ fn resource_usage() -> Value {
             ("ipcReceived", ru.as_ref().map(|r| r.ru_msgrcv)),
             ("signalsCount", ru.as_ref().map(|r| r.ru_nsignals)),
             ("voluntaryContextSwitches", ru.as_ref().map(|r| r.ru_nvcsw)),
-            ("involuntaryContextSwitches", ru.as_ref().map(|r| r.ru_nivcsw)),
+            (
+                "involuntaryContextSwitches",
+                ru.as_ref().map(|r| r.ru_nivcsw),
+            ),
         ];
         for (k, v) in fields {
             m.insert(k.into(), Value::Float(v.unwrap_or(0) as f64));
@@ -510,15 +527,19 @@ fn exec_ve(args: &[Value]) -> Result<Value, String> {
     });
     let env_strs: Vec<String> = {
         let from_arg = with_host(|h| match args.get(2).and_then(|v| h.get(v)) {
-            Some(JsObj::Object(p)) => {
-                Some(p.iter().map(|(k, v)| format!("{k}={}", h.str_of(v))).collect::<Vec<_>>())
-            }
+            Some(JsObj::Object(p)) => Some(
+                p.iter()
+                    .map(|(k, v)| format!("{k}={}", h.str_of(v)))
+                    .collect::<Vec<_>>(),
+            ),
             _ => None,
         });
         from_arg.unwrap_or_else(|| std::env::vars().map(|(k, v)| format!("{k}={v}")).collect())
     };
 
-    let to_c = |s: String| CString::new(s).map_err(|_| crate::host::type_error("process.execve: NUL in argument"));
+    let to_c = |s: String| {
+        CString::new(s).map_err(|_| crate::host::type_error("process.execve: NUL in argument"))
+    };
     let argv_c: Vec<CString> = argv_strs.into_iter().map(to_c).collect::<Result<_, _>>()?;
     let env_c: Vec<CString> = env_strs.into_iter().map(to_c).collect::<Result<_, _>>()?;
 
@@ -529,7 +550,9 @@ fn exec_ve(args: &[Value]) -> Result<Value, String> {
 
     // SAFETY: argv/envp are NUL-terminated arrays of valid C strings kept alive
     // above; on success execve never returns.
-    unsafe { libc::execve(prog.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr()); }
+    unsafe {
+        libc::execve(prog.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr());
+    }
     Err(crate::host::type_error(&format!(
         "process.execve failed: {}",
         std::io::Error::last_os_error()
@@ -540,15 +563,17 @@ fn exec_ve(args: &[Value]) -> Result<Value, String> {
 /// (persisted through the real environment so a later `process.env` read sees it).
 fn load_env_file(path: &str) -> Result<Value, String> {
     let path = if path.is_empty() { ".env" } else { path };
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("Error: ENOENT: {e}, open '{path}'"))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("Error: ENOENT: {e}, open '{path}'"))?;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, val)) = line.split_once('=') else { continue };
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         if key.is_empty() {
             continue;

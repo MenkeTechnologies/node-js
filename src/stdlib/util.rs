@@ -72,7 +72,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                     Ok(v) if with_host(|h| h.is_null(&v)) => usize::MAX,
                     Ok(v) => {
                         let n = with_host(|h| h.to_number(&v));
-                        if n.is_finite() && n >= 0.0 { n as usize } else { usize::MAX }
+                        if n.is_finite() && n >= 0.0 {
+                            n as usize
+                        } else {
+                            usize::MAX
+                        }
                     }
                     Err(_) => 2,
                 },
@@ -104,7 +108,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         ))),
         // `util.isArray === Array.isArray` (a legacy alias Node still ships).
         "isArray" => Ok(Value::Bool(with_host(|h| {
-            matches!(h.get(&args.first().cloned().unwrap_or(Value::Undef)), Some(JsObj::Array(_)))
+            matches!(
+                h.get(&args.first().cloned().unwrap_or(Value::Undef)),
+                Some(JsObj::Array(_))
+            )
         }))),
         // `stripVTControlCharacters(str)`: remove ANSI/VT escape sequences.
         "stripVTControlCharacters" => {
@@ -197,8 +204,15 @@ pub fn format(args: &[Value]) -> String {
     }
     let fmt = with_host(|h| h.str_of(&args[0]));
     // A non-string first argument: inspect everything, space-joined.
-    if !matches!(args[0], Value::Str(_)) && !with_host(|h| matches!(h.get(&args[0]), Some(JsObj::Str(_)))) {
-        return with_host(|h| args.iter().map(|a| h.console_format(a)).collect::<Vec<_>>().join(" "));
+    if !matches!(args[0], Value::Str(_))
+        && !with_host(|h| matches!(h.get(&args[0]), Some(JsObj::Str(_))))
+    {
+        return with_host(|h| {
+            args.iter()
+                .map(|a| h.console_format(a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
     }
 
     let mut out = String::new();
@@ -236,7 +250,11 @@ pub fn format(args: &[Value]) -> String {
             }
             'd' | 'i' => {
                 let n = with_host(|h| h.to_number(arg));
-                out.push_str(&if n.is_nan() { "NaN".into() } else { (n.trunc() as i64).to_string() });
+                out.push_str(&if n.is_nan() {
+                    "NaN".into()
+                } else {
+                    (n.trunc() as i64).to_string()
+                });
             }
             'f' => out.push_str(&crate::host::fmt_number(with_host(|h| h.to_number(arg)))),
             'j' => {
@@ -300,7 +318,10 @@ const CALLBACKIFY_SRC: &str = "(function(original){\n\
 fn promisify(args: &[Value]) -> Result<Value, String> {
     let orig = args.first().cloned().unwrap_or(Value::Undef);
     if !with_host(|h| crate::host::is_callable(h, &orig)) {
-        return Err("TypeError [ERR_INVALID_ARG_TYPE]: The \"original\" argument must be of type function".into());
+        return Err(
+            "TypeError [ERR_INVALID_ARG_TYPE]: The \"original\" argument must be of type function"
+                .into(),
+        );
     }
     let factory = run_completion(PROMISIFY_SRC)?;
     crate::host::invoke(&factory, vec![orig], None)
@@ -311,7 +332,10 @@ fn promisify(args: &[Value]) -> Result<Value, String> {
 fn callbackify(args: &[Value]) -> Result<Value, String> {
     let orig = args.first().cloned().unwrap_or(Value::Undef);
     if !with_host(|h| crate::host::is_callable(h, &orig)) {
-        return Err("TypeError [ERR_INVALID_ARG_TYPE]: The \"original\" argument must be of type function".into());
+        return Err(
+            "TypeError [ERR_INVALID_ARG_TYPE]: The \"original\" argument must be of type function"
+                .into(),
+        );
     }
     let factory = run_completion(CALLBACKIFY_SRC)?;
     crate::host::invoke(&factory, vec![orig], None)
@@ -343,7 +367,9 @@ fn debuglog(args: &[Value]) -> Result<Value, String> {
 /// Whether `NODE_DEBUG` enables `section` (comma/space-separated, case-insensitive,
 /// `*` wildcards allowed — matching Node's env parsing).
 fn debuglog_enabled(section: &str) -> bool {
-    let Ok(env) = std::env::var("NODE_DEBUG") else { return false };
+    let Ok(env) = std::env::var("NODE_DEBUG") else {
+        return false;
+    };
     let sec = section.to_uppercase();
     env.split(|c: char| c == ',' || c.is_whitespace())
         .filter(|s| !s.is_empty())
@@ -534,19 +560,39 @@ const ERRNO_TABLE: &[(&str, i32, &str)] = &[
     ("E2BIG", libc::E2BIG, "argument list too long"),
     ("EACCES", libc::EACCES, "permission denied"),
     ("EADDRINUSE", libc::EADDRINUSE, "address already in use"),
-    ("EADDRNOTAVAIL", libc::EADDRNOTAVAIL, "address not available"),
-    ("EAFNOSUPPORT", libc::EAFNOSUPPORT, "address family not supported"),
+    (
+        "EADDRNOTAVAIL",
+        libc::EADDRNOTAVAIL,
+        "address not available",
+    ),
+    (
+        "EAFNOSUPPORT",
+        libc::EAFNOSUPPORT,
+        "address family not supported",
+    ),
     ("EAGAIN", libc::EAGAIN, "resource temporarily unavailable"),
     ("EALREADY", libc::EALREADY, "connection already in progress"),
     ("EBADF", libc::EBADF, "bad file descriptor"),
     ("EBUSY", libc::EBUSY, "resource busy or locked"),
     ("ECANCELED", libc::ECANCELED, "operation canceled"),
-    ("ECONNABORTED", libc::ECONNABORTED, "software caused connection abort"),
+    (
+        "ECONNABORTED",
+        libc::ECONNABORTED,
+        "software caused connection abort",
+    ),
     ("ECONNREFUSED", libc::ECONNREFUSED, "connection refused"),
     ("ECONNRESET", libc::ECONNRESET, "connection reset by peer"),
-    ("EDESTADDRREQ", libc::EDESTADDRREQ, "destination address required"),
+    (
+        "EDESTADDRREQ",
+        libc::EDESTADDRREQ,
+        "destination address required",
+    ),
     ("EEXIST", libc::EEXIST, "file already exists"),
-    ("EFAULT", libc::EFAULT, "bad address in system call argument"),
+    (
+        "EFAULT",
+        libc::EFAULT,
+        "bad address in system call argument",
+    ),
     ("EFBIG", libc::EFBIG, "file too large"),
     ("EHOSTDOWN", libc::EHOSTDOWN, "host is down"),
     ("EHOSTUNREACH", libc::EHOSTUNREACH, "host is unreachable"),
@@ -575,16 +621,36 @@ const ERRNO_TABLE: &[(&str, i32, &str)] = &[
     ("ENOTEMPTY", libc::ENOTEMPTY, "directory not empty"),
     ("ENOTSOCK", libc::ENOTSOCK, "socket operation on non-socket"),
     ("ENXIO", libc::ENXIO, "no such device or address"),
-    ("EOPNOTSUPP", libc::EOPNOTSUPP, "operation not supported on socket"),
-    ("EOVERFLOW", libc::EOVERFLOW, "value too large for defined data type"),
+    (
+        "EOPNOTSUPP",
+        libc::EOPNOTSUPP,
+        "operation not supported on socket",
+    ),
+    (
+        "EOVERFLOW",
+        libc::EOVERFLOW,
+        "value too large for defined data type",
+    ),
     ("EPERM", libc::EPERM, "operation not permitted"),
     ("EPIPE", libc::EPIPE, "broken pipe"),
     ("EPROTO", libc::EPROTO, "protocol error"),
-    ("EPROTONOSUPPORT", libc::EPROTONOSUPPORT, "protocol not supported"),
-    ("EPROTOTYPE", libc::EPROTOTYPE, "protocol wrong type for socket"),
+    (
+        "EPROTONOSUPPORT",
+        libc::EPROTONOSUPPORT,
+        "protocol not supported",
+    ),
+    (
+        "EPROTOTYPE",
+        libc::EPROTOTYPE,
+        "protocol wrong type for socket",
+    ),
     ("ERANGE", libc::ERANGE, "result too large"),
     ("EROFS", libc::EROFS, "read-only file system"),
-    ("ESHUTDOWN", libc::ESHUTDOWN, "cannot send after transport endpoint shutdown"),
+    (
+        "ESHUTDOWN",
+        libc::ESHUTDOWN,
+        "cannot send after transport endpoint shutdown",
+    ),
     ("ESPIPE", libc::ESPIPE, "invalid seek"),
     ("ESRCH", libc::ESRCH, "no such process"),
     ("ETIMEDOUT", libc::ETIMEDOUT, "connection timed out"),
@@ -603,11 +669,17 @@ fn errno_of(err: f64) -> i32 {
 }
 
 fn errno_name(e: i32) -> Option<&'static str> {
-    ERRNO_TABLE.iter().find(|(_, code, _)| *code == e).map(|(n, _, _)| *n)
+    ERRNO_TABLE
+        .iter()
+        .find(|(_, code, _)| *code == e)
+        .map(|(n, _, _)| *n)
 }
 
 fn errno_message(e: i32) -> Option<&'static str> {
-    ERRNO_TABLE.iter().find(|(_, code, _)| *code == e).map(|(_, _, m)| *m)
+    ERRNO_TABLE
+        .iter()
+        .find(|(_, code, _)| *code == e)
+        .map(|(_, _, m)| *m)
 }
 
 /// `util.getSystemErrorMap()` → a `Map` of negative errno → `[name, message]`.
@@ -622,7 +694,10 @@ fn system_error_map() -> Value {
             let key = crate::host::map_key(h, &key_val);
             entries.insert(key, (key_val, pair));
         }
-        h.alloc(JsObj::Map { entries, weak: false })
+        h.alloc(JsObj::Map {
+            entries,
+            weak: false,
+        })
     })
 }
 
@@ -657,8 +732,7 @@ fn parse_args(config_args: &[Value]) -> Result<Value, String> {
 
     let lookup_long = |name: &str| opts.iter().find(|o| o.long == name);
     let lookup_short = |c: &str| opts.iter().find(|o| o.short.as_deref() == Some(c));
-    let is_bool_long =
-        |name: &str| opts.iter().any(|o| o.long == name && !o.is_string);
+    let is_bool_long = |name: &str| opts.iter().any(|o| o.long == name && !o.is_string);
 
     let mut values: IndexMap<String, Slot> = IndexMap::new();
     let mut positionals: Vec<String> = Vec::new();
@@ -937,7 +1011,9 @@ fn parse_env(input: &str) -> Value {
             continue;
         }
         // Next `=` or newline: a newline first means the line has no assignment.
-        let Some(eq_or_nl) = content.find(['=', '\n']) else { break };
+        let Some(eq_or_nl) = content.find(['=', '\n']) else {
+            break;
+        };
         if content.as_bytes()[eq_or_nl] == b'\n' {
             content = env_trim(&content[eq_or_nl + 1..]);
             continue;
@@ -1040,7 +1116,20 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
             c,
-            '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
+            '!' | '#'
+                | '$'
+                | '%'
+                | '&'
+                | '\''
+                | '*'
+                | '+'
+                | '-'
+                | '.'
+                | '^'
+                | '_'
+                | '`'
+                | '|'
+                | '~'
         )
 }
 
@@ -1287,7 +1376,16 @@ fn serialize_mime_params(pairs: &[(String, String)]) -> String {
 /// Method names dispatched through `mime_params_instance_call` (for
 /// `instance_has_method` wiring; `@@iterator` powers `for..of` / spread).
 pub const MIME_PARAMS_METHODS: &[&str] = &[
-    "get", "set", "has", "delete", "entries", "keys", "values", "toString", "toJSON", "@@iterator",
+    "get",
+    "set",
+    "has",
+    "delete",
+    "entries",
+    "keys",
+    "values",
+    "toString",
+    "toJSON",
+    "@@iterator",
 ];
 
 /// Method names dispatched through `mime_type_instance_call`.
@@ -1360,7 +1458,11 @@ pub fn construct_mime_params(_args: &[Value]) -> Result<Value, String> {
 }
 
 /// `MIMEParams` instance methods.
-pub fn mime_params_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+pub fn mime_params_instance_call(
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     match method {
         "get" => {
             let name = super::arg_str(args, 0);
@@ -1371,7 +1473,9 @@ pub fn mime_params_instance_call(recv: &Value, method: &str, args: &[Value]) -> 
         }
         "has" => {
             let name = super::arg_str(args, 0);
-            Ok(Value::Bool(mime_pairs_of(recv).iter().any(|(k, _)| *k == name)))
+            Ok(Value::Bool(
+                mime_pairs_of(recv).iter().any(|(k, _)| *k == name),
+            ))
         }
         "set" => {
             let name = super::arg_str(args, 0);
@@ -1460,7 +1564,11 @@ pub fn construct_mime_type(args: &[Value]) -> Result<Value, String> {
 /// `MIMEType` instance methods. `type`/`subtype`/`essence`/`params` are data
 /// properties read directly; `toString`/`toJSON` serialize live (reflecting any
 /// `params` mutation).
-pub fn mime_type_instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
+pub fn mime_type_instance_call(
+    recv: &Value,
+    method: &str,
+    _args: &[Value],
+) -> Result<Value, String> {
     match method {
         "toString" | "toJSON" => {
             // Read the essence and the live params object under one borrow.

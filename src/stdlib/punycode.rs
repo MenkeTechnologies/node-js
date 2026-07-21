@@ -38,7 +38,14 @@ const INITIAL_N: u32 = 128;
 /// halfwidth dots); all normalize to `.` in the output.
 const DOTS: &[char] = &['\u{2E}', '\u{3002}', '\u{FF0E}', '\u{FF61}'];
 
-pub const METHODS: &[&str] = &["encode", "decode", "toASCII", "toUnicode", "ucs2Decode", "ucs2Encode"];
+pub const METHODS: &[&str] = &[
+    "encode",
+    "decode",
+    "toASCII",
+    "toUnicode",
+    "ucs2Decode",
+    "ucs2Encode",
+];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let input = super::arg_str(args, 0);
@@ -60,8 +67,14 @@ pub fn constant(name: &str) -> Option<Value> {
     match name {
         "ucs2" => Some(with_host(|h| {
             let mut m = IndexMap::new();
-            m.insert("decode".into(), h.alloc(JsObj::Builtin("punycode.ucs2Decode".into())));
-            m.insert("encode".into(), h.alloc(JsObj::Builtin("punycode.ucs2Encode".into())));
+            m.insert(
+                "decode".into(),
+                h.alloc(JsObj::Builtin("punycode.ucs2Decode".into())),
+            );
+            m.insert(
+                "encode".into(),
+                h.alloc(JsObj::Builtin("punycode.ucs2Encode".into())),
+            );
             h.new_object(m)
         })),
         "version" => Some(with_host(|h| h.new_str("2.3.1"))),
@@ -114,7 +127,11 @@ fn ucs2_encode_val(arg: Option<&Value>) -> Value {
 // ── domain-level ToASCII / ToUnicode ─────────────────────────────────────────
 
 fn map_labels(domain: &str, f: impl Fn(&str) -> String) -> String {
-    domain.split(|c| DOTS.contains(&c)).map(f).collect::<Vec<_>>().join(".")
+    domain
+        .split(|c| DOTS.contains(&c))
+        .map(f)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn to_ascii(domain: &str) -> String {
@@ -283,7 +300,9 @@ fn decode(input: &str) -> Result<Vec<u32>, String> {
             }
             let digit = basic_to_digit(chars[idx])?;
             idx += 1;
-            i = i.checked_add(digit.checked_mul(w).ok_or("overflow")?).ok_or("overflow")?;
+            i = i
+                .checked_add(digit.checked_mul(w).ok_or("overflow")?)
+                .ok_or("overflow")?;
             let t = threshold(k, bias);
             if digit < t {
                 break;

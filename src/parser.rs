@@ -11,9 +11,36 @@ use crate::ast::*;
 use crate::lexer::{lex, Tok, Token};
 
 const KEYWORDS: &[&str] = &[
-    "var", "let", "const", "function", "return", "if", "else", "while", "do", "for", "of", "in",
-    "switch", "case", "default", "break", "continue", "true", "false", "null", "this", "new",
-    "typeof", "void", "delete", "instanceof", "throw", "try", "catch", "finally",
+    "var",
+    "let",
+    "const",
+    "function",
+    "return",
+    "if",
+    "else",
+    "while",
+    "do",
+    "for",
+    "of",
+    "in",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "true",
+    "false",
+    "null",
+    "this",
+    "new",
+    "typeof",
+    "void",
+    "delete",
+    "instanceof",
+    "throw",
+    "try",
+    "catch",
+    "finally",
 ];
 
 fn is_keyword(s: &str) -> bool {
@@ -39,7 +66,13 @@ struct Parser {
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
     let src = crate::rust_ffi::desugar(src);
     let toks = lex(&src)?;
-    let mut p = Parser { toks, pos: 0, in_generator: false, in_async: false, no_in: false };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        in_generator: false,
+        in_async: false,
+        no_in: false,
+    };
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.parse_stmt()?);
@@ -160,7 +193,9 @@ impl Parser {
             Tok::Ident(kw) if kw == "function" => self.parse_func_decl(false)?,
             // `async function …` (declaration). `async` stays a plain identifier
             // anywhere else (contextual keyword).
-            Tok::Ident(kw) if kw == "async" && self.peek_kw(1, "function") && !self.peek_newline(1) => {
+            Tok::Ident(kw)
+                if kw == "async" && self.peek_kw(1, "function") && !self.peek_newline(1) =>
+            {
                 self.advance(); // async
                 self.parse_func_decl(true)?
             }
@@ -175,7 +210,11 @@ impl Parser {
             Tok::Ident(kw) if kw == "switch" => self.parse_switch()?,
             Tok::Ident(kw) if kw == "return" => {
                 self.advance();
-                let arg = if self.is_punct(";") || self.is_punct("}") || self.newline_before() || self.at_eof() {
+                let arg = if self.is_punct(";")
+                    || self.is_punct("}")
+                    || self.newline_before()
+                    || self.at_eof()
+                {
                     None
                 } else {
                     Some(self.parse_expr()?)
@@ -206,8 +245,7 @@ impl Parser {
             // statement position is a label (never an expression; the reserved
             // control keywords are all matched above, and switch `case`/`default`
             // labels are parsed inside `parse_switch`).
-            Tok::Ident(name)
-                if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == ":") =>
+            Tok::Ident(name) if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == ":") =>
             {
                 self.advance(); // the label identifier
                 self.advance(); // the ':'
@@ -229,7 +267,10 @@ impl Parser {
     }
     /// Whether the token `n` ahead has a newline before it.
     fn peek_newline(&self, n: usize) -> bool {
-        self.toks.get(self.pos + n).map(|t| t.newline_before).unwrap_or(false)
+        self.toks
+            .get(self.pos + n)
+            .map(|t| t.newline_before)
+            .unwrap_or(false)
     }
 
     /// Parse a `function` declaration (the `function`/`async function` keyword is
@@ -252,7 +293,11 @@ impl Parser {
 
     /// Parse a brace-delimited function body under the given generator/async
     /// context (so `yield`/`await` inside are operators, not identifiers).
-    fn parse_fn_body_block(&mut self, is_generator: bool, is_async: bool) -> Result<Vec<Stmt>, String> {
+    fn parse_fn_body_block(
+        &mut self,
+        is_generator: bool,
+        is_async: bool,
+    ) -> Result<Vec<Stmt>, String> {
         let (pg, pa) = (self.in_generator, self.in_async);
         self.in_generator = is_generator;
         self.in_async = is_async;
@@ -323,18 +368,20 @@ impl Parser {
             members.push(self.parse_class_member()?);
         }
         self.expect_punct("}")?;
-        Ok(ClassNode { name, parent, members })
+        Ok(ClassNode {
+            name,
+            parent,
+            members,
+        })
     }
 
     /// Parse one class member: `[static] [get|set|async|*] name(params){…}` or a
     /// `[static] name [= init];` field.
     fn parse_class_member(&mut self) -> Result<ClassMember, String> {
-        let is_static = self.is_kw("static")
-            && !self.peek_is_member_punct(1)
-            && {
-                self.advance();
-                true
-            };
+        let is_static = self.is_kw("static") && !self.peek_is_member_punct(1) && {
+            self.advance();
+            true
+        };
         // Accessor / async / generator prefixes (each contextual: only a prefix
         // when followed by another member name, not itself the member name).
         let mut kind = MemberKind::Method;
@@ -388,7 +435,11 @@ impl Parser {
         Ok(ClassMember {
             key,
             computed,
-            kind: if is_ctor { MemberKind::Constructor } else { kind },
+            kind: if is_ctor {
+                MemberKind::Constructor
+            } else {
+                kind
+            },
             is_static,
             is_generator,
             is_async,
@@ -527,7 +578,10 @@ impl Parser {
         self.advance();
         let body = Box::new(self.parse_stmt()?);
         if !self.eat_kw("while") {
-            return Err(format!("SyntaxError: expected 'while' (line {})", self.line()));
+            return Err(format!(
+                "SyntaxError: expected 'while' (line {})",
+                self.line()
+            ));
         }
         self.expect_punct("(")?;
         let test = self.parse_expr()?;
@@ -543,7 +597,9 @@ impl Parser {
         self.expect_punct("(")?;
         // Optional declaration or expression init.
         let decl_kind = match self.tok() {
-            Tok::Ident(s) if s == "var" || s == "let" || s == "const" => Some(self.parse_decl_kind()),
+            Tok::Ident(s) if s == "var" || s == "let" || s == "const" => {
+                Some(self.parse_decl_kind())
+            }
             _ => None,
         };
         // Empty init: `for (;;)`.
@@ -586,7 +642,10 @@ impl Parser {
             } else {
                 None
             };
-            let mut decls = vec![Declarator { target: first_target, init }];
+            let mut decls = vec![Declarator {
+                target: first_target,
+                init,
+            }];
             while self.eat_punct(",") {
                 let target = self.parse_binding_target()?;
                 let init = if self.eat_punct("=") {
@@ -658,7 +717,11 @@ impl Parser {
             };
             self.expect_punct(":")?;
             let mut body = Vec::new();
-            while !self.is_punct("}") && !self.is_kw("case") && !self.is_kw("default") && !self.at_eof() {
+            while !self.is_punct("}")
+                && !self.is_kw("case")
+                && !self.is_kw("default")
+                && !self.at_eof()
+            {
                 body.push(self.parse_stmt()?);
             }
             cases.push(SwitchCase { test, body });
@@ -886,7 +949,11 @@ impl Parser {
         }
         // Prefix ++/--.
         if self.is_punct("++") || self.is_punct("--") {
-            let op = if self.is_punct("++") { UpdateOp::Inc } else { UpdateOp::Dec };
+            let op = if self.is_punct("++") {
+                UpdateOp::Inc
+            } else {
+                UpdateOp::Dec
+            };
             self.advance();
             let e = self.parse_unary()?;
             return Ok(Expr::Update {
@@ -902,7 +969,11 @@ impl Parser {
         let mut e = self.parse_call_member()?;
         // Postfix ++/-- (no line break before).
         if (self.is_punct("++") || self.is_punct("--")) && !self.newline_before() {
-            let op = if self.is_punct("++") { UpdateOp::Inc } else { UpdateOp::Dec };
+            let op = if self.is_punct("++") {
+                UpdateOp::Inc
+            } else {
+                UpdateOp::Dec
+            };
             self.advance();
             e = Expr::Update {
                 op,
@@ -920,7 +991,10 @@ impl Parser {
                 self.advance();
                 let prop = self.ident_name()?;
                 if prop != "target" {
-                    return Err(format!("SyntaxError: expected 'target' (line {})", self.line()));
+                    return Err(format!(
+                        "SyntaxError: expected 'target' (line {})",
+                        self.line()
+                    ));
                 }
                 Expr::NewTarget
             } else {
@@ -1002,7 +1076,11 @@ impl Parser {
     /// already parsed as `tag`, and the current token is the template).
     fn parse_tagged_template(&mut self, tag: Expr) -> Result<Expr, String> {
         let (quasis, raws, exprs_src) = match self.tok().clone() {
-            Tok::Template { quasis, raws, exprs } => (quasis, raws, exprs),
+            Tok::Template {
+                quasis,
+                raws,
+                exprs,
+            } => (quasis, raws, exprs),
             _ => unreachable!(),
         };
         self.advance();
@@ -1086,7 +1164,11 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Str(s))
             }
-            Tok::Template { quasis, raws: _, exprs } => {
+            Tok::Template {
+                quasis,
+                raws: _,
+                exprs,
+            } => {
                 self.advance();
                 let mut parsed = Vec::new();
                 for src in &exprs {
@@ -1214,7 +1296,8 @@ impl Parser {
             }
             // `get key() {}` / `set key(v) {}` accessor (contextual: `get`/`set`
             // is a modifier only when followed by another key, not `:`/`(`/`,`).
-            if (self.is_kw("get") || self.is_kw("set")) && !self.peek_is_member_punct(1)
+            if (self.is_kw("get") || self.is_kw("set"))
+                && !self.peek_is_member_punct(1)
                 && !matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == ":" || p == ",")
             {
                 let is_getter = self.is_kw("get");
@@ -1245,7 +1328,9 @@ impl Parser {
             // Concise-method modifiers: `async` and/or `*` before the key.
             let mut m_async = false;
             let mut m_gen = false;
-            if self.is_kw("async") && !self.peek_is_member_punct(1) && !self.peek_newline(1)
+            if self.is_kw("async")
+                && !self.peek_is_member_punct(1)
+                && !self.peek_newline(1)
                 && !matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == ":" || p == ",")
             {
                 self.advance();
@@ -1355,7 +1440,9 @@ impl Parser {
         }
         // `ident => ...`
         if let Some(Tok::Ident(name)) = self.toks.get(base).map(|t| &t.tok) {
-            if !is_keyword(name) && matches!(self.toks.get(base + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "=>") {
+            if !is_keyword(name)
+                && matches!(self.toks.get(base + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "=>")
+            {
                 let name = name.clone();
                 if is_async {
                     self.advance(); // async
@@ -1381,7 +1468,8 @@ impl Parser {
         if matches!(self.toks.get(base).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "(") {
             if let Some(close) = self.matching_paren(base) {
                 let after = close + 1;
-                if matches!(self.toks.get(after).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "=>") {
+                if matches!(self.toks.get(after).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "=>")
+                {
                     if is_async {
                         self.advance(); // async
                     }
@@ -1447,7 +1535,13 @@ impl Parser {
 /// Parse a template-literal `${...}` field's raw source into an expression.
 fn parse_expr_source(src: &str) -> Result<Expr, String> {
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0, in_generator: false, in_async: false, no_in: false };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        in_generator: false,
+        in_async: false,
+        no_in: false,
+    };
     let e = p.parse_expr()?;
     Ok(e)
 }

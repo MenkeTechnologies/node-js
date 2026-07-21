@@ -85,7 +85,11 @@ use std::sync::Arc;
 
 /// `http2` module functions routed through `stdlib::call`.
 pub const METHODS: &[&str] = &[
-    "createSecureServer", "createServer", "connect", "getDefaultSettings", "getPackedSettings",
+    "createSecureServer",
+    "createServer",
+    "connect",
+    "getDefaultSettings",
+    "getPackedSettings",
     "getUnpackedSettings",
 ];
 
@@ -93,12 +97,30 @@ pub const METHODS: &[&str] = &[
 /// `stdlib::instance_has_method` so a method *read* yields a bound method).
 pub const SERVER_METHODS: &[&str] = &["listen", "close", "address", "setTimeout"];
 pub const STREAM_METHODS: &[&str] = &[
-    "respond", "write", "end", "close", "setEncoding", "setTimeout", "pause", "resume",
+    "respond",
+    "write",
+    "end",
+    "close",
+    "setEncoding",
+    "setTimeout",
+    "pause",
+    "resume",
     // HTTP/1-compat surface (Http2ServerResponse), best-effort:
-    "writeHead", "setHeader", "getHeader", "removeHeader",
+    "writeHead",
+    "setHeader",
+    "getHeader",
+    "removeHeader",
 ];
-pub const SESSION_METHODS: &[&str] =
-    &["settings", "ping", "goaway", "close", "destroy", "ref", "unref", "setTimeout"];
+pub const SESSION_METHODS: &[&str] = &[
+    "settings",
+    "ping",
+    "goaway",
+    "close",
+    "destroy",
+    "ref",
+    "unref",
+    "setTimeout",
+];
 
 // ── HTTP/2 constants (RFC 7540 §6, §11) ──────────────────────────────────────
 
@@ -147,9 +169,17 @@ fn next_session_key() -> u64 {
 enum H2Cmd {
     /// Send a HEADERS frame carrying the given (already ordered, `:status`-first)
     /// header list; `end` sets END_STREAM (a header-only response).
-    Respond { stream_id: u32, headers: Vec<(String, String)>, end: bool },
+    Respond {
+        stream_id: u32,
+        headers: Vec<(String, String)>,
+        end: bool,
+    },
     /// Send DATA (chunked to MAX_FRAME_SIZE); `end` sets END_STREAM on the last.
-    Data { stream_id: u32, data: Vec<u8>, end: bool },
+    Data {
+        stream_id: u32,
+        data: Vec<u8>,
+        end: bool,
+    },
     /// RST_STREAM with NO_ERROR.
     Close { stream_id: u32 },
     /// GOAWAY(NO_ERROR) then terminate the owner loop.
@@ -216,11 +246,20 @@ fn u64_prop(recv: &Value, key: &str) -> Option<u64> {
 /// Delegate the EventEmitter surface to `events`; `None` for a non-emitter method.
 fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match method {
-        "on" | "addListener" | "prependListener" | "once" | "prependOnceListener" | "emit"
-        | "removeListener" | "off" | "removeAllListeners" | "listenerCount" | "eventNames"
-        | "setMaxListeners" | "getMaxListeners" | "listeners" => {
-            Some(super::events::instance_call(recv, method, args.to_vec()))
-        }
+        "on"
+        | "addListener"
+        | "prependListener"
+        | "once"
+        | "prependOnceListener"
+        | "emit"
+        | "removeListener"
+        | "off"
+        | "removeAllListeners"
+        | "listenerCount"
+        | "eventNames"
+        | "setMaxListeners"
+        | "getMaxListeners"
+        | "listeners" => Some(super::events::instance_call(recv, method, args.to_vec())),
         _ => None,
     }
 }
@@ -261,12 +300,16 @@ fn object_pairs(obj: &Value) -> Vec<(String, String)> {
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "createSecureServer" => create_secure_server(args),
-        "createServer" => Err("Error: http2.createServer (cleartext h2c / prior-knowledge) \
+        "createServer" => Err(
+            "Error: http2.createServer (cleartext h2c / prior-knowledge) \
             is not implemented in node-js; use http2.createSecureServer (h2 over TLS)"
-            .to_string()),
-        "connect" => Err("Error: http2.connect (HTTP/2 client) is not implemented in node-js; \
+                .to_string(),
+        ),
+        "connect" => Err(
+            "Error: http2.connect (HTTP/2 client) is not implemented in node-js; \
             only the HTTP/2 server (http2.createSecureServer) is implemented"
-            .to_string()),
+                .to_string(),
+        ),
         "getDefaultSettings" => Ok(default_settings_object()),
         "getPackedSettings" => Ok(pack_settings(args)),
         "getUnpackedSettings" => unpack_settings(args),
@@ -281,8 +324,12 @@ pub fn constant(name: &str) -> Option<Value> {
         "constants" => Some(constants_object()),
         // Expose ctor namespaces so `http2.Http2ServerRequest.prototype` etc. resolve
         // to *something* (they are not separately constructable here).
-        "Http2ServerRequest" => Some(with_host(|h| h.alloc(JsObj::Builtin("Http2ServerRequest".into())))),
-        "Http2ServerResponse" => Some(with_host(|h| h.alloc(JsObj::Builtin("Http2ServerResponse".into())))),
+        "Http2ServerRequest" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("Http2ServerRequest".into()))
+        })),
+        "Http2ServerResponse" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("Http2ServerResponse".into()))
+        })),
         _ => None,
     }
 }
@@ -326,10 +373,11 @@ fn constants_object() -> Value {
         put_i(&mut m, "NGHTTP2_SETTINGS_MAX_FRAME_SIZE", 0x5);
         put_i(&mut m, "NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE", 0x6);
         // A representative subset of the HTTP2_HEADER_* string constants.
-        let hdr = |m: &mut IndexMap<String, Value>, k: &str, v: &str, h: &mut crate::host::JsHost| {
-            let s = h.new_str(v);
-            m.insert(k.to_string(), s);
-        };
+        let hdr =
+            |m: &mut IndexMap<String, Value>, k: &str, v: &str, h: &mut crate::host::JsHost| {
+                let s = h.new_str(v);
+                m.insert(k.to_string(), s);
+            };
         hdr(&mut m, "HTTP2_HEADER_STATUS", ":status", h);
         hdr(&mut m, "HTTP2_HEADER_METHOD", ":method", h);
         hdr(&mut m, "HTTP2_HEADER_AUTHORITY", ":authority", h);
@@ -505,18 +553,27 @@ fn build_h2_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<ServerC
 fn take_pending_config(server: &Value) -> Option<Arc<ServerConfig>> {
     PENDING_CONFIGS.with(|p| {
         let mut p = p.borrow_mut();
-        p.iter().position(|(s, _)| s == server).map(|pos| p.remove(pos).1)
+        p.iter()
+            .position(|(s, _)| s == server)
+            .map(|pos| p.remove(pos).1)
     })
 }
 
 // ── instance dispatch (Http2Server / Http2Stream / Http2Session) ─────────────
 
-pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub fn instance_call(
+    tag: &str,
+    recv: &Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match tag {
         "Http2Server" => server_call(recv, method, args),
         "Http2Stream" => stream_call(recv, method, args),
         "Http2Session" => session_call(recv, method, args),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
@@ -529,7 +586,9 @@ fn server_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
         "close" => server_close(recv, &args),
         "address" => Ok(get_prop(recv, "@@address").unwrap_or(Value::Undef)),
         "setTimeout" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("server.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "server.{method} is not a function"
+        ))),
     }
 }
 
@@ -558,35 +617,45 @@ fn server_listen(recv: &Value, args: &[Value]) -> Result<Value, String> {
     if let Some(addr) = local {
         let mut a = IndexMap::new();
         a.insert("port".into(), Value::Float(addr.port() as f64));
-        a.insert("address".into(), with_host(|h| h.new_str(addr.ip().to_string())));
-        a.insert("family".into(), with_host(|h| h.new_str(if addr.is_ipv6() { "IPv6" } else { "IPv4" })));
+        a.insert(
+            "address".into(),
+            with_host(|h| h.new_str(addr.ip().to_string())),
+        );
+        a.insert(
+            "family".into(),
+            with_host(|h| h.new_str(if addr.is_ipv6() { "IPv6" } else { "IPv4" })),
+        );
         let addr_obj = with_host(|h| h.new_object(a));
         set_prop(recv, "@@address", addr_obj);
     }
     let stop = Arc::new(AtomicBool::new(false));
     H2.with(|s| {
-        s.borrow_mut().servers.insert(id, H2ServerRec { emitter: recv.clone(), stop: stop.clone() });
+        s.borrow_mut().servers.insert(
+            id,
+            H2ServerRec {
+                emitter: recv.clone(),
+                stop: stop.clone(),
+            },
+        );
     });
     with_host(|h| h.incr_handle());
 
     let io_tx = with_host(|h| h.io_sender());
     listener.set_nonblocking(true).ok();
-    std::thread::spawn(move || {
-        loop {
-            if stop.load(Ordering::Acquire) {
-                break;
+    std::thread::spawn(move || loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let cfg = config.clone();
+                let tx = io_tx.clone();
+                std::thread::spawn(move || serve_connection(id, stream, cfg, tx));
             }
-            match listener.accept() {
-                Ok((stream, _addr)) => {
-                    let cfg = config.clone();
-                    let tx = io_tx.clone();
-                    std::thread::spawn(move || serve_connection(id, stream, cfg, tx));
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(_) => break,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            Err(_) => break,
         }
     });
 
@@ -610,7 +679,10 @@ fn server_close(recv: &Value, args: &[Value]) -> Result<Value, String> {
             let _ = with_host(|h| h.io_sender()).send(Box::new(|| Ok(())));
         }
     }
-    if let Some(cb) = args.first().filter(|v| with_host(|h| crate::host::is_callable(h, v))) {
+    if let Some(cb) = args
+        .first()
+        .filter(|v| with_host(|h| crate::host::is_callable(h, v)))
+    {
         invoke(cb, Vec::new(), None)?;
     }
     super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))])?;
@@ -622,7 +694,12 @@ fn server_close(recv: &Value, args: &[Value]) -> Result<Value, String> {
 /// One background thread per accepted TCP connection: complete the TLS handshake
 /// (negotiating ALPN `h2`), then run the HTTP/2 framing loop. Owns the
 /// `StreamOwned` and the HPACK `Encoder`/`Decoder` for the whole connection.
-fn serve_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConfig>, io_tx: Sender<IoTask>) {
+fn serve_connection(
+    server_id: u64,
+    mut sock: TcpStream,
+    config: Arc<ServerConfig>,
+    io_tx: Sender<IoTask>,
+) {
     // The socket is inherited non-blocking from the accept poll loop; put it in
     // blocking mode so the TLS handshake and the initial SETTINGS write can't
     // fail with WouldBlock. A per-read timeout (set later) gives the framing loop
@@ -652,7 +729,9 @@ fn serve_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConfi
     let session_key = next_session_key();
     {
         let tx_sess = tx.clone();
-        let _ = io_tx.send(Box::new(move || on_session(server_id, session_key, tx_sess)));
+        let _ = io_tx.send(Box::new(move || {
+            on_session(server_id, session_key, tx_sess)
+        }));
     }
 
     if h2_debug() {
@@ -697,7 +776,10 @@ fn serve_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConfi
             match rx.try_recv() {
                 Ok(cmd) => {
                     if h2_debug() {
-                        eprintln!("[http2] connection {session_key}: draining {}", cmd_name(&cmd));
+                        eprintln!(
+                            "[http2] connection {session_key}: draining {}",
+                            cmd_name(&cmd)
+                        );
                     }
                     if !apply_cmd(&mut stream, &mut encoder, max_stream_id, cmd) {
                         if h2_debug() {
@@ -721,13 +803,19 @@ fn serve_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConfi
             }
             Ok(n) => inbuf.extend_from_slice(&buf[..n]),
             Err(ref e)
-                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
             {
                 continue;
             }
             Err(e) => {
                 if h2_debug() {
-                    eprintln!("[http2] connection {session_key}: read error {:?} ({e})", e.kind());
+                    eprintln!(
+                        "[http2] connection {session_key}: read error {:?} ({e})",
+                        e.kind()
+                    );
                 }
                 break;
             }
@@ -750,13 +838,15 @@ fn serve_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConfi
             if inbuf.len() < 9 {
                 break;
             }
-            let len = ((inbuf[0] as usize) << 16) | ((inbuf[1] as usize) << 8) | (inbuf[2] as usize);
+            let len =
+                ((inbuf[0] as usize) << 16) | ((inbuf[1] as usize) << 8) | (inbuf[2] as usize);
             if inbuf.len() < 9 + len {
                 break; // await the rest of the frame body.
             }
             let ftype = inbuf[3];
             let flags = inbuf[4];
-            let stream_id = u32::from_be_bytes([inbuf[5], inbuf[6], inbuf[7], inbuf[8]]) & 0x7fff_ffff;
+            let stream_id =
+                u32::from_be_bytes([inbuf[5], inbuf[6], inbuf[7], inbuf[8]]) & 0x7fff_ffff;
             let payload: Vec<u8> = inbuf[9..9 + len].to_vec();
             inbuf.drain(..9 + len);
             if h2_debug() {
@@ -805,7 +895,10 @@ fn serve_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConfi
                     let headers: Vec<(String, String)> = decoded
                         .into_iter()
                         .map(|(k, v)| {
-                            (String::from_utf8_lossy(&k).into_owned(), String::from_utf8_lossy(&v).into_owned())
+                            (
+                                String::from_utf8_lossy(&k).into_owned(),
+                                String::from_utf8_lossy(&v).into_owned(),
+                            )
                         })
                         .collect();
                     let end_stream = flags & FL_END_STREAM != 0;
@@ -835,7 +928,9 @@ fn serve_connection(server_id: u64, mut sock: TcpStream, config: Arc<ServerConfi
 
     // Best-effort GOAWAY then close.
     if h2_debug() {
-        eprintln!("[http2] connection {session_key}: framing loop exited, sending GOAWAY + closing");
+        eprintln!(
+            "[http2] connection {session_key}: framing loop exited, sending GOAWAY + closing"
+        );
     }
     let mut goaway = Vec::with_capacity(8);
     goaway.extend_from_slice(&(max_stream_id & 0x7fff_ffff).to_be_bytes());
@@ -871,7 +966,11 @@ fn apply_cmd(
     cmd: H2Cmd,
 ) -> bool {
     match cmd {
-        H2Cmd::Respond { stream_id, headers, end } => {
+        H2Cmd::Respond {
+            stream_id,
+            headers,
+            end,
+        } => {
             let block = encode_header_block(encoder, &headers);
             if h2_debug() {
                 eprintln!(
@@ -885,9 +984,16 @@ fn apply_cmd(
                 .and_then(|_| stream.flush())
                 .is_ok()
         }
-        H2Cmd::Data { stream_id, data, end } => {
+        H2Cmd::Data {
+            stream_id,
+            data,
+            end,
+        } => {
             if h2_debug() {
-                eprintln!("[http2] write DATA stream={stream_id} len={} end_stream={end}", data.len());
+                eprintln!(
+                    "[http2] write DATA stream={stream_id} len={} end_stream={end}",
+                    data.len()
+                );
             }
             send_data(stream, stream_id, &data, end)
         }
@@ -935,7 +1041,13 @@ fn send_data(
 
 /// Write one HTTP/2 frame: 9-octet header (24-bit length, 8-bit type, 8-bit flags,
 /// 31-bit stream id) followed by the payload (RFC 7540 §4.1).
-fn write_frame<W: Write>(w: &mut W, ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> std::io::Result<()> {
+fn write_frame<W: Write>(
+    w: &mut W,
+    ftype: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> std::io::Result<()> {
     let len = payload.len();
     let mut hdr = [0u8; 9];
     hdr[0] = (len >> 16) as u8;
@@ -998,19 +1110,30 @@ fn strip_data_padding(payload: &[u8], flags: u8) -> Vec<u8> {
 /// `incr_handle`.
 fn on_session(server_id: u64, session_key: u64, tx: Sender<H2Cmd>) -> Result<(), String> {
     with_host(|h| h.incr_handle());
-    let server = H2.with(|s| s.borrow().servers.get(&server_id).map(|r| r.emitter.clone()));
+    let server = H2.with(|s| {
+        s.borrow()
+            .servers
+            .get(&server_id)
+            .map(|r| r.emitter.clone())
+    });
     let Some(server) = server else { return Ok(()) };
     let mut extra = IndexMap::new();
     extra.insert("@@h2session".into(), Value::Float(session_key as f64));
     let session = new_emitter_object("Http2Session", extra);
     H2.with(|s| {
-        s.borrow_mut()
-            .sessions
-            .insert(session_key, H2SessionRec { emitter: session.clone(), tx });
+        s.borrow_mut().sessions.insert(
+            session_key,
+            H2SessionRec {
+                emitter: session.clone(),
+                tx,
+            },
+        );
     });
-    if let Err(e) =
-        super::events::instance_call(&server, "emit", vec![with_host(|h| h.new_str("session")), session])
-    {
+    if let Err(e) = super::events::instance_call(
+        &server,
+        "emit",
+        vec![with_host(|h| h.new_str("session")), session],
+    ) {
         report_handler_error("session", &e);
     }
     Ok(())
@@ -1042,7 +1165,12 @@ fn on_headers(
     end_stream: bool,
     tx: Sender<H2Cmd>,
 ) -> Result<(), String> {
-    let server = H2.with(|s| s.borrow().servers.get(&server_id).map(|r| r.emitter.clone()));
+    let server = H2.with(|s| {
+        s.borrow()
+            .servers
+            .get(&server_id)
+            .map(|r| r.emitter.clone())
+    });
     let Some(server) = server else { return Ok(()) };
 
     // Build the header object exposed to JS (pseudo-headers kept as `:`-prefixed).
@@ -1062,7 +1190,12 @@ fn on_headers(
     H2.with(|s| {
         s.borrow_mut().streams.insert(
             stream_key,
-            H2StreamRec { emitter: stream_obj.clone(), tx, stream_id, responded: false },
+            H2StreamRec {
+                emitter: stream_obj.clone(),
+                tx,
+                stream_id,
+                responded: false,
+            },
         );
     });
 
@@ -1134,13 +1267,20 @@ fn h2_debug() -> bool {
 
 /// Emit an inbound request-body DATA chunk (and `end` on END_STREAM) on the stream.
 fn on_data(stream_key: u64, data: Vec<u8>, end_stream: bool) -> Result<(), String> {
-    let stream = H2.with(|s| s.borrow().streams.get(&stream_key).map(|r| r.emitter.clone()));
+    let stream = H2.with(|s| {
+        s.borrow()
+            .streams
+            .get(&stream_key)
+            .map(|r| r.emitter.clone())
+    });
     let Some(stream) = stream else { return Ok(()) };
     if !data.is_empty() {
         let chunk = super::buffer::from_bytes(&data);
-        if let Err(e) =
-            super::events::instance_call(&stream, "emit", vec![with_host(|h| h.new_str("data")), chunk])
-        {
+        if let Err(e) = super::events::instance_call(
+            &stream,
+            "emit",
+            vec![with_host(|h| h.new_str("data")), chunk],
+        ) {
             report_handler_error("data", &e);
             return Ok(());
         }
@@ -1156,7 +1296,10 @@ fn on_data(stream_key: u64, data: Vec<u8>, end_stream: bool) -> Result<(), Strin
 }
 
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
 }
 
 // ── Http2Stream instance methods ─────────────────────────────────────────────
@@ -1183,7 +1326,8 @@ fn stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
         }
         // HTTP/1-compat: writeHead(status[, headersObj]) → respond.
         "writeHead" => {
-            let status = with_host(|h| args.first().map(|v| h.to_number(v)).unwrap_or(200.0)) as u32;
+            let status =
+                with_host(|h| args.first().map(|v| h.to_number(v)).unwrap_or(200.0)) as u32;
             let mut hdrs: Vec<(String, String)> = Vec::new();
             for a in args.iter().skip(1) {
                 if matches!(a, Value::Obj(_)) {
@@ -1206,7 +1350,9 @@ fn stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
         }
         "getHeader" => {
             let k = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
-            Ok(get_prop(recv, "@@pendingHeaders").and_then(|bag| get_prop(&bag, &k)).unwrap_or(Value::Undef))
+            Ok(get_prop(recv, "@@pendingHeaders")
+                .and_then(|bag| get_prop(&bag, &k))
+                .unwrap_or(Value::Undef))
         }
         "removeHeader" => {
             let k = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
@@ -1240,7 +1386,9 @@ fn stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
             if let Some(key) = stream_key_of(recv) {
                 let sent = H2.with(|s| {
                     s.borrow().streams.get(&key).map(|r| {
-                        let _ = r.tx.send(H2Cmd::Close { stream_id: r.stream_id });
+                        let _ = r.tx.send(H2Cmd::Close {
+                            stream_id: r.stream_id,
+                        });
                     })
                 });
                 let _ = sent;
@@ -1248,7 +1396,9 @@ fn stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, St
             Ok(recv.clone())
         }
         "setEncoding" | "setTimeout" | "pause" | "resume" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("stream.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "stream.{method} is not a function"
+        ))),
     }
 }
 
@@ -1289,12 +1439,18 @@ fn do_respond(recv: &Value, mut headers: Vec<(String, String)>, end: bool) -> Re
         ordered.push((k.to_ascii_lowercase(), v));
     }
 
-    let Some(key) = stream_key_of(recv) else { return Ok(()) };
+    let Some(key) = stream_key_of(recv) else {
+        return Ok(());
+    };
     H2.with(|s| {
         if let Some(r) = s.borrow_mut().streams.get_mut(&key) {
             if !r.responded {
                 r.responded = true;
-                let _ = r.tx.send(H2Cmd::Respond { stream_id: r.stream_id, headers: ordered, end });
+                let _ = r.tx.send(H2Cmd::Respond {
+                    stream_id: r.stream_id,
+                    headers: ordered,
+                    end,
+                });
             }
         }
     });
@@ -1303,8 +1459,16 @@ fn do_respond(recv: &Value, mut headers: Vec<(String, String)>, end: bool) -> Re
 
 /// Ensure the response HEADERS have been sent (auto-`respond` with 200 otherwise).
 fn ensure_responded(recv: &Value) -> Result<(), String> {
-    let Some(key) = stream_key_of(recv) else { return Ok(()) };
-    let responded = H2.with(|s| s.borrow().streams.get(&key).map(|r| r.responded).unwrap_or(true));
+    let Some(key) = stream_key_of(recv) else {
+        return Ok(());
+    };
+    let responded = H2.with(|s| {
+        s.borrow()
+            .streams
+            .get(&key)
+            .map(|r| r.responded)
+            .unwrap_or(true)
+    });
     if !responded {
         do_respond(recv, Vec::new(), false)?;
     }
@@ -1316,7 +1480,11 @@ fn send_stream_data(recv: &Value, data: Vec<u8>, end: bool) {
     if let Some(key) = stream_key_of(recv) {
         H2.with(|s| {
             if let Some(r) = s.borrow().streams.get(&key) {
-                let _ = r.tx.send(H2Cmd::Data { stream_id: r.stream_id, data, end });
+                let _ = r.tx.send(H2Cmd::Data {
+                    stream_id: r.stream_id,
+                    data,
+                    end,
+                });
             }
         });
     }
@@ -1341,7 +1509,9 @@ fn session_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
             Ok(recv.clone())
         }
         "settings" | "ping" | "ref" | "unref" | "setTimeout" => Ok(recv.clone()),
-        _ => Err(crate::host::type_error(&format!("session.{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "session.{method} is not a function"
+        ))),
     }
 }
 

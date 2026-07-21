@@ -119,7 +119,12 @@ fn resolve_oracle() -> String {
         }
         return p;
     }
-    for p in ["node", "/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
+    for p in [
+        "node",
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ] {
         if version_of(p).is_some() {
             return p.to_string();
         }
@@ -304,9 +309,29 @@ const INTS: &[&str] = &[
 const POSINTS: &[&str] = &["1", "2", "3", "4", "5", "6", "8", "10"];
 // Floats biased toward the exponential-notation threshold and repr edge cases.
 const FLOATS: &[&str] = &[
-    "0.1", "0.2", "0.5", "1.5", "2.5", "3.14", "10.0", "-1.5", "100.0", "0.0", "-0.0", "1e21",
-    "1e-7", "1e-6", "1e100", "1.5e300", "123.456", "0.0001234", "9.999999e20", "1e22", "-0.4",
-    "1.005", "8.575",
+    "0.1",
+    "0.2",
+    "0.5",
+    "1.5",
+    "2.5",
+    "3.14",
+    "10.0",
+    "-1.5",
+    "100.0",
+    "0.0",
+    "-0.0",
+    "1e21",
+    "1e-7",
+    "1e-6",
+    "1e100",
+    "1.5e300",
+    "123.456",
+    "0.0001234",
+    "9.999999e20",
+    "1e22",
+    "-0.4",
+    "1.005",
+    "8.575",
 ];
 // Values that exercise NaN / Infinity / -0 propagation.
 const SPECIALS: &[&str] = &["NaN", "Infinity", "-Infinity", "0/0", "1/0", "-1/0", "-0"];
@@ -385,7 +410,18 @@ fn gen_bitwise(seed: u64) -> Vec<String> {
 fn gen_equality(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let vals = &[
-        "0", "1", "''", "'0'", "'1'", "'a'", "null", "undefined", "true", "false", "[]", "[0]",
+        "0",
+        "1",
+        "''",
+        "'0'",
+        "'1'",
+        "'a'",
+        "null",
+        "undefined",
+        "true",
+        "false",
+        "[]",
+        "[0]",
         "NaN",
     ];
     let a = pick(r, vals);
@@ -419,7 +455,10 @@ fn gen_strmeth(seed: u64) -> Vec<String> {
         // split('') on a SHORT string: a >6-element array triggers node's
         // util.inspect multi-line grouping, a documented known gap (BUGS.md), so
         // keep the result within the single-line regime.
-        7 => format!("{}.split('')", pick(r, &["'abc'", "'a'", "''", "'hi'", "'abcde'", "'Wor'"])),
+        7 => format!(
+            "{}.split('')",
+            pick(r, &["'abc'", "'a'", "''", "'hi'", "'abcde'", "'Wor'"])
+        ),
         8 => format!("{s}.replace('a', 'X')"),
         9 => format!("{s}.replaceAll('a', 'X')"),
         10 => format!("{s}.indexOf('o')"),
@@ -513,7 +552,17 @@ fn gen_json(seed: u64) -> Vec<String> {
 fn gen_logic(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let vals = &[
-        "0", "1", "''", "'x'", "null", "undefined", "true", "false", "[]", "{}", "NaN",
+        "0",
+        "1",
+        "''",
+        "'x'",
+        "null",
+        "undefined",
+        "true",
+        "false",
+        "[]",
+        "{}",
+        "NaN",
     ];
     let a = pick(r, vals);
     let b = pick(r, vals);
@@ -534,8 +583,20 @@ fn gen_logic(seed: u64) -> Vec<String> {
 fn gen_parse(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let strs = &[
-        "'42'", "'42px'", "'  17  '", "'0x1f'", "'101'", "'3.14'", "'1e3'", "''", "'abc'",
-        "'-5'", "'  '", "'0.5e2'", "'Infinity'", "'  12.5abc'",
+        "'42'",
+        "'42px'",
+        "'  17  '",
+        "'0x1f'",
+        "'101'",
+        "'3.14'",
+        "'1e3'",
+        "''",
+        "'abc'",
+        "'-5'",
+        "'  '",
+        "'0.5e2'",
+        "'Infinity'",
+        "'  12.5abc'",
     ];
     let s = pick(r, strs);
     let e = match r.below(6) {
@@ -609,7 +670,11 @@ fn gen_math(seed: u64) -> Vec<String> {
         5 => format!("Math.sign({x})"),
         6 => format!("Math.max({x}, {})", pick(r, INTS)),
         7 => format!("Math.min({x}, {})", pick(r, INTS)),
-        8 => format!("Math.pow({}, {})", pick(r, POSINTS), pick(r, &["2", "3", "0"])),
+        8 => format!(
+            "Math.pow({}, {})",
+            pick(r, POSINTS),
+            pick(r, &["2", "3", "0"])
+        ),
         9 => format!("Math.sqrt({})", pick(r, POSINTS)),
         10 => "Math.max(...[3, 1, 4, 1, 5])".to_string(),
         _ => format!("Math.hypot({}, {})", pick(r, POSINTS), pick(r, POSINTS)),
@@ -884,7 +949,9 @@ fn gen_async(seed: u64) -> Vec<String> {
 /// constructor. Every probe prints a deterministic value or a caught error message.
 fn gen_bigint(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
-    let bigs = &["0n", "1n", "2n", "3n", "7n", "10n", "-3n", "-7n", "42n", "100n", "255n", "1000n"];
+    let bigs = &[
+        "0n", "1n", "2n", "3n", "7n", "10n", "-3n", "-7n", "42n", "100n", "255n", "1000n",
+    ];
     let a = pick(r, bigs);
     let b = pick(r, bigs);
     let nb = pick(r, &["1", "2", "10", "-3", "0", "100"]); // a Number, for the mix path
@@ -905,8 +972,14 @@ fn gen_bigint(seed: u64) -> Vec<String> {
         9 => format!("{a}.toString({})", 2 + r.below(35)),
         10 => format!("{a} & {b}, {a} | {b}, {a} ^ {b}, ~{a}"),
         // The BigInt/Number mix is a hard TypeError — verify the exact message.
-        11 => format!("(() => {{ try {{ return {a} + {nb}; }} catch (e) {{ return e.message; }} }})()"),
-        12 => format!("BigInt({}), BigInt('{}'), BigInt(true)", pick(r, &["5", "42", "-7", "0"]), pick(r, &["10", "255", "0x1f"])),
+        11 => format!(
+            "(() => {{ try {{ return {a} + {nb}; }} catch (e) {{ return e.message; }} }})()"
+        ),
+        12 => format!(
+            "BigInt({}), BigInt('{}'), BigInt(true)",
+            pick(r, &["5", "42", "-7", "0"]),
+            pick(r, &["10", "255", "0x1f"])
+        ),
         _ => format!("{a} + {b} * {}", pick(r, bigs)),
     };
     vec![format!("console.log({e})")]

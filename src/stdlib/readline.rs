@@ -43,9 +43,21 @@ pub const METHODS: &[&str] = &[
 /// Methods dispatched on an `@@native = "Interface"` object (reported to the
 /// parent for `instance_has_method` wiring).
 pub const INTERFACE_METHODS: &[&str] = &[
-    "question", "write", "close", "pause", "resume", "prompt", "setPrompt",
-    "getPrompt", "on", "once", "addListener", "prependListener", "removeListener",
-    "off", "removeAllListeners",
+    "question",
+    "write",
+    "close",
+    "pause",
+    "resume",
+    "prompt",
+    "setPrompt",
+    "getPrompt",
+    "on",
+    "once",
+    "addListener",
+    "prependListener",
+    "removeListener",
+    "off",
+    "removeAllListeners",
 ];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
@@ -58,7 +70,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let x = super::arg_num(args, 1);
             let y = args.get(2).filter(|v| !matches!(v, Value::Undef));
             let seq = match y {
-                Some(yv) => format!("\x1b[{};{}H", with_host(|h| h.to_number(yv)) as i64 + 1, x as i64 + 1),
+                Some(yv) => format!(
+                    "\x1b[{};{}H",
+                    with_host(|h| h.to_number(yv)) as i64 + 1,
+                    x as i64 + 1
+                ),
                 None => format!("\x1b[{}G", x as i64 + 1),
             };
             write_stdout(&seq);
@@ -68,15 +84,29 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let dx = super::arg_num(args, 1) as i64;
             let dy = super::arg_num(args, 2) as i64;
             let mut seq = String::new();
-            if dx > 0 { seq.push_str(&format!("\x1b[{dx}C")); } else if dx < 0 { seq.push_str(&format!("\x1b[{}D", -dx)); }
-            if dy > 0 { seq.push_str(&format!("\x1b[{dy}B")); } else if dy < 0 { seq.push_str(&format!("\x1b[{}A", -dy)); }
+            if dx > 0 {
+                seq.push_str(&format!("\x1b[{dx}C"));
+            } else if dx < 0 {
+                seq.push_str(&format!("\x1b[{}D", -dx));
+            }
+            if dy > 0 {
+                seq.push_str(&format!("\x1b[{dy}B"));
+            } else if dy < 0 {
+                seq.push_str(&format!("\x1b[{}A", -dy));
+            }
             write_stdout(&seq);
             Ok(Value::Bool(true))
         }
         "clearLine" => {
             let dir = super::arg_num(args, 1);
             // dir < 0 → to start (1K); dir > 0 → to end (0K); 0 → whole line (2K).
-            let seq = if dir < 0.0 { "\x1b[1K" } else if dir > 0.0 { "\x1b[0K" } else { "\x1b[2K" };
+            let seq = if dir < 0.0 {
+                "\x1b[1K"
+            } else if dir > 0.0 {
+                "\x1b[0K"
+            } else {
+                "\x1b[2K"
+            };
             write_stdout(seq);
             Ok(Value::Bool(true))
         }
@@ -149,7 +179,11 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             // or `question(q, options, cb)`).
             // The `.find` predicate receives `&&Value`; deref once so `is_callable`
             // sees a `&Value`. `find` yields `Option<&Value>`, cloned to `Value`.
-            let cb = args.iter().rev().find(|v| with_host(|h| is_callable(h, v))).cloned();
+            let cb = args
+                .iter()
+                .rev()
+                .find(|v| with_host(|h| is_callable(h, v)))
+                .cloned();
             if let Some(cb) = cb {
                 let line_val = with_host(|h| h.new_str(line));
                 crate::host::invoke(&cb, vec![line_val], None)?;
@@ -191,7 +225,9 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         "removeListener" | "off" | "removeAllListeners" => Ok(recv.clone()),
         // No interactive loop to tear down / pause; honest no-ops.
         "close" | "pause" | "resume" => Ok(Value::Undef),
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 

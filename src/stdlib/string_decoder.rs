@@ -13,7 +13,11 @@ use indexmap::IndexMap;
 
 /// `new StringDecoder([encoding])`.
 pub fn construct(args: &[Value]) -> Result<Value, String> {
-    let enc = if args.is_empty() { "utf8".to_string() } else { super::arg_str(args, 0) };
+    let enc = if args.is_empty() {
+        "utf8".to_string()
+    } else {
+        super::arg_str(args, 0)
+    };
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("StringDecoder"));
@@ -42,7 +46,10 @@ fn bytes_of(v: &Value) -> Vec<u8> {
 
 fn encoding_of(recv: &Value) -> String {
     with_host(|h| match h.get(recv) {
-        Some(JsObj::Object(p)) => p.get("encoding").map(|v| h.str_of(v)).unwrap_or_else(|| "utf8".into()),
+        Some(JsObj::Object(p)) => p
+            .get("encoding")
+            .map(|v| h.str_of(v))
+            .unwrap_or_else(|| "utf8".into()),
         _ => "utf8".into(),
     })
 }
@@ -91,7 +98,9 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             }
             Ok(with_host(|h| h.new_str(decoded)))
         }
-        _ => Err(crate::host::type_error(&format!("{method} is not a function"))),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
     }
 }
 
