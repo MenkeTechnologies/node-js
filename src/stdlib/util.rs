@@ -30,7 +30,21 @@ pub const METHODS: &[&str] = &[
     "parseArgs",
     "promisify",
     "callbackify",
+    "parseEnv",
+    "debug",
 ];
+
+/// Non-function `util` exports (`require('util').TextEncoder`, `.MIMEType`, …).
+/// Each resolves to a `Builtin("<name>")` the parent `construct`s via `new`.
+pub fn constant(name: &str) -> Option<Value> {
+    match name {
+        "types" => Some(with_host(|h| h.alloc(JsObj::Builtin("util/types".into())))),
+        "TextEncoder" | "TextDecoder" | "MIMEType" | "MIMEParams" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
+        }
+        _ => None,
+    }
+}
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     if let Some(pred) = method.strip_prefix("types.") {
@@ -124,6 +138,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "debuglog" => return Some(debuglog(args)),
         "promisify" => return Some(promisify(args)),
         "callbackify" => return Some(callbackify(args)),
+        // `util.parseEnv(content)` → an object of the parsed dotenv assignments.
+        "parseEnv" => Ok(parse_env(&super::arg_str(args, 0))),
+        // `util.debug === util.debuglog` (a documented alias).
+        "debug" => return Some(debuglog(args)),
         _ => return None,
     })
 }
@@ -887,4 +905,582 @@ fn read_options(config: &Value) -> Vec<OptCfg> {
             }
         })
         .collect()
+}
+
+// ── parseEnv ─────────────────────────────────────────────────────────────────
+// Faithful port of Node's C++ `Dotenv::ParseContent` (src/node_dotenv.cc): CRLF
+// normalization, `#`/blank-line skipping, `export ` prefix stripping, single /
+// double / backtick quotes (`\n` expanded only inside double quotes), unquoted
+// inline `#` comments, unterminated quotes, and last-wins on duplicate keys.
+// Node emits the keys sorted, so we `sort_keys` before materializing.
+
+/// Trim ASCII whitespace (space, tab, newline) from both ends, matching Node's
+/// `trim_spaces` (which trims only `" \t\n"`).
+fn env_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c == ' ' || c == '\t' || c == '\n')
+}
+
+/// `util.parseEnv(content)` → an object of parsed `KEY=VALUE` assignments.
+fn parse_env(input: &str) -> Value {
+    let lines = input.replace('\r', "");
+    let mut pairs: IndexMap<String, String> = IndexMap::new();
+    let mut content: &str = env_trim(&lines);
+
+    while !content.is_empty() {
+        let first = content.as_bytes()[0];
+        // Skip blank lines and full-line comments.
+        if first == b'\n' || first == b'#' {
+            match content.find('\n') {
+                Some(nl) => content = &content[nl + 1..],
+                None => content = "",
+            }
+            continue;
+        }
+        // Next `=` or newline: a newline first means the line has no assignment.
+        let Some(eq_or_nl) = content.find(['=', '\n']) else { break };
+        if content.as_bytes()[eq_or_nl] == b'\n' {
+            content = env_trim(&content[eq_or_nl + 1..]);
+            continue;
+        }
+        // Key up to `=`.
+        let mut key = env_trim(&content[..eq_or_nl]);
+        content = &content[eq_or_nl + 1..];
+        // `KEY=` (empty value).
+        if content.is_empty() || content.as_bytes()[0] == b'\n' {
+            pairs.insert(key.to_string(), String::new());
+            continue;
+        }
+        content = env_trim(content);
+        // Skip empty keys (`=value`, `"   "=value`).
+        if key.is_empty() {
+            continue;
+        }
+        // `export ` prefix.
+        if let Some(rest) = key.strip_prefix("export ") {
+            key = env_trim(rest);
+        }
+        if content.is_empty() {
+            pairs.insert(key.to_string(), String::new());
+            break;
+        }
+        let vfirst = content.as_bytes()[0];
+        // Double-quoted value: expand literal `\n`, may span raw newlines.
+        if vfirst == b'"' {
+            if let Some(rel) = content[1..].find('"') {
+                let closing = rel + 1;
+                let value = content[1..closing].replace("\\n", "\n");
+                pairs.insert(key.to_string(), value);
+                match content[closing + 1..].find('\n') {
+                    Some(nl) => content = &content[closing + 1 + nl + 1..],
+                    None => content = "",
+                }
+                continue;
+            }
+            // No closing quote — fall through to the generic quote handler.
+        }
+        // Single / double / backtick quoted value (no escape expansion).
+        if vfirst == b'\'' || vfirst == b'"' || vfirst == b'`' {
+            match content[1..].find(vfirst as char) {
+                None => match content.find('\n') {
+                    Some(nl) => {
+                        pairs.insert(key.to_string(), content[..nl].to_string());
+                        content = &content[nl + 1..];
+                    }
+                    None => {
+                        pairs.insert(key.to_string(), content.to_string());
+                        break;
+                    }
+                },
+                Some(rel) => {
+                    let closing = rel + 1;
+                    pairs.insert(key.to_string(), content[1..closing].to_string());
+                    match content[closing + 1..].find('\n') {
+                        Some(nl) => content = &content[closing + 1 + nl + 1..],
+                        None => content = "",
+                    }
+                    continue;
+                }
+            }
+        } else {
+            // Unquoted value: up to the newline, `#` starts an inline comment, trim.
+            let (raw, next) = match content.find('\n') {
+                Some(nl) => (&content[..nl], &content[nl + 1..]),
+                None => (content, ""),
+            };
+            let value = match raw.find('#') {
+                Some(h) => &raw[..h],
+                None => raw,
+            };
+            pairs.insert(key.to_string(), env_trim(value).to_string());
+            content = next;
+        }
+        content = env_trim(content);
+    }
+
+    pairs.sort_keys();
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        for (k, v) in pairs {
+            let val = h.new_str(v);
+            m.insert(k, val);
+        }
+        h.new_object(m)
+    })
+}
+
+// ── MIMEType / MIMEParams ────────────────────────────────────────────────────
+// Faithful port of Node's `lib/internal/mime.js`. A `MIMEType` is a native object
+// tagged `@@native = "MIMEType"` with `type`/`subtype`/`essence` data properties
+// and a `params` `MIMEParams` instance; a `MIMEParams` is tagged `@@native =
+// "MIMEParams"` with its ordered unique `(name, value)` pairs in a hidden
+// `@@pairs` array (mirrors the URLSearchParams representation).
+
+/// An HTTP token code point (`NOT_HTTP_TOKEN_CODE_POINT` inverse).
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
+        )
+}
+
+/// An HTTP quoted-string code point (`NOT_HTTP_QUOTED_STRING_CODE_POINT` inverse):
+/// tab, printable ASCII, and Latin-1 supplement.
+fn is_quoted_string_char(c: char) -> bool {
+    c == '\t' || ('\u{20}'..='\u{7e}').contains(&c) || ('\u{80}'..='\u{ff}').contains(&c)
+}
+
+/// HTTP whitespace (`\r \n \t space`).
+fn is_http_ws(c: char) -> bool {
+    matches!(c, '\r' | '\n' | '\t' | ' ')
+}
+
+/// Lowercase only ASCII `A-Z`, leaving other code points intact (Node's
+/// `toASCIILower`).
+fn ascii_lower(s: &str) -> String {
+    s.to_ascii_lowercase()
+}
+
+/// Build the `TypeError [ERR_INVALID_MIME_SYNTAX]` message (with the offending
+/// index when known).
+fn mime_syntax_err(part: &str, s: &str, index: Option<usize>) -> String {
+    match index {
+        Some(i) => format!(
+            "TypeError [ERR_INVALID_MIME_SYNTAX]: The MIME syntax for a {part} in \"{s}\" is invalid at {i}"
+        ),
+        None => format!(
+            "TypeError [ERR_INVALID_MIME_SYNTAX]: The MIME syntax for a {part} in \"{s}\" is invalid"
+        ),
+    }
+}
+
+/// Parse `type/subtype` off the front of a MIME string; returns
+/// `(type, subtype, remaining-params-string)`.
+fn parse_type_and_subtype(s: &str) -> Result<(String, String, String), String> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    // Skip leading HTTP whitespace.
+    let mut pos = 0;
+    while pos < n && is_http_ws(chars[pos]) {
+        pos += 1;
+    }
+    // Read the type up to `/`.
+    let type_end = (pos..n).find(|&i| chars[i] == '/');
+    let trimmed_type: String = match type_end {
+        Some(e) => chars[pos..e].iter().collect(),
+        None => chars[pos..].iter().collect(),
+    };
+    let type_invalid = trimmed_type.chars().position(|c| !is_token_char(c));
+    if trimmed_type.is_empty() || type_invalid.is_some() || type_end.is_none() {
+        return Err(mime_syntax_err("type", s, type_invalid));
+    }
+    let type_end = type_end.unwrap();
+    pos = type_end + 1;
+    let mime_type = ascii_lower(&trimmed_type);
+    // Read the subtype up to `;`.
+    let sub_end = (pos..n).find(|&i| chars[i] == ';');
+    let raw_subtype: &[char] = match sub_end {
+        Some(e) => &chars[pos..e],
+        None => &chars[pos..],
+    };
+    let mut new_pos = pos + raw_subtype.len();
+    if sub_end.is_some() {
+        new_pos += 1;
+    }
+    // Trim trailing HTTP whitespace from the subtype only.
+    let mut end = raw_subtype.len();
+    while end > 0 && is_http_ws(raw_subtype[end - 1]) {
+        end -= 1;
+    }
+    let trimmed_subtype: String = raw_subtype[..end].iter().collect();
+    let sub_invalid = trimmed_subtype.chars().position(|c| !is_token_char(c));
+    if trimmed_subtype.is_empty() || sub_invalid.is_some() {
+        return Err(mime_syntax_err("subtype", s, sub_invalid));
+    }
+    let subtype = ascii_lower(&trimmed_subtype);
+    let params: String = chars[new_pos.min(n)..].iter().collect();
+    Ok((mime_type, subtype, params))
+}
+
+/// Scan a quoted parameter value starting just after the opening `"` (Node's
+/// `QUOTED_VALUE_PATTERN`). Returns `(matched_len, lone_backslash, closing_quote)`.
+fn scan_quoted(chars: &[char], start: usize) -> (usize, bool, bool) {
+    let n = chars.len();
+    let mut i = start;
+    let mut lone_backslash = false;
+    let mut closing_quote = false;
+    while i < n {
+        match chars[i] {
+            '\\' => {
+                if i + 1 >= n {
+                    lone_backslash = true;
+                    i += 1;
+                    break;
+                }
+                i += 2;
+            }
+            '"' => {
+                closing_quote = true;
+                i += 1;
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    (i - start, lone_backslash, closing_quote)
+}
+
+/// Remove single `\` escapes (Node's `removeBackslashes`).
+fn remove_backslashes(s: &[char]) -> String {
+    let n = s.len();
+    if n == 0 {
+        return String::new();
+    }
+    let mut ret = String::new();
+    let mut i = 0usize;
+    while i < n - 1 {
+        if s[i] == '\\' {
+            i += 1;
+            ret.push(s[i]);
+        } else {
+            ret.push(s[i]);
+        }
+        i += 1;
+    }
+    if i == n - 1 {
+        ret.push(s[i]);
+    }
+    ret
+}
+
+/// Parse a MIME parameter string into ordered, unique `(name, value)` pairs.
+fn parse_mime_params(s: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    // The source ends where trailing whitespace begins.
+    let mut end_of_source = n;
+    while end_of_source > 0 && is_http_ws(chars[end_of_source - 1]) {
+        end_of_source -= 1;
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut position = 0usize;
+    while position < end_of_source {
+        // Skip whitespace before the parameter name.
+        while position < n && is_http_ws(chars[position]) {
+            position += 1;
+        }
+        // Read the name up to `;`, `=`, or end.
+        let mut after = position;
+        while after < n && chars[after] != ';' && chars[after] != '=' {
+            after += 1;
+        }
+        let name = ascii_lower(&chars[position..after].iter().collect::<String>());
+        position = after;
+        if position < end_of_source {
+            let ch = chars[position];
+            position += 1;
+            // A `;` terminator means a value-less parameter — ignore it.
+            if ch == ';' {
+                continue;
+            }
+        }
+        if position >= end_of_source {
+            break;
+        }
+        let value = if chars[position] == '"' {
+            // Quoted-string value.
+            position += 1;
+            let (matched_len, lone_backslash, closing_quote) = scan_quoted(&chars, position);
+            let matched = &chars[position..position + matched_len];
+            position += matched_len;
+            let inside: &[char] = if lone_backslash || closing_quote {
+                &matched[..matched.len().saturating_sub(1)]
+            } else {
+                matched
+            };
+            let mut v = remove_backslashes(inside);
+            if lone_backslash {
+                v.push('\\');
+            }
+            v
+        } else {
+            // Bare value up to `;`, trailing whitespace trimmed.
+            let value_end = (position..n).find(|&i| chars[i] == ';').unwrap_or(n);
+            let raw = &chars[position..value_end];
+            position += raw.len();
+            let mut end = raw.len();
+            while end > 0 && is_http_ws(raw[end - 1]) {
+                end -= 1;
+            }
+            let trimmed: String = raw[..end].iter().collect();
+            if trimmed.is_empty() {
+                // Node `continue`s here without the trailing `position++`, leaving
+                // `position` on the `;` so the next iteration consumes it.
+                continue;
+            }
+            trimmed
+        };
+        // Keep only valid, non-duplicate parameters (first value wins).
+        let name_ok = !name.is_empty() && name.chars().all(is_token_char);
+        let value_ok = value.chars().all(is_quoted_string_char);
+        if name_ok && value_ok && !out.iter().any(|(k, _)| *k == name) {
+            out.push((name, value));
+        }
+        position += 1;
+    }
+    out
+}
+
+/// Serialize a parameter value: bare if it is a valid token, else a quoted string
+/// with `"`/`\` escaped (Node's `encode`).
+fn encode_param_value(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".to_string();
+    }
+    if value.chars().all(is_token_char) {
+        return value.to_string();
+    }
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    format!("\"{escaped}\"")
+}
+
+/// Serialize ordered pairs as `name=value;name2=value2` (MIMEParams `toString`).
+fn serialize_mime_params(pairs: &[(String, String)]) -> String {
+    let mut ret = String::new();
+    for (k, v) in pairs {
+        if !ret.is_empty() {
+            ret.push(';');
+        }
+        ret.push_str(k);
+        ret.push('=');
+        ret.push_str(&encode_param_value(v));
+    }
+    ret
+}
+
+/// Method names dispatched through `mime_params_instance_call` (for
+/// `instance_has_method` wiring; `@@iterator` powers `for..of` / spread).
+pub const MIME_PARAMS_METHODS: &[&str] = &[
+    "get", "set", "has", "delete", "entries", "keys", "values", "toString", "toJSON", "@@iterator",
+];
+
+/// Method names dispatched through `mime_type_instance_call`.
+pub const MIME_TYPE_METHODS: &[&str] = &["toString", "toJSON"];
+
+/// Build a `MIMEParams` native object from ordered pairs.
+fn make_mime_params(pairs: &[(String, String)]) -> Value {
+    with_host(|h| {
+        let items: Vec<Value> = pairs
+            .iter()
+            .map(|(k, v)| {
+                let kv = vec![h.new_str(k.clone()), h.new_str(v.clone())];
+                h.new_array(kv)
+            })
+            .collect();
+        let arr = h.new_array(items);
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str("MIMEParams"));
+        m.insert("@@pairs".into(), arr);
+        h.new_object(m)
+    })
+}
+
+/// Read the ordered `(name, value)` pairs out of a `MIMEParams`.
+fn mime_pairs_of(recv: &Value) -> Vec<(String, String)> {
+    with_host(|h| {
+        let items: Vec<Value> = match h.get(recv) {
+            Some(JsObj::Object(p)) => match p.get("@@pairs").and_then(|a| h.get(a)) {
+                Some(JsObj::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        items
+            .iter()
+            .map(|it| match h.get(it) {
+                Some(JsObj::Array(kv)) => {
+                    let kv = kv.clone();
+                    let k = kv.first().map(|x| h.str_of(x)).unwrap_or_default();
+                    let v = kv.get(1).map(|x| h.str_of(x)).unwrap_or_default();
+                    (k, v)
+                }
+                _ => (h.str_of(it), String::new()),
+            })
+            .collect()
+    })
+}
+
+/// Overwrite a `MIMEParams`' backing `@@pairs` array.
+fn set_mime_pairs(recv: &Value, pairs: &[(String, String)]) {
+    with_host(|h| {
+        let items: Vec<Value> = pairs
+            .iter()
+            .map(|(k, v)| {
+                let kv = vec![h.new_str(k.clone()), h.new_str(v.clone())];
+                h.new_array(kv)
+            })
+            .collect();
+        let arr = h.new_array(items);
+        if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+            p.insert("@@pairs".into(), arr);
+        }
+    });
+}
+
+/// `new util.MIMEParams()` — an empty parameter set (Node's constructor takes no
+/// arguments).
+pub fn construct_mime_params(_args: &[Value]) -> Result<Value, String> {
+    Ok(make_mime_params(&[]))
+}
+
+/// `MIMEParams` instance methods.
+pub fn mime_params_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    match method {
+        "get" => {
+            let name = super::arg_str(args, 0);
+            match mime_pairs_of(recv).into_iter().find(|(k, _)| *k == name) {
+                Some((_, v)) => Ok(with_host(|h| h.new_str(v))),
+                None => Ok(with_host(|h| h.null())),
+            }
+        }
+        "has" => {
+            let name = super::arg_str(args, 0);
+            Ok(Value::Bool(mime_pairs_of(recv).iter().any(|(k, _)| *k == name)))
+        }
+        "set" => {
+            let name = super::arg_str(args, 0);
+            let value = super::arg_str(args, 1);
+            if let Some(i) = name.chars().position(|c| !is_token_char(c)) {
+                return Err(mime_syntax_err("parameter name", &name, Some(i)));
+            }
+            if name.is_empty() {
+                return Err(mime_syntax_err("parameter name", &name, None));
+            }
+            if let Some(i) = value.chars().position(|c| !is_quoted_string_char(c)) {
+                return Err(mime_syntax_err("parameter value", &value, Some(i)));
+            }
+            let mut pairs = mime_pairs_of(recv);
+            match pairs.iter_mut().find(|(k, _)| *k == name) {
+                Some(slot) => slot.1 = value,
+                None => pairs.push((name, value)),
+            }
+            set_mime_pairs(recv, &pairs);
+            Ok(Value::Undef)
+        }
+        "delete" => {
+            let name = super::arg_str(args, 0);
+            let mut pairs = mime_pairs_of(recv);
+            pairs.retain(|(k, _)| *k != name);
+            set_mime_pairs(recv, &pairs);
+            Ok(Value::Undef)
+        }
+        "keys" => {
+            let pairs = mime_pairs_of(recv);
+            Ok(with_host(|h| {
+                let items = pairs.into_iter().map(|(k, _)| h.new_str(k)).collect();
+                h.alloc(JsObj::Iter { items, idx: 0 })
+            }))
+        }
+        "values" => {
+            let pairs = mime_pairs_of(recv);
+            Ok(with_host(|h| {
+                let items = pairs.into_iter().map(|(_, v)| h.new_str(v)).collect();
+                h.alloc(JsObj::Iter { items, idx: 0 })
+            }))
+        }
+        "entries" | "@@iterator" => {
+            let pairs = mime_pairs_of(recv);
+            Ok(with_host(|h| {
+                let items = pairs
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let kv = vec![h.new_str(k), h.new_str(v)];
+                        h.new_array(kv)
+                    })
+                    .collect();
+                h.alloc(JsObj::Iter { items, idx: 0 })
+            }))
+        }
+        "toString" | "toJSON" => {
+            let s = serialize_mime_params(&mime_pairs_of(recv));
+            Ok(with_host(|h| h.new_str(s)))
+        }
+        _ => Err(crate::host::type_error(&format!(
+            "mimeParams.{method} is not a function"
+        ))),
+    }
+}
+
+/// `new util.MIMEType(input)` — parse into `type`/`subtype`/`essence`/`params`.
+pub fn construct_mime_type(args: &[Value]) -> Result<Value, String> {
+    // Node coerces the argument to a string first (`${string}`), so a missing
+    // argument parses as the literal `"undefined"` (which then throws).
+    let input = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
+    let (mime_type, subtype, params_str) = parse_type_and_subtype(&input)?;
+    let essence = format!("{mime_type}/{subtype}");
+    // Build the `MIMEParams` instance BEFORE the allocating `with_host` (never nest).
+    let params = make_mime_params(&parse_mime_params(&params_str));
+    Ok(with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str("MIMEType"));
+        m.insert("type".into(), h.new_str(mime_type));
+        m.insert("subtype".into(), h.new_str(subtype));
+        m.insert("essence".into(), h.new_str(essence));
+        m.insert("params".into(), params);
+        h.new_object(m)
+    }))
+}
+
+/// `MIMEType` instance methods. `type`/`subtype`/`essence`/`params` are data
+/// properties read directly; `toString`/`toJSON` serialize live (reflecting any
+/// `params` mutation).
+pub fn mime_type_instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
+    match method {
+        "toString" | "toJSON" => {
+            // Read the essence and the live params object under one borrow.
+            let (essence, params) = with_host(|h| match h.get(recv) {
+                Some(JsObj::Object(p)) => (
+                    p.get("essence").map(|x| h.str_of(x)).unwrap_or_default(),
+                    p.get("params").cloned().unwrap_or(Value::Undef),
+                ),
+                _ => (String::new(), Value::Undef),
+            });
+            let param_str = serialize_mime_params(&mime_pairs_of(&params));
+            let out = if param_str.is_empty() {
+                essence
+            } else {
+                format!("{essence};{param_str}")
+            };
+            Ok(with_host(|h| h.new_str(out)))
+        }
+        _ => Err(crate::host::type_error(&format!(
+            "mimeType.{method} is not a function"
+        ))),
+    }
 }

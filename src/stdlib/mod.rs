@@ -359,8 +359,18 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "module" => node_module::constant(name),
         "Module" => node_module::static_constant(name),
         "stream/web" => stream_web::constant(name),
-        "util" if name == "types" => {
-            Some(with_host(|h| h.alloc(JsObj::Builtin("util/types".into()))))
+        // util.types / util.TextEncoder|TextDecoder / util.MIMEType|MIMEParams.
+        "util" => util::constant(name),
+        // crypto class-constructor exports (require('crypto').Sign etc.) — the
+        // instances are made by factory fns, but the ctor names must resolve.
+        "crypto"
+            if matches!(
+                name,
+                "Sign" | "Verify" | "KeyObject" | "DiffieHellman" | "ECDH" | "X509Certificate"
+                    | "Hash" | "Hmac" | "Cipheriv" | "Decipheriv"
+            ) =>
+        {
+            Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
         }
         _ => None,
     }
@@ -390,6 +400,9 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "Blob" => Some(buffer::construct_blob(args)),
         "File" => Some(buffer::construct_file(args)),
         "AssertionError" => Some(Ok(assert::construct_assertion_error(args))),
+        "X509Certificate" => Some(crypto::construct_x509(args)),
+        "MIMEType" => Some(util::construct_mime_type(args)),
+        "MIMEParams" => Some(util::construct_mime_params(args)),
         "Resolver" => Some(Ok(dns::construct_resolver(args))),
         "ReadStream" | "WriteStream" => Some(Ok(tty::construct(name, args))),
         "MessageChannel" => Some(worker_threads::construct_message_channel(args)),
@@ -492,6 +505,17 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "Deserializer" => v8::DESERIALIZER_METHODS,
         "Console" => console::CONSOLE_METHODS,
         "ChildProcess" => child_process::CHILD_PROCESS_METHODS,
+        "Sign" => &["update", "sign"],
+        "Verify" => &["update", "verify"],
+        "KeyObject" => &["export", "equals"],
+        "DiffieHellman" => &[
+            "generateKeys", "computeSecret", "getPrime", "getGenerator", "getPublicKey",
+            "getPrivateKey", "setPublicKey", "setPrivateKey",
+        ],
+        "ECDH" => &["generateKeys", "computeSecret", "getPublicKey", "getPrivateKey", "setPrivateKey"],
+        "X509Certificate" => &["toString"],
+        "MIMEType" => util::MIME_TYPE_METHODS,
+        "MIMEParams" => util::MIME_PARAMS_METHODS,
         t if stream_web::is_class(t) => stream_web::methods_for(t),
         _ => &[],
     };
@@ -549,6 +573,13 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
             stream::instance_call(tag, recv, method, args)
         }
         "Cipheriv" | "Decipheriv" => crypto::cipher_instance_call(tag, recv, method, &args),
+        "Sign" | "Verify" => crypto::sign_verify_instance_call(tag, recv, method, &args),
+        "KeyObject" => crypto::key_object_instance_call(recv, method, &args),
+        "DiffieHellman" => crypto::dh_instance_call(recv, method, &args),
+        "ECDH" => crypto::ecdh_instance_call(recv, method, &args),
+        "X509Certificate" => crypto::x509_instance_call(recv, method, &args),
+        "MIMEType" => util::mime_type_instance_call(recv, method, &args),
+        "MIMEParams" => util::mime_params_instance_call(recv, method, &args),
         "Blob" | "File" => buffer::blob_call(recv, method, &args),
         "ReadStream" => tty::instance_call(recv, method, &args),
         "Resolver" => dns::resolver_instance_call(recv, method, args),

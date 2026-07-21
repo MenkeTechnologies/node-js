@@ -131,6 +131,26 @@ subtle = "2.6"
 # dns: real recursive/system-config DNS resolution (resolve4/6/Mx/Txt/Cname/…).
 hickory-resolver = "0.24"
 
+# ── crypto (asymmetric): real RustCrypto backends for the `crypto` module ─────
+# RSA (keygen/sign/verify/OAEP+PKCS1), NIST P-256/P-384 ECDSA+ECDH, Ed25519,
+# X25519 ECDH, PKCS#8/SPKI/SEC1/PEM key encoding, X.509 parsing, primality
+# (checkPrime/generatePrime), Argon2 KDF.
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pem", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa", "ecdh", "pem", "pkcs8"] }
+ecdsa = "0.16"
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+signature = "2"
+pkcs8 = { version = "0.10", features = ["pem", "alloc"] }
+spki = "0.7"
+sec1 = "0.7"
+x509-cert = "0.2"
+num-prime = "0.4"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+const-oid = "0.9"
+
 # Arbitrary-precision integers backing JS `BigInt` (the `10n` literal + bigint
 # arithmetic). Same crates/versions pythonrs uses for its bignum path.
 num-bigint = "0.4"
