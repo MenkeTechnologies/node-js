@@ -86,6 +86,7 @@ use std::sync::Arc;
 /// `http2` module functions routed through `stdlib::call`.
 pub const METHODS: &[&str] = &[
     "createSecureServer", "createServer", "connect", "getDefaultSettings", "getPackedSettings",
+    "getUnpackedSettings",
 ];
 
 /// Instance method names for the `@@native` tags this module owns (exposed to
@@ -267,7 +268,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             only the HTTP/2 server (http2.createSecureServer) is implemented"
             .to_string()),
         "getDefaultSettings" => Ok(default_settings_object()),
-        "getPackedSettings" => Ok(super::buffer::from_bytes(&[])),
+        "getPackedSettings" => Ok(pack_settings(args)),
+        "getUnpackedSettings" => unpack_settings(args),
         _ => return None,
     })
 }
@@ -352,6 +354,95 @@ fn default_settings_object() -> Value {
         m.insert("maxConcurrentStreams".into(), Value::Float(100.0));
         h.new_object(m)
     })
+}
+
+// ── getPackedSettings / getUnpackedSettings (RFC 7540 §6.5.1 wire form) ───────
+
+/// Append one SETTINGS entry (2-byte identifier + 4-byte value, big-endian).
+fn push_setting(out: &mut Vec<u8>, id: u16, val: u32) {
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&val.to_be_bytes());
+}
+
+/// `http2.getPackedSettings(settings)` — serialize the SETTINGS values present on
+/// `settings` into the RFC 7540 §6.5.1 wire form (6 octets per entry: a 2-byte
+/// identifier followed by a 4-byte value, big-endian). Only keys actually present
+/// on the object are emitted, in the canonical identifier order (1..6) Node uses;
+/// this is the exact inverse of `getUnpackedSettings`.
+fn pack_settings(args: &[Value]) -> Value {
+    let settings = args.first().cloned().unwrap_or(Value::Undef);
+    let num = |key: &str| -> Option<u32> {
+        get_prop(&settings, key)
+            .filter(|v| !matches!(v, Value::Undef))
+            .map(|v| with_host(|h| h.to_number(&v)) as u32)
+    };
+    let mut out: Vec<u8> = Vec::new();
+    if let Some(v) = num("headerTableSize") {
+        push_setting(&mut out, 0x1, v);
+    }
+    if let Some(p) = get_prop(&settings, "enablePush").filter(|v| !matches!(v, Value::Undef)) {
+        let on = with_host(|h| h.truthy(&p));
+        push_setting(&mut out, 0x2, u32::from(on));
+    }
+    if let Some(v) = num("maxConcurrentStreams") {
+        push_setting(&mut out, 0x3, v);
+    }
+    if let Some(v) = num("initialWindowSize") {
+        push_setting(&mut out, 0x4, v);
+    }
+    if let Some(v) = num("maxFrameSize") {
+        push_setting(&mut out, 0x5, v);
+    }
+    if let Some(v) = num("maxHeaderListSize").or_else(|| num("maxHeaderSize")) {
+        push_setting(&mut out, 0x6, v);
+    }
+    super::buffer::from_bytes(&out)
+}
+
+/// `http2.getUnpackedSettings(buf)` — parse a packed SETTINGS payload (6 octets per
+/// entry: 2-byte identifier + 4-byte value, big-endian) back into a settings object
+/// (`{ headerTableSize, enablePush, maxConcurrentStreams, initialWindowSize,
+/// maxFrameSize, maxHeaderSize, maxHeaderListSize }`, only the keys present in the
+/// buffer). The inverse of `getPackedSettings`. Throws `ERR_HTTP2_INVALID_PACKED_
+/// SETTINGS_LENGTH` when the length is not a multiple of six.
+fn unpack_settings(args: &[Value]) -> Result<Value, String> {
+    let bytes = value_bytes(args.first());
+    if bytes.len() % 6 != 0 {
+        return Err("RangeError [ERR_HTTP2_INVALID_PACKED_SETTINGS_LENGTH]: \
+                    Packed settings length must be a multiple of six"
+            .to_string());
+    }
+    let mut m = IndexMap::new();
+    for chunk in bytes.chunks_exact(6) {
+        let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+        let val = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
+        match id {
+            0x1 => {
+                m.insert("headerTableSize".to_string(), Value::Float(val as f64));
+            }
+            0x2 => {
+                m.insert("enablePush".to_string(), Value::Bool(val != 0));
+            }
+            0x3 => {
+                m.insert("maxConcurrentStreams".to_string(), Value::Float(val as f64));
+            }
+            0x4 => {
+                m.insert("initialWindowSize".to_string(), Value::Float(val as f64));
+            }
+            0x5 => {
+                m.insert("maxFrameSize".to_string(), Value::Float(val as f64));
+            }
+            // Identifier 6 maps to BOTH `maxHeaderSize` and its `maxHeaderListSize`
+            // alias (Node emits both, in that order).
+            0x6 => {
+                m.insert("maxHeaderSize".to_string(), Value::Float(val as f64));
+                m.insert("maxHeaderListSize".to_string(), Value::Float(val as f64));
+            }
+            // Unknown identifiers are ignored per RFC 7540 §6.5.
+            _ => {}
+        }
+    }
+    Ok(with_host(|h| h.new_object(m)))
 }
 
 // ── http2.createSecureServer ─────────────────────────────────────────────────

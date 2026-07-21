@@ -14,21 +14,37 @@
 //!     through its callback `(error, stdout, stderr)` scheduled as a microtask
 //!     (`queue_micro`), matching Node's "callback fires after the current tick"
 //!     ordering. `stdout`/`stderr` are strings, as Node's `exec` default.
+//!   * `execFile(file, args, cb)` is `exec` without a shell — `file` is run
+//!     directly with the `args` array — and additionally returns a (non-live)
+//!     ChildProcess-shaped object carrying the collected result.
 //!   * `spawn(cmd, args)` runs the command to completion up front and returns a
 //!     minimal ChildProcess-shaped object carrying the already-collected
-//!     `pid`, `exitCode`, `stdout` and `stderr`. LIMITATION: because there is no
-//!     event loop at this layer, the returned object is NOT a live EventEmitter
-//!     — `.on('close'|'exit'|'data', …)` listeners registered by the caller
-//!     after `spawn` returns do not fire (the process has already finished and
-//!     its output is exposed as plain properties instead).
+//!     `pid`, `exitCode`, `stdout` and `stderr`. LIMITATION: because these run
+//!     synchronously, the returned object is not live — `.on('close'|'exit', …)`
+//!     listeners registered by the caller after the call do not fire (the
+//!     process has already finished and its output is exposed as properties).
+//!
+//! `fork(modulePath)` is the exception: it spawns THIS `node` executable on
+//! `modulePath` as a genuinely live child and returns a live ChildProcess
+//! emitter that fires `exit`/`close` when the process terminates and supports
+//! `.kill()`. Its IPC channel (`.send()` / `process.on('message')`) is NOT
+//! implemented — see the `fork` fn doc for why.
 
 use super::arg_str;
-use crate::host::with_host;
+use crate::host::{with_host, IoTask, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
-pub const METHODS: &[&str] = &["execSync", "spawnSync", "execFileSync", "exec", "spawn"];
+pub const METHODS: &[&str] =
+    &["execSync", "spawnSync", "execFileSync", "exec", "execFile", "spawn", "fork"];
+
+/// Instance method names for the `ChildProcess` `@@native` tag, exposed to
+/// `stdlib::instance_has_method` (property reads that yield a bound method).
+pub const CHILD_PROCESS_METHODS: &[&str] = &["kill", "send", "disconnect", "ref", "unref"];
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
@@ -36,9 +52,34 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "spawnSync" => spawn_sync(args),
         "execFileSync" => exec_file_sync(args),
         "exec" => exec(args),
+        "execFile" => exec_file(args),
         "spawn" => spawn(args),
+        "fork" => fork(args),
         _ => return None,
     })
+}
+
+// ── live ChildProcess registry (used by `fork`) ──────────────────────────────
+
+/// Process-global id source for live (`fork`ed) children.
+static NEXT_CHILD_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Main-thread record for a live child: its emitter object and a shared handle
+/// the waiter thread polls (`try_wait`) and `kill` signals through.
+struct ChildRec {
+    emitter: Value,
+    handle: Arc<Mutex<Option<Child>>>,
+}
+
+thread_local! {
+    static CHILDREN: std::cell::RefCell<std::collections::HashMap<u64, ChildRec>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Build a `ChildProcess`-shaped emitter object (tagged `@@native = "ChildProcess"`)
+/// carrying the given extra properties, sharing the EventEmitter shape.
+fn child_object(extra: IndexMap<String, Value>) -> Value {
+    super::net::new_emitter_object("ChildProcess", extra)
 }
 
 /// Result of running a child to completion: exit code (`None` if terminated by a
@@ -209,28 +250,235 @@ fn spawn(args: &[Value]) -> Result<Value, String> {
     let cmd_args = arg_array(args, 1);
     match run(&cmd, &cmd_args, None) {
         Ok(r) => {
-            // Allocate the Buffers before the outer `with_host` (from_bytes borrows
-            // the host itself — nesting would panic).
+            // Allocate the Buffers / null before building the map (`from_bytes` and
+            // `null` borrow the host — nesting inside another `with_host` panics).
             let stdout = super::buffer::from_bytes(&r.stdout);
             let stderr = super::buffer::from_bytes(&r.stderr);
-            Ok(with_host(|h| {
-                let mut m = IndexMap::new();
-                m.insert("pid".into(), Value::Float(r.pid as f64));
-                m.insert(
-                    "exitCode".into(),
-                    r.status
-                        .map(|c| Value::Float(c as f64))
-                        .unwrap_or_else(|| h.null()),
-                );
-                m.insert("signalCode".into(), h.null());
-                m.insert("killed".into(), Value::Bool(false));
-                m.insert("stdout".into(), stdout);
-                m.insert("stderr".into(), stderr);
-                h.new_object(m)
-            }))
+            let null = with_host(|h| h.null());
+            let mut m = IndexMap::new();
+            m.insert("pid".into(), Value::Float(r.pid as f64));
+            m.insert(
+                "exitCode".into(),
+                r.status.map(|c| Value::Float(c as f64)).unwrap_or_else(|| null.clone()),
+            );
+            m.insert("signalCode".into(), null);
+            m.insert("killed".into(), Value::Bool(false));
+            m.insert("connected".into(), Value::Bool(false));
+            m.insert("stdout".into(), stdout);
+            m.insert("stderr".into(), stderr);
+            Ok(child_object(m))
         }
         Err(e) => Err(format!("Error: spawn {cmd} {e}")),
     }
+}
+
+/// `execFile(file[, args][, options][, callback])` — like `exec` but WITHOUT a
+/// shell: `file` is run directly with the `args` array. Runs to completion, fires
+/// `callback(error, stdout, stderr)` (strings) as a microtask, and returns a
+/// (non-live) ChildProcess-shaped object carrying the collected result.
+fn exec_file(args: &[Value]) -> Result<Value, String> {
+    let file = arg_str(args, 0);
+    let cmd_args = arg_array(args, 1);
+    // Callback is the last function-shaped argument, if any.
+    let cb = args
+        .iter()
+        .rev()
+        .find(|v| with_host(|h| crate::host::is_callable(h, v)))
+        .cloned();
+
+    match run(&file, &cmd_args, None) {
+        Ok(r) => {
+            let stdout_buf = super::buffer::from_bytes(&r.stdout);
+            let stderr_buf = super::buffer::from_bytes(&r.stderr);
+            let null = with_host(|h| h.null());
+            if let Some(cb) = cb {
+                let so = String::from_utf8_lossy(&r.stdout).into_owned();
+                let se = String::from_utf8_lossy(&r.stderr).into_owned();
+                let err = if r.status == Some(0) {
+                    null.clone()
+                } else {
+                    let code = r.status.unwrap_or(-1);
+                    with_host(|h| h.new_str(format!("Error: Command failed: {file}\nexit code {code}")))
+                };
+                with_host(|h| {
+                    let so = h.new_str(so);
+                    let se = h.new_str(se);
+                    h.queue_micro(cb, vec![err, so, se]);
+                });
+            }
+            let mut m = IndexMap::new();
+            m.insert("pid".into(), Value::Float(r.pid as f64));
+            m.insert(
+                "exitCode".into(),
+                r.status.map(|c| Value::Float(c as f64)).unwrap_or_else(|| null.clone()),
+            );
+            m.insert("signalCode".into(), null);
+            m.insert("killed".into(), Value::Bool(false));
+            m.insert("connected".into(), Value::Bool(false));
+            m.insert("stdout".into(), stdout_buf);
+            m.insert("stderr".into(), stderr_buf);
+            Ok(child_object(m))
+        }
+        Err(e) => {
+            if let Some(cb) = cb {
+                let msg = with_host(|h| h.new_str(format!("Error: spawn {file} {e}")));
+                let empty1 = with_host(|h| h.new_str(""));
+                let empty2 = with_host(|h| h.new_str(""));
+                with_host(|h| h.queue_micro(cb, vec![msg, empty1, empty2]));
+            }
+            Err(format!("Error: spawn {file} {e}"))
+        }
+    }
+}
+
+/// `fork(modulePath[, args][, options])` — spawn THIS `node` executable on
+/// `modulePath` as a live child (inheriting stdio), returning a live
+/// ChildProcess emitter that fires `exit`/`close` when the child terminates.
+///
+/// LIMITATION: Node's `fork` also opens an IPC channel so parent and child can
+/// exchange messages via `child.send()` / `process.on('message')`. That requires
+/// the child `node` process to detect and bind an inherited IPC file descriptor,
+/// which this runtime does not implement — so `child.send()` is a no-op that
+/// returns `false`, `child.connected` is `false`, and no `'message'` event fires.
+/// The process itself is real and live (`exit`/`close`/`kill` all work).
+fn fork(args: &[Value]) -> Result<Value, String> {
+    let module = arg_str(args, 0);
+    let extra_args = arg_array(args, 1);
+    let exe = std::env::current_exe().map_err(|e| format!("Error: fork: {e}"))?;
+
+    let mut cmd = Command::new(exe);
+    cmd.arg(&module).args(&extra_args);
+    cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let child = cmd.spawn().map_err(|e| format!("Error: fork {module} {e}"))?;
+    let pid = child.id();
+
+    let id = NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed);
+    let handle = Arc::new(Mutex::new(Some(child)));
+
+    let mut extra = IndexMap::new();
+    extra.insert("@@childid".into(), Value::Float(id as f64));
+    extra.insert("pid".into(), Value::Float(pid as f64));
+    extra.insert("connected".into(), Value::Bool(false));
+    extra.insert("killed".into(), Value::Bool(false));
+    extra.insert("exitCode".into(), with_host(|h| h.null()));
+    extra.insert("signalCode".into(), with_host(|h| h.null()));
+    let emitter = child_object(extra);
+    CHILDREN.with(|c| {
+        c.borrow_mut().insert(id, ChildRec { emitter: emitter.clone(), handle: handle.clone() });
+    });
+    with_host(|h| h.incr_handle());
+
+    let io_tx = with_host(|h| h.io_sender());
+    std::thread::spawn(move || wait_child(id, handle, io_tx));
+    Ok(emitter)
+}
+
+/// Background waiter for a `fork`ed child: polls `try_wait` (so `kill` can still
+/// acquire the shared handle between polls) and posts an `IoTask` emitting
+/// `exit`/`close` once the child terminates.
+fn wait_child(id: u64, handle: Arc<Mutex<Option<Child>>>, io_tx: Sender<IoTask>) {
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let status = {
+            let mut g = match handle.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match g.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(status)) => {
+                        *g = None;
+                        Some(status.code())
+                    }
+                    Ok(None) => None,
+                    Err(_) => {
+                        *g = None;
+                        Some(None)
+                    }
+                },
+                // Handle already taken (killed + reaped elsewhere): stop polling.
+                None => return,
+            }
+        };
+        if let Some(code) = status {
+            let _ = io_tx.send(Box::new(move || on_child_exit(id, code)));
+            return;
+        }
+    }
+}
+
+/// Main-thread handler: emit `exit` then `close` on a terminated child, mark it,
+/// release its event-loop handle, and drop its registry record.
+fn on_child_exit(id: u64, code: Option<i32>) -> Result<(), String> {
+    let emitter = CHILDREN.with(|c| c.borrow().get(&id).map(|r| r.emitter.clone()));
+    let Some(emitter) = emitter else { return Ok(()) };
+    let (code_val, null1, null2) = with_host(|h| {
+        let cv = code.map(|c| Value::Float(c as f64)).unwrap_or_else(|| h.null());
+        (cv, h.null(), h.null())
+    });
+    set_prop(&emitter, "exitCode", code_val.clone());
+    set_prop(&emitter, "killed", Value::Bool(true));
+    let ev_exit = with_host(|h| h.new_str("exit"));
+    let ev_close = with_host(|h| h.new_str("close"));
+    super::events::instance_call(&emitter, "emit", vec![ev_exit, code_val.clone(), null1])?;
+    super::events::instance_call(&emitter, "emit", vec![ev_close, code_val, null2])?;
+    CHILDREN.with(|c| c.borrow_mut().remove(&id));
+    with_host(|h| h.decr_handle());
+    let _ = with_host(|h| h.io_sender()).send(Box::new(|| Ok(())));
+    Ok(())
+}
+
+fn set_prop(recv: &Value, key: &str, val: Value) {
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+            p.insert(key.to_string(), val);
+        }
+    });
+}
+
+// ── ChildProcess instance methods (tag `@@native = "ChildProcess"`) ──────────
+
+/// `stdlib::instance_call` entry for a `ChildProcess` receiver. EventEmitter
+/// methods delegate to `events`; process-control methods act on the live child
+/// (only `fork`ed children are live — a `spawn`/`execFile` result has already
+/// exited, so `kill` is a no-op there).
+pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    match method {
+        "on" | "addListener" | "prependListener" | "once" | "prependOnceListener" | "emit"
+        | "removeListener" | "off" | "removeAllListeners" | "listenerCount" | "eventNames"
+        | "setMaxListeners" | "getMaxListeners" | "listeners" => {
+            super::events::instance_call(recv, method, args)
+        }
+        "kill" => Ok(Value::Bool(kill_child(recv))),
+        // IPC is not implemented (see `fork` doc): `send` cannot deliver a message.
+        "send" => Ok(Value::Bool(false)),
+        "disconnect" => {
+            set_prop(recv, "connected", Value::Bool(false));
+            Ok(Value::Undef)
+        }
+        "ref" | "unref" => Ok(recv.clone()),
+        _ => Err(crate::host::type_error(&format!("child.{method} is not a function"))),
+    }
+}
+
+/// Terminate a live (`fork`ed) child. The signal argument is accepted for API
+/// compatibility but ignored — `std::process::Child::kill` always sends `SIGKILL`.
+/// Returns `true` if a live child was signalled.
+fn kill_child(recv: &Value) -> bool {
+    let id = with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) => p.get("@@childid").map(|v| h.to_number(v) as u64),
+        _ => None,
+    });
+    let Some(id) = id else { return false };
+    let handle = CHILDREN.with(|c| c.borrow().get(&id).map(|r| r.handle.clone()));
+    let Some(handle) = handle else { return false };
+    if let Ok(mut g) = handle.lock() {
+        if let Some(child) = g.as_mut() {
+            let _ = child.kill();
+            return true;
+        }
+    }
+    false
 }
 
 /// Bytes → a `Buffer` value (default) or a decoded string when `encoding` is set

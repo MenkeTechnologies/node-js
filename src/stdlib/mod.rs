@@ -59,6 +59,10 @@ pub mod cluster;
 pub mod domain;
 pub mod http2;
 pub mod trace_events;
+pub mod node_module;
+pub mod stream_consumers;
+pub mod stream_promises;
+pub mod stream_web;
 
 /// Native-heavy core modules that node-js does not yet implement (TLS handshakes,
 /// HTTP/2 framing, OS worker threads sharing the thread-local heap, UDP sockets,
@@ -129,6 +133,10 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "domain" => Some("domain"),
         "http2" => Some("http2"),
         "trace_events" => Some("trace_events"),
+        "module" => Some("module"),
+        "stream/consumers" => Some("stream/consumers"),
+        "stream/promises" => Some("stream/promises"),
+        "stream/web" => Some("stream/web"),
         other => UNIMPLEMENTED_MODULES.iter().copied().find(|&m| m == other),
     }
 }
@@ -192,6 +200,10 @@ pub fn is_method(qualified: &str) -> bool {
         "domain" => domain::METHODS.contains(&m),
         "http2" => http2::METHODS.contains(&m),
         "trace_events" => trace_events::METHODS.contains(&m),
+        "module" => node_module::METHODS.contains(&m),
+        "Module" => node_module::MODULE_STATIC_METHODS.contains(&m),
+        "stream/consumers" => stream_consumers::METHODS.contains(&m),
+        "stream/promises" => stream_promises::is_method(m),
         // Any method on an unimplemented namespace routes to `call`, which throws
         // an honest "not implemented" error (so `mod.foo()` fails clearly rather
         // than silently returning undefined).
@@ -273,6 +285,10 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "domain" => domain::call(m, args)?,
         "http2" => http2::call(m, args)?,
         "trace_events" => trace_events::call(m, args)?,
+        "module" => node_module::call(m, args)?,
+        "Module" => node_module::static_call(m, args)?,
+        "stream/consumers" => stream_consumers::call(m, args)?,
+        "stream/promises" => stream_promises::call(m, args)?,
         _ if is_unimplemented(ns) => {
             Err(format!("Error: {ns}.{m} is not implemented in node-js"))
         }
@@ -340,6 +356,9 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "cluster" => cluster::constant(name),
         "domain" => domain::constant(name),
         "http2" => http2::constant(name),
+        "module" => node_module::constant(name),
+        "Module" => node_module::static_constant(name),
+        "stream/web" => stream_web::constant(name),
         "util" if name == "types" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("util/types".into()))))
         }
@@ -385,6 +404,8 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // net/http constructors: their `construct` already returns Option<Result>.
         "Socket" | "Stream" | "Server" | "SocketAddress" | "BlockList" => net::construct(name, args),
         "Agent" | "http.Server" => http::construct(name, args),
+        // stream/web WHATWG classes (its `construct` returns Option<Result>).
+        n if stream_web::is_class(n) => stream_web::construct(n, args),
         _ => None,
     }
 }
@@ -470,6 +491,8 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "Serializer" => v8::SERIALIZER_METHODS,
         "Deserializer" => v8::DESERIALIZER_METHODS,
         "Console" => console::CONSOLE_METHODS,
+        "ChildProcess" => child_process::CHILD_PROCESS_METHODS,
+        t if stream_web::is_class(t) => stream_web::methods_for(t),
         _ => &[],
     };
     let is_emitter = matches!(
@@ -478,7 +501,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
             | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" | "UdpSocket"
             | "Worker" | "MessagePort" | "TLSServer" | "TLSSocket" | "HTTPSServerResponse"
             | "HTTPSClientRequest" | "ClusterWorker" | "Domain" | "Http2Server" | "Http2Stream"
-            | "Http2Session" | "ClientRequest" | "FSReadStream" | "FSWriteStream"
+            | "Http2Session" | "ClientRequest" | "FSReadStream" | "FSWriteStream" | "ChildProcess"
     );
     base.contains(&name) || (is_emitter && EMITTER.contains(&name))
 }
@@ -535,6 +558,8 @@ pub fn instance_call(tag: &str, recv: &Value, method: &str, args: Vec<Value>) ->
         "TracingChannel" => diagnostics_channel::tracing_instance_call(recv, method, &args),
         "Serializer" | "Deserializer" => v8::instance_call(tag, recv, method, args),
         "Console" => console::instance_call(recv, method, args),
+        "ChildProcess" => child_process::instance_call(recv, method, args),
+        t if stream_web::is_class(t) => stream_web::instance_call(t, recv, method, args),
         "AsyncLocalStorage" | "AsyncHook" => async_hooks::instance_call(tag, recv, method, args),
         "Channel" => diagnostics_channel::instance_call(recv, method, &args),
         "WriteStream" => process::stream_instance_call(recv, method, &args),

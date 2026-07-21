@@ -35,7 +35,42 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 /// `tls` module functions routed through `stdlib::call`.
-pub const MODULE_METHODS: &[&str] = &["connect", "createServer", "createSecureContext"];
+pub const MODULE_METHODS: &[&str] = &[
+    "connect",
+    "createServer",
+    "createSecureContext",
+    "checkServerIdentity",
+    "convertALPNProtocols",
+    "getCiphers",
+    "getCACertificates",
+    "setDefaultCACertificates",
+    "getCertificateCompressionAlgorithms",
+];
+
+/// The standard OpenSSL cipher-suite names (lowercase) reported by
+/// `tls.getCiphers()`, matching Node v26's fixed list (TLS 1.2 suites plus the
+/// `tls_*` TLS 1.3 suites). A fixed protocol constant, not a runtime value.
+const CIPHERS: &[&str] = &[
+    "aes128-gcm-sha256", "aes128-sha", "aes128-sha256", "aes256-gcm-sha384", "aes256-sha",
+    "aes256-sha256", "dhe-psk-aes128-cbc-sha", "dhe-psk-aes128-cbc-sha256",
+    "dhe-psk-aes128-gcm-sha256", "dhe-psk-aes256-cbc-sha", "dhe-psk-aes256-cbc-sha384",
+    "dhe-psk-aes256-gcm-sha384", "dhe-psk-chacha20-poly1305", "dhe-rsa-aes128-gcm-sha256",
+    "dhe-rsa-aes128-sha", "dhe-rsa-aes128-sha256", "dhe-rsa-aes256-gcm-sha384", "dhe-rsa-aes256-sha",
+    "dhe-rsa-aes256-sha256", "dhe-rsa-chacha20-poly1305", "ecdhe-ecdsa-aes128-gcm-sha256",
+    "ecdhe-ecdsa-aes128-sha", "ecdhe-ecdsa-aes128-sha256", "ecdhe-ecdsa-aes256-gcm-sha384",
+    "ecdhe-ecdsa-aes256-sha", "ecdhe-ecdsa-aes256-sha384", "ecdhe-ecdsa-chacha20-poly1305",
+    "ecdhe-psk-aes128-cbc-sha", "ecdhe-psk-aes128-cbc-sha256", "ecdhe-psk-aes256-cbc-sha",
+    "ecdhe-psk-aes256-cbc-sha384", "ecdhe-psk-chacha20-poly1305", "ecdhe-rsa-aes128-gcm-sha256",
+    "ecdhe-rsa-aes128-sha", "ecdhe-rsa-aes128-sha256", "ecdhe-rsa-aes256-gcm-sha384",
+    "ecdhe-rsa-aes256-sha", "ecdhe-rsa-aes256-sha384", "ecdhe-rsa-chacha20-poly1305",
+    "psk-aes128-cbc-sha", "psk-aes128-cbc-sha256", "psk-aes128-gcm-sha256", "psk-aes256-cbc-sha",
+    "psk-aes256-cbc-sha384", "psk-aes256-gcm-sha384", "psk-chacha20-poly1305", "rsa-psk-aes128-cbc-sha",
+    "rsa-psk-aes128-cbc-sha256", "rsa-psk-aes128-gcm-sha256", "rsa-psk-aes256-cbc-sha",
+    "rsa-psk-aes256-cbc-sha384", "rsa-psk-aes256-gcm-sha384", "rsa-psk-chacha20-poly1305",
+    "srp-aes-128-cbc-sha", "srp-aes-256-cbc-sha", "srp-rsa-aes-128-cbc-sha", "srp-rsa-aes-256-cbc-sha",
+    "tls_aes_128_ccm_8_sha256", "tls_aes_128_ccm_sha256", "tls_aes_128_gcm_sha256",
+    "tls_aes_256_gcm_sha384", "tls_chacha20_poly1305_sha256",
+];
 
 /// Instance method names for the two `@@native` tags this module owns, exposed to
 /// `stdlib::instance_has_method` (property reads that yield a bound method).
@@ -98,6 +133,10 @@ thread_local! {
     static PENDING_CONFIGS: std::cell::RefCell<Vec<(Value, Arc<ServerConfig>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static PENDING_HOOKS: std::cell::RefCell<Vec<(Value, ConnHook)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// User-supplied default CA certificates (PEM strings) set via
+    /// `setDefaultCACertificates`; read back by `getCACertificates('default')`.
+    static DEFAULT_CA_CERTS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -168,8 +207,153 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             }
             h.new_object(m)
         }))),
+        "checkServerIdentity" => Some(check_server_identity(args)),
+        "convertALPNProtocols" => Some(convert_alpn_protocols(args)),
+        "getCiphers" => Some(Ok(with_host(|h| {
+            let items = CIPHERS.iter().map(|c| h.new_str(*c)).collect();
+            h.new_array(items)
+        }))),
+        "getCACertificates" => Some(get_ca_certificates(args)),
+        "setDefaultCACertificates" => Some(set_default_ca_certificates(args)),
+        // rustls' default configuration does not negotiate TLS certificate
+        // compression (RFC 8879), so no algorithm is actually supported. Node v26
+        // likewise returns `[]` here.
+        "getCertificateCompressionAlgorithms" => Some(Ok(with_host(|h| h.new_array(Vec::new())))),
         _ => None,
     }
+}
+
+// ── tls.checkServerIdentity / ALPN / CA certificates ─────────────────────────
+
+/// Read an array of strings (or a single string) from a value; Buffers/other
+/// element types are stringified. Empty when the value is absent or not iterable.
+fn read_string_array(v: Option<&Value>) -> Vec<String> {
+    let Some(v) = v else { return Vec::new() };
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Array(items)) => items.iter().map(|x| h.str_of(x)).collect(),
+        _ if h.as_str(v).is_some() => vec![h.str_of(v)],
+        _ => Vec::new(),
+    })
+}
+
+/// Does `host` match the certificate identity `pattern`, honouring a single
+/// leftmost-label wildcard (`*.example.com` matches `a.example.com` but not
+/// `example.com` nor `a.b.example.com`)? Case-insensitive.
+fn host_matches(host: &str, pattern: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        // Wildcard covers exactly one leftmost label.
+        match host.split_once('.') {
+            Some((_, rest)) => rest == suffix,
+            None => false,
+        }
+    } else {
+        host == pattern
+    }
+}
+
+/// `tls.checkServerIdentity(hostname, cert)` — best-effort string comparison of
+/// `hostname` against the certificate's `subjectaltname` DNS entries (falling
+/// back to `subject.CN` when no SAN is present). Returns `undefined` on a match,
+/// or an `ERR_TLS_CERT_ALTNAME_INVALID`-shaped Error object on mismatch.
+fn check_server_identity(args: &[Value]) -> Result<Value, String> {
+    let host = super::arg_str(args, 0);
+    let cert = args.get(1).cloned().unwrap_or(Value::Undef);
+
+    // Collect DNS altnames from `subjectaltname` ("DNS:a.com, DNS:*.b.com").
+    let altname_str = get_prop(&cert, "subjectaltname")
+        .filter(|v| with_host(|h| h.as_str(v)).is_some())
+        .map(|v| with_host(|h| h.str_of(&v)))
+        .unwrap_or_default();
+    let dns_names: Vec<String> = altname_str
+        .split(',')
+        .filter_map(|e| e.trim().strip_prefix("DNS:").map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let matched = if !dns_names.is_empty() {
+        dns_names.iter().any(|p| host_matches(&host, p))
+    } else {
+        // No SAN: fall back to the subject Common Name.
+        let cn = get_prop(&cert, "subject")
+            .and_then(|s| get_prop(&s, "CN"))
+            .filter(|v| with_host(|h| h.as_str(v)).is_some())
+            .map(|v| with_host(|h| h.str_of(&v)))
+            .unwrap_or_default();
+        !cn.is_empty() && host_matches(&host, &cn)
+    };
+
+    if matched {
+        return Ok(Value::Undef);
+    }
+    let reason = if !altname_str.is_empty() {
+        format!("Host: {host}. is not in the cert's altnames: {altname_str}")
+    } else {
+        format!("Host: {host}. is not cert's CN")
+    };
+    let message = format!("Hostname/IP does not match certificate's altnames: {reason}");
+    Ok(with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("message".into(), h.new_str(message));
+        m.insert("reason".into(), h.new_str(reason));
+        m.insert("host".into(), h.new_str(host));
+        m.insert("code".into(), h.new_str("ERR_TLS_CERT_ALTNAME_INVALID"));
+        m.insert("cert".into(), cert);
+        h.new_object(m)
+    }))
+}
+
+/// `tls.convertALPNProtocols(protocols, out)` — encode `protocols` into the wire
+/// format (each entry prefixed by a single length byte), store it on
+/// `out.ALPNProtocols` as a Buffer, and return that Buffer.
+fn convert_alpn_protocols(args: &[Value]) -> Result<Value, String> {
+    let protocols = read_string_array(args.first());
+    let mut wire = Vec::new();
+    for p in &protocols {
+        let bytes = p.as_bytes();
+        // Node clamps to 255 (a single length byte); over-long entries throw, but
+        // best-effort here simply truncates the encoded length.
+        wire.push(bytes.len().min(255) as u8);
+        wire.extend_from_slice(&bytes[..bytes.len().min(255)]);
+    }
+    let buf = super::buffer::from_bytes(&wire);
+    if let Some(out) = args.get(1).filter(|v| matches!(v, Value::Obj(_))) {
+        set_prop(out, "ALPNProtocols", buf.clone());
+    }
+    Ok(buf)
+}
+
+/// `tls.getCACertificates([type])` — return PEM strings for the requested store.
+///
+/// LIMITATION: the bundled `'default'` Mozilla store cannot be reproduced from
+/// `webpki-roots`, which ships extracted *trust anchors* (subject + SPKI + name
+/// constraints), not full X.509 certificates — so no faithful PEM can be built
+/// from them. `'default'` therefore returns whatever was installed via
+/// `setDefaultCACertificates` (empty until then); `'system'`/`'extra'`/`'bundled'`
+/// return `[]`.
+fn get_ca_certificates(args: &[Value]) -> Result<Value, String> {
+    let kind = if args.is_empty() {
+        "default".to_string()
+    } else {
+        super::arg_str(args, 0)
+    };
+    let certs: Vec<String> = match kind.as_str() {
+        "default" => DEFAULT_CA_CERTS.with(|c| c.borrow().clone()),
+        _ => Vec::new(),
+    };
+    Ok(with_host(|h| {
+        let items = certs.into_iter().map(|c| h.new_str(c)).collect();
+        h.new_array(items)
+    }))
+}
+
+/// `tls.setDefaultCACertificates(certs)` — store `certs` (PEM strings or Buffers)
+/// as the process default CA set for later `getCACertificates('default')` reads.
+fn set_default_ca_certificates(args: &[Value]) -> Result<Value, String> {
+    let certs = read_string_array(args.first());
+    DEFAULT_CA_CERTS.with(|c| *c.borrow_mut() = certs);
+    Ok(Value::Undef)
 }
 
 // ── TLS crypto config ────────────────────────────────────────────────────────

@@ -41,6 +41,10 @@ pub const METHODS: &[&str] = &[
     "createHistogram",
     "eventLoopUtilization",
     "monitorEventLoopDelay",
+    "timerify",
+    // Internal hook the `timerify` wrapper calls to deliver its 'function' entry
+    // (hidden `@@` name — not a user-facing method, only reachable by the wrapper).
+    "@@timerify_record",
 ];
 
 /// Methods dispatched on an `@@native = "Histogram"` object (from
@@ -160,8 +164,72 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // (it stays empty until values are `record`ed manually). `enable`/`disable`
         // are no-ops. Honest empty data, never a fabricated delay distribution.
         "monitorEventLoopDelay" => Ok(new_histogram()),
+        "timerify" => timerify(args),
+        "@@timerify_record" => Ok(timerify_record(args)),
         _ => return None,
     })
+}
+
+// ── timerify ──────────────────────────────────────────────────────────────────
+// `performance.timerify(fn)` wraps `fn` so each call records a 'function'
+// PerformanceEntry (name = `fn.name`, duration = call time). The wrapper is a REAL
+// JS closure compiled + invoked here (the same re-entrant factory technique
+// `util.promisify` uses), closing over the original function and a native record
+// hook (`Builtin("performance.@@timerify_record")`). Node delivers 'function'
+// entries to subscribed PerformanceObservers only — they are NOT retained on the
+// global timeline (`performance.getEntriesByType('function')` is empty in v26) — so
+// the hook notifies observers without buffering the entry.
+
+/// Compile a single JS expression and run it on the current host, returning its
+/// completion value (re-entrant-safe; mirrors `util`'s `run_completion`).
+fn run_completion(src: &str) -> Result<Value, String> {
+    let prog = crate::compile_completion(src)?;
+    let chunk = crate::load_merged(prog);
+    crate::host::run_chunk_on(chunk)
+}
+
+const TIMERIFY_SRC: &str = "(function(original, record){\n\
+  var perf = require('perf_hooks').performance;\n\
+  return function(){\n\
+    var start = perf.now();\n\
+    try {\n\
+      return original.apply(this, arguments);\n\
+    } finally {\n\
+      record(original.name || '', start, perf.now());\n\
+    }\n\
+  };\n\
+})";
+
+/// `performance.timerify(fn[, options])` → a wrapped `fn` that records a 'function'
+/// `PerformanceEntry` (its call duration) on every invocation.
+fn timerify(args: &[Value]) -> Result<Value, String> {
+    let orig = args.first().cloned().unwrap_or(Value::Undef);
+    if !with_host(|h| crate::host::is_callable(h, &orig)) {
+        return Err(
+            "TypeError [ERR_INVALID_ARG_TYPE]: The \"fn\" argument must be of type function".into(),
+        );
+    }
+    let factory = run_completion(TIMERIFY_SRC)?;
+    let record = with_host(|h| h.alloc(JsObj::Builtin("performance.@@timerify_record".into())));
+    crate::host::invoke(&factory, vec![orig, record], None)
+}
+
+/// Native hook invoked by the `timerify` wrapper `(name, startTime, endTime)`:
+/// deliver a 'function' entry (call duration) to subscribed observers. Not stored
+/// on the global timeline — matching Node v26, where function entries reach
+/// observers only.
+fn timerify_record(args: &[Value]) -> Value {
+    let name = super::arg_str(args, 0);
+    let start = super::arg_num(args, 1);
+    let end = super::arg_num(args, 2);
+    let e = Entry {
+        name,
+        entry_type: "function",
+        start_time: start,
+        duration: (end - start).max(0.0),
+    };
+    notify_observers(&e);
+    Value::Undef
 }
 
 /// `new PerformanceObserver(callback)` — build an observer holding its callback,
