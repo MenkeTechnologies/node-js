@@ -3746,53 +3746,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         }
         "sort" => {
             let mut items = array_items(recv);
-            let cmp = args.first().cloned();
-            // Insertion sort so we can call the (fallible) JS comparator.
-            let mut err: Option<String> = None;
-            for i in 1..items.len() {
-                let mut j = i;
-                while j > 0 {
-                    let order = match &cmp {
-                        Some(cb) => {
-                            match host::invoke(
-                                cb,
-                                vec![items[j - 1].clone(), items[j].clone()],
-                                None,
-                            ) {
-                                Ok(v) => with_host(|h| h.to_number(&v)),
-                                Err(e) => {
-                                    err = Some(e);
-                                    0.0
-                                }
-                            }
-                        }
-                        None => {
-                            let a = with_host(|h| h.str_of(&items[j - 1]));
-                            let b = with_host(|h| h.str_of(&items[j]));
-                            if a > b {
-                                1.0
-                            } else {
-                                -1.0
-                            }
-                        }
-                    };
-                    if err.is_some() {
-                        break;
-                    }
-                    if order > 0.0 {
-                        items.swap(j - 1, j);
-                        j -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                if err.is_some() {
-                    break;
-                }
-            }
-            if let Some(e) = err {
-                return Err(e);
-            }
+            sort_values(&mut items, args.first())?;
             with_host(|h| {
                 if let Some(JsObj::Array(a)) = h.get_mut(recv) {
                     *a = items;
@@ -3800,15 +3754,67 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             });
             Ok(recv.clone())
         }
-        "flat" => {
-            let items = array_items(recv);
-            let mut out = Vec::new();
-            for it in items {
-                match with_host(|h| h.get(&it).cloned()) {
-                    Some(JsObj::Array(inner)) => out.extend(inner),
-                    _ => out.push(it),
+        // ES2023 change-by-copy: sort a fresh copy, leaving the receiver untouched.
+        "toSorted" => {
+            let mut items = array_items(recv);
+            sort_values(&mut items, args.first())?;
+            Ok(with_host(|h| h.new_array(items)))
+        }
+        "toReversed" => {
+            let mut items = array_items(recv);
+            items.reverse();
+            Ok(with_host(|h| h.new_array(items)))
+        }
+        "toSpliced" => {
+            let mut items = array_items(recv);
+            let len = items.len();
+            let start = {
+                let s = arg_num(&args, 0);
+                if s < 0.0 {
+                    ((len as f64 + s).max(0.0)) as usize
+                } else {
+                    (s as usize).min(len)
                 }
+            };
+            let delete = if args.len() >= 2 {
+                (arg_num(&args, 1).max(0.0) as usize).min(len - start)
+            } else if args.is_empty() {
+                0
+            } else {
+                len - start
+            };
+            let inserts: Vec<Value> = args.iter().skip(2).cloned().collect();
+            items.splice(start..start + delete, inserts);
+            Ok(with_host(|h| h.new_array(items)))
+        }
+        "with" => {
+            let mut items = array_items(recv);
+            let len = items.len() as i64;
+            let rel = arg_num(&args, 0) as i64;
+            let idx = if rel < 0 { len + rel } else { rel };
+            if idx < 0 || idx >= len {
+                return Err(host::range_error(&format!("Invalid index : {rel}")));
             }
+            items[idx as usize] = args.get(1).cloned().unwrap_or(Value::Undef);
+            Ok(with_host(|h| h.new_array(items)))
+        }
+        "flat" => {
+            // depth defaults to 1; `Infinity` flattens fully. ToIntegerOrInfinity:
+            // NaN → 0, otherwise truncate toward zero (negatives act as 0).
+            let raw = if args.is_empty() {
+                1.0
+            } else {
+                arg_num(&args, 0)
+            };
+            let depth = if raw.is_nan() {
+                0.0
+            } else if raw.is_infinite() {
+                raw
+            } else {
+                raw.trunc()
+            };
+            let mut out = Vec::new();
+            flatten_into(array_items(recv), depth, &mut out);
             Ok(with_host(|h| h.new_array(out)))
         }
         "keys" => {
@@ -3840,6 +3846,58 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             Ok(with_host(|h| h.new_str(s)))
         }
         _ => Err(host::type_error(&format!("{name} is not a function"))),
+    }
+}
+
+/// In-place sort of `items` (shared by `sort` and `toSorted`). Uses insertion
+/// sort so the fallible JS comparator can be called; default order is by the
+/// string form of each element. Propagates a comparator error.
+fn sort_values(items: &mut [Value], cmp: Option<&Value>) -> Result<(), String> {
+    for i in 1..items.len() {
+        let mut j = i;
+        while j > 0 {
+            let order = match cmp {
+                Some(cb) => {
+                    let v = host::invoke(cb, vec![items[j - 1].clone(), items[j].clone()], None)?;
+                    with_host(|h| h.to_number(&v))
+                }
+                None => {
+                    let a = with_host(|h| h.str_of(&items[j - 1]));
+                    let b = with_host(|h| h.str_of(&items[j]));
+                    if a > b {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                }
+            };
+            if order > 0.0 {
+                items.swap(j - 1, j);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively flatten `items` up to `depth` levels into `out`. `depth` is an
+/// f64 so `Infinity` (full flatten) and finite counts share one path.
+fn flatten_into(items: Vec<Value>, depth: f64, out: &mut Vec<Value>) {
+    for it in items {
+        let inner = if depth > 0.0 {
+            match with_host(|h| h.get(&it).cloned()) {
+                Some(JsObj::Array(inner)) => Some(inner),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match inner {
+            Some(inner) => flatten_into(inner, depth - 1.0, out),
+            None => out.push(it),
+        }
     }
 }
 
@@ -4342,26 +4400,113 @@ fn to_precision(n: f64, p: usize) -> String {
     }
 }
 
+/// `Number.prototype.toString(radix)` for radix 2..=36 (radix 10 goes through
+/// `fmt_number`). Faithful port of V8's `DoubleToRadixCString`: the integer part
+/// is emitted exact, and fractional digits are produced up to the input double's
+/// precision (terminating via a ULP-sized `delta`), with round-half-to-even and
+/// carry-over back into already-written digits (and into the integer part).
 fn to_radix(n: f64, radix: u32) -> String {
     if !n.is_finite() {
         return host::fmt_number(n);
     }
-    let neg = n < 0.0;
-    let mut i = n.abs().trunc() as u64;
-    if i == 0 {
-        return "0".into();
-    }
     let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut out = Vec::new();
-    while i > 0 {
-        out.push(digits[(i % radix as u64) as usize]);
-        i /= radix as u64;
+    let rf = radix as f64;
+    let neg = n < 0.0;
+    let value = n.abs();
+
+    let mut integer = value.floor();
+    let mut fraction = value - integer;
+
+    // Fraction digits, most-significant first.
+    let mut frac: Vec<u8> = Vec::new();
+    // Only compute fractional digits down to the input double's precision.
+    let mut delta = 0.5 * (next_up(value) - value);
+    delta = delta.max(next_up(0.0));
+    if fraction >= delta {
+        loop {
+            // Shift up by one digit.
+            fraction *= rf;
+            delta *= rf;
+            let digit = fraction as usize;
+            frac.push(digits[digit]);
+            fraction -= digit as f64;
+            // Round to even.
+            if fraction > 0.5 || (fraction == 0.5 && (digit & 1) == 1) {
+                if fraction + delta > 1.0 {
+                    // Carry-over: back-trace already-written fraction digits.
+                    loop {
+                        match frac.pop() {
+                            None => {
+                                // Carried past the point into the integer part.
+                                integer += 1.0;
+                                break;
+                            }
+                            Some(c) => {
+                                let d = if c > b'9' {
+                                    (c - b'a' + 10) as u32
+                                } else {
+                                    (c - b'0') as u32
+                                };
+                                if d + 1 < radix {
+                                    frac.push(digits[(d + 1) as usize]);
+                                    break;
+                                }
+                                // digit was radix-1: drop it and keep carrying.
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            if fraction < delta {
+                break;
+            }
+        }
     }
+
+    // Integer digits, least-significant first (reversed at the end).
+    let mut int_out: Vec<u8> = Vec::new();
+    // For magnitudes ≥ 2^53, `fmod` loses low bits: pre-fill trailing zeros.
+    while v8_exponent(integer / rf) > 0 {
+        integer /= rf;
+        int_out.push(b'0');
+    }
+    loop {
+        let remainder = integer % rf;
+        int_out.push(digits[remainder as usize]);
+        integer = (integer - remainder) / rf;
+        if integer <= 0.0 {
+            break;
+        }
+    }
+    int_out.reverse();
+
+    let mut out: Vec<u8> = Vec::new();
     if neg {
         out.push(b'-');
     }
-    out.reverse();
+    out.extend_from_slice(&int_out);
+    if !frac.is_empty() {
+        out.push(b'.');
+        out.extend_from_slice(&frac);
+    }
     String::from_utf8(out).unwrap()
+}
+
+/// Next representable f64 above `x` (`x` finite, `x ≥ 0`) — V8's `NextDouble`.
+fn next_up(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() + 1)
+}
+
+/// V8's `Double::Exponent`: the binary exponent of the significand-scaled value
+/// (`> 0` iff |x| ≥ 2^53). Used to detect integers past `fmod`'s exact range.
+fn v8_exponent(x: f64) -> i32 {
+    let biased = ((x.to_bits() >> 52) & 0x7ff) as i32;
+    if biased == 0 {
+        -1074 // denormal
+    } else {
+        biased - 1075
+    }
 }
 
 // ══ Map / Set / Symbol / generator methods ═══════════════════════════════════
@@ -4602,7 +4747,9 @@ fn symbol_method(recv: &Value, name: &str, _args: Vec<Value>) -> Result<Value, S
 fn object_create(args: Vec<Value>) -> Result<Value, String> {
     let proto = arg0(&args);
     let obj = with_host(|h| h.new_object(IndexMap::new()));
-    if !with_host(|h| h.is_null(&proto)) && !matches!(proto, Value::Undef) {
+    // `set_proto` records a null proto as an explicit null-prototype object;
+    // undefined leaves the object with the default (bare-object) prototype.
+    if !matches!(proto, Value::Undef) {
         with_host(|h| h.set_proto(&obj, proto));
     }
     // Optional second arg: a property-descriptor map.

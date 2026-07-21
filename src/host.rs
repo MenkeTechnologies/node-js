@@ -17,6 +17,7 @@ use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -396,6 +397,11 @@ pub struct JsHost {
     /// `[[Prototype]]` link per heap object, by heap index. Absent = default
     /// (`Object.prototype` for objects, `null` for the root).
     protos: HashMap<u32, Value>,
+    /// Heap objects whose `[[Prototype]]` is *explicitly* null — via
+    /// `Object.create(null)` or `Object.setPrototypeOf(o, null)`. Distinct from a
+    /// bare `{}` (absent from `protos` but conceptually `Object.prototype`), which
+    /// is why `Object.create(null) instanceof Object` can read `false`.
+    null_proto_objs: HashSet<u32>,
     /// Own properties of function objects (functions are objects in JS): a live
     /// closure's `name`/`prototype`/static-ish members. Keyed by heap index.
     fn_props: HashMap<u32, IndexMap<String, Value>>,
@@ -566,6 +572,7 @@ impl JsHost {
             signal: None,
             null_val: Value::Undef,
             protos: HashMap::new(),
+            null_proto_objs: HashSet::new(),
             fn_props: HashMap::new(),
             accessors: HashMap::new(),
             builtin_statics: HashMap::new(),
@@ -600,15 +607,25 @@ impl JsHost {
             None
         }
     }
-    /// Set `v`'s `[[Prototype]]` to `proto` (or clear it if `proto` is null).
+    /// Set `v`'s `[[Prototype]]` to `proto`. Null links the object as an explicit
+    /// null-prototype object (recorded so `instanceof Object` reads false);
+    /// undefined just clears any link without the null marker.
     pub fn set_proto(&mut self, v: &Value, proto: Value) {
         if let Value::Obj(i) = v {
-            if self.is_null(&proto) || matches!(proto, Value::Undef) {
+            if self.is_null(&proto) {
+                self.protos.remove(i);
+                self.null_proto_objs.insert(*i);
+            } else if matches!(proto, Value::Undef) {
                 self.protos.remove(i);
             } else {
                 self.protos.insert(*i, proto);
+                self.null_proto_objs.remove(i);
             }
         }
+    }
+    /// Whether `v`'s `[[Prototype]]` was explicitly set to null.
+    pub fn has_null_proto(&self, v: &Value) -> bool {
+        matches!(v, Value::Obj(i) if self.null_proto_objs.contains(i))
     }
     pub fn object_proto(&self) -> Value {
         self.object_proto.clone()
@@ -2797,14 +2814,10 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
                         | Some(JsObj::Generator { .. })
                 );
                 if is_obj {
-                    // A null-prototype object created via Object.create(null) is
-                    // NOT an Object instance.
-                    if matches!(kind, Some(JsObj::Object(_)))
-                        && with_host(|h| h.proto_of(obj)).is_none()
-                    {
-                        // Distinguish an ordinary object (no explicit proto but
-                        // conceptually Object.prototype) from Object.create(null):
-                        // we can't, so treat a bare object as an Object instance.
+                    // A null-prototype object (Object.create(null) or
+                    // setPrototypeOf(o, null)) is NOT an Object instance.
+                    if with_host(|h| h.has_null_proto(obj)) {
+                        return Ok(false);
                     }
                     return Ok(true);
                 }

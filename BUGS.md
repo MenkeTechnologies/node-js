@@ -107,6 +107,9 @@ dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
   coroutines on the shared thread-local heap).
 - **Iterators** — honoring `Symbol.iterator` in `for-of`/spread for user
   iterables; array/string/Map/Set/generator iterators with `.next()`.
+- **Labeled statements** — `outer: for (...) { ... continue outer / break outer }`
+  bind `continue`/`break` to the labeled loop target (compiler.rs). Verified
+  against `node v26.5.0`: labeled `continue`/`break` retarget the correct loop.
 - **Promises + async/await + event loop** — `new Promise`, `.then`/`.catch`/
   `.finally`, `Promise.resolve`/`reject`/`all`/`allSettled`/`race`/`any`; `async`
   functions/arrows/methods, `await`, rejection-as-throw; a host-driven loop
@@ -118,8 +121,6 @@ dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
 These are absent from the lexer/parser/compiler; a program using them fails
 loudly rather than producing a wrong result. The fuzzer does not generate them.
 
-- **Labeled statements** (`outer: for (...)` with `break outer`). Labels are
-  parsed after `break`/`continue` but not bound to a target.
 - **`-x ** y`** — JS makes an unparenthesized unary minus directly before `**` a
   `SyntaxError` (`(-x) ** y` or `-(x ** y)` is required). node-js's parser accepts
   it and evaluates `-(x ** y)`. Applies to both Number and BigInt; the fuzzer
@@ -135,16 +136,20 @@ crate can represent and **rejects the rest at RegExp-construction time** with a
 `\d \w \s \D \W \S` and word-boundary `\b`/`\B`, quantifiers (`* + ? {n} {n,}
 {n,m}` + lazy `?`), anchors `^ $`, capturing/non-capturing/named groups
 (`(...)`, `(?:...)`, `(?<name>...)`), alternation `|`, escapes, `\uXXXX`/`\u{...}`
-(translated to Rust `\x{...}`), and the flags `g` (global), `i` (ignoreCase), `m`
+(translated to Rust `\x{...}`), **backreferences** (`\1`, `\k<name>`) and
+**lookahead / lookbehind** (`(?=)`, `(?!)`, `(?<=)`, `(?<!)`) — all provided by
+`fancy-regex` 0.18 — and the flags `g` (global), `i` (ignoreCase), `m`
 (multiline), `s` (dotAll), `u`, `y` (sticky), `d` (accepted; indices ignored).
 `test`/`exec`/`match`/`matchAll`/`replace`/`replaceAll`/`split`/`search` and the
 `$1`/`$&`/`` $` ``/`$'`/`$<name>`/`$$` replacement patterns + function replacers.
 
-**Rejected (construction throws `SyntaxError`, never a wrong match):**
-
-- **Backreferences** (`\1`, `\k<name>`) — Rust `regex` has none.
-- **Lookahead / lookbehind** (`(?=)`, `(?!)`, `(?<=)`, `(?<!)`) — Rust `regex`
-  has no zero-width assertions of this kind.
+**Rejected (construction throws `SyntaxError`, never a wrong match):** any pattern
+`fancy-regex` cannot compile is rejected at RegExp-construction time
+(`regexp.rs` maps the compile error to a JS `SyntaxError`) rather than silently
+mis-executed. Backreferences and lookahead/lookbehind — previously listed here —
+are **now supported** (see the Supported list above); verified against
+`node v26.5.0`: `/(\w)\1/.test('aa')` → `true`, `/(?<=foo)bar/.test('foobar')`
+→ `true`.
 
 **Known behavioral divergences within the supported subset:**
 
@@ -171,16 +176,6 @@ cases the fuzzer is scoped away from)
   onto multiple lines — is not modelled. A `>6`-element array nested inside an
   object may also render at the wrong indentation. Top-level arrays match Node.
 
-- **`Number.prototype.toString(radix)` for a non-integer receiver.** The integer
-  part is converted correctly for any radix 2..36; the **fractional** part is
-  dropped. The fuzzer's `num` mode uses integer receivers for `toString(radix)`.
-
-- **`Object.create(null)` vs an ordinary object under `instanceof Object`.** A
-  null-prototype object is reported as `instanceof Object` (node reports `false`).
-  Our model can't distinguish "no explicit prototype" from "explicit null
-  prototype", so a bare object literal and `Object.create(null)` both read as
-  Object instances. Not exercised by the fuzzer.
-
 ## Fixed since the initial parity sweep (previously divergences, now correct)
 
 Recorded so the same gaps are not "re-discovered" as regressions. All verified
@@ -202,3 +197,14 @@ against `node v26.5.0`:
 - **`String.prototype.slice`/`substr`** — reversed bounds yield the empty string;
   `substr` handles a negative start.
 - **`parseFloat`** parses `Infinity` / `-Infinity`.
+- **`Number.prototype.toString(radix)` for a non-integer receiver.** Fractional
+  digits are now emitted in the target radix (V8's `DoubleToRadixCString` port,
+  round-half-to-even with ULP-sized termination): `(3.5).toString(2) === "11.1"`,
+  `(255.5).toString(16) === "ff.8"`; integer receivers unaffected.
+- **`Object.create(null)` under `instanceof Object`.** An explicit null-prototype
+  object (via `Object.create(null)` or `Object.setPrototypeOf(o, null)`) is now
+  tracked distinctly from a bare `{}`, so `Object.create(null) instanceof Object`
+  is `false` while `({}) instanceof Object` stays `true`.
+- **ES2023 change-by-copy Array methods.** `toSorted`/`toReversed`/`toSpliced`/
+  `with` return a new array leaving the receiver unchanged; `with` throws
+  `RangeError: Invalid index : <i>` on an out-of-range index.
