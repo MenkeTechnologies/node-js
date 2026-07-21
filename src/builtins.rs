@@ -4563,32 +4563,30 @@ fn to_radix(n: f64, radix: u32) -> String {
             frac.push(digits[digit]);
             fraction -= digit as f64;
             // Round to even.
-            if fraction > 0.5 || (fraction == 0.5 && (digit & 1) == 1) {
-                if fraction + delta > 1.0 {
-                    // Carry-over: back-trace already-written fraction digits.
-                    loop {
-                        match frac.pop() {
-                            None => {
-                                // Carried past the point into the integer part.
-                                integer += 1.0;
+            if (fraction > 0.5 || (fraction == 0.5 && (digit & 1) == 1)) && fraction + delta > 1.0 {
+                // Carry-over: back-trace already-written fraction digits.
+                loop {
+                    match frac.pop() {
+                        None => {
+                            // Carried past the point into the integer part.
+                            integer += 1.0;
+                            break;
+                        }
+                        Some(c) => {
+                            let d = if c > b'9' {
+                                (c - b'a' + 10) as u32
+                            } else {
+                                (c - b'0') as u32
+                            };
+                            if d + 1 < radix {
+                                frac.push(digits[(d + 1) as usize]);
                                 break;
                             }
-                            Some(c) => {
-                                let d = if c > b'9' {
-                                    (c - b'a' + 10) as u32
-                                } else {
-                                    (c - b'0') as u32
-                                };
-                                if d + 1 < radix {
-                                    frac.push(digits[(d + 1) as usize]);
-                                    break;
-                                }
-                                // digit was radix-1: drop it and keep carrying.
-                            }
+                            // digit was radix-1: drop it and keep carrying.
                         }
                     }
-                    break;
                 }
+                break;
             }
             if fraction < delta {
                 break;
