@@ -340,6 +340,126 @@ pub fn weakref_call(recv: &Value, method: &str) -> Result<Value, String> {
     }
 }
 
+// ── FinalizationRegistry (no-GC approximation) ────────────────────────────────
+//
+// This VM holds every value strongly (see `WeakRef` above), so a registered
+// target is never reclaimed and the cleanup callback never fires. The ECMAScript
+// spec permits an implementation to never call cleanup callbacks, so this is a
+// conformant approximation: the constructor and `register`/`unregister` enforce
+// their type checks and `unregister`'s bookkeeping exactly, only the (optional)
+// callback invocation is absent. Registered unregister-tokens are tracked in a
+// hidden `@@fr_tokens` array so `unregister` returns the correct boolean.
+
+/// Whether `v` is an Object (a valid `register` target / unregister token) — a
+/// heap value that is not one of the primitive-wrapper heap variants.
+fn is_object_value(v: &Value) -> bool {
+    matches!(v, Value::Obj(_))
+        && with_host(|h| {
+            !matches!(
+                h.get(v),
+                Some(JsObj::Str(_))
+                    | Some(JsObj::Symbol { .. })
+                    | Some(JsObj::BigInt(_))
+                    | Some(JsObj::Null)
+            )
+        })
+}
+
+pub fn construct_finalization_registry(args: &[Value]) -> Result<Value, String> {
+    let cb = args.first().cloned().unwrap_or(Value::Undef);
+    if !with_host(|h| crate::host::is_callable(h, &cb)) {
+        return Err(crate::host::type_error(
+            "FinalizationRegistry: cleanup must be callable",
+        ));
+    }
+    Ok(with_host(|h| {
+        let tokens = h.new_array(Vec::new());
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str("FinalizationRegistry"));
+        m.insert("@@fr_cb".into(), cb);
+        m.insert("@@fr_tokens".into(), tokens);
+        h.new_object(m)
+    }))
+}
+
+pub fn finalization_registry_call(
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    match method {
+        "register" => {
+            let target = args.first().cloned().unwrap_or(Value::Undef);
+            let held = args.get(1).cloned().unwrap_or(Value::Undef);
+            let token = args.get(2).cloned().unwrap_or(Value::Undef);
+            if !is_object_value(&target) {
+                return Err(crate::host::type_error(
+                    "FinalizationRegistry.prototype.register: target must be an object",
+                ));
+            }
+            if with_host(|h| h.strict_eq(&target, &held)) {
+                return Err(crate::host::type_error(
+                    "FinalizationRegistry.prototype.register: target and holdings must not be same",
+                ));
+            }
+            // A supplied unregister token must be an object; record it so a later
+            // `unregister` can find (and drop) this registration.
+            if !matches!(token, Value::Undef) {
+                if !is_object_value(&token) {
+                    return Err(crate::host::type_error(
+                        "FinalizationRegistry.prototype.register: unregister token must be an object",
+                    ));
+                }
+                with_host(|h| {
+                    let toks = registry_tokens(h, recv);
+                    if let Some(JsObj::Array(items)) = h.get_mut(&toks) {
+                        items.push(token);
+                    }
+                });
+            }
+            Ok(Value::Undef)
+        }
+        "unregister" => {
+            let token = args.first().cloned().unwrap_or(Value::Undef);
+            if !is_object_value(&token) {
+                return Err(crate::host::type_error(
+                    "FinalizationRegistry.prototype.unregister: unregister token must be an object",
+                ));
+            }
+            Ok(Value::Bool(with_host(|h| {
+                let toks = registry_tokens(h, recv);
+                let kept: Vec<Value> = match h.get(&toks) {
+                    Some(JsObj::Array(items)) => items
+                        .iter()
+                        .filter(|t| !h.strict_eq(t, &token))
+                        .cloned()
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let removed = match h.get(&toks) {
+                    Some(JsObj::Array(items)) => items.len() != kept.len(),
+                    _ => false,
+                };
+                if let Some(JsObj::Array(items)) = h.get_mut(&toks) {
+                    *items = kept;
+                }
+                removed
+            })))
+        }
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
+    }
+}
+
+/// The hidden `@@fr_tokens` array backing a `FinalizationRegistry`.
+fn registry_tokens(h: &crate::host::JsHost, recv: &Value) -> Value {
+    match h.get(recv) {
+        Some(JsObj::Object(p)) => p.get("@@fr_tokens").cloned().unwrap_or(Value::Undef),
+        _ => Value::Undef,
+    }
+}
+
 // ── TextEncoder / TextDecoder ─────────────────────────────────────────────────
 
 pub fn construct_text_encoder() -> Result<Value, String> {

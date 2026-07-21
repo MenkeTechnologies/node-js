@@ -656,6 +656,7 @@ fn default_ctor_name(h: &host::JsHost, recv: &Value) -> Option<&'static str> {
                 Some("URL") => Some("URL"),
                 Some("Date") => Some("Date"),
                 Some("WeakRef") => Some("WeakRef"),
+                Some("FinalizationRegistry") => Some("FinalizationRegistry"),
                 Some("TextEncoder") => Some("TextEncoder"),
                 Some("TextDecoder") => Some("TextDecoder"),
                 Some("EventEmitter") => Some("EventEmitter"),
@@ -715,6 +716,7 @@ fn is_builtin_ctor(name: &str) -> bool {
             | "Float32Array"
             | "Float64Array"
             | "WeakRef"
+            | "FinalizationRegistry"
             | "TextEncoder"
             | "TextDecoder"
             | "IncomingMessage"
@@ -1109,7 +1111,13 @@ fn set_property(recv: &Value, name: &str, val: Value) {
     }
     with_host(|h| match h.get_mut(recv) {
         Some(JsObj::Object(props)) => {
+            // Adding a *new* array-index key must re-place it into ascending
+            // integer-key order (updating an existing key keeps its position).
+            let is_new = !props.contains_key(name);
             props.insert(name.to_string(), val);
+            if is_new && host::array_index(name).is_some() {
+                host::canonicalize_own_keys(props);
+            }
         }
         Some(JsObj::Array(items)) => {
             if name == "length" {
@@ -1794,6 +1802,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "Float32Array",
     "Float64Array",
     "WeakRef",
+    "FinalizationRegistry",
     "TextEncoder",
     "TextDecoder",
     "queueMicrotask",
@@ -2792,6 +2801,7 @@ fn object_assign(args: Vec<Value>) -> Result<Value, String> {
                 for (k, v) in entries {
                     p.insert(k, v);
                 }
+                host::canonicalize_own_keys(p);
             }
         });
     }
@@ -4929,6 +4939,7 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get_mut(obj) {
                     p.insert(key.to_string(), v);
+                    host::canonicalize_own_keys(p);
                 }
             });
         }

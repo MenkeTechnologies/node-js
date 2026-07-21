@@ -291,3 +291,136 @@ fn regex_backrefs_and_lookaround() {
     "#;
     assert_eq!(run(src), "true false\ntrue\nfooX\n100\ntrue");
 }
+
+// ── Integer-key property ordering (OrdinaryOwnPropertyKeys) ───────────────────
+// Array-index keys enumerate in ascending numeric order BEFORE insertion-ordered
+// string keys, consistently across keys/values/entries, for-in, spread, and
+// JSON.stringify — matching V8/Node.
+
+#[test]
+fn integer_key_ordering_all_enumeration_paths() {
+    let src = r#"
+        const o = {b:1, "2":2, a:3, "1":4, "10":5, c:6, "0":7};
+        console.log(JSON.stringify(Object.keys(o)));
+        console.log(JSON.stringify(Object.values(o)));
+        console.log(JSON.stringify(o));                     // stringify order
+        let a=[]; for (const k in o) a.push(k); console.log(a.join(","));  // for-in
+        console.log(JSON.stringify({...o}));                // spread
+        console.log(JSON.stringify(Object.entries(o)));
+    "#;
+    assert_eq!(
+        run(src),
+        "[\"0\",\"1\",\"2\",\"10\",\"b\",\"a\",\"c\"]\n\
+         [7,4,2,5,1,3,6]\n\
+         {\"0\":7,\"1\":4,\"2\":2,\"10\":5,\"b\":1,\"a\":3,\"c\":6}\n\
+         0,1,2,10,b,a,c\n\
+         {\"0\":7,\"1\":4,\"2\":2,\"10\":5,\"b\":1,\"a\":3,\"c\":6}\n\
+         [[\"0\",7],[\"1\",4],[\"2\",2],[\"10\",5],[\"b\",1],[\"a\",3],[\"c\",6]]"
+    );
+}
+
+#[test]
+fn integer_key_ordering_dynamic_and_boundaries() {
+    let src = r#"
+        // A dynamically added array-index key re-places into ascending order.
+        const d = {}; d.z=1; d["5"]=2; d.a=3; d["2"]=4;
+        console.log(JSON.stringify(Object.keys(d)));
+        // 2^32-1 (4294967295) is NOT an array index (stays a string key);
+        // 2^32-2 (4294967294) IS.
+        const b = {}; b["4294967295"]=1; b["4294967294"]=2; b.x=3; b["0"]=4;
+        console.log(JSON.stringify(Object.keys(b)));
+        // Leading-zero / non-canonical numeric strings are plain string keys.
+        console.log(JSON.stringify(Object.keys({"01":1, "1":2, "0":3})));
+        // JSON.parse result and Object.assign target both re-order.
+        console.log(JSON.stringify(Object.keys(JSON.parse('{"b":1,"2":2,"a":3,"1":4}'))));
+        console.log(JSON.stringify(Object.keys(Object.assign({z:1}, {"3":2}, {"1":3}))));
+    "#;
+    assert_eq!(
+        run(src),
+        "[\"2\",\"5\",\"z\",\"a\"]\n\
+         [\"0\",\"4294967294\",\"4294967295\",\"x\"]\n\
+         [\"0\",\"1\",\"01\"]\n\
+         [\"1\",\"2\",\"b\",\"a\"]\n\
+         [\"1\",\"3\",\"z\"]"
+    );
+}
+
+// ── console.log object multiline breakLength wrapping ─────────────────────────
+// A single-line object wider than Node's 80-char breakLength wraps one property
+// per line, exactly as arrays already do (including the constructor/tag prefix).
+
+#[test]
+fn object_inspect_wraps_past_break_length() {
+    // Short object stays on one line; a wide one wraps.
+    assert_eq!(run("console.log({a:1,b:2,c:3});"), "{ a: 1, b: 2, c: 3 }");
+    assert_eq!(
+        run("console.log({aaaaaaaaaa:1,bbbbbbbbbb:2,cccccccccc:3,dddddddddd:4,eeeeeeeeee:5});"),
+        "{\n  aaaaaaaaaa: 1,\n  bbbbbbbbbb: 2,\n  cccccccccc: 3,\n  dddddddddd: 4,\n  eeeeeeeeee: 5\n}"
+    );
+}
+
+#[test]
+fn object_inspect_wraps_class_instance_and_nesting() {
+    // A class instance folds its constructor tag into the break calculation, so
+    // `Point { … }` wraps when the single-line form would exceed 80 columns.
+    let point = r#"
+        class Point { constructor(){ this.xcoord=1; this.ycoord=2; this.zcoord=3;
+            this.label="origin"; this.color="red"; } }
+        console.log(new Point());
+    "#;
+    assert_eq!(
+        run(point),
+        "Point {\n  xcoord: 1,\n  ycoord: 2,\n  zcoord: 3,\n  label: 'origin',\n  color: 'red'\n}"
+    );
+    // The inner object fits on one line; only the outer breaks.
+    assert_eq!(
+        run("console.log({short:1,nested:{deep:{a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8,i:9}}});"),
+        "{\n  short: 1,\n  nested: { deep: { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 } }\n}"
+    );
+}
+
+// ── FinalizationRegistry (no-GC approximation; callbacks never fire) ──────────
+// The heap holds every value strongly, so cleanup callbacks never run (a
+// spec-permitted behavior). The constructor and register/unregister type checks
+// and the unregister bookkeeping are exact.
+
+#[test]
+fn finalization_registry_contract() {
+    let src = r#"
+        const reg = new FinalizationRegistry(v => v);
+        const obj = {}, tok = {};
+        console.log(typeof reg, reg instanceof FinalizationRegistry,
+                    typeof reg.register, typeof reg.unregister);
+        console.log(reg.register(obj, "held", tok));   // undefined
+        console.log(reg.unregister(tok), reg.unregister(tok), reg.unregister({}));
+        console.log(FinalizationRegistry.name);
+    "#;
+    assert_eq!(
+        run(src),
+        "object true function function\n\
+         undefined\n\
+         true false false\n\
+         FinalizationRegistry"
+    );
+}
+
+#[test]
+fn finalization_registry_type_errors() {
+    let src = r#"
+        const errs = [];
+        const grab = f => { try { f(); } catch (e) { errs.push(e.constructor.name); } };
+        grab(() => new FinalizationRegistry(123));          // callback not callable
+        grab(() => new FinalizationRegistry());             // missing callback
+        const reg = new FinalizationRegistry(() => {});
+        grab(() => reg.register(42, "h"));                  // target not an object
+        grab(() => reg.register({}, {}, 42));               // token not an object
+        const o = {};
+        grab(() => reg.register(o, o));                     // target === heldValue
+        grab(() => reg.unregister(42));                     // token not an object
+        console.log(errs.join(","));
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError,TypeError,TypeError,TypeError,TypeError,TypeError"
+    );
+}

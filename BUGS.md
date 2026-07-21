@@ -164,11 +164,13 @@ are **now supported** (see the Supported list above); verified against
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
 
-- **Nested-object/array width-based line breaking.** `util.inspect` array
-  *grouping* (>6 elements) is ported faithfully, but the general `breakLength` 80
-  wrapping of nested objects — where a long single-line object/array is broken
-  onto multiple lines — is not modelled. A `>6`-element array nested inside an
-  object may also render at the wrong indentation. Top-level arrays match Node.
+- **`util.inspect` `compact` depth-gate (only under a raised `{depth}`).** Node
+  forces an object/array onto multiple lines when its deepest descendant is `≥
+  compact` (3) levels below it, even if the single-line form fits `breakLength`.
+  Only the `breakLength` 80 fit is modelled, not the depth-gate, so
+  `util.inspect(x, {depth: N>2})` on a `≥4`-level-deep structure may stay on one
+  line where Node breaks it. `console.log` (fixed `depth: 2`, where the gate can
+  never fire) is byte-identical.
 
 ## Fixed since the initial parity sweep (previously divergences, now correct)
 
@@ -202,3 +204,25 @@ against `node v26.5.0`:
 - **ES2023 change-by-copy Array methods.** `toSorted`/`toReversed`/`toSpliced`/
   `with` return a new array leaving the receiver unchanged; `with` throws
   `RangeError: Invalid index : <i>` on an out-of-range index.
+- **Integer-key property ordering (`OrdinaryOwnPropertyKeys`).** Own array-index
+  keys now enumerate in ascending numeric order before insertion-ordered string
+  keys, consistently across `Object.keys`/`values`/`entries`,
+  `getOwnPropertyNames`, `for-in`, spread `{...o}`, `Object.assign`, `JSON.parse`
+  results, and `JSON.stringify`. `2^32-1` and non-canonical numeric strings
+  (leading zero, sign, fraction) stay string keys.
+- **Object `console.log` multiline `breakLength` wrapping.** A single-line object
+  wider than 80 columns now wraps one property per line like arrays already did,
+  including the constructor / `[Object: null prototype]` tag in the width
+  calculation. `>6`-element arrays nested inside objects also render at the
+  correct indentation.
+- **`instanceof` for native-tagged instances.** A `WeakRef`, `FinalizationRegistry`,
+  `TextEncoder`, `TextDecoder`, etc. is now an instance of the builtin whose name
+  matches its hidden `@@native` tag (`new WeakRef({}) instanceof WeakRef` is
+  `true`). (`Object.prototype.toString.call(x)` still returns `[object Object]`
+  for these — a separate, pre-existing `Symbol.toStringTag` gap shared by
+  `Map`/`Set`/`Promise`/`Date`/`URL`.)
+- **`FinalizationRegistry`** — constructor requires a callable; `register(target,
+  held[, token])` and `unregister(token)` enforce their `TypeError`s and
+  `unregister` returns the correct boolean. Cleanup callbacks never fire because
+  the heap holds every value strongly (a spec-permitted approximation, same basis
+  as `WeakRef`).

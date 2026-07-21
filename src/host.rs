@@ -834,7 +834,10 @@ impl JsHost {
     pub fn new_array(&mut self, items: Vec<Value>) -> Value {
         self.alloc(JsObj::Array(items))
     }
-    pub fn new_object(&mut self, props: IndexMap<String, Value>) -> Value {
+    pub fn new_object(&mut self, mut props: IndexMap<String, Value>) -> Value {
+        // Integer-index keys enumerate ascending-first regardless of the order
+        // they were supplied in (object literal, spread, Object.assign result).
+        canonicalize_own_keys(&mut props);
         self.alloc(JsObj::Object(props))
     }
     pub fn as_str(&self, v: &Value) -> Option<String> {
@@ -1093,6 +1096,57 @@ pub fn fmt_number(f: f64) -> String {
         return format!("-{}", js_number_repr(-f));
     }
     js_number_repr(f)
+}
+
+/// If `k` is an array-index property key, return its numeric value. Per
+/// ECMAScript, a String property key `P` is an array index iff
+/// `ToString(ToUint32(P)) === P` and `ToUint32(P) !== 2^32 - 1` — i.e. a
+/// canonical decimal (no leading zeros, no sign) in the range `0..=2^32-2`.
+pub fn array_index(k: &str) -> Option<u32> {
+    if k.is_empty() {
+        return None;
+    }
+    if k == "0" {
+        return Some(0);
+    }
+    // A leading '0' (other than the lone "0" above) is non-canonical.
+    if k.as_bytes()[0] == b'0' {
+        return None;
+    }
+    if !k.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match k.parse::<u64>() {
+        // Array index must be < 2^32-1; u32::MAX == 2^32-1 is excluded.
+        Ok(n) if n < u32::MAX as u64 => Some(n as u32),
+        _ => None,
+    }
+}
+
+/// Compare two own-property keys for `OrdinaryOwnPropertyKeys` enumeration order:
+/// integer-index keys sort ascending-numeric and precede all string keys; two
+/// non-index keys compare `Equal` so a *stable* sort leaves them in insertion
+/// order. (Symbols are stored as `@@…`/`#…` string keys and are non-index, so
+/// they also fall into the stable-insertion-order tail.)
+pub fn key_order_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (array_index(a), array_index(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Reorder an object's own-property map into `OrdinaryOwnPropertyKeys` order in
+/// place: array-index keys ascending first, then the remaining keys in their
+/// existing (insertion) order. A no-op unless at least one index key is present,
+/// so the overwhelmingly common all-string-key object keeps its exact order and
+/// pays nothing. `IndexMap::sort_by` is a stable sort.
+pub fn canonicalize_own_keys(props: &mut IndexMap<String, Value>) {
+    if props.keys().any(|k| array_index(k).is_some()) {
+        props.sort_by(|ak, _, bk, _| key_order_cmp(ak, bk));
+    }
 }
 
 /// ECMAScript `Number::toString` layout for a positive, finite, nonzero value.
@@ -1427,7 +1481,7 @@ impl JsHost {
                             format!("{}: {}", fmt_key(k), self.inspect_lvl(val, indent + 2))
                         })
                         .collect();
-                    format!("{prefix}{{ {} }}", inner.join(", "))
+                    self.render_object(&inner, &prefix, indent)
                 }
                 Some(JsObj::Symbol { desc, .. }) => match desc {
                     Some(d) => format!("Symbol({d})"),
@@ -1539,6 +1593,27 @@ impl JsHost {
         let pad = " ".repeat(indent);
         let sep = format!(",\n{pad}  ");
         format!("[\n{pad}  {}\n{pad}]", lines.join(&sep))
+    }
+
+    /// Render a non-empty object's already-formatted `key: value` strings with
+    /// Node's `util.inspect` layout: a single line when it fits `breakLength`,
+    /// else one property per line indented by `indent + 2`. `prefix` is the
+    /// constructor/`[Object: null prototype]` tag (with trailing space) or empty.
+    /// Mirrors `render_array`'s break decision. (Node's `compact` depth gate is a
+    /// no-op at `console.log`'s default depth of 2, so only length matters here.)
+    fn render_object(&self, output: &[String], prefix: &str, indent: usize) -> String {
+        // start = output.length + indentationLvl + braces[0].len + base(0) + 10.
+        // For a tagged object Node folds the tag into `braces[0]` (e.g.
+        // `"Point {"`, `"[Object: null prototype] {"`), so its length is the
+        // prefix (which carries the trailing space) plus the `{`.
+        let braces0 = prefix.chars().count() + 1;
+        let start = output.len() + indent + braces0 + 10;
+        if is_below_break_length(output, start) {
+            return format!("{prefix}{{ {} }}", output.join(", "));
+        }
+        let pad = " ".repeat(indent);
+        let sep = format!(",\n{pad}  ");
+        format!("{prefix}{{\n{pad}  {}\n{pad}}}", output.join(&sep))
     }
 
     /// The `.name` of any callable (function/class/builtin/bound).
@@ -2635,7 +2710,11 @@ fn init_fields(cv: &ClassVal, inst: &Value) -> Result<(), String> {
         let val = invoke(thunk, Vec::new(), Some(inst.clone()))?;
         with_host(|h| {
             if let Some(JsObj::Object(props)) = h.get_mut(inst) {
+                let is_new = !props.contains_key(name);
                 props.insert(name.clone(), val);
+                if is_new && array_index(name).is_some() {
+                    canonicalize_own_keys(props);
+                }
             }
         });
     }
@@ -2670,6 +2749,7 @@ pub fn super_construct(
                     for (k, v) in entries {
                         props.insert(k, v);
                     }
+                    canonicalize_own_keys(props);
                 }
             });
             Ok(())
@@ -2865,7 +2945,14 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
                 }
                 return Ok(false);
             }
-            _ => {}
+            // A native-tagged instance (`WeakRef`, `FinalizationRegistry`,
+            // `TextEncoder`, …) is an instance of the builtin whose name matches
+            // its hidden `@@native` tag.
+            other => {
+                if crate::stdlib::native_tag(obj).as_deref() == Some(other) {
+                    return Ok(true);
+                }
+            }
         }
     }
     with_host(|h| h.ensure_error_protos());
