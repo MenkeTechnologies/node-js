@@ -91,7 +91,8 @@ dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
   `Object.getPrototypeOf`/`setPrototypeOf`/`create`; `obj.__proto__` (read + the
   literal `{ __proto__: x }` form); `defineProperty`/`getOwnPropertyDescriptor`.
 - **`instanceof`** (walks the chain; structural for builtin `Array`/`Object`/
-  `Function`), **`in`** and **`hasOwnProperty`** respecting the chain.
+  `Function`/`Map`/`WeakMap`/`Set`/`WeakSet`/`Promise`), **`in`** and
+  **`hasOwnProperty`** respecting the chain.
 - **`this` binding** — method calls, `fn.call`/`apply`/`bind`, arrow lexical
   capture, `new` binding, `new.target`.
 - **Error hierarchy** — `Error`/`TypeError`/`RangeError`/`SyntaxError`/
@@ -160,13 +161,6 @@ are **now supported** (see the Supported list above); verified against
 - **`.index` on non-BMP input.** `exec`/`match` report the match position as a
   Unicode *char* offset; JS uses UTF-16 code-unit offsets, so an astral-plane
   character before the match shifts the index by one. Identical on BMP text.
-- **`exec`/non-global `match` result array display.** The result array carries
-  `.index`/`.input`/`.groups` own properties; `console.log` of the *raw* array
-  does not render those extra properties (Node does). Element access
-  (`m[0]`, `m.index`, `m.groups.x`) is correct — only the raw-array `util.inspect`
-  differs. The `regex` fuzzer mode accesses elements rather than printing the raw
-  array.
-
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
 

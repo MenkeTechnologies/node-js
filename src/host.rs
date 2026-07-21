@@ -1357,7 +1357,15 @@ impl JsHost {
                 Some(JsObj::BigInt(b)) => format!("{b}n"),
                 Some(JsObj::RegExp(r)) => format!("/{}/{}", r.source, r.flags),
                 Some(JsObj::Array(items)) => {
-                    if items.is_empty() {
+                    // Own enumerable non-index string props (e.g. a `str.match(re)`
+                    // result's `index`/`input`/`groups`, or a user-assigned
+                    // `arr.foo`) render after the elements, as `key: value`.
+                    let prop_keys: Vec<String> = self
+                        .fn_prop_keys(v)
+                        .into_iter()
+                        .filter(|k| !k.starts_with("@@") && !k.starts_with('#'))
+                        .collect();
+                    if items.is_empty() && prop_keys.is_empty() {
                         return "[]".into();
                     }
                     // Node's default inspect depth is 2 (root = depth 0); deeper
@@ -1365,18 +1373,33 @@ impl JsHost {
                     if indent > 2 * inspect_max_depth() {
                         return "[Array]".into();
                     }
-                    let inner: Vec<String> = items
+                    let mut inner: Vec<String> = items
                         .iter()
                         .map(|x| self.inspect_lvl(x, indent + 2))
                         .collect();
-                    self.render_array(&inner, items, indent)
+                    let has_props = !prop_keys.is_empty();
+                    for k in &prop_keys {
+                        let val = self.fn_prop(v, k).unwrap_or(Value::Undef);
+                        inner.push(format!(
+                            "{}: {}",
+                            fmt_key(k),
+                            self.inspect_lvl(&val, indent + 2)
+                        ));
+                    }
+                    self.render_array(&inner, items, indent, has_props)
                 }
                 Some(JsObj::Object(props)) => {
                     // Instances print with their constructor name as a prefix
-                    // (`C { x: 1 }`); plain objects have none.
-                    let prefix = match self.ctor_name(v) {
-                        n if n.is_empty() || n == "Object" => String::new(),
-                        n => format!("{n} "),
+                    // (`C { x: 1 }`); plain objects have none; a null-prototype
+                    // object (e.g. an `Object.groupBy` result) is tagged
+                    // `[Object: null prototype]`.
+                    let prefix = if self.has_null_proto(v) {
+                        "[Object: null prototype] ".to_string()
+                    } else {
+                        match self.ctor_name(v) {
+                            n if n.is_empty() || n == "Object" => String::new(),
+                            n => format!("{n} "),
+                        }
                     };
                     // Skip internal symbol-keyed props (`@@…`) in the display.
                     let shown: Vec<(&String, &Value)> = props
@@ -1391,6 +1414,9 @@ impl JsHost {
                     if indent > 2 * inspect_max_depth() {
                         return if prefix.is_empty() {
                             "[Object]".into()
+                        } else if self.has_null_proto(v) {
+                            // Already bracketed (`[Object: null prototype]`).
+                            prefix.trim_end().to_string()
                         } else {
                             format!("[{}]", prefix.trim_end())
                         };
@@ -1485,10 +1511,18 @@ impl JsHost {
     /// grid via `groupArrayElements` (for >6 entries), else one element per line.
     /// `values` is the raw element list (drives numeric right-alignment); `indent`
     /// is the array's own indentation level.
-    fn render_array(&self, output: &[String], values: &[Value], indent: usize) -> String {
+    fn render_array(
+        &self,
+        output: &[String],
+        values: &[Value],
+        indent: usize,
+        has_props: bool,
+    ) -> String {
         // Group array elements together if the array has more than six entries.
+        // Arrays carrying extra own props (`index`/`input`/… on a match result)
+        // are never grid-grouped — Node lays those out plainly.
         let entries = output.len();
-        let (lines, grouped) = if entries > 6 {
+        let (lines, grouped) = if entries > 6 && !has_props {
             group_array_elements(self, output, values, indent)
         } else {
             (output.to_vec(), false)
@@ -2799,6 +2833,14 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
         match name.as_str() {
             "Array" => return Ok(matches!(kind, Some(JsObj::Array(_)))),
             "Function" => return Ok(with_host(|h| is_callable(h, obj))),
+            // Map/Set/Promise instances are distinct heap variants, not
+            // prototype-linked, so match them structurally (a WeakMap/WeakSet is a
+            // Map/Set with `weak: true`, so `weakMap instanceof Map` is false).
+            "Map" => return Ok(matches!(kind, Some(JsObj::Map { weak: false, .. }))),
+            "WeakMap" => return Ok(matches!(kind, Some(JsObj::Map { weak: true, .. }))),
+            "Set" => return Ok(matches!(kind, Some(JsObj::Set { weak: false, .. }))),
+            "WeakSet" => return Ok(matches!(kind, Some(JsObj::Set { weak: true, .. }))),
+            "Promise" => return Ok(matches!(kind, Some(JsObj::Promise { .. }))),
             "Object" => {
                 // Everything object-typed except a null-prototype object is an
                 // Object instance.

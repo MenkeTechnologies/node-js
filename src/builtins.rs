@@ -1858,6 +1858,7 @@ const NS_METHODS: &[&str] = &[
     "Object.defineProperty",
     "Object.getOwnPropertyDescriptor",
     "Object.hasOwn",
+    "Object.groupBy",
     "Array.isArray",
     "Array.from",
     "Array.of",
@@ -1885,6 +1886,8 @@ const NS_METHODS: &[&str] = &[
     "Promise.allSettled",
     "Promise.race",
     "Promise.any",
+    "Promise.withResolvers",
+    "Map.groupBy",
     "process.nextTick",
     "Error.captureStackTrace",
     "require.resolve",
@@ -2079,6 +2082,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Object.defineProperty" => object_define_property(args),
         "Object.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
+        // `Object.groupBy(items, cb)` (ES2024): group into a null-prototype object
+        // keyed by `ToPropertyKey(cb(item, i))`, each value an array of members.
+        "Object.groupBy" => object_group_by(args),
         "Symbol" => Ok(with_host(|h| {
             let desc = args
                 .first()
@@ -2135,6 +2141,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Promise.allSettled" => promise_all(args, AllMode::AllSettled),
         "Promise.race" => promise_race(args, false),
         "Promise.any" => promise_race(args, true),
+        // `Promise.withResolvers()` (ES2024): a new pending promise plus its own
+        // resolve/reject functions, returned as `{ promise, resolve, reject }`.
+        "Promise.withResolvers" => promise_with_resolvers(),
+        // `Map.groupBy(items, cb)` (ES2024): group into a `Map` keyed by the raw
+        // `cb(item, i)` result (SameValueZero), each value an array of members.
+        "Map.groupBy" => map_group_by(args),
         n if host::ERROR_NAMES.contains(&n) => Ok(make_error(name, &args)),
         _ if name.starts_with("Math.") => math_fn(&name[5..], &args),
         // Internal continuations (Promise resolve/reject fns, `.finally` wrappers).
@@ -2798,6 +2810,61 @@ fn object_from_entries(args: Vec<Value>) -> Result<Value, String> {
     Ok(with_host(|h| h.new_object(props)))
 }
 
+/// `Object.groupBy(items, cb)` — group the iterable `items` into a null-prototype
+/// object. Keys are `ToPropertyKey(cb(item, index))`; values are arrays of the
+/// members mapped to that key, in first-seen key order.
+fn object_group_by(args: Vec<Value>) -> Result<Value, String> {
+    let items = host::iter_all(&arg0(&args))?;
+    let cb = args.get(1).cloned().unwrap_or(Value::Undef);
+    let mut groups: IndexMap<String, Vec<Value>> = IndexMap::new();
+    for (i, item) in items.into_iter().enumerate() {
+        let key_v = host::invoke(&cb, vec![item.clone(), Value::Float(i as f64)], None)?;
+        let key = with_host(|h| h.property_key(&key_v));
+        groups.entry(key).or_default().push(item);
+    }
+    let props: IndexMap<String, Value> = with_host(|h| {
+        groups
+            .into_iter()
+            .map(|(k, v)| (k, h.new_array(v)))
+            .collect()
+    });
+    let obj = with_host(|h| h.new_object(props));
+    // A null-prototype object (as Node returns), so it has no inherited members.
+    with_host(|h| {
+        let nv = h.null();
+        h.set_proto(&obj, nv);
+    });
+    Ok(obj)
+}
+
+/// `Map.groupBy(items, cb)` — like `Object.groupBy` but returns a `Map` keyed by
+/// the raw `cb(item, index)` value under SameValueZero (so object/any keys work).
+fn map_group_by(args: Vec<Value>) -> Result<Value, String> {
+    let items = host::iter_all(&arg0(&args))?;
+    let cb = args.get(1).cloned().unwrap_or(Value::Undef);
+    let m = with_host(|h| {
+        h.alloc(JsObj::Map {
+            entries: IndexMap::new(),
+            weak: false,
+        })
+    });
+    for (i, item) in items.into_iter().enumerate() {
+        let key_v = host::invoke(&cb, vec![item.clone(), Value::Float(i as f64)], None)?;
+        let existing = map_method(&m, "get", vec![key_v.clone()])?;
+        if matches!(existing, Value::Undef) {
+            let arr = with_host(|h| h.new_array(vec![item]));
+            map_method(&m, "set", vec![key_v, arr])?;
+        } else {
+            with_host(|h| {
+                if let Some(JsObj::Array(a)) = h.get_mut(&existing) {
+                    a.push(item);
+                }
+            });
+        }
+    }
+    Ok(m)
+}
+
 fn array_from(args: Vec<Value>) -> Result<Value, String> {
     // `Array.from` accepts generators and user iterables, plus array-likes with a
     // numeric `.length`.
@@ -3321,7 +3388,10 @@ fn replace_str_fn(s: &str, pat: &str, repl: &Value, all: bool) -> Result<String,
     Ok(out)
 }
 fn is_number_method(name: &str) -> bool {
-    matches!(name, "toFixed" | "toString" | "toPrecision" | "valueOf")
+    matches!(
+        name,
+        "toFixed" | "toString" | "toPrecision" | "toLocaleString" | "valueOf"
+    )
 }
 
 /// Dispatch `recv.name(args)` for the built-in prototype methods.
@@ -4238,9 +4308,61 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
                 Ok(new_s(to_precision(n, p.max(1))))
             }
         }
+        "toLocaleString" => Ok(new_s(to_locale_string(n))),
         "valueOf" => Ok(Value::Float(n)),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
+}
+
+/// `Number.prototype.toLocaleString()` with the default locale and options:
+/// integer part grouped in threes with `,`, up to 3 fraction digits (rounded
+/// half away from zero), trailing fractional zeros dropped. Mirrors V8's default
+/// `Intl.NumberFormat().format` output (`(12345.678).toLocaleString()` ⇒
+/// `"12,345.678"`; `(1234.5678)` ⇒ `"1,234.568"`). `NaN`, `±Infinity`, and `-0`
+/// render as `"NaN"`, `"∞"`/`"-∞"`, and `"-0"`.
+fn to_locale_string(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-∞" } else { "∞" }.to_string();
+    }
+    let neg = n.is_sign_negative();
+    // Round the magnitude to at most 3 fraction digits, then drop trailing zeros
+    // (and a bare trailing point). `to_fixed` rounds half away from zero.
+    let fixed = to_fixed(n.abs(), 3);
+    let trimmed = match fixed.split_once('.') {
+        Some(_) => fixed.trim_end_matches('0').trim_end_matches('.'),
+        None => fixed.as_str(),
+    };
+    let (int_part, frac_part) = match trimmed.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (trimmed, None),
+    };
+    let mut out = String::new();
+    if neg {
+        out.push('-'); // Intl keeps the sign even for -0.
+    }
+    out.push_str(&group_thousands(int_part));
+    if let Some(f) = frac_part {
+        out.push('.');
+        out.push_str(f);
+    }
+    out
+}
+
+/// Insert `,` as a thousands separator into a nonnegative integer digit string.
+fn group_thousands(int_part: &str) -> String {
+    let bytes = int_part.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n + n / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (n - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
 }
 
 /// `Number.prototype.toFixed(f)`: fixed-point with `f` fractional digits, rounding
@@ -4960,6 +5082,21 @@ fn promise_reject(v: Value) -> Result<Value, String> {
     host::reject_promise_val(id, v);
     with_host(|h| h.promise_mark_handled(id)); // avoid spurious unhandled noise
     Ok(p)
+}
+
+/// `Promise.withResolvers()` — a fresh pending promise paired with its own
+/// resolve/reject continuations (the same `@@presolve`/`@@preject` thunks the
+/// executor receives), returned as a plain `{ promise, resolve, reject }` object.
+fn promise_with_resolvers() -> Result<Value, String> {
+    let p = with_host(|h| h.new_promise());
+    let id = with_host(|h| h.promise_id(&p).unwrap());
+    let resolve = make_builtin(format!("@@presolve:{id}"));
+    let reject = make_builtin(format!("@@preject:{id}"));
+    let mut props: IndexMap<String, Value> = IndexMap::new();
+    props.insert("promise".into(), p);
+    props.insert("resolve".into(), resolve);
+    props.insert("reject".into(), reject);
+    Ok(with_host(|h| h.new_object(props)))
 }
 
 #[derive(Clone, Copy)]
