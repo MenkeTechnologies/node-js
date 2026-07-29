@@ -46,6 +46,10 @@ pub struct Cli {
     #[arg(long = "disasm")]
     pub disasm: bool,
 
+    /// Run the script, then report which fusevm tiers took each of its chunks.
+    #[arg(long = "tiers")]
+    pub tiers: bool,
+
     /// The `.js` script to run (omit with --repl / --lsp / --dap / -e).
     #[arg(value_name = "FILE")]
     pub file: Option<String>,

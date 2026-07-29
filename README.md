@@ -90,6 +90,7 @@ source ──▶ lexer ──▶ parser ──▶ compiler ──▶ fusevm::Chu
 node script.js                       # run a file
 node -e 'console.log(1 + 1)'         # evaluate a one-liner
 echo 'console.log(6 * 7)' | node     # read a script from stdin
+node --tiers script.js               # run it, then report which fusevm tiers took it
 ```
 
 Errors go to stderr in terse `node: <reason>` form; nothing else is printed.
