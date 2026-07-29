@@ -12,6 +12,25 @@ documentation = "https://docs.rs/node-js"
 keywords = ["javascript", "interpreter", "compiler", "jit", "fusevm"]
 categories = ["command-line-utilities", "compilers"]
 publish = true
+# Keep the published crate lean: ship `src/`, `man/`, `completions/`,
+# README/LICENSE — nothing else. Everything below stays in git for
+# local/CI use but is omitted from `cargo package` / the crates.io
+# tarball. Mirrors strykelang's exclude set.
+exclude = [
+    "/.github/",
+    "/tests/",
+    "/examples/",
+    "/docs/",
+    "/bench/",
+    "/benches/",
+    "/parity/",
+    "/parity-scripts/",
+    "/scripts/",
+    "/vendor/",
+    "/tools/",
+    "/fuzz/",
+    "/BUGS.md",
+]
 
 # node-js is a standalone crate, not a workspace member. An explicit empty
 # `[workspace]` stops cargo walking up to the MenkeTechnologiesMeta parent.
