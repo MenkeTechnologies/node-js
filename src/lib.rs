@@ -108,6 +108,47 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
     run_compiled(compile_or_load(src)?)
 }
 
+/// Run a JS source string on a fresh host with `globals` bound and the
+/// program's output captured in-process, returning the program's outcome
+/// alongside everything it wrote.
+///
+/// This is the entry point for an embedder rather than for the `node` binary,
+/// and it exists because [`eval_str`] cannot serve one: it resets the host
+/// first, which wipes any global installed beforehand, and it lets
+/// `console.log` reach the real stdout, which corrupts a host that owns the
+/// terminal. Both are fixed here — the globals are seeded *after* the reset,
+/// and every write the program makes lands in the returned string.
+///
+/// The outcome and the output are returned separately (rather than the output
+/// only on success) because a program that prints and *then* throws produced
+/// both, and an embedder generally wants to show both.
+///
+/// ```no_run
+/// use nodejs::Value;
+/// use std::sync::Arc;
+/// let (result, out) = nodejs::eval_str_captured(
+///     "console.log(stdin.toUpperCase())",
+///     &[("stdin", Value::Str(Arc::new("hi".to_string())))],
+/// );
+/// assert!(result.is_ok());
+/// assert_eq!(out, "HI\n");
+/// ```
+pub fn eval_str_captured(src: &str, globals: &[(&str, Value)]) -> (Result<Value, String>, String) {
+    host::reset_host();
+    if let Ok(cwd) = std::env::current_dir() {
+        module::set_entry_dir(cwd);
+    }
+    host::with_host(|h| {
+        for (name, value) in globals {
+            h.set_global(name, value.clone());
+        }
+        h.begin_capture();
+    });
+    let result = compile_or_load(src).and_then(run_compiled);
+    let output = host::with_host(|h| h.end_capture());
+    (result, output)
+}
+
 /// Read and run a `.js` file (transparently rkyv-cached — see `compile_or_load`).
 pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;

@@ -453,6 +453,12 @@ pub struct JsHost {
     /// queues are empty. A pure script never touches it, so it exits exactly as
     /// before.
     open_handles: usize,
+    /// In-process output sink. When `Some`, everything the program writes to
+    /// stdout/stderr is appended here instead of reaching the process streams —
+    /// what an embedder (a TUI that owns the terminal) needs so a `console.log`
+    /// cannot corrupt its display. `None` (the default) is the ordinary
+    /// standalone `node` behaviour: writes go straight to the real streams.
+    capture: Option<String>,
 }
 
 /// A queued unit of work: either a JS callback invocation (`queueMicrotask`,
@@ -591,6 +597,7 @@ impl JsHost {
             io_tx,
             io_rx: Some(io_rx),
             open_handles: 0,
+            capture: None,
         };
         h.null_val = h.alloc(JsObj::Null);
         // `Object.prototype`: the chain root, its own `[[Prototype]]` is null.
@@ -937,6 +944,55 @@ impl JsHost {
     }
     pub fn set_global(&mut self, name: &str, val: Value) {
         self.globals.insert(name.to_string(), val);
+    }
+
+    // ── output capture ───────────────────────────────────────────────────
+    //
+    // Every write a *program* makes — `console.log`, `process.stdout.write`,
+    // `print` — funnels through `write_out`, so turning capture on redirects all
+    // of them at once. Diagnostics the runtime itself emits (the REPL banner, a
+    // crash traceback from `main`) deliberately do not: they belong to the
+    // process, not to the program.
+
+    /// Start capturing program output in-process. Any text already captured is
+    /// discarded, so each run starts clean.
+    pub fn begin_capture(&mut self) {
+        self.capture = Some(String::new());
+    }
+
+    /// Stop capturing and take everything written since [`begin_capture`],
+    /// returning the empty string when capture was not on.
+    ///
+    /// [`begin_capture`]: JsHost::begin_capture
+    pub fn end_capture(&mut self) -> String {
+        self.capture.take().unwrap_or_default()
+    }
+
+    /// Whether output is being captured — the one thing a caller needs to know
+    /// before asking the real stream a question (`isTTY`, cursor position).
+    pub fn capturing(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Write program output: into the capture buffer when capturing, else to the
+    /// process stream `stderr` selects. `s` is written verbatim — callers add
+    /// their own line ending, as `console.log` does and `process.stdout.write`
+    /// does not.
+    pub fn write_out(&mut self, s: &str, stderr: bool) {
+        if let Some(buf) = &mut self.capture {
+            buf.push_str(s);
+            return;
+        }
+        use std::io::Write as _;
+        if stderr {
+            let mut e = std::io::stderr();
+            let _ = e.write_all(s.as_bytes());
+            let _ = e.flush();
+        } else {
+            let mut o = std::io::stdout();
+            let _ = o.write_all(s.as_bytes());
+            let _ = o.flush();
+        }
     }
     pub fn del_name(&mut self, name: &str) {
         if self

@@ -295,14 +295,7 @@ pub fn stream_instance_call(recv: &Value, method: &str, args: &[Value]) -> Resul
                 _ => 1.0,
             });
             let chunk = super::arg_str(args, 0);
-            use std::io::Write as _;
-            if fd == 2.0 {
-                let _ = std::io::stderr().write_all(chunk.as_bytes());
-                let _ = std::io::stderr().flush();
-            } else {
-                let _ = std::io::stdout().write_all(chunk.as_bytes());
-                let _ = std::io::stdout().flush();
-            }
+            with_host(|h| h.write_out(&chunk, fd == 2.0));
             Ok(Value::Bool(true))
         }
         // A no-op stream surface so `.on('data')`/`.once`/`.end()` chaining loads.
@@ -366,16 +359,11 @@ fn stream_fd(recv: &Value) -> f64 {
     })
 }
 
-/// Write raw bytes to the process's stdout/stderr (chosen by fd).
+/// Write raw bytes as program output on stdout/stderr (chosen by fd) — through
+/// the host funnel, so an embedder capturing output receives these too.
 fn write_fd(fd: f64, bytes: &[u8]) {
-    use std::io::Write as _;
-    if fd == 2.0 {
-        let _ = std::io::stderr().write_all(bytes);
-        let _ = std::io::stderr().flush();
-    } else {
-        let _ = std::io::stdout().write_all(bytes);
-        let _ = std::io::stdout().flush();
-    }
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    with_host(|h| h.write_out(&text, fd == 2.0));
 }
 
 /// The ANSI control sequence for a `tty.WriteStream` cursor/erase method.

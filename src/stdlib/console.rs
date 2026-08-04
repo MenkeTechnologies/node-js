@@ -279,11 +279,7 @@ fn emit(line: &str, stderr: bool) {
             return;
         }
     }
-    if stderr {
-        eprintln!("{out}");
-    } else {
-        println!("{out}");
-    }
+    with_host(|h| h.write_out(&format!("{out}\n"), stderr));
 }
 
 // ── console.table ────────────────────────────────────────────────────────────

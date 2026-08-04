@@ -2421,11 +2421,7 @@ fn print_line(args: &[Value], stderr: bool) {
     // Node's console.log(...args) === util.format(...args): printf-style
     // substitution when the first arg is a format string, else inspect-and-join.
     let line: String = crate::stdlib::util::format(args);
-    if stderr {
-        eprintln!("{line}");
-    } else {
-        println!("{line}");
-    }
+    with_host(|h| h.write_out(&format!("{line}\n"), stderr));
 }
 
 fn arg0(args: &[Value]) -> Value {
