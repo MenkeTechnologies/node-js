@@ -5,23 +5,13 @@
 //! These run in-process (not through the `node` binary like the parity suites),
 //! because that is precisely what is under test.
 
-use std::sync::Arc;
-
-use nodejs::Value;
-
-fn str_val(s: &str) -> Value {
-    Value::Str(Arc::new(s.to_string()))
-}
-
 /// A seeded global is visible to the program. `eval_str` cannot do this — it
 /// resets the host, so anything installed beforehand is gone by the time the
 /// program runs.
 #[test]
 fn seeded_globals_survive_the_host_reset() {
-    let (result, out) = nodejs::eval_str_captured(
-        "console.log(stdin.toUpperCase())",
-        &[("stdin", str_val("hello"))],
-    );
+    let (result, out) =
+        nodejs::eval_str_captured("console.log(stdin.toUpperCase())", &[("stdin", "hello")]);
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(out, "HELLO\n");
 }
@@ -60,4 +50,14 @@ fn capture_resets_between_runs() {
     let (_, second) = nodejs::eval_str_captured("console.log('two')", &[]);
     assert_eq!(first, "one\n");
     assert_eq!(second, "two\n");
+}
+
+/// A seeded global is a real JS string, not merely something that stringifies:
+/// it answers `typeof` and its own methods. Strings live on the host heap, so
+/// this is the property a `Value`-shaped API would silently get wrong.
+#[test]
+fn seeded_globals_are_real_strings() {
+    let (result, out) = nodejs::eval_str_captured("console.log(typeof stdin)", &[("stdin", "hi")]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(out, "string\n");
 }

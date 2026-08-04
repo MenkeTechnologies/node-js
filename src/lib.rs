@@ -123,24 +123,26 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
 /// only on success) because a program that prints and *then* throws produced
 /// both, and an embedder generally wants to show both.
 ///
+/// Globals are given as text and interned as real JS strings here. They are
+/// deliberately *not* `Value`: strings live on this host's heap as
+/// `JsObj::Str`, so a `Value::Str` a caller builds is at best coerced and at
+/// worst method-less. Handing the host text and letting it intern removes that
+/// trap, and matches the sibling runtimes' embedder entry points.
+///
 /// ```no_run
-/// use nodejs::Value;
-/// use std::sync::Arc;
-/// let (result, out) = nodejs::eval_str_captured(
-///     "console.log(stdin.toUpperCase())",
-///     &[("stdin", Value::Str(Arc::new("hi".to_string())))],
-/// );
+/// let (result, out) = nodejs::eval_str_captured("console.log(stdin.toUpperCase())", &[("stdin", "hi")]);
 /// assert!(result.is_ok());
 /// assert_eq!(out, "HI\n");
 /// ```
-pub fn eval_str_captured(src: &str, globals: &[(&str, Value)]) -> (Result<Value, String>, String) {
+pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, String>, String) {
     host::reset_host();
     if let Ok(cwd) = std::env::current_dir() {
         module::set_entry_dir(cwd);
     }
     host::with_host(|h| {
-        for (name, value) in globals {
-            h.set_global(name, value.clone());
+        for (name, text) in globals {
+            let value = h.new_str(*text);
+            h.set_global(name, value);
         }
         h.begin_capture();
     });
