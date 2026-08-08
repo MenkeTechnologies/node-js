@@ -94,6 +94,21 @@ pub mod ops {
     pub const NUM_STEP: u16 = 59; // [tag(±1), old] -> pushes ToNumeric(old), returns old±1 (type-preserving; BigInt-aware ++/--)
     pub const ITER_CLOSE: u16 = 60; // [iterator] -> close it (for-of break: run a generator's finally / call .return())
     pub const TYPEOF_NAME: u16 = 61; // [name] -> str; `typeof <ident>` reads the name WITHOUT throwing (unbound -> "undefined")
+    pub const SIG_BREAK: u16 = 62; // [label|""] -> raise a Break signal and halt the chunk (break out of a `try`)
+    pub const SIG_CONTINUE: u16 = 63; // [label|""] -> raise a Continue signal and halt the chunk
+    pub const SIG_UNWIND: u16 = 64; // [tag] -> 0 none / 1 break here / 2 continue here; halts the chunk to propagate
+}
+
+/// `SIG_UNWIND` scope tags: what the emitting site is nested in.
+pub mod unwind {
+    /// No enclosing loop in this chunk — any pending signal propagates outward.
+    pub const NO_LOOP: &str = "";
+    /// An enclosing UNLABELED loop in this chunk.
+    pub const PLAIN_LOOP: &str = "\u{0}";
+    /// `SIG_UNWIND` result codes.
+    pub const NONE: i64 = 0;
+    pub const BREAK: i64 = 1;
+    pub const CONTINUE: i64 = 2;
 }
 
 /// `DEF_MEMBER` member-kind tags.
@@ -137,6 +152,11 @@ pub struct FuncDef {
     /// True for an `async` function/method/arrow: calling it drives a coroutine
     /// and returns a Promise; `await` inside suspends via the same yielder.
     pub is_async: bool,
+    /// True for a NAMED function *expression* (`const f = function fact(n) {…}`):
+    /// the closure gets an extra environment binding its own name to itself, so
+    /// the body can recurse through that name even when the outer binding differs.
+    #[serde(default)]
+    pub self_name: bool,
 }
 
 /// One parameter slot. `name` is the simple bound name; a destructuring pattern
@@ -352,6 +372,11 @@ fn new_env(parent: Option<Env>) -> Env {
     }))
 }
 
+/// A fresh empty scope chained under `parent`.
+pub fn child_env(parent: Env) -> Env {
+    new_env(Some(parent))
+}
+
 /// One function activation.
 pub struct Frame {
     pub env: Env,
@@ -369,12 +394,15 @@ pub struct Frame {
     pub owner: Option<String>,
 }
 
-/// A non-local control signal.
+/// A non-local control signal. `Break`/`Continue` carry the optional loop label
+/// and are only raised when the target loop lives in an ENCLOSING chunk (a
+/// `break` inside a `try` block, which the host runs as its own chunk); a
+/// same-chunk `break` is a plain compiler-resolved jump.
 #[derive(Clone)]
 pub enum Signal {
     Return(Value),
-    Break,
-    Continue,
+    Break(Option<String>),
+    Continue(Option<String>),
 }
 
 /// The JavaScript runtime.

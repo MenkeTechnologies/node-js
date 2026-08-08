@@ -70,6 +70,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::NUM_STEP, b_num_step);
     vm.register_builtin(ops::ITER_CLOSE, b_iter_close);
     vm.register_builtin(ops::TYPEOF_NAME, b_typeof_name);
+    vm.register_builtin(ops::SIG_BREAK, b_sig_break);
+    vm.register_builtin(ops::SIG_CONTINUE, b_sig_continue);
+    vm.register_builtin(ops::SIG_UNWIND, b_sig_unwind);
 }
 
 /// `ITER_CLOSE`: close the iterator on the stack (a for-of `break`). A generator
@@ -1260,17 +1263,33 @@ fn b_mkfunc(vm: &mut VM, _: u8) -> Value {
         Value::Float(f) => f as usize,
         _ => return abort(vm, "internal: MKFUNC id".into()),
     };
-    let is_arrow = with_host(|h| h.funcs.get(def_id).map(|d| d.is_arrow).unwrap_or(false));
+    let (is_arrow, self_name) = with_host(|h| match h.funcs.get(def_id) {
+        Some(d) => (
+            d.is_arrow,
+            (d.self_name && !d.name.is_empty()).then(|| d.name.clone()),
+        ),
+        None => (false, None),
+    });
     with_host(|h| {
-        let env = h.current_env_capture();
+        let mut env = h.current_env_capture();
         let this = h.current_this();
-        h.alloc(JsObj::Func(FuncVal {
+        // A named function expression closes over an extra scope holding its own
+        // name, so the body can recurse through it (`function f(){ … f() … }`)
+        // independently of whatever the outer binding is later set to.
+        if self_name.is_some() {
+            env = host::child_env(env);
+        }
+        let f = h.alloc(JsObj::Func(FuncVal {
             def_id,
-            env: Some(env),
+            env: Some(env.clone()),
             this,
             is_arrow,
             home_class: None,
-        }))
+        }));
+        if let Some(n) = self_name {
+            env.borrow_mut().vars.insert(n, f.clone());
+        }
+        f
     })
 }
 
@@ -1422,6 +1441,69 @@ fn b_sig_return(vm: &mut VM, _: u8) -> Value {
     with_host(|h| h.signal = Some(host::Signal::Return(v.clone())));
     vm.ip = vm.chunk.ops.len();
     v
+}
+
+/// `break [label]` whose target loop lives in an enclosing chunk (the statement is
+/// inside a `try` block, which the host runs as its own chunk). Raise the signal
+/// and halt this chunk; `SIG_UNWIND` after the `TRY` op re-dispatches it.
+fn b_sig_break(vm: &mut VM, _: u8) -> Value {
+    let label = sval(&vm.pop());
+    let label = (!label.is_empty()).then_some(label);
+    with_host(|h| h.signal = Some(host::Signal::Break(label)));
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
+}
+
+/// `continue [label]` out of a `try` block — see [`b_sig_break`].
+fn b_sig_continue(vm: &mut VM, _: u8) -> Value {
+    let label = sval(&vm.pop());
+    let label = (!label.is_empty()).then_some(label);
+    with_host(|h| h.signal = Some(host::Signal::Continue(label)));
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
+}
+
+/// Dispatch a pending control signal at the instruction after a `TRY`. `tag`
+/// describes what the `try` is nested in (see [`host::unwind`]):
+///
+/// * no signal → `NONE`, execution continues normally;
+/// * `Return`, or no enclosing loop in this chunk → halt the chunk so the signal
+///   keeps travelling outward;
+/// * `break`/`continue` targeting the enclosing loop → consume it and report
+///   `BREAK`/`CONTINUE` so the compiler-emitted jump lands on the loop's exit /
+///   continue target;
+/// * a LABELED `break`/`continue` for some outer loop → report `BREAK` but leave
+///   the signal pending, so leaving this loop re-dispatches it one level out.
+fn b_sig_unwind(vm: &mut VM, _: u8) -> Value {
+    let tag = sval(&vm.pop());
+    let sig = match with_host(|h| h.signal.clone()) {
+        Some(s) => s,
+        None => return Value::Int(host::unwind::NONE),
+    };
+    let (label, code) = match &sig {
+        host::Signal::Return(_) => {
+            vm.ip = vm.chunk.ops.len();
+            return Value::Int(host::unwind::NONE);
+        }
+        host::Signal::Break(l) => (l.clone(), host::unwind::BREAK),
+        host::Signal::Continue(l) => (l.clone(), host::unwind::CONTINUE),
+    };
+    if tag == host::unwind::NO_LOOP {
+        vm.ip = vm.chunk.ops.len();
+        return Value::Int(host::unwind::NONE);
+    }
+    let targets_this_loop = match &label {
+        None => true, // unlabeled: always the innermost enclosing loop
+        Some(l) => tag == *l,
+    };
+    if targets_this_loop {
+        with_host(|h| h.signal = None);
+        Value::Int(code)
+    } else {
+        // Some outer labeled loop: leave this one via its break exit, keeping the
+        // signal pending for the next dispatch point.
+        Value::Int(host::unwind::BREAK)
+    }
 }
 
 fn b_throw(vm: &mut VM, _: u8) -> Value {
@@ -3396,7 +3478,7 @@ fn replace_str_fn(s: &str, pat: &str, repl: &Value, all: bool) -> Result<String,
 fn is_number_method(name: &str) -> bool {
     matches!(
         name,
-        "toFixed" | "toString" | "toPrecision" | "toLocaleString" | "valueOf"
+        "toFixed" | "toExponential" | "toString" | "toPrecision" | "toLocaleString" | "valueOf"
     )
 }
 
@@ -4295,8 +4377,29 @@ fn bigint_method(b: &num_bigint::BigInt, name: &str, args: Vec<Value>) -> Result
 fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "toFixed" => {
-            let digits = arg_num(&args, 0).max(0.0) as usize;
-            Ok(new_s(to_fixed(n, digits)))
+            let digits = arg_num(&args, 0);
+            if !(0.0..=100.0).contains(&digits.trunc()) {
+                return Err(host::range_error(
+                    "toFixed() digits argument must be between 0 and 100",
+                ));
+            }
+            Ok(new_s(to_fixed(n, digits as usize)))
+        }
+        "toExponential" => {
+            // `undefined` (or a missing argument) selects the shortest form.
+            let f = match args.first() {
+                None | Some(Value::Undef) => None,
+                Some(_) => {
+                    let d = arg_num(&args, 0).trunc();
+                    if !(0.0..=100.0).contains(&d) {
+                        return Err(host::range_error(
+                            "toExponential() argument must be between 0 and 100",
+                        ));
+                    }
+                    Some(d as usize)
+                }
+            };
+            Ok(new_s(to_exponential(n, f)))
         }
         "toString" => {
             let radix = args.first().map(|_| arg_num(&args, 0) as u32).unwrap_or(10);
@@ -4307,11 +4410,18 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
             }
         }
         "toPrecision" => {
-            if args.is_empty() {
-                Ok(new_s(host::fmt_number(n)))
-            } else {
-                let p = arg_num(&args, 0) as usize;
-                Ok(new_s(to_precision(n, p.max(1))))
+            // `undefined` (or a missing argument) behaves like `toString()`.
+            match args.first() {
+                None | Some(Value::Undef) => Ok(new_s(host::fmt_number(n))),
+                Some(_) => {
+                    let p = arg_num(&args, 0).trunc();
+                    if !(1.0..=100.0).contains(&p) {
+                        return Err(host::range_error(
+                            "toPrecision() argument must be between 1 and 100",
+                        ));
+                    }
+                    Ok(new_s(to_precision(n, p as usize)))
+                }
             }
         }
         "toLocaleString" => Ok(new_s(to_locale_string(n))),
@@ -4447,26 +4557,12 @@ fn assemble_decimal(digits: &[u8], point: usize, f: usize) -> String {
     format!("{int_str}.{frac}")
 }
 
-/// `Number.prototype.toPrecision(p)`: `p` significant digits, switching to
-/// exponential form when the decimal exponent `e` satisfies `e < -6` or `e ≥ p`
-/// (ECMAScript Number.prototype.toPrecision). Trailing zeros are significant and
-/// retained (`(100).toPrecision(5) === "100.00"`).
-fn to_precision(n: f64, p: usize) -> String {
-    if !n.is_finite() {
-        return host::fmt_number(n);
-    }
-    if n == 0.0 {
-        return if p == 1 {
-            "0".into()
-        } else {
-            format!("0.{}", "0".repeat(p - 1))
-        };
-    }
-    let neg = n < 0.0;
-    let a = n.abs();
-    // Take the EXACT digits with guard positions past the p-th, then round to p
-    // significant digits half away from zero — Rust's `{:.*e}` rounds half to
-    // EVEN (`(2.5).toPrecision(1)` would give "2"), but JS rounds half up ("3").
+/// Round the nonnegative finite `a` to `p` significant decimal digits, half away
+/// from zero, returning the `p` digits and the decimal exponent `e` such that the
+/// value is `0.d…d × 10^(e+1)` (i.e. `d.d…d e±e`). Rust's `{:.*e}` rounds half to
+/// EVEN (`(2.5)` at 1 digit would give "2"), but JS rounds half up ("3"), so the
+/// exact digits are taken with guard positions and rounded here.
+fn round_significant(a: f64, p: usize) -> (String, i32) {
     let sci = format!("{a:.*e}", p - 1 + 25);
     let (mant, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
     let mut e: i32 = exp_str.parse().expect("LowerExp exponent is an integer");
@@ -4498,6 +4594,68 @@ fn to_precision(n: f64, p: usize) -> String {
         }
         s = d.iter().map(|x| (x + b'0') as char).collect();
     }
+    (s, e)
+}
+
+/// `Number.prototype.toExponential(f)`: one digit before the point and `f` after,
+/// with a signed decimal exponent (`(100).toExponential(2) === "1.00e+2"`). With
+/// `f` omitted, as many digits as uniquely identify the value are used
+/// (`(123456).toExponential() === "1.23456e+5"`). Rounding is half away from zero
+/// on the exact value, matching `toPrecision`.
+fn to_exponential(n: f64, f: Option<usize>) -> String {
+    if !n.is_finite() {
+        return host::fmt_number(n);
+    }
+    let neg = n < 0.0;
+    let a = n.abs();
+    let (s, e) = if a == 0.0 {
+        // Zero has no significant digits: emit "0" padded to the requested width.
+        ("0".repeat(f.unwrap_or(0) + 1), 0)
+    } else {
+        match f {
+            Some(f) => round_significant(a, f + 1),
+            None => {
+                // Shortest round-tripping digits (Rust's `{:e}` is shortest).
+                let sci = format!("{a:e}");
+                let (mant, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
+                let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+                let trimmed = digits.trim_end_matches('0');
+                let digits = if trimmed.is_empty() { "0" } else { trimmed };
+                (digits.to_string(), exp_str.parse().unwrap_or(0))
+            }
+        }
+    };
+    let sign = if e >= 0 { '+' } else { '-' };
+    let mag = e.abs();
+    let body = if s.len() == 1 {
+        format!("{s}e{sign}{mag}")
+    } else {
+        format!("{}.{}e{sign}{mag}", &s[..1], &s[1..])
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// `Number.prototype.toPrecision(p)`: `p` significant digits, switching to
+/// exponential form when the decimal exponent `e` satisfies `e < -6` or `e ≥ p`
+/// (ECMAScript Number.prototype.toPrecision). Trailing zeros are significant and
+/// retained (`(100).toPrecision(5) === "100.00"`).
+fn to_precision(n: f64, p: usize) -> String {
+    if !n.is_finite() {
+        return host::fmt_number(n);
+    }
+    if n == 0.0 {
+        return if p == 1 {
+            "0".into()
+        } else {
+            format!("0.{}", "0".repeat(p - 1))
+        };
+    }
+    let neg = n < 0.0;
+    let (s, e) = round_significant(n.abs(), p);
     let pp = p as i32;
 
     let body = if e < -6 || e >= pp {

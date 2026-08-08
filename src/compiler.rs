@@ -13,7 +13,7 @@
 //! constants; JS-level strings are always heap objects built by `MKSTR`.
 
 use crate::ast::*;
-use crate::host::{binop as bop, member, ops, unop, FuncDef, ParamSlot, TryDef};
+use crate::host::{binop as bop, member, ops, unop, unwind, FuncDef, ParamSlot, TryDef};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 
 /// A compiled program: the top-level chunk plus the function template table and
@@ -88,6 +88,14 @@ pub struct Compiler {
     pending_label: Option<String>,
     /// Emit per-statement `DBG_LINE` markers for the DAP debugger (`node --dap`).
     debug: bool,
+    /// Index into `loops` of the first loop opened by the chunk being emitted.
+    /// A `break`/`continue` targeting a loop BELOW this index leaves the current
+    /// chunk (a `try` body is compiled as its own chunk), so it cannot be a plain
+    /// jump and is raised as a signal instead.
+    chunk_loop_base: usize,
+    /// Whether this chunk contains a signal-raising `break`/`continue`, so loops
+    /// in it must re-dispatch a still-pending signal when they exit.
+    chunk_signals: bool,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -271,43 +279,51 @@ impl Compiler {
             }
             StmtKind::Labeled { label, body } => self.compile_labeled(b, label, body)?,
             StmtKind::Break(label) => {
-                let j = b.emit(Op::Jump(0), line);
-                let ctx = match label {
+                let idx = match label {
                     // `break outer`: the nearest enclosing context carrying that label.
                     Some(name) => self
                         .loops
-                        .iter_mut()
-                        .rev()
-                        .find(|c| c.label.as_deref() == Some(name.as_str()))
+                        .iter()
+                        .rposition(|c| c.label.as_deref() == Some(name.as_str()))
                         .ok_or_else(|| format!("SyntaxError: Undefined label '{name}'"))?,
                     None => self
                         .loops
-                        .last_mut()
+                        .len()
+                        .checked_sub(1)
                         .ok_or("SyntaxError: 'break' outside loop")?,
                 };
-                ctx.breaks.push(j);
+                if idx >= self.chunk_loop_base {
+                    let j = b.emit(Op::Jump(0), line);
+                    self.loops[idx].breaks.push(j);
+                } else {
+                    self.emit_signal_jump(b, ops::SIG_BREAK, label.as_deref(), line);
+                }
             }
             StmtKind::Continue(label) => {
-                let j = b.emit(Op::Jump(0), line);
-                let ctx = match label {
+                let idx = match label {
                     // `continue outer`: the labeled loop (a label on a non-loop
                     // cannot catch `continue`).
                     Some(name) => self
                         .loops
-                        .iter_mut()
-                        .rev()
-                        .find(|c| c.catches_continue && c.label.as_deref() == Some(name.as_str()))
+                        .iter()
+                        .rposition(|c| {
+                            c.catches_continue && c.label.as_deref() == Some(name.as_str())
+                        })
                         .ok_or_else(|| {
                             format!("SyntaxError: Undefined label '{name}' for continue")
                         })?,
                     None => self
                         .loops
-                        .iter_mut()
-                        .rev()
-                        .find(|c| c.catches_continue)
+                        .iter()
+                        .rposition(|c| c.catches_continue)
                         .ok_or("SyntaxError: 'continue' outside loop")?,
                 };
-                ctx.continues.push(j);
+                if idx >= self.chunk_loop_base {
+                    let j = b.emit(Op::Jump(0), line);
+                    self.loops[idx].continues.push(j);
+                } else {
+                    self.emit_signal_jump(b, ops::SIG_CONTINUE, label.as_deref(), line);
+                }
             }
             StmtKind::Throw(e) => {
                 self.compile_expr(b, e)?;
@@ -539,8 +555,18 @@ impl Compiler {
             for br in ctx.breaks {
                 b.patch_jump(br, end);
             }
+            self.redispatch_after_loop(b);
         }
         Ok(())
+    }
+
+    /// After a loop/switch exits, a signal raised deeper in this chunk may still be
+    /// pending (a LABELED `break`/`continue` for an OUTER loop). Re-dispatch it one
+    /// level out. Emitted only when this chunk actually raises signals.
+    fn redispatch_after_loop(&mut self, b: &mut ChunkBuilder) {
+        if self.chunk_signals {
+            self.emit_signal_dispatch(b);
+        }
     }
 
     fn compile_while(
@@ -569,6 +595,7 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, end);
         }
+        self.redispatch_after_loop(b);
         Ok(())
     }
 
@@ -597,6 +624,7 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, end);
         }
+        self.redispatch_after_loop(b);
         Ok(())
     }
 
@@ -643,6 +671,7 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, end);
         }
+        self.redispatch_after_loop(b);
         Ok(())
     }
 
@@ -729,6 +758,7 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, end);
         }
+        self.redispatch_after_loop(b);
         Ok(())
     }
 
@@ -769,6 +799,7 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, break_target);
         }
+        self.redispatch_after_loop(b);
         Ok(())
     }
 
@@ -830,6 +861,7 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, end);
         }
+        self.redispatch_after_loop(b);
         Ok(())
     }
 
@@ -865,13 +897,28 @@ impl Compiler {
         b.emit(Op::LoadInt(id as i64), 0);
         b.emit(Op::CallBuiltin(ops::TRY, 1), 0);
         b.emit(Op::Pop, 0);
+        // The try/catch/finally bodies ran as their own chunks, so a `return` or
+        // a `break`/`continue` inside them left a signal instead of jumping.
+        self.emit_signal_dispatch(b);
         Ok(())
     }
 
+    /// Compile statements into a SEPARATE chunk (a try/catch/finally body). Loops
+    /// opened outside it are unreachable by a plain jump, so `chunk_loop_base`
+    /// moves up for the duration.
     fn compile_block_chunk(&mut self, stmts: &[Stmt]) -> Result<Chunk, String> {
         let mut cb = ChunkBuilder::new();
-        self.hoist_funcs(&mut cb, stmts)?;
-        self.compile_stmts(&mut cb, stmts)?;
+        let base = std::mem::replace(&mut self.chunk_loop_base, self.loops.len());
+        let signals = std::mem::take(&mut self.chunk_signals);
+        let r = (|| {
+            self.hoist_funcs(&mut cb, stmts)?;
+            self.compile_stmts(&mut cb, stmts)
+        })();
+        self.chunk_loop_base = base;
+        // A signal raised inside the nested chunk still has to be dispatched by a
+        // loop in THIS chunk, so the flag propagates outward.
+        self.chunk_signals |= signals;
+        r?;
         Ok(cb.build())
     }
 
@@ -886,11 +933,22 @@ impl Compiler {
     ) -> Result<usize, String> {
         let (slots, prologue) = self.lower_params(params)?;
         let mut fb = ChunkBuilder::new();
-        // Function-body function hoisting.
-        self.hoist_funcs(&mut fb, &prologue)?;
-        self.hoist_funcs(&mut fb, body)?;
-        self.compile_stmts(&mut fb, &prologue)?;
-        self.compile_stmts(&mut fb, body)?;
+        // A function body is its own control-flow universe: `break`/`continue` can
+        // never target a loop in the enclosing function.
+        let saved_loops = std::mem::take(&mut self.loops);
+        let saved_base = std::mem::replace(&mut self.chunk_loop_base, 0);
+        let saved_signals = std::mem::take(&mut self.chunk_signals);
+        let r = (|| {
+            // Function-body function hoisting.
+            self.hoist_funcs(&mut fb, &prologue)?;
+            self.hoist_funcs(&mut fb, body)?;
+            self.compile_stmts(&mut fb, &prologue)?;
+            self.compile_stmts(&mut fb, body)
+        })();
+        self.loops = saved_loops;
+        self.chunk_loop_base = saved_base;
+        self.chunk_signals = saved_signals;
+        r?;
         let def = FuncDef {
             name: name.to_string(),
             params: slots,
@@ -898,6 +956,7 @@ impl Compiler {
             is_arrow: false,
             is_generator,
             is_async,
+            self_name: false,
         };
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
@@ -1233,7 +1292,14 @@ impl Compiler {
                         FnBody::Block(b) => b.clone(),
                         FnBody::Expr(e) => vec![Stmt::from(StmtKind::Return(Some((**e).clone())))],
                     };
-                    self.build_function(&n, params, &stmts, *is_generator, *is_async)?
+                    let id = self.build_function(&n, params, &stmts, *is_generator, *is_async)?;
+                    // A NAMED function expression binds its own name inside the body
+                    // (object/class methods parse with `name: None`, so this only
+                    // fires for `function name(…) {…}` in expression position).
+                    if name.is_some() {
+                        self.functions[id].1.self_name = true;
+                    }
+                    id
                 };
                 self.emit_mkfunc(b, def_id);
             }
@@ -1578,7 +1644,13 @@ impl Compiler {
                 b.emit(Op::LogNot, 0);
             }
             BinOp::In => {
-                self.compile_expr(b, l)?;
+                // `#field in obj` is the private-brand check: the left operand is a
+                // private NAME, not a variable read, so it lowers to the key string
+                // (private fields live as `#`-prefixed properties on the instance).
+                match l {
+                    Expr::Ident(n) if n.starts_with('#') => self.name_const(b, n),
+                    _ => self.compile_expr(b, l)?,
+                }
                 self.compile_expr(b, r)?;
                 b.emit(Op::CallBuiltin(ops::CONTAINS, 2), 0);
             }
@@ -1689,6 +1761,71 @@ impl Compiler {
 
     /// For an optional access: object on TOS. If nullish, replace with undefined
     /// and jump over the access. Returns the jump index to patch to the end.
+    /// Raise a `break`/`continue` whose target loop is outside this chunk.
+    fn emit_signal_jump(
+        &mut self,
+        b: &mut ChunkBuilder,
+        op: u16,
+        label: Option<&str>,
+        line: u32,
+    ) {
+        self.name_const(b, label.unwrap_or(""));
+        b.emit(Op::CallBuiltin(op, 1), line);
+        b.emit(Op::Pop, line);
+        self.chunk_signals = true;
+    }
+
+    /// Emit the `SIG_UNWIND` dispatch that runs right after a `TRY` (or after a
+    /// loop that may still hold a signal for an outer labeled loop): route a
+    /// pending `break`/`continue` to the enclosing loop's exit/continue target, or
+    /// halt the chunk so a `return` (or a signal for a loop further out) keeps
+    /// propagating.
+    fn emit_signal_dispatch(&mut self, b: &mut ChunkBuilder) {
+        // `break` lands on the innermost enclosing context, `continue` on the
+        // innermost one that catches it (a `switch` in between catches neither).
+        // Both must live in THIS chunk, otherwise the signal has to keep travelling.
+        let brk = self.loops.len().checked_sub(1).filter(|i| *i >= self.chunk_loop_base);
+        let cont = self
+            .loops
+            .iter()
+            .rposition(|c| c.catches_continue)
+            .filter(|i| *i >= self.chunk_loop_base);
+        let (Some(idx), Some(cont_idx)) = (brk, cont) else {
+            self.name_const(b, unwind::NO_LOOP);
+            b.emit(Op::CallBuiltin(ops::SIG_UNWIND, 1), 0);
+            b.emit(Op::Pop, 0);
+            return;
+        };
+        let tag = match &self.loops[idx].label {
+            Some(l) => l.clone(),
+            None => unwind::PLAIN_LOOP.to_string(),
+        };
+        self.name_const(b, &tag);
+        b.emit(Op::CallBuiltin(ops::SIG_UNWIND, 1), 0); // [code]
+        b.emit(Op::Dup, 0);
+        b.emit(Op::LoadInt(unwind::BREAK), 0);
+        b.emit(Op::CallBuiltin(ops::STRICT_EQ, 2), 0);
+        let jb = b.emit(Op::JumpIfTrue(0), 0);
+        b.emit(Op::Dup, 0);
+        b.emit(Op::LoadInt(unwind::CONTINUE), 0);
+        b.emit(Op::CallBuiltin(ops::STRICT_EQ, 2), 0);
+        let jc = b.emit(Op::JumpIfTrue(0), 0);
+        b.emit(Op::Pop, 0); // no signal: drop the code and fall through
+        let jafter = b.emit(Op::Jump(0), 0);
+        let brk_land = b.current_pos();
+        b.emit(Op::Pop, 0);
+        let brk_jump = b.emit(Op::Jump(0), 0);
+        let cont_land = b.current_pos();
+        b.emit(Op::Pop, 0);
+        let cont_jump = b.emit(Op::Jump(0), 0);
+        let after = b.current_pos();
+        b.patch_jump(jb, brk_land);
+        b.patch_jump(jc, cont_land);
+        b.patch_jump(jafter, after);
+        self.loops[idx].breaks.push(brk_jump);
+        self.loops[cont_idx].continues.push(cont_jump);
+    }
+
     fn emit_optional_guard(&mut self, b: &mut ChunkBuilder) -> usize {
         b.emit(Op::Dup, 0);
         b.emit(Op::CallBuiltin(ops::NULLISH, 1), 0);
@@ -1702,13 +1839,91 @@ impl Compiler {
         jend
     }
 
+    /// `callee?.(args)` — the CALLEE itself may be nullish, in which case the whole
+    /// call short-circuits to `undefined` without evaluating the arguments. A
+    /// method callee (`obj.m?.()`) must still be invoked with `this === obj`, so it
+    /// is dispatched through `m.call(obj, …)` / `m.apply(obj, …)`.
+    fn compile_optional_call(
+        &mut self,
+        b: &mut ChunkBuilder,
+        func: &Expr,
+        args: &[Expr],
+    ) -> Result<(), String> {
+        let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
+        if let Expr::Member {
+            object,
+            property,
+            optional: obj_optional,
+        } = func
+        {
+            self.compile_expr(b, object)?; // [recv]
+            let jobj = if *obj_optional {
+                Some(self.emit_optional_guard(b))
+            } else {
+                None
+            };
+            b.emit(Op::Dup, 0); // [recv, recv]
+            self.name_const(b, property); // [recv, recv, name]
+            b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [recv, fn]
+            // Nullish callee: drop both the method and the receiver.
+            b.emit(Op::Dup, 0);
+            b.emit(Op::CallBuiltin(ops::NULLISH, 1), 0);
+            let jlive = b.emit(Op::JumpIfFalse(0), 0);
+            b.emit(Op::Pop, 0);
+            b.emit(Op::Pop, 0);
+            b.emit(Op::LoadUndef, 0);
+            let jend = b.emit(Op::Jump(0), 0);
+            let live = b.current_pos();
+            b.patch_jump(jlive, live);
+            // [recv, fn] -> fn.call(recv, …) / fn.apply(recv, argsArray)
+            let via = if has_spread { "apply" } else { "call" };
+            self.name_const(b, via); // [recv, fn, via]
+            b.emit(Op::Rot, 0); // [fn, via, recv]
+            let extra = if has_spread {
+                self.compile_spread_args(b, args)?; // [fn, via, recv, argsArray]
+                1
+            } else {
+                for a in args {
+                    self.compile_expr(b, a)?;
+                }
+                args.len()
+            };
+            b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(3 + extra)?), 0);
+            let end = b.current_pos();
+            b.patch_jump(jend, end);
+            if let Some(j) = jobj {
+                b.patch_jump(j, end);
+            }
+            return Ok(());
+        }
+        // Plain callee (`f?.()`, `obj[k]?.()`): evaluate it, guard, then call with
+        // no receiver — matching the non-optional path for the same callee shape.
+        self.compile_expr(b, func)?;
+        let jend = self.emit_optional_guard(b);
+        if has_spread {
+            self.compile_spread_args(b, args)?;
+            b.emit(Op::CallBuiltin(ops::APPLY, 2), 0);
+        } else {
+            for a in args {
+                self.compile_expr(b, a)?;
+            }
+            b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
+        }
+        let end = b.current_pos();
+        b.patch_jump(jend, end);
+        Ok(())
+    }
+
     fn compile_call(
         &mut self,
         b: &mut ChunkBuilder,
         func: &Expr,
         args: &[Expr],
-        _optional: bool,
+        optional: bool,
     ) -> Result<(), String> {
+        if optional {
+            return self.compile_optional_call(b, func, args);
+        }
         let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
         match func {
             // `super(...args)` — invoke the parent constructor on the current
