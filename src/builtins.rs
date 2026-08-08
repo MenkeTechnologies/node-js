@@ -3047,7 +3047,10 @@ fn array_like_items(src: &Value) -> Vec<Value> {
 // ── JSON ──────────────────────────────────────────────────────────────────────
 
 fn json_stringify(args: Vec<Value>) -> Result<Value, String> {
-    let v = arg0(&args);
+    // `toJSON` runs BEFORE serialization and may be user code, so the tree is
+    // rewritten first — outside the host borrow `json_str` holds, and before the
+    // BigInt walk, which has no cycle guard of its own.
+    let v = apply_to_json(&arg0(&args), &mut Vec::new())?;
     // A BigInt anywhere in a serializable position is a TypeError (JSON has no
     // bigint form), matching Node's exact message.
     if with_host(|h| json_has_bigint(h, &v)) {
@@ -3072,6 +3075,62 @@ fn json_stringify(args: Vec<Value>) -> Result<Value, String> {
         Some(s) => Ok(with_host(|h| h.new_str(s))),
         None => Ok(Value::Undef),
     }
+}
+
+/// Replace every value in the tree that defines `toJSON()` with its result (the
+/// `SerializeJSONProperty` step). Applies to user methods, class methods, and the
+/// native `Date`/`Buffer`/`URL` accessors alike. Returns a fresh tree; the input
+/// is never mutated. Depth-capped so a cyclic structure cannot spin forever.
+fn apply_to_json(v: &Value, path: &mut Vec<Value>) -> Result<Value, String> {
+    if !matches!(v, Value::Obj(_)) {
+        return Ok(v.clone());
+    }
+    // A value that contains itself has no JSON form.
+    if with_host(|h| path.iter().any(|p| h.strict_eq(p, v))) {
+        return Err(host::type_error("Converting circular structure to JSON"));
+    }
+    let tag = crate::stdlib::native_tag(v);
+    let has_to_json = with_host(|h| match host::lookup_chain(h, v, "toJSON") {
+        Some(f) => host::is_callable(h, &f),
+        None => false,
+    }) || tag.as_deref().map(crate::stdlib::has_to_json).unwrap_or(false);
+    if has_to_json {
+        let r = host::call_method(v, "toJSON", Vec::new())?;
+        path.push(v.clone());
+        let out = apply_to_json(&r, path);
+        path.pop();
+        return out;
+    }
+    let obj = with_host(|h| h.get(v).cloned());
+    path.push(v.clone());
+    let out = (|| match obj {
+        Some(JsObj::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in &items {
+                out.push(apply_to_json(it, path)?);
+            }
+            Ok(with_host(|h| h.new_array(out)))
+        }
+        Some(JsObj::Object(props)) => {
+            // Only rebuild when a descendant actually changed, so plain data keeps
+            // its identity (and its prototype / native tag).
+            let mut next: IndexMap<String, Value> = IndexMap::new();
+            let mut changed = false;
+            for (k, val) in &props {
+                let nv = apply_to_json(val, path)?;
+                changed |= !with_host(|h| h.strict_eq(&nv, val));
+                next.insert(k.clone(), nv);
+            }
+            if changed {
+                Ok(with_host(|h| h.new_object(next)))
+            } else {
+                Ok(v.clone())
+            }
+        }
+        _ => Ok(v.clone()),
+    })();
+    path.pop();
+    out
 }
 
 /// Whether a value tree contains a `BigInt` in a position `JSON.stringify` would

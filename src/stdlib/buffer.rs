@@ -14,6 +14,7 @@ pub const STATIC_METHODS: &[&str] = &[
     "concat",
     "isBuffer",
     "byteLength",
+    "compare",
 ];
 
 /// Free functions of the `buffer` module itself (`require('buffer').atob`, …), as
@@ -269,6 +270,16 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
             super::arg_num(args, 0).max(0.0) as usize
         ])),
         "concat" => concat(args),
+        // Static `Buffer.compare(a, b)` — the sort comparator form.
+        "compare" => {
+            let a = bytes_of(&args.first().cloned().unwrap_or(Value::Undef));
+            let b = bytes_of(&args.get(1).cloned().unwrap_or(Value::Undef));
+            Ok(Value::Float(match a.cmp(&b) {
+                std::cmp::Ordering::Less => -1.0,
+                std::cmp::Ordering::Equal => 0.0,
+                std::cmp::Ordering::Greater => 1.0,
+            }))
+        }
         "isBuffer" => Ok(Value::Bool(
             super::native_tag(&args.first().cloned().unwrap_or(Value::Undef)).as_deref()
                 == Some("Buffer"),
@@ -360,7 +371,13 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             Ok(Value::Float(*bytes.get(i).unwrap_or(&0) as f64))
         }
         "includes" | "indexOf" | "lastIndexOf" => {
-            let needle = decode_str(&arg_str(args, 0), "utf8");
+            // The needle is a string, a byte value, or another Buffer.
+            let target = args.first().cloned().unwrap_or(Value::Undef);
+            let needle = match &target {
+                Value::Int(_) | Value::Float(_) => vec![super::arg_num(args, 0) as u8],
+                _ if super::native_tag(&target).as_deref() == Some("Buffer") => bytes_of(&target),
+                _ => decode_str(&arg_str(args, 0), "utf8"),
+            };
             // An empty needle matches at 0 (indexOf) / len (lastIndexOf), like Node.
             let pos = if needle.is_empty() {
                 Some(if method == "lastIndexOf" {
@@ -405,6 +422,60 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 | ((*bytes.get(i + 1).unwrap_or(&0) as u16) << 8);
             Ok(Value::Float(v as f64))
         }
+        // 32-bit and signed reads. `readIntXX` reinterprets the same bytes as
+        // two's complement.
+        "readUInt32BE" | "readUInt32LE" | "readInt32BE" | "readInt32LE" => {
+            let i = super::arg_num(args, 0).max(0.0) as usize;
+            let at = |k: usize| *bytes.get(i + k).unwrap_or(&0) as u32;
+            let v = if method.ends_with("BE") {
+                (at(0) << 24) | (at(1) << 16) | (at(2) << 8) | at(3)
+            } else {
+                at(0) | (at(1) << 8) | (at(2) << 16) | (at(3) << 24)
+            };
+            Ok(Value::Float(if method.starts_with("readInt") {
+                v as i32 as f64
+            } else {
+                v as f64
+            }))
+        }
+        "readInt8" => {
+            let i = super::arg_num(args, 0).max(0.0) as usize;
+            Ok(Value::Float(*bytes.get(i).unwrap_or(&0) as i8 as f64))
+        }
+        "readInt16BE" | "readInt16LE" => {
+            let i = super::arg_num(args, 0).max(0.0) as usize;
+            let at = |k: usize| *bytes.get(i + k).unwrap_or(&0) as u16;
+            let v = if method.ends_with("BE") {
+                (at(0) << 8) | at(1)
+            } else {
+                at(0) | (at(1) << 8)
+            };
+            Ok(Value::Float(v as i16 as f64))
+        }
+        // `buf[i]` by method: `at` accepts a negative index like Array.prototype.at.
+        "at" => {
+            let i = super::arg_num(args, 0);
+            let idx = if i < 0.0 { i + bytes.len() as f64 } else { i };
+            Ok(match bytes.get(idx.max(-1.0) as usize) {
+                Some(b) if idx >= 0.0 => Value::Float(*b as f64),
+                _ => Value::Undef,
+            })
+        }
+        // Iteration helpers: a Buffer is an index/byte collection.
+        "values" | "keys" | "entries" => {
+            let items: Vec<Value> = with_host(|h| match method {
+                "keys" => (0..bytes.len()).map(|i| Value::Float(i as f64)).collect(),
+                "values" => bytes.iter().map(|b| Value::Float(*b as f64)).collect(),
+                _ => bytes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        h.new_array(vec![Value::Float(i as f64), Value::Float(*b as f64)])
+                    })
+                    .collect(),
+            });
+            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+        }
         // In-place writes: mutate the backing `@@bytes`, return the next offset.
         "writeUInt8" => {
             let mut b = bytes.clone();
@@ -431,6 +502,27 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             }
             set_bytes(recv, &b);
             Ok(Value::Float((off + 2) as f64))
+        }
+        "writeUInt32BE" | "writeUInt32LE" | "writeInt32BE" | "writeInt32LE" => {
+            let mut b = bytes.clone();
+            let val = super::arg_num(args, 0) as i64 as u32;
+            let off = super::arg_num(args, 1).max(0.0) as usize;
+            let be = [
+                (val >> 24) as u8,
+                (val >> 16) as u8,
+                (val >> 8) as u8,
+                val as u8,
+            ];
+            let out: Vec<u8> = if method.ends_with("BE") {
+                be.to_vec()
+            } else {
+                be.iter().rev().copied().collect()
+            };
+            if off + 3 < b.len() {
+                b[off..off + 4].copy_from_slice(&out);
+            }
+            set_bytes(recv, &b);
+            Ok(Value::Float((off + 4) as f64))
         }
         // write(string[, offset[, length]][, encoding]) — returns bytes written.
         "write" => {

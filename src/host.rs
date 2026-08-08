@@ -2436,6 +2436,13 @@ impl JsHost {
                     .map(|(k, v)| self.new_array(vec![k, v]))
                     .collect())
             }
+            // A `Buffer` iterates over its BYTES (it is a Uint8Array in Node).
+            Some(JsObj::Object(props)) if props.contains_key("@@bytes") => {
+                match props.get("@@bytes").cloned().and_then(|b| self.get(&b).cloned()) {
+                    Some(JsObj::Array(items)) => Ok(items),
+                    _ => Ok(Vec::new()),
+                }
+            }
             _ => Err(type_error(&format!("{} is not iterable", self.type_of(v)))),
         }
     }

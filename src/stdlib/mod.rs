@@ -455,6 +455,13 @@ pub fn native_tag(recv: &Value) -> Option<String> {
     })
 }
 
+/// Native instance tags whose `instance_call` implements `toJSON()`, which
+/// `JSON.stringify` must invoke before serializing the value. (`instance_has_method`
+/// only covers tags with a declared method table; `Date` dispatches directly.)
+pub fn has_to_json(tag: &str) -> bool {
+    matches!(tag, "Buffer" | "Date" | "URL" | "MIMEType" | "MIMEParams")
+}
+
 /// Whether `name` is a method of a native instance tagged `tag`. Used by
 /// `get_property` so a method *read* (`server.listen.apply(...)`, the express
 /// listen path) yields a bound method rather than `undefined` — the method is
@@ -525,6 +532,21 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
             "writeUInt8",
             "writeUInt16BE",
             "writeUInt16LE",
+            "readUInt32BE",
+            "readUInt32LE",
+            "readInt8",
+            "readInt16BE",
+            "readInt16LE",
+            "readInt32BE",
+            "readInt32LE",
+            "writeUInt32BE",
+            "writeUInt32LE",
+            "writeInt32BE",
+            "writeInt32LE",
+            "at",
+            "values",
+            "keys",
+            "entries",
         ],
         "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" => &[
             "read",
