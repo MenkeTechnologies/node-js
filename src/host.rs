@@ -543,6 +543,10 @@ struct GenCell {
     /// A completion injected by `.return(v)` / `.throw(e)`: consumed by the next
     /// `yield` resume so the body unwinds (running any pending `finally`).
     inject: Option<GenInject>,
+    /// True for an `async function*` body, where `await` AND `yield` share one
+    /// coroutine yielder: `await` wraps its operand in an await marker so the
+    /// driver can tell an internal suspension from a real yield.
+    async_gen: bool,
 }
 
 /// A forced completion pushed into a suspended generator by `.return()`/`.throw()`.
@@ -2651,12 +2655,13 @@ pub fn run_user_func_nt(
     // A generator function does not run its body on call — it returns a suspended
     // generator over the already-bound frame.
     if def.is_generator {
-        return Ok(make_generator(
-            def.chunk.clone(),
-            env,
-            this_val,
-            fv.home_class.clone(),
-        ));
+        let gen = make_generator(def.chunk.clone(), env, this_val, fv.home_class.clone());
+        if def.is_async {
+            if let Some(JsObj::Generator { id }) = with_host(|h| h.get(&gen).cloned()) {
+                with_host(|h| h.generators[id as usize].async_gen = true);
+            }
+        }
+        return Ok(gen);
     }
     // An async function runs on a coroutine and returns a Promise: it executes
     // synchronously up to the first `await`, then continues via microtasks.
@@ -3180,6 +3185,7 @@ fn make_generator(
             done: false,
             started: false,
             inject: None,
+            async_gen: false,
         });
         id
     });
@@ -3394,6 +3400,14 @@ pub fn get_async_iterator(src: &Value) -> Result<Value, String> {
     if let Some(f) = user_async_iterator_fn(src) {
         return invoke(&f, Vec::new(), Some(src.clone()));
     }
+    // An `async function*` object IS its own async iterator; draining it into a
+    // list here would run the whole body (and any `finally`) before the consumer
+    // sees the first value.
+    if let Some(JsObj::Generator { id }) = with_host(|h| h.get(src).cloned()) {
+        if with_host(|h| h.generators[id as usize].async_gen) {
+            return Ok(src.clone());
+        }
+    }
     let items = iter_all(src)?;
     Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
 }
@@ -3417,6 +3431,12 @@ fn user_async_iterator_fn(v: &Value) -> Option<Value> {
 /// value, awaits it, and packages `{value: resolved, done:false}` (or
 /// `{done:true}` at exhaustion).
 pub fn async_step(iterator: &Value) -> Result<Value, String> {
+    // An `async function*` object: resume it through the await-aware driver.
+    if let Some(JsObj::Generator { id }) = with_host(|h| h.get(iterator).cloned()) {
+        if with_host(|h| h.generators[id as usize].async_gen) {
+            return Ok(async_gen_step(iterator));
+        }
+    }
     // Sync-fallback iterator: drive it here, awaiting each yielded value.
     if let Some(JsObj::Iter { items, idx }) = with_host(|h| h.get(iterator).cloned()) {
         if idx >= items.len() {
@@ -3982,6 +4002,19 @@ fn drive_async(gen: Value, rid: u32, send: Value) {
 /// The AWAIT op body (runs inside the async coroutine): suspend, yielding the
 /// awaited value; on resume, unwrap the settlement packet (throwing on reject).
 pub fn await_value(awaited: Value) -> Result<Value, String> {
+    // Inside an `async function*`, `await` and `yield` share one coroutine
+    // yielder, so an awaited value has to be tagged or the driver would hand it
+    // to the consumer as if the body had yielded it.
+    let awaited = match CUR_GEN.with(|c| c.get()) {
+        Some(id) if with_host(|h| h.generators[id as usize].async_gen) => {
+            with_host(|h| {
+                let mut m = IndexMap::new();
+                m.insert(AWAIT_MARKER.to_string(), awaited);
+                h.new_object(m)
+            })
+        }
+        _ => awaited,
+    };
     let packet = gen_yield(awaited)?;
     let items = with_host(|h| h.iter_vec(&packet)).unwrap_or_default();
     let tag = items
@@ -3994,6 +4027,66 @@ pub fn await_value(awaited: Value) -> Result<Value, String> {
         Err(with_host(|h| crate::builtins::error_string(h, &val)))
     } else {
         Ok(val)
+    }
+}
+
+/// Hidden key marking an `await` suspension inside an async generator.
+const AWAIT_MARKER: &str = "@@await";
+
+/// The operand of an `await` suspension, or `None` for a real `yield`.
+fn await_marker(v: &Value) -> Option<Value> {
+    match with_host(|h| h.get(v).cloned()) {
+        Some(JsObj::Object(props)) if props.len() == 1 => props.get(AWAIT_MARKER).cloned(),
+        _ => None,
+    }
+}
+
+/// One `.next()` of an `async function*`: resume the body, transparently settling
+/// every internal `await` suspension, and resolve with the `{value, done}` record
+/// of the first REAL yield (or the body's completion).
+fn async_gen_step(gen: &Value) -> Value {
+    let step = with_host(|h| h.new_promise());
+    let sid = with_host(|h| h.promise_id(&step).unwrap());
+    drive_async_gen(gen.clone(), sid, Value::Undef);
+    step
+}
+
+fn drive_async_gen(gen: Value, sid: u32, send: Value) {
+    let iter_record = |value: Value, done: bool| {
+        with_host(|h| {
+            let mut m = IndexMap::new();
+            m.insert("value".to_string(), value);
+            m.insert("done".to_string(), Value::Bool(done));
+            h.new_object(m)
+        })
+    };
+    match gen_resume(&gen, send) {
+        Ok(GenStep::Yield(v)) => match await_marker(&v) {
+            Some(awaited) => {
+                // An internal `await`: settle it, then resume the body.
+                let ap = promise_of(&awaited);
+                let aid = with_host(|h| h.promise_id(&ap).unwrap());
+                subscribe_native(
+                    aid,
+                    Box::new(move |state, val| {
+                        let tag = if state == PromiseState::Rejected {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        let packet = with_host(|h| h.new_array(vec![Value::Float(tag), val]));
+                        drive_async_gen(gen.clone(), sid, packet);
+                        Ok(())
+                    }),
+                );
+            }
+            None => resolve_promise_val(sid, iter_record(v, false)),
+        },
+        Ok(GenStep::Done(v)) => resolve_promise_val(sid, iter_record(v, true)),
+        Err(e) => {
+            let ev = take_exc_or_error(&e);
+            reject_promise_val(sid, ev);
+        }
     }
 }
 

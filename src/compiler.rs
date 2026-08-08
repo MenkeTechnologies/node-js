@@ -126,6 +126,9 @@ pub struct Compiler {
     /// Number of block scopes open at the current emission point, so a jump out of
     /// them can pop exactly the right number.
     scope_depth: usize,
+    /// True while compiling an `async function*` body, where `yield*` must drive
+    /// the delegate through the ASYNC iteration protocol.
+    in_async_generator: bool,
     /// Number of for-of/for-in iterators parked on the VM stack at this point. A
     /// `break`/`continue` that leaves such a loop must close and drop its iterator,
     /// otherwise the enclosing loop's `FORITER` would peek at the wrong one.
@@ -873,6 +876,11 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::POP_SCOPE, 0), 0);
             b.emit(Op::Pop, 0);
         }
+        // Leaving early closes the async iterator, running an async generator's
+        // pending `finally` / calling a user iterator's `.return()`.
+        self.load_local(b, &iter_tmp);
+        b.emit(Op::CallBuiltin(ops::ITER_CLOSE, 1), 0);
+        b.emit(Op::Pop, 0);
         let end = b.current_pos();
         b.patch_jump(jdone, end);
         for br in ctx.breaks {
@@ -931,6 +939,7 @@ impl Compiler {
             b.emit(Op::Pop, 0);
         }
         b.emit(Op::CallBuiltin(ops::ITER_CLOSE, 1), 0);
+        b.emit(Op::Pop, 0); // ITER_CLOSE leaves its result; the `done` path popped
         let end = b.current_pos();
         b.patch_jump(jafter, end);
         for br in ctx.breaks {
@@ -1089,6 +1098,7 @@ impl Compiler {
         let saved_signals = std::mem::take(&mut self.chunk_signals);
         let saved_depth = std::mem::take(&mut self.scope_depth);
         let saved_iters = std::mem::take(&mut self.iter_depth);
+        let saved_agen = std::mem::replace(&mut self.in_async_generator, is_generator && is_async);
         let r = (|| {
             // Function-body function hoisting.
             self.hoist_funcs(&mut fb, &prologue)?;
@@ -1101,6 +1111,7 @@ impl Compiler {
         self.chunk_signals = saved_signals;
         self.scope_depth = saved_depth;
         self.iter_depth = saved_iters;
+        self.in_async_generator = saved_agen;
         r?;
         let def = FuncDef {
             name: name.to_string(),
@@ -1262,8 +1273,43 @@ impl Compiler {
         arg: &Option<Box<Expr>>,
         delegate: bool,
     ) -> Result<(), String> {
-        if delegate {
-            // `yield* iterable`: iterate, yielding each element.
+        if delegate && self.in_async_generator {
+            // `yield* x` inside an `async function*` delegates over the ASYNC
+            // iterator: await each step, re-yield its value, and evaluate to the
+            // delegate's return value.
+            match arg {
+                Some(e) => self.compile_expr(b, e)?,
+                None => {
+                    b.emit(Op::LoadUndef, 0);
+                }
+            }
+            b.emit(Op::CallBuiltin(ops::GET_ASYNC_ITER, 1), 0); // [aiter]
+            let start = b.current_pos();
+            b.emit(Op::Dup, 0); // [aiter, aiter]
+            b.emit(Op::CallBuiltin(ops::ASYNC_STEP, 1), 0); // [aiter, stepPromise]
+            b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0); // [aiter, step]
+            b.emit(Op::Dup, 0); // [aiter, step, step]
+            self.name_const(b, "done");
+            b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0);
+            b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+            let jdone = b.emit(Op::JumpIfTrue(0), 0); // [aiter, step]
+            self.name_const(b, "value");
+            b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [aiter, value]
+            b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // [aiter, sent]
+            b.emit(Op::Pop, 0); // [aiter]
+            b.emit(Op::Jump(start), 0);
+            let done = b.current_pos();
+            b.patch_jump(jdone, done);
+            self.name_const(b, "value"); // [aiter, step, "value"]
+            b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [aiter, returnValue]
+            b.emit(Op::Swap, 0); // [returnValue, aiter]
+            b.emit(Op::Pop, 0); // [returnValue]
+        } else if delegate {
+            // `yield* iterable`: step the delegate through the iterator protocol,
+            // re-yielding each value and FORWARDING whatever `.next(x)` sent in.
+            // The expression's value is the delegate's RETURN value, which
+            // `FORITER` discards — hence the explicit `.next()` calls.
+            let sent_tmp = self.tmp_name("delegated");
             match arg {
                 Some(e) => self.compile_expr(b, e)?,
                 None => {
@@ -1271,16 +1317,34 @@ impl Compiler {
                 }
             }
             b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
+            self.name_const(b, &sent_tmp);
+            b.emit(Op::LoadUndef, 0);
+            b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
+            b.emit(Op::Pop, 0);
             let start = b.current_pos();
-            b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next]
-            let jdone = b.emit(Op::JumpIfFalse(0), 0);
-            b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // yield the value -> [iterator, sent]
-            b.emit(Op::Pop, 0); // drop the sent value
+            b.emit(Op::Dup, 0); // [iterator, iterator]
+            self.name_const(b, "next");
+            self.load_local(b, &sent_tmp);
+            b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0); // [iterator, step]
+            b.emit(Op::Dup, 0);
+            self.name_const(b, "done");
+            b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0);
+            b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+            let jdone = b.emit(Op::JumpIfTrue(0), 0); // [iterator, step]
+            self.name_const(b, "value");
+            b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [iterator, value]
+            b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // [iterator, sent]
+            self.name_const(b, &sent_tmp);
+            b.emit(Op::Swap, 0);
+            b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
+            b.emit(Op::Pop, 0);
             b.emit(Op::Jump(start), 0);
             let done = b.current_pos();
             b.patch_jump(jdone, done);
-            b.emit(Op::Pop, 0); // drop the iterator
-            b.emit(Op::LoadUndef, 0); // `yield*` evaluates to the delegate's return
+            self.name_const(b, "value"); // [iterator, step, "value"]
+            b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [iterator, returnValue]
+            b.emit(Op::Swap, 0);
+            b.emit(Op::Pop, 0); // [returnValue]
         } else {
             match arg {
                 Some(e) => self.compile_expr(b, e)?,
