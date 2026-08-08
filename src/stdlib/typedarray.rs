@@ -180,7 +180,7 @@ fn elems_of(v: &Value) -> Option<Vec<f64>> {
 }
 
 /// The `@@kind` of a typed-array receiver (defaults to `Uint8Array`).
-fn kind_of(recv: &Value) -> String {
+pub fn kind_of(recv: &Value) -> String {
     with_host(|h| match h.get(recv) {
         Some(JsObj::Object(p)) => p
             .get("@@kind")

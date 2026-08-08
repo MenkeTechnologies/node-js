@@ -3106,6 +3106,15 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
                 }
                 return Ok(false);
             }
+            // A Node `Buffer` IS a `Uint8Array` subclass instance.
+            "Uint8Array" if crate::stdlib::native_tag(obj).as_deref() == Some("Buffer") => {
+                return Ok(true);
+            }
+            // Every typed array carries the same `TypedArray` tag; the constructor
+            // it is an instance of is its ELEMENT KIND.
+            k if crate::stdlib::native_tag(obj).as_deref() == Some("TypedArray") => {
+                return Ok(crate::stdlib::typedarray::kind_of(obj) == k);
+            }
             // A native-tagged instance (`WeakRef`, `FinalizationRegistry`,
             // `TextEncoder`, …) is an instance of the builtin whose name matches
             // its hidden `@@native` tag.

@@ -24,11 +24,17 @@ The real `express` 5.2.1 + its 65-package dependency tree loads and serves HTTP:
 `app.get`/routing/route params/query, `res.send`/`res.json`/`res.status`, and
 `app.listen` all match `node` byte-for-byte (verified via curl). Remaining gap:
 `express.json()` / `express.urlencoded()` **request-body parsing** fails inside
-`iconv-lite`, because node-js's `Buffer` is a plain `@@native` object rather than
-a real **`Uint8Array` subclass** — so `buf instanceof Uint8Array` is `false` and
-`iconv`/`safer-buffer`'s Buffer-static copy loop misses `isBuffer`. Making
-`Buffer` a genuine `Uint8Array` subclass (and enumerating builtin-namespace
-static keys) is the next chunk of work. GET/response-side Express is unaffected.
+`iconv-lite`.
+
+Two of the three underlying causes are now closed: `buf instanceof Uint8Array`
+is `true` (`host.rs` `instanceof`), and a `Buffer` supports indexed byte access
+(`buf[i]` read/write), byte iteration (`for…of`, spread), `values`/`keys`/
+`entries`/`at`, and the 32-bit + signed `read*`/`write*` accessors. What remains
+is that a `Buffer` is still a plain `@@native` object rather than a genuine
+`Uint8Array` **subclass instance**, so `Object.prototype.toString.call(buf)`
+reports `[object Object]` rather than `[object Uint8Array]`, and builtin
+namespaces do not enumerate their static keys — which `safer-buffer`'s
+Buffer-static copy loop relies on. GET/response-side Express is unaffected.
 
 
 node-js is JavaScript lowered to fusevm (bytecode VM + Cranelift JIT), with a
@@ -105,12 +111,31 @@ dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
   symbol-keyed properties, `typeof sym === 'symbol'`.
 - **Generators** — `function*`, `yield`, `yield*`, `.next(x)`/`.return()`,
   generator-as-iterable in `for-of` and spread (via `corosensei` stackful
-  coroutines on the shared thread-local heap).
+  coroutines on the shared thread-local heap). `yield*` evaluates to the
+  delegate's RETURN value and forwards the argument passed to `.next(x)`.
+- **Async generators** — an `async function*` is its own async iterator, stepped
+  lazily by `for await`. `await` and `yield` share one coroutine yielder, so an
+  `await` suspension is tagged and settled by the driver rather than surfacing to
+  the consumer; `yield*` inside an async generator uses the async protocol.
 - **Iterators** — honoring `Symbol.iterator` in `for-of`/spread for user
   iterables; array/string/Map/Set/generator iterators with `.next()`.
 - **Labeled statements** — `outer: for (...) { ... continue outer / break outer }`
   bind `continue`/`break` to the labeled loop target (compiler.rs). Verified
   against `node v26.5.0`: labeled `continue`/`break` retarget the correct loop.
+- **Block scoping** — `let`/`const` live in the innermost block (`{ }`, a `switch`
+  body, a `try`/`catch`/`finally` body, the catch parameter), while `var` and
+  hoisted function declarations bind at function scope. `for`/`for-of`/`for-in`/
+  `for await` with a `let`/`const` head create a PER-ITERATION environment, so a
+  closure made in one pass captures that pass's value
+  (`for (let i = 0; i < 3; i++) fs.push(() => i)` yields `0,1,2`).
+- **Non-local control flow out of a `try`** — the host runs a `try`/`catch`/
+  `finally` body as its own chunk, so `return`/`break`/`continue` crossing that
+  boundary raise a signal that `SIG_UNWIND` re-dispatches after the `TRY` op
+  (labeled targets across nested loops included).
+- **`AggregateError`** — `new AggregateError(errors, message)` with `.errors`;
+  `Promise.any` rejects with one carrying every reason.
+- **`Error.prototype.toString`** — `String(err)` / `` `${err}` `` render
+  `Name: message` (or just `Name` when the message is empty).
 - **Promises + async/await + event loop** — `new Promise`, `.then`/`.catch`/
   `.finally`, `Promise.resolve`/`reject`/`all`/`allSettled`/`race`/`any`; `async`
   functions/arrows/methods, `await`, rejection-as-throw; a host-driven loop
@@ -185,9 +210,22 @@ against `node v26.5.0`:
   `{} + [] === "[object Object]"`; a user `toString`/`valueOf` is now invoked by
   `String(x)` / template interpolation / object keys.
 - **`==` loose equality.** Abstract Equality with `ToPrimitive`.
-- **`Number.prototype.toFixed`/`toPrecision`** — round half away from zero on the
-  exact value, preserve the sign of a zero result, keep full precision at large
-  magnitudes.
+- **`Number.prototype.toFixed`/`toPrecision`/`toExponential`** — round half away
+  from zero on the exact value, preserve the sign of a zero result, keep full
+  precision at large magnitudes, and throw the spec `RangeError` outside the
+  0..100 / 1..100 argument ranges.
+- **`JSON.stringify` honors `toJSON`** — user methods, class methods, and the
+  native `Date`/`Buffer`/`URL` accessors, applied before serialization. A
+  self-referential value throws `TypeError: Converting circular structure to
+  JSON` instead of overflowing the stack.
+- **Optional call `f?.()`** — short-circuits to `undefined` on a nullish callee
+  without evaluating the arguments, keeping the receiver for `obj.m?.()`.
+- **Named function expressions** — `const f = function fact(n) { … fact(n-1) … }`
+  binds its own name inside the body.
+- **Private brand checks** — `#field in obj`.
+- **Thrown-error identity across coroutines** — a `throw` inside an `async`
+  function or generator body reaches `.catch`/`catch` as the ORIGINAL error
+  object (it used to be rebuilt from a string, losing the subclass).
 - **`Math.hypot`** — scaled algorithm matching V8's last-ULP result.
 - **`Math.round`** preserves negative zero.
 - **`String.prototype.slice`/`substr`** — reversed bounds yield the empty string;

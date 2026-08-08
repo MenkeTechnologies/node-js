@@ -247,6 +247,37 @@ fn bytes_of(recv: &Value) -> Vec<u8> {
     })
 }
 
+/// `buf[i]` — the byte at an integer index, or `undefined` past the end.
+pub fn byte_get(recv: &Value, index: &str) -> Value {
+    let i: usize = match index.parse() {
+        Ok(i) => i,
+        Err(_) => return Value::Undef,
+    };
+    match bytes_of(recv).get(i) {
+        Some(b) => Value::Float(*b as f64),
+        None => Value::Undef,
+    }
+}
+
+/// `buf[i] = n` — write one byte (truncated to 8 bits, as a Uint8Array does).
+/// Returns whether `recv` was a Buffer and the write landed.
+pub fn byte_set(recv: &Value, index: &str, val: &Value) -> bool {
+    if super::native_tag(recv).as_deref() != Some("Buffer") {
+        return false;
+    }
+    let i: usize = match index.parse() {
+        Ok(i) => i,
+        Err(_) => return false,
+    };
+    let mut bytes = bytes_of(recv);
+    if i >= bytes.len() {
+        return true; // out of range writes are dropped, not appended
+    }
+    bytes[i] = with_host(|h| h.to_number(val)) as i64 as u8;
+    set_bytes(recv, &bytes);
+    true
+}
+
 pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "from" => from(args),

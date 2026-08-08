@@ -546,6 +546,14 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                     return Ok(v);
                 }
             }
+            // `buf[i]`: a Buffer's bytes live in a hidden `@@bytes` array, not as
+            // own numeric props, so integer keys read through to it.
+            if !name.is_empty()
+                && name.bytes().all(|b| b.is_ascii_digit())
+                && props.contains_key("@@bytes")
+            {
+                return Ok(crate::stdlib::buffer::byte_get(recv, name));
+            }
             if let Some(v) = props.get(name) {
                 v.clone()
             } else if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
@@ -1129,6 +1137,10 @@ fn set_property(recv: &Value, name: &str, val: Value) {
             Some(JsObj::Object(ref p)) if p.get("@@native").map(|v| with_host(|h| h.str_of(v))).as_deref() == Some("TypedArray")
         );
         if is_ta && crate::stdlib::typedarray::elem_set(recv, name, &val) {
+            return;
+        }
+        // `buf[i] = n` writes through to the Buffer's hidden byte array.
+        if crate::stdlib::buffer::byte_set(recv, name, &val) {
             return;
         }
     }
