@@ -3663,6 +3663,18 @@ impl JsHost {
         let message = lookup_chain(self, v, "message")
             .map(|m| self.str_of(&m))
             .unwrap_or_default();
+        // Node's internal coded errors override `toString` as
+        // `${name} [${code}]: ${message}` (internal/errors.js NodeError). The
+        // `@@nodeError` tag marks the errors `synth_error` built from a
+        // `Name [ERR_CODE]: …` string, so a user error that merely has a `.code`
+        // property still stringifies plainly.
+        if let Some(JsObj::Object(p)) = self.get(v) {
+            if p.contains_key("@@nodeError") {
+                if let Some(code) = p.get("code").map(|c| self.str_of(c)) {
+                    return Some(format!("{name} [{code}]: {message}"));
+                }
+            }
+        }
         Some(match (name.is_empty(), message.is_empty()) {
             (true, _) => message,
             (false, true) => name,

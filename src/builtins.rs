@@ -1640,17 +1640,38 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
 /// the matching builtin error prototype so `instanceof`/`.constructor` work.
 pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
     h.ensure_error_protos();
-    let (name, message) = match e.split_once(": ") {
-        Some((n, m)) if host::ERROR_NAMES.contains(&n) => (n.to_string(), m.to_string()),
-        _ => ("Error".to_string(), e.to_string()),
+    // A `Name [ERR_CODE]: message` head carries a Node error `code` next to the
+    // error class, exactly as Node's internal errors render it in `.stack`.
+    let (head, rest) = match e.split_once(": ") {
+        Some((n, m)) => (n, m.to_string()),
+        None => ("", e.to_string()),
+    };
+    let (base, code) = match head.split_once(" [") {
+        Some((n, c)) if c.ends_with(']') => (n, Some(c[..c.len() - 1].to_string())),
+        _ => (head, None),
+    };
+    let (name, message) = if host::ERROR_NAMES.contains(&base) {
+        (base.to_string(), rest)
+    } else {
+        ("Error".to_string(), e.to_string())
     };
     let mut props: IndexMap<String, Value> = IndexMap::new();
     let mv = h.new_str(message.clone());
     props.insert("message".into(), mv);
+    if let Some(c) = &code {
+        let cv = h.new_str(c.clone());
+        props.insert("code".into(), cv);
+        // Marks this as a Node internal error, whose `toString` brackets the code.
+        props.insert("@@nodeError".into(), Value::Bool(true));
+    }
+    let label = match &code {
+        Some(c) => format!("{name} [{c}]"),
+        None => name.clone(),
+    };
     let stack = if message.is_empty() {
-        format!("{name}\n    at <anonymous>")
+        format!("{label}\n    at <anonymous>")
     } else {
-        format!("{name}: {message}\n    at <anonymous>")
+        format!("{label}: {message}\n    at <anonymous>")
     };
     let sv = h.new_str(stack);
     props.insert("stack".into(), sv);

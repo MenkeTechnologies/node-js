@@ -134,7 +134,7 @@ fn map_labels(domain: &str, f: impl Fn(&str) -> String) -> String {
         .join(".")
 }
 
-fn to_ascii(domain: &str) -> String {
+pub(crate) fn to_ascii(domain: &str) -> String {
     map_labels(domain, |label| {
         // Only labels carrying non-ASCII get the `xn--` ACE form.
         if label.chars().any(|c| (c as u32) >= 0x80) {

@@ -318,10 +318,11 @@ const CALLBACKIFY_SRC: &str = "(function(original){\n\
 fn promisify(args: &[Value]) -> Result<Value, String> {
     let orig = args.first().cloned().unwrap_or(Value::Undef);
     if !with_host(|h| crate::host::is_callable(h, &orig)) {
-        return Err(
-            "TypeError [ERR_INVALID_ARG_TYPE]: The \"original\" argument must be of type function"
-                .into(),
-        );
+        return Err(std::format!(
+            "TypeError [ERR_INVALID_ARG_TYPE]: The \"original\" argument must be of \
+             type function. Received {}",
+            super::received_desc(&orig)
+        ));
     }
     let factory = run_completion(PROMISIFY_SRC)?;
     crate::host::invoke(&factory, vec![orig], None)
@@ -332,10 +333,11 @@ fn promisify(args: &[Value]) -> Result<Value, String> {
 fn callbackify(args: &[Value]) -> Result<Value, String> {
     let orig = args.first().cloned().unwrap_or(Value::Undef);
     if !with_host(|h| crate::host::is_callable(h, &orig)) {
-        return Err(
-            "TypeError [ERR_INVALID_ARG_TYPE]: The \"original\" argument must be of type function"
-                .into(),
-        );
+        return Err(std::format!(
+            "TypeError [ERR_INVALID_ARG_TYPE]: The \"original\" argument must be of \
+             type function. Received {}",
+            super::received_desc(&orig)
+        ));
     }
     let factory = run_completion(CALLBACKIFY_SRC)?;
     crate::host::invoke(&factory, vec![orig], None)

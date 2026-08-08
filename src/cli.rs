@@ -50,6 +50,22 @@ pub struct Cli {
     #[arg(long = "tiers")]
     pub tiers: bool,
 
+    /// Silence all `process.emitWarning` output (Node's `--no-warnings`).
+    #[arg(long = "no-warnings")]
+    pub no_warnings: bool,
+
+    /// Silence DeprecationWarnings only (Node's `--no-deprecation`).
+    #[arg(long = "no-deprecation")]
+    pub no_deprecation: bool,
+
+    /// Suppress the one-time "(Use `node --trace-warnings ...`)" hint on warnings.
+    #[arg(long = "trace-warnings")]
+    pub trace_warnings: bool,
+
+    /// Suppress that hint for DeprecationWarnings (Node's `--trace-deprecation`).
+    #[arg(long = "trace-deprecation")]
+    pub trace_deprecation: bool,
+
     /// The `.js` script to run (omit with --repl / --lsp / --dap / -e).
     #[arg(value_name = "FILE")]
     pub file: Option<String>,

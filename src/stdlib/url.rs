@@ -250,16 +250,10 @@ fn build(p: &Parts) -> Value {
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
-        "parse" => Ok(legacy_parse(&arg_str(args, 0))),
-        "format" => Ok(with_host(|h| {
-            // format(URL|object): if it's a native URL, return its href.
-            let v = args.first().cloned().unwrap_or(Value::Undef);
-            let s = match h.get(&v) {
-                Some(JsObj::Object(p)) => p.get("href").map(|x| h.str_of(x)).unwrap_or_default(),
-                _ => h.str_of(&v),
-            };
-            h.new_str(s)
-        })),
+        "parse" => legacy_parse(args).map(|u| super::url_legacy::to_js(&u)),
+        "format" => super::url_legacy::format_value(
+            &args.first().cloned().unwrap_or(Value::Undef),
+        ),
         // `url.fileURLToPath(url)` — a `file:` URL/string → a filesystem path
         // (percent-decoded). POSIX best-effort: any authority (host) is accepted
         // but not re-prefixed; Windows drive/UNC rewriting is not modeled.
@@ -289,68 +283,30 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "resolveObject" => {
             let from = arg_str(args, 0);
             let to = arg_str(args, 1);
-            Ok(legacy_parse(&legacy_resolve(&from, &to)))
+            let resolved = legacy_resolve(&from, &to);
+            super::url_legacy::parse(&resolved, false, false).map(|u| super::url_legacy::to_js(&u))
         }
         _ => return None,
     })
 }
 
-/// Legacy `url.parse` — a plain object (not a `URL` instance), matching Node's
-/// field set and insertion order.
-fn legacy_parse(input: &str) -> Value {
-    let p = parse_absolute(input);
-    with_host(|h| {
-        let mut m = IndexMap::new();
-        let null = h.null();
-        let opt = |h: &mut crate::host::JsHost, s: &str| {
-            if s.is_empty() {
-                h.null()
-            } else {
-                h.new_str(s)
-            }
-        };
-        match p {
-            Some(p) => {
-                let auth = if p.username.is_empty() {
-                    String::new()
-                } else if p.password.is_empty() {
-                    p.username.clone()
-                } else {
-                    format!("{}:{}", p.username, p.password)
-                };
-                m.insert("protocol".into(), h.new_str(p.protocol.clone()));
-                m.insert("slashes".into(), Value::Bool(true));
-                m.insert("auth".into(), opt(h, &auth));
-                m.insert("host".into(), h.new_str(p.host()));
-                m.insert("port".into(), opt(h, &p.port));
-                m.insert("hostname".into(), h.new_str(p.hostname.clone()));
-                m.insert("hash".into(), opt(h, &p.hash));
-                m.insert("search".into(), opt(h, &p.search));
-                m.insert("query".into(), opt(h, p.search.trim_start_matches('?')));
-                m.insert("pathname".into(), h.new_str(p.pathname.clone()));
-                m.insert(
-                    "path".into(),
-                    h.new_str(format!("{}{}", p.pathname, p.search)),
-                );
-                m.insert("href".into(), h.new_str(p.href()));
-            }
-            None => {
-                m.insert("protocol".into(), null.clone());
-                m.insert("slashes".into(), null.clone());
-                m.insert("auth".into(), null.clone());
-                m.insert("host".into(), null.clone());
-                m.insert("port".into(), null.clone());
-                m.insert("hostname".into(), null.clone());
-                m.insert("hash".into(), null.clone());
-                m.insert("search".into(), null.clone());
-                m.insert("query".into(), null.clone());
-                m.insert("pathname".into(), h.new_str(input));
-                m.insert("path".into(), h.new_str(input));
-                m.insert("href".into(), h.new_str(input));
-            }
-        }
-        h.new_object(m)
-    })
+/// Legacy `url.parse(urlString[, parseQueryString[, slashesDenoteHost]])`.
+/// Emits the one-shot `DEP0169` deprecation warning, exactly as Node's
+/// `urlParse` does, then delegates to the `Url.prototype.parse` port.
+fn legacy_parse(args: &[Value]) -> Result<super::url_legacy::Url, String> {
+    super::process::emit_deprecation_warning(
+        "DEP0169",
+        "`url.parse()` behavior is not standardized and prone to errors that \
+         have security implications. Use the WHATWG URL API instead. CVEs are \
+         not issued for `url.parse()` vulnerabilities.",
+    );
+    let input = arg_str(args, 0);
+    let truthy = |i: usize| {
+        args.get(i)
+            .map(|v| with_host(|h| h.truthy(v)))
+            .unwrap_or(false)
+    };
+    super::url_legacy::parse(&input, truthy(1), truthy(2))
 }
 
 /// `URL` instance methods (component reads are plain data properties).
@@ -484,7 +440,7 @@ fn url_to_http_options(v: &Value) -> Value {
 
 /// Percent-decode a URL component (`%XX` → byte, then UTF-8 lossy). Unlike the
 /// form decoder this leaves `+` literal (a file path may legitimately contain it).
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;

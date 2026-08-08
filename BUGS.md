@@ -8,9 +8,18 @@ via std), `diagnostics_channel`, `events`, `fs`, `http`, `net`, `os`, `path`
 (+`/posix` +`/win32` — both flavors are a faithful port of Node's `lib/path.js`,
 differentially verified over 33,600 cases), `perf_hooks`, `process`, `punycode`,
 `querystring`, `stream`,
-`string_decoder`, `timers`(+`/promises`), `tty`, `url`, `util`(+`/types`), `v8`
+`string_decoder`, `timers`(+`/promises`), `tty`, `url` (both the WHATWG `URL`
+and the legacy `parse`/`format` API — the latter a faithful port of Node's
+`Url.prototype.parse`/`.format`, differentially verified over 15,808 cases),
+`util`(+`/types`), `v8`
 (serialize = JSON, not V8 binary; heap stats are a shim), `async_hooks`
 (AsyncLocalStorage sync-only; hooks are no-ops), `zlib`.
+
+`process.emitWarning` writes to stderr in Node's format
+(`(node:PID) [CODE] Name: message`, plus the one-time
+`(Use \`node --trace-… ...\`)` hint), honoring `--no-warnings`,
+`--no-deprecation`, `--trace-warnings` and `--trace-deprecation`. `url.parse`
+emits `DEP0169` through it.
 
 Known-but-UNIMPLEMENTED (require() returns a namespace so import-then-conditional
 code loads; calling a method throws `Error: <mod>.<method> is not implemented in

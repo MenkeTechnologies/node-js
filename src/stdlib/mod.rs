@@ -57,6 +57,7 @@ pub mod trace_events;
 pub mod tty;
 pub mod typedarray;
 pub mod url;
+pub mod url_legacy;
 pub mod util;
 pub mod util_types;
 pub mod v8;
@@ -758,6 +759,51 @@ pub fn instance_call(
 }
 
 // ── shared helpers ──────────────────────────────────────────────────────────
+
+/// The `Received …` tail Node appends to an `ERR_INVALID_ARG_TYPE` message
+/// (`internal/errors.js` `determineSpecificType`): `null`/`undefined` verbatim,
+/// a primitive as `type <typeof> (<inspected>)`, an object as
+/// `an instance of <Ctor>`.
+pub(crate) fn received_desc(v: &Value) -> String {
+    with_host(|h| {
+        if matches!(v, Value::Undef) {
+            return "undefined".to_string();
+        }
+        if h.is_null(v) {
+            return "null".to_string();
+        }
+        let ty = h.type_of(v);
+        if ty == "object" || ty == "function" {
+            // `ctor_name` is empty for the builtin shapes (they carry no user
+            // class), so fall back to the intrinsic constructor name.
+            let name = match h.ctor_name(v) {
+                n if !n.is_empty() => n,
+                _ => match h.get(v) {
+                    Some(JsObj::Array(_)) => "Array".into(),
+                    Some(JsObj::Map { .. }) => "Map".into(),
+                    Some(JsObj::Set { .. }) => "Set".into(),
+                    Some(JsObj::Promise { .. }) => "Promise".into(),
+                    Some(JsObj::RegExp(_)) => "RegExp".into(),
+                    Some(JsObj::Object(p)) => match p.get("@@native") {
+                        Some(t) => h.str_of(t),
+                        None => "Object".into(),
+                    },
+                    _ => "Object".into(),
+                },
+            };
+            return format!("an instance of {name}");
+        }
+        let shown = match ty {
+            "string" => format!("'{}'", h.str_of(v)),
+            "bigint" => format!("{}n", h.str_of(v)),
+            "number" if matches!(v, Value::Float(f) if *f == 0.0 && f.is_sign_negative()) => {
+                "-0".to_string()
+            }
+            _ => h.str_of(v),
+        };
+        format!("type {ty} ({shown})")
+    })
+}
 
 /// ToString of `args[i]` (empty string if absent).
 pub(crate) fn arg_str(args: &[Value], i: usize) -> String {

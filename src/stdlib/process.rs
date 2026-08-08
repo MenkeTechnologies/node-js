@@ -69,6 +69,92 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Whether the one-shot "(Use `node --trace-… ...`)" hint has been printed.
+/// Node prints it after the FIRST warning only, per process.
+static TRACE_HINT_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Port of `internal/process/warning.js` `onWarning`: render a warning to
+/// stderr as `(node:PID) [CODE] Name: message`, followed by an optional detail
+/// line and the one-time trace hint. Suppressed by `--no-warnings`, and
+/// deprecations additionally by `--no-deprecation`.
+pub fn emit_warning(name: &str, code: Option<&str>, message: &str, detail: Option<&str>) {
+    let argv: Vec<String> = std::env::args().collect();
+    let flag = |f: &str| argv.iter().any(|a| a == f);
+    let is_deprecation = name == "DeprecationWarning";
+    if flag("--no-warnings") || (is_deprecation && flag("--no-deprecation")) {
+        return;
+    }
+    let trace = flag("--trace-warnings") || (is_deprecation && flag("--trace-deprecation"));
+
+    let mut msg = std::format!("(node:{}) ", std::process::id());
+    if let Some(c) = code {
+        msg.push_str(&std::format!("[{c}] "));
+    }
+    msg.push_str(&std::format!("{name}: {message}"));
+    if let Some(d) = detail {
+        msg.push_str(&std::format!("\n{d}"));
+    }
+    if !trace
+        && !TRACE_HINT_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        let trace_flag = if is_deprecation {
+            "--trace-deprecation"
+        } else {
+            "--trace-warnings"
+        };
+        msg.push_str(&std::format!(
+            "\n(Use `node {trace_flag} ...` to show where the warning was created)"
+        ));
+    }
+    eprintln!("{msg}");
+}
+
+/// A `DeprecationWarning` fires at most once per `code` per process, matching
+/// the `warned` latches Node keeps at each deprecation site.
+pub fn emit_deprecation_warning(code: &str, message: &str) {
+    use std::cell::RefCell;
+    thread_local! {
+        static SEEN: RefCell<std::collections::HashSet<String>> =
+            RefCell::new(std::collections::HashSet::new());
+    }
+    let first = SEEN.with(|s| s.borrow_mut().insert(code.to_string()));
+    if first {
+        emit_warning("DeprecationWarning", Some(code), message, None);
+    }
+}
+
+/// `process.emitWarning(warning[, options])` / `(warning[, type[, code]])`.
+fn emit_warning_args(args: &[Value]) {
+    let message = super::arg_str(args, 0);
+    let mut name = "Warning".to_string();
+    let mut code: Option<String> = None;
+    let mut detail: Option<String> = None;
+    match args.get(1) {
+        Some(v) if with_host(|h| matches!(h.get(v), Some(JsObj::Object(_)))) => {
+            let field = |k: &str| {
+                with_host(|h| match h.get(v) {
+                    Some(JsObj::Object(p)) => p
+                        .get(k)
+                        .filter(|x| !h.is_nullish(x))
+                        .map(|x| h.str_of(x)),
+                    _ => None,
+                })
+            };
+            if let Some(t) = field("type") {
+                name = t;
+            }
+            code = field("code");
+            detail = field("detail");
+        }
+        Some(_) => {
+            name = super::arg_str(args, 1);
+            code = args.get(2).map(|_| super::arg_str(args, 2));
+        }
+        None => {}
+    }
+    emit_warning(&name, code.as_deref(), &message, detail.as_deref());
+}
+
 /// Data properties, served through `namespace_property` → `stdlib::constant`.
 pub fn constant(name: &str) -> Option<Value> {
     Some(match name {
@@ -122,7 +208,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         }
         "listeners" => Ok(with_host(|h| h.new_array(Vec::new()))),
         "emit" => Ok(Value::Bool(false)),
-        "emitWarning" => Ok(Value::Undef),
+        "emitWarning" => {
+            emit_warning_args(args);
+            Ok(Value::Undef)
+        }
         "chdir" | "exit" | "kill" | "reallyExit" | "setSourceMapsEnabled" => Ok(Value::Undef),
 
         // POSIX identity queries (libc; pure reads, always safe).
