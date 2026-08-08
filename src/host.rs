@@ -1493,6 +1493,8 @@ impl JsHost {
                             _ => Vec::new(),
                         };
                         String::from_utf8_lossy(&bytes).into_owned()
+                    } else if let Some(s) = self.error_to_string(v) {
+                        s
                     } else {
                         "[object Object]".into()
                     }
@@ -3300,8 +3302,15 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<GenStep, String> {
     let out = coro.resume(send); // no host borrow held; body drives its own VM
 
     CUR_GEN.with(|c| c.set(prev));
-    let gen_ctx = with_host(|h| h.install_gen_ctx(caller_ctx));
+    let mut gen_ctx = with_host(|h| h.install_gen_ctx(caller_ctx));
+    // A `throw` inside the body left the thrown VALUE in the generator's context,
+    // which the swap above just stashed away. Hand it to the caller so the
+    // rejection/catch keeps the original error object instead of a string rebuild.
+    let thrown = gen_ctx.exc.take();
     with_host(|h| {
+        if let Some(v) = thrown {
+            h.exc = Some(v);
+        }
         h.generators[id as usize].ctx = gen_ctx;
         h.generators[id as usize].coro = Some(coro);
     });
@@ -3593,6 +3602,39 @@ pub fn error_proto_of(h: &JsHost, name: &str) -> Option<Value> {
     h.error_protos.get(name).cloned()
 }
 
+impl JsHost {
+    /// `Error.prototype.toString` for an object whose prototype chain reaches
+    /// `Error.prototype`: `"Name"` with an empty message, else `"Name: message"`.
+    /// `None` for anything that is not an error, so the caller keeps its own
+    /// stringification.
+    fn error_to_string(&self, v: &Value) -> Option<String> {
+        let base = self.error_protos.get("Error")?;
+        let mut cur = self.proto_of(v);
+        let mut is_error = false;
+        while let Some(p) = cur {
+            if self.strict_eq(&p, base) {
+                is_error = true;
+                break;
+            }
+            cur = self.proto_of(&p);
+        }
+        if !is_error {
+            return None;
+        }
+        let name = lookup_chain(self, v, "name")
+            .map(|n| self.str_of(&n))
+            .unwrap_or_else(|| "Error".into());
+        let message = lookup_chain(self, v, "message")
+            .map(|m| self.str_of(&m))
+            .unwrap_or_default();
+        Some(match (name.is_empty(), message.is_empty()) {
+            (true, _) => message,
+            (false, true) => name,
+            (false, false) => format!("{name}: {message}"),
+        })
+    }
+}
+
 /// The set of builtin error constructor names forming the error hierarchy.
 pub const ERROR_NAMES: &[&str] = &[
     "Error",
@@ -3602,6 +3644,7 @@ pub const ERROR_NAMES: &[&str] = &[
     "ReferenceError",
     "EvalError",
     "URIError",
+    "AggregateError",
 ];
 
 impl JsHost {

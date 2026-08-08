@@ -1911,6 +1911,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "ReferenceError",
     "EvalError",
     "URIError",
+    "AggregateError",
     "BigInt",
     "RegExp",
     "Date",
@@ -2513,6 +2514,17 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
 }
 
 fn make_error(name: &str, args: &[Value]) -> Value {
+    // `new AggregateError(errors, message)` takes the causes FIRST; every other
+    // error constructor takes the message first.
+    let agg = name == "AggregateError";
+    let (errors, args) = if agg {
+        (
+            Some(args.first().cloned().unwrap_or(Value::Undef)),
+            args.get(1..).unwrap_or(&[]),
+        )
+    } else {
+        (None, args)
+    };
     with_host(|h| {
         h.ensure_error_protos();
         let mut props: IndexMap<String, Value> = IndexMap::new();
@@ -2532,6 +2544,12 @@ fn make_error(name: &str, args: &[Value]) -> Value {
         };
         let sv = h.new_str(stack);
         props.insert("stack".into(), sv);
+        if let Some(errs) = errors {
+            // Materialize the iterable into the own `errors` array property.
+            let items = h.iter_vec(&errs).unwrap_or_default();
+            let arr = h.new_array(items);
+            props.insert("errors".into(), arr);
+        }
         let e = h.new_object(props);
         if let Some(p) = host::error_proto_of(h, name) {
             h.set_proto(&e, p);
@@ -5389,10 +5407,11 @@ fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
                         let mut r = remaining.borrow_mut();
                         *r -= 1;
                         if *r == 0 {
-                            // All rejected → AggregateError (simplified to an Error).
-                            let agg = with_host(|h| {
-                                synth_error(h, "AggregateError: All promises were rejected")
-                            });
+                            // All rejected → AggregateError carrying every reason.
+                            let reasons =
+                                with_host(|h| h.new_array(errors.borrow().clone()));
+                            let msg = with_host(|h| h.new_str("All promises were rejected"));
+                            let agg = make_error("AggregateError", &[reasons, msg]);
                             host::reject_promise_val(rid, agg);
                         }
                     }

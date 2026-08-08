@@ -95,6 +95,8 @@ struct LoopCtx {
     break_depth: usize,
     /// Block-scope depth the `continue` target expects.
     continue_depth: usize,
+    /// Number of iterators on the VM stack inside this loop's body.
+    iter_depth: usize,
     /// Whether `continue` binds here (true for loops, false for `switch`).
     catches_continue: bool,
     /// The source label attached to this loop/block, if any (`outer: for …`),
@@ -124,6 +126,10 @@ pub struct Compiler {
     /// Number of block scopes open at the current emission point, so a jump out of
     /// them can pop exactly the right number.
     scope_depth: usize,
+    /// Number of for-of/for-in iterators parked on the VM stack at this point. A
+    /// `break`/`continue` that leaves such a loop must close and drop its iterator,
+    /// otherwise the enclosing loop's `FORITER` would peek at the wrong one.
+    iter_depth: usize,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -330,6 +336,7 @@ impl Compiler {
                 };
                 if idx >= self.chunk_loop_base {
                     self.emit_unwind_scopes(b, self.loops[idx].break_depth);
+                    self.emit_close_iters(b, self.loops[idx].iter_depth);
                     let j = b.emit(Op::Jump(0), line);
                     self.loops[idx].breaks.push(j);
                 } else {
@@ -357,6 +364,7 @@ impl Compiler {
                 };
                 if idx >= self.chunk_loop_base {
                     self.emit_unwind_scopes(b, self.loops[idx].continue_depth);
+                    self.emit_close_iters(b, self.loops[idx].iter_depth);
                     let j = b.emit(Op::Jump(0), line);
                     self.loops[idx].continues.push(j);
                 } else {
@@ -597,6 +605,7 @@ impl Compiler {
                 continues: Vec::new(),
                 break_depth: self.scope_depth,
                 continue_depth: self.scope_depth,
+                iter_depth: self.iter_depth,
                 catches_continue: false,
                 label: Some(label.to_string()),
             });
@@ -634,6 +643,7 @@ impl Compiler {
             continues: Vec::new(),
             break_depth: self.scope_depth,
             continue_depth: self.scope_depth,
+            iter_depth: self.iter_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
@@ -664,6 +674,7 @@ impl Compiler {
             continues: Vec::new(),
             break_depth: self.scope_depth,
             continue_depth: self.scope_depth,
+            iter_depth: self.iter_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
@@ -726,6 +737,7 @@ impl Compiler {
             continues: Vec::new(),
             break_depth: self.scope_depth,
             continue_depth: self.scope_depth,
+            iter_depth: self.iter_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
@@ -769,7 +781,10 @@ impl Compiler {
     ) -> Result<(), String> {
         self.compile_expr(b, iter)?;
         b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
-        self.loop_over(b, declare, target, body)
+        self.iter_depth += 1;
+        let r = self.loop_over(b, declare, target, body);
+        self.iter_depth -= 1;
+        r
     }
 
     fn compile_for_in(
@@ -783,7 +798,10 @@ impl Compiler {
         self.compile_expr(b, object)?;
         b.emit(Op::CallBuiltin(ops::FORIN_KEYS, 1), 0); // [keys_array]
         b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
-        self.loop_over(b, declare, target, body)
+        self.iter_depth += 1;
+        let r = self.loop_over(b, declare, target, body);
+        self.iter_depth -= 1;
+        r
     }
 
     /// `for await (target of iterable) body`. Obtains an async iterator, then each
@@ -834,6 +852,7 @@ impl Compiler {
             continues: Vec::new(),
             break_depth: self.scope_depth,
             continue_depth: self.scope_depth,
+            iter_depth: self.iter_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
@@ -886,6 +905,7 @@ impl Compiler {
             continues: Vec::new(),
             break_depth: self.scope_depth,
             continue_depth: self.scope_depth,
+            iter_depth: self.iter_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
@@ -961,6 +981,7 @@ impl Compiler {
             continues: Vec::new(),
             break_depth: self.scope_depth,
             continue_depth: self.scope_depth,
+            iter_depth: self.iter_depth,
             catches_continue: false,
             label: None,
         });
@@ -1035,12 +1056,14 @@ impl Compiler {
         let base = std::mem::replace(&mut self.chunk_loop_base, self.loops.len());
         let signals = std::mem::take(&mut self.chunk_signals);
         let depth = std::mem::take(&mut self.scope_depth);
+        let iters = std::mem::take(&mut self.iter_depth);
         let r = (|| {
             self.hoist_funcs(&mut cb, stmts)?;
             self.compile_stmts(&mut cb, stmts)
         })();
         self.chunk_loop_base = base;
         self.scope_depth = depth;
+        self.iter_depth = iters;
         // A signal raised inside the nested chunk still has to be dispatched by a
         // loop in THIS chunk, so the flag propagates outward.
         self.chunk_signals |= signals;
@@ -1065,6 +1088,7 @@ impl Compiler {
         let saved_base = std::mem::replace(&mut self.chunk_loop_base, 0);
         let saved_signals = std::mem::take(&mut self.chunk_signals);
         let saved_depth = std::mem::take(&mut self.scope_depth);
+        let saved_iters = std::mem::take(&mut self.iter_depth);
         let r = (|| {
             // Function-body function hoisting.
             self.hoist_funcs(&mut fb, &prologue)?;
@@ -1076,6 +1100,7 @@ impl Compiler {
         self.chunk_loop_base = saved_base;
         self.chunk_signals = saved_signals;
         self.scope_depth = saved_depth;
+        self.iter_depth = saved_iters;
         r?;
         let def = FuncDef {
             name: name.to_string(),
@@ -1909,6 +1934,18 @@ impl Compiler {
     fn emit_copy_scope(&self, b: &mut ChunkBuilder) {
         b.emit(Op::CallBuiltin(ops::COPY_SCOPE, 0), 0);
         b.emit(Op::Pop, 0);
+    }
+
+    /// Close and drop every for-of/for-in iterator between here and `target`
+    /// depth. A jump to an OUTER loop abandons the inner loops, and their
+    /// iterators are parked on the VM stack, so they must be popped (running a
+    /// generator's `finally` / the iterator protocol's `.return()`) or the outer
+    /// `FORITER` would read the wrong stack slot.
+    fn emit_close_iters(&self, b: &mut ChunkBuilder, target: usize) {
+        for _ in target..self.iter_depth {
+            b.emit(Op::CallBuiltin(ops::ITER_CLOSE, 1), 0);
+            b.emit(Op::Pop, 0);
+        }
     }
 
     /// Close every block scope between here and `target` depth, without changing
