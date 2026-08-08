@@ -73,6 +73,10 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SIG_BREAK, b_sig_break);
     vm.register_builtin(ops::SIG_CONTINUE, b_sig_continue);
     vm.register_builtin(ops::SIG_UNWIND, b_sig_unwind);
+    vm.register_builtin(ops::PUSH_SCOPE, b_push_scope);
+    vm.register_builtin(ops::POP_SCOPE, b_pop_scope);
+    vm.register_builtin(ops::COPY_SCOPE, b_copy_scope);
+    vm.register_builtin(ops::DECLARE_VAR, b_declare_var);
 }
 
 /// `ITER_CLOSE`: close the iterator on the stack (a for-of `break`). A generator
@@ -444,6 +448,30 @@ fn b_declare(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     with_host(|h| h.declare_name(&name, val.clone()));
     val
+}
+
+/// `var x = …` / a hoisted `function f(){}`: bind at function scope, skipping any
+/// open block scopes, so the name outlives the block it was written in.
+fn b_declare_var(vm: &mut VM, _: u8) -> Value {
+    let val = vm.pop();
+    let name = sval(&vm.pop());
+    with_host(|h| h.declare_var_name(&name, val.clone()));
+    val
+}
+
+fn b_push_scope(_: &mut VM, _: u8) -> Value {
+    with_host(|h| h.push_scope());
+    Value::Undef
+}
+
+fn b_pop_scope(_: &mut VM, _: u8) -> Value {
+    with_host(|h| h.pop_scope());
+    Value::Undef
+}
+
+fn b_copy_scope(_: &mut VM, _: u8) -> Value {
+    with_host(|h| h.copy_scope());
+    Value::Undef
 }
 
 fn b_delname(vm: &mut VM, _: u8) -> Value {
@@ -1539,8 +1567,14 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
         None => return abort(vm, "internal: unknown try id".into()),
     };
     let mut pending: Option<String> = None;
+    // Each sub-block runs as its own chunk on THIS frame, so a throw part-way
+    // through can leave block scopes open. Snapshot the scope and restore it
+    // before the handler and after the whole statement.
+    let scope = with_host(|h| h.scope_snapshot());
 
+    with_host(|h| h.push_scope()); // the try block is its own block scope
     let body_res = host::run_chunk_on(td.block.clone());
+    with_host(|h| h.restore_scope(scope.clone()));
     let signal_after = with_host(|h| h.signal.is_some());
     if let Err(e) = body_res {
         if signal_after {
@@ -1553,10 +1587,14 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                 h.error = None;
                 h.exc = None;
             });
+            // The catch parameter is block-scoped to the handler.
+            with_host(|h| h.push_scope());
             if let Some(name) = bind {
                 with_host(|h| h.declare_name(name, thrown));
             }
-            if let Err(e2) = host::run_chunk_on(hbody.clone()) {
+            let hres = host::run_chunk_on(hbody.clone());
+            with_host(|h| h.restore_scope(scope.clone()));
+            if let Err(e2) = hres {
                 pending = Some(e2);
             }
         } else {
@@ -1567,7 +1605,10 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
     // finally always runs; a finally error/signal supersedes.
     if let Some(fin) = &td.finalizer {
         let sig_before = with_host(|h| h.signal.take());
-        match host::run_chunk_on(fin.clone()) {
+        with_host(|h| h.push_scope()); // ditto for `finally`
+        let fres = host::run_chunk_on(fin.clone());
+        with_host(|h| h.restore_scope(scope.clone()));
+        match fres {
             Ok(_) => {
                 if with_host(|h| h.signal.is_none()) {
                     with_host(|h| h.signal = sig_before);

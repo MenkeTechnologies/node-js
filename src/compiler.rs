@@ -66,10 +66,35 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
     }
 }
 
+/// The binding scope a declaration keyword introduces.
+fn bind_mode(kind: DeclKind) -> BindMode {
+    match kind {
+        DeclKind::Var => BindMode::Var,
+        DeclKind::Let | DeclKind::Const => BindMode::Lexical,
+    }
+}
+
+/// How a binding site introduces its name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindMode {
+    /// Plain assignment to an existing binding (`x = 1`, a for-of head without
+    /// `let`/`const`/`var`).
+    Assign,
+    /// `let`/`const`/`class`: bound in the innermost BLOCK scope.
+    Lexical,
+    /// `var` / a hoisted function declaration: bound at FUNCTION scope.
+    Var,
+}
+
 /// Break/continue jump fixups for a loop or switch.
 struct LoopCtx {
     breaks: Vec<usize>,
     continues: Vec<usize>,
+    /// Block-scope depth the `break` target expects; a `break` from inside nested
+    /// blocks pops back down to it first.
+    break_depth: usize,
+    /// Block-scope depth the `continue` target expects.
+    continue_depth: usize,
     /// Whether `continue` binds here (true for loops, false for `switch`).
     catches_continue: bool,
     /// The source label attached to this loop/block, if any (`outer: for …`),
@@ -96,6 +121,9 @@ pub struct Compiler {
     /// Whether this chunk contains a signal-raising `break`/`continue`, so loops
     /// in it must re-dispatch a still-pending signal when they exit.
     chunk_signals: bool,
+    /// Number of block scopes open at the current emission point, so a jump out of
+    /// them can pop exactly the right number.
+    scope_depth: usize,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -181,7 +209,8 @@ impl Compiler {
             {
                 let def_id = self.build_function(name, params, body, *is_generator, *is_async)?;
                 self.emit_mkfunc(b, def_id);
-                self.declare(b, &Expr::Ident(name.clone()));
+                // Function declarations hoist to the enclosing FUNCTION scope.
+                self.declare_as(b, &Expr::Ident(name.clone()), BindMode::Var);
             }
         }
         Ok(())
@@ -217,7 +246,8 @@ impl Compiler {
                     b.emit(Op::Pop, line);
                 }
             }
-            StmtKind::Decl { decls, .. } => {
+            StmtKind::Decl { kind, decls } => {
+                let mode = bind_mode(*kind);
                 for d in decls {
                     match &d.init {
                         Some(v) => {
@@ -232,12 +262,14 @@ impl Compiler {
                             b.emit(Op::LoadUndef, line);
                         }
                     }
-                    self.compile_bind(b, &d.target, true)?;
+                    self.compile_bind(b, &d.target, mode)?;
                 }
             }
             StmtKind::Block(body) => {
+                self.emit_push_scope(b);
                 self.hoist_funcs(b, body)?;
                 self.compile_stmts(b, body)?;
+                self.emit_pop_scope(b);
             }
             StmtKind::If { test, cons, alt } => self.compile_if(b, test, cons, alt)?,
             StmtKind::While { test, body } => self.compile_while(b, test, body)?,
@@ -255,10 +287,11 @@ impl Compiler {
                 body,
                 is_await,
             } => {
+                let mode = decl_kind.map(bind_mode).unwrap_or(BindMode::Assign);
                 if *is_await {
-                    self.compile_for_await(b, decl_kind.is_some(), target, iter, body)?
+                    self.compile_for_await(b, mode, target, iter, body)?
                 } else {
-                    self.compile_for_of(b, decl_kind.is_some(), target, iter, body)?
+                    self.compile_for_of(b, mode, target, iter, body)?
                 }
             }
             StmtKind::ForIn {
@@ -266,7 +299,10 @@ impl Compiler {
                 target,
                 object,
                 body,
-            } => self.compile_for_in(b, decl_kind.is_some(), target, object, body)?,
+            } => {
+                let mode = decl_kind.map(bind_mode).unwrap_or(BindMode::Assign);
+                self.compile_for_in(b, mode, target, object, body)?
+            }
             StmtKind::Switch { disc, cases } => self.compile_switch(b, disc, cases)?,
             StmtKind::Return(e) => {
                 match e {
@@ -293,6 +329,7 @@ impl Compiler {
                         .ok_or("SyntaxError: 'break' outside loop")?,
                 };
                 if idx >= self.chunk_loop_base {
+                    self.emit_unwind_scopes(b, self.loops[idx].break_depth);
                     let j = b.emit(Op::Jump(0), line);
                     self.loops[idx].breaks.push(j);
                 } else {
@@ -319,6 +356,7 @@ impl Compiler {
                         .ok_or("SyntaxError: 'continue' outside loop")?,
                 };
                 if idx >= self.chunk_loop_base {
+                    self.emit_unwind_scopes(b, self.loops[idx].continue_depth);
                     let j = b.emit(Op::Jump(0), line);
                     self.loops[idx].continues.push(j);
                 } else {
@@ -345,14 +383,14 @@ impl Compiler {
         &mut self,
         b: &mut ChunkBuilder,
         target: &Expr,
-        declare: bool,
+        declare: BindMode,
     ) -> Result<(), String> {
         match target {
             Expr::Ident(_) => {
-                if declare {
-                    self.declare(b, target);
-                } else {
+                if declare == BindMode::Assign {
                     self.store_simple(b, target)?;
+                } else {
+                    self.declare_as(b, target, declare);
                 }
             }
             Expr::Member { .. } | Expr::Index { .. } => {
@@ -379,10 +417,21 @@ impl Compiler {
 
     /// Emit a `DECLARE` of a simple name binding, consuming TOS value.
     fn declare(&self, b: &mut ChunkBuilder, target: &Expr) {
+        self.declare_as(b, target, BindMode::Lexical);
+    }
+
+    /// Emit the declaration op matching `mode`: block-scoped for `let`/`const`,
+    /// function-scoped for `var` and hoisted function declarations.
+    fn declare_as(&self, b: &mut ChunkBuilder, target: &Expr, mode: BindMode) {
         if let Expr::Ident(n) = target {
+            let op = if mode == BindMode::Var {
+                ops::DECLARE_VAR
+            } else {
+                ops::DECLARE
+            };
             self.name_const(b, n);
             b.emit(Op::Swap, 0);
-            b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
+            b.emit(Op::CallBuiltin(op, 2), 0);
             b.emit(Op::Pop, 0);
         }
     }
@@ -421,7 +470,7 @@ impl Compiler {
         &mut self,
         b: &mut ChunkBuilder,
         items: &[Expr],
-        declare: bool,
+        declare: BindMode,
     ) -> Result<(), String> {
         let star_idx = items
             .iter()
@@ -447,7 +496,7 @@ impl Compiler {
         &mut self,
         b: &mut ChunkBuilder,
         props: &[Prop],
-        declare: bool,
+        declare: BindMode,
     ) -> Result<(), String> {
         // Object value on TOS; keep it, read each key, bind, then drop.
         let obj_tmp = self.tmp_name("destr");
@@ -546,6 +595,8 @@ impl Compiler {
             self.loops.push(LoopCtx {
                 breaks: Vec::new(),
                 continues: Vec::new(),
+                break_depth: self.scope_depth,
+                continue_depth: self.scope_depth,
                 catches_continue: false,
                 label: Some(label.to_string()),
             });
@@ -581,6 +632,8 @@ impl Compiler {
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
+            break_depth: self.scope_depth,
+            continue_depth: self.scope_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
@@ -609,6 +662,8 @@ impl Compiler {
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
+            break_depth: self.scope_depth,
+            continue_depth: self.scope_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
@@ -636,8 +691,27 @@ impl Compiler {
         update: &Option<Expr>,
         body: &Stmt,
     ) -> Result<(), String> {
+        // A `let`/`const` head is scoped to the loop AND re-bound per iteration, so
+        // a closure made in one pass keeps that pass's value (ForBodyEvaluation's
+        // CreatePerIterationEnvironment). A `var` head belongs to the function.
+        let per_iteration = matches!(
+            init.as_deref(),
+            Some(Stmt {
+                kind: StmtKind::Decl {
+                    kind: DeclKind::Let | DeclKind::Const,
+                    ..
+                },
+                ..
+            })
+        );
+        if per_iteration {
+            self.emit_push_scope(b);
+        }
         if let Some(init) = init {
             self.compile_stmt(b, init)?;
+        }
+        if per_iteration {
+            self.emit_copy_scope(b);
         }
         let start = b.current_pos();
         let jfalse = match test {
@@ -650,11 +724,18 @@ impl Compiler {
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
+            break_depth: self.scope_depth,
+            continue_depth: self.scope_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
         let cont_target = b.current_pos();
+        if per_iteration {
+            // Fresh copy BEFORE the update, so the update advances the NEXT pass's
+            // binding and the one just captured keeps this pass's value.
+            self.emit_copy_scope(b);
+        }
         if let Some(u) = update {
             self.compile_expr(b, u)?;
             b.emit(Op::Pop, 0);
@@ -671,6 +752,9 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, end);
         }
+        if per_iteration {
+            self.emit_pop_scope(b);
+        }
         self.redispatch_after_loop(b);
         Ok(())
     }
@@ -678,7 +762,7 @@ impl Compiler {
     fn compile_for_of(
         &mut self,
         b: &mut ChunkBuilder,
-        declare: bool,
+        declare: BindMode,
         target: &Expr,
         iter: &Expr,
         body: &Stmt,
@@ -691,7 +775,7 @@ impl Compiler {
     fn compile_for_in(
         &mut self,
         b: &mut ChunkBuilder,
-        declare: bool,
+        declare: BindMode,
         target: &Expr,
         object: &Expr,
         body: &Stmt,
@@ -708,7 +792,7 @@ impl Compiler {
     fn compile_for_await(
         &mut self,
         b: &mut ChunkBuilder,
-        declare: bool,
+        declare: BindMode,
         target: &Expr,
         iter: &Expr,
         body: &Stmt,
@@ -740,23 +824,40 @@ impl Compiler {
         self.load_local(b, &step_tmp);
         self.name_const(b, "value");
         b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [value]
+        let per_iteration = declare == BindMode::Lexical;
+        if per_iteration {
+            self.emit_push_scope(b);
+        }
         self.compile_bind(b, target, declare)?;
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
+            break_depth: self.scope_depth,
+            continue_depth: self.scope_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
+        let cont_target = b.current_pos();
+        if per_iteration {
+            self.emit_pop_scope(b);
+        }
         b.emit(Op::Jump(start), 0);
         let ctx = self.loops.pop().unwrap();
         for c in ctx.continues {
-            b.patch_jump(c, start);
+            b.patch_jump(c, cont_target);
+        }
+        // `done` arrives before the iteration scope is open; `break` from inside it
+        // still has one to close.
+        let break_target = b.current_pos();
+        if per_iteration {
+            b.emit(Op::CallBuiltin(ops::POP_SCOPE, 0), 0);
+            b.emit(Op::Pop, 0);
         }
         let end = b.current_pos();
         b.patch_jump(jdone, end);
         for br in ctx.breaks {
-            b.patch_jump(br, end);
+            b.patch_jump(br, break_target);
         }
         self.redispatch_after_loop(b);
         Ok(())
@@ -766,25 +867,37 @@ impl Compiler {
     fn loop_over(
         &mut self,
         b: &mut ChunkBuilder,
-        declare: bool,
+        declare: BindMode,
         target: &Expr,
         body: &Stmt,
     ) -> Result<(), String> {
+        // `for (const v of …)` binds a FRESH `v` each pass, so a closure made in one
+        // pass keeps that pass's element.
+        let per_iteration = declare == BindMode::Lexical;
         let start = b.current_pos();
         b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next]
         let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next
+        if per_iteration {
+            self.emit_push_scope(b);
+        }
         self.compile_bind(b, target, declare)?; // consumes value -> [iterator]
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
+            break_depth: self.scope_depth,
+            continue_depth: self.scope_depth,
             catches_continue: true,
             label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
+        let cont_target = b.current_pos();
+        if per_iteration {
+            self.emit_pop_scope(b);
+        }
         b.emit(Op::Jump(start), 0);
         let ctx = self.loops.pop().unwrap();
         for c in ctx.continues {
-            b.patch_jump(c, start);
+            b.patch_jump(c, cont_target);
         }
         let done = b.current_pos();
         b.patch_jump(jdone, done);
@@ -793,6 +906,10 @@ impl Compiler {
         let break_target = b.current_pos();
         // `break` out of a for-of closes the iterator (runs a generator's pending
         // `finally` / calls a user iterator's `.return()`), then drops it.
+        if per_iteration {
+            b.emit(Op::CallBuiltin(ops::POP_SCOPE, 0), 0);
+            b.emit(Op::Pop, 0);
+        }
         b.emit(Op::CallBuiltin(ops::ITER_CLOSE, 1), 0);
         let end = b.current_pos();
         b.patch_jump(jafter, end);
@@ -815,6 +932,10 @@ impl Compiler {
         b.emit(Op::Swap, 0);
         b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
         b.emit(Op::Pop, 0);
+        // All cases share ONE block scope, so `case 1: let x = …` is visible to the
+        // later cases but dies with the switch. It opens BEFORE the test chain
+        // because each case test jumps straight into its body.
+        self.emit_push_scope(b);
         // Emit the test chain: `if (disc === caseTest) goto bodyN`.
         let mut body_jumps: Vec<Option<usize>> = Vec::new();
         let mut default_idx: Option<usize> = None;
@@ -838,6 +959,8 @@ impl Compiler {
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
+            break_depth: self.scope_depth,
+            continue_depth: self.scope_depth,
             catches_continue: false,
             label: None,
         });
@@ -861,6 +984,7 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, end);
         }
+        self.emit_pop_scope(b);
         self.redispatch_after_loop(b);
         Ok(())
     }
@@ -910,11 +1034,13 @@ impl Compiler {
         let mut cb = ChunkBuilder::new();
         let base = std::mem::replace(&mut self.chunk_loop_base, self.loops.len());
         let signals = std::mem::take(&mut self.chunk_signals);
+        let depth = std::mem::take(&mut self.scope_depth);
         let r = (|| {
             self.hoist_funcs(&mut cb, stmts)?;
             self.compile_stmts(&mut cb, stmts)
         })();
         self.chunk_loop_base = base;
+        self.scope_depth = depth;
         // A signal raised inside the nested chunk still has to be dispatched by a
         // loop in THIS chunk, so the flag propagates outward.
         self.chunk_signals |= signals;
@@ -938,6 +1064,7 @@ impl Compiler {
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_base = std::mem::replace(&mut self.chunk_loop_base, 0);
         let saved_signals = std::mem::take(&mut self.chunk_signals);
+        let saved_depth = std::mem::take(&mut self.scope_depth);
         let r = (|| {
             // Function-body function hoisting.
             self.hoist_funcs(&mut fb, &prologue)?;
@@ -948,6 +1075,7 @@ impl Compiler {
         self.loops = saved_loops;
         self.chunk_loop_base = saved_base;
         self.chunk_signals = saved_signals;
+        self.scope_depth = saved_depth;
         r?;
         let def = FuncDef {
             name: name.to_string(),
@@ -1257,7 +1385,7 @@ impl Compiler {
             Expr::Assign { target, value } => {
                 self.compile_expr(b, value)?;
                 b.emit(Op::Dup, 0); // assignment yields the value
-                self.compile_bind(b, target, false)?;
+                self.compile_bind(b, target, BindMode::Assign)?;
             }
             Expr::Update { op, prefix, target } => self.compile_update(b, *op, *prefix, target)?,
             Expr::Call {
@@ -1703,10 +1831,10 @@ impl Compiler {
             b.emit(Op::Swap, 0); // [new, oldN]
             b.emit(Op::Pop, 0); // [new]
             b.emit(Op::Dup, 0); // [new, new]
-            self.compile_bind(b, target, false)?; // stores new -> [new]
+            self.compile_bind(b, target, BindMode::Assign)?; // stores new -> [new]
         } else {
             // x++: store new, yield oldN.
-            self.compile_bind(b, target, false)?; // stores new -> [oldN]
+            self.compile_bind(b, target, BindMode::Assign)?; // stores new -> [oldN]
         }
         Ok(())
     }
@@ -1761,6 +1889,37 @@ impl Compiler {
 
     /// For an optional access: object on TOS. If nullish, replace with undefined
     /// and jump over the access. Returns the jump index to patch to the end.
+    // ── block scopes ─────────────────────────────────────────────────────
+    /// Enter a block scope: `let`/`const` declared after this point die at the
+    /// matching [`Self::emit_pop_scope`].
+    fn emit_push_scope(&mut self, b: &mut ChunkBuilder) {
+        b.emit(Op::CallBuiltin(ops::PUSH_SCOPE, 0), 0);
+        b.emit(Op::Pop, 0);
+        self.scope_depth += 1;
+    }
+
+    fn emit_pop_scope(&mut self, b: &mut ChunkBuilder) {
+        b.emit(Op::CallBuiltin(ops::POP_SCOPE, 0), 0);
+        b.emit(Op::Pop, 0);
+        self.scope_depth -= 1;
+    }
+
+    /// Replace the innermost scope with a copy of its bindings — the per-iteration
+    /// environment that makes each `for (let i …)` pass capture its own `i`.
+    fn emit_copy_scope(&self, b: &mut ChunkBuilder) {
+        b.emit(Op::CallBuiltin(ops::COPY_SCOPE, 0), 0);
+        b.emit(Op::Pop, 0);
+    }
+
+    /// Close every block scope between here and `target` depth, without changing
+    /// the compile-time depth (the jump that follows leaves this code path).
+    fn emit_unwind_scopes(&self, b: &mut ChunkBuilder, target: usize) {
+        for _ in target..self.scope_depth {
+            b.emit(Op::CallBuiltin(ops::POP_SCOPE, 0), 0);
+            b.emit(Op::Pop, 0);
+        }
+    }
+
     /// Raise a `break`/`continue` whose target loop is outside this chunk.
     fn emit_signal_jump(
         &mut self,

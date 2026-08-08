@@ -97,6 +97,10 @@ pub mod ops {
     pub const SIG_BREAK: u16 = 62; // [label|""] -> raise a Break signal and halt the chunk (break out of a `try`)
     pub const SIG_CONTINUE: u16 = 63; // [label|""] -> raise a Continue signal and halt the chunk
     pub const SIG_UNWIND: u16 = 64; // [tag] -> 0 none / 1 break here / 2 continue here; halts the chunk to propagate
+    pub const PUSH_SCOPE: u16 = 65; // [] -> enter a fresh block scope (`let`/`const` live here)
+    pub const POP_SCOPE: u16 = 66; // [] -> leave the innermost block scope
+    pub const COPY_SCOPE: u16 = 67; // [] -> replace the innermost block scope with a COPY (per-iteration `let`)
+    pub const DECLARE_VAR: u16 = 68; // [name, value] -> declare at FUNCTION scope, ignoring block scopes (`var`)
 }
 
 /// `SIG_UNWIND` scope tags: what the emitting site is nested in.
@@ -380,6 +384,9 @@ pub fn child_env(parent: Env) -> Env {
 /// One function activation.
 pub struct Frame {
     pub env: Env,
+    /// The env this activation started in — the FUNCTION scope. `var` and hoisted
+    /// function declarations bind here no matter how many block scopes are open.
+    pub base_env: Env,
     pub this_obj: Option<Value>,
     /// `new.target` for this activation (the constructor when invoked via `new`).
     pub new_target: Option<Value>,
@@ -594,7 +601,8 @@ impl JsHost {
             tries: Vec::new(),
             globals: IndexMap::new(),
             frames: vec![Frame {
-                env: module_env,
+                env: module_env.clone(),
+                base_env: module_env,
                 this_obj: None,
                 new_target: None,
                 home_class: None,
@@ -959,9 +967,12 @@ impl JsHost {
         self.globals.insert(name.to_string(), val);
     }
 
-    /// Declare a new binding in the current scope (`let`/`const`/`var`).
+    /// Declare a new binding in the current scope (`let`/`const`). At the top of
+    /// the module frame there is no local env, so those names become globals; once
+    /// a block scope is open the binding belongs to that block.
     pub fn declare_name(&mut self, name: &str, val: Value) {
-        if self.frames.len() == 1 {
+        let f = self.frame();
+        if self.frames.len() == 1 && Rc::ptr_eq(&f.env, &f.base_env) {
             self.globals.insert(name.to_string(), val);
         } else {
             self.cur_env()
@@ -969,6 +980,57 @@ impl JsHost {
                 .vars
                 .insert(name.to_string(), val);
         }
+    }
+
+    /// Declare a `var` (or a hoisted function declaration): FUNCTION-scoped, so it
+    /// skips every open block scope and lands in the activation's base env.
+    pub fn declare_var_name(&mut self, name: &str, val: Value) {
+        if self.frames.len() == 1 {
+            self.globals.insert(name.to_string(), val);
+            return;
+        }
+        let base = self.frame().base_env.clone();
+        base.borrow_mut().vars.insert(name.to_string(), val);
+    }
+
+    /// Enter a fresh block scope.
+    pub fn push_scope(&mut self) {
+        let env = self.cur_env();
+        self.frames.last_mut().unwrap().env = child_env(env);
+    }
+
+    /// Leave the innermost block scope (never pops past the activation's base).
+    pub fn pop_scope(&mut self) {
+        let cur = self.cur_env();
+        if Rc::ptr_eq(&cur, &self.frame().base_env) {
+            return;
+        }
+        let parent = cur.borrow().parent.clone();
+        if let Some(p) = parent {
+            self.frames.last_mut().unwrap().env = p;
+        }
+    }
+
+    /// Replace the innermost block scope with a fresh copy of its bindings — the
+    /// per-iteration environment a `for (let i …)` loop creates, so a closure made
+    /// in one iteration keeps that iteration's value.
+    pub fn copy_scope(&mut self) {
+        let cur = self.cur_env();
+        if Rc::ptr_eq(&cur, &self.frame().base_env) {
+            return;
+        }
+        let parent = cur.borrow().parent.clone();
+        let fresh = new_env(parent);
+        fresh.borrow_mut().vars = cur.borrow().vars.clone();
+        self.frames.last_mut().unwrap().env = fresh;
+    }
+
+    /// The current block-scope env, for save/restore across a nested chunk.
+    pub fn scope_snapshot(&self) -> Env {
+        self.cur_env()
+    }
+    pub fn restore_scope(&mut self, env: Env) {
+        self.frames.last_mut().unwrap().env = env;
     }
     pub fn set_global(&mut self, name: &str, val: Value) {
         self.globals.insert(name.to_string(), val);
@@ -2606,6 +2668,7 @@ pub fn run_user_func_nt(
         .and_then(|n| with_host(|h| h.class_registry.get(n).cloned()));
     with_host(|h| {
         h.frames.push(Frame {
+            base_env: env.clone(),
             env,
             this_obj: this_val,
             new_target,
@@ -3095,6 +3158,7 @@ fn make_generator(
         .as_ref()
         .and_then(|n| with_host(|h| h.class_registry.get(n).cloned()));
     let frame = Frame {
+        base_env: env.clone(),
         env,
         this_obj: this_val,
         new_target: None,
