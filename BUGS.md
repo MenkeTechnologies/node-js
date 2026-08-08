@@ -5,7 +5,9 @@ Implemented natively (verified vs node v26): `assert`(+`/strict`), `buffer`,
 `child_process` (exec/spawnSync/execSync; `spawn` is sync-backed, not a live
 streaming ChildProcess), `console`, `crypto` (hashes/hmac), `dns` (lookup/resolve
 via std), `diagnostics_channel`, `events`, `fs`, `http`, `net`, `os`, `path`
-(+`/posix`), `perf_hooks`, `process`, `punycode`, `querystring`, `stream`,
+(+`/posix` +`/win32` — both flavors are a faithful port of Node's `lib/path.js`,
+differentially verified over 33,600 cases), `perf_hooks`, `process`, `punycode`,
+`querystring`, `stream`,
 `string_decoder`, `timers`(+`/promises`), `tty`, `url`, `util`(+`/types`), `v8`
 (serialize = JSON, not V8 binary; heap stats are a shim), `async_hooks`
 (AsyncLocalStorage sync-only; hooks are no-ops), `zlib`.
@@ -15,8 +17,7 @@ code loads; calling a method throws `Error: <mod>.<method> is not implemented in
 node-js` — honest, never a silent fake): `tls`, `http2`, `https`, `worker_threads`,
 `cluster`, `dgram`, `inspector`, `wasi`, `trace_events`, `domain`, `repl`, `vm`,
 `readline`, `dns/promises` (use `require('dns').promises`). These need real
-TLS/HTTP2/OS-threads/sandboxing substrate. `fs/promises`, `stream/consumers`,
-`path/win32` not yet aliased.
+TLS/HTTP2/OS-threads/sandboxing substrate.
 
 
 ## Express (real npm package) — runs and serves HTTP; body-parsing gap

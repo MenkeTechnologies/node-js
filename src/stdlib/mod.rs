@@ -101,10 +101,11 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "zlib" => Some("zlib"),
         "querystring" => Some("querystring"),
         "console" => Some("console"),
-        // `path/posix` is exactly our POSIX `path`; `assert/strict` is `assert`
-        // (our assert is already strict-equality based).
+        // `path/posix` is exactly our POSIX `path` (node-js targets a POSIX host,
+        // so `require('path') === path.posix`); `path/win32` is the separate
+        // backslash flavor. `assert/strict` is `assert` (already strict-based).
         "path/posix" => Some("path"),
-        "path/win32" => Some("path"),
+        "path/win32" => Some("path/win32"),
         // `sys` is the long-deprecated alias for `util`.
         "sys" => Some("util"),
         "assert/strict" => Some("assert"),
@@ -147,7 +148,7 @@ pub fn is_method(qualified: &str) -> bool {
     };
     match ns {
         "fs" => fs::METHODS.contains(&m),
-        "path" => path::METHODS.contains(&m),
+        "path" | "path/win32" => path::METHODS.contains(&m),
         "os" => os::METHODS.contains(&m),
         "util" => util::METHODS.contains(&m),
         "assert" => assert::METHODS.contains(&m),
@@ -236,7 +237,8 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let (ns, m) = name.split_once('.')?;
     Some(match ns {
         "fs" => fs::call(m, args)?,
-        "path" => path::call(m, args)?,
+        "path" => path::call(path::Flavor::Posix, m, args)?,
+        "path/win32" => path::call(path::Flavor::Win32, m, args)?,
         "os" => os::call(m, args)?,
         "util" => util::call(m, args)?,
         "assert" => assert::call(m, args)?,
@@ -312,12 +314,16 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// `buffer.Buffer`, `url.URL`), reachable via `namespace_property`.
 pub fn constant(ns: &str, name: &str) -> Option<Value> {
     match ns {
-        // `path.posix` is our POSIX path itself; expose it (and `path.win32` as a
-        // best-effort alias) as a nested namespace so `path.posix.join(...)` works.
-        "path" if name == "posix" || name == "win32" => {
+        // Both flavors carry `.posix`/`.win32` cross-links, exactly as Node's
+        // `posix.win32 = win32.win32 = win32; posix.posix = win32.posix = posix`.
+        "path" | "path/win32" if name == "posix" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("path".into()))))
         }
-        "path" => path::constant(name),
+        "path" | "path/win32" if name == "win32" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("path/win32".into()))))
+        }
+        "path" => path::constant(path::Flavor::Posix, name),
+        "path/win32" => path::constant(path::Flavor::Win32, name),
         "os" => os::constant(name),
         "buffer" if name == "Buffer" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into()))))
