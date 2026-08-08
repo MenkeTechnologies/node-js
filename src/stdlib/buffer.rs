@@ -233,6 +233,11 @@ pub fn from_bytes(bytes: &[u8]) -> Value {
         m.insert("@@native".into(), h.new_str("Buffer"));
         m.insert("@@bytes".into(), arr);
         m.insert("length".into(), Value::Float(bytes.len() as f64));
+        // The `Uint8Array` view properties a Buffer inherits in Node. `byteLength`
+        // equals `length` because the element size is 1.
+        m.insert("byteLength".into(), Value::Float(bytes.len() as f64));
+        m.insert("byteOffset".into(), Value::Float(0.0));
+        m.insert("BYTES_PER_ELEMENT".into(), Value::Float(1.0));
         h.new_object(m)
     })
 }
@@ -626,6 +631,25 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             set_bytes(&target, &tb);
             Ok(Value::Float(n as f64))
         }
+        // `TypedArray.prototype.set(source[, offset])` — copy `source`'s bytes in
+        // at `offset`, throwing when they would not fit (as Node does).
+        "set" => {
+            let src = bytes_of(&args.first().cloned().unwrap_or(Value::Undef));
+            let offset = if args.len() > 1 {
+                super::arg_num(args, 1).max(0.0) as usize
+            } else {
+                0
+            };
+            if offset + src.len() > bytes.len() {
+                return Err(crate::host::range_error(
+                    "offset is out of bounds",
+                ));
+            }
+            let mut out = bytes.clone();
+            out[offset..offset + src.len()].copy_from_slice(&src);
+            set_bytes(recv, &out);
+            Ok(Value::Undef)
+        }
         _ => Err(crate::host::type_error(&format!(
             "buffer.{method} is not a function"
         ))),
@@ -693,7 +717,7 @@ fn decode_str(s: &str, enc: &str) -> Vec<u8> {
     }
 }
 
-fn encode_bytes(bytes: &[u8], enc: &str) -> String {
+pub(crate) fn encode_bytes(bytes: &[u8], enc: &str) -> String {
     match enc.to_ascii_lowercase().as_str() {
         "hex" => to_hex(bytes),
         "base64" | "base64url" => to_base64(bytes),

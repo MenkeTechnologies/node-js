@@ -16,7 +16,7 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
-pub const STATIC_METHODS: &[&str] = &["from", "of"];
+pub const STATIC_METHODS: &[&str] = &["from", "of", "isView"];
 
 /// The nine element kinds plus `ArrayBuffer` (which carries only a byte length).
 pub fn is_ctor(name: &str) -> bool {
@@ -136,6 +136,18 @@ pub fn static_call(kind: &str, method: &str, args: &[Value]) -> Option<Result<Va
                 .collect(),
         )),
         "from" => from(kind, args),
+        // `ArrayBuffer.isView(x)` — true for a typed array or a Buffer (which is
+        // a Uint8Array view), false for the backing ArrayBuffer itself.
+        "isView" => Ok(Value::Bool(with_host(|h| {
+            matches!(
+                h.get(&args.first().cloned().unwrap_or(Value::Undef)),
+                Some(crate::host::JsObj::Object(p))
+                    if matches!(
+                        p.get("@@native").map(|t| h.str_of(t)).as_deref(),
+                        Some("TypedArray") | Some("Buffer") | Some("DataView")
+                    )
+            )
+        }))),
         _ => return None,
     })
 }

@@ -1048,27 +1048,50 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
 }
 
 /// The `Object.prototype.toString` brand tag for `v` (`[object Array]` etc.).
+/// Every builtin exotic object reports its own brand, which is how packages
+/// type-test values they did not construct (`toString.call(x) ===
+/// '[object Uint8Array]'`). A `Buffer` reports `Uint8Array` because in Node it
+/// IS a `Uint8Array` subclass and inherits that `Symbol.toStringTag`.
 fn object_tag(h: &host::JsHost, v: &Value) -> String {
-    let tag = match v {
-        Value::Undef => "Undefined",
-        Value::Bool(_) => "Boolean",
-        Value::Int(_) | Value::Float(_) => "Number",
-        Value::Str(_) => "String",
+    let tag: String = match v {
+        Value::Undef => "Undefined".into(),
+        Value::Bool(_) => "Boolean".into(),
+        Value::Int(_) | Value::Float(_) => "Number".into(),
+        Value::Str(_) => "String".into(),
         Value::Obj(_) => match h.get(v) {
-            Some(JsObj::Null) => "Null",
-            Some(JsObj::Str(_)) => "String",
-            Some(JsObj::Array(_)) => "Array",
+            Some(JsObj::Null) => "Null".into(),
+            Some(JsObj::Str(_)) => "String".into(),
+            Some(JsObj::Array(_)) => "Array".into(),
             Some(JsObj::Func(_))
             | Some(JsObj::Class(_))
             | Some(JsObj::Builtin(_))
             | Some(JsObj::BoundFunc { .. })
-            | Some(JsObj::BoundMethod { .. }) => "Function",
-            Some(JsObj::RegExp(_)) => "RegExp",
-            _ => "Object",
+            | Some(JsObj::BoundMethod { .. }) => "Function".into(),
+            Some(JsObj::RegExp(_)) => "RegExp".into(),
+            Some(JsObj::Map { weak, .. }) => if *weak { "WeakMap" } else { "Map" }.into(),
+            Some(JsObj::Set { weak, .. }) => if *weak { "WeakSet" } else { "Set" }.into(),
+            Some(JsObj::Promise { .. }) => "Promise".into(),
+            Some(JsObj::Symbol { .. }) => "Symbol".into(),
+            Some(JsObj::BigInt(_)) => "BigInt".into(),
+            // Native-tagged instances brand by their tag; a typed array brands by
+            // its element kind (`@@kind`), and every Error subclass is `Error`.
+            Some(JsObj::Object(p)) => match p.get("@@native").map(|t| h.str_of(t)).as_deref() {
+                Some("TypedArray") => p
+                    .get("@@kind")
+                    .map(|k| h.str_of(k))
+                    .unwrap_or_else(|| "Uint8Array".into()),
+                Some("Buffer") => "Uint8Array".into(),
+                Some("ArrayBuffer") => "ArrayBuffer".into(),
+                Some("DataView") => "DataView".into(),
+                Some("Date") => "Date".into(),
+                _ if h.error_to_string(v).is_some() => "Error".into(),
+                _ => "Object".into(),
+            },
+            _ => "Object".into(),
         },
         // node-js only produces the Value variants above; fusevm's shell-oriented
         // variants never arise here.
-        _ => "Object",
+        _ => "Object".into(),
     };
     format!("[object {tag}]")
 }
@@ -2929,6 +2952,33 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
                 h.new_array(out)
             }));
         }
+        // A stdlib namespace (`Buffer`, `require('buffer')`): its own enumerable
+        // keys are the members node-js implements, each resolved to the same
+        // first-class value a property read would give.
+        let names = crate::stdlib::namespace_keys(&ns);
+        if !names.is_empty() {
+            let entries: Vec<(String, Value)> = names
+                .into_iter()
+                .map(|k| {
+                    let val = namespace_property(&ns, &k);
+                    (k, val)
+                })
+                .collect();
+            return Ok(with_host(|h| {
+                let out: Vec<Value> = entries
+                    .into_iter()
+                    .map(|(k, val)| match mode {
+                        1 => val,
+                        2 => {
+                            let ks = h.new_str(k);
+                            h.new_array(vec![ks, val])
+                        }
+                        _ => h.new_str(k),
+                    })
+                    .collect();
+                h.new_array(out)
+            }));
+        }
     }
     let entries: Vec<(String, Value)> = with_host(|h| match h.get(&v) {
         Some(JsObj::Object(props)) => props
@@ -4319,25 +4369,52 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                 None => Ok(Value::Float(f64::NAN)),
             }
         }
+        // The search quartet all honor their optional position argument.
+        // `"a&b&c".indexOf("&", 2)` must be 3, not 1 — body-parser's
+        // parameterCount walks a query string with exactly that call.
         "indexOf" => {
-            let needle = with_host(|h| h.str_of(&arg0(&args)));
-            Ok(Value::Float(byte_to_char_index(s, s.find(&needle))))
+            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
+            let from = clamp_pos(arg_num(&args, 1), chars.len());
+            Ok(Value::Float(
+                search_from(&chars, &needle, from)
+                    .map(|i| i as f64)
+                    .unwrap_or(-1.0),
+            ))
         }
         "lastIndexOf" => {
-            let needle = with_host(|h| h.str_of(&arg0(&args)));
-            Ok(Value::Float(byte_to_char_index(s, s.rfind(&needle))))
+            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
+            // An absent or NaN position means "search the whole string".
+            let n = arg_num(&args, 1);
+            let upto = if n.is_nan() {
+                chars.len()
+            } else {
+                clamp_pos(n, chars.len())
+            };
+            Ok(Value::Float(
+                search_last(&chars, &needle, upto)
+                    .map(|i| i as f64)
+                    .unwrap_or(-1.0),
+            ))
         }
         "includes" => {
-            let needle = with_host(|h| h.str_of(&arg0(&args)));
-            Ok(Value::Bool(s.contains(&needle)))
+            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
+            let from = clamp_pos(arg_num(&args, 1), chars.len());
+            Ok(Value::Bool(search_from(&chars, &needle, from).is_some()))
         }
         "startsWith" => {
-            let needle = with_host(|h| h.str_of(&arg0(&args)));
-            Ok(Value::Bool(s.starts_with(&needle)))
+            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
+            let from = clamp_pos(arg_num(&args, 1), chars.len());
+            Ok(Value::Bool(chars[from..].starts_with(&needle)))
         }
         "endsWith" => {
-            let needle = with_host(|h| h.str_of(&arg0(&args)));
-            Ok(Value::Bool(s.ends_with(&needle)))
+            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
+            // The 2nd argument is where the string is treated as ENDING.
+            let end = if args.len() < 2 || matches!(args[1], Value::Undef) {
+                chars.len()
+            } else {
+                clamp_pos(arg_num(&args, 1), chars.len())
+            };
+            Ok(Value::Bool(chars[..end].ends_with(&needle)))
         }
         "slice" => {
             let (lo, hi) = slice_bounds(&args, chars.len());
@@ -4474,6 +4551,44 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
 
 fn new_s(s: String) -> Value {
     with_host(|h| h.new_str(s))
+}
+
+/// `ToIntegerOrInfinity(n)` clamped into `0..=len` — the position argument of
+/// the `String.prototype` search methods. `NaN` (an absent argument) is `0`.
+fn clamp_pos(n: f64, len: usize) -> usize {
+    if n.is_nan() || n <= 0.0 {
+        0
+    } else if n >= len as f64 {
+        len
+    } else {
+        n.trunc() as usize
+    }
+}
+
+/// The lowest index `>= from` at which `needle` occurs in `hay`. An empty
+/// needle matches at `from` itself, as JS specifies.
+fn search_from(hay: &[char], needle: &[char], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from.min(hay.len()));
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (from..=hay.len().saturating_sub(needle.len())).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// The highest index `<= upto` at which `needle` occurs in `hay`.
+fn search_last(hay: &[char], needle: &[char], upto: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(upto.min(hay.len()));
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    let last = hay.len() - needle.len();
+    (0..=upto.min(last))
+        .rev()
+        .find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
 fn byte_to_char_index(s: &str, byte: Option<usize>) -> f64 {

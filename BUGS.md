@@ -28,23 +28,46 @@ node-js` — honest, never a silent fake): `tls`, `http2`, `https`, `worker_thre
 `readline`, `dns/promises` (use `require('dns').promises`). These need real
 TLS/HTTP2/OS-threads/sandboxing substrate.
 
+`async_hooks.AsyncResource` is real for the synchronous case: `runInAsyncScope`
+invokes the function with the given receiver and arguments, and `bind` (instance
+and static) returns the function bound to its `thisArg`. There is no
+async-resource graph, so `asyncId()`/`triggerAsyncId()` return the same fixed
+placeholders `executionAsyncId()`/`triggerAsyncId()` do and `emitDestroy()`
+returns `this` without destroying anything.
 
-## Express (real npm package) — runs and serves HTTP; body-parsing gap
-The real `express` 5.2.1 + its 65-package dependency tree loads and serves HTTP:
-`app.get`/routing/route params/query, `res.send`/`res.json`/`res.status`, and
-`app.listen` all match `node` byte-for-byte (verified via curl). Remaining gap:
-`express.json()` / `express.urlencoded()` **request-body parsing** fails inside
-`iconv-lite`.
+A builtin namespace (`require('buffer')`, `Buffer`, `fs`, …) enumerates the
+members node-js ACTUALLY implements under `for…in` / `Object.keys` — not Node's
+full export list. A package that clones a namespace key-by-key therefore gets
+the working set rather than an empty object.
 
-Two of the three underlying causes are now closed: `buf instanceof Uint8Array`
-is `true` (`host.rs` `instanceof`), and a `Buffer` supports indexed byte access
-(`buf[i]` read/write), byte iteration (`for…of`, spread), `values`/`keys`/
-`entries`/`at`, and the 32-bit + signed `read*`/`write*` accessors. What remains
-is that a `Buffer` is still a plain `@@native` object rather than a genuine
-`Uint8Array` **subclass instance**, so `Object.prototype.toString.call(buf)`
-reports `[object Object]` rather than `[object Uint8Array]`, and builtin
-namespaces do not enumerate their static keys — which `safer-buffer`'s
-Buffer-static copy loop relies on. GET/response-side Express is unaffected.
+
+## Express (real npm package) — runs, serves HTTP, and parses request bodies
+The real `express` 5.2.1 + its 65-package dependency tree loads and serves HTTP.
+Verified end-to-end against `node v26.7.0` with the same app and the same `curl`
+calls, byte-comparing every response body: `app.get`/routing/route params/query,
+`res.send`/`res.json`/`res.status`, `app.listen`, **and** the body parsers —
+`express.json()` (object, array, UTF-8, empty, and the malformed-input error
+path returning `entity.parse.failed`), `express.urlencoded()`,
+`express.text()` and `express.raw()`. All byte-identical.
+
+The blockers were NOT the ones previously guessed here. They were:
+
+1. **`async_hooks.AsyncResource` did not exist**, so `new AsyncResource(...)`
+   threw `is not a constructor` inside `raw-body` and `on-finished`, which both
+   wrap their callbacks with it.
+2. **Builtin namespaces did not enumerate their members**, so `safer-buffer`'s
+   `for (key in Buffer) Safer[key] = Buffer[key]` produced an empty object and
+   `iconv-lite` then hit `isBuffer is not a function`.
+3. **`String.prototype.indexOf` ignored its `fromIndex`**, so `body-parser`'s
+   `parameterCount` never advanced past the first `&` and rejected every
+   urlencoded body with `parameters.too.many`.
+
+`Object.prototype.toString.call(buf)` is now `[object Uint8Array]` (and every
+other builtin exotic brands correctly), `ArrayBuffer.isView(buf)` is `true`, and
+`buf.byteLength`/`byteOffset`/`BYTES_PER_ELEMENT`/`set` exist. A `Buffer` is
+still a `@@native`-tagged object rather than a genuine `Uint8Array` subclass
+INSTANCE, so `Object.getPrototypeOf(buf) === Buffer.prototype` is `false`; no
+observed package depends on that identity.
 
 
 node-js is JavaScript lowered to fusevm (bytecode VM + Cranelift JIT), with a

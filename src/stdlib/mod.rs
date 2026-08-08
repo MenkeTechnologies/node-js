@@ -147,85 +147,100 @@ pub fn is_method(qualified: &str) -> bool {
     let Some((ns, m)) = qualified.split_once('.') else {
         return qualified == "assert";
     };
+    // Any method on an unimplemented namespace routes to `call`, which throws an
+    // honest "not implemented" error (so `mod.foo()` fails clearly rather than
+    // silently returning undefined).
+    is_unimplemented(ns) || namespace_methods(ns).contains(&m) || namespace_ctors(ns).contains(&m)
+}
+
+/// The callable members of builtin namespace `ns`. THE single table backing both
+/// `is_method` (does `ns.m` dispatch?) and `namespace_keys` (what does `for (k in
+/// ns)` yield?), so a method can never be callable-but-unenumerable or the reverse.
+pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
     match ns {
-        "fs" => fs::METHODS.contains(&m),
-        "path" | "path/win32" => path::METHODS.contains(&m),
-        "os" => os::METHODS.contains(&m),
-        "util" => util::METHODS.contains(&m),
-        "assert" => assert::METHODS.contains(&m),
-        "assertStrict" => assert::METHODS.contains(&m),
-        "crypto" => crypto::METHODS.contains(&m),
-        "Buffer" => buffer::STATIC_METHODS.contains(&m),
-        "buffer" => m == "Buffer" || buffer::MODULE_METHODS.contains(&m),
-        "Date" => date::STATIC_METHODS.contains(&m),
-        "TextEncoder" | "TextDecoder" => false,
-        n if typedarray::is_ctor(n) => typedarray::STATIC_METHODS.contains(&m),
-        "url" => url::MODULE_METHODS.contains(&m) || m == "URL",
-        "net" => net::MODULE_METHODS.contains(&m),
-        "http" => http::MODULE_METHODS.contains(&m),
-        "stream" => stream::METHODS.contains(&m),
-        "worker_threads" => worker_threads::METHODS.contains(&m),
-        "zlib" => zlib::MODULE_METHODS.contains(&m),
-        "querystring" => querystring::METHODS.contains(&m),
-        "tty" => tty::METHODS.contains(&m),
-        "process" => process::METHODS.contains(&m),
-        "EventEmitter" => m == "EventEmitter" || events::STATIC_METHODS.contains(&m),
-        "console" => console::METHODS.contains(&m),
-        "child_process" => child_process::METHODS.contains(&m),
-        "dns" => dns::METHODS.contains(&m),
-        "punycode" => punycode::METHODS.contains(&m),
-        "timers" => timers::METHODS.contains(&m),
-        "timers/promises" => timers::PROMISES_METHODS.contains(&m),
-        "perf_hooks" | "performance" => perf_hooks::METHODS.contains(&m),
-        "async_hooks" => async_hooks::METHODS.contains(&m),
-        "util/types" => util_types::METHODS.contains(&m),
-        "diagnostics_channel" => diagnostics_channel::METHODS.contains(&m),
-        "v8" => v8::METHODS.contains(&m),
-        "readline" => readline::METHODS.contains(&m),
-        "vm" => vm::METHODS.contains(&m),
-        "fs/promises" => fs_promises::METHODS.contains(&m),
-        "dgram" => dgram::MODULE_METHODS.contains(&m),
-        "dns/promises" => matches!(
-            m,
-            "lookup"
-                | "lookupService"
-                | "resolve"
-                | "resolve4"
-                | "resolve6"
-                | "resolveMx"
-                | "resolveTxt"
-                | "resolveCname"
-                | "resolveNs"
-                | "resolvePtr"
-                | "resolveSrv"
-                | "resolveSoa"
-                | "resolveNaptr"
-                | "resolveCaa"
-                | "resolveTlsa"
-                | "resolveAny"
-                | "reverse"
-                | "getServers"
-                | "setServers"
-                | "getDefaultResultOrder"
-                | "setDefaultResultOrder"
-        ),
-        "tls" => tls::MODULE_METHODS.contains(&m),
-        "https" => https::MODULE_METHODS.contains(&m),
-        "repl" => repl::METHODS.contains(&m),
-        "cluster" => cluster::METHODS.contains(&m),
-        "domain" => domain::METHODS.contains(&m),
-        "http2" => http2::METHODS.contains(&m),
-        "trace_events" => trace_events::METHODS.contains(&m),
-        "module" => node_module::METHODS.contains(&m),
-        "Module" => node_module::MODULE_STATIC_METHODS.contains(&m),
-        "stream/consumers" => stream_consumers::METHODS.contains(&m),
-        "stream/promises" => stream_promises::is_method(m),
-        // Any method on an unimplemented namespace routes to `call`, which throws
-        // an honest "not implemented" error (so `mod.foo()` fails clearly rather
-        // than silently returning undefined).
-        _ if is_unimplemented(ns) => true,
-        _ => false,
+        "fs" => fs::METHODS,
+        "path" | "path/win32" => path::METHODS,
+        "os" => os::METHODS,
+        "util" => util::METHODS,
+        "assert" | "assertStrict" => assert::METHODS,
+        "crypto" => crypto::METHODS,
+        "Buffer" => buffer::STATIC_METHODS,
+        "buffer" => buffer::MODULE_METHODS,
+        "Date" => date::STATIC_METHODS,
+        n if typedarray::is_ctor(n) => typedarray::STATIC_METHODS,
+        "url" => url::MODULE_METHODS,
+        "net" => net::MODULE_METHODS,
+        "http" => http::MODULE_METHODS,
+        "stream" => stream::METHODS,
+        "worker_threads" => worker_threads::METHODS,
+        "zlib" => zlib::MODULE_METHODS,
+        "querystring" => querystring::METHODS,
+        "tty" => tty::METHODS,
+        "process" => process::METHODS,
+        "EventEmitter" => events::STATIC_METHODS,
+        "console" => console::METHODS,
+        "child_process" => child_process::METHODS,
+        "dns" => dns::METHODS,
+        "dns/promises" => dns::PROMISES_METHODS,
+        "punycode" => punycode::METHODS,
+        "timers" => timers::METHODS,
+        "timers/promises" => timers::PROMISES_METHODS,
+        "perf_hooks" | "performance" => perf_hooks::METHODS,
+        "async_hooks" => async_hooks::METHODS,
+        "AsyncResource" => async_hooks::RESOURCE_STATIC_METHODS,
+        "util/types" => util_types::METHODS,
+        "diagnostics_channel" => diagnostics_channel::METHODS,
+        "v8" => v8::METHODS,
+        "readline" => readline::METHODS,
+        "vm" => vm::METHODS,
+        "fs/promises" => fs_promises::METHODS,
+        "dgram" => dgram::MODULE_METHODS,
+        "tls" => tls::MODULE_METHODS,
+        "https" => https::MODULE_METHODS,
+        "repl" => repl::METHODS,
+        "cluster" => cluster::METHODS,
+        "domain" => domain::METHODS,
+        "http2" => http2::METHODS,
+        "trace_events" => trace_events::METHODS,
+        "module" => node_module::METHODS,
+        "Module" => node_module::MODULE_STATIC_METHODS,
+        "stream/consumers" => stream_consumers::METHODS,
+        "stream/promises" => stream_promises::METHODS,
+        _ => &[],
     }
+}
+
+/// Class/constructor members a namespace re-exports as values rather than
+/// callable methods (`require('buffer').Buffer`, `require('url').URL`). They are
+/// enumerable own keys too, so `for (k in buffer)` sees `Buffer`.
+fn namespace_ctors(ns: &str) -> &'static [&'static str] {
+    match ns {
+        "buffer" => &["Buffer", "Blob", "File"],
+        "url" => &["URL", "URLSearchParams"],
+        "EventEmitter" => &["EventEmitter"],
+        "async_hooks" => &["AsyncLocalStorage", "AsyncResource"],
+        "string_decoder" => &["StringDecoder"],
+        "assert" => &["AssertionError"],
+        "console" => &["Console"],
+        "vm" => &["Script"],
+        "fs" => &["promises"],
+        _ => &[],
+    }
+}
+
+/// The enumerable own keys of the builtin namespace `ns` — what `for (key in ns)`
+/// and `Object.keys(ns)` yield. These are the members node-js ACTUALLY
+/// implements, not Node's full export list, so a package that copies a namespace
+/// key-by-key (safer-buffer clones `buffer` and `Buffer`) ends up with exactly the
+/// working set rather than an empty object.
+pub fn namespace_keys(ns: &str) -> Vec<String> {
+    let mut out: Vec<String> = namespace_ctors(ns).iter().map(|s| s.to_string()).collect();
+    for m in namespace_methods(ns) {
+        if !out.iter().any(|k| k == m) {
+            out.push((*m).to_string());
+        }
+    }
+    out
 }
 
 /// Dispatch a resolved stdlib builtin (`assert`, or `namespace.method`). Returns
@@ -272,6 +287,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "timers/promises" => timers::promises_call(m, args)?,
         "perf_hooks" | "performance" => perf_hooks::call(m, args)?,
         "async_hooks" => async_hooks::call(m, args)?,
+        "AsyncResource" => async_hooks::static_call(m, args)?,
         "util/types" => util_types::call(m, args)?,
         "diagnostics_channel" => diagnostics_channel::call(m, args)?,
         "v8" => v8::call(m, args)?,
@@ -522,6 +538,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "IncomingMessage" => &["pause", "resume", "setEncoding", "destroy"],
         "Buffer" => &[
             "toString",
+            "set",
             "toJSON",
             "equals",
             "slice",
@@ -569,6 +586,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "URL" => &["toString", "toJSON"],
         "AsyncLocalStorage" => async_hooks::ALS_METHODS,
         "AsyncHook" => async_hooks::HOOK_METHODS,
+        "AsyncResource" => async_hooks::RESOURCE_METHODS,
         "Channel" => &["subscribe", "unsubscribe", "publish"],
         "WriteStream" => &[
             "write",
@@ -749,7 +767,9 @@ pub fn instance_call(
         "Console" => console::instance_call(recv, method, args),
         "ChildProcess" => child_process::instance_call(recv, method, args),
         t if stream_web::is_class(t) => stream_web::instance_call(t, recv, method, args),
-        "AsyncLocalStorage" | "AsyncHook" => async_hooks::instance_call(tag, recv, method, args),
+        "AsyncLocalStorage" | "AsyncHook" | "AsyncResource" => {
+            async_hooks::instance_call(tag, recv, method, args)
+        }
         "Channel" => diagnostics_channel::instance_call(recv, method, &args),
         "WriteStream" => process::stream_instance_call(recv, method, &args),
         _ => Err(crate::host::type_error(&format!(

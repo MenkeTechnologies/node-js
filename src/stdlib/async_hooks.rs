@@ -47,6 +47,44 @@ pub const METHODS: &[&str] = &["executionAsyncId", "triggerAsyncId", "createHook
 /// so a method *read* (`als.run.bind(...)`) resolves before it is invoked.
 pub const ALS_METHODS: &[&str] = &["getStore", "run", "enterWith", "exit", "disable"];
 pub const HOOK_METHODS: &[&str] = &["enable", "disable"];
+pub const RESOURCE_METHODS: &[&str] = &[
+    "runInAsyncScope",
+    "emitDestroy",
+    "asyncId",
+    "triggerAsyncId",
+    "bind",
+];
+
+/// Static members on the `AsyncResource` constructor itself.
+pub const RESOURCE_STATIC_METHODS: &[&str] = &["bind"];
+
+/// `AsyncResource.bind(fn[, type[, thisArg]])` — with no async-context graph to
+/// capture there is nothing to restore, so the bound function IS `fn` (bound to
+/// `thisArg` when one is given). Node's own semantics reduce to this whenever no
+/// context is active.
+pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match method {
+        "bind" => {
+            let f = args.first().cloned().unwrap_or(Value::Undef);
+            Some(Ok(bind_to(f, args.get(2).cloned())))
+        }
+        _ => None,
+    }
+}
+
+/// `fn` itself, or a `fn.bind(thisArg)` when a non-nullish receiver is supplied.
+fn bind_to(f: Value, this: Option<Value>) -> Value {
+    match this.filter(|t| !with_host(|h| h.is_nullish(t))) {
+        Some(t) => with_host(|h| {
+            h.alloc(crate::host::JsObj::BoundFunc {
+                target: f,
+                this: t,
+                args: Vec::new(),
+            })
+        }),
+        None => f,
+    }
+}
 
 pub fn call(method: &str, _args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
@@ -64,6 +102,12 @@ pub fn call(method: &str, _args: &[Value]) -> Option<Result<Value, String>> {
 pub fn construct(name: &str, _args: &[Value]) -> Option<Result<Value, String>> {
     match name {
         "AsyncLocalStorage" => Some(Ok(new_native("AsyncLocalStorage"))),
+        // `new AsyncResource(type[, options])`. node-js tracks no async-resource
+        // graph, so the instance is a context-free handle: `runInAsyncScope`
+        // calls the function directly, which is what Node does when no context
+        // is active. Consumers (raw-body, on-finished) only need it to preserve
+        // `this`/arguments across a callback, and that is exact.
+        "AsyncResource" => Some(Ok(new_native("AsyncResource"))),
         _ => None,
     }
 }
@@ -100,6 +144,36 @@ pub fn instance_call(
             ))),
         },
         "AsyncLocalStorage" => als_call(recv, method, args),
+        "AsyncResource" => resource_call(recv, method, args),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
+    }
+}
+
+/// An `AsyncResource` instance. There is no resource graph, so the ids are the
+/// same fixed placeholders `executionAsyncId`/`triggerAsyncId` report and
+/// `emitDestroy` has nothing to destroy — but `runInAsyncScope` really does
+/// invoke the function with the given receiver and arguments.
+fn resource_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    match method {
+        // runInAsyncScope(fn[, thisArg[, ...args]]) === fn.apply(thisArg, args).
+        "runInAsyncScope" => {
+            let f = args.first().cloned().unwrap_or(Value::Undef);
+            // Pass the receiver through verbatim (Node uses `ReflectApply`), so
+            // an explicit `null` gets the same sloppy-mode coercion `fn.call(null)`
+            // already applies rather than silently becoming "no receiver".
+            let this = args.get(1).cloned();
+            let rest = args.get(2..).map(|s| s.to_vec()).unwrap_or_default();
+            invoke(&f, rest, this)
+        }
+        "bind" => {
+            let f = args.first().cloned().unwrap_or(Value::Undef);
+            Ok(bind_to(f, args.get(1).cloned()))
+        }
+        "emitDestroy" => Ok(recv.clone()),
+        "asyncId" => Ok(Value::Float(1.0)),
+        "triggerAsyncId" => Ok(Value::Float(0.0)),
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
         ))),

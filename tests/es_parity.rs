@@ -495,3 +495,129 @@ fn parenthesized_and_update_expressions_still_exponentiate() {
     "#;
     assert_eq!(run(src), "-8\n-8\n0.125\n512\nNaN\n-8n\n8\n27");
 }
+
+// ── String search methods honor their position argument ──────────────────────
+
+#[test]
+fn string_search_methods_honor_the_position_argument() {
+    // `indexOf`/`lastIndexOf`/`includes`/`startsWith`/`endsWith` all ignored
+    // their 2nd argument, which made body-parser's parameterCount loop until it
+    // hit the limit and reject every urlencoded body. Values from node v26.7.0.
+    let src = r#"
+        const s = "abcabc";
+        const p = (...xs) => console.log(xs.join(","));
+        p(s.indexOf("b"), s.indexOf("b",0), s.indexOf("b",2), s.indexOf("b",5), s.indexOf("b",-3), s.indexOf("b",NaN), s.indexOf("b",100));
+        p(s.indexOf(""), s.indexOf("",3), s.indexOf("",100), s.indexOf("",-1));
+        p(s.lastIndexOf("b"), s.lastIndexOf("b",0), s.lastIndexOf("b",3), s.lastIndexOf("b",4), s.lastIndexOf("b",-1), s.lastIndexOf("b",NaN), s.lastIndexOf("b",100));
+        p(s.lastIndexOf(""), s.lastIndexOf("",2), s.lastIndexOf("",100));
+        p(s.includes("b"), s.includes("b",2), s.includes("b",5), s.includes("b",-1));
+        p(s.startsWith("a"), s.startsWith("a",3), s.startsWith("b",1), s.startsWith("a",-1), s.startsWith("a",100));
+        p(s.endsWith("c"), s.endsWith("c",3), s.endsWith("a",1), s.endsWith("c",0), s.endsWith("c",100));
+        const u = "héllo—世界";
+        p(u.indexOf("世"), u.indexOf("世",5), u.indexOf("l",2), u.lastIndexOf("l"), u.lastIndexOf("l",3));
+        p(s.indexOf("abcabcabc"), s.lastIndexOf("abcabcabc"), s.includes("abcabcabc"));
+        p(s.indexOf("b",2.9), s.lastIndexOf("b",1.9), s.startsWith("b",1.9));
+    "#;
+    assert_eq!(
+        run(src),
+        "1,1,4,-1,1,1,-1\n\
+         0,3,6,0\n\
+         4,-1,1,4,-1,4,4\n\
+         6,2,6\n\
+         true,true,false,true\n\
+         true,true,true,true,false\n\
+         true,true,true,false,true\n\
+         6,6,2,3,3\n\
+         -1,-1,false\n\
+         4,1,true"
+    );
+}
+
+// ── Object.prototype.toString brand tags ─────────────────────────────────────
+
+#[test]
+fn object_prototype_tostring_brands_builtin_exotics() {
+    // Everything reported `[object Object]`, which breaks the duck-typing that
+    // packages use on values they did not construct. A Buffer brands as
+    // Uint8Array because in Node it IS a Uint8Array subclass.
+    let src = r#"
+        const T = (x) => Object.prototype.toString.call(x);
+        console.log([
+          T(new Uint8Array(1)), T(new Float64Array(1)), T(new Int16Array(1)),
+          T(new ArrayBuffer(1)), T(Buffer.from("a")), T(new Map()), T(new Set()),
+          T(new WeakMap()), T(new WeakSet()), T(new Date(0)), T(Promise.resolve()),
+          T(Symbol("s")), T(1n), T(new Error("x")), T(new TypeError("x")),
+          T(/a/), T([1]), T({}), T(function () {}), T(null), T(undefined),
+          T(1), T("s"), T(true),
+        ].join("\n"));
+    "#;
+    assert_eq!(
+        run(src),
+        "[object Uint8Array]\n[object Float64Array]\n[object Int16Array]\n\
+         [object ArrayBuffer]\n[object Uint8Array]\n[object Map]\n[object Set]\n\
+         [object WeakMap]\n[object WeakSet]\n[object Date]\n[object Promise]\n\
+         [object Symbol]\n[object BigInt]\n[object Error]\n[object Error]\n\
+         [object RegExp]\n[object Array]\n[object Object]\n[object Function]\n\
+         [object Null]\n[object Undefined]\n[object Number]\n[object String]\n\
+         [object Boolean]"
+    );
+}
+
+// ── builtin namespaces enumerate the members node-js implements ──────────────
+
+#[test]
+fn builtin_namespaces_enumerate_their_members() {
+    // safer-buffer rebuilds `Buffer` with `for (key in Buffer) Safer[key] =
+    // Buffer[key]`; with an unenumerable namespace that produced an empty object
+    // and `Buffer.isBuffer is not a function` deep inside iconv-lite.
+    let src = r#"
+        const buffer = require("buffer");
+        const B = buffer.Buffer;
+        const Safer = {};
+        for (const key in B) { if (B.hasOwnProperty(key)) Safer[key] = B[key]; }
+        console.log(typeof Safer.isBuffer, typeof Safer.from, typeof Safer.alloc, typeof Safer.concat);
+        console.log(Safer.isBuffer(B.from("x")), Safer.from("hi").toString());
+        console.log(Object.keys(B).includes("isBuffer"), Object.keys(B).length === Object.keys(B).length);
+        const mod = [];
+        for (const key in buffer) mod.push(key);
+        console.log(mod.includes("Buffer"), mod.includes("atob"));
+        console.log(Object.keys({}).length, Object.keys([1, 2]).join(","));
+    "#;
+    assert_eq!(
+        run(src),
+        "function function function function\n\
+         true hi\n\
+         true true\n\
+         true true\n\
+         0 0,1"
+    );
+}
+
+// ── AsyncResource ────────────────────────────────────────────────────────────
+
+#[test]
+fn async_resource_runs_and_binds() {
+    // raw-body and on-finished both do `new AsyncResource(name)` then
+    // `res.runInAsyncScope.bind(res, fn, null)`; without the class the express
+    // body-parse path threw "AsyncResource is not a constructor".
+    let src = r#"
+        const ah = require("async_hooks");
+        const { AsyncResource } = ah;
+        const r = new AsyncResource("X");
+        console.log(typeof r.runInAsyncScope, typeof r.emitDestroy, typeof r.bind);
+        console.log(r.runInAsyncScope(function (a, b) { return [this.tag, a, b].join(","); }, { tag: "T" }, 1, 2));
+        console.log(AsyncResource.bind(function (x) { return "s:" + x + ":" + this.k; }, "n", { k: 9 })(5));
+        console.log(r.bind(function (x) { return "i:" + x; })(7));
+        console.log(r.emitDestroy() === r);
+        function wrap(fn) {
+          const res = new ah.AsyncResource(fn.name || "bound-anonymous-fn");
+          if (!res || !res.runInAsyncScope) return fn;
+          return res.runInAsyncScope.bind(res, fn, null);
+        }
+        console.log(wrap(function named(a) { return "wrapped " + a; })("zz"));
+    "#;
+    assert_eq!(
+        run(src),
+        "function function function\nT,1,2\ns:5:9\ni:7\ntrue\nwrapped zz"
+    );
+}

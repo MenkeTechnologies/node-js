@@ -390,8 +390,17 @@ pub fn feed(sock_id: u64, _socket: &Value, bytes: &[u8]) -> Result<(), String> {
             invoke(&listener, vec![req.clone(), res], None)?;
         }
         // Body streaming: emit any request body then `end` for downstream readers.
+        // A listener that called `req.setEncoding(enc)` gets a decoded string
+        // chunk instead of a Buffer, matching Node's Readable.
         if !parsed.body.is_empty() {
-            let chunk = super::buffer::from_bytes(&parsed.body);
+            let encoding = with_host(|h| match h.get(&req) {
+                Some(JsObj::Object(p)) => p.get("@@encoding").map(|v| h.str_of(v)),
+                _ => None,
+            });
+            let chunk = match encoding {
+                Some(enc) => with_host(|h| { let s = super::buffer::encode_bytes(&parsed.body, &enc); h.new_str(s) }),
+                None => super::buffer::from_bytes(&parsed.body),
+            };
             super::events::instance_call(
                 &req,
                 "emit",
@@ -492,6 +501,36 @@ fn build_incoming(req: &ParsedReq) -> Value {
     super::net::new_emitter_object("IncomingMessage", extra)
 }
 
+/// The Readable surface of `req`. node-js reads the whole request body off the
+/// socket BEFORE invoking the listener and then delivers it as a single `data`
+/// emit followed by `end` — so there is no partially-consumed stream to pause,
+/// resume or unpipe, and these really are complete rather than stubbed.
+/// `setEncoding` is the exception: it changes what the `data` chunk IS, so it
+/// records the encoding and `emit_body` decodes with it.
+fn incoming_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    match method {
+        // Nothing is piped anywhere (node-js has no `pipe` on `req`), and the
+        // body is already buffered, so these are no-ops that return `this` —
+        // which is exactly Node's contract for an already-drained readable.
+        "pause" | "resume" | "unpipe" | "destroy" => Ok(recv.clone()),
+        "isPaused" => Ok(Value::Bool(false)),
+        // Subsequent `data` chunks arrive as strings in this encoding.
+        "setEncoding" => {
+            let enc = super::arg_str(&args, 0);
+            with_host(|h| {
+                let v = h.new_str(enc);
+                if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                    p.insert("@@encoding".into(), v);
+                }
+            });
+            Ok(recv.clone())
+        }
+        _ => Err(crate::host::type_error(&format!(
+            "req.{method} is not a function"
+        ))),
+    }
+}
+
 // ── ServerResponse (res) ─────────────────────────────────────────────────────
 
 fn build_response(sock_id: u64) -> Value {
@@ -546,9 +585,7 @@ pub fn instance_call(
         return super::events::instance_call(recv, method, args);
     }
     match tag {
-        "IncomingMessage" => Err(crate::host::type_error(&format!(
-            "req.{method} is not a function"
-        ))),
+        "IncomingMessage" => incoming_call(recv, method, args),
         "ServerResponse" => response_call(recv, method, args),
         "ClientRequest" => client_request_call(recv, method, args),
         // Minimal Agent: no live sockets to tear down.

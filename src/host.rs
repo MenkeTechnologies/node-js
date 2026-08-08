@@ -2457,6 +2457,10 @@ impl JsHost {
                 .cloned()
                 .collect(),
             Some(JsObj::Array(items)) => (0..items.len()).map(|i| i.to_string()).collect(),
+            // A builtin namespace (`require('buffer')`, `Buffer`) enumerates the
+            // members node-js implements, so a package that copies a namespace
+            // key-by-key gets the working set instead of an empty object.
+            Some(JsObj::Builtin(ns)) => crate::stdlib::namespace_keys(&ns.clone()),
             _ => Vec::new(),
         };
         keys.into_iter().map(|k| self.new_str(k)).collect()
@@ -3643,7 +3647,7 @@ impl JsHost {
     /// `Error.prototype`: `"Name"` with an empty message, else `"Name: message"`.
     /// `None` for anything that is not an error, so the caller keeps its own
     /// stringification.
-    fn error_to_string(&self, v: &Value) -> Option<String> {
+    pub(crate) fn error_to_string(&self, v: &Value) -> Option<String> {
         let base = self.error_protos.get("Error")?;
         let mut cur = self.proto_of(v);
         let mut is_error = false;

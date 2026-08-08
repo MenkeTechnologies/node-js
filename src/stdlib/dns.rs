@@ -73,6 +73,32 @@ pub const METHODS: &[&str] = &[
 
 /// Method surface of a `dns.Resolver` instance (wired by the parent via
 /// `instance_has_method("Resolver", …)`).
+/// `dns/promises` surface: the shared sync helpers plus every promise-returning
+/// resolver. `stdlib::call` maps each of the latter to dns's `promise<Cap>` fn.
+pub const PROMISES_METHODS: &[&str] = &[
+    "lookup",
+    "lookupService",
+    "resolve",
+    "resolve4",
+    "resolve6",
+    "resolveMx",
+    "resolveTxt",
+    "resolveCname",
+    "resolveNs",
+    "resolvePtr",
+    "resolveSrv",
+    "resolveSoa",
+    "resolveNaptr",
+    "resolveCaa",
+    "resolveTlsa",
+    "resolveAny",
+    "reverse",
+    "getServers",
+    "setServers",
+    "getDefaultResultOrder",
+    "setDefaultResultOrder",
+];
+
 pub const RESOLVER_METHODS: &[&str] = &[
     "getServers",
     "setServers",
