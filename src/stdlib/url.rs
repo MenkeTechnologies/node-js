@@ -114,7 +114,7 @@ fn parse_absolute(input: &str) -> Option<Parts> {
     let pathname = if tail.is_empty() {
         "/".to_string()
     } else {
-        tail.to_string()
+        normalize_path(tail)
     };
 
     Some(Parts {
@@ -129,6 +129,45 @@ fn parse_absolute(input: &str) -> Option<Parts> {
     })
 }
 
+/// Collapse `.` and `..` segments in an absolute-ish URL path, per the WHATWG
+/// URL path-state machine: `.` drops, `..` pops the previous segment (never past
+/// the root), and a trailing `.`/`..` leaves a trailing slash
+/// (`/a/b/../../../c` → `/c`, `/a/b/..` → `/a/`).
+fn normalize_path(path: &str) -> String {
+    if !path.contains('.') {
+        return path.to_string();
+    }
+    let rooted = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    let mut trailing_slash = false;
+    for seg in path.split('/') {
+        match seg {
+            "." => trailing_slash = true,
+            ".." => {
+                out.pop();
+                trailing_slash = true;
+            }
+            _ => {
+                out.push(seg);
+                trailing_slash = false;
+            }
+        }
+    }
+    // `split` on a rooted path yields a leading "" that rebuilds the root slash;
+    // a `..` may have popped it, so restore it.
+    if rooted && out.first() != Some(&"") {
+        out.insert(0, "");
+    }
+    let mut joined = out.join("/");
+    if trailing_slash && !joined.ends_with('/') {
+        joined.push('/');
+    }
+    if joined.is_empty() {
+        joined.push('/');
+    }
+    joined
+}
+
 /// `new URL(input[, base])`.
 pub fn construct(args: &[Value]) -> Result<Value, String> {
     let input = arg_str(args, 0);
@@ -138,13 +177,41 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
             if args.len() > 1 {
                 let base = arg_str(args, 1);
                 parse_absolute(&base).map(|mut b| {
-                    if input.starts_with('/') {
-                        b.pathname = input.clone();
+                    // Split the RELATIVE reference's own query/fragment off first;
+                    // they replace the base's, they do not append to its path.
+                    let mut rest = input.as_str();
+                    let hash = match rest.find('#') {
+                        Some(i) => {
+                            let h = rest[i..].to_string();
+                            rest = &rest[..i];
+                            h
+                        }
+                        None => String::new(),
+                    };
+                    let search = match rest.find('?') {
+                        Some(i) => {
+                            let q = rest[i..].to_string();
+                            rest = &rest[..i];
+                            q
+                        }
+                        None => String::new(),
+                    };
+                    // A rooted reference replaces the path; anything else resolves
+                    // against the base's DIRECTORY (everything up to its last `/`).
+                    let merged = if rest.starts_with('/') {
+                        rest.to_string()
+                    } else if rest.is_empty() {
+                        b.pathname.clone()
                     } else {
-                        b.pathname = format!("/{input}");
-                    }
-                    b.search.clear();
-                    b.hash.clear();
+                        let dir = match b.pathname.rfind('/') {
+                            Some(i) => &b.pathname[..=i],
+                            None => "/",
+                        };
+                        format!("{dir}{rest}")
+                    };
+                    b.pathname = normalize_path(&merged);
+                    b.search = search;
+                    b.hash = hash;
                     b
                 })
             } else {
