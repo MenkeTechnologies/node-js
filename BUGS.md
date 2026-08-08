@@ -145,22 +145,20 @@ dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
 - **`AggregateError`** — `new AggregateError(errors, message)` with `.errors`;
   `Promise.any` rejects with one carrying every reason.
 - **`Error.prototype.toString`** — `String(err)` / `` `${err}` `` render
-  `Name: message` (or just `Name` when the message is empty).
+  `Name: message` (or just `Name` when the message is empty). An error raised by
+  a core module carries Node's `.code` (`ERR_INVALID_ARG_TYPE`, …) and renders
+  `Name [CODE]: message`, matching `internal/errors.js` `NodeError.toString`.
+- **`-x ** y` is a `SyntaxError`** — the grammar allows only an
+  UpdateExpression left of `**`, so `-x ** y` / `typeof x ** y` /
+  `await x ** y` (and the BigInt forms) are rejected with Node's exact message
+  rather than silently evaluated as `-(x ** y)`; `(-x) ** y`, `-(x ** y)`,
+  `x++ ** y` and `++x ** y` all parse. The fuzzer still parenthesizes the base,
+  so this is pinned by dedicated tests in `tests/es_parity.rs`.
 - **Promises + async/await + event loop** — `new Promise`, `.then`/`.catch`/
   `.finally`, `Promise.resolve`/`reject`/`all`/`allSettled`/`race`/`any`; `async`
   functions/arrows/methods, `await`, rejection-as-throw; a host-driven loop
   draining `process.nextTick` → promise microtasks → timers
   (`setTimeout`/`setInterval`/`setImmediate`, `queueMicrotask`), Node ordering.
-
-## Not implemented (parse/compile-time error, no silent wrong answer)
-
-These are absent from the lexer/parser/compiler; a program using them fails
-loudly rather than producing a wrong result. The fuzzer does not generate them.
-
-- **`-x ** y`** — JS makes an unparenthesized unary minus directly before `**` a
-  `SyntaxError` (`(-x) ** y` or `-(x ** y)` is required). node-js's parser accepts
-  it and evaluates `-(x ** y)`. Applies to both Number and BigInt; the fuzzer
-  parenthesizes the base to avoid generating this ambiguous form.
 
 ## Regular expressions — supported subset and known divergences
 

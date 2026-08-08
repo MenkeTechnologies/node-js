@@ -931,6 +931,22 @@ impl Parser {
         Some((prec, ra, log, bin))
     }
 
+    /// Reject a `**` directly after a just-parsed UnaryExpression. JS only
+    /// allows an UpdateExpression there (`x++ ** y` and `++x ** y` are fine),
+    /// so an unparenthesized `-x ** y` / `typeof x ** y` / `await x ** y` is a
+    /// SyntaxError rather than a silently-reassociated `-(x ** y)`.
+    fn reject_unary_before_pow(&mut self) -> Result<(), String> {
+        if self.is_punct("**") {
+            return Err(format!(
+                "SyntaxError: Unary operator used immediately before exponentiation \
+                 expression. Parenthesis must be used to disambiguate operator \
+                 precedence (line {})",
+                self.line()
+            ));
+        }
+        Ok(())
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, String> {
         let op = match self.tok() {
             Tok::Punct(p) if p == "!" => Some(UnOp::Not),
@@ -945,6 +961,10 @@ impl Parser {
         if let Some(op) = op {
             self.advance();
             let e = self.parse_unary()?;
+            // `ExponentiationExpression : UpdateExpression ** …` — a
+            // UnaryExpression on the left of `**` is a SyntaxError, so
+            // `-x ** y` must be written `(-x) ** y` or `-(x ** y)`.
+            self.reject_unary_before_pow()?;
             return Ok(Expr::Unary(op, Box::new(e)));
         }
         // Prefix ++/--.
@@ -1239,6 +1259,9 @@ impl Parser {
                     "await" if self.in_async => {
                         self.advance();
                         let e = self.parse_unary()?;
+                        // An AwaitExpression is a UnaryExpression, so it too
+                        // cannot sit directly left of `**`.
+                        self.reject_unary_before_pow()?;
                         Ok(Expr::Await(Box::new(e)))
                     }
                     _ if is_keyword(&s) => Err(format!(

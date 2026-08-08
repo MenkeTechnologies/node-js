@@ -424,3 +424,74 @@ fn finalization_registry_type_errors() {
         "TypeError,TypeError,TypeError,TypeError,TypeError,TypeError"
     );
 }
+
+// ── `-x ** y` is a SyntaxError, `x++ ** y` is not ────────────────────────────
+
+/// Run `src` expecting a non-zero exit, returning trimmed stderr.
+fn run_failing(src: &str) -> String {
+    let mut f = tempfile::Builder::new()
+        .suffix(".js")
+        .tempfile()
+        .expect("temp file");
+    f.write_all(src.as_bytes()).expect("write source");
+    let out = Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(f.path())
+        .output()
+        .expect("spawn node binary");
+    assert!(
+        !out.status.success(),
+        "expected a failure, got stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    String::from_utf8_lossy(&out.stderr).trim_end().to_string()
+}
+
+#[test]
+fn unary_directly_before_exponentiation_is_a_syntax_error() {
+    // `ExponentiationExpression : UpdateExpression ** …` — every UnaryExpression
+    // form is rejected. Verified against node v26.7.0, which reports the same
+    // message for each of these.
+    for src in [
+        "let x = 2, y = 3, o = { p: 1 }, a = [];\nconsole.log(-x ** y);",
+        "let x = 2, y = 3;\nconsole.log(+x ** y);",
+        "let x = 2, y = 3;\nconsole.log(~x ** y);",
+        "let x = 2, y = 3;\nconsole.log(!x ** y);",
+        "let x = 2, y = 3;\nconsole.log(typeof x ** y);",
+        "let x = 2, y = 3;\nconsole.log(void x ** y);",
+        "let x = 2, y = 3, o = { p: 1 };\nconsole.log(delete o.p ** y);",
+        "let x = 2n, y = 3n;\nconsole.log(-x ** y);",
+        // Inside a computed member and an array literal, and across a newline
+        // (`**` cannot start a statement, so ASI does not rescue it).
+        "let x = 2, y = 3, a = [];\nconsole.log(a[-x ** y]);",
+        "let x = 2, y = 3;\nconsole.log([-x ** y]);",
+        "let x = 2, y = 3;\nconsole.log(-x\n** y);",
+        "async function f(x, y) { return await x ** y; }\nf(2, 3);",
+    ] {
+        let err = run_failing(src);
+        assert!(
+            err.contains(
+                "SyntaxError: Unary operator used immediately before exponentiation \
+                 expression. Parenthesis must be used to disambiguate operator precedence"
+            ),
+            "unexpected error for {src:?}:\n{err}"
+        );
+    }
+}
+
+#[test]
+fn parenthesized_and_update_expressions_still_exponentiate() {
+    // The two legal disambiguations, an UpdateExpression base (which the grammar
+    // DOES allow left of `**`), right-associativity, and a unary on the RIGHT.
+    let src = r#"
+        let x = 2, y = 3;
+        console.log((-x) ** y);
+        console.log(-(x ** y));
+        console.log(x ** -y);
+        console.log(2 ** 3 ** 2);
+        console.log((typeof x) ** y);
+        console.log((-2n) ** 3n);
+        let a = 2; console.log(a++ ** y);
+        let b = 2; console.log(++b ** y);
+    "#;
+    assert_eq!(run(src), "-8\n-8\n0.125\n512\nNaN\n-8n\n8\n27");
+}
