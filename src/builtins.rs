@@ -5822,19 +5822,24 @@ fn generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value,
     // its body has to be driven through the await-aware stepper (a plain
     // `gen_resume` would surface an internal `await` suspension as a bogus yield).
     if host::is_async_generator(recv) {
+        // All three go through `[[AsyncGeneratorQueue]]` (ECMA-262 27.6.3.6):
+        // `.return`/`.throw` must wait behind a `.next()` that is still
+        // suspended on an internal `await`, or that `.next()` would report
+        // `{done: true}` for a value the body had not yet reached. An uncaught
+        // `.throw(e)` rejects the returned promise; it does not throw here.
         return match name {
-            "next" => Ok(host::async_gen_step(recv, arg0(&args))),
-            // `return`/`throw` unwind the body synchronously (any `await` inside a
-            // `finally` still suspends through the same driver), then report the
-            // completion as a settled promise.
-            "return" => {
-                let step = host::gen_return(recv, arg0(&args))?;
-                Ok(host::promise_of(&gen_step_record(step)))
-            }
-            "throw" => {
-                let step = host::gen_throw(recv, arg0(&args))?;
-                Ok(host::promise_of(&gen_step_record(step)))
-            }
+            "next" => Ok(host::async_gen_enqueue(
+                recv,
+                host::GenReq::Next(arg0(&args)),
+            )),
+            "return" => Ok(host::async_gen_enqueue(
+                recv,
+                host::GenReq::Return(arg0(&args)),
+            )),
+            "throw" => Ok(host::async_gen_enqueue(
+                recv,
+                host::GenReq::Throw(arg0(&args)),
+            )),
             "@@asyncIterator" => Ok(recv.clone()),
             _ => Err(host::type_error(&format!(
                 "asyncGenerator.{name} is not a function"
@@ -5869,14 +5874,6 @@ fn generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value,
         _ => Err(host::type_error(&format!(
             "generator.{name} is not a function"
         ))),
-    }
-}
-
-/// The `{ value, done }` record for a generator step outcome.
-fn gen_step_record(step: host::GenStep) -> Value {
-    match step {
-        host::GenStep::Yield(v) => iter_result(v, false),
-        host::GenStep::Done(v) => iter_result(v, true),
     }
 }
 

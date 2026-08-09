@@ -666,12 +666,15 @@ struct GenCell {
     /// coroutine yielder: `await` wraps its operand in an await marker so the
     /// driver can tell an internal suspension from a real yield.
     async_gen: bool,
-    /// `[[AsyncGeneratorQueue]]` — pending `.next(v)` requests as
-    /// `(sent value, step promise id)`. ECMA-262 27.6.3.6 keeps this queue so
-    /// overlapping `.next()` calls resume the body ONE AT A TIME and settle in
-    /// request order; without it a second `.next()` issued before the first
-    /// settles races past it and the results arrive swapped.
-    queue: std::collections::VecDeque<(Value, u32)>,
+    /// `[[AsyncGeneratorQueue]]` — pending requests as
+    /// `(completion, step promise id)`. ECMA-262 27.6.3.6 keeps this queue so
+    /// overlapping requests resume the body ONE AT A TIME and settle in request
+    /// order; without it a second request issued before the first settles races
+    /// past it and the results arrive swapped. `.next`, `.return` AND `.throw`
+    /// all enqueue — a `.return()` that skipped the queue would terminate the
+    /// body while an earlier `.next()` was still suspended on an `await`, and
+    /// that `.next()` would then wrongly report `{done: true}`.
+    queue: std::collections::VecDeque<(GenReq, u32)>,
     /// True while a queued request is being driven.
     running: bool,
 }
@@ -679,6 +682,20 @@ struct GenCell {
 /// A forced completion pushed into a suspended generator by `.return()`/`.throw()`.
 enum GenInject {
     Return(Value),
+    Throw(Value),
+}
+
+/// One queued `[[AsyncGeneratorQueue]]` request. ECMA-262 27.6.3.6
+/// `AsyncGeneratorEnqueue` records a *completion*, not just a sent value, which
+/// is why `.return()` and `.throw()` queue behind pending `.next()` calls
+/// instead of unwinding the body on the spot.
+#[derive(Clone)]
+pub enum GenReq {
+    /// `.next(v)` — resume normally with `v`.
+    Next(Value),
+    /// `.return(v)` — resume with a forced return completion.
+    Return(Value),
+    /// `.throw(e)` — resume with a forced throw completion.
     Throw(Value),
 }
 
@@ -4681,19 +4698,30 @@ fn await_marker(v: &Value) -> Option<Value> {
     })
 }
 
-/// One `.next()` of an `async function*`: resume the body, transparently settling
-/// every internal `await` suspension, and resolve with the `{value, done}` record
-/// of the first REAL yield (or the body's completion).
-pub fn async_gen_step(gen: &Value, send: Value) -> Value {
+/// `AsyncGeneratorEnqueue` — queue one request against an `async function*` and
+/// hand back the promise its `{value, done}` record (or rejection) will settle.
+///
+/// All three of `.next`, `.return` and `.throw` come through here, so a request
+/// never resumes the body while an earlier one is still suspended on an
+/// internal `await`.
+pub fn async_gen_enqueue(gen: &Value, req: GenReq) -> Value {
     let step = with_host(|h| h.new_promise());
     let sid = with_host(|h| h.promise_id(&step).unwrap());
-    let id = match with_host(|h| h.get(gen).cloned()) {
-        Some(JsObj::Generator { id }) => id,
-        _ => return step,
+    let id = match with_host(|h| match h.get(gen) {
+        Some(JsObj::Generator { id }) => Some(*id),
+        _ => None,
+    }) {
+        Some(id) => id,
+        None => return step,
     };
-    with_host(|h| h.generators[id as usize].queue.push_back((send, sid)));
+    with_host(|h| h.generators[id as usize].queue.push_back((req, sid)));
     pump_async_gen(gen.clone(), id);
     step
+}
+
+/// One `.next(v)` of an `async function*`.
+pub fn async_gen_step(gen: &Value, send: Value) -> Value {
+    async_gen_enqueue(gen, GenReq::Next(send))
 }
 
 /// `AsyncGeneratorResumeNext`: start the oldest queued request, unless one is
@@ -4702,11 +4730,44 @@ fn pump_async_gen(gen: Value, id: u32) {
     if with_host(|h| h.generators[id as usize].running) {
         return;
     }
-    let Some((send, sid)) = with_host(|h| h.generators[id as usize].queue.pop_front()) else {
+    let Some((req, sid)) = with_host(|h| h.generators[id as usize].queue.pop_front()) else {
         return;
     };
     with_host(|h| h.generators[id as usize].running = true);
-    drive_async_gen(gen, sid, send);
+    start_async_gen_req(gen, sid, req);
+}
+
+/// Begin one queued request: resume the body with the completion it carries,
+/// then hand the outcome to the shared continuation.
+///
+/// A RETURN completion always Awaits its value before the body sees it — via
+/// `AsyncGeneratorUnwrapYieldResumption` (ECMA-262 27.6.3.7) when the generator
+/// is suspended at a `yield`, and via `AsyncGeneratorAwaitReturn` (27.6.3.9)
+/// when it is not yet started or already completed. So a `.return()` settles one
+/// microtask after a `.next()` or `.throw()` issued in its place would, and the
+/// `finally` it unwinds through runs a tick later too. Skipping that tick lets a
+/// `.return()` overtake the reactions of the `.next()` it followed.
+fn start_async_gen_req(gen: Value, sid: u32, req: GenReq) {
+    if matches!(req, GenReq::Return(_)) {
+        with_host(|h| {
+            h.queue_micro_native(Box::new(move || {
+                resume_async_gen_req(gen, sid, req);
+                Ok(())
+            }))
+        });
+        return;
+    }
+    resume_async_gen_req(gen, sid, req);
+}
+
+/// Deliver a queued completion to the body and settle its step promise.
+fn resume_async_gen_req(gen: Value, sid: u32, req: GenReq) {
+    let step = match req {
+        GenReq::Next(v) => gen_resume(&gen, v),
+        GenReq::Return(v) => gen_return(&gen, v),
+        GenReq::Throw(e) => gen_throw(&gen, e),
+    };
+    settle_async_gen_step(gen, sid, step);
 }
 
 /// One request has settled: release the body and start the next queued request.
@@ -4737,12 +4798,26 @@ fn iter_record(value: Value, done: bool) -> Value {
     })
 }
 
-fn drive_async_gen(gen: Value, sid: u32, send: Value) {
-    let id = match with_host(|h| h.get(&gen).cloned()) {
-        Some(JsObj::Generator { id }) => id,
-        _ => return,
+/// Resume a request that was suspended on an internal `await` (always a normal
+/// completion — the awaited promise's outcome rides in `packet`).
+fn drive_async_gen(gen: Value, sid: u32, packet: Value) {
+    let step = gen_resume(&gen, packet);
+    settle_async_gen_step(gen, sid, step);
+}
+
+/// Turn one body resumption into a settled step promise: transparently re-drive
+/// internal `await` suspensions, and settle on the first REAL yield or on the
+/// body's completion. Shared by the initial resume of a queued request and by
+/// every await-resumption of it.
+fn settle_async_gen_step(gen: Value, sid: u32, step: Result<GenStep, String>) {
+    let id = match with_host(|h| match h.get(&gen) {
+        Some(JsObj::Generator { id }) => Some(*id),
+        _ => None,
+    }) {
+        Some(id) => id,
+        None => return,
     };
-    match gen_resume(&gen, send) {
+    match step {
         Ok(GenStep::Yield(v)) => match await_marker(&v) {
             Some(awaited) => {
                 // An internal `await`: settle it, then resume the body. The

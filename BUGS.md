@@ -67,10 +67,19 @@ timers, promises or sockets, so `executionAsyncId()` inside a `setTimeout`/
 - **`AsyncGeneratorYield` awaits.** `yield v` in an `async function*` awaits `v`
   before the step promise settles, so `yield somePromise` hands the consumer the
   RESOLVED value.
-- **`[[AsyncGeneratorQueue]]`.** Overlapping `.next()` calls on an async
-  generator queue and resume the body one at a time, so their results settle in
-  request order. `asyncGen.next()` returns a promise (it used to return a bare
-  `{value, done}` record, so `it.next().then(...)` threw).
+- **`[[AsyncGeneratorQueue]]`.** Overlapping requests on an async generator queue
+  and resume the body one at a time, so their results settle in request order.
+  `asyncGen.next()` returns a promise (it used to return a bare `{value, done}`
+  record, so `it.next().then(...)` threw). `.return()` and `.throw()` enqueue
+  too (27.6.3.6 `AsyncGeneratorEnqueue` records a *completion*, not just a sent
+  value) — they used to unwind the body on the spot, so a `.return()` issued
+  while an earlier `.next()` was suspended on an internal `await` terminated the
+  generator underneath it and that `.next()` wrongly reported `{done: true}`;
+  an uncaught `.throw(e)` also threw synchronously instead of rejecting the
+  promise it returned. A `.return()` costs one extra microtask: its value is
+  Awaited before the body sees it, via `AsyncGeneratorUnwrapYieldResumption`
+  (27.6.3.7) at a `yield` and `AsyncGeneratorAwaitReturn` (27.6.3.9) otherwise.
+  `.next()` and `.throw()` resume inline.
 - **Unhandled rejections are fatal**, matching Node's default
   `--unhandled-rejections=throw`: at each microtask checkpoint a promise that
   settled rejected with no handler is reported on stderr and the process exits
