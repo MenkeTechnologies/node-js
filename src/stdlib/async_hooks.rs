@@ -1,12 +1,22 @@
 //! Node `async_hooks` module — honest minimal implementation.
 //!
-//! node-js has no per-async-resource id tracking and no async-context
-//! propagation, so most of this module is a deliberate, documented no-op whose
-//! only job is to let code that defensively imports `async_hooks` load and run
-//! without crashing:
+//! There IS a real async-resource id graph, but only over the resources this
+//! module itself creates:
 //!
-//!   - `executionAsyncId()` returns a fixed `1`, `triggerAsyncId()` returns `0`.
-//!     These are NOT real resource ids — there is no async-resource graph.
+//!   - Every `new AsyncResource(type)` takes the next monotonically increasing
+//!     `asyncId` (from 2; Node reserves 1 for the root context) and records the
+//!     creating context's id as its `triggerAsyncId`.
+//!   - `runInAsyncScope` makes that pair the current execution context for the
+//!     duration of the call, so `executionAsyncId()` inside reports the
+//!     resource and a resource constructed there inherits it as its parent.
+//!     Nesting `runInAsyncScope` therefore builds a real parent chain.
+//!
+//! What is NOT modeled: node-js does not instrument timers, promises, sockets
+//! or any other engine-level async resource, so `executionAsyncId()` inside a
+//! `setTimeout`/`.then` callback reports the ROOT context (1) rather than a
+//! per-callback id, and `triggerAsyncId()` there reports 0. Only the
+//! `AsyncResource` graph above is real. Consequently:
+//!
 //!   - `createHook({ init, before, after, destroy })` returns a hook object with
 //!     chainable `enable()`/`disable()`. The registered callbacks are stored
 //!     nowhere and NEVER FIRE — node-js does not instrument async resource
@@ -38,6 +48,48 @@ thread_local! {
     /// `getStore()` returns. A stack (not a single slot) so nested `run` calls
     /// restore the enclosing store correctly.
     static STORES: RefCell<HashMap<u32, Vec<Value>>> = RefCell::new(HashMap::new());
+
+    /// Monotonic async-id source. Node reserves 1 for the root execution
+    /// context, so fresh resources start at 2.
+    static NEXT_ASYNC_ID: RefCell<f64> = const { RefCell::new(2.0) };
+
+    /// The execution-context stack as `(asyncId, triggerAsyncId)` pairs, rooted
+    /// at Node's `(1, 0)`. `runInAsyncScope` pushes the resource's pair for the
+    /// duration of the call, which is what makes `executionAsyncId()` inside the
+    /// scope report the resource and a resource *created* in that scope inherit
+    /// it as its `triggerAsyncId`.
+    static EXEC_STACK: RefCell<Vec<(f64, f64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The id of the currently-executing async context (Node's `executionAsyncId`).
+pub fn execution_async_id() -> f64 {
+    EXEC_STACK.with(|s| s.borrow().last().map(|p| p.0).unwrap_or(1.0))
+}
+
+/// The id of the context that *created* the currently-executing one.
+pub fn trigger_async_id() -> f64 {
+    EXEC_STACK.with(|s| s.borrow().last().map(|p| p.1).unwrap_or(0.0))
+}
+
+/// Take the next async id.
+fn fresh_async_id() -> f64 {
+    NEXT_ASYNC_ID.with(|n| {
+        let mut n = n.borrow_mut();
+        let id = *n;
+        *n += 1.0;
+        id
+    })
+}
+
+/// Run `f` with `(async_id, trigger_id)` as the current execution context,
+/// restoring the previous context even if `f` fails.
+fn in_async_scope<T>(async_id: f64, trigger_id: f64, f: impl FnOnce() -> T) -> T {
+    EXEC_STACK.with(|s| s.borrow_mut().push((async_id, trigger_id)));
+    let r = f();
+    EXEC_STACK.with(|s| {
+        s.borrow_mut().pop();
+    });
+    r
 }
 
 /// Module-level callable members.
@@ -88,9 +140,8 @@ fn bind_to(f: Value, this: Option<Value>) -> Value {
 
 pub fn call(method: &str, _args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
-        // Fixed placeholders — there is no async-resource id graph.
-        "executionAsyncId" => Ok(Value::Float(1.0)),
-        "triggerAsyncId" => Ok(Value::Float(0.0)),
+        "executionAsyncId" => Ok(Value::Float(execution_async_id())),
+        "triggerAsyncId" => Ok(Value::Float(trigger_async_id())),
         // The hook object; its callbacks never fire (see module docs).
         "createHook" => Ok(new_hook()),
         _ => return None,
@@ -99,15 +150,35 @@ pub fn call(method: &str, _args: &[Value]) -> Option<Result<Value, String>> {
 
 /// Construct a stdlib class instance (`new AsyncLocalStorage()`). `None` for any
 /// other name so the parent's `construct` can fall through.
-pub fn construct(name: &str, _args: &[Value]) -> Option<Result<Value, String>> {
+pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
         "AsyncLocalStorage" => Some(Ok(new_native("AsyncLocalStorage"))),
-        // `new AsyncResource(type[, options])`. node-js tracks no async-resource
-        // graph, so the instance is a context-free handle: `runInAsyncScope`
-        // calls the function directly, which is what Node does when no context
-        // is active. Consumers (raw-body, on-finished) only need it to preserve
-        // `this`/arguments across a callback, and that is exact.
-        "AsyncResource" => Some(Ok(new_native("AsyncResource"))),
+        // `new AsyncResource(type[, options])` takes the next monotonic async id
+        // and records the creating context as its `triggerAsyncId`, so a graph
+        // built by nesting `runInAsyncScope` calls has real parent links.
+        // `options.triggerAsyncId` overrides the inherited parent, as in Node.
+        "AsyncResource" => {
+            let r = new_native("AsyncResource");
+            let trigger = args
+                .get(1)
+                .and_then(|o| {
+                    with_host(|h| match h.get(o) {
+                        Some(crate::host::JsObj::Object(p)) => p
+                            .get("triggerAsyncId")
+                            .filter(|v| !matches!(v, Value::Undef))
+                            .map(|v| h.to_number(v)),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(execution_async_id);
+            with_host(|h| {
+                if let Some(crate::host::JsObj::Object(p)) = h.get_mut(&r) {
+                    p.insert("@@asyncId".into(), Value::Float(fresh_async_id()));
+                    p.insert("@@triggerAsyncId".into(), Value::Float(trigger));
+                }
+            });
+            Some(Ok(r))
+        }
         _ => None,
     }
 }
@@ -118,6 +189,16 @@ fn new_native(tag: &'static str) -> Value {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(tag));
         h.new_object(m)
+    })
+}
+
+/// A hidden numeric slot on a native instance (`@@asyncId`), or `fallback`.
+fn hidden_num(recv: &Value, key: &str, fallback: f64) -> f64 {
+    with_host(|h| match h.get(recv) {
+        Some(crate::host::JsObj::Object(p)) => {
+            p.get(key).map(|v| h.to_number(v)).unwrap_or(fallback)
+        }
+        _ => fallback,
     })
 }
 
@@ -151,13 +232,16 @@ pub fn instance_call(
     }
 }
 
-/// An `AsyncResource` instance. There is no resource graph, so the ids are the
-/// same fixed placeholders `executionAsyncId`/`triggerAsyncId` report and
-/// `emitDestroy` has nothing to destroy — but `runInAsyncScope` really does
-/// invoke the function with the given receiver and arguments.
+/// An `AsyncResource` instance. Each carries a real monotonic `asyncId` and the
+/// `triggerAsyncId` of the context that created it, and `runInAsyncScope` makes
+/// that pair the current execution context for the duration of the call — so
+/// `executionAsyncId()` inside the callback reports the resource, and a resource
+/// constructed there records this one as its parent. `emitDestroy` still has
+/// nothing to destroy (no `destroy` hooks fire; see the module docs).
 fn resource_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     match method {
-        // runInAsyncScope(fn[, thisArg[, ...args]]) === fn.apply(thisArg, args).
+        // runInAsyncScope(fn[, thisArg[, ...args]]) === fn.apply(thisArg, args),
+        // run under this resource's async context.
         "runInAsyncScope" => {
             let f = args.first().cloned().unwrap_or(Value::Undef);
             // Pass the receiver through verbatim (Node uses `ReflectApply`), so
@@ -165,15 +249,17 @@ fn resource_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, 
             // already applies rather than silently becoming "no receiver".
             let this = args.get(1).cloned();
             let rest = args.get(2..).map(|s| s.to_vec()).unwrap_or_default();
-            invoke(&f, rest, this)
+            let id = hidden_num(recv, "@@asyncId", 1.0);
+            let trigger = hidden_num(recv, "@@triggerAsyncId", 0.0);
+            in_async_scope(id, trigger, || invoke(&f, rest, this))
         }
         "bind" => {
             let f = args.first().cloned().unwrap_or(Value::Undef);
             Ok(bind_to(f, args.get(1).cloned()))
         }
         "emitDestroy" => Ok(recv.clone()),
-        "asyncId" => Ok(Value::Float(1.0)),
-        "triggerAsyncId" => Ok(Value::Float(0.0)),
+        "asyncId" => Ok(Value::Float(hidden_num(recv, "@@asyncId", 1.0))),
+        "triggerAsyncId" => Ok(Value::Float(hidden_num(recv, "@@triggerAsyncId", 0.0))),
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
         ))),

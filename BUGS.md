@@ -28,12 +28,30 @@ node-js` — honest, never a silent fake): `tls`, `http2`, `https`, `worker_thre
 `readline`, `dns/promises` (use `require('dns').promises`). These need real
 TLS/HTTP2/OS-threads/sandboxing substrate.
 
-`async_hooks.AsyncResource` is real for the synchronous case: `runInAsyncScope`
-invokes the function with the given receiver and arguments, and `bind` (instance
-and static) returns the function bound to its `thisArg`. There is no
-async-resource graph, so `asyncId()`/`triggerAsyncId()` return the same fixed
-placeholders `executionAsyncId()`/`triggerAsyncId()` do and `emitDestroy()`
-returns `this` without destroying anything.
+`async_hooks.AsyncResource` carries a real id graph. Each `new AsyncResource()`
+takes the next monotonically increasing `asyncId` (from 2 — Node reserves 1 for
+the root context) and records the creating context as its `triggerAsyncId`;
+`runInAsyncScope` installs that pair as the current execution context for the
+duration of the call, so `executionAsyncId()` inside reports the resource and a
+resource constructed there inherits it as its parent. Nesting builds a real
+parent chain. `bind` (instance and static) returns the function bound to its
+`thisArg`, and `emitDestroy()` returns `this` without destroying anything.
+
+The graph covers ONLY resources this module creates. node-js does not instrument
+timers, promises or sockets, so `executionAsyncId()` inside a `setTimeout`/
+`.then` callback reports the root context (1), not a per-callback id, and
+`createHook` callbacks still never fire.
+
+A `Buffer` is a real `Uint8Array` subclass instance:
+`Object.getPrototypeOf(buf) === Buffer.prototype` holds, that prototype is a
+genuine object whose own `[[Prototype]]` is `Uint8Array.prototype`, and a
+Buffer's own keys are its byte indices (`Object.keys`, `for…in`,
+`getOwnPropertyNames`, `hasOwnProperty`, `getOwnPropertyDescriptor` and object
+spread all agree). One divergence remains: Node's `Buffer.prototype` methods are
+*enumerable*, so `for (k in buf)` in Node yields the ~100 prototype method names
+after the byte indices. node-js implements a subset of those methods and marks
+them non-enumerable, so `for (k in buf)` yields the indices only. Emitting our
+shorter list instead would advertise methods Node has that node-js does not.
 
 A builtin namespace (`require('buffer')`, `Buffer`, `fs`, …) enumerates the
 members node-js ACTUALLY implements under `for…in` / `Object.keys` — not Node's
