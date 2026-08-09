@@ -789,6 +789,18 @@ fn is_object_method(name: &str) -> bool {
     )
 }
 
+/// The `Object.prototype` methods installed as thunks on the real
+/// `Object.prototype` object, so `Object.prototype.toString.call(x)` and a class
+/// prototype's inherited `hasOwnProperty` both resolve through the chain.
+pub const OBJECT_PROTO_METHODS: &[&str] = &[
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toString",
+    "toLocaleString",
+    "valueOf",
+];
+
 pub fn is_object_builtin_method(name: &str) -> bool {
     matches!(
         name,
@@ -1031,6 +1043,7 @@ fn namespace_property(ns: &str, name: &str) -> Value {
         }) {
             return p;
         }
+        let _ = ns;
         return with_host(|h| h.alloc(JsObj::Builtin(format!("{ns}.prototype"))));
     }
     // A method read off a builtin prototype namespace (`Array.prototype.slice`):
@@ -1059,6 +1072,12 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
     if ctor == "Object" && method == "toString" {
         return Ok(with_host(|h| h.new_str(object_tag(h, recv))));
+    }
+    // These thunks now live on the real `Object.prototype` object, i.e. on the
+    // receiver's own chain — routing back through `call_method` would re-resolve
+    // this very thunk and recurse.
+    if ctor == "Object" && is_object_builtin_method(method) {
+        return object_builtin_method(recv, method, args);
     }
     // `EventEmitter.prototype.<m>` mixed onto a receiver (express's `app`): run the
     // emitter method directly against `recv` (routing back through `call_method`
@@ -2183,6 +2202,14 @@ const NS_METHODS: &[&str] = &[
     "Reflect.get",
     "Reflect.set",
     "Reflect.getPrototypeOf",
+    "Reflect.setPrototypeOf",
+    "Reflect.getOwnPropertyDescriptor",
+    "Reflect.defineProperty",
+    "Reflect.deleteProperty",
+    "Reflect.apply",
+    "Reflect.construct",
+    "Reflect.isExtensible",
+    "Reflect.preventExtensions",
     "Promise.resolve",
     "Promise.reject",
     "Promise.all",
@@ -2383,9 +2410,28 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(Value::Bool(r))
         }
         "Object.fromEntries" => object_from_entries(args),
-        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => Ok(with_host(|h| {
-            h.proto_of(&arg0(&args)).unwrap_or_else(|| h.null())
-        })),
+        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => {
+            let v = arg0(&args);
+            // `Object.create(null)` and friends really do have a null prototype.
+            if with_host(|h| h.has_null_proto(&v)) {
+                return Ok(with_host(|h| h.null()));
+            }
+            if let Some(p) = with_host(|h| h.proto_of(&v)) {
+                return Ok(p);
+            }
+            // A builtin exotic with no explicit `[[Prototype]]` link reports its
+            // constructor's prototype namespace (`Object.getPrototypeOf([]) ===
+            // Array.prototype`), which `strict_eq` compares by name. A plain
+            // object reports the one real `Object.prototype` object.
+            Ok(with_host(|h| {
+                h.ensure_native_protos();
+                match default_ctor_name(h, &v) {
+                    Some("Object") => h.object_proto(),
+                    Some(c) => h.alloc(JsObj::Builtin(format!("{c}.prototype"))),
+                    None => h.null(),
+                }
+            }))
+        }
         "Object.setPrototypeOf" => {
             let obj = arg0(&args);
             let proto = args.get(1).cloned().unwrap_or(Value::Undef);
@@ -2425,7 +2471,51 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             _ => Value::Undef,
         })),
         "Map" | "WeakMap" | "Set" | "WeakSet" | "Promise" => construct_builtin(name, args),
-        "Reflect.ownKeys" => object_keys(args, 0),
+        // `Reflect.ownKeys` reports EVERY own key, non-enumerable included —
+        // the same set as `getOwnPropertyNames` (node-js has no symbol-keyed
+        // own properties, so there is no second half to append).
+        "Reflect.ownKeys" => object_keys(args, 3),
+        "Reflect.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
+        "Reflect.defineProperty" => {
+            object_define_property(args)?;
+            Ok(Value::Bool(true))
+        }
+        "Reflect.deleteProperty" => {
+            let obj = arg0(&args);
+            let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            with_host(|h| {
+                if let Some(JsObj::Object(props)) = h.get_mut(&obj) {
+                    props.shift_remove(&k);
+                }
+            });
+            Ok(Value::Bool(true))
+        }
+        "Reflect.setPrototypeOf" => {
+            let obj = arg0(&args);
+            let p = args.get(1).cloned().unwrap_or(Value::Undef);
+            with_host(|h| h.set_proto(&obj, p));
+            Ok(Value::Bool(true))
+        }
+        "Reflect.isExtensible" => Ok(Value::Bool(with_host(|h| h.is_extensible(&arg0(&args))))),
+        "Reflect.preventExtensions" => {
+            let v = arg0(&args);
+            with_host(|h| h.prevent_extensions(&v));
+            Ok(Value::Bool(true))
+        }
+        // `Reflect.apply(target, thisArg, argsList)` / `Reflect.construct(t, a)`.
+        "Reflect.apply" => {
+            let f = arg0(&args);
+            let this = args.get(1).cloned();
+            let list = with_host(|h| h.iter_vec(&args.get(2).cloned().unwrap_or(Value::Undef)))
+                .unwrap_or_default();
+            host::invoke(&f, list, this.filter(|t| !with_host(|h| h.is_nullish(t))))
+        }
+        "Reflect.construct" => {
+            let f = arg0(&args);
+            let list = with_host(|h| h.iter_vec(&args.get(1).cloned().unwrap_or(Value::Undef)))
+                .unwrap_or_default();
+            host::construct(&f, list)
+        }
         "Reflect.has" => {
             let obj = arg0(&args);
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
@@ -3103,7 +3193,19 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
         // A stdlib namespace (`Buffer`, `require('buffer')`): its own enumerable
         // keys are the members node-js implements, each resolved to the same
         // first-class value a property read would give.
-        let names = crate::stdlib::namespace_keys(&ns);
+        let mut names = crate::stdlib::namespace_keys(&ns);
+        // A core namespace (`Reflect`, `Math`, `JSON`) has no stdlib key list —
+        // its members live in the builtin dispatch table. They are
+        // non-enumerable in V8, so they surface only under
+        // `getOwnPropertyNames`/`Reflect.ownKeys` (mode 3), never `Object.keys`.
+        if names.is_empty() && mode == 3 {
+            let prefix = format!("{ns}.");
+            names = NS_METHODS
+                .iter()
+                .filter_map(|q| q.strip_prefix(&prefix))
+                .map(|m| m.to_string())
+                .collect();
+        }
         if !names.is_empty() {
             let entries: Vec<(String, Value)> = names
                 .into_iter()

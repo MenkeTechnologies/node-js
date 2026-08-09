@@ -2023,6 +2023,15 @@ impl JsHost {
                 if na || nb {
                     return na && nb;
                 }
+                // A builtin namespace/constructor/prototype is a SINGLETON in JS
+                // (`Math === Math`, `Array.prototype === Array.prototype`), but
+                // every bare reference here allocates a fresh handle, so compare
+                // those by name rather than by heap index.
+                if let (Some(JsObj::Builtin(x)), Some(JsObj::Builtin(y))) =
+                    (self.get(a), self.get(b))
+                {
+                    return x == y;
+                }
                 // Reference identity for arrays/objects/functions.
                 matches!((a, b), (Value::Obj(x), Value::Obj(y)) if x == y)
             }
@@ -4056,6 +4065,20 @@ impl JsHost {
             return;
         }
         let obj_proto = self.object_proto();
+        // `Object.prototype` is the one builtin prototype that already existed as
+        // a real object (it is the chain root). Register it so `Object.prototype`
+        // reads resolve to THAT object rather than a fresh `Builtin` namespace —
+        // otherwise `Object.getPrototypeOf(C.prototype) === Object.prototype`
+        // compares a real object against a thunk and reads false.
+        self.native_protos
+            .insert("Object".to_string(), obj_proto.clone());
+        for m in crate::builtins::OBJECT_PROTO_METHODS {
+            let thunk = self.alloc(JsObj::Builtin(format!("@proto:Object:{m}")));
+            if let Some(JsObj::Object(p)) = self.get_mut(&obj_proto) {
+                p.insert((*m).to_string(), thunk);
+            }
+            self.hide_prop(&obj_proto, m);
+        }
         let mut chain = vec![
             ("Uint8Array", obj_proto),
             ("Buffer", Value::Undef), // filled in below with Uint8Array.prototype
