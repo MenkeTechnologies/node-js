@@ -435,10 +435,8 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // `from`. Routing everything through `from` made `new Buffer(3)` one byte
         // long.
         "Buffer" => {
-            let numeric = matches!(
-                args.first(),
-                Some(Value::Int(_)) | Some(Value::Float(_))
-            ) && args.len() == 1;
+            let numeric = matches!(args.first(), Some(Value::Int(_)) | Some(Value::Float(_)))
+                && args.len() == 1;
             let m = if numeric { "alloc" } else { "from" };
             Some(buffer::static_call(m, args).unwrap_or(Ok(Value::Undef)))
         }

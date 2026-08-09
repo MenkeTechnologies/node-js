@@ -409,7 +409,8 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         // where every Buffer already owns its bytes.
         "allocUnsafe" | "allocUnsafeSlow" => Ok(from_bytes(&vec![
             0u8;
-            super::arg_num(args, 0).max(0.0) as usize
+            super::arg_num(args, 0).max(0.0)
+                as usize
         ])),
         "concat" => concat(args),
         // `Buffer.of(...bytes)` — the `%TypedArray%.of` form: each argument is one
