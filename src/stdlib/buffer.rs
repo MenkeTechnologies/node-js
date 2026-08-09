@@ -305,20 +305,43 @@ fn bytes_of(recv: &Value) -> Vec<u8> {
     })
 }
 
+/// The handle of `recv`'s hidden `@@bytes` array, without copying it.
+fn bytes_handle(recv: &Value) -> Option<Value> {
+    with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) => p.get("@@bytes").cloned(),
+        _ => None,
+    })
+}
+
 /// `buf[i]` — the byte at an integer index, or `undefined` past the end.
+///
+/// Reads through to the single element. Materialising the whole buffer here
+/// (the old `bytes_of` call) made one indexed read O(len), so any loop over a
+/// Buffer — including a request body arriving through `express.json()` — cost
+/// O(len^2).
 pub fn byte_get(recv: &Value, index: &str) -> Value {
     let i: usize = match index.parse() {
         Ok(i) => i,
         Err(_) => return Value::Undef,
     };
-    match bytes_of(recv).get(i) {
-        Some(b) => Value::Float(*b as f64),
-        None => Value::Undef,
-    }
+    let arr = match bytes_handle(recv) {
+        Some(a) => a,
+        None => return Value::Undef,
+    };
+    with_host(|h| match h.get(&arr) {
+        Some(JsObj::Array(items)) => match items.get(i) {
+            Some(v) => Value::Float(h.to_number(v)),
+            None => Value::Undef,
+        },
+        _ => Value::Undef,
+    })
 }
 
 /// `buf[i] = n` — write one byte (truncated to 8 bits, as a Uint8Array does).
 /// Returns whether `recv` was a Buffer and the write landed.
+///
+/// Writes the single element in place; the old path copied the buffer out,
+/// changed one byte, and wrote every byte back.
 pub fn byte_set(recv: &Value, index: &str, val: &Value) -> bool {
     if super::native_tag(recv).as_deref() != Some("Buffer") {
         return false;
@@ -327,12 +350,19 @@ pub fn byte_set(recv: &Value, index: &str, val: &Value) -> bool {
         Ok(i) => i,
         Err(_) => return false,
     };
-    let mut bytes = bytes_of(recv);
-    if i >= bytes.len() {
-        return true; // out of range writes are dropped, not appended
-    }
-    bytes[i] = with_host(|h| h.to_number(val)) as i64 as u8;
-    set_bytes(recv, &bytes);
+    let arr = match bytes_handle(recv) {
+        Some(a) => a,
+        None => return false,
+    };
+    let b = with_host(|h| h.to_number(val)) as i64 as u8;
+    with_host(|h| {
+        if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
+            // Out of range writes are dropped, not appended.
+            if let Some(slot) = items.get_mut(i) {
+                *slot = Value::Float(b as f64);
+            }
+        }
+    });
     true
 }
 

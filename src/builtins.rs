@@ -3,7 +3,7 @@
 //! from the host. Handlers pop their arguments off the VM operand stack and
 //! return the result value, which the VM pushes back.
 
-use crate::host::{self, ops, with_host, FuncVal, JsObj};
+use crate::host::{self, ops, with_host, FuncVal, JsObj, ObjKind};
 use fusevm::{NumOp, Value, VM};
 use indexmap::IndexMap;
 
@@ -501,6 +501,17 @@ fn b_getattr(vm: &mut VM, _: u8) -> Value {
 
 /// Read `recv.name` (also the computed-key path for string keys). Walks own
 /// properties, accessors, and the prototype chain (class methods / getters).
+/// Read one small piece out of `recv`'s heap cell under a short borrow.
+///
+/// The closure must not call back into the host (`with_host` is a `RefCell`
+/// borrow and re-entering panics) — which is exactly why it hands back only the
+/// value needed: the caller re-enters freely afterwards. This replaces the old
+/// `h.get(recv).cloned()` habit, which deep-copied a whole `Vec`/`IndexMap`/
+/// `String` just to look at it.
+fn peek<R>(recv: &Value, f: impl FnOnce(&JsObj) -> Option<R>) -> Option<R> {
+    with_host(|h| h.get(recv).and_then(f))
+}
+
 pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
     if with_host(|h| h.is_nullish(recv)) {
         return Err(host::type_error(&format!(
@@ -533,29 +544,33 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
             return Ok(with_host(|h| h.alloc(JsObj::Builtin(cn.to_string()))));
         }
     }
-    let obj = with_host(|h| h.get(recv).cloned());
-    Ok(match obj {
-        Some(JsObj::Object(props)) => {
+    let kind = with_host(|h| h.kind_of(recv));
+    Ok(match kind {
+        Some(ObjKind::Object) => {
+            let numeric = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
             // Typed-array element read (`ta[i]`): elements live in a hidden
             // `@@elems`, not as own numeric props, so intercept integer keys.
-            if !name.is_empty()
-                && name.bytes().all(|b| b.is_ascii_digit())
-                && matches!(props.get("@@native"), Some(v) if with_host(|h| h.str_of(v)) == "TypedArray")
-            {
+            if numeric && crate::stdlib::native_tag(recv).as_deref() == Some("TypedArray") {
                 if let Some(v) = crate::stdlib::typedarray::elem_get(recv, name) {
                     return Ok(v);
                 }
             }
             // `buf[i]`: a Buffer's bytes live in a hidden `@@bytes` array, not as
             // own numeric props, so integer keys read through to it.
-            if !name.is_empty()
-                && name.bytes().all(|b| b.is_ascii_digit())
-                && props.contains_key("@@bytes")
+            if numeric
+                && peek(recv, |o| match o {
+                    JsObj::Object(p) => Some(p.contains_key("@@bytes")),
+                    _ => None,
+                })
+                .unwrap_or(false)
             {
                 return Ok(crate::stdlib::buffer::byte_get(recv, name));
             }
-            if let Some(v) = props.get(name) {
-                v.clone()
+            if let Some(v) = peek(recv, |o| match o {
+                JsObj::Object(p) => p.get(name).cloned(),
+                _ => None,
+            }) {
+                v
             } else if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
                 // A method / data property inherited from the prototype chain.
                 v
@@ -574,18 +589,23 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 Value::Undef
             }
         }
-        Some(JsObj::Class(_)) | Some(JsObj::Func(_)) | Some(JsObj::BoundFunc { .. }) => {
+        Some(ObjKind::Class) | Some(ObjKind::Func) | Some(ObjKind::BoundFunc) => {
             function_property(recv, name)
         }
-        Some(JsObj::Symbol { desc, .. }) => match name {
-            "description" => match desc {
-                Some(d) => with_host(|h| h.new_str(d)),
-                None => Value::Undef,
-            },
+        Some(ObjKind::Symbol) => match name {
+            "description" => {
+                match peek(recv, |o| match o {
+                    JsObj::Symbol { desc, .. } => desc.clone(),
+                    _ => None,
+                }) {
+                    Some(d) => with_host(|h| h.new_str(d)),
+                    None => Value::Undef,
+                }
+            }
             "toString" => bound_method(recv, name),
             _ => Value::Undef,
         },
-        Some(JsObj::BigInt(_)) => {
+        Some(ObjKind::BigInt) => {
             if matches!(
                 name,
                 "toString" | "valueOf" | "toLocaleString" | "constructor"
@@ -595,53 +615,88 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 Value::Undef
             }
         }
-        Some(JsObj::RegExp(r)) => crate::regexp::regexp_property(&r, name).unwrap_or_else(|| {
-            if crate::regexp::is_regexp_method(name) {
-                bound_method(recv, name)
-            } else {
-                Value::Undef
+        Some(ObjKind::RegExp) => {
+            // A RegExp holds no collection, so cloning the compiled pattern here
+            // does not scale with any input size; `regexp_property` re-enters the
+            // host to allocate `source`/`flags`, so it cannot run under a borrow.
+            let r = peek(recv, |o| match o {
+                JsObj::RegExp(r) => Some(r.clone()),
+                _ => None,
+            });
+            match r {
+                Some(r) => crate::regexp::regexp_property(&r, name).unwrap_or_else(|| {
+                    if crate::regexp::is_regexp_method(name) {
+                        bound_method(recv, name)
+                    } else {
+                        Value::Undef
+                    }
+                }),
+                None => Value::Undef,
             }
-        }),
+        }
         // A WeakMap/WeakSet has NO `size` (its contents are not observable), so
         // the read must be `undefined` rather than a live count.
-        Some(JsObj::Map { entries, weak }) => match name {
-            "size" if !weak => Value::Float(entries.len() as f64),
-            "@@iterator" => bound_method(recv, name),
-            _ if is_map_method(name) => bound_method(recv, name),
-            _ => Value::Undef,
-        },
-        Some(JsObj::Set { entries, weak }) => match name {
-            "size" if !weak => Value::Float(entries.len() as f64),
-            "@@iterator" => bound_method(recv, name),
-            _ if is_set_method(name) => bound_method(recv, name),
-            _ => Value::Undef,
-        },
-        Some(JsObj::Generator { .. }) => {
+        Some(ObjKind::Map) => {
+            let (len, weak) = peek(recv, |o| match o {
+                JsObj::Map { entries, weak } => Some((entries.len(), *weak)),
+                _ => None,
+            })
+            .unwrap_or((0, false));
+            match name {
+                "size" if !weak => Value::Float(len as f64),
+                "@@iterator" => bound_method(recv, name),
+                _ if is_map_method(name) => bound_method(recv, name),
+                _ => Value::Undef,
+            }
+        }
+        Some(ObjKind::Set) => {
+            let (len, weak) = peek(recv, |o| match o {
+                JsObj::Set { entries, weak } => Some((entries.len(), *weak)),
+                _ => None,
+            })
+            .unwrap_or((0, false));
+            match name {
+                "size" if !weak => Value::Float(len as f64),
+                "@@iterator" => bound_method(recv, name),
+                _ if is_set_method(name) => bound_method(recv, name),
+                _ => Value::Undef,
+            }
+        }
+        Some(ObjKind::Generator) => {
             if is_generator_method(name) {
                 bound_method(recv, name)
             } else {
                 Value::Undef
             }
         }
-        Some(JsObj::Promise { .. }) => {
+        Some(ObjKind::Promise) => {
             if matches!(name, "then" | "catch" | "finally") {
                 bound_method(recv, name)
             } else {
                 Value::Undef
             }
         }
-        Some(JsObj::Iter { .. }) => {
+        Some(ObjKind::Iter) => {
             if matches!(name, "next" | "return" | "@@iterator") {
                 bound_method(recv, name)
             } else {
                 Value::Undef
             }
         }
-        Some(JsObj::Array(items)) => {
+        Some(ObjKind::Array) => {
             if name == "length" {
-                Value::Float(items.len() as f64)
+                let n = peek(recv, |o| match o {
+                    JsObj::Array(items) => Some(items.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+                Value::Float(n as f64)
             } else if let Ok(i) = name.parse::<usize>() {
-                items.get(i).cloned().unwrap_or(Value::Undef)
+                peek(recv, |o| match o {
+                    JsObj::Array(items) => items.get(i).cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::Undef)
             } else if name == "@@iterator" || is_array_method(name) || is_object_method(name) {
                 bound_method(recv, name)
             } else if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
@@ -652,11 +707,19 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 Value::Undef
             }
         }
-        Some(JsObj::Str(s)) => {
+        Some(ObjKind::Str) => {
             if name == "length" {
-                Value::Float(s.chars().count() as f64)
+                let n = peek(recv, |o| match o {
+                    JsObj::Str(s) => Some(s.chars().count()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+                Value::Float(n as f64)
             } else if let Ok(i) = name.parse::<usize>() {
-                match s.chars().nth(i) {
+                match peek(recv, |o| match o {
+                    JsObj::Str(s) => s.chars().nth(i),
+                    _ => None,
+                }) {
                     Some(c) => with_host(|h| h.new_str(c.to_string())),
                     None => Value::Undef,
                 }
@@ -666,7 +729,14 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 Value::Undef
             }
         }
-        Some(JsObj::Builtin(ns)) => namespace_property(&ns, name),
+        Some(ObjKind::Builtin) => {
+            let ns = peek(recv, |o| match o {
+                JsObj::Builtin(ns) => Some(ns.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+            namespace_property(&ns, name)
+        }
         _ => {
             // Primitive numbers/booleans: method access -> bound method.
             if matches!(recv, Value::Float(_) | Value::Int(_)) && is_number_method(name) {
@@ -817,7 +887,7 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             let k = with_host(|h| h.property_key(&arg0(&args)));
             // A builtin namespace/prototype receiver (`Map.prototype`) reports
             // ownership via `has_property` (its methods resolve as thunks).
-            if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Builtin(_))) {
+            if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Builtin) {
                 return Ok(Value::Bool(has_property(recv, &k)));
             }
             let has = with_host(|h| match h.get(recv) {
@@ -934,7 +1004,7 @@ fn is_generator_method(name: &str) -> bool {
 /// prototype, length) plus inherited statics and `call`/`apply`/`bind`.
 fn function_property(recv: &Value, name: &str) -> Value {
     // A class static, inherited down the constructor chain.
-    if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Class(_))) {
+    if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Class) {
         if let Some(v) = with_host(|h| h.class_static(recv, name)) {
             return v;
         }
@@ -967,12 +1037,11 @@ fn ensure_fn_prototype(recv: &Value) -> Value {
         return p;
     }
     // Arrows / classes: no auto prototype (classes set their own).
-    let is_arrow =
-        matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Func(f)) if f.is_arrow);
+    let is_arrow = with_host(|h| matches!(h.get(recv), Some(JsObj::Func(f)) if f.is_arrow));
     if is_arrow {
         return Value::Undef;
     }
-    if !matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Func(_))) {
+    if with_host(|h| h.kind_of(recv)) != Some(ObjKind::Func) {
         return Value::Undef;
     }
     with_host(|h| {
@@ -1165,8 +1234,7 @@ fn b_setattr(vm: &mut VM, _: u8) -> Value {
 
 fn set_property(recv: &Value, name: &str, val: Value) {
     // `obj.__proto__ = p` re-links the prototype.
-    if name == "__proto__" && matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Object(_)))
-    {
+    if name == "__proto__" && with_host(|h| h.kind_of(recv)) == Some(ObjKind::Object) {
         with_host(|h| h.set_proto(recv, val));
         return;
     }
@@ -1186,8 +1254,8 @@ fn set_property(recv: &Value, name: &str, val: Value) {
     }
     // Writing `name`/`prototype`/statics on a function value.
     if matches!(
-        with_host(|h| h.get(recv).cloned()),
-        Some(JsObj::Func(_)) | Some(JsObj::Class(_))
+        with_host(|h| h.kind_of(recv)),
+        Some(ObjKind::Func) | Some(ObjKind::Class)
     ) {
         with_host(|h| h.set_fn_prop(recv, name, val));
         return;
@@ -1195,7 +1263,10 @@ fn set_property(recv: &Value, name: &str, val: Value) {
     // Writing a static onto a builtin namespace/ctor (`Error.prepareStackTrace`).
     // Each bare reference is a fresh `Builtin` handle, so route to the stable
     // per-namespace side table rather than the per-index `fn_props`.
-    if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(recv).cloned()) {
+    if let Some(ns) = peek(recv, |o| match o {
+        JsObj::Builtin(ns) => Some(ns.clone()),
+        _ => None,
+    }) {
         with_host(|h| h.set_builtin_static(&ns, name, val));
         return;
     }
@@ -1219,10 +1290,7 @@ fn set_property(recv: &Value, name: &str, val: Value) {
     }
     // Typed-array element write (`ta[i] = v`): coerce + store into `@@elems`.
     if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
-        let is_ta = matches!(
-            with_host(|h| h.get(recv).cloned()),
-            Some(JsObj::Object(ref p)) if p.get("@@native").map(|v| with_host(|h| h.str_of(v))).as_deref() == Some("TypedArray")
-        );
+        let is_ta = crate::stdlib::native_tag(recv).as_deref() == Some("TypedArray");
         if is_ta && crate::stdlib::typedarray::elem_set(recv, name, &val) {
             return;
         }
@@ -1232,7 +1300,7 @@ fn set_property(recv: &Value, name: &str, val: Value) {
         }
     }
     // An arbitrary own prop on an array (e.g. exec-result `.index`/`.input`).
-    if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Array(_)))
+    if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Array)
         && name != "length"
         && name.parse::<usize>().is_err()
     {
@@ -4125,7 +4193,7 @@ fn is_string_method(name: &str) -> bool {
 
 /// Whether `v` is a `RegExp` value (drives the regex path of `match`/`replace`/…).
 fn is_regexp_arg(v: &Value) -> bool {
-    matches!(with_host(|h| h.get(v).cloned()), Some(JsObj::RegExp(_)))
+    with_host(|h| h.kind_of(v)) == Some(ObjKind::RegExp)
 }
 
 /// `str.replace(strPattern, fn)` — a function replacer against a literal (string)
@@ -4163,30 +4231,55 @@ fn is_number_method(name: &str) -> bool {
 
 /// Dispatch `recv.name(args)` for the built-in prototype methods.
 pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
-    let obj = with_host(|h| h.get(recv).cloned());
-    match obj {
-        Some(JsObj::Array(_)) => array_method(recv, name, args),
-        Some(JsObj::Str(s)) => string_method(&s, name, args),
-        Some(JsObj::Map { .. }) => map_method(recv, name, args),
-        Some(JsObj::Set { .. }) => set_method(recv, name, args),
-        Some(JsObj::Generator { .. }) => generator_method(recv, name, args),
-        Some(JsObj::Promise { .. }) => promise_method(recv, name, args),
-        Some(JsObj::Iter { .. }) => iter_method(recv, name, args),
-        Some(JsObj::Symbol { .. }) => symbol_method(recv, name, args),
-        Some(JsObj::BigInt(b)) => bigint_method(&b, name, args),
-        Some(JsObj::RegExp(_)) => crate::regexp::regexp_method(recv, name, args),
-        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => {
+    // Only the tag is needed to pick the branch — cloning the receiver here made
+    // every `arr.push(x)` copy the whole array, so a fill loop was O(n^2).
+    match with_host(|h| h.kind_of(recv)) {
+        Some(ObjKind::Array) => array_method(recv, name, args),
+        Some(ObjKind::Str) => {
+            // `string_method` consumes the text itself, so this clone is the
+            // payload, not a tag probe.
+            let s = peek(recv, |o| match o {
+                JsObj::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+            string_method(&s, name, args)
+        }
+        Some(ObjKind::Map) => map_method(recv, name, args),
+        Some(ObjKind::Set) => set_method(recv, name, args),
+        Some(ObjKind::Generator) => generator_method(recv, name, args),
+        Some(ObjKind::Promise) => promise_method(recv, name, args),
+        Some(ObjKind::Iter) => iter_method(recv, name, args),
+        Some(ObjKind::Symbol) => symbol_method(recv, name, args),
+        Some(ObjKind::BigInt) => {
+            let b = peek(recv, |o| match o {
+                JsObj::BigInt(b) => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+            bigint_method(&b, name, args)
+        }
+        Some(ObjKind::RegExp) => crate::regexp::regexp_method(recv, name, args),
+        Some(ObjKind::Func) | Some(ObjKind::Class) | Some(ObjKind::BoundFunc) => {
             match function_builtin_method(recv, name, &args)? {
                 Some(v) => Ok(v),
                 None => Err(host::type_error(&format!("{name} is not a function"))),
             }
         }
-        Some(JsObj::Object(props)) => {
-            if let Some(f) = props.get(name).cloned() {
+        Some(ObjKind::Object) => {
+            if let Some(f) = peek(recv, |o| match o {
+                JsObj::Object(p) => p.get(name).cloned(),
+                _ => None,
+            }) {
                 host::invoke(&f, args, Some(recv.clone()))
             } else if name == "hasOwnProperty" {
                 let k = with_host(|h| h.str_of(&arg0(&args)));
-                Ok(Value::Bool(props.contains_key(&k)))
+                let has = peek(recv, |o| match o {
+                    JsObj::Object(p) => Some(p.contains_key(&k)),
+                    _ => None,
+                })
+                .unwrap_or(false);
+                Ok(Value::Bool(has))
             } else if name == "toString" {
                 Ok(with_host(|h| h.new_str("[object Object]")))
             } else {
@@ -4206,6 +4299,9 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
     }
 }
 
+/// A copy of the whole backing store, for the methods that genuinely consume
+/// every element (`map`, `filter`, `join`, …). Never call it just to read
+/// `.len()` — use [`array_len`], or `push`/`unshift` become O(n) per call.
 fn array_items(recv: &Value) -> Vec<Value> {
     with_host(|h| match h.get(recv) {
         Some(JsObj::Array(items)) => items.clone(),
@@ -4213,15 +4309,29 @@ fn array_items(recv: &Value) -> Vec<Value> {
     })
 }
 
+/// The element count, without copying the elements.
+fn array_len(recv: &Value) -> usize {
+    peek(recv, |o| match o {
+        JsObj::Array(items) => Some(items.len()),
+        _ => None,
+    })
+    .unwrap_or(0)
+}
+
 fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "push" => {
-            with_host(|h| {
+            // `push` returns the new length; take it from the same mutable
+            // borrow rather than copying the array back out to count it.
+            let len = with_host(|h| {
                 if let Some(JsObj::Array(items)) = h.get_mut(recv) {
                     items.extend(args.iter().cloned());
+                    items.len()
+                } else {
+                    0
                 }
             });
-            Ok(Value::Float(array_items(recv).len() as f64))
+            Ok(Value::Float(len as f64))
         }
         "pop" => Ok(with_host(|h| {
             if let Some(JsObj::Array(items)) = h.get_mut(recv) {
@@ -4249,7 +4359,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                     }
                 }
             });
-            Ok(Value::Float(array_items(recv).len() as f64))
+            Ok(Value::Float(array_len(recv) as f64))
         }
         "join" => {
             let sep = if args.is_empty() {
@@ -4320,7 +4430,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         "fill" => {
             // fill(value[, start[, end]]) — negative indices count from the end.
             let val = arg0(&args);
-            let len = array_items(recv).len() as i64;
+            let len = array_len(recv) as i64;
             let norm =
                 |v: i64| -> usize { (if v < 0 { (len + v).max(0) } else { v.min(len) }) as usize };
             let start = if args.len() >= 2 {
@@ -4655,7 +4765,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             Ok(with_host(|h| h.new_array(out)))
         }
         "keys" => {
-            let n = array_items(recv).len();
+            let n = array_len(recv);
             let items: Vec<Value> = (0..n).map(|i| Value::Float(i as f64)).collect();
             Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
         }
@@ -4739,7 +4849,7 @@ fn flatten_into(items: Vec<Value>, depth: f64, out: &mut Vec<Value>) {
 }
 
 fn array_splice(recv: &Value, args: Vec<Value>) -> Result<Value, String> {
-    let len = array_items(recv).len();
+    let len = array_len(recv);
     let start = {
         let s = arg_num(&args, 0);
         if s < 0.0 {

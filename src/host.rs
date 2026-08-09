@@ -260,6 +260,62 @@ pub enum JsObj {
     RegExp(Box<RegExpObj>),
 }
 
+/// Which variant a heap object is, carrying none of its contents.
+///
+/// Property access has to pick a branch by variant, but the code inside a branch
+/// re-enters the host (`bound_method`, `lookup_chain`, `invoke`), so it cannot
+/// hold a `&JsObj` borrow across the match. The way out used to be
+/// `h.get(v).cloned()` — which deep-copies the entire backing store (a whole
+/// `Vec<Value>`, `IndexMap`, or `String`) just to read its tag. That made one
+/// property read O(len) and any loop over a collection O(n^2). This type is the
+/// same discriminant with nothing attached, so the probe is O(1) and each branch
+/// re-borrows for only the one field it actually needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjKind {
+    Str,
+    Array,
+    Object,
+    Func,
+    Builtin,
+    BoundMethod,
+    Null,
+    Iter,
+    BoundFunc,
+    Class,
+    Symbol,
+    Map,
+    Set,
+    Generator,
+    Promise,
+    BigInt,
+    RegExp,
+}
+
+impl JsObj {
+    /// This object's variant, without touching its contents.
+    pub fn kind(&self) -> ObjKind {
+        match self {
+            JsObj::Str(_) => ObjKind::Str,
+            JsObj::Array(_) => ObjKind::Array,
+            JsObj::Object(_) => ObjKind::Object,
+            JsObj::Func(_) => ObjKind::Func,
+            JsObj::Builtin(_) => ObjKind::Builtin,
+            JsObj::BoundMethod { .. } => ObjKind::BoundMethod,
+            JsObj::Null => ObjKind::Null,
+            JsObj::Iter { .. } => ObjKind::Iter,
+            JsObj::BoundFunc { .. } => ObjKind::BoundFunc,
+            JsObj::Class(_) => ObjKind::Class,
+            JsObj::Symbol { .. } => ObjKind::Symbol,
+            JsObj::Map { .. } => ObjKind::Map,
+            JsObj::Set { .. } => ObjKind::Set,
+            JsObj::Generator { .. } => ObjKind::Generator,
+            JsObj::Promise { .. } => ObjKind::Promise,
+            JsObj::BigInt(_) => ObjKind::BigInt,
+            JsObj::RegExp(_) => ObjKind::RegExp,
+        }
+    }
+}
+
 /// A `RegExp` object: the compiled `fancy_regex::Regex` plus the JS-visible
 /// source, flag booleans, and the mutable `lastIndex` cursor (used by `g`/`y`
 /// matching). fancy-regex adds lookaround + backreferences on top of the Rust
@@ -1095,6 +1151,12 @@ impl JsHost {
         } else {
             None
         }
+    }
+    /// Which variant `v` points at, without copying its contents. Use this in
+    /// place of `get(v).cloned()` whenever only the tag is needed — see
+    /// [`ObjKind`].
+    pub fn kind_of(&self, v: &Value) -> Option<ObjKind> {
+        self.get(v).map(JsObj::kind)
     }
     pub fn new_str(&mut self, s: impl Into<String>) -> Value {
         self.alloc(JsObj::Str(s.into()))
@@ -2961,7 +3023,10 @@ pub fn call_named(name: &str, args: Vec<Value>) -> Result<Value, String> {
 pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     // Namespace builtins (`console`, `Math`, `JSON`, ...): dispatch by qualified
     // name.
-    if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(recv).cloned()) {
+    if let Some(ns) = with_host(|h| match h.get(recv) {
+        Some(JsObj::Builtin(ns)) => Some(ns.clone()),
+        _ => None,
+    }) {
         let qualified = format!("{ns}.{name}");
         if crate::builtins::is_known_builtin(&qualified) {
             return crate::builtins::call_builtin_function(&qualified, args);
@@ -2972,7 +3037,7 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
     // Object.prototype builtin (hasOwnProperty …). Resolve via `lookup_*`
     // directly — NOT get_property — so the Object.prototype-builtin fallback
     // never routes back through a BoundMethod and recurses.
-    if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Object(_))) {
+    if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Object) {
         // A native stdlib instance (`Buffer`/crypto `Hash`/`EventEmitter`/`URL`/
         // fs `Stats`/http `ServerResponse`…) carries a hidden `@@native` tag.
         // A user-added or reparented-prototype method takes precedence over the
@@ -3019,18 +3084,18 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
     // Function value methods: call / apply / bind, then any static method stored
     // on the function object.
     if matches!(
-        with_host(|h| h.get(recv).cloned()),
-        Some(JsObj::Func(_))
-            | Some(JsObj::Class(_))
-            | Some(JsObj::BoundFunc { .. })
-            | Some(JsObj::BoundMethod { .. })
-            | Some(JsObj::Builtin(_))
+        with_host(|h| h.kind_of(recv)),
+        Some(ObjKind::Func)
+            | Some(ObjKind::Class)
+            | Some(ObjKind::BoundFunc)
+            | Some(ObjKind::BoundMethod)
+            | Some(ObjKind::Builtin)
     ) {
         if let Some(r) = crate::builtins::function_builtin_method(recv, name, &args)? {
             return Ok(r);
         }
         // A static method (own or inherited): `this` is the constructor (`recv`).
-        let stat = if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Class(_))) {
+        let stat = if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Class) {
             with_host(|h| h.class_static(recv, name))
         } else {
             with_host(|h| h.fn_prop(recv, name))
@@ -3051,7 +3116,7 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
         // An `Object.prototype` method invoked with a builtin namespace/prototype
         // as `this` (`hasOwnProperty.call(Map.prototype, 'get')`, the get-intrinsic
         // ownership probe) — dispatch it against the builtin receiver.
-        if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Builtin(_)))
+        if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Builtin)
             && crate::builtins::is_object_builtin_method(name)
         {
             return crate::builtins::object_builtin_method(recv, name, args);
@@ -4610,10 +4675,10 @@ const AWAIT_MARKER: &str = "@@await";
 
 /// The operand of an `await` suspension, or `None` for a real `yield`.
 fn await_marker(v: &Value) -> Option<Value> {
-    match with_host(|h| h.get(v).cloned()) {
+    with_host(|h| match h.get(v) {
         Some(JsObj::Object(props)) if props.len() == 1 => props.get(AWAIT_MARKER).cloned(),
         _ => None,
-    }
+    })
 }
 
 /// One `.next()` of an `async function*`: resume the body, transparently settling
@@ -4652,10 +4717,14 @@ fn finish_async_gen_step(gen: Value, id: u32) {
 
 /// Whether `v` is an `async function*` object (its `.next()` yields promises).
 pub fn is_async_generator(v: &Value) -> bool {
-    match with_host(|h| h.get(v).cloned()) {
-        Some(JsObj::Generator { id }) => with_host(|h| h.generators[id as usize].async_gen),
-        _ => false,
-    }
+    let id = match with_host(|h| match h.get(v) {
+        Some(JsObj::Generator { id }) => Some(*id),
+        _ => None,
+    }) {
+        Some(id) => id,
+        None => return false,
+    };
+    with_host(|h| h.generators[id as usize].async_gen)
 }
 
 /// A `{ value, done }` iterator-result object.

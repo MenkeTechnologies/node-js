@@ -327,30 +327,59 @@ are **now supported** (see the Supported list above); verified against
 - **`.index` on non-BMP input.** `exec`/`match` report the match position as a
   Unicode *char* offset; JS uses UTF-16 code-unit offsets, so an astral-plane
   character before the match shifts the index by one. Identical on BMP text.
-## Collection iteration is O(n^2) — an UPSTREAM fusevm issue
+## FIXED — collection access was O(n^2), and the cause was local to node-js
 
-Per-element iteration over a JS array or a `Buffer` costs quadratic time. Measured
-on this machine with the debug build, summing every element of an array of `n`
-integers (`for-of` plus an indexed loop):
+Per-element access to a JS array, object, or `Buffer` used to cost quadratic
+time. An earlier revision of this file blamed `fusevm::Value::Array` holding a
+by-value `Vec<Value>`. **That attribution was wrong.** node-js never constructs a
+`fusevm::Value::Array` at all — its arrays are `JsObj::Array(Vec<Value>)` in its
+own heap, reached through a `Value::Obj(u32)` handle (`src/host.rs:205`). The
+fusevm `Arc`-backed array added in 0.19.0 therefore changed nothing here.
 
-| n | time |
+The real cause was four node-js sites that cloned an **entire heap cell just to
+read its variant tag**, because `with_host` is a `RefCell` borrow and the code
+inside each match arm re-enters the host, so a `&JsObj` borrow could not be held
+across the match. `h.get(recv).cloned()` escaped the borrow — and deep-copied the
+whole backing `Vec`/`IndexMap`/`String` every time:
+
+| site | cost before |
 | --- | --- |
-| 2,000 | 0.36 s |
-| 4,000 | 1.34 s |
-| 8,000 | 5.25 s |
-| 16,000 | 20.83 s |
+| `get_property` (`src/builtins.rs:515`) | every property read copied the whole receiver, so `a[i]` and `a.length` were O(len) |
+| `set_property` (`src/builtins.rs:1236`) | up to five whole-receiver copies per assignment |
+| `call_method` (`src/host.rs:3023`) + `call_type_method` (`src/builtins.rs:4235`) | every `a.push(x)` copied the whole array before dispatching |
+| `buffer::byte_get` / `byte_set` (`src/stdlib/buffer.rs:322`, `:345`) | one `buf[i]` materialised the whole buffer as a `Vec<u8>`; one `buf[i] = n` wrote every byte back |
 
-Doubling `n` quadruples the time. An indexed `Buffer` read plus `toString('hex')`
-shows the same shape (0.04 / 0.13 / 0.42 / 1.52 s). The cause is not in node-js:
-`fusevm::Value::Array` holds a by-value `Vec<Value>`, so every load of the
-sequence deep-copies it. Fixing it needs an `Arc`-backed array in fusevm, which
-is shared by every frontend — node-js deliberately does NOT paper over it with a
-local caching layer.
+The fix is not `Arc`/copy-on-write — JS arrays are mutable and aliased
+(`const a=[1]; const b=a; b.push(2)` must be visible through `a`), and the heap
+already gives correct aliasing because every handle points at one canonical cell.
+The fix is to stop copying in order to *look*: `ObjKind` (`src/host.rs:274`) and
+`JsHost::kind_of` (`src/host.rs:1158`) return the discriminant alone, and `peek`
+(`src/builtins.rs:511`) hands back only the one field an arm needs. `push`/
+`unshift` take their return length from the same mutable borrow via `array_len`
+(`src/builtins.rs:4315`) instead of copying the array out to count it, and the
+Buffer paths read and write the single element in place.
 
-This does **not** affect `express.json()`: `body-parser` concatenates the socket
-chunks and hands a STRING to `JSON.parse`, so no per-byte JS loop runs. The same
-POST at 5.5 KB and at 98 KB (a 17.6x larger body) takes 0.040 s and 0.046 s —
-flat, not quadratic.
+Summing every element of an array of `n` integers (`for-of` plus an indexed
+loop), debug build, same machine — and an indexed `Buffer` read plus
+`toString('hex')`:
+
+| n | array before | array after | buffer before | buffer after |
+| --- | --- | --- | --- | --- |
+| 2,000 | 0.35 s | 0.02 s | 0.13 s | 0.03 s |
+| 4,000 | 1.36 s | 0.04 s | 0.47 s | 0.05 s |
+| 8,000 | 5.36 s | 0.09 s | 1.71 s | 0.11 s |
+| 16,000 | 20.72 s | 0.18 s | 6.72 s | 0.22 s |
+| 32,000 | 81.93 s | 0.36 s | 26.67 s | 0.45 s |
+
+Both curves were quadratic (4x per doubling) and are now linear (2x per
+doubling) — 228x at n=32,000 for arrays, 59x for Buffers. Object property access
+was quadratic for the same reason and is linear too.
+
+`express.json()` was never hit by this, and that remains true: `body-parser`
+concatenates the socket chunks and hands a STRING to `JSON.parse`, so no
+per-element JS loop runs over the body. Real express 5 POSTs of 25 KB → 207 KB
+are flat in both builds (0.16–0.18 s before, 0.06–0.07 s after); the improvement
+there is general property-access speedup, not a change in body-size scaling.
 
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
