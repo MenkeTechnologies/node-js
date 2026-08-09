@@ -526,6 +526,19 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
             None => Ok(Value::Undef), // set-only property reads as undefined
         };
     }
+    // `Symbol.toStringTag` read as an ordinary property. The builtins that carry
+    // one expose it to a plain read, not just to `Object.prototype.toString` —
+    // `new Uint8Array(1)[Symbol.toStringTag]` is `'Uint8Array'`, and a `Buffer`
+    // inherits `'Uint8Array'` from the typed-array prototype it now really has.
+    // Anything the receiver's own chain provides wins (a class may define its
+    // own getter), so this is only the fallback.
+    if name == "@@toStringTag" {
+        if with_host(|h| host::lookup_chain(h, recv, name)).is_none() {
+            if let Some(tag) = with_host(|h| well_known_tag(h, recv)) {
+                return Ok(with_host(|h| h.new_str(tag)));
+            }
+        }
+    }
     // `constructor`: a user class/function sets it on the prototype chain, and
     // that wins; otherwise every builtin instance reports its native
     // constructor (so `[].constructor`, `new Map().constructor`,
@@ -894,18 +907,14 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Builtin) {
                 return Ok(Value::Bool(has_property(recv, &k)));
             }
+            // A Buffer's / typed array's own keys are its element indices: the
+            // `length`/`byteLength` slots are internal bookkeeping, and V8
+            // reports `hasOwnProperty('length')` as false for a typed array.
+            // Shared with the `in` operator so the two cannot drift apart.
+            if let Some(hit) = crate::stdlib::typedarray::has_index(recv, &k) {
+                return Ok(Value::Bool(hit));
+            }
             let has = with_host(|h| match h.get(recv) {
-                // A Buffer's own keys are its byte indices: the `length`/
-                // `byteLength` slots are internal bookkeeping, and V8 reports
-                // `hasOwnProperty('length')` as false for a typed array.
-                Some(JsObj::Object(p))
-                    if p.get("@@native").map(|t| h.str_of(t)).as_deref() == Some("Buffer") =>
-                {
-                    match (p.get("@@bytes").and_then(|b| h.get(b)), k.parse::<usize>()) {
-                        (Some(JsObj::Array(items)), Ok(i)) => i < items.len(),
-                        _ => false,
-                    }
-                }
                 Some(JsObj::Object(p)) => p.contains_key(&k) || h.own_accessor(recv, &k).is_some(),
                 Some(JsObj::Array(items)) => {
                     k == "length" || k.parse::<usize>().map(|i| i < items.len()).unwrap_or(false)
@@ -1180,7 +1189,12 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     if ctor == "Buffer" && crate::stdlib::native_tag(recv).as_deref() == Some("Buffer") {
         return crate::stdlib::buffer::instance_call(recv, method, &args);
     }
-    if ctor == "Uint8Array" {
+    // The shared typed-array methods now live on the `%TypedArray%.prototype`
+    // intermediate, so their thunks are tagged `TypedArray`; `Uint8Array` still
+    // appears for anything read directly off `Uint8Array.prototype`. Both
+    // dispatch the same way, and both must bypass `call_method` or the thunk
+    // would re-resolve itself off the receiver's chain and recurse.
+    if ctor == "Uint8Array" || ctor == "TypedArray" {
         match crate::stdlib::native_tag(recv).as_deref() {
             Some("Buffer") => return crate::stdlib::buffer::instance_call(recv, method, &args),
             Some("TypedArray") => {
@@ -1192,12 +1206,54 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     host::call_method(recv, method, args)
 }
 
+/// The value of `v[Symbol.toStringTag]` for a builtin that genuinely carries
+/// one, or `None` when reading that symbol must yield `undefined`.
+///
+/// Every builtin brand is already computed in exactly one place (`object_tag`),
+/// so this reuses it and subtracts the legacy builtins, which brand for
+/// `Object.prototype.toString` but expose no `Symbol.toStringTag` property.
+/// The subtracted list is measured against node v26.7.0, not assumed: `[]`,
+/// `function(){}`, `{}`, `new Date()`, `/x/` and `new Error()` all read
+/// `undefined`, while `Map`/`Set`/`Promise`/typed arrays/`ArrayBuffer`/
+/// `DataView`/`WeakRef`/`FinalizationRegistry`/`BigInt`/`Symbol`/generators/
+/// async+generator functions/`Math`/`JSON`/`Reflect`/`URL`/`URLSearchParams`/
+/// `TextEncoder`/`TextDecoder` all read their brand.
+fn well_known_tag(h: &host::JsHost, v: &Value) -> Option<String> {
+    // A primitive never carries the symbol except a BigInt/Symbol wrapper, both
+    // of which `object_tag` already brands.
+    let tag = object_brand(h, v);
+    const NO_TAG: &[&str] = &[
+        "Undefined",
+        "Null",
+        "Boolean",
+        "Number",
+        "String",
+        "Array",
+        "Function",
+        "Object",
+        "Date",
+        "RegExp",
+        "Error",
+    ];
+    if NO_TAG.contains(&tag.as_str()) {
+        return None;
+    }
+    Some(tag)
+}
+
 /// The `Object.prototype.toString` brand tag for `v` (`[object Array]` etc.).
 /// Every builtin exotic object reports its own brand, which is how packages
 /// type-test values they did not construct (`toString.call(x) ===
 /// '[object Uint8Array]'`). A `Buffer` reports `Uint8Array` because in Node it
 /// IS a `Uint8Array` subclass and inherits that `Symbol.toStringTag`.
 fn object_tag(h: &host::JsHost, v: &Value) -> String {
+    format!("[object {}]", object_brand(h, v))
+}
+
+/// The bare brand name behind `Object.prototype.toString` (`Array`, `Uint8Array`
+/// …), without the `[object …]` wrapper. Split out so the brand and the
+/// `Symbol.toStringTag` property read cannot disagree about what a value is.
+fn object_brand(h: &host::JsHost, v: &Value) -> String {
     let tag: String = match v {
         Value::Undef => "Undefined".into(),
         Value::Bool(_) => "Boolean".into(),
@@ -1269,7 +1325,7 @@ fn object_tag(h: &host::JsHost, v: &Value) -> String {
         // variants never arise here.
         _ => "Object".into(),
     };
-    format!("[object {tag}]")
+    tag
 }
 
 fn b_setattr(vm: &mut VM, _: u8) -> Value {
@@ -2651,6 +2707,15 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.fromEntries" => object_from_entries(args),
         "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => {
             let v = arg0(&args);
+            // Constructor-side inheritance: `Buffer extends Uint8Array`, so
+            // `Object.getPrototypeOf(Buffer)` is the `Uint8Array` constructor
+            // itself, not `Function.prototype`. This is the class-side half of
+            // the subclass link — the instance-side half is
+            // `Buffer.prototype`'s `[[Prototype]]`.
+            if matches!(with_host(|h| h.get(&v).cloned()), Some(JsObj::Builtin(ref n)) if n == "Buffer")
+            {
+                return Ok(with_host(|h| h.alloc(JsObj::Builtin("Uint8Array".into()))));
+            }
             // `Object.create(null)` and friends really do have a null prototype.
             if with_host(|h| h.has_null_proto(&v)) {
                 return Ok(with_host(|h| h.null()));
@@ -6335,6 +6400,14 @@ pub fn has_property(obj: &Value, key: &str) -> bool {
     // with the `in` operator before reading the intrinsic).
     if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(obj).cloned()) {
         return !matches!(namespace_property(&ns, key), Value::Undef);
+    }
+    // An integer index of a typed array / Buffer is an own property, and lives
+    // in the hidden element array rather than the property map — the same
+    // question `hasOwnProperty` answers, through the same helper. Only a hit
+    // short-circuits: a non-index key like `'length'` must still fall through
+    // to the ordinary chain lookup below.
+    if crate::stdlib::typedarray::has_index(obj, key) == Some(true) {
+        return true;
     }
     if with_host(|h| host::lookup_chain(h, obj, key)).is_some() {
         return true;

@@ -404,6 +404,11 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
                 == Some("Buffer"),
         )),
         "byteLength" => {
+            // A Buffer/typed array/ArrayBuffer argument reports its VIEW size,
+            // not its element count and not the length of a stringification.
+            if let Some(n) = view_byte_length(&args.first().cloned().unwrap_or(Value::Undef)) {
+                return Some(Ok(Value::Float(n)));
+            }
             let enc = args
                 .get(1)
                 .map(|_| arg_str(args, 1))
@@ -416,24 +421,60 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
     })
 }
 
+/// The bytes of any byte-like source: a JS array of byte values, another
+/// `Buffer`, ANY typed array, or an `ArrayBuffer`. `None` for anything else
+/// (a string, which every caller handles with its own encoding rules).
+///
+/// A `Buffer` is a `Uint8Array` subclass, so every place that accepts a Buffer
+/// accepts a typed array too. Each of `Buffer.from`, `Buffer.concat`,
+/// `buf.equals` and `buf.indexOf` had its own notion of "byte source" and all
+/// four understood `@@bytes` only: passing a `Uint8Array` made `from` fall
+/// through to the STRING path and produce the bytes of `"[object Object]"`,
+/// made `concat` contribute nothing, and made `equals`/`indexOf` silently miss.
+/// Routing them all through one helper is what keeps them from drifting again.
+///
+/// Element values are truncated to a byte each, which is what Node does:
+/// `Buffer.from(new Int32Array([1, 2, 300]))` is `<Buffer 01 02 2c>`.
+pub fn bytes_like(v: &Value) -> Option<Vec<u8>> {
+    // A Buffer or a typed array of any kind: its ELEMENTS, truncated.
+    if let Some(elems) = crate::stdlib::typedarray::elems_of(v) {
+        return Some(elems.iter().map(|x| *x as i64 as u8).collect());
+    }
+    // An `ArrayBuffer` carries only a byte length in this model, so it reads as
+    // that many zero bytes. Node would share the memory; nothing here can
+    // observe the difference until typed arrays get a real backing store.
+    if super::native_tag(v).as_deref() == Some("ArrayBuffer") {
+        let n = with_host(|h| match h.get(v) {
+            Some(JsObj::Object(p)) => p.get("byteLength").map(|b| h.to_number(b) as usize),
+            _ => None,
+        });
+        return n.map(|n| vec![0u8; n]);
+    }
+    // A plain JS array of byte values.
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Array(items)) => Some(items.iter().map(|x| h.to_number(x) as i64 as u8).collect()),
+        _ => None,
+    })
+}
+
+/// The `byteLength` a `Buffer`/typed array/`ArrayBuffer` reports, which is the
+/// VIEW's size in bytes rather than its element count — `Buffer.byteLength(new
+/// Int32Array([1,2,3]))` is 12, not 3. Verified against node v26.7.0.
+fn view_byte_length(v: &Value) -> Option<f64> {
+    match super::native_tag(v).as_deref() {
+        Some("Buffer") | Some("TypedArray") | Some("ArrayBuffer") => with_host(|h| match h.get(v) {
+            Some(JsObj::Object(p)) => p.get("byteLength").map(|b| h.to_number(b)),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 fn from(args: &[Value]) -> Result<Value, String> {
     let v = args.first().cloned().unwrap_or(Value::Undef);
-    // Array of byte values.
-    let arr = with_host(|h| match h.get(&v) {
-        Some(JsObj::Array(items)) => Some(
-            items
-                .iter()
-                .map(|x| h.to_number(x) as u8)
-                .collect::<Vec<u8>>(),
-        ),
-        _ => None,
-    });
-    if let Some(bytes) = arr {
+    // Any byte-like source (array of bytes, Buffer, typed array, ArrayBuffer).
+    if let Some(bytes) = bytes_like(&v) {
         return Ok(from_bytes(&bytes));
-    }
-    // Another Buffer: copy.
-    if super::native_tag(&v).as_deref() == Some("Buffer") {
-        return Ok(from_bytes(&bytes_of(&v)));
     }
     // String with an optional encoding.
     let enc = if args.len() > 1 {
@@ -453,7 +494,8 @@ fn concat(args: &[Value]) -> Result<Value, String> {
     );
     let mut out = Vec::new();
     for b in &list {
-        out.extend(bytes_of(b));
+        // Each part may be a Buffer OR any other typed array.
+        out.extend(bytes_like(b).unwrap_or_default());
     }
     Ok(from_bytes(&out))
 }
@@ -478,8 +520,9 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             h.new_object(m)
         })),
         "equals" => {
-            let other = bytes_of(&args.first().cloned().unwrap_or(Value::Undef));
-            Ok(Value::Bool(bytes == other))
+            // Comparable against any typed array, not just another Buffer.
+            let other = bytes_like(&args.first().cloned().unwrap_or(Value::Undef));
+            Ok(Value::Bool(other.is_some_and(|o| bytes == o)))
         }
         "slice" | "subarray" => {
             let (s, e) = slice_bounds(args, bytes.len());
@@ -494,7 +537,8 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let target = args.first().cloned().unwrap_or(Value::Undef);
             let needle = match &target {
                 Value::Int(_) | Value::Float(_) => vec![super::arg_num(args, 0) as u8],
-                _ if super::native_tag(&target).as_deref() == Some("Buffer") => bytes_of(&target),
+                // A Buffer or any other typed array searches by its bytes.
+                _ if bytes_like(&target).is_some() => bytes_like(&target).unwrap_or_default(),
                 _ => decode_str(&arg_str(args, 0), "utf8"),
             };
             // An empty needle matches at 0 (indexOf) / len (lastIndexOf), like Node.
@@ -730,6 +774,16 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             out[offset..offset + src.len()].copy_from_slice(&src);
             set_bytes(recv, &out);
             Ok(Value::Undef)
+        }
+        // A Buffer IS a `Uint8Array`, so anything it does not implement itself
+        // falls through to the shared typed-array behaviour it inherits —
+        // `every`, `map`, `filter`, `forEach`, `reduce`, `sort` and the rest.
+        // These used to READ as functions (the thunks resolve through
+        // `Uint8Array.prototype` on the chain) but throw on call, because
+        // dispatch landed here and stopped. A method the typed arrays do not
+        // have either still reports the Buffer-shaped error below.
+        _ if crate::stdlib::typedarray::PROTOTYPE_METHODS.contains(&method) => {
+            crate::stdlib::typedarray::instance_call(recv, method, args)
         }
         _ => Err(crate::host::type_error(&format!(
             "buffer.{method} is not a function"

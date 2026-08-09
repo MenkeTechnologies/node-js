@@ -54,23 +54,26 @@ pub const PROTOTYPE_METHODS: &[&str] = &[
 
 /// The nine element kinds plus `ArrayBuffer` (which carries only a byte length).
 pub fn is_ctor(name: &str) -> bool {
-    matches!(
-        name,
-        "Uint8Array"
-            | "Int8Array"
-            | "Uint8ClampedArray"
-            | "Int16Array"
-            | "Uint16Array"
-            | "Int32Array"
-            | "Uint32Array"
-            | "Float32Array"
-            | "Float64Array"
-            | "ArrayBuffer"
-    )
+    ELEMENT_KINDS.contains(&name) || name == "ArrayBuffer"
 }
 
+/// The element kinds, each of which gets its own real prototype object whose
+/// parent is the shared `%TypedArray%.prototype`. `Uint8Array` leads because
+/// `Buffer.prototype` chains onto it.
+pub const ELEMENT_KINDS: &[&str] = &[
+    "Uint8Array",
+    "Int8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+];
+
 /// Bytes per element for a typed-array kind.
-fn bytes_per_element(kind: &str) -> usize {
+pub fn bytes_per_element(kind: &str) -> usize {
     match kind {
         "Int8Array" | "Uint8Array" | "Uint8ClampedArray" => 1,
         "Int16Array" | "Uint16Array" => 2,
@@ -114,8 +117,27 @@ fn make(kind: &str, elems: Vec<f64>) -> Value {
         m.insert("@@elems".into(), arr);
         m.insert("length".into(), Value::Float(len as f64));
         m.insert("byteLength".into(), Value::Float((len * bpe) as f64));
+        // Every view reports where it starts in its backing store. A `Buffer`
+        // already carried this; a typed array did not, so `u8.byteOffset` read
+        // `undefined` where a Buffer read 0. Nothing here can produce a
+        // non-zero offset yet — see the note on `.buffer` below.
+        m.insert("byteOffset".into(), Value::Float(0.0));
         m.insert("BYTES_PER_ELEMENT".into(), Value::Float(bpe as f64));
-        h.new_object(m)
+        let obj = h.new_object(m);
+        // Link the instance to the real `Uint8Array.prototype` object so its
+        // inherited methods resolve through the chain, exactly as a `Buffer`
+        // already did. Without this a typed array was a bare tagged object and
+        // `new Uint8Array([1]).every` was not even a function — the methods
+        // existed on the prototype but nothing pointed at it.
+        h.ensure_native_protos();
+        if let Some(p) = h.native_proto(kind) {
+            h.set_proto(&obj, p);
+        }
+        // View metadata is real but non-enumerable, as it is for a Buffer.
+        for k in ["length", "byteLength", "byteOffset", "BYTES_PER_ELEMENT"] {
+            h.hide_prop(&obj, k);
+        }
+        obj
     })
 }
 
@@ -209,7 +231,7 @@ fn from(kind: &str, args: &[Value]) -> Result<Value, String> {
 }
 
 /// The element values of a typed array / Buffer (`None` for anything else).
-fn elems_of(v: &Value) -> Option<Vec<f64>> {
+pub fn elems_of(v: &Value) -> Option<Vec<f64>> {
     let tag = super::native_tag(v)?;
     let field = match tag.as_str() {
         "TypedArray" => "@@elems",
@@ -223,6 +245,36 @@ fn elems_of(v: &Value) -> Option<Vec<f64>> {
         },
         _ => None,
     })
+}
+
+/// The number of elements `v` exposes as integer-index own properties, for a
+/// typed array (`@@elems`) or a `Buffer` (`@@bytes`); `None` for anything else.
+///
+/// Both index-membership questions — `obj.hasOwnProperty(i)` and `i in obj` —
+/// must answer from this one place. They used to disagree: `hasOwnProperty`
+/// carried a hand-rolled arm that understood `@@bytes` only, so it was right for
+/// a Buffer and wrong for every other typed array, while the `in` operator knew
+/// about neither and reported false for every valid index of both.
+pub fn index_len(v: &Value) -> Option<usize> {
+    let field = match super::native_tag(v)?.as_str() {
+        "TypedArray" => "@@elems",
+        "Buffer" => "@@bytes",
+        _ => return None,
+    };
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Object(p)) => match p.get(field).and_then(|a| h.get(a)) {
+            Some(JsObj::Array(items)) => Some(items.len()),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Whether `key` is an in-range integer index of the typed array / Buffer `v`.
+/// `None` when `v` is neither, so callers can fall through to their own logic.
+pub fn has_index(v: &Value, key: &str) -> Option<bool> {
+    let len = index_len(v)?;
+    Some(key.parse::<usize>().map(|i| i < len).unwrap_or(false))
 }
 
 /// The `@@kind` of a typed-array receiver (defaults to `Uint8Array`).
@@ -273,11 +325,255 @@ pub fn elem_set(recv: &Value, key: &str, val: &Value) -> bool {
     })
 }
 
+/// Build a result of the same "species" as `recv`: a `Buffer` receiver yields a
+/// `Buffer`, every other typed array yields its own kind. Node picks the result
+/// type from the receiver's constructor, so `Buffer.from([1]).map(f)` is a
+/// Buffer and `new Int32Array([1]).map(f)` is an `Int32Array`.
+fn species(recv: &Value, kind: &str, elems: Vec<f64>) -> Value {
+    if super::native_tag(recv).as_deref() == Some("Buffer") {
+        let bytes: Vec<u8> = elems.iter().map(|x| *x as i64 as u8).collect();
+        return super::buffer::from_bytes(&bytes);
+    }
+    make(kind, elems)
+}
+
+/// Overwrite `recv`'s elements in place, for the methods that mutate and return
+/// the receiver (`fill`, `reverse`, `sort`, `copyWithin`). Writes through to
+/// whichever hidden array backs it — `@@elems` for a typed array, `@@bytes` for
+/// a `Buffer`.
+fn write_elems(recv: &Value, kind: &str, vals: &[f64]) {
+    let field = match super::native_tag(recv).as_deref() {
+        Some("Buffer") => "@@bytes",
+        _ => "@@elems",
+    };
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get(recv) {
+            if let Some(arr) = p.get(field).cloned() {
+                if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
+                    for (i, v) in vals.iter().enumerate() {
+                        if i < items.len() {
+                            items[i] = Value::Float(coerce(kind, *v));
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Resolve a relative index argument against `len` (negative counts from the
+/// end), clamped into range — the `RelativeIndex` coercion the typed-array
+/// methods share.
+fn rel_index(args: &[Value], idx: usize, len: usize, default: usize) -> usize {
+    if args.len() <= idx {
+        return default;
+    }
+    let n = super::arg_num(args, idx);
+    if n < 0.0 {
+        (len as f64 + n).max(0.0) as usize
+    } else {
+        (n as usize).min(len)
+    }
+}
+
 /// Typed-array instance methods.
 pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     let kind = kind_of(recv);
     let elems = elems_of(recv).unwrap_or_default();
+    // The callback-taking methods share one shape: invoke `cb(value, index,
+    // receiver)` per element. They are inherited by `Buffer` too, which is why
+    // they must live here rather than in either concrete type.
+    let call_cb = |i: usize, v: f64| -> Result<Value, String> {
+        crate::host::invoke(
+            &args.first().cloned().unwrap_or(Value::Undef),
+            vec![Value::Float(v), Value::Float(i as f64), recv.clone()],
+            None,
+        )
+    };
     match method {
+        "every" => {
+            for (i, v) in elems.iter().enumerate() {
+                let r = call_cb(i, *v)?;
+                if !with_host(|h| h.truthy(&r)) {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        "some" => {
+            for (i, v) in elems.iter().enumerate() {
+                let r = call_cb(i, *v)?;
+                if with_host(|h| h.truthy(&r)) {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            Ok(Value::Bool(false))
+        }
+        "forEach" => {
+            for (i, v) in elems.iter().enumerate() {
+                call_cb(i, *v)?;
+            }
+            Ok(Value::Undef)
+        }
+        "map" => {
+            let mut out = Vec::with_capacity(elems.len());
+            for (i, v) in elems.iter().enumerate() {
+                let r = call_cb(i, *v)?;
+                out.push(coerce(&kind, with_host(|h| h.to_number(&r))));
+            }
+            Ok(species(recv, &kind, out))
+        }
+        "filter" => {
+            let mut out = Vec::new();
+            for (i, v) in elems.iter().enumerate() {
+                let r = call_cb(i, *v)?;
+                if with_host(|h| h.truthy(&r)) {
+                    out.push(*v);
+                }
+            }
+            Ok(species(recv, &kind, out))
+        }
+        "find" | "findIndex" | "findLast" | "findLastIndex" => {
+            let last = method.starts_with("findLast");
+            let idxs: Vec<usize> = if last {
+                (0..elems.len()).rev().collect()
+            } else {
+                (0..elems.len()).collect()
+            };
+            for i in idxs {
+                let r = call_cb(i, elems[i])?;
+                if with_host(|h| h.truthy(&r)) {
+                    return Ok(if method.ends_with("Index") {
+                        Value::Float(i as f64)
+                    } else {
+                        Value::Float(elems[i])
+                    });
+                }
+            }
+            Ok(if method.ends_with("Index") {
+                Value::Float(-1.0)
+            } else {
+                Value::Undef
+            })
+        }
+        "reduce" | "reduceRight" => {
+            let right = method == "reduceRight";
+            let order: Vec<usize> = if right {
+                (0..elems.len()).rev().collect()
+            } else {
+                (0..elems.len()).collect()
+            };
+            let cb = args.first().cloned().unwrap_or(Value::Undef);
+            let mut it = order.into_iter();
+            let mut acc = if args.len() >= 2 {
+                args[1].clone()
+            } else {
+                match it.next() {
+                    Some(i) => Value::Float(elems[i]),
+                    None => {
+                        return Err(crate::host::type_error(
+                            "Reduce of empty array with no initial value",
+                        ))
+                    }
+                }
+            };
+            for i in it {
+                acc = crate::host::invoke(
+                    &cb,
+                    vec![
+                        acc,
+                        Value::Float(elems[i]),
+                        Value::Float(i as f64),
+                        recv.clone(),
+                    ],
+                    None,
+                )?;
+            }
+            Ok(acc)
+        }
+        "reverse" => {
+            let mut out = elems.clone();
+            out.reverse();
+            write_elems(recv, &kind, &out);
+            Ok(recv.clone())
+        }
+        "sort" => {
+            let mut out = elems.clone();
+            let cmp = args.first().cloned().unwrap_or(Value::Undef);
+            if with_host(|h| crate::host::is_callable(h, &cmp)) {
+                // A user comparator: insertion sort so each comparison can call
+                // back into JS (which `sort_by` cannot do — it takes a closure
+                // that must not fail).
+                for i in 1..out.len() {
+                    let mut j = i;
+                    while j > 0 {
+                        let r = crate::host::invoke(
+                            &cmp,
+                            vec![Value::Float(out[j - 1]), Value::Float(out[j])],
+                            None,
+                        )?;
+                        if with_host(|h| h.to_number(&r)) <= 0.0 {
+                            break;
+                        }
+                        out.swap(j - 1, j);
+                        j -= 1;
+                    }
+                }
+            } else {
+                // A typed array sorts NUMERICALLY by default, unlike `Array`
+                // which sorts by string. Verified against node v26.7.0:
+                // `new Uint8Array([10,9,1]).sort()` is `1,9,10` while
+                // `[10,9,1].sort()` is `1,10,9`.
+                out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            write_elems(recv, &kind, &out);
+            Ok(recv.clone())
+        }
+        "copyWithin" => {
+            let len = elems.len();
+            let target = rel_index(args, 0, len, 0);
+            let start = rel_index(args, 1, len, 0);
+            let end = rel_index(args, 2, len, len);
+            let src: Vec<f64> = elems[start.min(end)..end.max(start)].to_vec();
+            let mut out = elems.clone();
+            for (k, v) in src.iter().enumerate() {
+                if target + k < len {
+                    out[target + k] = *v;
+                }
+            }
+            write_elems(recv, &kind, &out);
+            Ok(recv.clone())
+        }
+        "at" => {
+            let n = super::arg_num(args, 0);
+            let i = if n < 0.0 { elems.len() as f64 + n } else { n };
+            if i < 0.0 || i >= elems.len() as f64 {
+                return Ok(Value::Undef);
+            }
+            Ok(Value::Float(elems[i as usize]))
+        }
+        "lastIndexOf" => {
+            let needle = super::arg_num(args, 0);
+            Ok(Value::Float(
+                elems
+                    .iter()
+                    .rposition(|x| *x == needle)
+                    .map(|p| p as f64)
+                    .unwrap_or(-1.0),
+            ))
+        }
+        "keys" | "values" | "entries" => {
+            let items: Vec<Value> = with_host(|h| match method {
+                "keys" => (0..elems.len()).map(|i| Value::Float(i as f64)).collect(),
+                "values" => elems.iter().map(|v| Value::Float(*v)).collect(),
+                _ => elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| h.new_array(vec![Value::Float(i as f64), Value::Float(*v)]))
+                    .collect(),
+            });
+            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+        }
         "toString" | "join" => {
             let sep = if method == "join" && !args.is_empty() {
                 super::arg_str(args, 0)

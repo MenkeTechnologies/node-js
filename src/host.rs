@@ -2997,13 +2997,20 @@ impl JsHost {
                     .map(|(k, v)| self.new_array(vec![k, v]))
                     .collect())
             }
-            // A `Buffer` iterates over its BYTES (it is a Uint8Array in Node).
-            Some(JsObj::Object(props)) if props.contains_key("@@bytes") => {
-                match props
-                    .get("@@bytes")
-                    .cloned()
-                    .and_then(|b| self.get(&b).cloned())
-                {
+            // A `Buffer` iterates over its BYTES and a typed array over its
+            // ELEMENTS — both are iterable in Node. Only `@@bytes` was handled
+            // here, so `[...buf]` worked while `[...new Uint8Array([1])]` threw
+            // "object is not iterable", which is the same invariant holding at
+            // one of its two sites.
+            Some(JsObj::Object(props))
+                if props.contains_key("@@bytes") || props.contains_key("@@elems") =>
+            {
+                let field = if props.contains_key("@@bytes") {
+                    "@@bytes"
+                } else {
+                    "@@elems"
+                };
+                match props.get(field).cloned().and_then(|b| self.get(&b).cloned()) {
                     Some(JsObj::Array(items)) => Ok(items),
                     _ => Ok(Vec::new()),
                 }
@@ -3770,7 +3777,18 @@ fn ctor_prototype(h: &JsHost, ctor: &Value) -> Option<Value> {
     match h.get(ctor) {
         Some(JsObj::Class(c)) => Some(c.proto.clone()),
         Some(JsObj::Func(_)) => h.fn_prop(ctor, "prototype"),
-        Some(JsObj::Builtin(name)) => h.error_protos.get(name).cloned(),
+        // A builtin's prototype lives in one of two registries: the error
+        // prototypes, or the native exotic prototypes (`Buffer.prototype`,
+        // `Uint8Array.prototype`). Consulting only the first made `instanceof`
+        // blind to the real `Buffer.prototype → Uint8Array.prototype` chain, so
+        // `Buffer.prototype instanceof Uint8Array` read false even though the
+        // link was there — the instance case only passed via a native-tag
+        // special case, which a prototype object does not carry.
+        Some(JsObj::Builtin(name)) => h
+            .error_protos
+            .get(name)
+            .or_else(|| h.native_protos.get(name))
+            .cloned(),
         Some(JsObj::BoundFunc { target, .. }) => ctor_prototype(h, &target.clone()),
         _ => None,
     }
@@ -3859,6 +3877,9 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
         }
     }
     with_host(|h| h.ensure_error_protos());
+    // The native exotic prototypes are built lazily; `instanceof` may be the
+    // first thing to ask for them, so materialise them before the chain walk.
+    with_host(|h| h.ensure_native_protos());
     let target = match with_host(|h| ctor_prototype(h, ctor)) {
         Some(p) => p,
         None => return Ok(false),
@@ -4563,27 +4584,70 @@ impl JsHost {
             }
             self.hide_prop(&obj_proto, m);
         }
-        let mut chain = vec![
-            ("Uint8Array", obj_proto),
-            ("Buffer", Value::Undef), // filled in below with Uint8Array.prototype
-        ];
+        // `Buffer.prototype → Uint8Array.prototype → %TypedArray%.prototype →
+        // Object.prototype`, which is the chain node v26.7.0 really has. The
+        // shared iteration methods (`every`, `map`, `filter`, …) live on the
+        // `%TypedArray%.prototype` intermediate, NOT on `Uint8Array.prototype`:
+        // measured, `Uint8Array.prototype.hasOwnProperty('every')` is false in
+        // Node while the intermediate owns it. `%TypedArray%` is not a global,
+        // so it is reachable only by walking the chain — exactly as in Node.
+        // Every element kind gets its own prototype hanging off the shared
+        // intermediate, so `Object.getPrototypeOf(new Int32Array(1))` is
+        // `Int32Array.prototype` rather than some other kind's. Linking them all
+        // to `Uint8Array.prototype` would have been the easy version and would
+        // have made an `Int32Array` claim the wrong prototype.
+        let mut chain: Vec<(&str, Value)> = vec![("TypedArray", obj_proto)];
+        for kind in crate::stdlib::typedarray::ELEMENT_KINDS {
+            chain.push((kind, Value::Undef)); // parent: %TypedArray%.prototype
+        }
+        // `Buffer.prototype`'s parent is `Uint8Array.prototype` specifically.
+        chain.push(("Buffer", Value::Undef));
         let mut prev: Option<Value> = None;
         for (ctor, parent) in chain.drain(..) {
             let proto = self.new_object(IndexMap::new());
-            let parent = match prev {
-                Some(p) => p,
-                None => parent,
+            // Each kind hangs off the shared intermediate; `Buffer` hangs off
+            // `Uint8Array.prototype`; the intermediate itself off
+            // `Object.prototype`.
+            let parent = match ctor {
+                "TypedArray" => parent,
+                "Buffer" => self
+                    .native_protos
+                    .get("Uint8Array")
+                    .cloned()
+                    .unwrap_or_else(|| prev.clone().expect("intermediate built first")),
+                _ => self
+                    .native_protos
+                    .get("TypedArray")
+                    .cloned()
+                    .unwrap_or_else(|| prev.clone().expect("intermediate built first")),
             };
             self.set_proto(&proto, parent);
-            let ctor_val = self.alloc(JsObj::Builtin(ctor.to_string()));
-            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
-                p.insert("constructor".into(), ctor_val);
+            // `%TypedArray%.prototype` has no reachable constructor global, so
+            // it gets no `constructor` slot (Node's is the anonymous
+            // `%TypedArray%` intrinsic).
+            if ctor != "TypedArray" {
+                let ctor_val = self.alloc(JsObj::Builtin(ctor.to_string()));
+                if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                    p.insert("constructor".into(), ctor_val);
+                }
+                self.hide_prop(&proto, "constructor");
             }
-            self.hide_prop(&proto, "constructor");
             let methods: &[&str] = match ctor {
                 "Buffer" => crate::stdlib::buffer::INSTANCE_METHODS,
-                _ => crate::stdlib::typedarray::PROTOTYPE_METHODS,
+                "TypedArray" => crate::stdlib::typedarray::PROTOTYPE_METHODS,
+                // A kind's prototype owns no methods; it inherits them from the
+                // intermediate above. It does own `BYTES_PER_ELEMENT`, which is
+                // per-kind and which Node really keeps there (measured:
+                // `Uint8Array.prototype.hasOwnProperty('BYTES_PER_ELEMENT')`).
+                _ => &[],
             };
+            if crate::stdlib::typedarray::ELEMENT_KINDS.contains(&ctor) {
+                let bpe = Value::Float(crate::stdlib::typedarray::bytes_per_element(ctor) as f64);
+                if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                    p.insert("BYTES_PER_ELEMENT".into(), bpe);
+                }
+                self.hide_prop(&proto, "BYTES_PER_ELEMENT");
+            }
             for m in methods {
                 let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
                 if let Some(JsObj::Object(p)) = self.get_mut(&proto) {

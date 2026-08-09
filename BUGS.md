@@ -140,12 +140,44 @@ A `Buffer` is a real `Uint8Array` subclass instance:
 `Object.getPrototypeOf(buf) === Buffer.prototype` holds, that prototype is a
 genuine object whose own `[[Prototype]]` is `Uint8Array.prototype`, and a
 Buffer's own keys are its byte indices (`Object.keys`, `for…in`,
-`getOwnPropertyNames`, `hasOwnProperty`, `getOwnPropertyDescriptor` and object
-spread all agree). One divergence remains: Node's `Buffer.prototype` methods are
-*enumerable*, so `for (k in buf)` in Node yields the ~100 prototype method names
-after the byte indices. node-js implements a subset of those methods and marks
-them non-enumerable, so `for (k in buf)` yields the indices only. Emitting our
-shorter list instead would advertise methods Node has that node-js does not.
+`getOwnPropertyNames`, `hasOwnProperty`, `getOwnPropertyDescriptor`, the `in`
+operator and object spread all agree).
+
+The full chain is the one Node has —
+`Buffer.prototype → Uint8Array.prototype → %TypedArray%.prototype →
+Object.prototype` — with the shared iteration methods on the `%TypedArray%`
+intermediate, each element kind carrying its own prototype (so an `Int32Array`
+does not claim `Uint8Array.prototype`), and the class side linked too:
+`Object.getPrototypeOf(Buffer) === Uint8Array`. Every one of the nine element
+kinds is prototype-linked, iterable, and answers `Symbol.toStringTag` with its
+own brand. A Buffer inherits the typed-array methods it does not implement
+itself (`every`/`some`/`map`/`filter`/`find*`/`reduce*`/`forEach`/`sort`/
+`reverse`/`copyWithin`/`join`/`at`/`lastIndexOf`), and a derivation keeps the
+receiver's type: `buf.map(f)` is a Buffer, `int32.map(f)` an `Int32Array`.
+Anything that accepts a Buffer accepts any typed array — `Buffer.from`,
+`Buffer.concat`, `buf.equals` and `buf.indexOf` share one byte-source helper,
+and `Buffer.byteLength` reports the VIEW size (12 for three `Int32Array`
+elements, not 3). A typed array sorts numerically, unlike `Array`.
+
+Two divergences remain:
+
+1. Node's `Buffer.prototype` methods are *enumerable*, so `for (k in buf)` in
+   Node yields the ~100 prototype method names after the byte indices. node-js
+   implements a subset of those methods and marks them non-enumerable, so
+   `for (k in buf)` yields the indices only. Emitting our shorter list instead
+   would advertise methods Node has that node-js does not.
+2. **There is no shared backing store, so `.buffer` is absent and views do not
+   alias.** `buf.buffer` is `undefined` where Node hands back the `ArrayBuffer`,
+   and `buf.slice(1,3)`/`subarray(1,3)` copy where Node returns a window over
+   the same memory (so writing through the result does not show up in the
+   parent, and two views over one `ArrayBuffer` are independent). An
+   `ArrayBuffer` here carries only a byte length, and a typed array's elements
+   live in a per-object hidden array; making views alias means re-basing both
+   onto one shared byte store and moving all 54 `@@bytes`/`@@elems` call sites
+   across 15 files onto it. That is a real refactor, not a patch — doing it
+   partially would leave some views aliasing and others not, which is worse
+   than the honest gap. `express.json()` does not depend on it (verified: a
+   live POST round-trips byte-identically).
 
 A builtin namespace (`require('buffer')`, `Buffer`, `fs`, …) enumerates the
 members node-js ACTUALLY implements under `for…in` / `Object.keys` — not Node's
@@ -179,6 +211,16 @@ builtin exotic brands correctly), `ArrayBuffer.isView(buf)` is `true`, and
 `buf.byteLength`/`byteOffset`/`BYTES_PER_ELEMENT`/`set` exist. A `Buffer` is a
 real `Uint8Array` subclass INSTANCE — see the Buffer section above; the earlier
 `@@native`-tagged approximation is gone.
+
+The same brand is readable as an ordinary property, not only through
+`Object.prototype.toString`: `buf[Symbol.toStringTag]` is `'Uint8Array'`, and
+every builtin that carries the symbol in Node reports it (`Map`, `Set`,
+`Promise`, the typed arrays, `ArrayBuffer`, `DataView`, `WeakRef`,
+`FinalizationRegistry`, `BigInt`, `Symbol`, generators, async/generator
+functions, `Math`, `JSON`, `Reflect`, `URL`, `URLSearchParams`, `TextEncoder`,
+`TextDecoder`) while the legacy ones that do not (`Array`, `Function`, plain
+objects, `Date`, `RegExp`, `Error`) read `undefined`. The brand and the symbol
+are computed from one function, so they cannot drift apart.
 
 The end-to-end check for all of this is a live POST, not an assertion about
 prototypes: real `express.json()` reads the request body off the socket into a
