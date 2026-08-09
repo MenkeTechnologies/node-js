@@ -1795,16 +1795,47 @@ fn encoding_arg(args: &[Value], i: usize) -> Option<String> {
     }
 }
 
+/// The failing *syscall* Node names in a filesystem error, for the JS-level
+/// entry points whose API name differs from it. `fs.readFileSync('/nope')`
+/// reports `open`, not `readFileSync`, because `open(2)` is what failed —
+/// and `err.syscall` is load-bearing for packages that branch on it.
+fn syscall_name(op: &str) -> &str {
+    match op {
+        "readFileSync" | "readFile" | "writeFile" | "writeFileSync" | "appendFile"
+        | "appendFileSync" | "createReadStream" | "createWriteStream" => "open",
+        "readdir" | "readdirSync" | "opendir" => "scandir",
+        other => other,
+    }
+}
+
 fn err_str(op: &str, path: &str, e: &std::io::Error) -> String {
     use std::io::ErrorKind::*;
     let code = match e.kind() {
         NotFound => "ENOENT",
         PermissionDenied => "EACCES",
         AlreadyExists => "EEXIST",
+        NotADirectory => "ENOTDIR",
+        IsADirectory => "EISDIR",
+        DirectoryNotEmpty => "ENOTEMPTY",
+        InvalidInput => "EINVAL",
+        BrokenPipe => "EPIPE",
         _ => "EIO",
     };
-    let reason = e.to_string();
-    let reason = reason.split(" (os error").next().unwrap_or("error");
+    // libuv's own reason strings, not Rust's `io::Error` `Display` — Rust
+    // capitalizes ("No such file or directory") where libuv (and therefore
+    // Node's `err.message`) does not.
+    let reason = match code {
+        "ENOENT" => "no such file or directory",
+        "EACCES" => "permission denied",
+        "EEXIST" => "file already exists",
+        "ENOTDIR" => "not a directory",
+        "EISDIR" => "illegal operation on a directory",
+        "ENOTEMPTY" => "directory not empty",
+        "EINVAL" => "invalid argument",
+        "EPIPE" => "broken pipe",
+        _ => "i/o error",
+    };
+    let op = syscall_name(op);
     if path.is_empty() {
         format!("Error: {code}: {reason}, {op}")
     } else {

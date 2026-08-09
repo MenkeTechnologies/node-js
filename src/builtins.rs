@@ -955,6 +955,7 @@ fn ensure_fn_prototype(recv: &Value) -> Value {
         if let Some(JsObj::Object(p)) = h.get_mut(&proto) {
             p.insert("constructor".to_string(), recv.clone());
         }
+        h.hide_prop(&proto, "constructor");
         h.set_fn_prop(recv, "prototype", proto.clone());
         proto
     })
@@ -1109,6 +1110,11 @@ fn set_property(recv: &Value, name: &str, val: Value) {
     if name == "__proto__" && matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Object(_)))
     {
         with_host(|h| h.set_proto(recv, val));
+        return;
+    }
+    // A non-writable own property, or a new key on a non-extensible object,
+    // silently discards the write (sloppy mode — the mode every script runs in).
+    if !with_host(|h| h.can_write_prop(recv, name)) {
         return;
     }
     // An inherited/own setter accessor intercepts the write.
@@ -1284,18 +1290,11 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
         let spread = matches!(flat[i], Value::Int(1));
         if spread {
             let src = flat[i + 1].clone();
-            let entries = with_host(|h| match h.get(&src) {
-                Some(JsObj::Object(m)) => m
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<Vec<_>>(),
-                Some(JsObj::Array(items)) => items
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, v)| (idx.to_string(), v.clone()))
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            });
+            // Object spread copies own *enumerable* properties only — never the
+            // hidden `@@…` slots (copying `@@native` used to turn `{...buf}`
+            // into something that still claimed to be a Buffer) and never a
+            // property a descriptor marked non-enumerable.
+            let entries = host::own_enum_entries_deep(&src);
             for (k, v) in entries {
                 props.insert(k, v);
             }
@@ -1698,11 +1697,82 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
     };
     let sv = h.new_str(stack);
     props.insert("stack".into(), sv);
+    // A libuv system-error message is itself the canonical encoding of the
+    // error's metadata — `ENOENT: no such file or directory, open '/x'` — so a
+    // filesystem/network failure recovers the enumerable `code`/`errno`/
+    // `syscall`/`path` own properties that `err.code === 'ENOENT'` checks (the
+    // single most common error-handling idiom in Node packages) depend on.
+    for (k, v) in syscall_error_fields(&message) {
+        let sv = match v {
+            SysField::Str(s) => h.new_str(s),
+            SysField::Num(n) => Value::Float(n),
+        };
+        props.insert(k.into(), sv);
+    }
     let obj = h.new_object(props);
     if let Some(p) = host::error_proto_of(h, &name) {
         h.set_proto(&obj, p);
     }
+    // `message`/`stack` are non-enumerable; a Node `ERR_*` error's `code` is not
+    // (`Object.keys(e)` on an `ERR_INVALID_ARG_TYPE` reads `["code"]`).
+    h.hide_prop(&obj, "message");
+    h.hide_prop(&obj, "stack");
     obj
+}
+
+enum SysField {
+    Str(String),
+    Num(f64),
+}
+
+/// Decompose a libuv-shaped message (`ECODE: reason, syscall 'path'`) into the
+/// own properties Node hangs off a system error. Returns empty for any message
+/// that is not in that shape.
+fn syscall_error_fields(message: &str) -> Vec<(&'static str, SysField)> {
+    let (code, rest) = match message.split_once(": ") {
+        Some((c, r))
+            if c.len() >= 2
+                && c.starts_with('E')
+                && c.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) =>
+        {
+            (c, r)
+        }
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<(&'static str, SysField)> = vec![
+        ("errno", SysField::Num(errno_for(code))),
+        ("code", SysField::Str(code.to_string())),
+    ];
+    // `reason, syscall 'path'` — the path is optional (`EPIPE: …, write`).
+    if let Some((_, tail)) = rest.split_once(", ") {
+        let (syscall, path) = match tail.split_once(" '") {
+            Some((s, p)) => (s, p.strip_suffix('\'')),
+            None => (tail, None),
+        };
+        out.push(("syscall", SysField::Str(syscall.to_string())));
+        if let Some(p) = path {
+            out.push(("path", SysField::Str(p.to_string())));
+        }
+    }
+    out
+}
+
+/// The negative `errno` Node reports for a libuv error code on this platform.
+/// Only the codes `err_str` can produce are mapped; anything else reports the
+/// generic `EIO` number rather than inventing a value.
+fn errno_for(code: &str) -> f64 {
+    let n: i32 = match code {
+        "ENOENT" => 2,
+        "EACCES" => 13,
+        "EEXIST" => 17,
+        "ENOTDIR" => 20,
+        "EISDIR" => 21,
+        "EINVAL" => 22,
+        "EPIPE" => 32,
+        "ENOTEMPTY" => 66,
+        _ => 5, // EIO
+    };
+    -f64::from(n)
 }
 
 // ── iteration ─────────────────────────────────────────────────────────────────
@@ -2046,6 +2116,13 @@ const NS_METHODS: &[&str] = &[
     "Object.getOwnPropertyNames",
     "Object.defineProperty",
     "Object.getOwnPropertyDescriptor",
+    "Object.getOwnPropertyDescriptors",
+    "Object.defineProperties",
+    "Object.isFrozen",
+    "Object.isSealed",
+    "Object.seal",
+    "Object.preventExtensions",
+    "Object.isExtensible",
     "Object.hasOwn",
     "Object.groupBy",
     "Array.isArray",
@@ -2226,7 +2303,24 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.values" => object_keys(args, 1),
         "Object.entries" => object_keys(args, 2),
         "Object.assign" => object_assign(args),
-        "Object.freeze" => Ok(arg0(&args)),
+        "Object.freeze" => {
+            let v = arg0(&args);
+            with_host(|h| h.seal_object(&v, true));
+            Ok(v)
+        }
+        "Object.seal" => {
+            let v = arg0(&args);
+            with_host(|h| h.seal_object(&v, false));
+            Ok(v)
+        }
+        "Object.preventExtensions" => {
+            let v = arg0(&args);
+            with_host(|h| h.prevent_extensions(&v));
+            Ok(v)
+        }
+        "Object.isFrozen" => Ok(Value::Bool(with_host(|h| h.is_sealed(&arg0(&args), true)))),
+        "Object.isSealed" => Ok(Value::Bool(with_host(|h| h.is_sealed(&arg0(&args), false)))),
+        "Object.isExtensible" => Ok(Value::Bool(with_host(|h| h.is_extensible(&arg0(&args))))),
         // Object.is — SameValue: like `===` but NaN is equal to NaN and +0 is
         // distinct from -0.
         "Object.is" => {
@@ -2262,7 +2356,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(obj)
         }
         "Object.create" => object_create(args),
-        "Object.getOwnPropertyNames" => object_keys(args, 0),
+        "Object.getOwnPropertyNames" => object_keys(args, 3),
         // `Object.hasOwn(obj, key)` — the static form of `hasOwnProperty`.
         "Object.hasOwn" => {
             let obj = arg0(&args);
@@ -2271,6 +2365,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Object.defineProperty" => object_define_property(args),
         "Object.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
+        "Object.getOwnPropertyDescriptors" => object_get_own_descriptors(args),
+        "Object.defineProperties" => object_define_properties(args),
         // `Object.groupBy(items, cb)` (ES2024): group into a null-prototype object
         // keyed by `ToPropertyKey(cb(item, i))`, each value an array of members.
         "Object.groupBy" => object_group_by(args),
@@ -2606,9 +2702,24 @@ fn make_error(name: &str, args: &[Value]) -> Value {
             let arr = h.new_array(items);
             props.insert("errors".into(), arr);
         }
+        // `new Error(msg, { cause })` (ES2022): installed only when the options
+        // bag actually has a `cause` key, so `new Error(m, {})` leaves none.
+        let opts = args.get(1);
+        if let Some(cause) = opts.and_then(|o| match h.get(o) {
+            Some(JsObj::Object(p)) => p.get("cause").cloned(),
+            _ => None,
+        }) {
+            props.insert("cause".into(), cause);
+        }
         let e = h.new_object(props);
         if let Some(p) = host::error_proto_of(h, name) {
             h.set_proto(&e, p);
+        }
+        // Every own slot an error constructor installs is non-enumerable in V8,
+        // which is why `Object.keys(err)` is `[]` and `JSON.stringify(err)` is
+        // `{}` — properties a *script* later assigns stay enumerable.
+        for k in ["message", "stack", "errors", "cause"] {
+            h.hide_prop(&e, k);
         }
         e
     })
@@ -2980,24 +3091,52 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
             }));
         }
     }
-    let entries: Vec<(String, Value)> = with_host(|h| match h.get(&v) {
-        Some(JsObj::Object(props)) => props
-            .iter()
-            .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
-            .map(|(k, val)| (k.clone(), val.clone()))
-            .collect(),
-        Some(JsObj::Array(items)) => items
-            .iter()
-            .enumerate()
-            .map(|(i, val)| (i.to_string(), val.clone()))
-            .collect(),
-        _ => Vec::new(),
+    // mode 3 (`getOwnPropertyNames`) reports every own string key including the
+    // non-enumerable ones, plus the exotic `length` an array carries.
+    let entries: Vec<(String, Value)> = with_host(|h| {
+        if mode == 3 {
+            let mut names: Vec<(String, Value)> = match h.get(&v) {
+                Some(JsObj::Object(props))
+                    if props.get("@@native").map(|t| h.str_of(t)).as_deref() != Some("Buffer") =>
+                {
+                    props
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
+                        .map(|(k, val)| (k.clone(), val.clone()))
+                        .collect()
+                }
+                Some(JsObj::Array(items)) => {
+                    let n = items.len();
+                    let mut v: Vec<(String, Value)> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, val)| (i.to_string(), val.clone()))
+                        .collect();
+                    v.push(("length".into(), Value::Float(n as f64)));
+                    v
+                }
+                _ => h.own_enum_entries(&v),
+            };
+            // Accessor-only properties own no slot in the map but are own keys.
+            for k in h.own_accessor_keys(&v) {
+                if !names.iter().any(|(n, _)| *n == k) {
+                    names.push((k, Value::Undef));
+                }
+            }
+            return names;
+        }
+        Vec::new()
     });
+    let entries = if mode == 3 {
+        entries
+    } else {
+        host::own_enum_entries_deep(&v)
+    };
     Ok(with_host(|h| {
         let out: Vec<Value> = entries
             .into_iter()
             .map(|(k, val)| match mode {
-                0 => h.new_str(k),
+                0 | 3 => h.new_str(k),
                 1 => val,
                 _ => {
                     let ks = h.new_str(k);
@@ -3012,10 +3151,8 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
 fn object_assign(args: Vec<Value>) -> Result<Value, String> {
     let target = arg0(&args);
     for src in args.iter().skip(1) {
-        let entries: Vec<(String, Value)> = with_host(|h| match h.get(src) {
-            Some(JsObj::Object(p)) => p.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            _ => Vec::new(),
-        });
+        // `Object.assign` copies own *enumerable* properties, running any getter.
+        let entries = host::own_enum_entries_deep(src);
         with_host(|h| {
             if let Some(JsObj::Object(p)) = h.get_mut(&target) {
                 for (k, v) in entries {
@@ -3285,9 +3422,9 @@ fn json_str(
                             })
                         })
                         .collect(),
-                    None => props
+                    None => h
+                        .own_enum_entries(v)
                         .iter()
-                        .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
                         .filter_map(|(k, val)| {
                             json_str(h, val, indent, depth + 1, keys)
                                 .map(|vs| format!("{}{sep}{vs}", json_quote(k)))
@@ -5334,15 +5471,30 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
 }
 
 /// Apply a `{ value | get | set }` descriptor object to `obj[key]`.
+///
+/// Per ECMAScript `ToPropertyDescriptor`, an omitted `writable`/`enumerable`/
+/// `configurable` field defaults to **false** — which is why a `defineProperty`
+/// data property is invisible to `Object.keys` unless the caller opts in. That
+/// asymmetry against plain assignment is the whole reason the attribute table
+/// exists.
 fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
-    let (value, get, set) = with_host(|h| match h.get(desc) {
-        Some(JsObj::Object(p)) => (
-            p.get("value").cloned(),
-            p.get("get").cloned(),
-            p.get("set").cloned(),
-        ),
-        _ => (None, None, None),
+    let (value, get, set, attrs) = with_host(|h| match h.get(desc) {
+        Some(JsObj::Object(p)) => {
+            let flag = |n: &str| p.get(n).map(|v| h.truthy(v)).unwrap_or(false);
+            (
+                p.get("value").cloned(),
+                p.get("get").cloned(),
+                p.get("set").cloned(),
+                host::PropAttrs {
+                    writable: flag("writable"),
+                    enumerable: flag("enumerable"),
+                    configurable: flag("configurable"),
+                },
+            )
+        }
+        _ => (None, None, None, host::PropAttrs::default()),
     });
+    with_host(|h| h.set_prop_attrs(obj, key, attrs));
     if get.is_some() || set.is_some() {
         with_host(|h| h.set_accessor(obj, key, get, set));
     } else if let Some(v) = value {
@@ -5362,6 +5514,20 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
             });
         }
     }
+}
+
+/// `Object.defineProperties(obj, descriptorMap)`.
+fn object_define_properties(args: Vec<Value>) -> Result<Value, String> {
+    let obj = arg0(&args);
+    let descs = args.get(1).cloned().unwrap_or(Value::Undef);
+    let entries: Vec<(String, Value)> = with_host(|h| match h.get(&descs) {
+        Some(JsObj::Object(p)) => p.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        _ => Vec::new(),
+    });
+    for (k, d) in entries {
+        apply_descriptor(&obj, &k, &d);
+    }
+    Ok(obj)
 }
 
 fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
@@ -5390,31 +5556,62 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     // Accessor descriptor?
     if let Some((get, set)) = with_host(|h| h.own_accessor(&obj, &key)) {
         return Ok(with_host(|h| {
+            let a = h.prop_attrs(&obj, &key);
             let mut m: IndexMap<String, Value> = IndexMap::new();
             m.insert("get".into(), get.unwrap_or(Value::Undef));
             m.insert("set".into(), set.unwrap_or(Value::Undef));
-            m.insert("enumerable".into(), Value::Bool(true));
-            m.insert("configurable".into(), Value::Bool(true));
+            m.insert("enumerable".into(), Value::Bool(a.enumerable));
+            m.insert("configurable".into(), Value::Bool(a.configurable));
             h.new_object(m)
         }));
     }
     let val = with_host(|h| match h.get(&obj) {
-        Some(JsObj::Object(p)) => p.get(&key).cloned(),
+        Some(JsObj::Object(p)) => p.get(&key).cloned().or_else(|| {
+            // A Buffer's bytes are own index properties even though they live in
+            // the hidden `@@bytes` slot rather than the property map.
+            match (p.get("@@bytes").and_then(|b| h.get(b)), key.parse::<usize>()) {
+                (Some(JsObj::Array(items)), Ok(i)) => items.get(i).cloned(),
+                _ => None,
+            }
+        }),
         // A function/class own prop lives in the fn-prop side table.
         Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => h.fn_prop(&obj, &key),
         _ => None,
     });
     match val {
         Some(v) => Ok(with_host(|h| {
+            let a = h.prop_attrs(&obj, &key);
             let mut m: IndexMap<String, Value> = IndexMap::new();
             m.insert("value".into(), v);
-            m.insert("writable".into(), Value::Bool(true));
-            m.insert("enumerable".into(), Value::Bool(true));
-            m.insert("configurable".into(), Value::Bool(true));
+            m.insert("writable".into(), Value::Bool(a.writable));
+            m.insert("enumerable".into(), Value::Bool(a.enumerable));
+            m.insert("configurable".into(), Value::Bool(a.configurable));
             h.new_object(m)
         })),
         None => Ok(Value::Undef),
     }
+}
+
+/// `Object.getOwnPropertyDescriptors(obj)` — the descriptor of every own string
+/// key, keyed by name. `Object.create(proto, getOwnPropertyDescriptors(src))` is
+/// the standard "clone with accessors intact" idiom, so this must agree
+/// key-for-key with `getOwnPropertyNames`.
+fn object_get_own_descriptors(args: Vec<Value>) -> Result<Value, String> {
+    let obj = arg0(&args);
+    let names = object_keys(vec![obj.clone()], 3)?;
+    let keys: Vec<String> = with_host(|h| match h.get(&names) {
+        Some(JsObj::Array(items)) => items.iter().map(|k| h.str_of(k)).collect(),
+        _ => Vec::new(),
+    });
+    let mut out: IndexMap<String, Value> = IndexMap::new();
+    for k in keys {
+        let ks = with_host(|h| h.new_str(k.clone()));
+        let d = object_get_own_descriptor(vec![obj.clone(), ks])?;
+        if !matches!(d, Value::Undef) {
+            out.insert(k, d);
+        }
+    }
+    Ok(with_host(|h| h.new_object(out)))
 }
 
 /// `key in obj` respecting the prototype chain.

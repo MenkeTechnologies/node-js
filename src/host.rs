@@ -369,6 +369,37 @@ pub type Env = Rc<RefCell<EnvData>>;
 /// An accessor property: `(getter, setter)`, either optional.
 pub type Accessor = (Option<Value>, Option<Value>);
 
+/// The three ECMAScript own-property attributes. `PropAttrs::default()` is the
+/// all-true shape a plain `o.k = v` assignment produces, which is why only
+/// deviations need storing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PropAttrs {
+    pub writable: bool,
+    pub enumerable: bool,
+    pub configurable: bool,
+}
+
+impl Default for PropAttrs {
+    fn default() -> Self {
+        PropAttrs {
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        }
+    }
+}
+
+impl PropAttrs {
+    /// The attribute shape V8 gives an internal-but-inspectable slot such as
+    /// `Error.prototype.message`, `err.stack` or a `Buffer`'s view metadata:
+    /// readable and replaceable, but never enumerated.
+    pub const HIDDEN: PropAttrs = PropAttrs {
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    };
+}
+
 fn new_env(parent: Option<Env>) -> Env {
     Rc::new(RefCell::new(EnvData {
         vars: IndexMap::new(),
@@ -443,6 +474,17 @@ pub struct JsHost {
     /// Accessor (getter/setter) properties per owning object, by heap index then
     /// key: `(get, set)`. Class `get x()`/`set x()` install here on the prototype.
     accessors: HashMap<u32, IndexMap<String, Accessor>>,
+    /// Own-property attributes that deviate from the plain-assignment default
+    /// (`{writable, enumerable, configurable}` all true), by heap index then key.
+    /// Only non-default entries are stored, so an ordinary object costs nothing;
+    /// `prop_attrs` returns the default for any key absent here. This is what
+    /// makes `Object.defineProperty(o, k, {enumerable: false})` invisible to
+    /// `Object.keys`/`for-in`/`JSON.stringify` while `getOwnPropertyNames` still
+    /// reports it, and what hides `Error`'s `message`/`stack` the way V8 does.
+    prop_attrs: HashMap<u32, IndexMap<String, PropAttrs>>,
+    /// Heap objects sealed against new properties by `Object.preventExtensions`,
+    /// `Object.seal` or `Object.freeze`.
+    non_extensible: HashSet<u32>,
     /// User-assigned static properties on a builtin namespace/constructor, keyed
     /// by namespace name then property (`Error` → `prepareStackTrace`,
     /// `stackTraceLimit`). Each bare `Error` reference allocates a fresh
@@ -621,6 +663,8 @@ impl JsHost {
             null_proto_objs: HashSet::new(),
             fn_props: HashMap::new(),
             accessors: HashMap::new(),
+            prop_attrs: HashMap::new(),
+            non_extensible: HashSet::new(),
             builtin_statics: HashMap::new(),
             object_proto: Value::Undef,
             proto_class: HashMap::new(),
@@ -795,6 +839,128 @@ impl JsHost {
         } else {
             None
         }
+    }
+
+    /// The own accessor-property keys of `owner`, in installation order.
+    pub fn own_accessor_keys(&self, owner: &Value) -> Vec<String> {
+        match owner {
+            Value::Obj(i) => self
+                .accessors
+                .get(i)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    // ── own-property attributes ──────────────────────────────────────────
+
+    /// Record non-default attributes for `owner[key]`. Storing the default shape
+    /// clears the entry so the table only ever holds deviations.
+    pub fn set_prop_attrs(&mut self, owner: &Value, key: &str, attrs: PropAttrs) {
+        if let Value::Obj(i) = owner {
+            if attrs == PropAttrs::default() {
+                if let Some(m) = self.prop_attrs.get_mut(i) {
+                    m.shift_remove(key);
+                }
+            } else {
+                self.prop_attrs
+                    .entry(*i)
+                    .or_default()
+                    .insert(key.to_string(), attrs);
+            }
+        }
+    }
+
+    /// The attributes of own property `owner[key]` (all-true when unrecorded).
+    pub fn prop_attrs(&self, owner: &Value, key: &str) -> PropAttrs {
+        match owner {
+            Value::Obj(i) => self
+                .prop_attrs
+                .get(i)
+                .and_then(|m| m.get(key))
+                .copied()
+                .unwrap_or_default(),
+            _ => PropAttrs::default(),
+        }
+    }
+
+    /// Whether own property `owner[key]` shows up in `for-in`/`Object.keys`.
+    /// Internal slots (`@@…`) and private class fields (`#…`) never do.
+    pub fn is_enumerable(&self, owner: &Value, key: &str) -> bool {
+        !key.starts_with("@@")
+            && !key.starts_with('#')
+            && self.prop_attrs(owner, key).enumerable
+    }
+
+    /// Mark `owner[key]` non-enumerable, leaving it writable/configurable — the
+    /// shape of every V8 "hidden but real" own property.
+    pub fn hide_prop(&mut self, owner: &Value, key: &str) {
+        self.set_prop_attrs(owner, key, PropAttrs::HIDDEN);
+    }
+
+    /// Whether a plain `owner[key] = v` assignment is allowed to land. A
+    /// non-writable data property silently ignores the write in sloppy mode,
+    /// which is the mode every script here runs in; so does adding a *new* key to
+    /// a non-extensible object.
+    pub fn can_write_prop(&self, owner: &Value, key: &str) -> bool {
+        if !self.prop_attrs(owner, key).writable {
+            return false;
+        }
+        if self.is_extensible(owner) {
+            return true;
+        }
+        match self.get(owner) {
+            Some(JsObj::Object(p)) => p.contains_key(key),
+            _ => true,
+        }
+    }
+
+    /// Mark `v` closed to new properties (`Object.preventExtensions`).
+    pub fn prevent_extensions(&mut self, v: &Value) {
+        if let Value::Obj(i) = v {
+            self.non_extensible.insert(*i);
+        }
+    }
+
+    pub fn is_extensible(&self, v: &Value) -> bool {
+        !matches!(v, Value::Obj(i) if self.non_extensible.contains(i))
+    }
+
+    /// Apply `Object.seal` (`freeze == false`) or `Object.freeze` (`true`): close
+    /// the object and strip `configurable` — and, when freezing, `writable` —
+    /// from every own property, data and accessor alike.
+    pub fn seal_object(&mut self, v: &Value, freeze: bool) {
+        self.prevent_extensions(v);
+        let mut keys = match self.get(v) {
+            Some(JsObj::Object(p)) => p.keys().cloned().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        keys.extend(self.own_accessor_keys(v));
+        for k in keys {
+            let mut a = self.prop_attrs(v, &k);
+            a.configurable = false;
+            if freeze {
+                a.writable = false;
+            }
+            self.set_prop_attrs(v, &k, a);
+        }
+    }
+
+    /// `Object.isSealed` (`freeze == false`) / `Object.isFrozen` (`true`).
+    pub fn is_sealed(&self, v: &Value, freeze: bool) -> bool {
+        if self.is_extensible(v) {
+            return false;
+        }
+        let mut keys = match self.get(v) {
+            Some(JsObj::Object(p)) => p.keys().cloned().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        keys.extend(self.own_accessor_keys(v));
+        keys.iter().all(|k| {
+            let a = self.prop_attrs(v, k);
+            !a.configurable && (!freeze || !a.writable)
+        })
     }
 
     /// A fresh unique `Symbol(desc)` value.
@@ -2449,11 +2615,68 @@ impl JsHost {
 
     /// Enumerable string keys of an object/array (for `for-in`). Internal
     /// symbol-keyed props (`@@…`) are not enumerable.
+    /// `for-in` visits own enumerable keys, then every *inherited* enumerable key
+    /// not already seen, walking the whole prototype chain. Class methods and the
+    /// builtin prototypes are non-enumerable, so in practice this only surfaces
+    /// keys a script put on a prototype itself (`F.prototype.y = 2`) — but that
+    /// is exactly the constructor-function idiom older packages are written in.
     pub fn enum_keys(&mut self, v: &Value) -> Vec<Value> {
-        let keys: Vec<String> = match self.get(v) {
+        let mut keys = self.own_enum_key_names(v);
+        let mut cur = self.proto_of(v);
+        let mut hops = 0;
+        while let Some(p) = cur {
+            // A cyclic or pathologically deep chain must not hang the loop.
+            hops += 1;
+            if hops > 100 || matches!(p, Value::Undef) || self.is_null(&p) {
+                break;
+            }
+            for k in self.own_enum_key_names(&p) {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+            cur = self.proto_of(&p);
+        }
+        keys.into_iter().map(|k| self.new_str(k)).collect()
+    }
+
+    /// The own *enumerable* string keys of `v`, in property order — the single
+    /// source of truth behind `for-in`, `Object.keys`/`values`/`entries`,
+    /// object spread, `Object.assign` and `JSON.stringify`. Internal slots
+    /// (`@@…`), private fields (`#…`) and anything marked non-enumerable via
+    /// `prop_attrs` are excluded.
+    pub fn own_enum_key_names(&self, v: &Value) -> Vec<String> {
+        let mut keys = self.own_enum_data_keys(v);
+        // An own accessor installed with `enumerable: true` enumerates too. Class
+        // `get x()`/`set x()` are marked non-enumerable at install, matching V8.
+        for k in self.own_accessor_keys(v) {
+            if self.prop_attrs(v, &k).enumerable && !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        keys
+    }
+
+    /// `own_enum_key_names` minus accessor properties: the enumerable keys that
+    /// own a slot in the object's property map.
+    fn own_enum_data_keys(&self, v: &Value) -> Vec<String> {
+        match self.get(v) {
+            // A `Buffer` is an index-keyed exotic: its own enumerable keys are
+            // `"0".."len-1"` (the bytes live in the hidden `@@bytes` slot), never
+            // the `length`/`byteLength` view metadata, which V8 keeps on the
+            // prototype chain or as non-enumerable own slots.
+            Some(JsObj::Object(props))
+                if props.get("@@native").map(|t| self.str_of(t)).as_deref() == Some("Buffer") =>
+            {
+                let n = match props.get("@@bytes").and_then(|b| self.get(b)) {
+                    Some(JsObj::Array(items)) => items.len(),
+                    _ => 0,
+                };
+                (0..n).map(|i| i.to_string()).collect()
+            }
             Some(JsObj::Object(props)) => props
                 .keys()
-                .filter(|k| !k.starts_with("@@") && !k.starts_with('#'))
+                .filter(|k| self.is_enumerable(v, k))
                 .cloned()
                 .collect(),
             Some(JsObj::Array(items)) => (0..items.len()).map(|i| i.to_string()).collect(),
@@ -2462,9 +2685,65 @@ impl JsHost {
             // key-by-key gets the working set instead of an empty object.
             Some(JsObj::Builtin(ns)) => crate::stdlib::namespace_keys(&ns.clone()),
             _ => Vec::new(),
-        };
-        keys.into_iter().map(|k| self.new_str(k)).collect()
+        }
     }
+
+    /// The own enumerable `(key, value)` pairs of `v`. Buffer index keys resolve
+    /// through the byte store; everything else reads the property map. Own
+    /// accessor keys come back as `Undef` here — `own_enum_entries_deep` runs
+    /// their getters, which cannot happen under the host borrow.
+    pub fn own_enum_entries(&self, v: &Value) -> Vec<(String, Value)> {
+        self.own_enum_key_names(v)
+            .into_iter()
+            .map(|k| {
+                let val = match self.get(v) {
+                    // A Buffer's index keys read out of the hidden `@@bytes`
+                    // array; resolve inline rather than through
+                    // `buffer::byte_get`, which would re-borrow the host.
+                    Some(JsObj::Object(props)) => props.get(&k).cloned().unwrap_or_else(|| {
+                        match (props.get("@@bytes").and_then(|b| self.get(b)), k.parse::<usize>()) {
+                            (Some(JsObj::Array(items)), Ok(i)) => {
+                                items.get(i).cloned().unwrap_or(Value::Undef)
+                            }
+                            _ => Value::Undef,
+                        }
+                    }),
+                    Some(JsObj::Array(items)) => k
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| items.get(i).cloned())
+                        .unwrap_or(Value::Undef),
+                    _ => Value::Undef,
+                };
+                (k, val)
+            })
+            .collect()
+    }
+}
+
+/// The own enumerable `(key, value)` pairs of `v` with every enumerable own
+/// accessor's getter invoked — the observable shape `Object.values`,
+/// `Object.entries`, object spread and `JSON.stringify` all need. Must be called
+/// outside a `with_host` borrow because a getter re-enters the host.
+pub fn own_enum_entries_deep(v: &Value) -> Vec<(String, Value)> {
+    let accessor_keys: Vec<String> = with_host(|h| {
+        h.own_accessor_keys(v)
+            .into_iter()
+            .filter(|k| h.prop_attrs(v, k).enumerable)
+            .collect()
+    });
+    let entries = with_host(|h| h.own_enum_entries(v));
+    entries
+        .into_iter()
+        .map(|(k, val)| {
+            if accessor_keys.contains(&k) {
+                let got = get_prop_chain(v, &k).unwrap_or(Value::Undef);
+                (k, got)
+            } else {
+                (k, val)
+            }
+        })
+        .collect()
 }
 
 // ── function invocation ──────────────────────────────────────────────────────
@@ -2754,6 +3033,8 @@ pub fn construct_nt(ctor: &Value, args: Vec<Value>, new_target: Value) -> Result
                     if let Some(JsObj::Object(pp)) = h.get_mut(&p) {
                         pp.insert("constructor".to_string(), ctor.clone());
                     }
+                    // `F.prototype.constructor` is non-enumerable in JS.
+                    h.hide_prop(&p, "constructor");
                     h.set_fn_prop(ctor, "prototype", p.clone());
                     p
                 });
@@ -2910,11 +3191,18 @@ pub fn super_construct(
                 _ => Vec::new(),
             });
             with_host(|h| {
+                let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
                 if let Some(JsObj::Object(props)) = h.get_mut(inst) {
                     for (k, v) in entries {
                         props.insert(k, v);
                     }
                     canonicalize_own_keys(props);
+                }
+                // The copied slots keep the attributes the builtin gave them, so
+                // `class E extends Error` instances hide `message`/`stack` too.
+                for k in keys {
+                    let a = h.prop_attrs(&built, &k);
+                    h.set_prop_attrs(inst, &k, a);
                 }
             });
             Ok(())
@@ -2986,6 +3274,7 @@ pub fn build_class(name: &str, parent: Value, ctor: Value) -> Value {
         if let Some(JsObj::Object(p)) = h.get_mut(&proto) {
             p.insert("constructor".to_string(), class_val.clone());
         }
+        h.hide_prop(&proto, "constructor");
         class_val
     })
 }
@@ -3026,6 +3315,10 @@ pub fn define_member(class_val: &Value, name: &str, kind: i64, is_static: bool, 
                 }
             }
         }
+        // Class methods and accessors are non-enumerable (ES2015 ClassDefinition-
+        // Evaluation), so `for (k in instance)` walking the prototype chain never
+        // yields them and `Object.keys(C.prototype)` is empty.
+        h.hide_prop(&target, name);
     });
 }
 
@@ -3720,6 +4013,10 @@ impl JsHost {
             p.insert("message".into(), empty);
             p.insert("constructor".into(), ctor);
         }
+        // Everything on `Error.prototype` is non-enumerable in V8.
+        for k in ["name", "message", "constructor"] {
+            self.hide_prop(&err_proto, k);
+        }
         self.error_protos.insert("Error".into(), err_proto.clone());
         for name in &ERROR_NAMES[1..] {
             let p = self.new_object(IndexMap::new());
@@ -3730,6 +4027,8 @@ impl JsHost {
                 o.insert("name".into(), nm);
                 o.insert("constructor".into(), ctor);
             }
+            self.hide_prop(&p, "name");
+            self.hide_prop(&p, "constructor");
             self.error_protos.insert((*name).to_string(), p);
         }
     }
