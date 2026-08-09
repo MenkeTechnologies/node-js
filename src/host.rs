@@ -434,6 +434,12 @@ pub struct Frame {
     /// The function name that owns this frame, for the DAP `stackTrace`; `None`
     /// for the module frame and anonymous activations.
     pub owner: Option<String>,
+    /// True ONLY for the program's module frame. A generator/async body runs on a
+    /// coroutine whose swapped-in context holds just ITS OWN frame, so the frame
+    /// COUNT cannot tell "module scope" from "coroutine body scope" — without this
+    /// flag every top-level `let`/`var` in such a body declared a GLOBAL, shared
+    /// across concurrent activations of the same function.
+    pub is_module: bool,
 }
 
 /// A non-local control signal. `Break`/`Continue` carry the optional loop label
@@ -462,6 +468,12 @@ pub struct JsHost {
     /// The in-flight thrown value, if any (JS `throw`).
     pub exc: Option<Value>,
     pub signal: Option<Signal>,
+    /// Promises that settled REJECTED this tick. Drained at each microtask
+    /// checkpoint: any still without a handler is an unhandled rejection.
+    pub pending_rejections: Vec<u32>,
+    /// `process.on(event, fn)` listeners, by event name. Only the events the
+    /// runtime actually emits (`unhandledRejection`) can fire.
+    pub process_listeners: IndexMap<String, Vec<Value>>,
     /// The canonical `null` handle (allocated once).
     null_val: Value,
     /// `[[Prototype]]` link per heap object, by heap index. Absent = default
@@ -598,6 +610,14 @@ struct GenCell {
     /// coroutine yielder: `await` wraps its operand in an await marker so the
     /// driver can tell an internal suspension from a real yield.
     async_gen: bool,
+    /// `[[AsyncGeneratorQueue]]` — pending `.next(v)` requests as
+    /// `(sent value, step promise id)`. ECMA-262 27.6.3.6 keeps this queue so
+    /// overlapping `.next()` calls resume the body ONE AT A TIME and settle in
+    /// request order; without it a second `.next()` issued before the first
+    /// settles races past it and the results arrive swapped.
+    queue: std::collections::VecDeque<(Value, u32)>,
+    /// True while a queued request is being driven.
+    running: bool,
 }
 
 /// A forced completion pushed into a suspended generator by `.return()`/`.throw()`.
@@ -663,10 +683,13 @@ impl JsHost {
                 home_class: None,
                 line: 0,
                 owner: None,
+                is_module: true,
             }],
             error: None,
             exc: None,
             signal: None,
+            pending_rejections: Vec::new(),
+            process_listeners: IndexMap::new(),
             null_val: Value::Undef,
             protos: HashMap::new(),
             null_proto_objs: HashSet::new(),
@@ -922,9 +945,7 @@ impl JsHost {
     /// Whether own property `owner[key]` shows up in `for-in`/`Object.keys`.
     /// Internal slots (`@@…`) and private class fields (`#…`) never do.
     pub fn is_enumerable(&self, owner: &Value, key: &str) -> bool {
-        !key.starts_with("@@")
-            && !key.starts_with('#')
-            && self.prop_attrs(owner, key).enumerable
+        !key.starts_with("@@") && !key.starts_with('#') && self.prop_attrs(owner, key).enumerable
     }
 
     /// Mark `owner[key]` non-enumerable, leaving it writable/configurable — the
@@ -1201,7 +1222,7 @@ impl JsHost {
     /// a block scope is open the binding belongs to that block.
     pub fn declare_name(&mut self, name: &str, val: Value) {
         let f = self.frame();
-        if self.frames.len() == 1 && Rc::ptr_eq(&f.env, &f.base_env) {
+        if f.is_module && Rc::ptr_eq(&f.env, &f.base_env) {
             self.globals.insert(name.to_string(), val);
         } else {
             self.cur_env()
@@ -1214,7 +1235,7 @@ impl JsHost {
     /// Declare a `var` (or a hoisted function declaration): FUNCTION-scoped, so it
     /// skips every open block scope and lands in the activation's base env.
     pub fn declare_var_name(&mut self, name: &str, val: Value) {
-        if self.frames.len() == 1 {
+        if self.frame().is_module {
             self.globals.insert(name.to_string(), val);
             return;
         }
@@ -1835,11 +1856,8 @@ impl JsHost {
                         _ => Vec::new(),
                     };
                     const MAX: usize = 50;
-                    let shown: Vec<String> = bytes
-                        .iter()
-                        .take(MAX)
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
+                    let shown: Vec<String> =
+                        bytes.iter().take(MAX).map(|b| format!("{b:02x}")).collect();
                     let mut out = format!("<Buffer {}", shown.join(" "));
                     if bytes.len() > MAX {
                         let more = bytes.len() - MAX;
@@ -1862,13 +1880,11 @@ impl JsHost {
                         .into_iter()
                         .filter(|k| k != "name")
                         .map(|k| {
-                            let val = self.fn_prop(v, &k).unwrap_or_else(|| {
-                                match self.get(v) {
-                                    Some(JsObj::Object(p)) => {
-                                        p.get(&k).cloned().unwrap_or(Value::Undef)
-                                    }
-                                    _ => Value::Undef,
+                            let val = self.fn_prop(v, &k).unwrap_or_else(|| match self.get(v) {
+                                Some(JsObj::Object(p)) => {
+                                    p.get(&k).cloned().unwrap_or(Value::Undef)
                                 }
+                                _ => Value::Undef,
                             });
                             format!("{}: {}", fmt_key(&k), self.inspect_lvl(&val, indent + 2))
                         })
@@ -2732,7 +2748,11 @@ impl JsHost {
             }
             // A `Buffer` iterates over its BYTES (it is a Uint8Array in Node).
             Some(JsObj::Object(props)) if props.contains_key("@@bytes") => {
-                match props.get("@@bytes").cloned().and_then(|b| self.get(&b).cloned()) {
+                match props
+                    .get("@@bytes")
+                    .cloned()
+                    .and_then(|b| self.get(&b).cloned())
+                {
                     Some(JsObj::Array(items)) => Ok(items),
                     _ => Ok(Vec::new()),
                 }
@@ -2835,25 +2855,29 @@ impl JsHost {
         self.own_enum_key_names(v)
             .into_iter()
             .map(|k| {
-                let val = match self.get(v) {
-                    // A Buffer's index keys read out of the hidden `@@bytes`
-                    // array; resolve inline rather than through
-                    // `buffer::byte_get`, which would re-borrow the host.
-                    Some(JsObj::Object(props)) => props.get(&k).cloned().unwrap_or_else(|| {
-                        match (props.get("@@bytes").and_then(|b| self.get(b)), k.parse::<usize>()) {
-                            (Some(JsObj::Array(items)), Ok(i)) => {
-                                items.get(i).cloned().unwrap_or(Value::Undef)
+                let val =
+                    match self.get(v) {
+                        // A Buffer's index keys read out of the hidden `@@bytes`
+                        // array; resolve inline rather than through
+                        // `buffer::byte_get`, which would re-borrow the host.
+                        Some(JsObj::Object(props)) => props.get(&k).cloned().unwrap_or_else(|| {
+                            match (
+                                props.get("@@bytes").and_then(|b| self.get(b)),
+                                k.parse::<usize>(),
+                            ) {
+                                (Some(JsObj::Array(items)), Ok(i)) => {
+                                    items.get(i).cloned().unwrap_or(Value::Undef)
+                                }
+                                _ => Value::Undef,
                             }
-                            _ => Value::Undef,
-                        }
-                    }),
-                    Some(JsObj::Array(items)) => k
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|i| items.get(i).cloned())
-                        .unwrap_or(Value::Undef),
-                    _ => Value::Undef,
-                };
+                        }),
+                        Some(JsObj::Array(items)) => k
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| items.get(i).cloned())
+                            .unwrap_or(Value::Undef),
+                        _ => Value::Undef,
+                    };
                 (k, val)
             })
             .collect()
@@ -3119,6 +3143,7 @@ pub fn run_user_func_nt(
             home_class: home,
             line: 0,
             owner: Some(def.name.clone()),
+            is_module: false,
         })
     });
     let r = run_chunk_on(def.chunk.clone());
@@ -3635,6 +3660,7 @@ fn make_generator(
         home_class: home,
         line: 0,
         owner: None,
+        is_module: false,
     };
     let id = with_host(|h| {
         let id = h.generators.len() as u32;
@@ -3649,6 +3675,8 @@ fn make_generator(
             started: false,
             inject: None,
             async_gen: false,
+            queue: std::collections::VecDeque::new(),
+            running: false,
         });
         id
     });
@@ -3897,19 +3925,24 @@ pub fn async_step(iterator: &Value) -> Result<Value, String> {
     // An `async function*` object: resume it through the await-aware driver.
     if let Some(JsObj::Generator { id }) = with_host(|h| h.get(iterator).cloned()) {
         if with_host(|h| h.generators[id as usize].async_gen) {
-            return Ok(async_gen_step(iterator));
+            return Ok(async_gen_step(iterator, Value::Undef));
         }
     }
     // Sync-fallback iterator: drive it here, awaiting each yielded value.
     if let Some(JsObj::Iter { items, idx }) = with_host(|h| h.get(iterator).cloned()) {
         if idx >= items.len() {
-            let rec = with_host(|h| {
-                let mut m = IndexMap::new();
-                m.insert("value".to_string(), Value::Undef);
-                m.insert("done".to_string(), Value::Bool(true));
-                h.new_object(m)
+            // `AsyncFromSyncIteratorContinuation` resolves the record THROUGH a
+            // promise even at exhaustion, so the `done: true` step costs the same
+            // two microtask ticks a value step does.
+            let step = with_host(|h| h.new_promise());
+            let sid = with_host(|h| h.promise_id(&step).unwrap());
+            with_host(|h| {
+                h.queue_micro_native(Box::new(move || {
+                    resolve_promise_val(sid, iter_record(Value::Undef, true));
+                    Ok(())
+                }))
             });
-            return Ok(promise_of(&rec));
+            return Ok(step);
         }
         let raw = items[idx].clone();
         with_host(|h| {
@@ -3928,13 +3961,7 @@ pub fn async_step(iterator: &Value) -> Result<Value, String> {
                 if state == PromiseState::Rejected {
                     reject_promise_val(sid, val);
                 } else {
-                    let rec = with_host(|h| {
-                        let mut m = IndexMap::new();
-                        m.insert("value".to_string(), val.clone());
-                        m.insert("done".to_string(), Value::Bool(false));
-                        h.new_object(m)
-                    });
-                    resolve_promise_val(sid, rec);
+                    resolve_promise_val(sid, iter_record(val, false));
                 }
                 Ok(())
             }),
@@ -4457,10 +4484,12 @@ pub fn run_event_loop() -> Result<(), String> {
 
 fn drive_event_loop(rx: Option<&Receiver<IoTask>>) -> Result<(), String> {
     loop {
-        // 1) Exhaust the microtask queue (nextTick before promise reactions).
+        // 1) Exhaust the microtask queue (nextTick before promise reactions),
+        //    then report anything that rejected with nobody watching.
         while let Some(task) = with_host(|h| h.next_microtask()) {
             task.run()?;
         }
+        check_unhandled_rejections()?;
 
         if with_host(|h| h.open_handles()) == 0 {
             // ── virtual-clock regime (unchanged behavior) ────────────────────
@@ -4554,13 +4583,11 @@ pub fn await_value(awaited: Value) -> Result<Value, String> {
     // yielder, so an awaited value has to be tagged or the driver would hand it
     // to the consumer as if the body had yielded it.
     let awaited = match CUR_GEN.with(|c| c.get()) {
-        Some(id) if with_host(|h| h.generators[id as usize].async_gen) => {
-            with_host(|h| {
-                let mut m = IndexMap::new();
-                m.insert(AWAIT_MARKER.to_string(), awaited);
-                h.new_object(m)
-            })
-        }
+        Some(id) if with_host(|h| h.generators[id as usize].async_gen) => with_host(|h| {
+            let mut m = IndexMap::new();
+            m.insert(AWAIT_MARKER.to_string(), awaited);
+            h.new_object(m)
+        }),
         _ => awaited,
     };
     let packet = gen_yield(awaited)?;
@@ -4592,26 +4619,65 @@ fn await_marker(v: &Value) -> Option<Value> {
 /// One `.next()` of an `async function*`: resume the body, transparently settling
 /// every internal `await` suspension, and resolve with the `{value, done}` record
 /// of the first REAL yield (or the body's completion).
-fn async_gen_step(gen: &Value) -> Value {
+pub fn async_gen_step(gen: &Value, send: Value) -> Value {
     let step = with_host(|h| h.new_promise());
     let sid = with_host(|h| h.promise_id(&step).unwrap());
-    drive_async_gen(gen.clone(), sid, Value::Undef);
+    let id = match with_host(|h| h.get(gen).cloned()) {
+        Some(JsObj::Generator { id }) => id,
+        _ => return step,
+    };
+    with_host(|h| h.generators[id as usize].queue.push_back((send, sid)));
+    pump_async_gen(gen.clone(), id);
     step
 }
 
+/// `AsyncGeneratorResumeNext`: start the oldest queued request, unless one is
+/// already in flight (the body may only be resumed by one request at a time).
+fn pump_async_gen(gen: Value, id: u32) {
+    if with_host(|h| h.generators[id as usize].running) {
+        return;
+    }
+    let Some((send, sid)) = with_host(|h| h.generators[id as usize].queue.pop_front()) else {
+        return;
+    };
+    with_host(|h| h.generators[id as usize].running = true);
+    drive_async_gen(gen, sid, send);
+}
+
+/// One request has settled: release the body and start the next queued request.
+fn finish_async_gen_step(gen: Value, id: u32) {
+    with_host(|h| h.generators[id as usize].running = false);
+    pump_async_gen(gen, id);
+}
+
+/// Whether `v` is an `async function*` object (its `.next()` yields promises).
+pub fn is_async_generator(v: &Value) -> bool {
+    match with_host(|h| h.get(v).cloned()) {
+        Some(JsObj::Generator { id }) => with_host(|h| h.generators[id as usize].async_gen),
+        _ => false,
+    }
+}
+
+/// A `{ value, done }` iterator-result object.
+fn iter_record(value: Value, done: bool) -> Value {
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("value".to_string(), value);
+        m.insert("done".to_string(), Value::Bool(done));
+        h.new_object(m)
+    })
+}
+
 fn drive_async_gen(gen: Value, sid: u32, send: Value) {
-    let iter_record = |value: Value, done: bool| {
-        with_host(|h| {
-            let mut m = IndexMap::new();
-            m.insert("value".to_string(), value);
-            m.insert("done".to_string(), Value::Bool(done));
-            h.new_object(m)
-        })
+    let id = match with_host(|h| h.get(&gen).cloned()) {
+        Some(JsObj::Generator { id }) => id,
+        _ => return,
     };
     match gen_resume(&gen, send) {
         Ok(GenStep::Yield(v)) => match await_marker(&v) {
             Some(awaited) => {
-                // An internal `await`: settle it, then resume the body.
+                // An internal `await`: settle it, then resume the body. The
+                // request stays in flight across the suspension.
                 let ap = promise_of(&awaited);
                 let aid = with_host(|h| h.promise_id(&ap).unwrap());
                 subscribe_native(
@@ -4628,12 +4694,34 @@ fn drive_async_gen(gen: Value, sid: u32, send: Value) {
                     }),
                 );
             }
-            None => resolve_promise_val(sid, iter_record(v, false)),
+            // ECMA-262 27.6.3.8 AsyncGeneratorYield step 5: the yielded value is
+            // AWAITED before the step promise settles, so `yield somePromise`
+            // hands the consumer the RESOLVED value (and costs its microtask).
+            None => {
+                let yp = promise_of(&v);
+                let yid = with_host(|h| h.promise_id(&yp).unwrap());
+                subscribe_native(
+                    yid,
+                    Box::new(move |state, val| {
+                        if state == PromiseState::Rejected {
+                            reject_promise_val(sid, val);
+                        } else {
+                            resolve_promise_val(sid, iter_record(val, false));
+                        }
+                        finish_async_gen_step(gen.clone(), id);
+                        Ok(())
+                    }),
+                );
+            }
         },
-        Ok(GenStep::Done(v)) => resolve_promise_val(sid, iter_record(v, true)),
+        Ok(GenStep::Done(v)) => {
+            resolve_promise_val(sid, iter_record(v, true));
+            finish_async_gen_step(gen, id);
+        }
         Err(e) => {
             let ev = take_exc_or_error(&e);
             reject_promise_val(sid, ev);
+            finish_async_gen_step(gen, id);
         }
     }
 }
@@ -4653,6 +4741,9 @@ pub fn promise_of(v: &Value) -> Value {
 /// Register a native reaction on promise `id` (schedules immediately if already
 /// settled).
 pub fn subscribe_native(id: u32, f: Box<dyn FnOnce(PromiseState, Value) -> Result<(), String>>) {
+    // A native continuation (`await`, promise adoption, `for await`) observes a
+    // rejection exactly as a `.catch` does, so it is not "unhandled".
+    with_host(|h| h.promise_mark_handled(id));
     let state = with_host(|h| h.promise_state(id));
     if state == PromiseState::Pending {
         with_host(|h| h.add_reaction(id, PromiseReaction::Native(f)));
@@ -4677,26 +4768,108 @@ pub fn resolve_promise_val(id: u32, value: Value) {
             reject_promise_val(id, e);
             return;
         }
-        subscribe_native(
-            vid,
-            Box::new(move |state, val| {
-                with_host(|h| h.settle_promise(id, state, val.clone()));
-                schedule_reactions(id);
+        // A native promise is still a thenable, so the spec routes it through
+        // `NewPromiseResolveThenableJob` too — one microtask before the adoption
+        // is even registered. (`await` does NOT pay this: V8's await optimization
+        // subscribes to a native promise directly, which `await_value` mirrors.)
+        with_host(|h| {
+            h.queue_micro_native(Box::new(move || {
+                subscribe_native(
+                    vid,
+                    Box::new(move |state, val| {
+                        with_host(|h| h.settle_promise(id, state, val.clone()));
+                        schedule_reactions(id);
+                        Ok(())
+                    }),
+                );
                 Ok(())
-            }),
-        );
+            }))
+        });
+        return;
+    }
+    // ECMA-262 27.2.1.3.2: any OBJECT carrying a callable `then` is assimilated
+    // through a dedicated job — the promise adopts what `then` reports, it is
+    // never fulfilled WITH the thenable itself.
+    if let Some(then) = thenable_then(&value) {
+        with_host(|h| {
+            h.queue_micro_native(Box::new(move || resolve_thenable_job(id, value, then)))
+        });
         return;
     }
     with_host(|h| h.settle_promise(id, PromiseState::Fulfilled, value));
     schedule_reactions(id);
 }
 
+/// `value.then` if `value` is an object with a callable `then` — the test that
+/// makes a value a *thenable*. Primitives (and objects without one) are `None`.
+fn thenable_then(value: &Value) -> Option<Value> {
+    if !with_host(|h| matches!(h.get(value), Some(JsObj::Object(_)))) {
+        return None;
+    }
+    let then = with_host(|h| lookup_chain(h, value, "then"))?;
+    with_host(|h| is_callable(h, &then)).then_some(then)
+}
+
+/// `NewPromiseResolveThenableJob`: hand the thenable this promise's own resolve /
+/// reject continuations and let it settle us. A throw out of `then` rejects.
+fn resolve_thenable_job(id: u32, thenable: Value, then: Value) -> Result<(), String> {
+    let res = with_host(|h| h.alloc(JsObj::Builtin(format!("@@presolve:{id}"))));
+    let rej = with_host(|h| h.alloc(JsObj::Builtin(format!("@@preject:{id}"))));
+    if let Err(e) = invoke(&then, vec![res, rej], Some(thenable)) {
+        let ev = take_exc_or_error(&e);
+        reject_promise_val(id, ev);
+    }
+    Ok(())
+}
+
 pub fn reject_promise_val(id: u32, value: Value) {
     if with_host(|h| h.promise_state(id)) != PromiseState::Pending {
         return;
     }
-    with_host(|h| h.settle_promise(id, PromiseState::Rejected, value));
+    with_host(|h| {
+        h.settle_promise(id, PromiseState::Rejected, value);
+        h.pending_rejections.push(id);
+    });
     schedule_reactions(id);
+}
+
+/// Report every promise that settled rejected since the last checkpoint and
+/// still has no handler. Node's default is `--unhandled-rejections=throw`: the
+/// rejection becomes an uncaught exception (stderr + exit 1) unless a
+/// `process.on('unhandledRejection')` listener takes it.
+fn check_unhandled_rejections() -> Result<(), String> {
+    loop {
+        let ids: Vec<u32> = with_host(|h| std::mem::take(&mut h.pending_rejections));
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for id in ids {
+            let unhandled = with_host(|h| {
+                h.promise_state(id) == PromiseState::Rejected && !h.promises[id as usize].handled
+            });
+            if !unhandled {
+                continue;
+            }
+            // Report each promise at most once, however many checkpoints pass.
+            with_host(|h| h.promise_mark_handled(id));
+            let val = with_host(|h| h.promise_value(id));
+            let listeners = with_host(|h| {
+                h.process_listeners
+                    .get("unhandledRejection")
+                    .cloned()
+                    .unwrap_or_default()
+            });
+            if listeners.is_empty() {
+                let msg = with_host(|h| crate::builtins::error_string(h, &val));
+                with_host(|h| h.exc = Some(val));
+                return Err(msg);
+            }
+            let promise = with_host(|h| h.alloc(JsObj::Promise { id }));
+            for f in listeners {
+                invoke(&f, vec![val.clone(), promise.clone()], None)?;
+            }
+        }
+    }
 }
 
 /// Drain a settled promise's reactions into microtasks.

@@ -945,7 +945,11 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, break_target);
         }
+        // Every exit path above has already closed and dropped THIS loop's
+        // iterator, so a signal re-dispatched here must not count it as live.
+        self.iter_depth -= 1;
         self.redispatch_after_loop(b);
+        self.iter_depth += 1;
         Ok(())
     }
 
@@ -2022,13 +2026,7 @@ impl Compiler {
     }
 
     /// Raise a `break`/`continue` whose target loop is outside this chunk.
-    fn emit_signal_jump(
-        &mut self,
-        b: &mut ChunkBuilder,
-        op: u16,
-        label: Option<&str>,
-        line: u32,
-    ) {
+    fn emit_signal_jump(&mut self, b: &mut ChunkBuilder, op: u16, label: Option<&str>, line: u32) {
         self.name_const(b, label.unwrap_or(""));
         b.emit(Op::CallBuiltin(op, 1), line);
         b.emit(Op::Pop, line);
@@ -2042,48 +2040,82 @@ impl Compiler {
     /// propagating.
     fn emit_signal_dispatch(&mut self, b: &mut ChunkBuilder) {
         // `break` lands on the innermost enclosing context, `continue` on the
-        // innermost one that catches it (a `switch` in between catches neither).
-        // Both must live in THIS chunk, otherwise the signal has to keep travelling.
-        let brk = self.loops.len().checked_sub(1).filter(|i| *i >= self.chunk_loop_base);
+        // innermost one that CATCHES it — a `switch` catches `break` but not
+        // `continue`, so the two targets are resolved INDEPENDENTLY. Either may be
+        // absent from this chunk, in which case a signal of that kind keeps
+        // travelling outward. (`cont` implies `brk`: a continue-catching loop is
+        // itself breakable, so it can never sit above the innermost context.)
+        let brk = self
+            .loops
+            .len()
+            .checked_sub(1)
+            .filter(|i| *i >= self.chunk_loop_base);
         let cont = self
             .loops
             .iter()
             .rposition(|c| c.catches_continue)
             .filter(|i| *i >= self.chunk_loop_base);
-        let (Some(idx), Some(cont_idx)) = (brk, cont) else {
-            self.name_const(b, unwind::NO_LOOP);
-            b.emit(Op::CallBuiltin(ops::SIG_UNWIND, 1), 0);
+        let tag_of = |i: Option<usize>, loops: &[LoopCtx]| match i {
+            Some(i) => loops[i]
+                .label
+                .clone()
+                .unwrap_or_else(|| unwind::PLAIN_LOOP.to_string()),
+            None => unwind::NO_LOOP.to_string(),
+        };
+        let brk_tag = tag_of(brk, &self.loops);
+        let cont_tag = tag_of(cont, &self.loops);
+        self.name_const(b, &brk_tag);
+        self.name_const(b, &cont_tag);
+        b.emit(Op::CallBuiltin(ops::SIG_UNWIND, 2), 0); // [code]
+        let Some(idx) = brk else {
+            // Nothing in this chunk can catch the signal; `SIG_UNWIND` already
+            // halted the chunk, so just drop its code.
             b.emit(Op::Pop, 0);
             return;
         };
-        let tag = match &self.loops[idx].label {
-            Some(l) => l.clone(),
-            None => unwind::PLAIN_LOOP.to_string(),
-        };
-        self.name_const(b, &tag);
-        b.emit(Op::CallBuiltin(ops::SIG_UNWIND, 1), 0); // [code]
         b.emit(Op::Dup, 0);
         b.emit(Op::LoadInt(unwind::BREAK), 0);
         b.emit(Op::CallBuiltin(ops::STRICT_EQ, 2), 0);
         let jb = b.emit(Op::JumpIfTrue(0), 0);
-        b.emit(Op::Dup, 0);
-        b.emit(Op::LoadInt(unwind::CONTINUE), 0);
-        b.emit(Op::CallBuiltin(ops::STRICT_EQ, 2), 0);
-        let jc = b.emit(Op::JumpIfTrue(0), 0);
+        let jc = cont.map(|_| {
+            b.emit(Op::Dup, 0);
+            b.emit(Op::LoadInt(unwind::CONTINUE), 0);
+            b.emit(Op::CallBuiltin(ops::STRICT_EQ, 2), 0);
+            b.emit(Op::JumpIfTrue(0), 0)
+        });
         b.emit(Op::Pop, 0); // no signal: drop the code and fall through
         let jafter = b.emit(Op::Jump(0), 0);
+        // The landing pads leave every block scope and iterator opened between
+        // here and the target, exactly as the plain compiler-resolved `break` /
+        // `continue` does. Skipping this leaked a scope onto the frame, so the
+        // NEXT `let`/`const` at that level bound in a dead child env and became
+        // invisible to any closure created afterwards.
+        let (brk_scope, brk_iter) = (self.loops[idx].break_depth, self.loops[idx].iter_depth);
         let brk_land = b.current_pos();
         b.emit(Op::Pop, 0);
+        self.emit_unwind_scopes(b, brk_scope);
+        self.emit_close_iters(b, brk_iter);
         let brk_jump = b.emit(Op::Jump(0), 0);
-        let cont_land = b.current_pos();
-        b.emit(Op::Pop, 0);
-        let cont_jump = b.emit(Op::Jump(0), 0);
+        let cont_jump = jc.map(|_| {
+            let (cs, ci) = cont
+                .map(|i| (self.loops[i].continue_depth, self.loops[i].iter_depth))
+                .unwrap_or((self.scope_depth, self.iter_depth));
+            let cont_land = b.current_pos();
+            b.emit(Op::Pop, 0);
+            self.emit_unwind_scopes(b, cs);
+            self.emit_close_iters(b, ci);
+            (cont_land, b.emit(Op::Jump(0), 0))
+        });
         let after = b.current_pos();
         b.patch_jump(jb, brk_land);
-        b.patch_jump(jc, cont_land);
+        if let (Some(jc), Some((cont_land, _))) = (jc, cont_jump) {
+            b.patch_jump(jc, cont_land);
+        }
         b.patch_jump(jafter, after);
         self.loops[idx].breaks.push(brk_jump);
-        self.loops[cont_idx].continues.push(cont_jump);
+        if let (Some(cont_idx), Some((_, cj))) = (cont, cont_jump) {
+            self.loops[cont_idx].continues.push(cj);
+        }
     }
 
     fn emit_optional_guard(&mut self, b: &mut ChunkBuilder) -> usize {
@@ -2125,7 +2157,7 @@ impl Compiler {
             b.emit(Op::Dup, 0); // [recv, recv]
             self.name_const(b, property); // [recv, recv, name]
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [recv, fn]
-            // Nullish callee: drop both the method and the receiver.
+                                                         // Nullish callee: drop both the method and the receiver.
             b.emit(Op::Dup, 0);
             b.emit(Op::CallBuiltin(ops::NULLISH, 1), 0);
             let jlive = b.emit(Op::JumpIfFalse(0), 0);

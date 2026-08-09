@@ -26,7 +26,7 @@ use std::path::PathBuf;
 /// v2: BigInt/RegExp/tagged-template/for-await lowering — new builtin ops
 ///     (MKBIGINT/MKREGEX/NUM_STEP/TAG_TMPL/…) and the type-preserving `++`/`--`
 ///     codegen; old cached bytecode would run the stale POS-based increment.
-const SCHEMA: u64 = 2;
+const SCHEMA: u64 = 5;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

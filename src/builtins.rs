@@ -1603,34 +1603,52 @@ fn b_sig_continue(vm: &mut VM, _: u8) -> Value {
 /// * a LABELED `break`/`continue` for some outer loop → report `BREAK` but leave
 ///   the signal pending, so leaving this loop re-dispatches it one level out.
 fn b_sig_unwind(vm: &mut VM, _: u8) -> Value {
-    let tag = sval(&vm.pop());
+    let cont_tag = sval(&vm.pop());
+    let brk_tag = sval(&vm.pop());
     let sig = match with_host(|h| h.signal.clone()) {
         Some(s) => s,
         None => return Value::Int(host::unwind::NONE),
     };
-    let (label, code) = match &sig {
-        host::Signal::Return(_) => {
-            vm.ip = vm.chunk.ops.len();
-            return Value::Int(host::unwind::NONE);
-        }
-        host::Signal::Break(l) => (l.clone(), host::unwind::BREAK),
-        host::Signal::Continue(l) => (l.clone(), host::unwind::CONTINUE),
-    };
-    if tag == host::unwind::NO_LOOP {
+    // Nothing in this chunk can catch a `break`: halt so the signal keeps going.
+    let propagate = |vm: &mut VM| {
         vm.ip = vm.chunk.ops.len();
-        return Value::Int(host::unwind::NONE);
-    }
-    let targets_this_loop = match &label {
-        None => true, // unlabeled: always the innermost enclosing loop
-        Some(l) => tag == *l,
+        Value::Int(host::unwind::NONE)
     };
-    if targets_this_loop {
-        with_host(|h| h.signal = None);
-        Value::Int(code)
-    } else {
-        // Some outer labeled loop: leave this one via its break exit, keeping the
-        // signal pending for the next dispatch point.
-        Value::Int(host::unwind::BREAK)
+    match &sig {
+        host::Signal::Return(_) => propagate(vm),
+        host::Signal::Break(label) => {
+            if brk_tag == host::unwind::NO_LOOP {
+                return propagate(vm);
+            }
+            let mine = match label {
+                None => true, // unlabeled: always the innermost enclosing context
+                Some(l) => brk_tag == *l,
+            };
+            if mine {
+                with_host(|h| h.signal = None);
+            }
+            // Not ours: still leave this context by its break exit, keeping the
+            // signal pending for the next dispatch point one level out.
+            Value::Int(host::unwind::BREAK)
+        }
+        host::Signal::Continue(label) => {
+            let mine = match label {
+                // Unlabeled `continue` binds to the innermost continue-catching
+                // loop — which a `switch` between here and it is NOT.
+                None => cont_tag != host::unwind::NO_LOOP,
+                Some(l) => cont_tag == *l,
+            };
+            if mine {
+                with_host(|h| h.signal = None);
+                return Value::Int(host::unwind::CONTINUE);
+            }
+            if brk_tag == host::unwind::NO_LOOP {
+                return propagate(vm);
+            }
+            // The target loop is further out: exit the innermost context here and
+            // re-dispatch there.
+            Value::Int(host::unwind::BREAK)
+        }
     }
 }
 
@@ -1711,7 +1729,19 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
         match fres {
             Ok(_) => {
                 if with_host(|h| h.signal.is_none()) {
+                    // The finalizer completed normally: the try/catch block's own
+                    // abrupt completion resumes.
                     with_host(|h| h.signal = sig_before);
+                } else {
+                    // ECMA-262 14.15.3 TryStatement evaluation: when the finalizer's
+                    // completion is abrupt (`return`/`break`/`continue` inside
+                    // `finally`), that completion REPLACES the try/catch block's —
+                    // including a pending throw, which is discarded, not rethrown.
+                    pending = None;
+                    with_host(|h| {
+                        h.error = None;
+                        h.exc = None;
+                    });
                 }
             }
             Err(e) => pending = Some(e),
@@ -1800,7 +1830,8 @@ fn syscall_error_fields(message: &str) -> Vec<(&'static str, SysField)> {
         Some((c, r))
             if c.len() >= 2
                 && c.starts_with('E')
-                && c.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) =>
+                && c.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) =>
         {
             (c, r)
         }
@@ -3445,7 +3476,10 @@ fn apply_to_json(v: &Value, path: &mut Vec<Value>) -> Result<Value, String> {
     let has_to_json = with_host(|h| match host::lookup_chain(h, v, "toJSON") {
         Some(f) => host::is_callable(h, &f),
         None => false,
-    }) || tag.as_deref().map(crate::stdlib::has_to_json).unwrap_or(false);
+    }) || tag
+        .as_deref()
+        .map(crate::stdlib::has_to_json)
+        .unwrap_or(false);
     if has_to_json {
         let r = host::call_method(v, "toJSON", Vec::new())?;
         path.push(v.clone());
@@ -3779,7 +3813,10 @@ impl JsonParser {
         // V8 reports the whole input for the JS literals that are famously not
         // JSON, without naming an offending character.
         let whole: String = self.chars.iter().collect();
-        if matches!(whole.as_str(), "undefined" | "NaN" | "Infinity" | "-Infinity") {
+        if matches!(
+            whole.as_str(),
+            "undefined" | "NaN" | "Infinity" | "-Infinity"
+        ) {
             return format!("SyntaxError: \"{whole}\" is not valid JSON");
         }
         let snippet = if len <= MAX_WHOLE {
@@ -3795,18 +3832,6 @@ impl JsonParser {
         format!("SyntaxError: Unexpected token '{c}', {snippet} is not valid JSON")
     }
 
-    /// The error for whatever is (or is not) at `pos` where a value was needed:
-    /// end of input, a stray number, a stray string, or a bad token.
-    fn err_value(&self, pos: usize) -> String {
-        match self.chars.get(pos) {
-            None => "SyntaxError: Unexpected end of JSON input".into(),
-            Some(c) if c.is_ascii_digit() || *c == '-' => {
-                self.err_at("Unexpected number", pos)
-            }
-            Some('"') => self.err_at("Unexpected string", pos),
-            _ => self.err_token(pos),
-        }
-    }
     fn skip_ws(&mut self) {
         while matches!(
             self.peek(),
@@ -3969,11 +3994,7 @@ impl JsonParser {
                     self.pos += 1;
                     break;
                 }
-                _ => {
-                    return Err(
-                        self.err_at("Expected ',' or ']' after array element", self.pos)
-                    )
-                }
+                _ => return Err(self.err_at("Expected ',' or ']' after array element", self.pos)),
             }
         }
         Ok(with_host(|h| h.new_array(items)))
@@ -4018,11 +4039,7 @@ impl JsonParser {
                     self.pos += 1;
                     break;
                 }
-                _ => {
-                    return Err(
-                        self.err_at("Expected ',' or '}' after property value", self.pos)
-                    )
-                }
+                _ => return Err(self.err_at("Expected ',' or '}' after property value", self.pos)),
             }
         }
         Ok(with_host(|h| h.new_object(props)))
@@ -5691,6 +5708,29 @@ fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
 }
 
 fn generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // An `async function*` object's methods return PROMISES of the record, and
+    // its body has to be driven through the await-aware stepper (a plain
+    // `gen_resume` would surface an internal `await` suspension as a bogus yield).
+    if host::is_async_generator(recv) {
+        return match name {
+            "next" => Ok(host::async_gen_step(recv, arg0(&args))),
+            // `return`/`throw` unwind the body synchronously (any `await` inside a
+            // `finally` still suspends through the same driver), then report the
+            // completion as a settled promise.
+            "return" => {
+                let step = host::gen_return(recv, arg0(&args))?;
+                Ok(host::promise_of(&gen_step_record(step)))
+            }
+            "throw" => {
+                let step = host::gen_throw(recv, arg0(&args))?;
+                Ok(host::promise_of(&gen_step_record(step)))
+            }
+            "@@asyncIterator" => Ok(recv.clone()),
+            _ => Err(host::type_error(&format!(
+                "asyncGenerator.{name} is not a function"
+            ))),
+        };
+    }
     match name {
         "next" => {
             let send = arg0(&args);
@@ -5719,6 +5759,14 @@ fn generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value,
         _ => Err(host::type_error(&format!(
             "generator.{name} is not a function"
         ))),
+    }
+}
+
+/// The `{ value, done }` record for a generator step outcome.
+fn gen_step_record(step: host::GenStep) -> Value {
+    match step {
+        host::GenStep::Yield(v) => iter_result(v, false),
+        host::GenStep::Done(v) => iter_result(v, true),
     }
 }
 
@@ -5924,7 +5972,10 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
         Some(JsObj::Object(p))
             if p.get("@@native").map(|t| h.str_of(t)).as_deref() == Some("Buffer") =>
         {
-            match (p.get("@@bytes").and_then(|b| h.get(b)), key.parse::<usize>()) {
+            match (
+                p.get("@@bytes").and_then(|b| h.get(b)),
+                key.parse::<usize>(),
+            ) {
                 (Some(JsObj::Array(items)), Ok(i)) => items.get(i).cloned(),
                 _ => None,
             }
@@ -6135,7 +6186,6 @@ fn promise_reject(v: Value) -> Result<Value, String> {
     let p = with_host(|h| h.new_promise());
     let id = with_host(|h| h.promise_id(&p).unwrap());
     host::reject_promise_val(id, v);
-    with_host(|h| h.promise_mark_handled(id)); // avoid spurious unhandled noise
     Ok(p)
 }
 
@@ -6241,8 +6291,7 @@ fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
                         *r -= 1;
                         if *r == 0 {
                             // All rejected → AggregateError carrying every reason.
-                            let reasons =
-                                with_host(|h| h.new_array(errors.borrow().clone()));
+                            let reasons = with_host(|h| h.new_array(errors.borrow().clone()));
                             let msg = with_host(|h| h.new_str("All promises were rejected"));
                             let agg = make_error("AggregateError", &[reasons, msg]);
                             host::reject_promise_val(rid, agg);

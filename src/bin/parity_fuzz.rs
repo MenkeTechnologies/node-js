@@ -1082,7 +1082,10 @@ fn gen_freeze(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let op = pick(r, &["freeze", "seal", "preventExtensions"]);
     let lit = pick(r, &["{a: 1, b: 2}", "{x: 'v'}", "{}", "{n: 0, m: null}"]);
-    let mutation = pick(r, &["o.a = 9;", "o.fresh = 1;", "delete o.a;", "o.b = o.b;"]);
+    let mutation = pick(
+        r,
+        &["o.a = 9;", "o.fresh = 1;", "delete o.a;", "o.b = o.b;"],
+    );
     let e = match r.below(5) {
         0 => "JSON.stringify(o)",
         1 => "[Object.isFrozen(o), Object.isSealed(o), Object.isExtensible(o)]",
@@ -1145,7 +1148,13 @@ fn gen_error(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let ctor = pick(
         r,
-        &["Error", "TypeError", "RangeError", "SyntaxError", "EvalError"],
+        &[
+            "Error",
+            "TypeError",
+            "RangeError",
+            "SyntaxError",
+            "EvalError",
+        ],
     );
     let msg = pick(r, &["boom", "", "with spaces", "sym#1"]);
     let e = match r.below(9) {
@@ -1160,6 +1169,353 @@ fn gen_error(seed: u64) -> Vec<String> {
         _ => format!("(() => {{ const a = new AggregateError([new {ctor}('{msg}')], 'agg'); return [a.errors.length, a.message, JSON.stringify(Object.keys(a)), JSON.stringify(a)]; }})()"),
     };
     vec![format!("console.log({e});")]
+}
+
+// ---------------------------------------------------------------------------
+// Abrupt completions (`unwind` mode)
+// ---------------------------------------------------------------------------
+
+/// One abrupt statement drawn from the set legal at this emission site,
+/// optionally guarded so it fires on one iteration only. Two statements in the
+/// same template share a guard on purpose: the interesting cases are the ones
+/// where a `throw` and a `return`/`break` are live SIMULTANEOUSLY (a `finally`
+/// that completes abruptly DISCARDS a pending exception), which a generator that
+/// staggers them across iterations can never reach.
+fn abrupt(r: &mut Rng, kinds: &[&str], guard: Option<&str>) -> String {
+    let s = *pick(r, kinds);
+    match guard {
+        Some(g) => format!("if ({g}) {{ {s} }}"),
+        None => s.to_string(),
+    }
+}
+
+/// Wrap `body` in one loop. Every kind ADVANCES unconditionally (the `while` /
+/// `do-while` forms increment at the top of the body), so a generated `continue`
+/// — including one raised from a `finally` — can never spin forever.
+fn loop_wrap(kind: u64, var: &str, label: Option<&str>, n: u64, body: &str) -> String {
+    let lab = label.map(|l| format!("{l}: ")).unwrap_or_default();
+    // The body sits inside its own BLOCK SCOPE. A jump that leaves the loop from
+    // inside a `try` has to close that scope on the way out; if it does not, the
+    // frame is left in a dead child env and the scope-liveness tail catches it.
+    let body =
+        format!("{{ let z_{var} = 'z' + {var}; if (z_{var} === '') out.push(z_{var}); {body} }}");
+    match kind % 5 {
+        0 => format!("{lab}for (let {var} = 0; {var} < {n}; {var}++) {{ {body} }}"),
+        1 => format!("{lab}for (const {var} of [0, 1, 2, 3].slice(0, {n})) {{ {body} }}"),
+        2 => format!("{lab}for (const {var} in {{ 0: 'a', 1: 'b', 2: 'c' }}) {{ {body} }}"),
+        3 => format!("{{ let {var} = -1; {lab}while ({var} + 1 < {n}) {{ {var}++; {body} }} }}"),
+        _ => {
+            format!("{{ let {var} = -1; {lab}do {{ {var}++; {body} }} while ({var} + 1 < {n}); }}")
+        }
+    }
+}
+
+/// Abrupt-completion fuzzer: `break`/`continue` (labeled and unlabeled), `return`
+/// and `throw` crossing `for`/`for-of`/`for-in`/`while`/`do-while`, `switch`,
+/// labeled blocks, `try`, `catch` and `finally`, nested up to two loop levels —
+/// and, deliberately, the same shapes with NO enclosing loop at all, where the
+/// only catcher of a `break` is a `switch` or a labeled block.
+///
+/// Every construct appends to one `out` array and the program prints
+/// `out.join(',')`, so a mis-routed jump shows up as a WRONG OR TRUNCATED
+/// sequence rather than as a crash. An escaping `throw` is caught by an outer
+/// handler and recorded, keeping it on stdout where the comparison can see it.
+fn gen_unwind(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = 2 + r.below(3);
+    let k = r.below(n);
+    let guard = format!("String(j) === '{k}'");
+    let g = Some(guard.as_str());
+    // `step` is incremented BEFORE the switch, so `- 1` makes the first visit
+    // select `case 0` — where the interesting `try` bodies live.
+    let sw = "(step - 1) % 3";
+    // Abrupt statements by what encloses the emission site.
+    let in_loop: &[&str] = &["break;", "continue;", "throw new Error('E');"];
+    let in_loop2: &[&str] = &[
+        "break;",
+        "continue;",
+        "break L0;",
+        "continue L0;",
+        "throw new Error('E');",
+    ];
+    let in_fn_loop: &[&str] = &[
+        "break;",
+        "continue;",
+        "return 'R';",
+        "throw new Error('E');",
+    ];
+    // The loop-free templates decide UP FRONT whether they are wrapped in a
+    // function, because `return` outside one is a SyntaxError under `node -e`
+    // (which evaluates a Script, not a CommonJS module).
+    let wrapped = r.below(2) == 0;
+    // Template 9 always wraps, so `return` is unconditionally legal there.
+    let fn_ret_or_throw: &[&str] = &["throw new Error('E');", "return 'R';"];
+    let in_switch: &[&str] = if wrapped {
+        &["break;", "throw new Error('E');", "return 'R';"]
+    } else {
+        &["break;", "throw new Error('E');"]
+    };
+    let labeled: &[&str] = if wrapped {
+        &["break L0;", "throw new Error('E');", "return 'R';"]
+    } else {
+        &["break L0;", "throw new Error('E');"]
+    };
+
+    // Each template is `(body, needs_fn)`. `needs_fn` wraps it in an arrow so a
+    // generated `return` is legal and its value is observable.
+    let (body, needs_fn) = match r.below(10) {
+        // A loop whose body is try/catch/finally, both slots able to fire together.
+        0 => {
+            let a = abrupt(r, in_loop, g);
+            let b = abrupt(r, in_loop, g);
+            (
+                loop_wrap(
+                    r.next_u64(),
+                    "j",
+                    None,
+                    n,
+                    &format!(
+                        "step++; try {{ {a} out.push('t' + j); }} \
+                         catch (e) {{ out.push('c' + e.message); }} \
+                         finally {{ out.push('f' + j); {b} }}"
+                    ),
+                ),
+                false,
+            )
+        }
+        // …the same, inside a function, so `return` competes with the others.
+        1 => {
+            let a = abrupt(r, in_fn_loop, g);
+            let b = abrupt(r, in_fn_loop, g);
+            (
+                loop_wrap(
+                    r.next_u64(),
+                    "j",
+                    None,
+                    n,
+                    &format!(
+                        "step++; try {{ {a} out.push('t' + j); }} finally {{ out.push('f' + j); {b} }}"
+                    ),
+                ),
+                true,
+            )
+        }
+        // A `switch` inside a loop: `break` binds to the switch, `continue` skips it.
+        2 => {
+            let a = abrupt(r, in_loop, g);
+            let b = abrupt(r, in_loop, g);
+            (
+                loop_wrap(
+                    r.next_u64(),
+                    "j",
+                    None,
+                    n,
+                    &format!(
+                        "step++; switch ({sw}) {{ case 0: out.push('s0'); {a} \
+                         case 1: out.push('s1'); break; default: out.push('sd'); {b} }} \
+                         out.push('post' + j);"
+                    ),
+                ),
+                false,
+            )
+        }
+        // A `try` inside a `switch` inside a loop.
+        3 => {
+            let a = abrupt(r, in_loop, g);
+            let b = abrupt(r, in_loop, g);
+            (
+                loop_wrap(
+                    r.next_u64(),
+                    "j",
+                    None,
+                    n,
+                    &format!(
+                        "step++; switch ({sw}) {{ case 0: try {{ {a} out.push('a' + j); }} \
+                         finally {{ out.push('f' + j); {b} }} default: out.push('d' + j); }}"
+                    ),
+                ),
+                false,
+            )
+        }
+        // Two loop levels, the inner body carrying a try — labeled jumps cross both.
+        4 => {
+            let a = abrupt(r, in_loop2, g);
+            let b = abrupt(r, in_loop2, g);
+            let inner = loop_wrap(
+                r.next_u64(),
+                "j",
+                None,
+                n,
+                &format!(
+                    "step++; try {{ {a} out.push('t' + j); }} \
+                     catch (e) {{ out.push('c' + e.message); }} \
+                     finally {{ out.push('f' + j); {b} }}"
+                ),
+            );
+            (
+                loop_wrap(
+                    r.next_u64(),
+                    "i",
+                    Some("L0"),
+                    n,
+                    &format!("out.push('i' + i); {inner}"),
+                ),
+                false,
+            )
+        }
+        // Two loop levels with the labeled jump raised from a `switch` in the inner
+        // body — the `break` target (`switch`) and the `continue` target (the outer
+        // loop) are then DIFFERENT contexts.
+        5 => {
+            let a = abrupt(r, in_loop2, g);
+            let inner = loop_wrap(
+                r.next_u64(),
+                "j",
+                None,
+                n,
+                &format!(
+                    "step++; switch ({sw}) {{ case 0: try {{ {a} }} \
+                     finally {{ out.push('f' + j); }} default: out.push('d' + j); }}"
+                ),
+            );
+            (
+                loop_wrap(
+                    r.next_u64(),
+                    "i",
+                    Some("L0"),
+                    n,
+                    &format!("out.push('i' + i); {inner}"),
+                ),
+                false,
+            )
+        }
+        // NO enclosing loop: a bare `switch` whose case holds a `try`. The only
+        // context that can catch the `break` is the `switch` itself.
+        6 => {
+            let a = abrupt(r, in_switch, None);
+            let b = abrupt(r, in_switch, None);
+            (
+                format!(
+                    "const j = 0; step++; switch ({sw}) {{ case 0: try {{ {a} out.push('a'); }} \
+                     finally {{ out.push('f'); {b} }} out.push('post'); \
+                     default: out.push('d'); }}"
+                ),
+                wrapped,
+            )
+        }
+        // NO enclosing loop: a LABELED `switch`, exited by `break L0` from a `try`.
+        7 => {
+            let a = abrupt(r, labeled, None);
+            (
+                format!(
+                    "const j = 0; step++; L0: switch ({sw}) {{ case 0: try {{ {a} out.push('a'); }} \
+                     finally {{ out.push('f'); }} default: out.push('d'); }} out.push('end');"
+                ),
+                wrapped,
+            )
+        }
+        // NO enclosing loop: a labeled BLOCK exited from inside a `try`.
+        8 => {
+            let a = abrupt(r, labeled, None);
+            let b = abrupt(r, labeled, None);
+            (
+                format!(
+                    "const j = 0; L0: {{ try {{ {a} out.push('a'); }} \
+                     finally {{ out.push('f'); {b} }} out.push('post'); }} out.push('end');"
+                ),
+                wrapped,
+            )
+        }
+        // A `finally` that completes abruptly while an exception is pending — the
+        // case where the abrupt completion DISCARDS the throw.
+        _ => {
+            let a = abrupt(r, fn_ret_or_throw, None);
+            let b = abrupt(r, fn_ret_or_throw, None);
+            let inner = format!(
+                "try {{ out.push('t'); {a} }} finally {{ out.push('f'); {b} }} out.push('post');"
+            );
+            let shaped = match r.below(3) {
+                0 => inner,
+                1 => format!("try {{ {inner} }} catch (e) {{ out.push('c' + e.message); }}"),
+                _ => format!("try {{ {inner} }} finally {{ out.push('F'); }}"),
+            };
+            (format!("const j = 0; step++; {shaped}"), true)
+        }
+    };
+    let body = if needs_fn {
+        format!("const run = () => {{ {body} return 'end'; }}; out.push(run());")
+    } else {
+        body
+    };
+    vec![
+        "const out = []; let step = 0;".into(),
+        format!("try {{ {body} }} catch (e) {{ out.push('X' + e.message); }}"),
+        // Scope-liveness tail. A `break`/`continue` raised as a signal out of a
+        // `try` jumps straight to its target; if that jump does not close the
+        // block scopes it passed through, the frame is left standing in a dead
+        // child env and THIS `const` binds somewhere the closure below cannot
+        // see it. Without the tail the leak is invisible — the program still
+        // prints the right sequence.
+        "const tail = out.length; const probe = () => tail;".into(),
+        "console.log(out.join(',') + '|' + probe());".into(),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Promise resolution + async ordering (`thenable` mode)
+// ---------------------------------------------------------------------------
+
+/// Promise-resolution and async-iteration ORDERING fuzzer. Each case runs one
+/// async construct against a ruler of chained `.then` callbacks, so the printed
+/// interleaving encodes exactly how many microtask ticks the construct costs —
+/// the observable that separates a spec-faithful `PromiseResolveThenableJob` /
+/// `AsyncGeneratorYield` from a shortcut that settles a tick early.
+///
+/// Everything is deterministic: no timers, no wall clock, no identities.
+fn gen_thenable(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let ruler = 4 + r.below(6);
+    // The value an `await`/`then`/`yield` is handed. Each costs a different,
+    // spec-defined number of ticks.
+    let val = *pick(
+        r,
+        &[
+            "'v'",
+            "Promise.resolve('v')",
+            "{ then(res) { res('v'); } }",
+            "{ then(res) { Promise.resolve().then(() => res('v')); } }",
+            "(async () => 'v')()",
+            "Promise.resolve(Promise.resolve('v'))",
+        ],
+    );
+    let probe = match r.below(8) {
+        0 => format!("(async () => {{ log('a0'); log('a1:' + await ({val})); }})();"),
+        1 => format!("Promise.resolve().then(() => ({val})).then(v => log('t:' + v));"),
+        2 => format!("new Promise(res => res({val})).then(v => log('n:' + v));"),
+        3 => format!("Promise.resolve({val}).then(v => log('r:' + v));"),
+        4 => format!(
+            "(async function* () {{ yield {val}; yield 'w'; }})()[Symbol.asyncIterator]; \
+             (async () => {{ for await (const v of (async function* () {{ yield {val}; yield 'w'; }})()) log('g:' + v); log('gdone'); }})();"
+        ),
+        5 => format!(
+            "(async () => {{ for await (const v of [{val}, 'w']) log('l:' + v); log('ldone'); }})();"
+        ),
+        6 => format!(
+            "const it = (async function* () {{ yield {val}; }})(); \
+             it.next().then(s => log('s:' + s.value + ',' + s.done)); \
+             it.next().then(s => log('e:' + s.value + ',' + s.done));"
+        ),
+        _ => format!(
+            "(async () => {{ for await (const v of (function* () {{ yield {val}; yield 'w'; }})()) log('y:' + v); log('ydone'); }})();"
+        ),
+    };
+    vec![
+        "const log = s => console.log(s);".into(),
+        probe,
+        format!(
+            "let p = Promise.resolve(); for (let i = 1; i <= {ruler}; i++) {{ const n = i; p = p.then(() => log('p' + n)); }}"
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,6 +1550,8 @@ enum Mode {
     Identity,
     Clone,
     ErrorShape,
+    Unwind,
+    Thenable,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -1222,6 +1580,8 @@ const REAL_MODES: &[Mode] = &[
     Mode::Identity,
     Mode::Clone,
     Mode::ErrorShape,
+    Mode::Unwind,
+    Mode::Thenable,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1257,6 +1617,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Identity => gen_identity(seed),
         Mode::Clone => gen_clone(seed),
         Mode::ErrorShape => gen_error(seed),
+        Mode::Unwind => gen_unwind(seed),
+        Mode::Thenable => gen_thenable(seed),
     }
 }
 
@@ -1288,6 +1650,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Identity => "identity",
         Mode::Clone => "clone",
         Mode::ErrorShape => "error",
+        Mode::Unwind => "unwind",
+        Mode::Thenable => "thenable",
     }
 }
 
@@ -1318,6 +1682,8 @@ const ALL_MODES: &[Mode] = &[
     Mode::Identity,
     Mode::Clone,
     Mode::ErrorShape,
+    Mode::Unwind,
+    Mode::Thenable,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {
@@ -1618,6 +1984,14 @@ fn main() {
     let next = AtomicU64::new(0);
     let checked = AtomicU64::new(0);
     let timeouts = AtomicU64::new(0);
+    // Cases where the REFERENCE itself failed or printed nothing. Such a case
+    // compares two failures, so an "agreement" on it is worth nothing — a mode
+    // whose zero-divergence score is built on them is measuring nothing at all.
+    let oracle_failed = AtomicU64::new(0);
+    let oracle_silent = AtomicU64::new(0);
+    // An ORACLE timeout is not a comparison: the case is skipped, so a run full
+    // of them would otherwise report a clean zero. Counted on its own line.
+    let oracle_timeouts = AtomicU64::new(0);
     let stop = AtomicBool::new(false);
     let divergences: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let start = Instant::now();
@@ -1649,6 +2023,15 @@ fn main() {
                 let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
                 if o.timed_out || r.timed_out {
                     timeouts.fetch_add(1, Ordering::Relaxed);
+                }
+                if o.timed_out {
+                    oracle_timeouts.fetch_add(1, Ordering::Relaxed);
+                }
+                if !o.timed_out && o.exit != 0 {
+                    oracle_failed.fetch_add(1, Ordering::Relaxed);
+                }
+                if !o.timed_out && o.stdout.is_empty() {
+                    oracle_silent.fetch_add(1, Ordering::Relaxed);
                 }
                 // oracle-side timeout ⇒ pathological case; not a parity gap.
                 if !o.timed_out && differs(&o, &r) {
@@ -1750,11 +2133,16 @@ fn main() {
     }
 
     let oracle = oracle_id(&oracle);
+    let oracle_failed = oracle_failed.load(Ordering::Relaxed);
+    let oracle_silent = oracle_silent.load(Ordering::Relaxed);
     println!(
         "\nfuzzed {checked} cases in {:.1}s ({:.0}/s)\n\
          oracle      : {}\n\
          divergences : {} ({} known / {} new)\n\
-         timeouts    : {}",
+         timeouts    : {}\n\
+         ref timeout : {} (reference timed out — SKIPPED, never counted as agreement)\n\
+         ref failed  : {} (reference exited non-zero — those cases compare two failures)\n\
+         ref silent  : {} (reference printed nothing — no value was observed)",
         elapsed.as_secs_f64(),
         checked as f64 / elapsed.as_secs_f64().max(0.001),
         oracle,
@@ -1762,6 +2150,9 @@ fn main() {
         known,
         new_records.len(),
         timeouts,
+        oracle_timeouts.load(Ordering::Relaxed),
+        oracle_failed,
+        oracle_silent,
     );
 
     if !divergences.is_empty() {

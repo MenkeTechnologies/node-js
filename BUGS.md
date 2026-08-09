@@ -55,6 +55,62 @@ timers, promises or sockets, so `executionAsyncId()` inside a `setTimeout`/
 `.then` callback reports the root context (1), not a per-callback id, and
 `createHook` callbacks still never fire.
 
+## Promise resolution, async iteration and unhandled rejections
+
+- **Thenable assimilation.** Resolving a promise with any object carrying a
+  callable `then` adopts it through `NewPromiseResolveThenableJob`
+  (ECMA-262 27.2.1.3.2) instead of fulfilling WITH the object — so `new
+  Promise(r => r(thenable))`, `Promise.resolve(thenable)`, a `.then` handler
+  RETURNING a thenable, and `await thenable` all deliver the settled value. A
+  native promise is a thenable too, so `.then`-chaining one costs the same two
+  microtask ticks it does in V8; `await` keeps V8's one-tick fast path.
+- **`AsyncGeneratorYield` awaits.** `yield v` in an `async function*` awaits `v`
+  before the step promise settles, so `yield somePromise` hands the consumer the
+  RESOLVED value.
+- **`[[AsyncGeneratorQueue]]`.** Overlapping `.next()` calls on an async
+  generator queue and resume the body one at a time, so their results settle in
+  request order. `asyncGen.next()` returns a promise (it used to return a bare
+  `{value, done}` record, so `it.next().then(...)` threw).
+- **Unhandled rejections are fatal**, matching Node's default
+  `--unhandled-rejections=throw`: at each microtask checkpoint a promise that
+  settled rejected with no handler is reported on stderr and the process exits
+  non-zero. `process.on('unhandledRejection', fn)` intercepts it —
+  `process.on`/`once`/`off`/`removeListener`/`removeAllListeners`/`listeners`/
+  `emit` now keep a real listener table instead of discarding registrations.
+
+## Abrupt completions (`break` / `continue` / `return` / `throw`)
+
+A `try`/`catch`/`finally` body runs as its own chunk, so a jump leaving it
+travels as a signal that the instruction after the `TRY` re-dispatches. Three
+things that got wrong are now right, and are pinned by `tests/es_parity.rs` plus
+the fuzzer's `unwind` mode:
+
+- A `finally` that completes abruptly (`return`/`break`/`continue`) REPLACES the
+  try/catch block's completion, discarding a pending exception (14.15.3).
+- `break` and `continue` resolve their targets INDEPENDENTLY: a `switch` (or a
+  labeled block) catches `break` but not `continue`. Requiring both to exist in
+  the same chunk made a `break` out of a `try` inside a loop-free `switch` fall
+  through to "propagate outward", silently halting the program.
+- The signal's landing pad now closes the block scopes and for-of/for-in
+  iterators it jumps past, which the compiler-resolved `break`/`continue` always
+  did. A leaked scope left the frame standing in a dead child env, so the NEXT
+  `let`/`const` at that level bound somewhere later closures could not see
+  (`for (let i…) { let z = i; try { break; } finally {} } const f = 1;
+  function g() { return f; }` threw `ReferenceError: f is not defined`).
+- A coroutine body's own frame is now marked, so a top-level `let`/`var` inside
+  an `async` function or generator is a LOCAL. It used to be declared as a
+  global (the module frame was identified by frame COUNT, and a coroutine's
+  swapped-in context holds exactly one frame), so two interleaved activations of
+  the same async function shared one binding.
+
+## `node -e` evaluates a Script, not a CommonJS module
+
+Node wraps a `.js` FILE in the CommonJS wrapper, which makes a top-level `return`
+legal; under `-e` it evaluates a Script, where the same `return` is a
+`SyntaxError`. node-js accepts a top-level `return` in both, so `node -e
+'return'` exits 0 here and 1 in Node. Only the `-e` path differs; running a file
+matches.
+
 `err.stack` names the REAL call chain — one `    at <function>` line per live
 frame — but carries no `file:line:column` (per-frame line tracking is only
 enabled under `--dap`) and none of Node's internal module-loader frames. So
@@ -109,12 +165,19 @@ The blockers were NOT the ones previously guessed here. They were:
    `parameterCount` never advanced past the first `&` and rejected every
    urlencoded body with `parameters.too.many`.
 
-`Object.prototype.toString.call(buf)` is now `[object Uint8Array]` (and every
-other builtin exotic brands correctly), `ArrayBuffer.isView(buf)` is `true`, and
-`buf.byteLength`/`byteOffset`/`BYTES_PER_ELEMENT`/`set` exist. A `Buffer` is
-still a `@@native`-tagged object rather than a genuine `Uint8Array` subclass
-INSTANCE, so `Object.getPrototypeOf(buf) === Buffer.prototype` is `false`; no
-observed package depends on that identity.
+`Object.prototype.toString.call(buf)` is `[object Uint8Array]` (and every other
+builtin exotic brands correctly), `ArrayBuffer.isView(buf)` is `true`, and
+`buf.byteLength`/`byteOffset`/`BYTES_PER_ELEMENT`/`set` exist. A `Buffer` is a
+real `Uint8Array` subclass INSTANCE — see the Buffer section above; the earlier
+`@@native`-tagged approximation is gone.
+
+The end-to-end check for all of this is a live POST, not an assertion about
+prototypes: real `express.json()` reads the request body off the socket into a
+Buffer, hands it through `raw-body`/`iconv-lite` to `JSON.parse`, and the route
+echoes the PARSED OBJECT back. Under `node v26.7.0` and under node-js the same
+app answers `{"got":{"a":1,"b":[2,3],"c":"ü"},"keys":["a","b","c"],"isArr":false,
+"sum":2}` byte-for-byte, and `/raw` reports `isBuf: true, isU8: true, protoOk:
+true` for a body that came off the wire.
 
 
 node-js is JavaScript lowered to fusevm (bytecode VM + Cranelift JIT), with a
@@ -264,6 +327,31 @@ are **now supported** (see the Supported list above); verified against
 - **`.index` on non-BMP input.** `exec`/`match` report the match position as a
   Unicode *char* offset; JS uses UTF-16 code-unit offsets, so an astral-plane
   character before the match shifts the index by one. Identical on BMP text.
+## Collection iteration is O(n^2) — an UPSTREAM fusevm issue
+
+Per-element iteration over a JS array or a `Buffer` costs quadratic time. Measured
+on this machine with the debug build, summing every element of an array of `n`
+integers (`for-of` plus an indexed loop):
+
+| n | time |
+| --- | --- |
+| 2,000 | 0.36 s |
+| 4,000 | 1.34 s |
+| 8,000 | 5.25 s |
+| 16,000 | 20.83 s |
+
+Doubling `n` quadruples the time. An indexed `Buffer` read plus `toString('hex')`
+shows the same shape (0.04 / 0.13 / 0.42 / 1.52 s). The cause is not in node-js:
+`fusevm::Value::Array` holds a by-value `Vec<Value>`, so every load of the
+sequence deep-copies it. Fixing it needs an `Arc`-backed array in fusevm, which
+is shared by every frontend — node-js deliberately does NOT paper over it with a
+local caching layer.
+
+This does **not** affect `express.json()`: `body-parser` concatenates the socket
+chunks and hands a STRING to `JSON.parse`, so no per-byte JS loop runs. The same
+POST at 5.5 KB and at 98 KB (a 17.6x larger body) takes 0.040 s and 0.046 s —
+flat, not quadratic.
+
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
 

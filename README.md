@@ -172,8 +172,16 @@ the reference: float representation and the exponential-notation threshold,
 methods, `toFixed`/`toPrecision` rounding, JSON round-trips and parse-error
 messages, property descriptors and the enumeration surface that depends on them,
 `freeze`/`seal` write and `delete` outcomes, builtin identity and prototype-chain
-reads, `structuredClone`'s reference graph, and error own-property shape.
-Select one with `--mode <name>`.
+reads, `structuredClone`'s reference graph, error own-property shape, abrupt
+completions (`unwind`), and promise-resolution / async-iteration microtask
+ordering (`thenable`). Select one with `--mode <name>`.
+
+The run summary reports three counts next to the divergence total: **ref
+timeout** (the reference timed out, so the case is skipped entirely), **ref
+failed** (the reference exited non-zero) and **ref silent** (the reference
+printed nothing). All three are zero when every case is a real comparison; a
+mode scoring zero divergences while any of them is high is comparing failures,
+not behavior.
 
 ## [0x06] BUILD
 

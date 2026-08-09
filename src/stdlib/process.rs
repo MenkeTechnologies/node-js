@@ -94,9 +94,7 @@ pub fn emit_warning(name: &str, code: Option<&str>, message: &str, detail: Optio
     if let Some(d) = detail {
         msg.push_str(&std::format!("\n{d}"));
     }
-    if !trace
-        && !TRACE_HINT_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
+    if !trace && !TRACE_HINT_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
         let trace_flag = if is_deprecation {
             "--trace-deprecation"
         } else {
@@ -133,10 +131,9 @@ fn emit_warning_args(args: &[Value]) {
         Some(v) if with_host(|h| matches!(h.get(v), Some(JsObj::Object(_)))) => {
             let field = |k: &str| {
                 with_host(|h| match h.get(v) {
-                    Some(JsObj::Object(p)) => p
-                        .get(k)
-                        .filter(|x| !h.is_nullish(x))
-                        .map(|x| h.str_of(x)),
+                    Some(JsObj::Object(p)) => {
+                        p.get(k).filter(|x| !h.is_nullish(x)).map(|x| h.str_of(x))
+                    }
                     _ => None,
                 })
             };
@@ -201,13 +198,62 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         })),
         "umask" => Ok(Value::Float(0.0)),
         "binding" => Err(crate::host::type_error("process.binding is not supported")),
-        // EventEmitter-style registration is accepted and ignored (returns the
-        // process namespace so `.on(...).on(...)` chains work); no signals fire.
-        "on" | "once" | "off" | "addListener" | "removeListener" | "removeAllListeners" => {
+        // EventEmitter-style registration. Listeners are REMEMBERED (the runtime
+        // emits `unhandledRejection`; signals still never fire), and every form
+        // returns the process namespace so `.on(...).on(...)` chains work.
+        "on" | "once" | "addListener" => {
+            let (event, f) = (event_name(args), args.get(1).cloned());
+            if let Some(f) = f {
+                with_host(|h| h.process_listeners.entry(event).or_default().push(f));
+            }
             Ok(with_host(|h| h.alloc(JsObj::Builtin("process".into()))))
         }
-        "listeners" => Ok(with_host(|h| h.new_array(Vec::new()))),
-        "emit" => Ok(Value::Bool(false)),
+        "off" | "removeListener" => {
+            let (event, f) = (event_name(args), args.get(1).cloned());
+            if let Some(f) = f {
+                with_host(|h| {
+                    if let Some(l) = h.process_listeners.get_mut(&event) {
+                        if let Some(i) = l.iter().position(|x| x == &f) {
+                            l.remove(i);
+                        }
+                    }
+                });
+            }
+            Ok(with_host(|h| h.alloc(JsObj::Builtin("process".into()))))
+        }
+        "removeAllListeners" => {
+            let event = event_name(args);
+            with_host(|h| {
+                if event.is_empty() {
+                    h.process_listeners.clear();
+                } else {
+                    h.process_listeners.shift_remove(&event);
+                }
+            });
+            Ok(with_host(|h| h.alloc(JsObj::Builtin("process".into()))))
+        }
+        "listeners" => {
+            let event = event_name(args);
+            Ok(with_host(|h| {
+                let l = h.process_listeners.get(&event).cloned().unwrap_or_default();
+                h.new_array(l)
+            }))
+        }
+        "emit" => {
+            let event = event_name(args);
+            let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+            let listeners =
+                with_host(|h| h.process_listeners.get(&event).cloned().unwrap_or_default());
+            let any = !listeners.is_empty();
+            let mut r = Ok(Value::Bool(any));
+            for f in listeners {
+                if let Err(e) = crate::host::invoke(&f, rest.clone(), None) {
+                    r = Err(e);
+                    break;
+                }
+            }
+            r
+        }
         "emitWarning" => {
             emit_warning_args(args);
             Ok(Value::Undef)
@@ -665,4 +711,11 @@ fn load_env_file(path: &str) -> Result<Value, String> {
         std::env::set_var(key, val);
     }
     Ok(Value::Undef)
+}
+
+/// The event name argument of an EventEmitter-style `process` call.
+fn event_name(args: &[Value]) -> String {
+    args.first()
+        .map(|v| with_host(|h| h.str_of(v)))
+        .unwrap_or_default()
 }

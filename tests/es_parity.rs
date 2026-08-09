@@ -621,3 +621,147 @@ fn async_resource_runs_and_binds() {
         "function function function\nT,1,2\ns:5:9\ni:7\ntrue\nwrapped zz"
     );
 }
+
+// ── abrupt completions out of `try`/`finally`/`switch` ──────────────────────
+
+#[test]
+fn finally_abrupt_completion_replaces_a_pending_throw() {
+    // ECMA-262 14.15.3: when the finalizer completes abruptly, ITS completion
+    // wins — the exception the try/catch block left pending is DISCARDED, not
+    // rethrown. Verified against node v26.7.0.
+    let src = r#"
+        function b() { try { throw new Error('boom'); } finally { return 2; } }
+        console.log(b());
+        function c() { try { return 1; } finally { return 3; } }
+        console.log(c());
+        function e() { try { try { throw new Error('x'); } finally { return 'inner'; } }
+                       catch (err) { return 'caught ' + err.message; } }
+        console.log(e());
+        const o = [];
+        for (let i = 0; i < 4; i++) { try { throw new Error('e' + i); } finally { o.push('f' + i); continue; } }
+        console.log(o.join(','));
+        function g() { try { throw new Error('a'); } catch (x) { throw new Error('b'); } finally { return 'y'; } }
+        console.log(g());
+    "#;
+    assert_eq!(run(src), "2\n3\ninner\nf0,f1,f2,f3\ny");
+}
+
+#[test]
+fn break_out_of_a_try_inside_a_switch_with_no_enclosing_loop() {
+    // The `break` leaves the try's own chunk as a signal. Its target (the
+    // `switch`, or a labeled block/switch) catches `break` but NOT `continue`,
+    // so the two targets have to be resolved independently — resolving them
+    // together made the whole program halt silently here.
+    let src = r#"
+        let o = [];
+        switch (2) { case 2: try { o.push('a'); break; } finally { o.push('f'); } o.push('never'); }
+        console.log(o.join(','));
+        o = [];
+        switch (2) { case 2: try { o.push('a'); break; } catch (e) {} o.push('never'); }
+        console.log(o.join(','));
+        o = [];
+        L: switch (1) { case 1: try { break L; } finally { o.push('fin'); } }
+        console.log(o.join(','));
+        o = [];
+        L2: { try { break L2; } finally { o.push('blk'); } o.push('never'); }
+        console.log(o.join(','));
+        o = [];
+        for (let i = 0; i < 3; i++) { L3: switch (i) { case 1: for (const x of [1, 2, 3]) { if (x === 2) break L3; o.push('x' + x); } o.push('nope'); default: o.push('d' + i); } }
+        console.log(o.join(','));
+    "#;
+    assert_eq!(run(src), "a,f\na\nfin\nblk\nd0,x1,d2");
+}
+
+// ── coroutine body scope isolation ───────────────────────────────────────────
+
+#[test]
+fn async_and_generator_bodies_do_not_share_top_level_bindings() {
+    // A coroutine runs with a swapped-in context holding only ITS frame, so a
+    // frame-COUNT test for "module scope" declared every top-level `let`/`var`
+    // in an async/generator body as a GLOBAL — two interleaved activations then
+    // wrote into one array.
+    let src = r#"
+        async function f() { let o = []; o.push('f1'); await null; o.push('f2'); return o.join(','); }
+        async function g() { let o = []; o.push('g1'); await null; o.push('g2'); return o.join(','); }
+        f().then(r => console.log('A', r));
+        g().then(r => console.log('B', r));
+        function* p() { var v = []; v.push('p1'); yield 0; v.push('p2'); return v.join(','); }
+        const i1 = p(), i2 = p();
+        i1.next(); i2.next();
+        console.log('C', i1.next().value, i2.next().value);
+    "#;
+    assert_eq!(run(src), "C p1,p2 p1,p2\nA f1,f2\nB g1,g2");
+}
+
+// ── Promise resolution: thenable assimilation ────────────────────────────────
+
+#[test]
+fn resolving_with_a_thenable_adopts_it_instead_of_fulfilling_with_it() {
+    // ECMA-262 27.2.1.3.2: an object with a callable `then` is adopted through
+    // `NewPromiseResolveThenableJob`. Fulfilling WITH the object handed every
+    // consumer the thenable itself.
+    let src = r#"
+        const th = { then(res) { res('TH'); } };
+        new Promise(r => r(th)).then(v => console.log('N', v));
+        Promise.resolve().then(() => th).then(v => console.log('T', v));
+        Promise.resolve(th).then(v => console.log('R', v));
+        (async () => console.log('A', await th))();
+        (async function* () { yield Promise.resolve('P'); yield th; })()
+          .next().then(s => console.log('G', s.value, s.done));
+    "#;
+    assert_eq!(run(src), "N TH\nR TH\nA TH\nG P false\nT TH");
+}
+
+#[test]
+fn async_generator_queues_overlapping_next_requests() {
+    // `[[AsyncGeneratorQueue]]`: a second `.next()` issued before the first
+    // settles must WAIT, so the two results arrive in request order.
+    let src = r#"
+        const it = (async function* () { yield Promise.resolve('v'); })();
+        it.next().then(s => console.log('s:' + s.value + ',' + s.done));
+        it.next().then(s => console.log('e:' + s.value + ',' + s.done));
+    "#;
+    assert_eq!(run(src), "s:v,false\ne:undefined,true");
+}
+
+// ── unhandled promise rejections ─────────────────────────────────────────────
+
+#[test]
+fn an_unhandled_rejection_reaches_a_process_listener() {
+    // Node's default is `--unhandled-rejections=throw`; a registered
+    // `process.on('unhandledRejection')` listener takes it instead. The fatal
+    // path is covered by `unhandled_rejection_is_fatal` below.
+    let src = r#"
+        process.on('unhandledRejection', (r) => console.log('caught', r.message));
+        Promise.reject(new Error('z'));
+        Promise.reject(new Error('q')).catch(e => console.log('handled', e.message));
+        (async () => { try { await Promise.reject(new Error('aw')); } catch (e) { console.log('await', e.message); } })();
+    "#;
+    assert_eq!(run(src), "handled q\nawait aw\ncaught z");
+}
+
+#[test]
+fn unhandled_rejection_is_fatal() {
+    // No listener and no `.catch`: the process must FAIL, not exit 0 having
+    // silently swallowed the error.
+    let mut f = tempfile::Builder::new()
+        .suffix(".js")
+        .tempfile()
+        .expect("temp file");
+    f.write_all(b"console.log('before'); Promise.reject(new Error('boom'));")
+        .expect("write source");
+    let out = Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(f.path())
+        .output()
+        .expect("spawn node binary");
+    assert!(
+        !out.status.success(),
+        "an unhandled rejection must not exit 0"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "before");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("boom"),
+        "stderr should name the rejection: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
