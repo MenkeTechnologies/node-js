@@ -42,6 +42,22 @@ timers, promises or sockets, so `executionAsyncId()` inside a `setTimeout`/
 `.then` callback reports the root context (1), not a per-callback id, and
 `createHook` callbacks still never fire.
 
+`err.stack` names the REAL call chain — one `    at <function>` line per live
+frame — but carries no `file:line:column` (per-frame line tracking is only
+enabled under `--dap`) and none of Node's internal module-loader frames. So
+`.stack` is diagnosable but can never be byte-identical to V8's, and no parity
+script asserts its text. `console.log(err)` renders the stack followed by any
+own property a script added (`Error: x\n    at f { code: 'C' }`), the shape V8
+uses — it no longer prints an object literal exposing the internal
+`message`/`stack` slots.
+
+`JSON.parse` reproduces V8's full family of failure messages, including the
+context-window rule for the default form (the whole input quoted when it is 20
+characters or shorter, otherwise a 10-character window either side of the error
+elided with `...`), the positional forms, and JSON's number grammar (`01` parses
+as `0` and then reports the stray digit, exactly as V8 does). 87/87 differential
+cases match.
+
 A `Buffer` is a real `Uint8Array` subclass instance:
 `Object.getPrototypeOf(buf) === Buffer.prototype` holds, that prototype is a
 genuine object whose own `[[Prototype]]` is `Uint8Array.prototype`, and a

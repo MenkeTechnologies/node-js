@@ -1756,10 +1756,11 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
         Some(c) => format!("{name} [{c}]"),
         None => name.clone(),
     };
+    let frames = h.stack_frames();
     let stack = if message.is_empty() {
-        format!("{label}\n    at <anonymous>")
+        format!("{label}{frames}")
     } else {
-        format!("{label}: {message}\n    at <anonymous>")
+        format!("{label}: {message}{frames}")
     };
     let sv = h.new_str(stack);
     props.insert("stack".into(), sv);
@@ -2827,9 +2828,10 @@ fn make_error(name: &str, args: &[Value]) -> Value {
         }
         // `.stack` is engine-specific; a simple `Name: message` header line
         // suffices for parity (the fuzzer never prints raw stacks).
+        let frames = h.stack_frames();
         let stack = match &msg {
-            Some(m) if !m.is_empty() => format!("{name}: {m}\n    at <anonymous>"),
-            _ => format!("{name}\n    at <anonymous>"),
+            Some(m) if !m.is_empty() => format!("{name}: {m}{frames}"),
+            _ => format!("{name}{frames}"),
         };
         let sv = h.new_str(stack);
         props.insert("stack".into(), sv);
@@ -3641,8 +3643,31 @@ fn json_parse(args: Vec<Value>) -> Result<Value, String> {
         pos: 0,
     };
     p.skip_ws();
+    if p.peek().is_none() {
+        return Err("SyntaxError: Unexpected end of JSON input".into());
+    }
     let v = p.parse_value()?;
+    let value_end = p.pos;
     p.skip_ws();
+    // Anything after the top-level value is an error — the parser used to accept
+    // and silently discard it, so `JSON.parse('{"a":1}x')` succeeded.
+    if let Some(c) = p.peek() {
+        // V8 names the token kind only when it butts directly against the value
+        // (`01` -> "Unexpected number at position 1"); with whitespace between
+        // it is just a non-whitespace character (`1 2`).
+        // Only a digit butted directly against a completed number literal —
+        // V8's number scanner is still in number context there. `5"x"` and
+        // `[0,1]0` exit the scanner cleanly and get the generic message.
+        let after_number = value_end > 0
+            && p.pos == value_end
+            && p.chars[value_end - 1].is_ascii_digit()
+            && c.is_ascii_digit();
+        return Err(if after_number {
+            p.err_at("Unexpected number", p.pos)
+        } else {
+            p.err_trailing(p.pos)
+        });
+    }
     // Optional reviver: walk bottom-up, transforming each (key, value).
     if let Some(reviver) = args
         .get(1)
@@ -3709,6 +3734,79 @@ impl JsonParser {
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
     }
+
+    /// `at position N (line L column C)` — the location suffix V8 appends to the
+    /// positional JSON parse errors. Positions are in UTF-16-ish code units;
+    /// node-js counts `char`s, which agree for the BMP.
+    fn at(&self, pos: usize) -> String {
+        let mut line = 1usize;
+        let mut col = 1usize;
+        for c in &self.chars[..pos.min(self.chars.len())] {
+            if *c == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        format!(" at position {pos} (line {line} column {col})")
+    }
+
+    /// A positional error (`Expected ':' after property name in JSON at …`).
+    fn err_at(&self, what: &str, pos: usize) -> String {
+        format!("SyntaxError: {what} in JSON{}", self.at(pos))
+    }
+
+    /// The one positional message V8 does NOT suffix with `in JSON`.
+    fn err_trailing(&self, pos: usize) -> String {
+        format!(
+            "SyntaxError: Unexpected non-whitespace character after JSON{}",
+            self.at(pos)
+        )
+    }
+
+    /// V8's default parse error: the offending character plus a window of the
+    /// source. The whole input is quoted when it is short (<= 20 chars);
+    /// otherwise a 10-character context window either side of `pos` is shown,
+    /// elided with `...` on whichever side was cut.
+    fn err_token(&self, pos: usize) -> String {
+        const MAX_WHOLE: usize = 20;
+        const CONTEXT: usize = 10;
+        let len = self.chars.len();
+        let Some(c) = self.chars.get(pos) else {
+            return "SyntaxError: Unexpected end of JSON input".into();
+        };
+        // V8 reports the whole input for the JS literals that are famously not
+        // JSON, without naming an offending character.
+        let whole: String = self.chars.iter().collect();
+        if matches!(whole.as_str(), "undefined" | "NaN" | "Infinity" | "-Infinity") {
+            return format!("SyntaxError: \"{whole}\" is not valid JSON");
+        }
+        let snippet = if len <= MAX_WHOLE {
+            format!("\"{whole}\"")
+        } else {
+            let start = pos.saturating_sub(CONTEXT);
+            let end = (pos + CONTEXT).min(len);
+            let body: String = self.chars[start..end].iter().collect();
+            let head = if start > 0 { "..." } else { "" };
+            let tail = if end < len { "..." } else { "" };
+            format!("{head}\"{body}\"{tail}")
+        };
+        format!("SyntaxError: Unexpected token '{c}', {snippet} is not valid JSON")
+    }
+
+    /// The error for whatever is (or is not) at `pos` where a value was needed:
+    /// end of input, a stray number, a stray string, or a bad token.
+    fn err_value(&self, pos: usize) -> String {
+        match self.chars.get(pos) {
+            None => "SyntaxError: Unexpected end of JSON input".into(),
+            Some(c) if c.is_ascii_digit() || *c == '-' => {
+                self.err_at("Unexpected number", pos)
+            }
+            Some('"') => self.err_at("Unexpected string", pos),
+            _ => self.err_token(pos),
+        }
+    }
     fn skip_ws(&mut self) {
         while matches!(
             self.peek(),
@@ -3732,15 +3830,19 @@ impl JsonParser {
                 Ok(with_host(|h| h.null()))
             }
             Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
-            _ => Err("SyntaxError: Unexpected token in JSON".into()),
+            None => Err("SyntaxError: Unexpected end of JSON input".into()),
+            _ => Err(self.err_token(self.pos)),
         }
     }
     fn expect_lit(&mut self, lit: &str) -> Result<(), String> {
         for ch in lit.chars() {
-            if self.peek() != Some(ch) {
-                return Err("SyntaxError: Unexpected token in JSON".into());
+            match self.peek() {
+                Some(c) if c == ch => self.pos += 1,
+                // V8 reports the first character that broke the literal, which is
+                // why `foo` complains about `'o'` (index 2) and not `'f'`.
+                None => return Err("SyntaxError: Unexpected end of JSON input".into()),
+                _ => return Err(self.err_token(self.pos)),
             }
-            self.pos += 1;
         }
         Ok(())
     }
@@ -3753,23 +3855,57 @@ impl JsonParser {
             Ok(Value::Bool(false))
         }
     }
+    /// JSON's number grammar: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+    /// A leading zero does NOT swallow the following digits — `01` parses as `0`
+    /// and the stray `1` becomes a trailing-token error, which is how V8 reports
+    /// it. Each way the grammar can run out has its own message.
     fn parse_number(&mut self) -> Result<Value, String> {
         let start = self.pos;
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')
-        {
+        if self.peek() == Some('-') {
             self.pos += 1;
+            if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                return Err(self.err_at("No number after minus sign", self.pos));
+            }
+        }
+        if self.peek() == Some('0') {
+            self.pos += 1;
+        } else {
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if self.peek() == Some('.') {
+            self.pos += 1;
+            if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                return Err(self.err_at("Unterminated fractional number", self.pos));
+            }
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                return Err(self.err_at("Exponent part is missing a number", self.pos));
+            }
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
         }
         let s: String = self.chars[start..self.pos].iter().collect();
         s.parse::<f64>()
             .map(Value::Float)
-            .map_err(|_| "SyntaxError: bad number in JSON".into())
+            .map_err(|_| self.err_at("Unexpected number", start))
     }
     fn parse_string(&mut self) -> Result<String, String> {
         self.pos += 1; // opening quote
         let mut out = String::new();
         loop {
             match self.peek() {
-                None => return Err("SyntaxError: unterminated string in JSON".into()),
+                None => return Err(self.err_at("Unterminated string", self.pos)),
                 Some('"') => {
                     self.pos += 1;
                     break;
@@ -3801,6 +3937,11 @@ impl JsonParser {
                     }
                     self.pos += 1;
                 }
+                // A raw control character is not legal inside a JSON string; it
+                // has to be escaped. V8 rejects it rather than passing it through.
+                Some(c) if (c as u32) < 0x20 => {
+                    return Err(self.err_at("Bad control character in string literal", self.pos))
+                }
                 Some(c) => {
                     out.push(c);
                     self.pos += 1;
@@ -3828,7 +3969,11 @@ impl JsonParser {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err("SyntaxError: bad array in JSON".into()),
+                _ => {
+                    return Err(
+                        self.err_at("Expected ',' or ']' after array element", self.pos)
+                    )
+                }
             }
         }
         Ok(with_host(|h| h.new_array(items)))
@@ -3843,10 +3988,23 @@ impl JsonParser {
         }
         loop {
             self.skip_ws();
+            if self.peek() != Some('"') {
+                // The first key uses the "or '}'" wording (an empty object is
+                // still legal there); a key after a comma does not. End of input
+                // reports the same expectation, at the end position.
+                return Err(if props.is_empty() {
+                    self.err_at("Expected property name or '}'", self.pos)
+                } else {
+                    self.err_at("Expected double-quoted property name", self.pos)
+                });
+            }
             let key = self.parse_string()?;
             self.skip_ws();
             if self.peek() != Some(':') {
-                return Err("SyntaxError: expected ':' in JSON".into());
+                return Err(match self.peek() {
+                    None => "SyntaxError: Unexpected end of JSON input".into(),
+                    _ => self.err_at("Expected ':' after property name", self.pos),
+                });
             }
             self.pos += 1;
             let val = self.parse_value()?;
@@ -3860,7 +4018,11 @@ impl JsonParser {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err("SyntaxError: bad object in JSON".into()),
+                _ => {
+                    return Err(
+                        self.err_at("Expected ',' or '}' after property value", self.pos)
+                    )
+                }
             }
         }
         Ok(with_host(|h| h.new_object(props)))

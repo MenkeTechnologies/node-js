@@ -1117,6 +1117,31 @@ impl JsHost {
             f.line = line;
         }
     }
+    /// The `.stack` tail for an error created right now: one `    at <name>`
+    /// line per live frame, innermost first, ending at the module frame.
+    ///
+    /// These are the REAL user frames — node-js has no `file:line:column` (the
+    /// per-frame line is only tracked under `--dap`) and no Node-internal
+    /// module-loader frames, so `.stack` names the call chain but can never be
+    /// byte-identical to V8's. The names are what makes a thrown error
+    /// diagnosable; the missing positions are documented in BUGS.md.
+    pub fn stack_frames(&self) -> String {
+        let mut out = String::new();
+        for (i, f) in self.frames.iter().enumerate().rev() {
+            let name = match (&f.owner, i) {
+                (Some(n), _) => n.clone(),
+                (None, 0) => "Object.<anonymous>".to_string(),
+                (None, _) => "<anonymous>".to_string(),
+            };
+            out.push_str("\n    at ");
+            out.push_str(&name);
+        }
+        if out.is_empty() {
+            out.push_str("\n    at <anonymous>");
+        }
+        out
+    }
+
     /// The call stack as (frame name, line) pairs, innermost first — for the DAP
     /// `stackTrace`. `owner` carries the function name where known.
     pub fn dbg_stack(&self) -> Vec<(String, u32)> {
@@ -1823,6 +1848,36 @@ impl JsHost {
                     }
                     out.push('>');
                     out
+                }
+                // An Error inspects as its `.stack` — never as an object literal
+                // exposing the internal `message`/`stack` slots. Any own property
+                // a script added beyond those follows in braces, as V8 renders
+                // it: `Error: x\n    at … { code: 'C' }`.
+                Some(JsObj::Object(_)) if self.error_to_string(v).is_some() => {
+                    let stack = lookup_chain(self, v, "stack")
+                        .map(|s| self.str_of(&s))
+                        .unwrap_or_else(|| self.error_to_string(v).unwrap_or_default());
+                    let extra: Vec<String> = self
+                        .own_enum_key_names(v)
+                        .into_iter()
+                        .filter(|k| k != "name")
+                        .map(|k| {
+                            let val = self.fn_prop(v, &k).unwrap_or_else(|| {
+                                match self.get(v) {
+                                    Some(JsObj::Object(p)) => {
+                                        p.get(&k).cloned().unwrap_or(Value::Undef)
+                                    }
+                                    _ => Value::Undef,
+                                }
+                            });
+                            format!("{}: {}", fmt_key(&k), self.inspect_lvl(&val, indent + 2))
+                        })
+                        .collect();
+                    if extra.is_empty() {
+                        stack
+                    } else {
+                        format!("{stack} {{ {} }}", extra.join(", "))
+                    }
                 }
                 Some(JsObj::Object(props)) => {
                     // Instances print with their constructor name as a prefix
