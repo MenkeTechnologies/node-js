@@ -18,6 +18,40 @@ use indexmap::IndexMap;
 
 pub const STATIC_METHODS: &[&str] = &["from", "of", "isView"];
 
+/// The methods installed on the real `Uint8Array.prototype` object (as
+/// `@proto:Uint8Array:<m>` thunks), so `Uint8Array.prototype.slice.call(x)`
+/// keeps working now that the prototype is an object rather than a `Builtin`
+/// namespace whose every property read synthesized a thunk.
+pub const PROTOTYPE_METHODS: &[&str] = &[
+    "at",
+    "copyWithin",
+    "entries",
+    "every",
+    "fill",
+    "filter",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "forEach",
+    "includes",
+    "indexOf",
+    "join",
+    "keys",
+    "lastIndexOf",
+    "map",
+    "reduce",
+    "reduceRight",
+    "reverse",
+    "set",
+    "slice",
+    "some",
+    "sort",
+    "subarray",
+    "toString",
+    "values",
+];
+
 /// The nine element kinds plus `ArrayBuffer` (which carries only a byte length).
 pub fn is_ctor(name: &str) -> bool {
     matches!(

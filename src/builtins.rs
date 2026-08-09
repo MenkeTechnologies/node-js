@@ -807,7 +807,18 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
                 return Ok(Value::Bool(has_property(recv, &k)));
             }
             let has = with_host(|h| match h.get(recv) {
-                Some(JsObj::Object(p)) => p.contains_key(&k),
+                // A Buffer's own keys are its byte indices: the `length`/
+                // `byteLength` slots are internal bookkeeping, and V8 reports
+                // `hasOwnProperty('length')` as false for a typed array.
+                Some(JsObj::Object(p))
+                    if p.get("@@native").map(|t| h.str_of(t)).as_deref() == Some("Buffer") =>
+                {
+                    match (p.get("@@bytes").and_then(|b| h.get(b)), k.parse::<usize>()) {
+                        (Some(JsObj::Array(items)), Ok(i)) => i < items.len(),
+                        _ => false,
+                    }
+                }
+                Some(JsObj::Object(p)) => p.contains_key(&k) || h.own_accessor(recv, &k).is_some(),
                 Some(JsObj::Array(items)) => {
                     k == "length" || k.parse::<usize>().map(|i| i < items.len()).unwrap_or(false)
                 }
@@ -828,8 +839,8 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
         }
         "propertyIsEnumerable" => {
             let k = with_host(|h| h.str_of(&arg0(&args)));
-            let has =
-                with_host(|h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key(&k)));
+            // Own *and* enumerable — a non-enumerable own slot reads false.
+            let has = with_host(|h| h.own_enum_key_names(recv).contains(&k));
             Ok(Value::Bool(has))
         }
         "toString" => Ok(with_host(|h| {
@@ -1010,6 +1021,16 @@ fn namespace_property(ns: &str, name: &str) -> Value {
     // thunks (`Object.prototype.toString.call(x)` is a load-time idiom in the
     // `get-intrinsic`/`function-bind` family).
     if name == "prototype" && is_builtin_ctor(ns) {
+        // `Buffer`/`Uint8Array` have real prototype *objects* — a Buffer's
+        // `[[Prototype]]` points at one, so `Object.getPrototypeOf(buf) ===
+        // Buffer.prototype` must compare equal, which a freshly-allocated
+        // `Builtin` handle never can.
+        if let Some(p) = with_host(|h| {
+            h.ensure_native_protos();
+            h.native_proto(ns)
+        }) {
+            return p;
+        }
         return with_host(|h| h.alloc(JsObj::Builtin(format!("{ns}.prototype"))));
     }
     // A method read off a builtin prototype namespace (`Array.prototype.slice`):
@@ -1044,6 +1065,22 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     // would re-resolve the mixed-in thunk and recurse).
     if ctor == "EventEmitter" {
         return crate::stdlib::events::instance_call(recv, method, args);
+    }
+    // Same recursion hazard for the exotics with a real prototype object: the
+    // thunk now lives ON the receiver's prototype chain, so `call_method` would
+    // re-resolve this very thunk. Dispatch straight to the native instance
+    // implementation when the receiver is in fact an instance of `ctor`.
+    if ctor == "Buffer" && crate::stdlib::native_tag(recv).as_deref() == Some("Buffer") {
+        return crate::stdlib::buffer::instance_call(recv, method, &args);
+    }
+    if ctor == "Uint8Array" {
+        match crate::stdlib::native_tag(recv).as_deref() {
+            Some("Buffer") => return crate::stdlib::buffer::instance_call(recv, method, &args),
+            Some("TypedArray") => {
+                return crate::stdlib::typedarray::instance_call(recv, method, &args)
+            }
+            _ => {}
+        }
     }
     host::call_method(recv, method, args)
 }
@@ -5566,14 +5603,18 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
         }));
     }
     let val = with_host(|h| match h.get(&obj) {
-        Some(JsObj::Object(p)) => p.get(&key).cloned().or_else(|| {
-            // A Buffer's bytes are own index properties even though they live in
-            // the hidden `@@bytes` slot rather than the property map.
+        // A Buffer's own properties are exactly its byte indices, read out of the
+        // hidden `@@bytes` slot; `length`/`byteLength` are internal bookkeeping
+        // that V8 keeps on the prototype, so they own no descriptor.
+        Some(JsObj::Object(p))
+            if p.get("@@native").map(|t| h.str_of(t)).as_deref() == Some("Buffer") =>
+        {
             match (p.get("@@bytes").and_then(|b| h.get(b)), key.parse::<usize>()) {
                 (Some(JsObj::Array(items)), Ok(i)) => items.get(i).cloned(),
                 _ => None,
             }
-        }),
+        }
+        Some(JsObj::Object(p)) => p.get(&key).cloned(),
         // A function/class own prop lives in the fn-prop side table.
         Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => h.fn_prop(&obj, &key),
         _ => None,

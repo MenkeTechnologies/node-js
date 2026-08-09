@@ -502,6 +502,11 @@ pub struct JsHost {
     class_registry: HashMap<String, Value>,
     /// Well-known prototype objects for the builtin error constructors, by name.
     error_protos: HashMap<String, Value>,
+    /// Real prototype *objects* for the builtin exotics whose instances need a
+    /// genuine `[[Prototype]]` link (`Buffer`, `Uint8Array`). Most builtin
+    /// prototypes are `Builtin("<Ctor>.prototype")` thunk namespaces, which
+    /// cannot appear on a prototype chain and report `typeof "function"`.
+    native_protos: HashMap<String, Value>,
     /// `Symbol.for` registry: description → symbol value.
     symbol_registry: HashMap<String, Value>,
     /// Monotonic id source for fresh `Symbol()` values.
@@ -670,6 +675,7 @@ impl JsHost {
             proto_class: HashMap::new(),
             class_registry: HashMap::new(),
             error_protos: HashMap::new(),
+            native_protos: HashMap::new(),
             symbol_registry: HashMap::new(),
             next_symbol: 1,
             generators: Vec::new(),
@@ -1760,6 +1766,36 @@ impl JsHost {
                     }
                     self.render_array(&inner, items, indent, has_props)
                 }
+                // A `Buffer` renders as `<Buffer 01 02 03>` — hex bytes, capped
+                // at 50 with a `... N more byte(s)` tail, exactly as
+                // `util.inspect` does. Without this a `console.log(buf)` (the
+                // single most common thing anyone does with a Buffer) printed
+                // the internal `{ length, byteLength, … }` bookkeeping.
+                Some(JsObj::Object(props))
+                    if props.get("@@native").map(|t| self.str_of(t)).as_deref()
+                        == Some("Buffer") =>
+                {
+                    let bytes: Vec<u8> = match props.get("@@bytes").and_then(|b| self.get(b)) {
+                        Some(JsObj::Array(items)) => {
+                            items.iter().map(|x| self.to_number(x) as u8).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    const MAX: usize = 50;
+                    let shown: Vec<String> = bytes
+                        .iter()
+                        .take(MAX)
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    let mut out = format!("<Buffer {}", shown.join(" "));
+                    if bytes.len() > MAX {
+                        let more = bytes.len() - MAX;
+                        let unit = if more == 1 { "byte" } else { "bytes" };
+                        out.push_str(&format!(" ... {more} more {unit}"));
+                    }
+                    out.push('>');
+                    out
+                }
                 Some(JsObj::Object(props)) => {
                     // Instances print with their constructor name as a prefix
                     // (`C { x: 1 }`); plain objects have none; a null-prototype
@@ -2825,6 +2861,14 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
                 if with_host(|h| is_callable(h, &f)) {
                     return invoke(&f, args, Some(recv.clone()));
                 }
+            }
+            // `Object.prototype` methods reach a native instance too — a Buffer
+            // inherits `hasOwnProperty`/`isPrototypeOf` through its prototype
+            // chain, and the native dispatcher has no entry for them.
+            if crate::builtins::is_object_builtin_method(name)
+                && !crate::stdlib::instance_has_method(&tag, name)
+            {
+                return crate::builtins::object_builtin_method(recv, name, args);
             }
             return crate::stdlib::instance_call(&tag, recv, name, args);
         }
@@ -3997,6 +4041,59 @@ impl JsHost {
     /// Object.prototype`, and every specific error's prototype → `Error.prototype`.
     /// Populated once; instances link to these so `e instanceof TypeError` and
     /// `e instanceof Error` both hold.
+    /// The real `Buffer.prototype` object, building the
+    /// `Buffer.prototype → Uint8Array.prototype → Object.prototype` chain on
+    /// first use.
+    ///
+    /// A `Buffer` used to be a bare tagged object with no `[[Prototype]]` at
+    /// all, so `Object.getPrototypeOf(buf) === Buffer.prototype` read false and
+    /// `instanceof` had to be special-cased around it. Each prototype is a
+    /// genuine object carrying `@proto:<Ctor>:<method>` thunks for its instance
+    /// methods, so `Buffer.prototype.slice.call(buf, 1)` still dispatches the
+    /// way it did when `Buffer.prototype` was a `Builtin` namespace.
+    pub fn ensure_native_protos(&mut self) {
+        if self.native_protos.contains_key("Buffer") {
+            return;
+        }
+        let obj_proto = self.object_proto();
+        let mut chain = vec![
+            ("Uint8Array", obj_proto),
+            ("Buffer", Value::Undef), // filled in below with Uint8Array.prototype
+        ];
+        let mut prev: Option<Value> = None;
+        for (ctor, parent) in chain.drain(..) {
+            let proto = self.new_object(IndexMap::new());
+            let parent = match prev {
+                Some(p) => p,
+                None => parent,
+            };
+            self.set_proto(&proto, parent);
+            let ctor_val = self.alloc(JsObj::Builtin(ctor.to_string()));
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert("constructor".into(), ctor_val);
+            }
+            self.hide_prop(&proto, "constructor");
+            let methods: &[&str] = match ctor {
+                "Buffer" => crate::stdlib::buffer::INSTANCE_METHODS,
+                _ => crate::stdlib::typedarray::PROTOTYPE_METHODS,
+            };
+            for m in methods {
+                let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
+                if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                    p.insert((*m).to_string(), thunk);
+                }
+                self.hide_prop(&proto, m);
+            }
+            self.native_protos.insert(ctor.to_string(), proto.clone());
+            prev = Some(proto);
+        }
+    }
+
+    /// The real prototype object for a builtin exotic, if it has one.
+    pub fn native_proto(&self, ctor: &str) -> Option<Value> {
+        self.native_protos.get(ctor).cloned()
+    }
+
     pub fn ensure_error_protos(&mut self) {
         if !self.error_protos.is_empty() {
             return;

@@ -17,6 +17,46 @@ pub const STATIC_METHODS: &[&str] = &[
     "compare",
 ];
 
+/// The methods a `Buffer` instance answers — the surface `instance_call`
+/// dispatches, and the set installed as `@proto:Buffer:<m>` thunks on the real
+/// `Buffer.prototype` object.
+pub const INSTANCE_METHODS: &[&str] = &[
+    "toString",
+    "set",
+    "toJSON",
+    "equals",
+    "slice",
+    "subarray",
+    "readUInt8",
+    "includes",
+    "indexOf",
+    "lastIndexOf",
+    "write",
+    "copy",
+    "fill",
+    "compare",
+    "readUInt16BE",
+    "readUInt16LE",
+    "writeUInt8",
+    "writeUInt16BE",
+    "writeUInt16LE",
+    "readUInt32BE",
+    "readUInt32LE",
+    "readInt8",
+    "readInt16BE",
+    "readInt16LE",
+    "readInt32BE",
+    "readInt32LE",
+    "writeUInt32BE",
+    "writeUInt32LE",
+    "writeInt32BE",
+    "writeInt32LE",
+    "at",
+    "values",
+    "keys",
+    "entries",
+];
+
 /// Free functions of the `buffer` module itself (`require('buffer').atob`, …), as
 /// opposed to the `Buffer` constructor's static methods above. Needs the parent
 /// `"buffer"` routing arm (see final report).
@@ -238,7 +278,20 @@ pub fn from_bytes(bytes: &[u8]) -> Value {
         m.insert("byteLength".into(), Value::Float(bytes.len() as f64));
         m.insert("byteOffset".into(), Value::Float(0.0));
         m.insert("BYTES_PER_ELEMENT".into(), Value::Float(1.0));
-        h.new_object(m)
+        let obj = h.new_object(m);
+        // A Buffer is a real `Uint8Array` subclass instance in Node, so link it
+        // to the actual `Buffer.prototype` object rather than leaving it a bare
+        // tagged object with no `[[Prototype]]`.
+        h.ensure_native_protos();
+        if let Some(p) = h.native_proto("Buffer") {
+            h.set_proto(&obj, p);
+        }
+        // The view metadata is real but non-enumerable; V8 keeps `length` and
+        // friends off `Object.keys(buf)` (whose own keys are the byte indices).
+        for k in ["length", "byteLength", "byteOffset", "BYTES_PER_ELEMENT"] {
+            h.hide_prop(&obj, k);
+        }
+        obj
     })
 }
 
