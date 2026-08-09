@@ -251,9 +251,7 @@ fn build(p: &Parts) -> Value {
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "parse" => legacy_parse(args).map(|u| super::url_legacy::to_js(&u)),
-        "format" => super::url_legacy::format_value(
-            &args.first().cloned().unwrap_or(Value::Undef),
-        ),
+        "format" => super::url_legacy::format_value(&args.first().cloned().unwrap_or(Value::Undef)),
         // `url.fileURLToPath(url)` — a `file:` URL/string → a filesystem path
         // (percent-decoded). POSIX best-effort: any authority (host) is accepted
         // but not re-prefixed; Windows drive/UNC rewriting is not modeled.

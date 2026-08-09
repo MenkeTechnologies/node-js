@@ -144,7 +144,8 @@ fn parse_host(u: &mut Url) {
 /// `/^[a-z0-9.+-]+:/i` — the matched protocol including the colon.
 fn match_protocol(rest: &[char]) -> Option<String> {
     let mut i = 0;
-    while i < rest.len() && (rest[i].is_ascii_alphanumeric() || matches!(rest[i], '.' | '+' | '-')) {
+    while i < rest.len() && (rest[i].is_ascii_alphanumeric() || matches!(rest[i], '.' | '+' | '-'))
+    {
         i += 1;
     }
     if i > 0 && rest.get(i) == Some(&':') {
@@ -240,7 +241,19 @@ fn has_forbidden_host_char(h: &str, ipv6: bool) -> bool {
     h.chars().any(|c| {
         matches!(
             c,
-            '\0' | '\t' | '\n' | '\r' | ' ' | '#' | '%' | '/' | '<' | '>' | '?' | '@' | '\\' | '^'
+            '\0' | '\t'
+                | '\n'
+                | '\r'
+                | ' '
+                | '#'
+                | '%'
+                | '/'
+                | '<'
+                | '>'
+                | '?'
+                | '@'
+                | '\\'
+                | '^'
                 | '|'
         ) || (!ipv6 && matches!(c, ':' | '[' | ']'))
     })
@@ -248,7 +261,11 @@ fn has_forbidden_host_char(h: &str, ipv6: bool) -> bool {
 
 /// Port of `Url.prototype.parse`. `slashes_denote_host` is the third `url.parse`
 /// argument. Errors correspond to the JS `throw` sites.
-pub fn parse(url: &str, parse_query_string: bool, slashes_denote_host: bool) -> Result<Url, String> {
+pub fn parse(
+    url: &str,
+    parse_query_string: bool,
+    slashes_denote_host: bool,
+) -> Result<Url, String> {
     let mut u = Url::default();
     let uc: Vec<char> = url.chars().collect();
 
@@ -558,7 +575,11 @@ fn invalid_url(_url: &str) -> String {
 /// The `noEscapeAuth` table: characters `Url.prototype.format` leaves as-is in
 /// `auth`. Everything else is percent-encoded UTF-8.
 fn auth_needs_escape(c: char) -> bool {
-    !(c.is_ascii_alphanumeric() || matches!(c, '!' | '-' | '.' | '_' | '~' | '\'' | '(' | ')' | '*' | ':'))
+    !(c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '!' | '-' | '.' | '_' | '~' | '\'' | '(' | ')' | '*' | ':'
+        ))
 }
 
 fn encode_auth(auth: &str) -> String {
@@ -709,7 +730,7 @@ fn from_js(v: &Value) -> (Url, Option<String>) {
     });
     let query_string = match &query_obj {
         Some(q) if with_host(|h| matches!(h.get(q), Some(JsObj::Object(_)))) => {
-            super::querystring::call("stringify", &[q.clone()])
+            super::querystring::call("stringify", std::slice::from_ref(q))
                 .and_then(|r| r.ok())
                 .map(|s| with_host(|h| h.str_of(&s)))
         }
@@ -756,9 +777,7 @@ pub fn format_value(v: &Value) -> Result<Value, String> {
     }
     // A WHATWG `URL` instance formats to its `href`.
     let href = with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) if p.get("@@native").is_some() => {
-            p.get("href").map(|x| h.str_of(x))
-        }
+        Some(JsObj::Object(p)) if p.get("@@native").is_some() => p.get("href").map(|x| h.str_of(x)),
         _ => None,
     });
     if let Some(href) = href {

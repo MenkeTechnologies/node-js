@@ -398,7 +398,10 @@ pub fn feed(sock_id: u64, _socket: &Value, bytes: &[u8]) -> Result<(), String> {
                 _ => None,
             });
             let chunk = match encoding {
-                Some(enc) => with_host(|h| { let s = super::buffer::encode_bytes(&parsed.body, &enc); h.new_str(s) }),
+                Some(enc) => with_host(|h| {
+                    let s = super::buffer::encode_bytes(&parsed.body, &enc);
+                    h.new_str(s)
+                }),
                 None => super::buffer::from_bytes(&parsed.body),
             };
             super::events::instance_call(

@@ -694,9 +694,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 0
             };
             if offset + src.len() > bytes.len() {
-                return Err(crate::host::range_error(
-                    "offset is out of bounds",
-                ));
+                return Err(crate::host::range_error("offset is out of bounds"));
             }
             let mut out = bytes.clone();
             out[offset..offset + src.len()].copy_from_slice(&src);

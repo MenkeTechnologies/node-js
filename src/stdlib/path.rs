@@ -121,9 +121,34 @@ fn is_device_root(c: char) -> bool {
 
 /// Device names Windows reserves regardless of directory (`CON`, `LPT3`, …).
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "COM\u{b9}",
-    "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
 ];
 
 /// Node's `isWindowsReservedName(path, colonIndex)` — is `path.slice(0,
@@ -152,7 +177,12 @@ fn index_of(p: &[char], ch: char, from: usize) -> isize {
 
 /// Port of Node's `normalizeString`: resolve `.`/`..` and collapse repeated
 /// separators, emitting `separator`-joined segments.
-fn normalize_string(path: &[char], allow_above_root: bool, flavor: Flavor, separator: char) -> String {
+fn normalize_string(
+    path: &[char],
+    allow_above_root: bool,
+    flavor: Flavor,
+    separator: char,
+) -> String {
     let mut res: Vec<char> = Vec::new();
     let mut last_segment_length: isize = 0;
     let mut last_slash: isize = -1;
@@ -305,9 +335,7 @@ fn resolve_win32(args: &[String]) -> String {
             // Fast path for the current directory. On a POSIX host Node
             // converts the cwd's forward slashes to backslashes here.
             if args.is_empty()
-                || (args.len() == 1
-                    && (args[0].is_empty() || args[0] == ".")
-                    && c.starts_with('/'))
+                || (args.len() == 1 && (args[0].is_empty() || args[0] == ".") && c.starts_with('/'))
             {
                 return c.replace('/', "\\");
             }
@@ -450,7 +478,11 @@ fn normalize_posix(path: &[char]) -> String {
             ".".into()
         };
     }
-    let out = if trailing { std::format!("{out}/") } else { out };
+    let out = if trailing {
+        std::format!("{out}/")
+    } else {
+        out
+    };
     if is_absolute {
         std::format!("/{out}")
     } else {
@@ -470,7 +502,11 @@ fn normalize_win32(path: &[char]) -> String {
     let code = path[0];
 
     if len == 1 {
-        return if code == '/' { "\\".into() } else { str_of(path) };
+        return if code == '/' {
+            "\\".into()
+        } else {
+            str_of(path)
+        };
     }
     if f.is_sep(code) {
         is_absolute = true;
@@ -507,10 +543,7 @@ fn normalize_win32(path: &[char]) -> String {
                                 root_end = 4 + possible.len();
                             }
                         } else if j == len {
-                            return std::format!(
-                                "\\\\{first_part}\\{}\\",
-                                str_of(&path[last..])
-                            );
+                            return std::format!("\\\\{first_part}\\{}\\", str_of(&path[last..]));
                         } else {
                             device =
                                 Some(std::format!("\\\\{first_part}\\{}", str_of(&path[last..j])));
@@ -756,7 +789,10 @@ fn relative_posix(from_in: &[char], to_in: &[char]) -> String {
         }
         k += 1;
     }
-    std::format!("{out}{}", str_of(&to[(to_start + last_common_sep) as usize..]))
+    std::format!(
+        "{out}{}",
+        str_of(&to[(to_start + last_common_sep) as usize..])
+    )
 }
 
 fn relative_win32(from_in: &[char], to_in: &[char]) -> String {
@@ -967,7 +1003,11 @@ fn dirname_win32(path: &[char]) -> String {
     let code = path[0];
 
     if len == 1 {
-        return if f.is_sep(code) { str_of(path) } else { ".".into() };
+        return if f.is_sep(code) {
+            str_of(path)
+        } else {
+            ".".into()
+        };
     }
 
     if f.is_sep(code) {
@@ -1034,11 +1074,7 @@ fn basename(flavor: Flavor, path: &[char], suffix: Option<&[char]>) -> String {
     let mut matched_slash = true;
 
     // A `C:` prefix is a root, not a trailing-separator candidate.
-    if flavor == Flavor::Win32
-        && path.len() >= 2
-        && is_device_root(path[0])
-        && path[1] == ':'
-    {
+    if flavor == Flavor::Win32 && path.len() >= 2 && is_device_root(path[0]) && path[1] == ':' {
         start = 2;
     }
 
@@ -1228,7 +1264,11 @@ fn parse_posix(path: &[char]) -> Parsed {
     }
 
     if end != -1 {
-        let s = if start_part == 0 && is_abs { 1 } else { start_part };
+        let s = if start_part == 0 && is_abs {
+            1
+        } else {
+            start_part
+        };
         if start_dot == -1
             || pre_dot_state == 0
             || (pre_dot_state == 1 && start_dot == end - 1 && start_dot == start_part + 1)
@@ -1404,7 +1444,11 @@ fn format(flavor: Flavor, obj: Option<&Value>) -> String {
         };
         std::format!("{}{ext}", get("name"))
     };
-    let dir = if !dir_raw.is_empty() { dir_raw } else { root.clone() };
+    let dir = if !dir_raw.is_empty() {
+        dir_raw
+    } else {
+        root.clone()
+    };
     if dir.is_empty() {
         return base;
     }
