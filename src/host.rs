@@ -662,8 +662,8 @@ impl Task {
     }
 }
 
-/// A scheduled macrotask (`setTimeout`/`setImmediate`). Ordering is by `(delay,
-/// seq)` — a deterministic virtual clock, never wall time.
+/// A scheduled macrotask (`setTimeout`/`setInterval`/`setImmediate`). Ordering
+/// is by `(delay, seq)` — a deterministic virtual clock, never wall time.
 pub struct Timer {
     pub id: u64,
     pub delay: f64,
@@ -671,9 +671,18 @@ pub struct Timer {
     pub callback: Value,
     pub args: Vec<Value>,
     pub cancelled: bool,
-    /// Real wall-clock deadline (`now + delay`), used only on the blocking I/O
-    /// path (`open_handles > 0`). With no open handles the loop stays on the
-    /// deterministic virtual clock and ignores this.
+    /// Repeat period in ms for a `setInterval` timer; `None` for the one-shot
+    /// `setTimeout`/`setImmediate`. A repeating timer is re-armed with a fresh
+    /// deadline each time it fires, so it keeps the loop alive indefinitely —
+    /// exactly like Node, where `setInterval` runs until cleared.
+    pub interval: Option<f64>,
+    /// Node's `ref`/`unref` handle bit. Only a *referenced* pending timer keeps
+    /// the event loop alive; an unref'd one still fires while the loop happens
+    /// to be alive for another reason, but never holds it open by itself.
+    pub refed: bool,
+    /// Real wall-clock deadline (`now + delay`), used only on the real-clock
+    /// path (an open handle or a pending interval). On the pure virtual clock
+    /// this is ignored.
     pub deadline: Instant,
 }
 
@@ -4789,10 +4798,20 @@ impl JsHost {
     pub fn queue_micro_native(&mut self, f: Box<dyn FnOnce() -> Result<(), String>>) {
         self.microtasks.push_back(Task::Native(f));
     }
-    pub fn add_timer(&mut self, delay: f64, callback: Value, args: Vec<Value>) -> u64 {
+    /// Schedule a macrotask. `interval` is the repeat period for `setInterval`
+    /// (`None` for the one-shot `setTimeout`/`setImmediate`). Returns the timer
+    /// id, which the `Timeout`/`Immediate` handle object carries so `clear*`,
+    /// `ref`/`unref` and `refresh` can find this entry again.
+    pub fn add_timer(
+        &mut self,
+        delay: f64,
+        callback: Value,
+        args: Vec<Value>,
+        interval: Option<f64>,
+    ) -> u64 {
         let id = self.next_timer;
         self.next_timer += 1;
-        // Real deadline for the blocking I/O path; `setImmediate` (delay < 0) is
+        // Real deadline for the real-clock path; `setImmediate` (delay < 0) is
         // clamped to "now". Virtual-clock ordering still uses `delay`/`seq`.
         let deadline = Instant::now() + Duration::from_millis(delay.max(0.0) as u64);
         self.macrotasks.push(Timer {
@@ -4802,9 +4821,61 @@ impl JsHost {
             callback,
             args,
             cancelled: false,
+            interval,
+            refed: true,
             deadline,
         });
         id
+    }
+    /// Re-arm a repeating timer that is about to fire, keeping its id (so a
+    /// `clearInterval` from *inside* the callback cancels this very entry) and
+    /// taking a fresh `seq` so same-delay peers still round-robin.
+    ///
+    /// Called BEFORE the callback runs: if it were called after, the entry would
+    /// be absent while the callback executed and a `clearInterval(t)` there would
+    /// cancel nothing, resurrecting an interval the program had stopped.
+    fn rearm_timer(&mut self, t: &Timer, period: f64) {
+        let seq = self.next_timer;
+        self.next_timer += 1;
+        let deadline = Instant::now() + Duration::from_millis(period.max(0.0) as u64);
+        self.macrotasks.push(Timer {
+            id: t.id,
+            delay: t.delay,
+            seq,
+            callback: t.callback.clone(),
+            args: t.args.clone(),
+            cancelled: false,
+            interval: Some(period),
+            refed: t.refed,
+            deadline,
+        });
+    }
+    /// `timeout.ref()` / `timeout.unref()` — set the handle bit on a pending
+    /// timer. A no-op once the timer has fired or been cleared (Node likewise
+    /// treats `ref`/`unref` on a dead timer as inert).
+    pub fn set_timer_refed(&mut self, id: u64, refed: bool) {
+        for t in &mut self.macrotasks {
+            if t.id == id && !t.cancelled {
+                t.refed = refed;
+            }
+        }
+    }
+    /// `timeout.hasRef()` — whether a still-pending timer holds the loop open.
+    /// A fired or cleared timer reports `false`, matching Node.
+    pub fn timer_has_ref(&self, id: u64) -> bool {
+        self.macrotasks
+            .iter()
+            .any(|t| t.id == id && !t.cancelled && t.refed)
+    }
+    /// `timeout.refresh()` — restart the countdown from now, as if the timer had
+    /// just been scheduled.
+    pub fn refresh_timer(&mut self, id: u64) {
+        let now = Instant::now();
+        for t in &mut self.macrotasks {
+            if t.id == id && !t.cancelled {
+                t.deadline = now + Duration::from_millis(t.delay.max(0.0) as u64);
+            }
+        }
     }
     /// Clone the I/O sender for a background I/O thread.
     pub fn io_sender(&self) -> Sender<IoTask> {
@@ -4876,25 +4947,48 @@ impl JsHost {
     fn has_microtasks(&self) -> bool {
         !self.nextticks.is_empty() || !self.microtasks.is_empty()
     }
-    fn has_macrotasks(&self) -> bool {
-        self.macrotasks.iter().any(|t| !t.cancelled)
+    /// Whether any pending timer is *referenced* — the timer half of Node's
+    /// handle count. Only these keep the loop alive; unref'd timers still fire
+    /// while something else holds the loop open, but never hold it themselves.
+    fn has_refed_macrotasks(&self) -> bool {
+        self.macrotasks.iter().any(|t| !t.cancelled && t.refed)
+    }
+    /// Whether any pending timer repeats. A repeating timer cannot run on the
+    /// virtual clock: virtual time never advances, so the interval would re-arm
+    /// at the same instant forever, spinning a core and starving every
+    /// longer-delay timer behind it. Its presence forces the real clock.
+    fn has_pending_interval(&self) -> bool {
+        self.macrotasks
+            .iter()
+            .any(|t| !t.cancelled && t.interval.is_some())
     }
 }
 
 /// Drive the event loop to quiescence.
 ///
-/// Two regimes, selected per iteration by `open_handles`:
+/// **Liveness** is Node's handle count: the loop runs while a microtask is
+/// pending, an open handle is registered (a listening server, a live socket, an
+/// in-flight async op), or a *referenced* timer is still pending. That last term
+/// is what makes `setInterval(fn, 1000)` hold the process open forever, as it
+/// does in Node — the interval re-arms itself, so a ref'd timer is always
+/// pending and the loop never reaches its exit condition.
 ///
-/// - **No open handles (pure script / timers only):** the original deterministic
-///   virtual clock — drain microtasks, fire the earliest `(delay, seq)` timer
-///   immediately (no real waiting), repeat until both queues empty, then EXIT.
-///   Parity output and test speed are unchanged.
-/// - **Open handles (a server is listening / sockets are live):** drain
-///   microtasks, fire every timer whose real deadline has passed, then BLOCK on
-///   the I/O channel (`recv_timeout` bounded by the next timer's real deadline,
-///   or unbounded `recv` if no timers) and run the received `IoTask` on the main
-///   thread. The host keeps its own `Sender`, so `recv` never disconnects while
-///   the process should stay alive.
+/// Two **clock regimes**, selected per iteration:
+///
+/// - **Virtual clock** (no open handles and no repeating timer): the original
+///   deterministic path — fire the earliest `(delay, seq)` timer immediately, no
+///   real waiting. Parity output and test speed for ordinary `setTimeout`
+///   scripts are unchanged.
+/// - **Real clock** (an open handle, or any pending interval): fire every timer
+///   whose wall-clock deadline has passed, then BLOCK on the I/O channel
+///   (`recv_timeout` bounded by the next deadline, or unbounded `recv` if no
+///   timers) and run the received `IoTask` on the main thread. The host keeps
+///   its own `Sender`, so `recv` never disconnects while the process should stay
+///   alive.
+///
+///   A repeating timer *must* take this path: virtual time never advances, so an
+///   interval on the virtual clock would re-fire at the same instant forever,
+///   spinning a core and starving every longer-delay timer behind it.
 ///
 /// Errors thrown by a task/timer/I/O dispatch abort the loop (uncaught → surfaced).
 pub fn run_event_loop() -> Result<(), String> {
@@ -4915,20 +5009,25 @@ fn drive_event_loop(rx: Option<&Receiver<IoTask>>) -> Result<(), String> {
         }
         check_unhandled_rejections()?;
 
-        if with_host(|h| h.open_handles()) == 0 {
-            // ── virtual-clock regime (unchanged behavior) ────────────────────
+        // 2) Liveness (Node's handle count). Nothing referenced left to do ⇒ the
+        //    process exits, dropping any unref'd timers still pending — which is
+        //    why `setTimeout(fn, 1000).unref()` never fires, while an unref'd
+        //    timer behind a ref'd one does.
+        let alive =
+            with_host(|h| h.has_microtasks() || h.open_handles() > 0 || h.has_refed_macrotasks());
+        if !alive {
+            break;
+        }
+
+        // 3) Pick the clock regime for this turn.
+        let virtual_clock = with_host(|h| h.open_handles() == 0 && !h.has_pending_interval());
+        if virtual_clock {
+            // ── virtual-clock regime (unchanged for one-shot timers) ─────────
             match with_host(|h| h.pop_next_timer()) {
-                Some(t) => {
-                    invoke(&t.callback, t.args, None)?;
-                }
-                None => {
-                    if !with_host(|h| h.has_microtasks()) {
-                        break;
-                    }
-                }
-            }
-            if !with_host(|h| h.has_microtasks() || h.has_macrotasks()) {
-                break;
+                Some(t) => fire_timer(t)?,
+                // Unreachable while `alive` holds (a ref'd timer must exist),
+                // but exiting is the safe reading of "nothing left to run".
+                None => break,
             }
             continue;
         }
@@ -4936,7 +5035,7 @@ fn drive_event_loop(rx: Option<&Receiver<IoTask>>) -> Result<(), String> {
         // ── real-clock / blocking-I/O regime ─────────────────────────────────
         let now = Instant::now();
         if let Some(t) = with_host(|h| h.pop_due_timer(now)) {
-            invoke(&t.callback, t.args, None)?;
+            fire_timer(t)?;
             continue; // re-drain microtasks, re-check deadlines
         }
         // Nothing due and no pending microtasks: block for the next I/O event,
@@ -4955,6 +5054,21 @@ fn drive_event_loop(rx: Option<&Receiver<IoTask>>) -> Result<(), String> {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // no senders left
         }
     }
+    Ok(())
+}
+
+/// Run one due timer's callback, first re-arming it if it repeats.
+///
+/// The re-arm happens BEFORE the callback runs so that a `clearInterval(t)`
+/// issued from inside that callback cancels the next occurrence. Re-arming
+/// afterwards would leave the interval absent from the queue for the duration of
+/// its own callback, so the `clear` would match nothing and the freshly pushed
+/// entry would resurrect an interval the program had just stopped.
+fn fire_timer(t: Timer) -> Result<(), String> {
+    if let Some(period) = t.interval {
+        with_host(|h| h.rearm_timer(&t, period));
+    }
+    invoke(&t.callback, t.args, None)?;
     Ok(())
 }
 

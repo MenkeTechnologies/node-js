@@ -508,6 +508,8 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         "getMaxListeners",
     ];
     let base: &[&str] = match tag {
+        "Timeout" => timers::TIMEOUT_METHODS,
+        "Immediate" => timers::IMMEDIATE_METHODS,
         "Server" => &["listen", "close", "address"],
         "Socket" => &[
             "write",
@@ -673,6 +675,7 @@ pub fn instance_call(
 ) -> Result<Value, String> {
     match tag {
         "Buffer" => buffer::instance_call(recv, method, &args),
+        "Timeout" | "Immediate" => timers::instance_call(recv, method, &args),
         "Date" => date::instance_call(recv, method, &args),
         "StringDecoder" => string_decoder::instance_call(recv, method, &args),
         "WeakRef" => typedarray::weakref_call(recv, method),

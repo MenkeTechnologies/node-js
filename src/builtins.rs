@@ -788,6 +788,8 @@ fn default_ctor_name(h: &host::JsHost, recv: &Value) -> Option<&'static str> {
                 Some("TextEncoder") => Some("TextEncoder"),
                 Some("TextDecoder") => Some("TextDecoder"),
                 Some("EventEmitter") => Some("EventEmitter"),
+                Some("Timeout") => Some("Timeout"),
+                Some("Immediate") => Some("Immediate"),
                 _ => Some("Object"),
             }
         }
@@ -810,10 +812,13 @@ fn default_ctor_name(h: &host::JsHost, recv: &Value) -> Option<&'static str> {
     }
 }
 
-/// The builtin globals that are constructor *functions* (callable via `new`), so
-/// `Ctor.name` is the constructor name. Excludes the non-callable namespaces
-/// (`Math`, `JSON`, `console`, `Reflect`, `process`), whose `.name` is
-/// `undefined` in Node.
+/// The builtin constructor *functions*, so `Ctor.name` is the constructor name.
+/// Excludes the non-callable namespaces (`Math`, `JSON`, `console`, `Reflect`,
+/// `process`), whose `.name` is `undefined` in Node.
+///
+/// Most are also globals, but not all: `Timeout`/`Immediate` are unexposed in
+/// Node (`typeof Timeout === 'undefined'`) yet still name themselves through a
+/// handle's `.constructor.name`, so they belong here and not in `GLOBALS`.
 fn is_builtin_ctor(name: &str) -> bool {
     matches!(
         name,
@@ -853,6 +858,8 @@ fn is_builtin_ctor(name: &str) -> bool {
             | "Buffer"
             | "URL"
             | "URLSearchParams"
+            | "Timeout"
+            | "Immediate"
     ) || host::ERROR_NAMES.contains(&name)
 }
 
@@ -2410,6 +2417,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "setImmediate",
     "clearTimeout",
     "clearInterval",
+    "clearImmediate",
     "structuredClone",
     "require",
     // CommonJS loader dispatch targets referenced by per-module `require`
@@ -2866,7 +2874,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(Value::Undef)
         }
         "setTimeout" | "setInterval" | "setImmediate" => Ok(schedule_timer(name, args)),
-        "clearTimeout" | "clearInterval" => {
+        "clearTimeout" | "clearInterval" | "clearImmediate" => {
             clear_timer(&arg0(&args));
             Ok(Value::Undef)
         }
@@ -6726,9 +6734,13 @@ fn enqueue_microtask(next_tick: bool, cb: Value, args: Vec<Value>) {
     });
 }
 
-/// `setTimeout`/`setInterval`/`setImmediate` — register a macrotask. We do NOT
-/// implement repeating intervals (each fires once) to keep output deterministic
-/// and terminating; the delay orders timers on a virtual clock.
+/// `setTimeout`/`setInterval`/`setImmediate` — register a macrotask and return
+/// the handle object Node returns (`Timeout` for the first two, `Immediate` for
+/// the third), carrying `ref`/`unref`/`hasRef`/`refresh`.
+///
+/// `setInterval` schedules a *repeating* timer: the loop re-arms it each time it
+/// fires, so it runs until cleared and — being referenced — holds the process
+/// open exactly as in Node.
 fn schedule_timer(name: &str, args: Vec<Value>) -> Value {
     let cb = arg0(&args);
     let delay = if name == "setImmediate" {
@@ -6744,11 +6756,22 @@ fn schedule_timer(name: &str, args: Vec<Value>) -> Value {
     } else {
         args.get(2..).map(|s| s.to_vec()).unwrap_or_default()
     };
-    let id = with_host(|h| h.add_timer(delay, cb, extra));
-    Value::Float(id as f64)
+    // Node clamps a sub-1ms interval to 1ms, so `setInterval(fn, 0)` yields a
+    // ~1000Hz timer rather than a busy loop that starves the rest of the queue.
+    let interval = (name == "setInterval").then(|| delay.max(1.0));
+    let id = with_host(|h| h.add_timer(delay, cb, extra, interval));
+    let tag = if name == "setImmediate" {
+        "Immediate"
+    } else {
+        "Timeout"
+    };
+    crate::stdlib::timers::new_handle(id, tag)
 }
 
+/// `clearTimeout`/`clearInterval`/`clearImmediate` — cancel by handle object or
+/// by the bare id it coerces to (code that stored `+timer` still works).
 fn clear_timer(v: &Value) {
-    let id = with_host(|h| h.to_number(v)) as u64;
+    let id =
+        crate::stdlib::timers::handle_id(v).unwrap_or_else(|| with_host(|h| h.to_number(v)) as u64);
     with_host(|h| h.cancel_timer(id));
 }

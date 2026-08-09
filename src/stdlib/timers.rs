@@ -17,6 +17,83 @@
 use super::arg_num;
 use crate::host::{with_host, JsObj};
 use fusevm::Value;
+use indexmap::IndexMap;
+
+// ── timer handle objects (`Timeout` / `Immediate`) ───────────────────────────
+
+/// Methods on a `Timeout` (returned by `setTimeout`/`setInterval`). Node's
+/// prototype carries exactly `refresh`, `unref`, `ref`, `hasRef`, `close`;
+/// `valueOf`/`toString` back the primitive coercion described on
+/// [`new_handle`].
+pub const TIMEOUT_METHODS: &[&str] = &[
+    "ref", "unref", "hasRef", "refresh", "close", "valueOf", "toString",
+];
+
+/// Methods on an `Immediate` (returned by `setImmediate`). Node's `Immediate`
+/// prototype has no `refresh` — there is no countdown to restart.
+pub const IMMEDIATE_METHODS: &[&str] = &["ref", "unref", "hasRef", "close", "valueOf", "toString"];
+
+/// Build the handle object a `set*` call returns: an `@@native`-tagged object
+/// (`"Timeout"` or `"Immediate"`) carrying the scheduler's timer id in a hidden
+/// `@@timerId` slot.
+///
+/// Node's handles coerce to their integer id (`String(t)` is `"2"`), which is
+/// what keeps `clearTimeout` working for code that stashed the return value in a
+/// number. `valueOf`/`toString` reproduce that for both ToPrimitive hints —
+/// Node reaches it via an own `Symbol.toPrimitive`, which this does not model.
+pub fn new_handle(id: u64, tag: &'static str) -> Value {
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str(tag));
+        m.insert("@@timerId".into(), Value::Float(id as f64));
+        h.new_object(m)
+    })
+}
+
+/// The timer id behind a handle object, or `None` for anything else.
+///
+/// Read straight off the heap slot rather than through `ToPrimitive`: the
+/// `clear*` builtins run inside a `with_host` borrow, and coercing via a
+/// `valueOf` call would re-enter `with_host` and panic on the `RefCell`.
+pub fn handle_id(v: &Value) -> Option<u64> {
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Object(p)) => p.get("@@timerId").map(|n| h.to_number(n) as u64),
+        _ => None,
+    })
+}
+
+/// Dispatch a method on a `Timeout`/`Immediate` handle.
+///
+/// `ref`/`unref`/`refresh` return the handle itself (Node chains them); they are
+/// inert once the timer has fired or been cleared, since the scheduler entry is
+/// gone. `close` is Node's alias for clearing the timer.
+pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
+    let id = handle_id(recv).unwrap_or(0);
+    match method {
+        "ref" => {
+            with_host(|h| h.set_timer_refed(id, true));
+            Ok(recv.clone())
+        }
+        "unref" => {
+            with_host(|h| h.set_timer_refed(id, false));
+            Ok(recv.clone())
+        }
+        "hasRef" => Ok(Value::Bool(with_host(|h| h.timer_has_ref(id)))),
+        "refresh" => {
+            with_host(|h| h.refresh_timer(id));
+            Ok(recv.clone())
+        }
+        "close" => {
+            with_host(|h| h.cancel_timer(id));
+            Ok(recv.clone())
+        }
+        "valueOf" => Ok(Value::Float(id as f64)),
+        "toString" => Ok(with_host(|h| h.new_str(id.to_string()))),
+        _ => Err(crate::host::type_error(&format!(
+            "timeout.{method} is not a function"
+        ))),
+    }
+}
 
 // ── timers (callback API) ────────────────────────────────────────────────────
 

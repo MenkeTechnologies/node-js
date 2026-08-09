@@ -493,6 +493,30 @@ cases the fuzzer is scoped away from)
   `[ 1, Symbol(k): 5 ]`, and `Object.getOwnPropertySymbols(a)` is empty where
   Node reports `Symbol(k)`. Object receivers do both correctly.
 
+- **A `Timeout`/`Immediate` handle has no reachable prototype object and no own
+  `Symbol.toPrimitive`.** The handle's methods dispatch through the native
+  `instance_call` table rather than sitting on a real prototype, so
+  `Object.getOwnPropertyNames(Object.getPrototypeOf(t))` is empty where Node
+  lists `constructor,refresh,unref,ref,hasRef,close`. Calling the methods,
+  `t.constructor.name`, and coercion (`String(t)`/`Number(t)` → the timer id,
+  via `valueOf`/`toString` rather than Node's own `Symbol.toPrimitive`) all
+  behave correctly; only reflection over the prototype differs. This is the
+  general native-instance shape, not a timer-specific one — `URL` reports the
+  same empty prototype, while `Buffer` has a real linked one.
+
+- **`ref`/`unref` on a socket or server do not change loop liveness.**
+  `socket.ref`/`unref` are accepted no-ops, and `server.ref`/`unref` are absent
+  entirely (`server.unref()` throws `TypeError: server.unref is not a
+  function`), so a program that unrefs its listener keeps the process alive
+  where Node exits. Timers do honor the handle bit; sockets and servers do not.
+  Fixing this needs more than adding the methods: `open_handles` is a bare
+  counter with no per-object identity, so an `unref` cannot tell whether the
+  handle it would decrement is still open, and an `unref` after a `close` would
+  consume some *other* handle's count and drop the loop early — turning a
+  hang into the worse failure of a live server exiting silently. It needs
+  per-handle identity (each socket/server owning a token it can release at most
+  once), which is a change to the handle model rather than to these methods.
+
 ## Fixed since the initial parity sweep (previously divergences, now correct)
 
 Recorded so the same gaps are not "re-discovered" as regressions. All verified
@@ -619,3 +643,20 @@ against `node v26.5.0`:
   the string contains a `'` but no `"`, a backtick when it contains both, and
   the C0 controls escape through Node's `meta` table (`\n`/`\t`/`\b`/`\f`/`\r`
   short forms, `\x0B`/`\x00`/`\x7F` uppercase hex otherwise).
+
+- **Timers keep the process alive (`ref`/`unref` handle counting).** Verified
+  against `node v26.7.0`. `setInterval` used to fire exactly ONCE and then let
+  the loop drain, so `setInterval(fn, 1000)` exited immediately where real node
+  runs until killed — a poller or heartbeat silently did nothing instead of
+  failing loudly. An interval now re-arms itself (before invoking its callback,
+  so a `clearInterval` from *inside* the callback still cancels it) and, being a
+  referenced handle, holds the loop open exactly as in Node. The loop stays
+  alive while a microtask, an open handle, or a *referenced* timer is pending;
+  an unref'd timer still fires while something else holds the loop open but
+  never holds it by itself. A pending interval also forces the real-clock
+  regime — on the virtual clock, where time never advances, it would re-fire at
+  the same instant forever and starve every longer-delay timer behind it.
+  `setTimeout`/`setInterval` now return a `Timeout` and `setImmediate` an
+  `Immediate`, carrying `ref`/`unref`/`hasRef`/`refresh`/`close`; both coerce to
+  their integer timer id, so code that stored the previously returned number
+  still clears correctly. The absent `clearImmediate` global was added.
