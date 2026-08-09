@@ -861,3 +861,27 @@ against `node v26.5.0`:
   GetTemplateObject (13.2.8.4) defines it non-writable, non-enumerable and
   non-configurable. It was an ordinary enumerable property, which put it in
   `Object.keys(strings)`.
+
+- **A builtin namespace enumerated its keys but not their values.**
+  `own_enum_entries` reads a property map, and a namespace (`require('path')`,
+  `Buffer`) has none — its members are resolved on demand by
+  `builtins::namespace_property`, which re-enters the host and so cannot run
+  under that borrow. Every value therefore came back `undefined` while the keys
+  came back right, so `{...require('path')}.join` and
+  `Object.assign({}, require('buffer')).Buffer` were `undefined` where node
+  v26.7.0 gives functions. `Object.keys`/`values`/`entries` were unaffected
+  (they resolve through `builtins`, not through the borrow), which is why the
+  gap survived: two enumeration paths, only one of them value-less.
+  `host::own_enum_entries_deep` now resolves a namespace's values the same way a
+  property read does.
+
+- **`require('stream/web')` enumerated no keys at all.** `stdlib::resolve` maps
+  the specifier onto the `stream/web` namespace, but `namespace_keys` is built
+  from `namespace_methods` ∪ `namespace_ctors` and the module exports nothing
+  but classes (`stream_web::METHODS` is empty) — so neither table backed it.
+  `Object.keys(require('stream/web')).length` was 0 against node v26.7.0's 18,
+  even though `require('stream/web').ReadableStream` resolved fine.
+  `namespace_ctors` now returns `stream_web::CLASSES`, giving the 17 classes
+  node-js implements (node's 18th, `ReadableStreamTee`, is not implemented, and
+  `namespace_keys` deliberately advertises the working set rather than node's
+  full export list).

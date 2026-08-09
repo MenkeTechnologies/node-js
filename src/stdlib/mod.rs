@@ -213,7 +213,7 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
 /// Class/constructor members a namespace re-exports as values rather than
 /// callable methods (`require('buffer').Buffer`, `require('url').URL`). They are
 /// enumerable own keys too, so `for (k in buffer)` sees `Buffer`.
-fn namespace_ctors(ns: &str) -> &'static [&'static str] {
+pub fn namespace_ctors(ns: &str) -> &'static [&'static str] {
     match ns {
         "buffer" => &["Buffer", "Blob", "File"],
         "url" => &["URL", "URLSearchParams"],
@@ -224,6 +224,14 @@ fn namespace_ctors(ns: &str) -> &'static [&'static str] {
         "console" => &["Console"],
         "vm" => &["Script"],
         "fs" => &["promises"],
+        // `stream/web` exports nothing BUT classes (`METHODS` is empty), so
+        // without this arm the namespace had no enumerable key at all: measured
+        // against node v26.7.0, `Object.keys(require('stream/web')).length` was
+        // 0 here and 18 there, even though every one of the classes resolved
+        // fine through `constant`. A namespace that answers property reads but
+        // enumerates empty breaks the copy-the-module pattern
+        // (`{ ...require('stream/web') }`, `for (k in web)`).
+        "stream/web" => stream_web::CLASSES,
         _ => &[],
     }
 }

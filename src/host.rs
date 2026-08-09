@@ -3391,6 +3391,27 @@ impl JsHost {
 /// `Object.entries`, object spread and `JSON.stringify` all need. Must be called
 /// outside a `with_host` borrow because a getter re-enters the host.
 pub fn own_enum_entries_deep(v: &Value) -> Vec<(String, Value)> {
+    // A builtin namespace (`require('path')`, `Buffer`) has no property map at
+    // all: its members are resolved on demand by `namespace_property`, which
+    // re-enters the host and so cannot run inside `own_enum_entries`'s borrow.
+    // Without this, spread and `Object.assign` copied the namespace's KEYS with
+    // `undefined` for every value — measured against node v26.7.0,
+    // `{...require('path')}.join` was `undefined` here and a function there,
+    // while `Object.entries(require('path'))` (which resolves through
+    // `builtins`, not through this borrow) was already correct. Two enumeration
+    // paths, one of them silently value-less.
+    if let Some(ns) = with_host(|h| match h.get(v) {
+        Some(JsObj::Builtin(ns)) => Some(ns.clone()),
+        _ => None,
+    }) {
+        return with_host(|h| h.own_enum_key_names(v))
+            .into_iter()
+            .map(|k| {
+                let val = crate::builtins::namespace_property(&ns, &k);
+                (k, val)
+            })
+            .collect();
+    }
     let accessor_keys: Vec<String> = with_host(|h| {
         h.own_accessor_keys(v)
             .into_iter()

@@ -1092,7 +1092,7 @@ fn ensure_fn_prototype(recv: &Value) -> Value {
 
 /// A property on a builtin namespace object (`Math.PI`, `Number.MAX_SAFE_INTEGER`,
 /// `console.log`).
-fn namespace_property(ns: &str, name: &str) -> Value {
+pub fn namespace_property(ns: &str, name: &str) -> Value {
     // Numeric constants.
     let konst = match (ns, name) {
         ("Math", "PI") => Some(std::f64::consts::PI),
