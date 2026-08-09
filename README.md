@@ -157,10 +157,23 @@ cargo build --bin parity --bin parity-fuzz
 ./target/debug/parity-fuzz --once --seed 1234  # replay one case, show both sides
 ```
 
+A third harness, `parity-scripts/run.sh`, byte-compares every
+`parity-scripts/**/*.js` file against the reference `node` (stdout AND
+success/failure agreement) and prints the pass rate:
+
+```sh
+bash parity-scripts/run.sh      # byte-parity rate over the whole corpus
+bash parity-scripts/run.sh -v   # plus a diff for each divergence
+```
+
 Fuzz generators are biased toward where a JS frontend is likely to disagree with
 the reference: float representation and the exponential-notation threshold,
 `ToInt32` bitwise wrap, the `==` coercion matrix, `+` coercion, string/array
-methods, `toFixed`/`toPrecision` rounding, and JSON round-trips.
+methods, `toFixed`/`toPrecision` rounding, JSON round-trips and parse-error
+messages, property descriptors and the enumeration surface that depends on them,
+`freeze`/`seal` write and `delete` outcomes, builtin identity and prototype-chain
+reads, `structuredClone`'s reference graph, and error own-property shape.
+Select one with `--mode <name>`.
 
 ## [0x06] BUILD
 

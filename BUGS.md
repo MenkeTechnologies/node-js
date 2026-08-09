@@ -28,6 +28,19 @@ node-js` — honest, never a silent fake): `tls`, `http2`, `https`, `worker_thre
 `readline`, `dns/promises` (use `require('dns').promises`). These need real
 TLS/HTTP2/OS-threads/sandboxing substrate.
 
+Two ECMAScript globals are absent entirely, and reference as `ReferenceError`
+rather than pretending:
+
+- **`Proxy`.** `Reflect` is complete (all 13 methods), but `Proxy` needs
+  interception hooks in every property funnel — `get_property`,
+  `set_property`, `has_property`, both delete paths, own-key enumeration, call
+  and construct — each of which has to invoke a user trap from inside a host
+  borrow. That is a structural change to the object model, not an addition to
+  it, so it is not attempted here rather than shipped half-working.
+- **`Intl`.** Needs ICU (locale-aware number/date/collation data). There is no
+  honest subset: a `Intl.NumberFormat` that only handles `en-US` would give
+  wrong answers for every other locale instead of an error.
+
 `async_hooks.AsyncResource` carries a real id graph. Each `new AsyncResource()`
 takes the next monotonically increasing `asyncId` (from 2 — Node reserves 1 for
 the root context) and records the creating context as its `triggerAsyncId`;
