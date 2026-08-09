@@ -36,6 +36,15 @@
 //! deterministically-schedulable output (fixed microtask/timer ordering,
 //! resolved-value chains) — never wall-clock- or identity-dependent results.
 //!
+//! The `descriptor`, `freeze`, `identity`, `clone` and `error` modes cover the
+//! object model: the `writable`/`enumerable`/`configurable` triple and every
+//! reader that must agree about it, `freeze`/`seal`/`preventExtensions` and
+//! their sloppy-mode write and `delete` outcomes, builtin singleton identity and
+//! prototype-chain reads, `structuredClone`'s reference graph, and error
+//! own-property shape (`cause`, `AggregateError`, subclassing). `identity`
+//! prints only fixed booleans and brand strings, never an address, and `error`
+//! never prints stack text — its frames are engine-specific.
+//!
 //! Subprocess-only: this binary never links the nodejs library — it compares two
 //! `node` processes, exactly as a user would observe them.
 //!
@@ -1022,6 +1031,137 @@ fn gen_regex(seed: u64) -> Vec<String> {
     vec![format!("console.log({e})")]
 }
 
+/// Property descriptors — the attribute triple, accessors, and every reader
+/// that has to agree about which own keys exist and which of them enumerate
+/// (`keys`/`values`/`entries`/spread/`assign`/`JSON`/`for-in`/
+/// `getOwnPropertyNames`/`propertyIsEnumerable`). The generated object always
+/// mixes a data property, a `defineProperty` data property with explicit flags,
+/// and an accessor, so key ORDER is asserted as well as key membership.
+fn gen_descriptor(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let enumerable = pick(r, &["true", "false"]);
+    let writable = pick(r, &["true", "false"]);
+    let configurable = pick(r, &["true", "false"]);
+    let acc_enum = pick(r, &["true", "false"]);
+    let mut setup = vec![
+        "const o = {first: 1};".to_string(),
+        format!(
+            "Object.defineProperty(o, 'mid', {{value: 2, enumerable: {enumerable}, \
+             writable: {writable}, configurable: {configurable}}});"
+        ),
+        format!(
+            "Object.defineProperty(o, 'acc', {{get() {{ return 3; }}, enumerable: {acc_enum}, \
+             configurable: true}});"
+        ),
+        "o.last = 4;".to_string(),
+    ];
+    // Sometimes mutate through the (possibly non-writable) slot first.
+    if r.below(2) == 0 {
+        setup.push("o.mid = 99;".to_string());
+    }
+    let e = match r.below(11) {
+        0 => "Object.keys(o)",
+        1 => "Object.values(o)",
+        2 => "Object.entries(o)",
+        3 => "JSON.stringify(o)",
+        4 => "JSON.stringify({...o})",
+        5 => "JSON.stringify(Object.assign({}, o))",
+        6 => "Object.getOwnPropertyNames(o)",
+        7 => "JSON.stringify(Object.getOwnPropertyDescriptor(o, 'mid'))",
+        8 => "[o.propertyIsEnumerable('mid'), o.propertyIsEnumerable('acc'), o.propertyIsEnumerable('last')]",
+        9 => "[Object.prototype.hasOwnProperty.call(o, 'mid'), Object.hasOwn(o, 'acc'), Object.hasOwn(o, 'nope')]",
+        _ => "(() => { const ks = []; for (const k in o) ks.push(k); return ks; })()",
+    };
+    setup.push(format!("console.log({e});"));
+    setup
+}
+
+/// Object freeze/seal/preventExtensions: the sloppy-mode write outcomes and the
+/// `isFrozen`/`isSealed`/`isExtensible` predicates.
+fn gen_freeze(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let op = pick(r, &["freeze", "seal", "preventExtensions"]);
+    let lit = pick(r, &["{a: 1, b: 2}", "{x: 'v'}", "{}", "{n: 0, m: null}"]);
+    let mutation = pick(r, &["o.a = 9;", "o.fresh = 1;", "delete o.a;", "o.b = o.b;"]);
+    let e = match r.below(5) {
+        0 => "JSON.stringify(o)",
+        1 => "[Object.isFrozen(o), Object.isSealed(o), Object.isExtensible(o)]",
+        2 => "Object.keys(o)",
+        3 => "Object.getOwnPropertyNames(o)",
+        _ => "JSON.stringify(Object.getOwnPropertyDescriptors(o))",
+    };
+    vec![
+        format!("const o = Object.{op}({lit});"),
+        mutation.to_string(),
+        format!("console.log({e});"),
+    ]
+}
+
+/// Builtin identity and prototype-chain reads: the `===` guards packages use to
+/// type-test values they did not construct. Every probe has a fixed boolean or
+/// string answer, never an address.
+fn gen_identity(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let e = match r.below(12) {
+        0 => "[Math === Math, JSON === JSON, Reflect === Reflect]",
+        1 => "[Array.prototype === Array.prototype, Object.prototype === Object.prototype]",
+        2 => "[Object.getPrototypeOf([]) === Array.prototype, Object.getPrototypeOf({}) === Object.prototype]",
+        3 => "[Object.getPrototypeOf(new Map()) === Map.prototype, Object.getPrototypeOf(new Set()) === Set.prototype]",
+        4 => "String(Object.getPrototypeOf(Object.create(null)))",
+        5 => "(() => { class C {} return [Object.getPrototypeOf(new C()) === C.prototype, Object.getPrototypeOf(C.prototype) === Object.prototype]; })()",
+        6 => "(() => { class A {} class B extends A {} return [Object.getPrototypeOf(B.prototype) === A.prototype, new B() instanceof A]; })()",
+        7 => "(() => { function F() {} return [Object.getPrototypeOf(new F()) === F.prototype, F.prototype.constructor === F]; })()",
+        8 => "[[] instanceof Array, [] instanceof Object, /x/ instanceof RegExp, new Date(0) instanceof Date]",
+        9 => "[Object.keys(Object.prototype).length, Object.keys(Array.prototype).length]",
+        10 => "(() => { const p = {i: 1}; const o = Object.create(p); o.own = 2; const ks = []; for (const k in o) ks.push(k); return [ks, Object.keys(o)]; })()",
+        _ => "[Object.prototype.toString.call([]), Object.prototype.toString.call(null), Object.prototype.toString.call(new Map())]",
+    };
+    vec![format!("console.log({e});")]
+}
+
+/// `structuredClone` — deep copy, reference-graph preservation, cycles, and the
+/// structured types (Map/Set/Date/RegExp/typed array) that are not plain
+/// objects. Every probe prints a shape or a boolean, never an identity.
+fn gen_clone(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let e = match r.below(9) {
+        0 => "JSON.stringify(structuredClone({a: 1, b: [1, [2, 3]], c: {d: 'x'}}))",
+        1 => "(() => { const s = {a: [1, 2]}; const c = structuredClone(s); c.a.push(3); return [JSON.stringify(s), JSON.stringify(c)]; })()",
+        2 => "(() => { const sh = {id: 1}; const c = structuredClone({p: sh, q: sh}); return [c.p === c.q, c.p !== sh]; })()",
+        3 => "(() => { const cy = {n: 'r'}; cy.self = cy; const c = structuredClone(cy); return [c.self === c, c.n]; })()",
+        4 => "(() => { const c = structuredClone(new Map([['k', [1, 2]]])); return [c instanceof Map, c.size, JSON.stringify([...c])]; })()",
+        5 => "(() => { const c = structuredClone(new Set([1, 2, 2])); return [c instanceof Set, c.size, JSON.stringify([...c])]; })()",
+        6 => "(() => { const c = structuredClone(new Date(86400000)); return [c instanceof Date, c.toISOString()]; })()",
+        7 => "(() => { const c = structuredClone(/a+b/gim); return [c instanceof RegExp, c.source, c.flags]; })()",
+        _ => "(() => { const c = structuredClone(new Uint8Array([7, 8, 9])); return [c instanceof Uint8Array, c.length, c[1]]; })()",
+    };
+    vec![format!("console.log({e});")]
+}
+
+/// Error object shape: own-property enumerability, `cause`, `AggregateError`,
+/// subclassing, and the `String(err)`/`JSON.stringify(err)` renderings. Stack
+/// text is never printed — its frames are engine-specific.
+fn gen_error(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let ctor = pick(
+        r,
+        &["Error", "TypeError", "RangeError", "SyntaxError", "EvalError"],
+    );
+    let msg = pick(r, &["boom", "", "with spaces", "sym#1"]);
+    let e = match r.below(9) {
+        0 => format!("JSON.stringify(Object.keys(new {ctor}('{msg}')))"),
+        1 => format!("Object.getOwnPropertyNames(new {ctor}('{msg}')).sort()"),
+        2 => format!("JSON.stringify(new {ctor}('{msg}'))"),
+        3 => format!("[String(new {ctor}('{msg}')), new {ctor}('{msg}').name, new {ctor}('{msg}').message]"),
+        4 => format!("JSON.stringify(Object.getOwnPropertyDescriptor(new {ctor}('{msg}'), 'message'))"),
+        5 => format!("(() => {{ const e = new {ctor}('{msg}', {{cause: 'why'}}); return [e.cause, JSON.stringify(Object.keys(e))]; }})()"),
+        6 => format!("(() => {{ const e = new {ctor}('{msg}'); e.extra = 1; return [JSON.stringify(Object.keys(e)), JSON.stringify(e)]; }})()"),
+        7 => format!("(() => {{ class E extends {ctor} {{ constructor(m) {{ super(m); this.name = 'E'; }} }} const e = new E('{msg}'); return [String(e), e instanceof {ctor}, e instanceof Error, JSON.stringify(Object.keys(e))]; }})()"),
+        _ => format!("(() => {{ const a = new AggregateError([new {ctor}('{msg}')], 'agg'); return [a.errors.length, a.message, JSON.stringify(Object.keys(a)), JSON.stringify(a)]; }})()"),
+    };
+    vec![format!("console.log({e});")]
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -1049,6 +1189,11 @@ enum Mode {
     Async,
     Bigint,
     Regex,
+    Descriptor,
+    Freeze,
+    Identity,
+    Clone,
+    ErrorShape,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -1072,6 +1217,11 @@ const REAL_MODES: &[Mode] = &[
     Mode::Async,
     Mode::Bigint,
     Mode::Regex,
+    Mode::Descriptor,
+    Mode::Freeze,
+    Mode::Identity,
+    Mode::Clone,
+    Mode::ErrorShape,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1102,6 +1252,11 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Async => gen_async(seed),
         Mode::Bigint => gen_bigint(seed),
         Mode::Regex => gen_regex(seed),
+        Mode::Descriptor => gen_descriptor(seed),
+        Mode::Freeze => gen_freeze(seed),
+        Mode::Identity => gen_identity(seed),
+        Mode::Clone => gen_clone(seed),
+        Mode::ErrorShape => gen_error(seed),
     }
 }
 
@@ -1128,6 +1283,11 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Async => "async",
         Mode::Bigint => "bigint",
         Mode::Regex => "regex",
+        Mode::Descriptor => "descriptor",
+        Mode::Freeze => "freeze",
+        Mode::Identity => "identity",
+        Mode::Clone => "clone",
+        Mode::ErrorShape => "error",
     }
 }
 
@@ -1153,6 +1313,11 @@ const ALL_MODES: &[Mode] = &[
     Mode::Async,
     Mode::Bigint,
     Mode::Regex,
+    Mode::Descriptor,
+    Mode::Freeze,
+    Mode::Identity,
+    Mode::Clone,
+    Mode::ErrorShape,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {

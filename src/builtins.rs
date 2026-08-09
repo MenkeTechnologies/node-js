@@ -1295,6 +1295,11 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
     let key = with_host(|h| h.str_of(&idx));
+    // A non-configurable property cannot be deleted; in sloppy mode the delete
+    // simply reports false rather than throwing.
+    if !with_host(|h| h.prop_attrs(&recv, &key).configurable) {
+        return Value::Bool(false);
+    }
     with_host(|h| match h.get_mut(&recv) {
         Some(JsObj::Object(props)) => {
             props.shift_remove(&key);
@@ -1314,6 +1319,9 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
 fn b_delprop_name(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let recv = vm.pop();
+    if !with_host(|h| h.prop_attrs(&recv, &name).configurable) {
+        return Value::Bool(false);
+    }
     with_host(|h| {
         if let Some(JsObj::Object(props)) = h.get_mut(&recv) {
             props.shift_remove(&name);
