@@ -1150,6 +1150,18 @@ fn namespace_property(ns: &str, name: &str) -> Value {
         let _ = ns;
         return with_host(|h| h.alloc(JsObj::Builtin(format!("{ns}.prototype"))));
     }
+    // A NATIVE stdlib constructor's `.prototype` (`StringDecoder`, `Hash`,
+    // `URLSearchParams`, …). These are absent from `is_builtin_ctor`, so the arm
+    // above never fired and the read produced `undefined` — which broke the ES5
+    // subclassing pattern libraries still ship. `iconv-lite`'s internal codec
+    // reads `StringDecoder.prototype.end` at load, and threw
+    // `Cannot read properties of undefined (reading 'end')`. Built from the same
+    // instance-method table a method read consults, so the two cannot disagree.
+    if name == "prototype" {
+        if let Some(p) = with_host(|h| h.ensure_ctor_proto(ns)) {
+            return p;
+        }
+    }
     // A method read off a builtin prototype namespace (`Array.prototype.slice`):
     // a `@proto:<Ctor>:<method>` thunk that, when invoked (typically via
     // `.call`/`.apply`), dispatches `method` against the invoke-time `this`.
@@ -1224,6 +1236,14 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
             }
             _ => {}
         }
+    }
+    // The general form of the two special cases above: a thunk taken off a native
+    // constructor's real prototype, invoked with a receiver that IS an instance of
+    // that constructor. Routing back through `call_method` would re-resolve this
+    // very thunk off the receiver's own chain and recurse forever, which is why
+    // each such prototype needed a hand-written bypass; now they all have one.
+    if crate::stdlib::native_tag(recv).as_deref() == Some(ctor) {
+        return crate::stdlib::instance_call(ctor, recv, method, args);
     }
     host::call_method(recv, method, args)
 }
@@ -2724,6 +2744,25 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // (20.2.1.1 `CreateDynamicFunction` is reached from both [[Call]] and
         // [[Construct]]), so both route to the one generator.
         "Function" => function_ctor(&args),
+        // `Buffer(arg[, encodingOrOffset[, length]])` — the deprecated call form
+        // (DEP0005). Node still supports it and still routes it to the same place
+        // `new Buffer` goes, which is why `safe-buffer`'s legacy `SafeBuffer`
+        // wrapper is just `return Buffer(arg, encodingOrOffset, length)`. Measured
+        // on node v26.7.0: `Buffer('abc').toString() === 'abc'`,
+        // `Buffer([1,2]).toString('hex') === '0102'`, `Buffer(3).length === 3`.
+        // Node emits DEP0005 once, on stderr, through the same one-shot machinery
+        // `url.parse`'s DEP0169 uses, so this does too rather than staying silent
+        // where Node warns.
+        "Buffer" => {
+            crate::stdlib::process::emit_deprecation_warning(
+                "DEP0005",
+                "Buffer() is deprecated due to security and usability issues. \
+                 Please use the Buffer.alloc(), Buffer.allocUnsafe(), or \
+                 Buffer.from() methods instead.",
+            );
+            crate::stdlib::construct("Buffer", &args)
+                .unwrap_or_else(|| Err(host::type_error("Buffer is not a function")))
+        }
         "Number.isInteger" => Ok(Value::Bool(is_integer(arg0(&args)))),
         "Number.isSafeInteger" => Ok(Value::Bool(is_safe_integer(arg0(&args)))),
         "Number.isNaN" => Ok(Value::Bool(

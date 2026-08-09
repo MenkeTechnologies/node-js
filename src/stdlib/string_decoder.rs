@@ -11,6 +11,11 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
+/// The methods a `StringDecoder` instance carries. Also the method set its real
+/// prototype object is built from, so a read (`sd.write`), a call (`sd.write(b)`)
+/// and a prototype lookup (`StringDecoder.prototype.write`) cannot disagree.
+pub const INSTANCE_METHODS: &[&str] = &["write", "end"];
+
 /// `new StringDecoder([encoding])`.
 pub fn construct(args: &[Value]) -> Result<Value, String> {
     let enc = if args.is_empty() {

@@ -426,7 +426,22 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
         "URL" => Some(url::construct(args)),
         "EventEmitter" => Some(Ok(events::new_emitter())),
-        "Buffer" => Some(buffer::static_call("from", args).unwrap_or(Ok(Value::Undef))),
+        // `new Buffer(x)` and the deprecated call form `Buffer(x)` are the same
+        // operation, and it is NOT simply `Buffer.from`: a NUMBER allocates that
+        // many zero bytes, where `Buffer.from(3)` is a TypeError in Node.
+        // Measured on node v26.7.0, `new Buffer(3)` and `Buffer(3)` are both
+        // `<Buffer 00 00 00>` (zero-filled since the `Buffer.alloc` semantics
+        // landed), while `new Buffer('ab')` and `new Buffer([1,2])` behave as
+        // `from`. Routing everything through `from` made `new Buffer(3)` one byte
+        // long.
+        "Buffer" => {
+            let numeric = matches!(
+                args.first(),
+                Some(Value::Int(_)) | Some(Value::Float(_))
+            ) && args.len() == 1;
+            let m = if numeric { "alloc" } else { "from" };
+            Some(buffer::static_call(m, args).unwrap_or(Ok(Value::Undef)))
+        }
         "Date" => Some(date::construct(args)),
         "StringDecoder" => Some(string_decoder::construct(args)),
         "WeakRef" => Some(typedarray::construct_weakref(args)),
@@ -490,6 +505,19 @@ pub fn has_to_json(tag: &str) -> bool {
 /// listen path) yields a bound method rather than `undefined` — the method is
 /// still dispatched through `instance_call` when the bound method is invoked.
 pub fn instance_has_method(tag: &str, name: &str) -> bool {
+    let (base, emitter) = instance_method_lists(tag);
+    base.contains(&name) || emitter.contains(&name)
+}
+
+/// The method names a native instance tagged `tag` carries, as
+/// `(its own list, the EventEmitter surface it also gets or empty)`.
+///
+/// Split out of [`instance_has_method`] so the same table can be *enumerated*,
+/// not only queried: `host::ensure_ctor_proto` builds a native constructor's
+/// real `.prototype` object from it. A predicate alone would have forced a
+/// second, hand-maintained list of the same names — the drift that put
+/// `listeners` on nine dispatchers and not on the three that run.
+pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&'static str]) {
     // Shared EventEmitter surface for the emitter-backed instances. Read from
     // `events::METHODS` so what an instance ADVERTISES here can never drift from
     // what the dispatchers actually delegate.
@@ -554,6 +582,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
             "setEncoding",
         ],
         "Hmac" => &["update", "digest"],
+        "StringDecoder" => string_decoder::INSTANCE_METHODS,
         "Interface" => readline::INTERFACE_METHODS,
         "Script" => vm::SCRIPT_METHODS,
         "URLSearchParams" => url::SEARCH_PARAMS_METHODS,
@@ -648,7 +677,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
             | "FSWriteStream"
             | "ChildProcess"
     );
-    base.contains(&name) || (is_emitter && EMITTER.contains(&name))
+    (base, if is_emitter { EMITTER } else { &[] })
 }
 
 /// Dispatch a method call on a native stdlib instance (`recv` carries a

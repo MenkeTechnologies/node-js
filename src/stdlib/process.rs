@@ -121,6 +121,39 @@ pub fn emit_deprecation_warning(code: &str, message: &str) {
     }
 }
 
+/// A signal NAME (`"SIGKILL"`, case-insensitive) to its number, or `None` if the
+/// name is not one this platform defines.
+///
+/// The numbers come from `libc`, not from a hand-written table: signal numbering
+/// differs between macOS and Linux above SIGTERM (`SIGUSR1` is 30 on Darwin and
+/// 10 on Linux), so a literal table is only correct on the platform it was
+/// written for. Shared with `cluster`'s `worker.kill`.
+pub fn signal_number(name: &str) -> Option<libc::c_int> {
+    Some(match name.to_uppercase().as_str() {
+        "SIGHUP" => libc::SIGHUP,
+        "SIGINT" => libc::SIGINT,
+        "SIGQUIT" => libc::SIGQUIT,
+        "SIGILL" => libc::SIGILL,
+        "SIGTRAP" => libc::SIGTRAP,
+        "SIGABRT" => libc::SIGABRT,
+        "SIGBUS" => libc::SIGBUS,
+        "SIGFPE" => libc::SIGFPE,
+        "SIGKILL" => libc::SIGKILL,
+        "SIGUSR1" => libc::SIGUSR1,
+        "SIGSEGV" => libc::SIGSEGV,
+        "SIGUSR2" => libc::SIGUSR2,
+        "SIGPIPE" => libc::SIGPIPE,
+        "SIGALRM" => libc::SIGALRM,
+        "SIGTERM" => libc::SIGTERM,
+        "SIGCHLD" => libc::SIGCHLD,
+        "SIGCONT" => libc::SIGCONT,
+        "SIGSTOP" => libc::SIGSTOP,
+        "SIGTSTP" => libc::SIGTSTP,
+        "SIGWINCH" => libc::SIGWINCH,
+        _ => return None,
+    })
+}
+
 /// `process.emitWarning(warning[, options])` / `(warning[, type[, code]])`.
 fn emit_warning_args(args: &[Value]) {
     let message = super::arg_str(args, 0);
@@ -258,7 +291,67 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             emit_warning_args(args);
             Ok(Value::Undef)
         }
-        "chdir" | "exit" | "kill" | "reallyExit" | "setSourceMapsEnabled" => Ok(Value::Undef),
+        // `process.exit([code])` really exits, and does so IMMEDIATELY — nothing
+        // after the call runs. It used to return `undefined` and let execution
+        // continue, which is a silent lie with teeth: the idiom
+        // `if (done) { server.close(); process.exit(0); }` (no `return`, because
+        // in Node none is needed) fell through to the statement after it. In a
+        // request-sequencing loop that meant re-entering the loop past the end of
+        // its array and destructuring `undefined`. Measured on node v26.7.0,
+        // `console.log('before'); process.exit(0); console.log('after')` prints
+        // only `before`; it printed both here.
+        //
+        // Under `--build`/`--dap`/embedding this is still a real process exit,
+        // exactly as it is in Node — there is no "exit but keep going" in the API.
+        // stdout/stderr are flushed first because `std::process::exit` runs no
+        // destructors.
+        "exit" | "reallyExit" => {
+            let code = match args.first() {
+                Some(v) if !matches!(v, Value::Undef) => with_host(|h| h.to_number(v)) as i32,
+                _ => 0,
+            };
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(code);
+        }
+        // `process.chdir(dir)` really changes the working directory, and throws on
+        // failure; it used to silently do nothing, so every later relative path
+        // still resolved against the old directory.
+        "chdir" => {
+            let dir = super::arg_str(args, 0);
+            std::env::set_current_dir(&dir)
+                .map(|()| Value::Undef)
+                .map_err(|e| format!("Error: ENOENT: {e}, chdir '{dir}'"))
+        }
+        // `process.kill(pid[, signal])` really signals the process. Node's default
+        // is SIGTERM, and a numeric or `'SIGxxx'` signal is accepted; signal `0`
+        // is the existence probe and sends nothing.
+        "kill" => {
+            let pid = with_host(|h| args.first().map(|v| h.to_number(v)).unwrap_or(0.0)) as i32;
+            let sig: Result<libc::c_int, String> = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undef) => match with_host(|h| h.as_str(v)) {
+                    Some(name) => {
+                        signal_number(&name).ok_or(format!("Error: Unknown signal: {name}"))
+                    }
+                    None => Ok(with_host(|h| h.to_number(v)) as libc::c_int),
+                },
+                _ => Ok(libc::SIGTERM),
+            };
+            sig.and_then(|sig| {
+                // SAFETY: `kill` is a plain syscall on a pid/signal pair; it
+                // mutates no process memory and reports failure through `errno`.
+                if unsafe { libc::kill(pid, sig) } != 0 {
+                    Err(format!("Error: {}", std::io::Error::last_os_error()))
+                } else {
+                    Ok(Value::Undef)
+                }
+            })
+        }
+        // A genuine no-op: node-js emits no source maps, so enabling their use
+        // changes nothing. Returning `undefined` is the whole of Node's contract
+        // here, so this is not a stub.
+        "setSourceMapsEnabled" => Ok(Value::Undef),
 
         // POSIX identity queries (libc; pure reads, always safe).
         "getuid" => Ok(Value::Float(unsafe { libc::getuid() } as f64)),

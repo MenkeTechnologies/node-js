@@ -7,14 +7,34 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
+/// The statics on `Buffer`. node v26.7.0's
+/// `Object.getOwnPropertyNames(Buffer).filter(n => typeof Buffer[n] === 'function')`
+/// reports eleven; this is ten of them.
+///
+/// Three used to be missing, and the gap was not cosmetic: `safe-buffer`
+/// feature-detects `Buffer.from && Buffer.alloc && Buffer.allocUnsafe &&
+/// Buffer.allocUnsafeSlow` and, on a miss, exports its own legacy `SafeBuffer`
+/// wrapper instead of the real `buffer` module. express's `res.send` takes
+/// `Buffer` from `safe-buffer`, so every `res.json()` went through that wrapper
+/// and died on its `Buffer(arg, …)` call.
+///
+/// The eleventh, `copyBytesFrom`, is deliberately absent rather than faked. It
+/// copies a typed array's raw BYTES with `offset`/`length` counted in ELEMENTS,
+/// which needs a per-kind little-endian serializer for all nine element kinds
+/// (typed arrays are stored here as a `@@elems` array of NUMBERS, not bytes).
+/// Listing it without that would advertise a method the dispatcher cannot
+/// implement — the exact drift this list exists to prevent.
 pub const STATIC_METHODS: &[&str] = &[
     "from",
     "alloc",
     "allocUnsafe",
+    "allocUnsafeSlow",
     "concat",
     "isBuffer",
+    "isEncoding",
     "byteLength",
     "compare",
+    "of",
 ];
 
 /// The methods a `Buffer` instance answers — the surface `instance_call`
@@ -384,11 +404,41 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
             };
             Ok(from_bytes(&bytes))
         }
-        "allocUnsafe" => Ok(from_bytes(&vec![
+        // `allocUnsafeSlow` differs from `allocUnsafe` only in skipping Node's
+        // shared pool — an allocator detail with no observable difference here,
+        // where every Buffer already owns its bytes.
+        "allocUnsafe" | "allocUnsafeSlow" => Ok(from_bytes(&vec![
             0u8;
             super::arg_num(args, 0).max(0.0) as usize
         ])),
         "concat" => concat(args),
+        // `Buffer.of(...bytes)` — the `%TypedArray%.of` form: each argument is one
+        // byte. Measured: `Buffer.of(1,2,3).toString('hex') === '010203'`,
+        // `Buffer.of().length === 0`.
+        "of" => Ok(from_bytes(
+            &args
+                .iter()
+                .map(|v| crate::host::with_host(|h| h.to_number(v)) as u8)
+                .collect::<Vec<u8>>(),
+        )),
+        // `Buffer.isEncoding(enc)` — case-insensitive over the encodings Node
+        // accepts. Measured: `UTF8`, `UTF-8`, `ASCII` and `Hex` are all true;
+        // `utf7`, `utf-16be`, `none` and `''` are all false.
+        "isEncoding" => Ok(Value::Bool(matches!(
+            super::arg_str(args, 0).to_ascii_lowercase().as_str(),
+            "utf8"
+                | "utf-8"
+                | "ucs2"
+                | "ucs-2"
+                | "utf16le"
+                | "utf-16le"
+                | "latin1"
+                | "binary"
+                | "base64"
+                | "base64url"
+                | "hex"
+                | "ascii"
+        ))),
         // Static `Buffer.compare(a, b)` — the sort comparator form.
         "compare" => {
             let a = bytes_of(&args.first().cloned().unwrap_or(Value::Undef));

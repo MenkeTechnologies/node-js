@@ -3616,6 +3616,27 @@ pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result
             let recv = this.unwrap_or(Value::Undef);
             crate::builtins::proto_method(&recv, &name["@proto:".len()..], args)
         }
+        // `NativeCtor.call(obj, …)` — ES5 "constructor stealing", still shipped by
+        // libraries that predate `class`. `iconv-lite`'s internal codec is exactly
+        // this:
+        //
+        //     function InternalDecoder(options, codec) { StringDecoder.call(this, codec.enc); }
+        //     InternalDecoder.prototype = StringDecoder.prototype;
+        //
+        // A native constructor builds a fresh tagged object, so initializing the
+        // SUPPLIED object means building one and moving its slots across.
+        //
+        // The guard is deliberately narrow: `obj` must already inherit from THIS
+        // constructor's prototype, i.e. the subclass really did adopt it. Without
+        // that, `Date.call(x)` and `Buffer.call(x)` — which in JS ignore `this` and
+        // return a string / a buffer — would start mutating `x` instead.
+        Some(JsObj::Builtin(ref name)) if steals_ctor(name, this.as_ref()) => {
+            let target = this.expect("guard checked");
+            let built = crate::stdlib::construct(name, &args)
+                .expect("guard checked a native constructor")?;
+            adopt_native_slots(&target, &built);
+            Ok(Value::Undef)
+        }
         Some(JsObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args),
         Some(JsObj::Func(fv)) => run_user_func(&fv, args, this),
         Some(JsObj::BoundMethod { recv, name }) => call_method(&recv, &name, args),
@@ -3637,6 +3658,55 @@ pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result
             with_host(|h| h.str_of(callable))
         ))),
     }
+}
+
+/// Whether calling the native constructor `name` with `this` is the ES5
+/// constructor-stealing pattern rather than an ordinary call.
+///
+/// True only when `name` really is a native stdlib constructor AND `this` is a
+/// plain object that already inherits from that constructor's prototype — the
+/// signature of `Sub.prototype = Native.prototype; Native.call(this, …)`. An
+/// object that merely happens to be passed as `this` does not qualify, so
+/// `Date.call(x)` / `Buffer.call(x)` keep their JS meaning (ignore `this`).
+fn steals_ctor(name: &str, this: Option<&Value>) -> bool {
+    let Some(target) = this else { return false };
+    if !with_host(|h| matches!(h.get(target), Some(JsObj::Object(_)))) {
+        return false;
+    }
+    // Already initialized (e.g. a re-entrant call) — nothing to steal.
+    if crate::stdlib::native_tag(target).is_some() {
+        return false;
+    }
+    let Some(proto) = with_host(|h| h.ensure_ctor_proto(name)) else {
+        return false;
+    };
+    let mut cur = with_host(|h| h.proto_of(target));
+    while let Some(p) = cur {
+        if p == proto {
+            return true;
+        }
+        cur = with_host(|h| h.proto_of(&p));
+    }
+    false
+}
+
+/// Move a freshly-constructed native instance's state onto `target`, so an
+/// object built by a subclass constructor becomes a working instance of the
+/// native class. Copies every own key the native constructor set — the hidden
+/// `@@`-prefixed slots that carry the state AND the plain ones it exposes
+/// (`StringDecoder`'s `encoding`) — without disturbing keys `target` already has.
+fn adopt_native_slots(target: &Value, built: &Value) {
+    let slots: Vec<(String, Value)> = with_host(|h| match h.get(built) {
+        Some(JsObj::Object(p)) => p.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        _ => Vec::new(),
+    });
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(target) {
+            for (k, v) in slots {
+                p.insert(k, v);
+            }
+        }
+    });
 }
 
 /// Execute a user function/closure body on a fresh frame.
@@ -4947,6 +5017,56 @@ impl JsHost {
     /// The real prototype object for a builtin exotic, if it has one.
     pub fn native_proto(&self, ctor: &str) -> Option<Value> {
         self.native_protos.get(ctor).cloned()
+    }
+
+    /// The real `.prototype` object for a native stdlib constructor (`StringDecoder`,
+    /// `Hash`, `URLSearchParams`, …), built on first read and cached.
+    ///
+    /// `Ctor.prototype` used to read `undefined` for every native class outside the
+    /// hand-written `is_builtin_ctor` list, which broke the ES5 subclassing pattern
+    /// that libraries still use. `iconv-lite`'s internal codec — reached from
+    /// `raw-body` on every `express.json()` request — does exactly this:
+    ///
+    /// ```text
+    /// var StringDecoder = require('string_decoder').StringDecoder;
+    /// if (!StringDecoder.prototype.end) StringDecoder.prototype.end = function () {};
+    /// function InternalDecoder(options, codec) { StringDecoder.call(this, codec.enc); }
+    /// InternalDecoder.prototype = StringDecoder.prototype;
+    /// ```
+    ///
+    /// The first line threw `Cannot read properties of undefined (reading 'end')`.
+    ///
+    /// Methods come from `stdlib::instance_method_lists`, the same table a method
+    /// READ consults, so the prototype can never advertise a name the dispatcher
+    /// does not implement. Each is the `@proto:<Ctor>:<method>` thunk that
+    /// dispatches against its invoke-time `this`, so a subclass instance whose
+    /// prototype IS this object gets the native implementation. Returns `None` for
+    /// a tag with no instance methods, leaving those constructors as they were.
+    pub fn ensure_ctor_proto(&mut self, ctor: &str) -> Option<Value> {
+        if let Some(p) = self.native_protos.get(ctor) {
+            return Some(p.clone());
+        }
+        let (own, emitter) = crate::stdlib::instance_method_lists(ctor);
+        if own.is_empty() && emitter.is_empty() {
+            return None;
+        }
+        let obj_proto = self.object_proto();
+        let proto = self.new_object(IndexMap::new());
+        self.set_proto(&proto, obj_proto);
+        let ctor_val = self.alloc(JsObj::Builtin(ctor.to_string()));
+        if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+            p.insert("constructor".into(), ctor_val);
+        }
+        self.hide_prop(&proto, "constructor");
+        for m in own.iter().chain(emitter.iter()) {
+            let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert((*m).to_string(), thunk);
+            }
+            self.hide_prop(&proto, m);
+        }
+        self.native_protos.insert(ctor.to_string(), proto.clone());
+        Some(proto)
     }
 
     pub fn ensure_error_protos(&mut self) {

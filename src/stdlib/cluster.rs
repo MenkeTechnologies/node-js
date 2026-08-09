@@ -523,22 +523,15 @@ fn pid_or_id(worker: &Value, key: &str) -> Option<u64> {
 }
 
 /// Map a kill signal argument (a name like `"SIGKILL"` or a number) to its signal
-/// number; defaults to `SIGTERM`.
+/// number; defaults to `SIGTERM`. The name table lives in `process`, so this
+/// dispatcher and `process.kill` cannot recognize different signal sets.
 fn signal_number(arg: Option<&Value>) -> libc::c_int {
     let Some(v) = arg else { return libc::SIGTERM };
     let n = with_host(|h| h.to_number(v));
     if n.is_finite() && n != 0.0 {
         return n as libc::c_int;
     }
-    match arg_str(std::slice::from_ref(v), 0).to_uppercase().as_str() {
-        "SIGKILL" => libc::SIGKILL,
-        "SIGINT" => libc::SIGINT,
-        "SIGHUP" => libc::SIGHUP,
-        "SIGQUIT" => libc::SIGQUIT,
-        "SIGUSR1" => libc::SIGUSR1,
-        "SIGUSR2" => libc::SIGUSR2,
-        _ => libc::SIGTERM,
-    }
+    super::process::signal_number(&arg_str(std::slice::from_ref(v), 0)).unwrap_or(libc::SIGTERM)
 }
 
 /// Read a string property off an options object (`None` if absent/empty).

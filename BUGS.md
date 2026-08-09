@@ -147,6 +147,42 @@ Two limits remain. `this` inside a dynamic function is `undefined` rather than
 `globalThis` — that is the general sloppy-mode `this` gap below, not specific to
 dynamic code. And `vm`'s contexts are not isolated (see `src/stdlib/vm.rs`).
 
+## Native constructors: real prototypes and ES5 subclassing
+
+A native stdlib constructor (`StringDecoder`, `Hash`, `URLSearchParams`, …) has a
+real `.prototype` object, built on first read from the same
+`stdlib::instance_method_lists` table a method *read* consults, so the prototype
+cannot advertise a name the dispatcher does not implement. `Ctor.prototype` used
+to read `undefined` for everything outside the hand-written `is_builtin_ctor`
+list.
+
+`NativeCtor.call(obj, …)` — ES5 "constructor stealing" — initializes `obj`
+instead of returning a fresh instance, but ONLY when `obj` already inherits from
+that constructor's prototype. Without that guard `Date.call(x)` and
+`Buffer.call(x)`, which in JS ignore `this`, would start mutating `x`.
+
+`Buffer.copyBytesFrom` is the one `Buffer` static still missing, and is
+deliberately absent from `buffer::STATIC_METHODS` rather than advertised: it
+copies a typed array's raw bytes with `offset`/`length` counted in ELEMENTS, and
+typed arrays are stored here as a `@@elems` array of numbers, so it needs a
+per-kind little-endian serializer for all nine element kinds.
+
+## `process.exit` really exits; `chdir` and `kill` really act
+
+`process.exit([code])` terminates immediately — nothing after the call runs, and
+no pending timer, microtask or `nextTick` fires. It used to return `undefined`
+and let execution continue, which broke the idiom `if (done) { srv.close();
+process.exit(0); }`: Node needs no `return` there, so real code does not write
+one, and the next statement ran anyway. `process.chdir(dir)` and
+`process.kill(pid[, sig])` were no-ops for the same reason and now perform the
+real syscall, throwing on failure. `process.setSourceMapsEnabled` stays a no-op,
+which is its whole contract here since node-js emits no source maps.
+
+Signal names map through `libc` constants, not a literal table: numbering
+differs between macOS and Linux above `SIGTERM` (`SIGUSR1` is 30 on Darwin, 10
+on Linux). `os.constants.signals` still reports the Darwin numbers and is the
+remaining literal table.
+
 ## Sloppy-mode `this` is `undefined`, not `globalThis`
 
 A plain (unbound, non-method) function call binds `this` to `undefined` here; in
@@ -182,13 +218,6 @@ patching `.length`.
 `var y = 2` does not appear as `globalThis.y`; the two live in separate tables
 (`JsHost.globals` versus the `globalThis` object). Node's `global` alias is
 absent entirely (`ReferenceError`).
-
-## `Object.getOwnPropertyNames(fn)` is empty
-
-A function object reports no own property names; Node reports
-`['length','name','prototype']`. The values are all readable individually
-(`fn.length`, `fn.name`, `fn.prototype`) — they are computed on demand rather
-than stored as own slots, so the enumeration does not see them.
 
 ## `node -e` evaluates a Script, not a CommonJS module
 
@@ -272,15 +301,17 @@ the working set rather than an empty object.
 
 
 ## Express (real npm package) — runs, serves HTTP, and parses request bodies
-The real `express` 5.2.1 + its 65-package dependency tree loads and serves HTTP.
-Verified end-to-end against `node v26.7.0` with the same app and the same `curl`
-calls, byte-comparing every response body: `app.get`/routing/route params/query,
-`res.send`/`res.json`/`res.status`, `app.listen`, **and** the body parsers —
+The real `express` — both the **4.x** and **5.x** lines — plus its dependency
+tree loads and serves HTTP. Verified end-to-end against `node v26.7.0` with the
+same app and the same requests, byte-comparing every response body:
+`app.get`/routing/route params/query, `res.send`/`res.json`/`res.status`/
+`res.type`, `app.listen`, a 404 fall-through handler, **and** the body parsers —
 `express.json()` (object, array, UTF-8, empty, and the malformed-input error
 path returning `entity.parse.failed`), `express.urlencoded()`,
-`express.text()` and `express.raw()`. All byte-identical.
+`express.text()` and `express.raw()`. All byte-identical on both lines.
 
-The blockers were NOT the ones previously guessed here. They were:
+Express **5** cleared first, and the blockers were not the ones guessed before
+it was tried:
 
 1. **`async_hooks.AsyncResource` did not exist**, so `new AsyncResource(...)`
    threw `is not a constructor` inside `raw-body` and `on-finished`, which both
@@ -291,6 +322,23 @@ The blockers were NOT the ones previously guessed here. They were:
 3. **`String.prototype.indexOf` ignored its `fromIndex`**, so `body-parser`'s
    `parameterCount` never advanced past the first `&` and rejected every
    urlencoded body with `parameters.too.many`.
+
+Express **4** shares almost none of that path and needed four more, each of
+which failed earlier than the last:
+
+4. **`new Function` did not exist.** `depd`'s `wrapfunction` builds its
+   deprecation wrapper with it and `body-parser` calls that at module load, so
+   `require('express')` itself threw `Function is not a constructor` — express 4
+   never reached a single line of its own code.
+5. **The EventEmitter surface on a request/socket/stream was missing
+   `listeners`**, which `unpipe` calls on every `express.json()` request.
+6. **`StringDecoder.prototype` read `undefined`**, so `iconv-lite`'s internal
+   codec — which adopts that prototype and initializes itself via
+   `StringDecoder.call(this, enc)` — threw while building any decoder, i.e. on
+   every request with a charset.
+7. **`Buffer.allocUnsafeSlow` was missing**, which flipped `safe-buffer` onto its
+   legacy `SafeBuffer` wrapper, whose `Buffer(arg, …)` call form then threw. That
+   is the `Buffer` express 4's `res.send` uses, so every response died.
 
 `Object.prototype.toString.call(buf)` is `[object Uint8Array]` (and every other
 builtin exotic brands correctly), `ArrayBuffer.isView(buf)` is `true`, and
