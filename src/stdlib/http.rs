@@ -571,20 +571,12 @@ pub fn instance_call(
     method: &str,
     args: Vec<Value>,
 ) -> Result<Value, String> {
-    // EventEmitter surface is shared with `net` sockets.
-    if matches!(
-        method,
-        "on" | "addListener"
-            | "prependListener"
-            | "once"
-            | "prependOnceListener"
-            | "emit"
-            | "removeListener"
-            | "off"
-            | "removeAllListeners"
-            | "listenerCount"
-            | "eventNames"
-    ) {
+    // EventEmitter surface is shared with `net` sockets, and the set of names is
+    // read from `events::METHODS` rather than re-listed: the copy that used to
+    // live here was missing `listeners`, `setMaxListeners` and `getMaxListeners`,
+    // so `unpipe` — reached from `body-parser` on every `express.json()` request
+    // — died on `req.listeners('data') is not a function`.
+    if super::events::METHODS.contains(&method) {
         return super::events::instance_call(recv, method, args);
     }
     match tag {

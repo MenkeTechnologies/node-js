@@ -69,6 +69,30 @@ pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
     host::run_main(load_merged(prog))
 }
 
+/// Compile `src` and run it on the LIVE host — no reset, no event-loop drain —
+/// in the GLOBAL scope, returning its completion value.
+///
+/// This is the ONE runtime-source evaluator on this frontend. Every construct
+/// that turns a source string into a running program funnels through here:
+/// the CommonJS module wrapper (`module::compile_wrapper`), `vm.runInThisContext`
+/// / `vm.Script` / `vm.compileFunction`, `new Function` / `Function(...)`
+/// (`builtins::dynamic_function`), and the internal JS factories
+/// (`util.promisify`, `stream/promises`, `stream/consumers`,
+/// `performance.timerify`, `module.builtinModules`). Each of those used to carry
+/// its own `compile_completion` → `load_merged` → `run_chunk_on` triple — seven
+/// copies of the same three lines — and every one of them inherited the same
+/// bug: `run_chunk_on` executes on whatever frame is CURRENT, so nested source
+/// saw the calling function's locals. Measured against node v26.7.0,
+/// `function outer(){ let secret = 1; return require('./m.js'); }` with `m.js` =
+/// `module.exports = typeof secret` is `"undefined"` there and was `"number"`
+/// here; `vm.runInThisContext('typeof loc')` likewise. `run_chunk_in_global_scope`
+/// fixes it once, for all of them.
+pub fn eval_in_global_scope(src: &str) -> Result<Value, String> {
+    let prog = compile_completion(src)?;
+    let chunk = load_merged(prog);
+    host::run_chunk_in_global_scope(chunk)
+}
+
 /// Transparent bytecode cache: return the cached compiled `Program` for `src`
 /// (skipping lex/parse/lower entirely), else compile it, store it in the
 /// `~/.node-js/scripts.rkyv` shard, and return it. This runs on EVERY ordinary

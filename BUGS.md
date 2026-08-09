@@ -24,9 +24,16 @@ emits `DEP0169` through it.
 Known-but-UNIMPLEMENTED (require() returns a namespace so import-then-conditional
 code loads; calling a method throws `Error: <mod>.<method> is not implemented in
 node-js` — honest, never a silent fake): `tls`, `http2`, `https`, `worker_threads`,
-`cluster`, `dgram`, `inspector`, `wasi`, `trace_events`, `domain`, `repl`, `vm`,
+`cluster`, `dgram`, `inspector`, `wasi`, `trace_events`, `domain`, `repl`,
 `readline`, `dns/promises` (use `require('dns').promises`). These need real
 TLS/HTTP2/OS-threads/sandboxing substrate.
+
+`vm` is NOT in that list — it is implemented (`src/stdlib/vm.rs`), because the
+engine has a real runtime source evaluator. `runInThisContext`, `Script`,
+`compileFunction` and `runInNewContext` all compile and run genuine source; what
+`vm` does NOT provide is context ISOLATION, since there is only one global heap.
+That limitation is stated in the module's own docs and is not the same thing as
+being unimplemented.
 
 Two ECMAScript globals are absent entirely, and reference as `ReferenceError`
 rather than pretending:
@@ -112,13 +119,92 @@ the fuzzer's `unwind` mode:
   swapped-in context holds exactly one frame), so two interleaved activations of
   the same async function shared one binding.
 
+## Runtime source evaluation (`new Function`, `eval`, `vm`)
+
+Source compiled at runtime goes through ONE evaluator, `crate::eval_in_global_scope`
+(`compile_completion` → `load_merged` → `host::run_chunk_in_global_scope`). Its
+callers are the CommonJS module wrapper, `vm.runInThisContext`/`Script`/
+`compileFunction`, `new Function`/`Function(...)`, and the internal JS factories
+(`util.promisify`, `stream/promises`, `stream/consumers`, `performance.timerify`,
+`module.builtinModules`).
+
+`new Function(p…, body)` reproduces V8's synthesized source exactly — measured on
+node v26.7.0, `new Function('a','b','return a+b').toString()` is
+`"function anonymous(a,b\n) {\nreturn a+b\n}"` with `.name === 'anonymous'`,
+while `vm.compileFunction('return a+b', ['a','b']).toString()` is
+`"function (a, b) {\nreturn a+b\n}"` with `.name === ''`. That text is retained
+per function, so `Function.prototype.toString` reports it; ordinary functions
+keep no source (the compiler records no spans) and still render
+`function <name>() { [code] }`.
+
+`eval` distinguishes the two call forms the spec distinguishes. A DIRECT eval —
+the literal `eval(...)` form, which is the only one reaching `host::call_named` —
+evaluates in the caller's scope; `(0, eval)(src)`, `const e = eval; e(src)` and
+every other value-call form is an INDIRECT eval and evaluates in the global
+scope. A user binding named `eval` shadows the intrinsic and wins.
+
+Two limits remain. `this` inside a dynamic function is `undefined` rather than
+`globalThis` — that is the general sloppy-mode `this` gap below, not specific to
+dynamic code. And `vm`'s contexts are not isolated (see `src/stdlib/vm.rs`).
+
+## Sloppy-mode `this` is `undefined`, not `globalThis`
+
+A plain (unbound, non-method) function call binds `this` to `undefined` here; in
+sloppy mode Node binds it to `globalThis` and boxes a primitive `this`
+(10.2.1.2 `OrdinaryCallBindThis`). Measured on node v26.7.0,
+`function f(){ return typeof this } ; [f(), f.call(null), f.call(5)]` is
+`['object','object','object']` there and `['undefined','object','number']` here.
+This affects every unbound call, not just dynamically compiled ones.
+
+## Strings are indexed by code point, not by UTF-16 code unit
+
+A JS string is a sequence of UTF-16 code units; a node-js string is a Rust
+`String` indexed by code point. The two agree on all of the BMP and diverge on
+every astral character. Measured on node v26.7.0 with `a = "𝒳"`:
+
+| expression | node v26.7.0 | node-js |
+| --- | --- | --- |
+| `a.length` | `2` | `1` |
+| `a.charCodeAt(0)` | `55349` | `119987` |
+| `a.charCodeAt(1)` | `56499` | `NaN` |
+| `a[0]` | `"\ud835"` | `"𝒳"` |
+| `a.split("").length` | `2` | `1` |
+| `"ab𝒳cd".indexOf("c")` | `4` | `3` |
+
+`codePointAt`, UTF-8 byte handling (`Buffer.byteLength`, `Buffer.from(s)`,
+`StringDecoder` across a split multi-byte sequence) and all BMP text agree.
+Closing this means giving the string layer UTF-16 semantics throughout, not
+patching `.length`.
+
+## `globalThis` is not backed by the global scope
+
+`globalThis.x = 1` does not create a readable binding `x`, and a top-level
+`var y = 2` does not appear as `globalThis.y`; the two live in separate tables
+(`JsHost.globals` versus the `globalThis` object). Node's `global` alias is
+absent entirely (`ReferenceError`).
+
+## `Object.getOwnPropertyNames(fn)` is empty
+
+A function object reports no own property names; Node reports
+`['length','name','prototype']`. The values are all readable individually
+(`fn.length`, `fn.name`, `fn.prototype`) — they are computed on demand rather
+than stored as own slots, so the enumeration does not see them.
+
 ## `node -e` evaluates a Script, not a CommonJS module
 
 Node wraps a `.js` FILE in the CommonJS wrapper, which makes a top-level `return`
 legal; under `-e` it evaluates a Script, where the same `return` is a
 `SyntaxError`. node-js accepts a top-level `return` in both, so `node -e
-'return'` exits 0 here and 1 in Node. Only the `-e` path differs; running a file
-matches.
+'return'` exits 0 here and 1 in Node.
+
+The same difference has a second, opposite face: node-js evaluates a FILE with
+Script semantics too, so a file's top-level `var` is a global here and a module
+local in Node. Measured on node v26.7.0 with
+`var mv = 1; console.log(new Function("return typeof mv")())`, a file prints
+`undefined` there and `number` here, while `node -e` with the same source prints
+`number` in both. Dynamically compiled source therefore sees an entry FILE's
+top-level bindings here and does not in Node. Closing it means running the entry
+file through the CommonJS wrapper, as Node does.
 
 `err.stack` names the REAL call chain — one `    at <function>` line per live
 frame — but carries no `file:line:column` (per-frame line tracking is only

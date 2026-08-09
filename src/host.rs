@@ -544,6 +544,23 @@ pub struct JsHost {
     globals: IndexMap<String, Value>,
     /// The frame stack (bottom = module).
     frames: Vec<Frame>,
+    /// The program's top-level scope — the scope runtime-compiled source runs in
+    /// (`new Function`, indirect `eval`, `vm.runInThisContext`; see
+    /// `run_chunk_in_global_scope`), as opposed to whatever function frame
+    /// happens to be executing when that source is compiled.
+    ///
+    /// Held as its own field rather than read off `frames[0]` because a coroutine
+    /// body runs with `frames` SWAPPED for its own one-frame context
+    /// (`install_gen_ctx`), so the bottom frame is not the top-level frame there.
+    ///
+    /// Note this is node-js's ONE top-level scope. Node distinguishes the global
+    /// scope from a CommonJS module's scope (a module body is a wrapper
+    /// function), so in Node a file's top-level `var` is invisible to dynamic
+    /// code; here the entry file is evaluated with Script semantics, so it stays
+    /// visible. That is the same entry-file-is-a-Script divergence `BUGS.md`
+    /// records for top-level `return`, not a separate one — and `node -e`, which
+    /// really is a Script, matches Node exactly.
+    global_env: Env,
     pub error: Option<String>,
     /// The in-flight thrown value, if any (JS `throw`).
     pub exc: Option<Value>,
@@ -781,7 +798,7 @@ impl Default for JsHost {
 
 impl JsHost {
     pub fn new() -> JsHost {
-        let module_env = new_env(None);
+        let global_env = new_env(None);
         let (io_tx, io_rx) = std::sync::mpsc::channel();
         let mut h = JsHost {
             heap: Vec::new(),
@@ -789,8 +806,8 @@ impl JsHost {
             tries: Vec::new(),
             globals: IndexMap::new(),
             frames: vec![Frame {
-                env: module_env.clone(),
-                base_env: module_env,
+                env: global_env.clone(),
+                base_env: global_env.clone(),
                 this_obj: None,
                 new_target: None,
                 home_class: None,
@@ -798,6 +815,7 @@ impl JsHost {
                 owner: None,
                 is_module: true,
             }],
+            global_env,
             error: None,
             exc: None,
             signal: None,
@@ -1662,6 +1680,41 @@ pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     }
 }
 
+/// Run `chunk` in the GLOBAL scope instead of the caller's.
+///
+/// `run_chunk_on` executes on whatever frame is current, so a nested run sees —
+/// and can shadow — the *calling function's* locals. That is right for a direct
+/// `eval`, and wrong for every other runtime-source construct: a `new Function`
+/// body, an indirect `eval` and `vm.runInThisContext` are all specified to run
+/// in the global scope (ECMA-262 19.2.1.1 `PerformEval` with a null
+/// `strictCaller`/`direct` pair; `FunctionBody` is instantiated with the *global*
+/// environment, 20.2.1.1.1 step 26). Measured against node v26.7.0,
+/// `function outer(){ let loc = 42; return vm.runInThisContext('typeof loc'); }`
+/// is `"undefined"` there and was `"number"` here.
+///
+/// A `var` the chunk itself declares lands in the top-level scope and persists,
+/// so successive `vm.runInThisContext` calls share it.
+pub fn run_chunk_in_global_scope(chunk: Chunk) -> Result<Value, String> {
+    let global_env = with_host(|h| h.global_env.clone());
+    with_host(|h| {
+        h.frames.push(Frame {
+            env: global_env.clone(),
+            base_env: global_env,
+            this_obj: None,
+            new_target: None,
+            home_class: None,
+            line: 0,
+            owner: None,
+            is_module: true,
+        })
+    });
+    let r = run_chunk_on(chunk);
+    with_host(|h| {
+        h.frames.pop();
+    });
+    r
+}
+
 /// Run the top-level program chunk, then drain the event loop (microtasks +
 /// timers) until quiescent — matching Node, which keeps the process alive while
 /// pending async work remains.
@@ -1951,6 +2004,14 @@ impl JsHost {
                     }
                 }
                 Some(JsObj::Func(f)) => {
+                    // A function built from runtime source (`new Function`,
+                    // `vm.compileFunction`) retains the exact text V8 synthesizes
+                    // for it, so `Function.prototype.toString` reports what Node
+                    // reports. Ordinary functions carry no source here (the
+                    // compiler keeps no spans), so they fall back to a placeholder.
+                    if let Some(src) = self.fn_prop(v, "@@source") {
+                        return self.str_of(&src);
+                    }
                     let name = self
                         .funcs
                         .get(f.def_id)
@@ -3209,6 +3270,18 @@ pub fn call_named(name: &str, args: Vec<Value>) -> Result<Value, String> {
     if let Some(v) = with_host(|h| h.read_name(name)) {
         return invoke(&v, args, None);
     }
+    // A DIRECT eval — the literal `eval(src)` call form — is the ONLY one that
+    // evaluates in the CALLER's scope; `(0, eval)(src)`, `const e = eval; e(src)`
+    // and `[eval][0](src)` all reach the same function value but are INDIRECT
+    // evals and evaluate in the global scope (ECMA-262 19.2.1.1 `PerformEval`).
+    // This is the one place the two forms are distinguishable without a compiler
+    // change: `call_named` is reached only from `ops::CALL`, which the compiler
+    // emits exclusively for a bare-identifier callee, while every value-call form
+    // goes through `invoke` → `call_builtin_function`. The `read_name` miss above
+    // has already established that `eval` is not shadowed by a user binding.
+    if name == "eval" {
+        return crate::builtins::eval_source(args.first(), true);
+    }
     if crate::builtins::is_known_builtin(name) {
         return crate::builtins::call_builtin_function(name, args);
     }
@@ -3284,6 +3357,11 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
         if crate::builtins::is_object_builtin_method(name) {
             return crate::builtins::object_builtin_method(recv, name, args);
         }
+        if name == "constructor" {
+            if let Some(r) = call_default_ctor(recv, &args) {
+                return r;
+            }
+        }
         return Err(type_error(&format!("{name} is not a function")));
     }
     // Function value methods: call / apply / bind, then any static method stored
@@ -3327,8 +3405,31 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
             return crate::builtins::object_builtin_method(recv, name, args);
         }
     }
+    if name == "constructor" {
+        if let Some(r) = call_default_ctor(recv, &args) {
+            return r;
+        }
+    }
     // Type methods (array/string/number, Map/Set/Symbol/generator methods).
     crate::builtins::call_type_method(recv, name, args)
+}
+
+/// `x.constructor(...)` invoked as a CALL when nothing on `x`'s prototype chain
+/// owns a `constructor` slot.
+///
+/// Reading the property already resolves a builtin instance's native constructor
+/// (the `constructor` arm of `builtins::get_property`), but the CALL path only
+/// consulted the prototype chain, so the two disagreed:
+/// `(function(){}).constructor === Function` read `true` while
+/// `(function(){}).constructor('return 9')` threw
+/// `TypeError: constructor is not a function`. That call form is exactly how
+/// `get-intrinsic` — a transitive dependency of express — reaches the `Function`
+/// constructor. Resolved here through the same one definition the read uses, so
+/// the two can no longer drift apart. `None` means "not resolvable/callable",
+/// leaving the caller's original error in place.
+fn call_default_ctor(recv: &Value, args: &[Value]) -> Option<Result<Value, String>> {
+    let ctor = crate::builtins::get_property(recv, "constructor").ok()?;
+    with_host(|h| is_callable(h, &ctor)).then(|| invoke(&ctor, args.to_vec(), None))
 }
 
 /// Call any callable value.

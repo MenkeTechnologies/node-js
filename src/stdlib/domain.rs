@@ -243,21 +243,7 @@ fn get_prop(recv: &Value, key: &str) -> Option<Value> {
 
 /// EventEmitter method delegation (shared shape with `net`/`http` emitters).
 fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
-    match method {
-        "on"
-        | "once"
-        | "emit"
-        | "addListener"
-        | "prependListener"
-        | "prependOnceListener"
-        | "removeListener"
-        | "off"
-        | "removeAllListeners"
-        | "listeners"
-        | "listenerCount"
-        | "eventNames"
-        | "setMaxListeners"
-        | "getMaxListeners" => Some(super::events::instance_call(recv, method, args.to_vec())),
-        _ => None,
-    }
+    super::events::METHODS
+        .contains(&method)
+        .then(|| super::events::instance_call(recv, method, args.to_vec()))
 }

@@ -550,23 +550,9 @@ fn parent_deliver(json: String) -> Result<(), String> {
 
 // ── instance dispatch (from `stdlib::instance_call`) ─────────────────────────
 
-/// The shared EventEmitter method names delegated to `events`.
-const EMITTER_METHODS: &[&str] = &[
-    "on",
-    "addListener",
-    "prependListener",
-    "once",
-    "prependOnceListener",
-    "emit",
-    "removeListener",
-    "off",
-    "removeAllListeners",
-    "listenerCount",
-    "listeners",
-    "eventNames",
-    "setMaxListeners",
-    "getMaxListeners",
-];
+/// The shared EventEmitter method names delegated to `events` — the one
+/// definition, so this dispatcher cannot drift from the emitter surface.
+const EMITTER_METHODS: &[&str] = super::events::METHODS;
 
 pub fn instance_call(
     tag: &str,

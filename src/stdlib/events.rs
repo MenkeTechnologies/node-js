@@ -43,9 +43,14 @@ pub const METHODS: &[&str] = &[
 
 pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     match method {
-        "listeners" => Ok(with_host(|h| {
-            h.new_array(listeners(recv, &arg_str(&args, 0)))
-        })),
+        // Both the event-name coercion and the listener lookup re-enter the host,
+        // so they must resolve BEFORE the `with_host` that allocates the array —
+        // nesting them inside it panics with `RefCell already borrowed`. That was
+        // latent until `listeners` became reachable on a socket/request/stream.
+        "listeners" => {
+            let items = listeners(recv, &arg_str(&args, 0));
+            Ok(with_host(|h| h.new_array(items)))
+        }
         // A no-op accessor pair kept for API completeness; the emitter has no cap.
         "setMaxListeners" => Ok(recv.clone()),
         "getMaxListeners" => Ok(Value::Float(10.0)),

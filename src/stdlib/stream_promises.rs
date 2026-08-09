@@ -35,12 +35,12 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     })
 }
 
-/// Compile a single JS expression and run it on the current host, returning its
-/// completion value (re-entrant-safe; mirrors `util`'s `run_completion`).
+/// Compile a single JS expression and run it on the LIVE host, returning its
+/// completion value. Delegates to the frontend's ONE runtime-source evaluator
+/// (`crate::eval_in_global_scope`), which runs the factory in the program's
+/// module scope rather than in the calling function's frame.
 fn run_completion(src: &str) -> Result<Value, String> {
-    let prog = crate::compile_completion(src)?;
-    let chunk = crate::load_merged(prog);
-    crate::host::run_chunk_on(chunk)
+    crate::eval_in_global_scope(src)
 }
 
 // `finished(stream[, options])` → a Promise. The incoming args (stream, and an

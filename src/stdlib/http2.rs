@@ -245,23 +245,9 @@ fn u64_prop(recv: &Value, key: &str) -> Option<u64> {
 
 /// Delegate the EventEmitter surface to `events`; `None` for a non-emitter method.
 fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
-    match method {
-        "on"
-        | "addListener"
-        | "prependListener"
-        | "once"
-        | "prependOnceListener"
-        | "emit"
-        | "removeListener"
-        | "off"
-        | "removeAllListeners"
-        | "listenerCount"
-        | "eventNames"
-        | "setMaxListeners"
-        | "getMaxListeners"
-        | "listeners" => Some(super::events::instance_call(recv, method, args.to_vec())),
-        _ => None,
-    }
+    super::events::METHODS
+        .contains(&method)
+        .then(|| super::events::instance_call(recv, method, args.to_vec()))
 }
 
 /// Raw bytes of a `write`/`end`/`key`/`cert` argument (Buffer bytes or UTF-8).

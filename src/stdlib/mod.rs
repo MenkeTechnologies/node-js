@@ -490,23 +490,10 @@ pub fn has_to_json(tag: &str) -> bool {
 /// listen path) yields a bound method rather than `undefined` — the method is
 /// still dispatched through `instance_call` when the bound method is invoked.
 pub fn instance_has_method(tag: &str, name: &str) -> bool {
-    // Shared EventEmitter surface for the emitter-backed instances.
-    const EMITTER: &[&str] = &[
-        "on",
-        "once",
-        "emit",
-        "addListener",
-        "prependListener",
-        "prependOnceListener",
-        "removeListener",
-        "off",
-        "removeAllListeners",
-        "listeners",
-        "listenerCount",
-        "eventNames",
-        "setMaxListeners",
-        "getMaxListeners",
-    ];
+    // Shared EventEmitter surface for the emitter-backed instances. Read from
+    // `events::METHODS` so what an instance ADVERTISES here can never drift from
+    // what the dispatchers actually delegate.
+    const EMITTER: &[&str] = events::METHODS;
     let base: &[&str] = match tag {
         "Timeout" => timers::TIMEOUT_METHODS,
         "Immediate" => timers::IMMEDIATE_METHODS,

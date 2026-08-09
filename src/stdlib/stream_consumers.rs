@@ -44,11 +44,11 @@ const CONSUMER_SRC: &str = "(function (stream, kind) {\n\
 })";
 
 /// Compile a single JS expression and run it on the LIVE host, returning its
-/// completion value (mirrors `util`'s promisify factory path).
+/// completion value. Delegates to the frontend's ONE runtime-source evaluator
+/// (`crate::eval_in_global_scope`), which runs the factory in the program's
+/// module scope rather than in the calling function's frame.
 fn run_completion(src: &str) -> Result<Value, String> {
-    let prog = crate::compile_completion(src)?;
-    let chunk = crate::load_merged(prog);
-    crate::host::run_chunk_on(chunk)
+    crate::eval_in_global_scope(src)
 }
 
 /// Module free-function dispatch (`consumers.text`, `consumers.json`, …).

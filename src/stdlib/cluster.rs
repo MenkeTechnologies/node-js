@@ -87,23 +87,9 @@ pub const WORKER_METHODS: &[&str] = &[
     "isDead",
 ];
 
-/// The shared EventEmitter method names delegated to `events`.
-const EMITTER_METHODS: &[&str] = &[
-    "on",
-    "addListener",
-    "prependListener",
-    "once",
-    "prependOnceListener",
-    "emit",
-    "removeListener",
-    "off",
-    "removeAllListeners",
-    "listenerCount",
-    "listeners",
-    "eventNames",
-    "setMaxListeners",
-    "getMaxListeners",
-];
+/// The shared EventEmitter method names delegated to `events` — the one
+/// definition, so this dispatcher cannot drift from the emitter surface.
+const EMITTER_METHODS: &[&str] = super::events::METHODS;
 
 /// Monotonic worker-id source (matches Node: ids start at 1 and count up).
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);

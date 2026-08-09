@@ -153,23 +153,9 @@ fn value_bytes(v: &Value) -> Vec<u8> {
 
 /// Delegate the EventEmitter methods to `events`; `None` for a non-emitter method.
 fn emitter_dispatch(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
-    match method {
-        "on"
-        | "addListener"
-        | "prependListener"
-        | "once"
-        | "prependOnceListener"
-        | "emit"
-        | "removeListener"
-        | "off"
-        | "removeAllListeners"
-        | "listeners"
-        | "listenerCount"
-        | "eventNames"
-        | "setMaxListeners"
-        | "getMaxListeners" => Some(super::events::instance_call(recv, method, args.to_vec())),
-        _ => None,
-    }
+    super::events::METHODS
+        .contains(&method)
+        .then(|| super::events::instance_call(recv, method, args.to_vec()))
 }
 
 // ── module: dgram.createSocket ────────────────────────────────────────────────

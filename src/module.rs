@@ -46,9 +46,6 @@ thread_local! {
     /// The compiled synthetic-CallSite-array factory (for `Error.captureStackTrace`
     /// under a custom `Error.prepareStackTrace`), minted once per host.
     static CALLSITE_FACTORY: RefCell<Option<Value>> = const { RefCell::new(None) };
-    /// Monotonic counter feeding the temporary capture-variable name used to read
-    /// a compiled expression's value out of the shared module scope.
-    static SEQ: RefCell<u64> = const { RefCell::new(0) };
 }
 
 /// Clear all per-host loader state. Called from `host::reset_host` so a fresh
@@ -57,7 +54,6 @@ pub fn reset() {
     CACHE.with(|c| c.borrow_mut().clear());
     FACTORY.with(|f| *f.borrow_mut() = None);
     CALLSITE_FACTORY.with(|f| *f.borrow_mut() = None);
-    SEQ.with(|s| *s.borrow_mut() = 0);
     ENTRY_DIR.with(|d| *d.borrow_mut() = std::env::current_dir().unwrap_or_default());
 }
 
@@ -301,32 +297,30 @@ fn module_exports(module: &Value) -> Value {
 }
 
 /// Compile `<source>` wrapped in the Node module wrapper and return the wrapper
-/// FUNCTION value. Uses a fresh unique capture variable so a nested load in
-/// progress cannot clobber the value before it is read.
+/// FUNCTION value.
 fn compile_wrapper(source: &str) -> Result<Value, String> {
-    let n = SEQ.with(|s| {
-        let mut b = s.borrow_mut();
-        *b += 1;
-        *b
-    });
-    let var = format!("__cjs_w{n}");
     // A trailing newline before `})` guards a source ending in a `//` comment.
-    let wrapped = format!(
-        "var {var} = (function (exports, require, module, __dirname, __filename) {{\n{source}\n}});"
-    );
-    eval_binding(&wrapped, &var)
+    eval_binding(&format!(
+        "(function (exports, require, module, __dirname, __filename) {{\n{source}\n}})"
+    ))
 }
 
-/// Compile+run a `var <name> = <expr>;` statement (expression statements pop
-/// their value, so a binding is how we capture an expression's result out of the
-/// shared module scope) and return the bound value. Runs on the LIVE host — no
-/// reset, no event-loop drain.
-fn eval_binding(src: &str, name: &str) -> Result<Value, String> {
-    let prog = crate::compile(src)?;
-    let main = crate::load_merged(prog);
-    host::run_chunk_on(main)?;
-    with_host(|h| h.read_name(name))
-        .ok_or_else(|| format!("module loader: failed to capture '{name}'"))
+/// Compile+run a single JS expression on the LIVE host — no reset, no
+/// event-loop drain — and return its value.
+///
+/// This delegates to `crate::eval_in_global_scope`, the frontend's one
+/// runtime-source evaluator, and two things changed with it. The wrapper used to
+/// be compiled as `var __cjs_wN = (function …);` and read back out of the scope
+/// with `read_name`, because a bare expression statement pops its value; a
+/// completion-value compile returns the expression directly, so the capture
+/// variable and its uniquifying counter are gone. And the run used to happen on
+/// the CALLER's frame, which let a module body see the locals of whatever
+/// function called `require`: measured against node v26.7.0,
+/// `function outer(){ let secret = 1; return require('./m.js'); }` with `m.js` =
+/// `module.exports = typeof secret` is `"undefined"` there and was `"number"`
+/// here.
+fn eval_binding(src: &str) -> Result<Value, String> {
+    crate::eval_in_global_scope(src)
 }
 
 /// Build a per-module `require` closure bound to `dir` (see module docs).
@@ -342,7 +336,7 @@ fn factory() -> Result<Value, String> {
     if let Some(f) = FACTORY.with(|f| f.borrow().clone()) {
         return Ok(f);
     }
-    let src = "var __cjs_factory = (function (__cjs_dir) {\n\
+    let src = "(function (__cjs_dir) {\n\
         var req = function (spec) { return __cjs_require(spec, __cjs_dir); };\n\
         req.resolve = function (spec) { return __cjs_resolve(spec, __cjs_dir); };\n\
         req.cache = {};\n\
@@ -350,7 +344,7 @@ fn factory() -> Result<Value, String> {
         req.extensions = {};\n\
         return req;\n\
     });";
-    let f = eval_binding(src, "__cjs_factory")?;
+    let f = eval_binding(src)?;
     FACTORY.with(|c| *c.borrow_mut() = Some(f.clone()));
     Ok(f)
 }
@@ -364,7 +358,7 @@ pub fn callsite_stack(depth: usize) -> Result<Value, String> {
     let factory = if let Some(f) = CALLSITE_FACTORY.with(|f| f.borrow().clone()) {
         f
     } else {
-        let src = "var __cjs_callsites = (function (n) {\n\
+        let src = "(function (n) {\n\
             var a = [];\n\
             for (var i = 0; i < n; i++) {\n\
                 a.push({\n\
@@ -382,7 +376,7 @@ pub fn callsite_stack(depth: usize) -> Result<Value, String> {
             }\n\
             return a;\n\
         });";
-        let f = eval_binding(src, "__cjs_callsites")?;
+        let f = eval_binding(src)?;
         CALLSITE_FACTORY.with(|c| *c.borrow_mut() = Some(f.clone()));
         f
     };

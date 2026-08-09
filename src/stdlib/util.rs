@@ -282,12 +282,12 @@ pub fn format(args: &[Value]) -> String {
 // with the wrapped function — the same re-entrant nested-run path `vm.runInThisContext`
 // uses — so the returned value is an ordinary user function (`typeof === "function"`).
 
-/// Compile a single JS expression and run it on the current host, returning its
-/// completion value. Re-entrant-safe (mirrors `vm::run_code`).
+/// Compile a single JS expression and run it on the LIVE host, returning its
+/// completion value. Delegates to the frontend's ONE runtime-source evaluator
+/// (`crate::eval_in_global_scope`), which runs the factory in the program's
+/// module scope rather than in the calling function's frame.
 fn run_completion(src: &str) -> Result<Value, String> {
-    let prog = crate::compile_completion(src)?;
-    let chunk = crate::load_merged(prog);
-    crate::host::run_chunk_on(chunk)
+    crate::eval_in_global_scope(src)
 }
 
 const PROMISIFY_SRC: &str = "(function(original){\n\

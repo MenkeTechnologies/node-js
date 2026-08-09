@@ -378,22 +378,7 @@ pub fn instance_call(
     method: &str,
     args: Vec<Value>,
 ) -> Result<Value, String> {
-    if matches!(
-        method,
-        "on" | "addListener"
-            | "prependListener"
-            | "once"
-            | "prependOnceListener"
-            | "emit"
-            | "removeListener"
-            | "off"
-            | "removeAllListeners"
-            | "listenerCount"
-            | "eventNames"
-            | "setMaxListeners"
-            | "getMaxListeners"
-            | "listeners"
-    ) {
+    if super::events::METHODS.contains(&method) {
         return super::events::instance_call(recv, method, args);
     }
     match tag {

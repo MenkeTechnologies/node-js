@@ -323,18 +323,11 @@ pub fn instance_call(
         let extra = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
         return emit_event(recv, &name, extra);
     }
-    if matches!(
-        method,
-        "on" | "addListener"
-            | "prependListener"
-            | "once"
-            | "prependOnceListener"
-            | "removeListener"
-            | "off"
-            | "removeAllListeners"
-            | "listenerCount"
-            | "eventNames"
-    ) {
+    // `emit` is intercepted above (lifecycle tracking); every other name in
+    // `events::METHODS` delegates. Reading the set from `events` rather than
+    // re-listing it is what puts `listeners`/`setMaxListeners`/`getMaxListeners`
+    // on a stream — the local copy was missing all three.
+    if super::events::METHODS.contains(&method) {
         return super::events::instance_call(recv, method, args);
     }
     match method {

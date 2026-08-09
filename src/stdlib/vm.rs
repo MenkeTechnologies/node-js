@@ -102,21 +102,35 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
 }
 
 /// Compile `code` and run it on the current host, returning the completion value
-/// (the last expression's value). This is the same nested-run path the module
-/// loader uses (`compile` → `load_merged` → `host::run_chunk_on`, cf.
-/// `module.rs`), so it is re-entrant-safe when called from within a running
-/// script.
+/// (the last expression's value). This is the frontend's ONE runtime-source
+/// evaluator (`crate::eval_in_global_scope`), shared with the CommonJS loader and
+/// `new Function`, so it is re-entrant-safe when called from within a running
+/// script and — per `runInThisContext`'s contract — runs in the GLOBAL scope, not
+/// the calling function's.
 fn run_code(code: &str) -> Result<Value, String> {
-    // compile_completion leaves the final expression's value as the result.
-    let prog = crate::compile_completion(code)?;
-    let main = crate::load_merged(prog);
-    crate::host::run_chunk_on(main)
+    crate::eval_in_global_scope(code)
 }
 
 /// `vm.compileFunction(code, params[, options])` — REAL: wrap `code` in a
 /// function literal with the requested parameter names and run it, returning the
 /// resulting callable (a genuine JS function value on the heap, invocable like any
-/// other). This reuses the same compile→run path as the rest of the module.
+/// other). Built by `builtins::dynamic_function`, the single dynamic-function
+/// generator shared with `new Function`.
+///
+/// V8 synthesizes a DIFFERENT source here than it does for the `Function`
+/// constructor, and the difference is observable through `.name`/`.toString()`.
+/// Measured on node v26.7.0:
+///
+/// ```text
+/// vm.compileFunction('return a+b', ['a','b']).toString() === 'function (a, b) {\nreturn a+b\n}'
+/// vm.compileFunction('return a+b', ['a','b']).name       === ''
+/// new Function('a','b','return a+b').toString()          === 'function anonymous(a,b\n) {\nreturn a+b\n}'
+/// new Function('a','b','return a+b').name                === 'anonymous'
+/// ```
+///
+/// So: no `anonymous` name, `", "` between parameters, and no newline before the
+/// closing paren of the parameter list. This used to emit the `Function`
+/// constructor's shape, which named the result `anonymous`.
 ///
 /// Scope note: the `options.parsingContext` / `contextExtensions` isolation knobs
 /// are ignored (node-js has one shared context, same limitation as
@@ -135,8 +149,7 @@ fn compile_function(args: &[Value]) -> Result<Value, String> {
         }),
         None => String::new(),
     };
-    let src = format!("(function anonymous({params}\n) {{\n{code}\n}})");
-    run_code(&src)
+    crate::builtins::dynamic_function(&format!("function ({params}) {{\n{code}\n}}"))
 }
 
 /// `runInNewContext`/Script.runInNewContext: NOT isolated. Merge the sandbox's

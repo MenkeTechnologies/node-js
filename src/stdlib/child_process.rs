@@ -470,21 +470,10 @@ fn set_prop(recv: &Value, key: &str, val: Value) {
 /// (only `fork`ed children are live — a `spawn`/`execFile` result has already
 /// exited, so `kill` is a no-op there).
 pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    if super::events::METHODS.contains(&method) {
+        return super::events::instance_call(recv, method, args);
+    }
     match method {
-        "on"
-        | "addListener"
-        | "prependListener"
-        | "once"
-        | "prependOnceListener"
-        | "emit"
-        | "removeListener"
-        | "off"
-        | "removeAllListeners"
-        | "listenerCount"
-        | "eventNames"
-        | "setMaxListeners"
-        | "getMaxListeners"
-        | "listeners" => super::events::instance_call(recv, method, args),
         "kill" => Ok(Value::Bool(kill_child(recv))),
         // IPC is not implemented (see `fork` doc): `send` cannot deliver a message.
         "send" => Ok(Value::Bool(false)),

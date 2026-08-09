@@ -2532,6 +2532,79 @@ pub fn is_known_builtin(name: &str) -> bool {
         || crate::stdlib::is_method(name)
 }
 
+// ── dynamic functions (runtime source → callable) ────────────────────────────
+
+/// Build a callable from a complete function-expression source text — the ONE
+/// dynamic-function generator on this frontend.
+///
+/// `src` is the exact source V8 synthesizes for the construct, WITHOUT the
+/// wrapping parentheses needed to parse it as an expression: those are added
+/// here, and `src` itself is retained so `Function.prototype.toString` reports
+/// what V8 reports. The two callers synthesize different text and both shapes
+/// are observable — see `stdlib::vm::compile_function` for the measured diff.
+///
+/// The body runs in the MODULE scope, never the constructing function's scope
+/// (20.2.1.1.1 step 26 instantiates a dynamic function's body against the
+/// *global* environment). That also makes a `var` inside the body a function
+/// local: measured on node v26.7.0, `new Function('a','var zz = 5; return zz + a')`
+/// returns 6 and leaves `globalThis.zz` `undefined`.
+pub fn dynamic_function(src: &str) -> Result<Value, String> {
+    let f = crate::eval_in_global_scope(&format!("({src})"))?;
+    with_host(|h| {
+        let s = h.new_str(src.to_string());
+        h.set_fn_prop(&f, "@@source", s);
+    });
+    Ok(f)
+}
+
+/// `new Function(p1, …, pN, body)` / `Function(p1, …, pN, body)`.
+///
+/// Argument convention (20.2.1.1.1): the LAST argument is the body and the rest
+/// are parameter-list fragments joined with `,` — so a fragment may itself hold
+/// several parameters (`new Function('a,b', 'c', …)` takes three). With no
+/// arguments at all, both the parameter list and the body are empty.
+///
+/// Measured on node v26.7.0:
+///
+/// ```text
+/// new Function('a','b','return a+b').toString() === 'function anonymous(a,b\n) {\nreturn a+b\n}'
+/// new Function().toString()                     === 'function anonymous(\n) {\n\n}'
+/// new Function('a,b','c','return [a,b,c]').length === 3
+/// new Function('a','b','return a+b').name       === 'anonymous'
+/// ```
+pub fn function_ctor(args: &[Value]) -> Result<Value, String> {
+    let parts: Vec<String> = args.iter().map(|a| with_host(|h| h.str_of(a))).collect();
+    let (params, body) = match parts.split_last() {
+        Some((body, params)) => (params.join(","), body.clone()),
+        None => (String::new(), String::new()),
+    };
+    dynamic_function(&format!("function anonymous({params}\n) {{\n{body}\n}}"))
+}
+
+/// `eval(src)`. `direct` selects the scope the source runs in: a DIRECT eval —
+/// the literal `eval(...)` call form — evaluates in the CALLER's scope, every
+/// other route to the same function value is an INDIRECT eval and evaluates in
+/// the global scope (ECMA-262 19.2.1.1 `PerformEval`). The two are told apart in
+/// `host::call_named`, which `ops::CALL` reaches and `ops::CALL_VALUE`/`APPLY`
+/// do not.
+///
+/// A non-string argument is returned unchanged (19.2.1.1 step 2).
+pub fn eval_source(arg: Option<&Value>, direct: bool) -> Result<Value, String> {
+    let v = arg.cloned().unwrap_or(Value::Undef);
+    let is_string =
+        matches!(v, Value::Str(_)) || with_host(|h| matches!(h.get(&v), Some(JsObj::Str(_))));
+    if !is_string {
+        return Ok(v);
+    }
+    let src = with_host(|h| h.str_of(&v));
+    let chunk = crate::load_merged(crate::compile_completion(&src)?);
+    if direct {
+        host::run_chunk_on(chunk)
+    } else {
+        host::run_chunk_in_global_scope(chunk)
+    }
+}
+
 /// Call a resolved builtin function (global or `namespace.method`).
 pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, String> {
     // `require(spec)`: the ENTRY script's top-level require — core module first,
@@ -2614,13 +2687,15 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "encodeURI" => uri_encode(&with_host(|h| h.str_of(&arg0(&args))), true),
         "decodeURIComponent" => uri_decode(&with_host(|h| h.str_of(&arg0(&args))), false),
         "decodeURI" => uri_decode(&with_host(|h| h.str_of(&arg0(&args))), true),
-        // `eval` exists as a global (libraries like get-intrinsic capture it as an
-        // intrinsic) but node-js has no runtime source evaluator; calling it is
-        // unsupported. A non-string argument is returned unchanged, as in JS.
-        "eval" => match arg0(&args) {
-            v @ (Value::Undef | Value::Bool(_) | Value::Int(_) | Value::Float(_)) => Ok(v),
-            _ => Err(host::type_error("eval is not supported in node-js")),
-        },
+        // Reaching `eval` through this table means the eval FUNCTION VALUE was
+        // called — `(0, eval)(src)`, `const e = eval; e(src)`, `[eval][0](src)`.
+        // Those are INDIRECT evals and run in the global scope. A literal
+        // `eval(src)` is intercepted earlier, in `host::call_named`.
+        "eval" => eval_source(args.first(), false),
+        // `new Function(...)` and `Function(...)` are the same operation
+        // (20.2.1.1 `CreateDynamicFunction` is reached from both [[Call]] and
+        // [[Construct]]), so both route to the one generator.
+        "Function" => function_ctor(&args),
         "Number.isInteger" => Ok(Value::Bool(is_integer(arg0(&args)))),
         "Number.isSafeInteger" => Ok(Value::Bool(is_safe_integer(arg0(&args)))),
         "Number.isNaN" => Ok(Value::Bool(
@@ -3115,6 +3190,11 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
             Ok(s)
         }
         "Promise" => new_promise(arg0(&args)),
+        // `new Function(p…, body)` — the same `CreateDynamicFunction` the plain
+        // call form runs (20.2.1.1). `depd`'s `wrapfunction` builds its
+        // deprecation wrapper this way, so `require('body-parser')` — and with it
+        // `require('express')` — dies at load without it.
+        "Function" => function_ctor(&args),
         "RegExp" => regexp_ctor(&args),
         "BigInt" => Err(host::type_error("BigInt is not a constructor")),
         "Error" => Ok(make_error(name, &args)),
