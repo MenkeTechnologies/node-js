@@ -401,6 +401,56 @@ cases the fuzzer is scoped away from)
   line where Node breaks it. `console.log` (fixed `depth: 2`, where the gate can
   never fire) is byte-identical.
 
+- **Array holes.** A node-js array is a dense `Vec<Value>`, so an elision or a
+  `delete` leaves `undefined` where V8 leaves a HOLE. Everything that
+  distinguishes the two therefore differs: `[1,,3].forEach` runs 3 times
+  (Node: 2), `1 in [1,,3]` is `true` (Node: `false`), and `console.log([1,,3])`
+  prints `[ 1, undefined, 3 ]` (Node: `[ 1, <1 empty item> ]`-style). `a[3]=1`
+  on an empty array materialises three `undefined`s rather than three holes.
+  Representing holes needs a sentinel through every array path (length, index
+  read/write, every iteration method, `inspect`), which is an array-model change
+  rather than an addition, so it is listed rather than half-done.
+
+- **The `arguments` object is a real Array.** `Array.isArray(arguments)` is
+  `true` and `Object.prototype.toString.call(arguments)` is `[object Array]`
+  (Node: `false` / `[object Arguments]`). Those two reads are the whole
+  divergence: `.length`, indexing, `Array.prototype.slice.call(arguments)`,
+  spread, `for…of`, and an arrow's lexical capture of the enclosing function's
+  `arguments` all match, because an Array answers all of it. A real Arguments
+  exotic needs its own `ObjKind` and a `[[ParameterMap]]`.
+
+- **The ENTRY script is not wrapped in the CommonJS wrapper.** A `require`d
+  module is (`module.rs:315`), and there `__filename`/`__dirname`/`module`/
+  `exports`/`arguments` all match Node down to `arguments.length === 5`. In the
+  file passed on the command line they are `undefined`, and top-level
+  `arguments` is a `ReferenceError`. Node runs both through the same wrapper.
+
+- **`String.prototype.normalize` is the identity.** `'é'.normalize('NFC')`
+  returns the input unchanged, so a decomposed string keeps its length (2, not
+  1). Real NFC/NFD/NFKC/NFKD needs Unicode normalization tables, which node-js
+  does not vendor.
+
+- **Strict mode is not tracked, so a frozen write never throws.** `'use strict';
+  Object.freeze(o); o.a = 2` silently does nothing here; Node throws
+  `TypeError: Cannot assign to read only property`. The sloppy-mode outcome (the
+  write is ignored, `delete` reports `false`) is correct and is what the `freeze`
+  fuzzer mode pins.
+
+- **`util.inspect` does not see a `Symbol.toStringTag` GETTER.** An inherited
+  DATA property renders as the `Ctor [Tag] ` prefix, but
+  `class C { get [Symbol.toStringTag]() { return 'Cee' } }` prints `C { … }`
+  where Node prints `C [Cee] { … }`. `inspect` runs under the host's `RefCell`
+  borrow and invoking the getter would re-enter the VM.
+  `Object.prototype.toString.call(x)` DOES run the getter and reports
+  `[object Cee]` — that path is not inside the borrow.
+
+- **Symbol-keyed properties on an ARRAY are not enumerated.** An array's extra
+  own properties live in the function-property side table rather than the
+  object property map, so `const a=[1]; a[sym]=5` READS back correctly (`a[sym]`
+  is `5`) but `console.log(a)` prints `[ 1 ]` where Node prints
+  `[ 1, Symbol(k): 5 ]`, and `Object.getOwnPropertySymbols(a)` is empty where
+  Node reports `Symbol(k)`. Object receivers do both correctly.
+
 ## Fixed since the initial parity sweep (previously divergences, now correct)
 
 Recorded so the same gaps are not "re-discovered" as regressions. All verified
@@ -460,11 +510,70 @@ against `node v26.5.0`:
 - **`instanceof` for native-tagged instances.** A `WeakRef`, `FinalizationRegistry`,
   `TextEncoder`, `TextDecoder`, etc. is now an instance of the builtin whose name
   matches its hidden `@@native` tag (`new WeakRef({}) instanceof WeakRef` is
-  `true`). (`Object.prototype.toString.call(x)` still returns `[object Object]`
-  for these — a separate, pre-existing `Symbol.toStringTag` gap shared by
-  `Map`/`Set`/`Promise`/`Date`/`URL`.)
+  `true`), and `Object.prototype.toString.call(x)` brands each of them
+  (`[object WeakRef]`, `[object URL]`, `[object URLSearchParams]`, …). Only the
+  `@@native` tags that carry a real `Symbol.toStringTag` in Node are listed —
+  `EventEmitter`, `Server`, `Hash`, `Readable` and friends are plain classes
+  with no tag, so they stay `[object Object]` as they do in Node.
 - **`FinalizationRegistry`** — constructor requires a callable; `register(target,
   held[, token])` and `unregister(token)` enforce their `TypeError`s and
   `unregister` returns the correct boolean. Cleanup callbacks never fire because
   the heap holds every value strongly (a spec-permitted approximation, same basis
   as `WeakRef`).
+- **`ToPrimitive` (7.1.1) is real, so a user `valueOf` actually runs.** Every
+  conversion site — `+`, `- * / % **`, the relational operators, `==` against a
+  primitive, `ToNumber` (unary `+`/`~`, `Number(x)`), the bitwise operators,
+  `ToPropertyKey` (`obj[keyObject]`) and `Array.prototype.join`/`toString` —
+  converts an object through `ToPrimitive` with the right hint before doing
+  anything else. It used to read the raw internal string form instead, so
+  `{valueOf(){return 7}} + 1` was `"[object Object]1"`, `+obj` was `NaN`, and
+  `obj == 7` was `false`.
+  - `Symbol.toPrimitive` is honored and takes precedence over
+    `valueOf`/`toString`.
+  - `Date` overrides the DEFAULT hint to `"string"` (21.4.4.45), so `date + 1`
+    concatenates while `date - 0` is arithmetic. `Date.prototype.valueOf` also
+    reaches the Date dispatcher now: it was shadowed by
+    `Object.prototype.valueOf` and returned the Date object, which is why `+d`
+    and `d - 0` were `NaN`.
+  - An object with no reachable `toString`/`valueOf` (`Object.create(null)`)
+    throws the spec `TypeError: Cannot convert object to primitive value`
+    instead of silently producing `"[object Object]"`; `toString`/`valueOf` on
+    a null-prototype object read as `undefined`.
+  - The conversion has to happen OUTSIDE the host's `RefCell` borrow (calling a
+    JS `valueOf` re-enters the VM), so it lives in `host::to_primitive` /
+    `to_number_value` / `to_property_key` and the ops call those before entering
+    `JsHost::arith`.
+- **Well-known symbols and symbol-keyed properties.** `Symbol.toPrimitive` and
+  `Symbol.toStringTag` exist alongside `Symbol.iterator`/`asyncIterator` — and
+  only those four, because those are the ones node-js acts on (a
+  `Symbol.hasInstance` that read as a symbol while `instanceof` ignored it would
+  be a silent fake). Their description is now the ECMAScript name, so
+  `String(Symbol.iterator)` is `Symbol(Symbol.iterator)`; identity is tracked by
+  symbol id, so `Symbol.for('Symbol.iterator')` and `Symbol('Symbol.iterator')`
+  stay distinct from the well-known one.
+  - `Symbol.toStringTag` (own or inherited, data property or getter) replaces
+    the builtin brand in `Object.prototype.toString`, and `function*` /
+    `async function` / `async function*` / a suspended (async) generator /
+    `Math` / `JSON` / `Reflect` all brand as themselves.
+  - `Object.getOwnPropertySymbols` exists, `Reflect.ownKeys` lists the symbol
+    keys after the string keys, and object spread / `Object.assign` copy own
+    enumerable symbol-keyed properties (`CopyDataProperties`, 7.3.25) — they
+    used to drop them. `Object.keys`/`for-in`/`JSON.stringify` still skip them,
+    as they must.
+- **An arrow function no longer shadows the enclosing `arguments`.**
+  `FunctionDeclarationInstantiation` (10.2.11) creates the `arguments` binding
+  only for a non-arrow function, so `arguments` inside an arrow resolves
+  lexically. node-js bound a fresh empty one in every call frame, which made
+  `function f() { const g = () => [...arguments]; return g(); }` see zero
+  arguments (`host.rs`, `bind_params`).
+- **`util.inspect` symbol keys, tag prefix, constructor prefix and quoting.**
+  An own enumerable symbol-keyed property renders as `Symbol(desc): value`; an
+  INHERITED `Symbol.toStringTag` renders as the `Ctor [Tag] ` prefix (an own
+  enumerable one does not, since it is already listed as a property — V8 does
+  the same to avoid printing it twice). The constructor prefix now also covers
+  `function F(){}` instances (`F { y: 2 }`), found by walking the prototype
+  chain for an own `constructor` the way V8's `getConstructorName` does. String
+  quoting is a port of Node's `strEscape`: single quotes normally, double when
+  the string contains a `'` but no `"`, a backtick when it contains both, and
+  the C0 controls escape through Node's `meta` table (`\n`/`\t`/`\b`/`\f`/`\r`
+  short forms, `\x0B`/`\x00`/`\x7F` uppercase hex otherwise).

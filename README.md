@@ -81,8 +81,11 @@ source ──▶ lexer ──▶ parser ──▶ compiler ──▶ fusevm::Chu
   preserved (observable in iteration and `JSON` round-trips).
 - **Arithmetic** lowers to native fusevm ops so the JIT can trace hot loops; a
   strict **numeric hook** supplies JS coercion for the non-numeric operand cases
-  (`+` string concat, `==` matrix, `ToInt32` for bitwise ops). Everything
-  JS-specific lowers to `CallBuiltin` handlers.
+  (`+` string concat, `==` matrix, `ToInt32` for bitwise ops). An object operand
+  goes through a real `ToPrimitive` first — which calls the user's
+  `Symbol.toPrimitive`/`valueOf`/`toString`, so it runs before the host borrow
+  the numeric hook takes. Everything JS-specific lowers to `CallBuiltin`
+  handlers.
 
 ## [0x02] USAGE
 

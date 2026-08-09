@@ -270,6 +270,30 @@ pub enum JsObj {
 /// property read O(len) and any loop over a collection O(n^2). This type is the
 /// same discriminant with nothing attached, so the probe is O(1) and each branch
 /// re-borrows for only the one field it actually needs.
+/// The well-known symbols node-js actually honors. `Symbol.<name>` is the
+/// interned symbol `@@Symbol.<name>`, and using it as a property key stores
+/// under the sentinel string `@@<name>` (`property_key`) so the internal
+/// lookups (`@@iterator`, `@@toPrimitive`, …) can find it without a symbol
+/// table walk. Symbols V8 defines but node-js does not act on are deliberately
+/// absent: `Symbol.hasInstance` reading as a symbol while `instanceof` ignored
+/// it would be a silent fake.
+pub const WELL_KNOWN_SYMBOLS: &[&str] =
+    &["iterator", "asyncIterator", "toPrimitive", "toStringTag"];
+
+/// Whether the internal key `k` came from a SYMBOL used as a property key
+/// (`@@sym:<id>`, or a well-known `@@iterator`), as opposed to one of node-js's
+/// hidden slots (`@@native`, `@@bytes`, `@@ms`, `@@kind`, …). Only the former
+/// is an observable JavaScript property.
+pub fn is_symbol_key(k: &str) -> bool {
+    match k.strip_prefix("@@") {
+        Some(rest) => rest
+            .strip_prefix("sym:")
+            .map(|i| i.parse::<u64>().is_ok())
+            .unwrap_or_else(|| WELL_KNOWN_SYMBOLS.contains(&rest)),
+        None => false,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObjKind {
     Str,
@@ -583,6 +607,13 @@ pub struct JsHost {
     symbol_registry: HashMap<String, Value>,
     /// Monotonic id source for fresh `Symbol()` values.
     next_symbol: u64,
+    /// Every live symbol by its id, so a `@@sym:<id>` property key can be
+    /// turned back into the symbol VALUE for `Object.getOwnPropertySymbols`.
+    symbols_by_id: HashMap<u64, Value>,
+    /// Well-known symbol ids (`Symbol.iterator` …) to their ECMAScript name.
+    /// Identity is by id, not description, so a user `Symbol("Symbol.iterator")`
+    /// is a distinct key.
+    well_known_ids: HashMap<u64, String>,
     /// Suspended generator coroutines, indexed by `JsObj::Generator.id`.
     generators: Vec<GenCell>,
     /// Promise cells, indexed by `JsObj::Promise.id`.
@@ -778,6 +809,8 @@ impl JsHost {
             native_protos: HashMap::new(),
             symbol_registry: HashMap::new(),
             next_symbol: 1,
+            symbols_by_id: HashMap::new(),
+            well_known_ids: HashMap::new(),
             generators: Vec::new(),
             promises: Vec::new(),
             microtasks: std::collections::VecDeque::new(),
@@ -850,13 +883,31 @@ impl JsHost {
     /// The constructor display name of `obj` for `util.inspect` (empty ⇒ plain
     /// object, no prefix).
     pub fn ctor_name(&self, obj: &Value) -> String {
-        match self.class_of(obj) {
-            Some(c) => match self.get(&c) {
-                Some(JsObj::Class(cv)) => cv.name.clone(),
-                _ => String::new(),
-            },
-            None => String::new(),
+        if let Some(c) = self.class_of(obj) {
+            if let Some(JsObj::Class(cv)) = self.get(&c) {
+                return cv.name.clone();
+            }
         }
+        // A `function F(){}` constructor is not a `class`, so it has no
+        // `proto_class` entry. V8's `getConstructorName` walks the prototype
+        // chain for an own `constructor` that is a named function — which is
+        // what makes `console.log(new F())` print `F { y: 2 }`.
+        let mut cur = self.proto_of(obj);
+        while let Some(p) = cur {
+            let ctor = match self.get(&p) {
+                Some(JsObj::Object(props)) => props.get("constructor").cloned(),
+                Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => self.fn_prop(&p, "constructor"),
+                _ => None,
+            };
+            if let Some(f) = ctor {
+                let n = self.callable_name(&f);
+                if !n.is_empty() {
+                    return n;
+                }
+            }
+            cur = self.proto_of(&p);
+        }
+        String::new()
     }
 
     /// A function's own-property table (created on demand).
@@ -1095,7 +1146,51 @@ impl JsHost {
     pub fn new_symbol(&mut self, desc: Option<String>) -> Value {
         let id = self.next_symbol;
         self.next_symbol += 1;
-        self.alloc(JsObj::Symbol { desc, id })
+        let v = self.alloc(JsObj::Symbol { desc, id });
+        self.symbols_by_id.insert(id, v.clone());
+        v
+    }
+
+    /// The symbol VALUE an internal symbol property key (`@@sym:<id>` or a
+    /// well-known `@@iterator`) came from.
+    pub fn symbol_of_key(&self, k: &str) -> Option<Value> {
+        if let Some(id) = k.strip_prefix("@@sym:").and_then(|i| i.parse::<u64>().ok()) {
+            return self.symbols_by_id.get(&id).cloned();
+        }
+        let name = k.strip_prefix("@@")?;
+        WELL_KNOWN_SYMBOLS
+            .contains(&name)
+            .then(|| {
+                self.symbol_registry
+                    .get(&format!("@@Symbol.{name}"))
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    /// The own symbol-keyed property keys of `v` as SYMBOL values —
+    /// `Object.getOwnPropertySymbols` / the symbol half of `Reflect.ownKeys`.
+    pub fn own_symbol_keys(&self, v: &Value) -> Vec<Value> {
+        let keys: Vec<String> = match self.get(v) {
+            Some(JsObj::Object(p)) => p.keys().cloned().collect(),
+            _ => return Vec::new(),
+        };
+        keys.iter().filter_map(|k| self.symbol_of_key(k)).collect()
+    }
+
+    /// The own SYMBOL-keyed enumerable `(internal key, value)` pairs of `v` —
+    /// what `CopyDataProperties` (object spread, `Object.assign`) copies
+    /// alongside the string keys, and what `Object.keys` / `for-in` /
+    /// `JSON.stringify` deliberately skip.
+    pub fn own_symbol_entries(&self, v: &Value) -> Vec<(String, Value)> {
+        match self.get(v) {
+            Some(JsObj::Object(p)) => p
+                .iter()
+                .filter(|(k, _)| is_symbol_key(k) && self.prop_attrs(v, k).enumerable)
+                .map(|(k, val)| (k.clone(), val.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
     /// The shared `Symbol.for(key)` value (interned by description).
     pub fn symbol_for(&mut self, key: &str) -> Value {
@@ -1115,16 +1210,34 @@ impl JsHost {
     pub fn well_known_async_iterator(&mut self) -> Value {
         self.symbol_for("@@Symbol.asyncIterator")
     }
+    /// A well-known symbol by its ECMAScript name (`toPrimitive`,
+    /// `toStringTag`, …). Its internal property key is `@@<name>` — see
+    /// [`WELL_KNOWN_SYMBOLS`] and `property_key`.
+    ///
+    /// Its DESCRIPTION is `Symbol.<name>`, so `String(Symbol.iterator)` prints
+    /// `Symbol(Symbol.iterator)` as V8 does, while the registry key keeps the
+    /// `@@` prefix — `Symbol.for('Symbol.iterator')` therefore stays a
+    /// different symbol, and identification is by id, so a user-made
+    /// `Symbol('Symbol.iterator')` is not mistaken for the well-known one.
+    pub fn well_known_symbol(&mut self, name: &str) -> Value {
+        let key = format!("@@Symbol.{name}");
+        if let Some(v) = self.symbol_registry.get(&key) {
+            return v.clone();
+        }
+        let s = self.new_symbol(Some(format!("Symbol.{name}")));
+        if let Some(JsObj::Symbol { id, .. }) = self.get(&s) {
+            self.well_known_ids.insert(*id, name.to_string());
+        }
+        self.symbol_registry.insert(key, s.clone());
+        s
+    }
     /// The internal property-key string for a value used as a key. A `Symbol`
     /// maps to a stable per-symbol string so symbol-keyed props round-trip;
     /// `Symbol.iterator` maps to the sentinel `@@iterator`.
     pub fn property_key(&self, v: &Value) -> String {
-        if let Some(JsObj::Symbol { desc, id }) = self.get(v) {
-            if desc.as_deref() == Some("@@Symbol.iterator") {
-                return "@@iterator".to_string();
-            }
-            if desc.as_deref() == Some("@@Symbol.asyncIterator") {
-                return "@@asyncIterator".to_string();
+        if let Some(JsObj::Symbol { id, .. }) = self.get(v) {
+            if let Some(n) = self.well_known_ids.get(id) {
+                return format!("@@{n}");
             }
             return format!("@@sym:{id}");
         }
@@ -1855,6 +1968,24 @@ impl JsHost {
         }
     }
 
+    /// The `Symbol.toStringTag` string `util.inspect` renders as a `[Tag]`
+    /// prefix. V8 suppresses the tag when it is an OWN ENUMERABLE property,
+    /// because it is then already listed as a `Symbol(Symbol.toStringTag): …`
+    /// entry and showing it twice would be wrong.
+    ///
+    /// Only a DATA property is seen. A tag supplied by a prototype getter
+    /// (`class C { get [Symbol.toStringTag]() { … } }`) would need a JS call,
+    /// which cannot run under the host borrow `inspect` holds — such an object
+    /// prints without the prefix.
+    fn inspect_tag(&self, v: &Value) -> Option<String> {
+        let own = matches!(self.get(v), Some(JsObj::Object(p)) if p.contains_key("@@toStringTag"));
+        if own && self.prop_attrs(v, "@@toStringTag").enumerable {
+            return None;
+        }
+        let t = lookup_chain(self, v, "@@toStringTag")?;
+        self.as_str(&t)
+    }
+
     /// `console.log`-style rendering of a top-level argument: bare strings print
     /// raw; everything else uses `inspect`.
     pub fn console_format(&self, v: &Value) -> String {
@@ -1979,39 +2110,56 @@ impl JsHost {
                     // (`C { x: 1 }`); plain objects have none; a null-prototype
                     // object (e.g. an `Object.groupBy` result) is tagged
                     // `[Object: null prototype]`.
+                    let ctor = match self.ctor_name(v) {
+                        n if n.is_empty() => "Object".to_string(),
+                        n => n,
+                    };
+                    let plain_prefix = if ctor == "Object" {
+                        String::new()
+                    } else {
+                        format!("{ctor} ")
+                    };
                     let prefix = if self.has_null_proto(v) {
                         "[Object: null prototype] ".to_string()
                     } else {
-                        match self.ctor_name(v) {
-                            n if n.is_empty() || n == "Object" => String::new(),
-                            n => format!("{n} "),
+                        // An inherited `Symbol.toStringTag` shows as `Ctor [Tag] `.
+                        match self.inspect_tag(v) {
+                            Some(t) if t != ctor => format!("{ctor} [{t}] "),
+                            _ => plain_prefix.clone(),
                         }
                     };
-                    // Skip internal symbol-keyed props (`@@…`) in the display.
-                    let shown: Vec<(&String, &Value)> = props
+                    // Skip node-js's internal slots (`@@native`, `@@bytes`, …) and
+                    // private class fields; a real symbol-keyed own property is a
+                    // visible one and renders as `Symbol(desc): value`.
+                    let mut shown: Vec<(String, &Value)> = props
                         .iter()
                         .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
+                        .map(|(k, val)| (fmt_key(k), val))
                         .collect();
+                    shown.extend(props.iter().filter_map(|(k, val)| {
+                        let sym = self.symbol_of_key(k)?;
+                        self.prop_attrs(v, k)
+                            .enumerable
+                            .then(|| (self.inspect(&sym), val))
+                    }));
                     if shown.is_empty() {
                         return format!("{prefix}{{}}");
                     }
                     // Depth limit (Node default 2): deeper objects collapse to
                     // `[Object]` (or `[ClassName]` for a named instance).
                     if indent > 2 * inspect_max_depth() {
-                        return if prefix.is_empty() {
-                            "[Object]".into()
-                        } else if self.has_null_proto(v) {
+                        return if self.has_null_proto(v) {
                             // Already bracketed (`[Object: null prototype]`).
                             prefix.trim_end().to_string()
+                        } else if plain_prefix.is_empty() {
+                            "[Object]".into()
                         } else {
-                            format!("[{}]", prefix.trim_end())
+                            format!("[{}]", plain_prefix.trim_end())
                         };
                     }
                     let inner: Vec<String> = shown
                         .iter()
-                        .map(|(k, val)| {
-                            format!("{}: {}", fmt_key(k), self.inspect_lvl(val, indent + 2))
-                        })
+                        .map(|(k, val)| format!("{k}: {}", self.inspect_lvl(val, indent + 2)))
                         .collect();
                     self.render_object(&inner, &prefix, indent)
                 }
@@ -2769,20 +2917,44 @@ fn pad_to(s: &str, width: usize, pad_start: bool) -> String {
     }
 }
 
-/// Quote a string the way `util.inspect` does (single quotes, escaped).
+/// Quote a string the way `util.inspect` does — a port of `strEscape` in Node's
+/// `lib/internal/util/inspect.js`.
+///
+/// The quote character is chosen so the contents need as little escaping as
+/// possible: single quotes normally, double quotes when the string contains a
+/// `'` but no `"`, and a backtick when it contains both (and neither a backtick
+/// nor a `${`). Only the ACTIVE quote is backslash-escaped, alongside `\` and
+/// the C0 controls + DEL, which use Node's `meta` table (`\n`, `\t`, `\b`,
+/// `\f`, `\r` short forms; `\x0B`, `\x1F`, `\x7F` uppercase-hex otherwise).
 fn quote_str(s: &str) -> String {
-    let mut out = String::from("'");
+    let quote = if !s.contains('\'') {
+        '\''
+    } else if !s.contains('"') {
+        '"'
+    } else if !s.contains('`') && !s.contains("${") {
+        '`'
+    } else {
+        '\''
+    };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
     for c in s.chars() {
         match c {
-            '\'' => out.push_str("\\'"),
+            _ if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
             '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
+            '\u{8}' => out.push_str("\\b"),
             '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
             '\r' => out.push_str("\\r"),
+            '\u{0}'..='\u{1f}' | '\u{7f}' => out.push_str(&format!("\\x{:02X}", c as u32)),
             _ => out.push(c),
         }
     }
-    out.push('\'');
+    out.push(quote);
     out
 }
 
@@ -3258,9 +3430,16 @@ fn bind_params(env: &Env, def: &FuncDef, args: Vec<Value>) {
             i += 1;
         }
     }
-    // `arguments` array (simple approximation).
-    let args_arr = with_host(|h| h.new_array(args));
-    vars.entry("arguments".to_string()).or_insert(args_arr);
+    // `arguments` array (simple approximation — see BUGS.md: it is a real
+    // Array, not an Arguments exotic). An ARROW function never gets one:
+    // `FunctionDeclarationInstantiation` (10.2.11) creates the binding only for
+    // a non-arrow, so `arguments` inside an arrow resolves lexically to the
+    // enclosing function's. Binding an empty one here made
+    // `function f(){ const g = () => [...arguments]; }` see zero args.
+    if !def.is_arrow {
+        let args_arr = with_host(|h| h.new_array(args));
+        vars.entry("arguments".to_string()).or_insert(args_arr);
+    }
     env.borrow_mut().vars = vars;
 }
 
@@ -3709,6 +3888,18 @@ impl JsHost {
     pub fn is_generator_val(&self, v: &Value) -> bool {
         matches!(self.get(v), Some(JsObj::Generator { .. }))
     }
+    /// Whether `v` is an ASYNC generator object — the borrow-free form of
+    /// [`is_async_generator`], usable from code already holding the host.
+    pub fn is_async_gen_val(&self, v: &Value) -> bool {
+        match self.get(v) {
+            Some(JsObj::Generator { id }) => self
+                .generators
+                .get(*id as usize)
+                .map(|g| g.async_gen)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
     pub fn gen_done(&self, id: u32) -> bool {
         self.generators
             .get(id as usize)
@@ -4089,33 +4280,120 @@ pub fn get_prop_chain(recv: &Value, name: &str) -> Result<Value, String> {
     crate::builtins::get_property(recv, name)
 }
 
-/// `ToString(v)` with `ToPrimitive` method dispatch: an object with a user
-/// `toString` (or `valueOf`) on its prototype chain has it invoked; everything
-/// else uses the raw `str_of`. Returns a heap string value.
-pub fn to_string_value(v: &Value) -> Result<Value, String> {
-    if with_host(|h| matches!(h.get(v), Some(JsObj::Object(_)))) {
-        // Prefer a user toString; fall back to valueOf if it returns a primitive.
-        for m in ["toString", "valueOf"] {
-            if let Some(f) = with_host(|h| lookup_chain(h, v, m)) {
-                if with_host(|h| is_callable(h, &f)) {
-                    let r = invoke(&f, Vec::new(), Some(v.clone()))?;
-                    // A primitive result is used directly; an object result from
-                    // toString is still stringified (matches V8's OrdinaryToPrimitive
-                    // fallthrough closely enough for our surface).
-                    if !matches!(with_host(|h| h.get(&r).cloned()), Some(JsObj::Object(_))) {
-                        return Ok(with_host(|h| {
-                            let s = h.str_of(&r);
-                            h.new_str(s)
-                        }));
-                    }
-                }
+/// Whether `v` is an ECMAScript primitive, i.e. `ToPrimitive` is the identity
+/// on it. `undefined`, `null`, booleans, numbers, strings, symbols and bigints
+/// qualify; every other heap cell (objects, arrays, functions, `Map`/`Set`,
+/// native-tagged instances) is an object and must be converted.
+pub fn is_primitive(h: &JsHost, v: &Value) -> bool {
+    match v {
+        Value::Obj(_) => matches!(
+            h.get(v),
+            None | Some(JsObj::Null)
+                | Some(JsObj::Str(_))
+                | Some(JsObj::Symbol { .. })
+                | Some(JsObj::BigInt(_))
+        ),
+        _ => true,
+    }
+}
+
+/// `ToPrimitive(v, hint)` — ECMA-262 7.1.1. `hint` is `"default"`, `"number"`
+/// or `"string"`.
+///
+/// An object carrying a `Symbol.toPrimitive` method (internal key
+/// `@@toPrimitive`) has it called with the hint and must return a primitive.
+/// Otherwise `OrdinaryToPrimitive` (7.1.1.1) tries `valueOf` then `toString` —
+/// the order reversed for the string hint — and takes the FIRST call whose
+/// result is a primitive. An object that yields no primitive (a null-prototype
+/// object has neither method) throws V8's
+/// `TypeError: Cannot convert object to primitive value`.
+///
+/// This is the conversion behind `+`, `-`/`*`/`/`/`%`/`**`, the relational
+/// operators, `==` against a primitive, and `ToPropertyKey` — all of which used
+/// to read `str_of` directly and so never invoked a user `valueOf`.
+pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
+    if with_host(|h| is_primitive(h, v)) {
+        return Ok(v.clone());
+    }
+    if let Some(f) = with_host(|h| lookup_chain(h, v, "@@toPrimitive")) {
+        if with_host(|h| is_callable(h, &f)) {
+            let hv = with_host(|h| h.new_str(hint.to_string()));
+            let r = invoke(&f, vec![hv], Some(v.clone()))?;
+            if with_host(|h| is_primitive(h, &r)) {
+                return Ok(r);
             }
+            return Err(type_error("Cannot convert object to primitive value"));
         }
     }
+    // `Date.prototype[@@toPrimitive]` (21.4.4.45) treats the DEFAULT hint as
+    // `"string"`, which is why `new Date() + 1` concatenates while
+    // `new Date() - 1` is arithmetic.
+    let hint = if hint == "default" && crate::stdlib::native_tag(v).as_deref() == Some("Date") {
+        "string"
+    } else {
+        hint
+    };
+    let order = if hint == "string" {
+        ["toString", "valueOf"]
+    } else {
+        ["valueOf", "toString"]
+    };
+    for m in order {
+        let f = crate::builtins::get_property(v, m).unwrap_or(Value::Undef);
+        if !with_host(|h| is_callable(h, &f)) {
+            continue;
+        }
+        let r = invoke(&f, Vec::new(), Some(v.clone()))?;
+        if with_host(|h| is_primitive(h, &r)) {
+            return Ok(r);
+        }
+    }
+    // Every object except a null-prototype one inherits `Object.prototype
+    // .toString`, which always returns a string — so the exhausted-methods
+    // TypeError is reachable only there. The exotics whose property funnel has
+    // no `toString` entry of its own (`Map`, `Set`, `Promise`, …) land here and
+    // get the same `[object Tag]` brand V8 gives them.
+    if !with_host(|h| h.has_null_proto(v)) {
+        return crate::builtins::proto_method(v, "Object:toString", Vec::new());
+    }
+    Err(type_error("Cannot convert object to primitive value"))
+}
+
+/// `ToString(v)` with `ToPrimitive` method dispatch: an object is converted
+/// with the string hint (so a user `toString` — or `valueOf`, if `toString`
+/// is absent or returns an object — is invoked), then rendered by `str_of`.
+/// Returns a heap string value.
+pub fn to_string_value(v: &Value) -> Result<Value, String> {
+    let p = to_primitive(v, "string")?;
     Ok(with_host(|h| {
-        let s = h.str_of(v);
+        let s = h.str_of(&p);
         h.new_str(s)
     }))
+}
+
+/// `ToNumber(v)` — ECMA-262 7.1.4 — with the object case going through
+/// `ToPrimitive(v, number)` first, so `+{ valueOf() { return 7 } }` is `7` and
+/// `+new Date(0)` is `0`. `JsHost::to_number` alone cannot do this: it runs
+/// under the host borrow and so can never invoke a JS `valueOf`.
+pub fn to_number_value(v: &Value) -> Result<f64, String> {
+    if let Some(n) = with_host(|h| is_primitive(h, v).then(|| h.to_number(v))) {
+        return Ok(n);
+    }
+    let p = to_primitive(v, "number")?;
+    Ok(with_host(|h| h.to_number(&p)))
+}
+
+/// `ToPropertyKey(v)` — ECMA-262 7.1.19. A symbol keeps its stable internal
+/// key; anything else is `ToPrimitive(v, string)` then `ToString`, so
+/// `obj[{ toString() { return 'k' } }]` really reads `obj.k`.
+pub fn to_property_key(v: &Value) -> Result<String, String> {
+    // One borrow for the overwhelmingly common primitive key (`a[i]`, `o[s]`,
+    // `o[sym]`); only an object key pays for the conversion.
+    if let Some(k) = with_host(|h| is_primitive(h, v).then(|| h.property_key(v))) {
+        return Ok(k);
+    }
+    let p = to_primitive(v, "string")?;
+    Ok(with_host(|h| h.str_of(&p)))
 }
 
 /// Whether `h.get(v)` is any callable kind.

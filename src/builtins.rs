@@ -583,7 +583,11 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 // A native instance method read as a property (`server.listen`) →
                 // a bound method, dispatched via `instance_call` when invoked.
                 bound_method(recv, name)
-            } else if is_object_method(name) {
+            } else if is_object_method(name) && !with_host(|h| h.has_null_proto(recv)) {
+                // `Object.create(null)` inherits nothing, so `toString`/`valueOf`
+                // read as `undefined` there — which is also what makes
+                // `Object.create(null) + 1` the spec `TypeError` instead of a
+                // silent `"[object Object]1"`.
                 bound_method(recv, name)
             } else {
                 Value::Undef
@@ -1087,12 +1091,10 @@ fn namespace_property(ns: &str, name: &str) -> Value {
     if name == "name" && is_builtin_ctor(ns) {
         return with_host(|h| h.new_str(ns.to_string()));
     }
-    // The well-known `Symbol.iterator` symbol (used as a computed method key).
-    if ns == "Symbol" && name == "iterator" {
-        return with_host(|h| h.well_known_iterator());
-    }
-    if ns == "Symbol" && name == "asyncIterator" {
-        return with_host(|h| h.well_known_async_iterator());
+    // A well-known symbol (`Symbol.iterator`, `Symbol.toPrimitive`, …) used as a
+    // computed property/method key.
+    if ns == "Symbol" && host::WELL_KNOWN_SYMBOLS.contains(&name) {
+        return with_host(|h| h.well_known_symbol(name));
     }
     // Non-function constants on a stdlib namespace (`path.sep`, `os.EOL`,
     // `buffer.Buffer`, `url.URL`).
@@ -1142,6 +1144,21 @@ fn namespace_property(ns: &str, name: &str) -> Value {
 pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result<Value, String> {
     let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
     if ctor == "Object" && method == "toString" {
+        // Steps 16-17 of 20.1.3.6: a `Symbol.toStringTag` STRING on the receiver
+        // (own or inherited, data property or getter) replaces the builtin brand,
+        // which is how a class advertises its own (`class C { get
+        // [Symbol.toStringTag]() { return 'Cee' } }` → `[object Cee]`). The read
+        // runs outside the host borrow so an accessor can be invoked.
+        let tagged = with_host(|h| {
+            host::lookup_chain(h, recv, "@@toStringTag").is_some()
+                || host::lookup_accessor(h, recv, "@@toStringTag").is_some()
+        });
+        if tagged {
+            let t = get_property(recv, "@@toStringTag")?;
+            if let Some(s) = with_host(|h| h.as_str(&t)) {
+                return Ok(with_host(|h| h.new_str(format!("[object {s}]"))));
+            }
+        }
         return Ok(with_host(|h| h.new_str(object_tag(h, recv))));
     }
     // These thunks now live on the real `Object.prototype` object, i.e. on the
@@ -1190,11 +1207,27 @@ fn object_tag(h: &host::JsHost, v: &Value) -> String {
             Some(JsObj::Null) => "Null".into(),
             Some(JsObj::Str(_)) => "String".into(),
             Some(JsObj::Array(_)) => "Array".into(),
-            Some(JsObj::Func(_))
-            | Some(JsObj::Class(_))
+            // `function*` / `async function` / `async function*` carry their own
+            // `Symbol.toStringTag` in V8 (27.3.3.2, 27.7.3.2, 27.4.3.2).
+            Some(JsObj::Func(f)) => match h.funcs.get(f.def_id) {
+                Some(d) if d.is_generator && d.is_async => "AsyncGeneratorFunction".into(),
+                Some(d) if d.is_generator => "GeneratorFunction".into(),
+                Some(d) if d.is_async => "AsyncFunction".into(),
+                _ => "Function".into(),
+            },
+            // `Math`/`JSON`/`Reflect` are namespace OBJECTS, not callables, and
+            // brand by name (21.3.1.9, 25.5.3, 28.1.14).
+            Some(JsObj::Builtin(n)) if matches!(n.as_str(), "Math" | "JSON" | "Reflect") => {
+                n.clone()
+            }
+            Some(JsObj::Class(_))
             | Some(JsObj::Builtin(_))
             | Some(JsObj::BoundFunc { .. })
             | Some(JsObj::BoundMethod { .. }) => "Function".into(),
+            // A suspended generator object is `[object Generator]`; an async one
+            // `[object AsyncGenerator]`.
+            Some(JsObj::Generator { .. }) if h.is_async_gen_val(v) => "AsyncGenerator".into(),
+            Some(JsObj::Generator { .. }) => "Generator".into(),
             Some(JsObj::RegExp(_)) => "RegExp".into(),
             Some(JsObj::Map { weak, .. }) => if *weak { "WeakMap" } else { "Map" }.into(),
             Some(JsObj::Set { weak, .. }) => if *weak { "WeakSet" } else { "Set" }.into(),
@@ -1209,9 +1242,24 @@ fn object_tag(h: &host::JsHost, v: &Value) -> String {
                     .map(|k| h.str_of(k))
                     .unwrap_or_else(|| "Uint8Array".into()),
                 Some("Buffer") => "Uint8Array".into(),
-                Some("ArrayBuffer") => "ArrayBuffer".into(),
-                Some("DataView") => "DataView".into(),
-                Some("Date") => "Date".into(),
+                // Every native class that really carries a `Symbol.toStringTag`
+                // in Node brands by its own name. Verified against node v26:
+                // `Object.prototype.toString.call(new WeakRef({}))` is
+                // `[object WeakRef]`. The rest of the `@@native` tags
+                // (`EventEmitter`, `Server`, `Hash`, `Readable`, …) are plain
+                // classes with NO tag, so they stay `[object Object]` — listing
+                // them here would invent a brand Node does not have.
+                Some(
+                    t @ ("ArrayBuffer"
+                    | "DataView"
+                    | "Date"
+                    | "WeakRef"
+                    | "FinalizationRegistry"
+                    | "TextEncoder"
+                    | "TextDecoder"
+                    | "URL"
+                    | "URLSearchParams"),
+                ) => t.into(),
                 _ if h.error_to_string(v).is_some() => "Error".into(),
                 _ => "Object".into(),
             },
@@ -1343,7 +1391,10 @@ fn h_val_to_len(v: &Value) -> usize {
 fn b_getitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
-    let key = with_host(|h| h.property_key(&idx));
+    let key = match host::to_property_key(&idx) {
+        Ok(k) => k,
+        Err(e) => return abort(vm, e),
+    };
     match get_property(&recv, &key) {
         Ok(v) => v,
         Err(e) => abort(vm, e),
@@ -1354,7 +1405,10 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let idx = vm.pop();
     let recv = vm.pop();
-    let key = with_host(|h| h.property_key(&idx));
+    let key = match host::to_property_key(&idx) {
+        Ok(k) => k,
+        Err(e) => return abort(vm, e),
+    };
     set_property(&recv, &key, val.clone());
     val
 }
@@ -1430,6 +1484,11 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
             // property a descriptor marked non-enumerable.
             let entries = host::own_enum_entries_deep(&src);
             for (k, v) in entries {
+                props.insert(k, v);
+            }
+            // `CopyDataProperties` (7.3.25) copies own enumerable SYMBOL keys
+            // too — only `Object.keys`/`for-in`/`JSON.stringify` skip them.
+            for (k, v) in with_host(|h| h.own_symbol_entries(&src)) {
                 props.insert(k, v);
             }
         } else {
@@ -1555,6 +1614,20 @@ fn b_strict_eq(vm: &mut VM, _: u8) -> Value {
 fn b_loose_eq(vm: &mut VM, _: u8) -> Value {
     let b = vm.pop();
     let a = vm.pop();
+    // Abstract Equality steps 10-11 (7.2.15): object ⇄ primitive converts the
+    // object with `ToPrimitive` — a JS `valueOf`/`Symbol.toPrimitive` call, so it
+    // runs before the host borrow. Object ⇄ object stays a reference check.
+    let (a, b) = match with_host(|h| (host::is_primitive(h, &a), host::is_primitive(h, &b))) {
+        (false, true) if coerces_against_object(&b) => match host::to_primitive(&a, "default") {
+            Ok(p) => (p, b),
+            Err(e) => return abort(vm, e),
+        },
+        (true, false) if coerces_against_object(&a) => match host::to_primitive(&b, "default") {
+            Ok(p) => (a, p),
+            Err(e) => return abort(vm, e),
+        },
+        _ => (a, b),
+    };
     Value::Bool(with_host(|h| h.loose_eq(&a, &b)))
 }
 
@@ -1576,7 +1649,11 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n,
         _ => 0,
     };
-    let r = with_host(|h| h.bitwise(tag, &a, &b));
+    // Both operands are ToPrimitive-d with the number hint before ToInt32
+    // (ECMA-262 13.12.1), which has to happen outside the host borrow.
+    let r = host::to_primitive(&a, "number")
+        .and_then(|a| host::to_primitive(&b, "number").map(|b| (a, b)))
+        .and_then(|(a, b)| with_host(|h| h.bitwise(tag, &a, &b)));
     finish(vm, r)
 }
 
@@ -1602,10 +1679,15 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
             _ => Value::Undef,
         };
     }
-    with_host(|h| match tag {
-        host::unop::POS => Value::Float(h.to_number(&v)),
+    // `ToNumber` outside the host borrow: an object operand's `valueOf` /
+    // `Symbol.toPrimitive` is a JS call, so it cannot run under `with_host`.
+    let n = match host::to_number_value(&v) {
+        Ok(n) => n,
+        Err(e) => return abort(vm, e),
+    };
+    match tag {
+        host::unop::POS => Value::Float(n),
         host::unop::BITNOT => {
-            let n = h.to_number(&v);
             let i = if n.is_finite() {
                 n.trunc() as i64 as i32
             } else {
@@ -1614,7 +1696,7 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
             Value::Float(!i as f64)
         }
         _ => Value::Undef,
-    })
+    }
 }
 
 // ── membership ────────────────────────────────────────────────────────────────
@@ -2146,8 +2228,53 @@ fn b_apply_method(vm: &mut VM, _: u8) -> Value {
 
 /// Host callback for arithmetic fusevm cannot complete natively (a non-`Int`/
 /// non-`Float` operand). Supplies JavaScript `+` concatenation and coercion.
+///
+/// Every operand is run through `ToPrimitive` FIRST (ECMA-262 13.15.3 for `+`,
+/// 13.6.3 for the other arithmetic ops, 13.10.1 for the relational ones), which
+/// is what invokes a user `valueOf`/`Symbol.toPrimitive`. It has to happen here
+/// rather than inside `JsHost::arith`, because calling back into JS re-enters
+/// the VM and `arith` runs under the host's `RefCell` borrow.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
-    with_host(|h| h.arith(op, a, b))
+    use NumOp::*;
+    let (a, b) = match op {
+        // `==`/`!=` only convert when the OTHER side is a primitive that can be
+        // compared numerically or textually; `{} == {}` stays a reference check.
+        Eq | Ne => {
+            let (pa, pb) = with_host(|h| (host::is_primitive(h, a), host::is_primitive(h, b)));
+            match (pa, pb) {
+                (false, true) if coerces_against_object(b) => {
+                    (host::to_primitive(a, "default")?, b.clone())
+                }
+                (true, false) if coerces_against_object(a) => {
+                    (a.clone(), host::to_primitive(b, "default")?)
+                }
+                _ => (a.clone(), b.clone()),
+            }
+        }
+        // `+` uses the default hint (`valueOf` first, but a string result still
+        // selects concatenation); everything else uses the number hint.
+        Add => (
+            host::to_primitive(a, "default")?,
+            host::to_primitive(b, "default")?,
+        ),
+        _ => (
+            host::to_primitive(a, "number")?,
+            host::to_primitive(b, "number")?,
+        ),
+    };
+    with_host(|h| h.arith(op, &a, &b))
+}
+
+/// Whether a primitive `v` makes `==` against an object convert that object
+/// (7.2.15 steps 10-11): numbers, strings, bigints and symbols do; `null`,
+/// `undefined` and booleans are settled without a `ToPrimitive` call
+/// (a boolean is coerced to a number first, and then it does).
+fn coerces_against_object(v: &Value) -> bool {
+    match v {
+        Value::Undef => false,
+        Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
+        _ => with_host(|h| !h.is_null(v)),
+    }
 }
 
 // ══ standard library ═══════════════════════════════════════════════════════════
@@ -2280,6 +2407,7 @@ const NS_METHODS: &[&str] = &[
     "Object.setPrototypeOf",
     "Object.create",
     "Object.getOwnPropertyNames",
+    "Object.getOwnPropertySymbols",
     "Object.defineProperty",
     "Object.getOwnPropertyDescriptor",
     "Object.getOwnPropertyDescriptors",
@@ -2450,7 +2578,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Number" => Ok(Value::Float(if args.is_empty() {
             0.0
         } else {
-            with_host(|h| h.to_number(&args[0]))
+            // ToNumber, which for an object runs ToPrimitive (a JS `valueOf` call).
+            host::to_number_value(&args[0])?
         })),
         "BigInt" => bigint_ctor(&arg0(&args)),
         "RegExp" => regexp_ctor(&args),
@@ -2550,6 +2679,13 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Object.create" => object_create(args),
         "Object.getOwnPropertyNames" => object_keys(args, 3),
+        "Object.getOwnPropertySymbols" => {
+            let v = arg0(&args);
+            Ok(with_host(|h| {
+                let syms = h.own_symbol_keys(&v);
+                h.new_array(syms)
+            }))
+        }
         // `Object.hasOwn(obj, key)` — the static form of `hasOwnProperty`.
         "Object.hasOwn" => {
             let obj = arg0(&args);
@@ -2584,7 +2720,19 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `Reflect.ownKeys` reports EVERY own key, non-enumerable included —
         // the same set as `getOwnPropertyNames` (node-js has no symbol-keyed
         // own properties, so there is no second half to append).
-        "Reflect.ownKeys" => object_keys(args, 3),
+        // `Reflect.ownKeys` is `OwnPropertyKeys` (7.3.23): every own key,
+        // non-enumerable included, strings first and then the SYMBOLS.
+        "Reflect.ownKeys" => {
+            let v = arg0(&args);
+            let names = object_keys(args, 3)?;
+            let syms = with_host(|h| h.own_symbol_keys(&v));
+            if syms.is_empty() {
+                return Ok(names);
+            }
+            let mut all = with_host(|h| h.iter_vec(&names)).unwrap_or_default();
+            all.extend(syms);
+            Ok(with_host(|h| h.new_array(all)))
+        }
         "Reflect.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
         "Reflect.defineProperty" => {
             object_define_property(args)?;
@@ -3382,11 +3530,13 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
 fn object_assign(args: Vec<Value>) -> Result<Value, String> {
     let target = arg0(&args);
     for src in args.iter().skip(1) {
-        // `Object.assign` copies own *enumerable* properties, running any getter.
+        // `Object.assign` copies own *enumerable* properties, running any getter
+        // — symbol-keyed ones included (7.3.25).
         let entries = host::own_enum_entries_deep(src);
+        let syms = with_host(|h| h.own_symbol_entries(src));
         with_host(|h| {
             if let Some(JsObj::Object(p)) = h.get_mut(&target) {
-                for (k, v) in entries {
+                for (k, v) in entries.into_iter().chain(syms) {
                     p.insert(k, v);
                 }
                 host::canonicalize_own_keys(p);
@@ -4231,6 +4381,26 @@ fn is_number_method(name: &str) -> bool {
 
 /// Dispatch `recv.name(args)` for the built-in prototype methods.
 pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // `Object.prototype.valueOf` is inherited by every exotic that does not
+    // override it (an Array does not), and returns the receiver. Without this
+    // the `ToPrimitive` probe on `[o] + ''` reached `array_method("valueOf")`
+    // and threw `valueOf is not a function`.
+    if name == "valueOf"
+        && matches!(
+            with_host(|h| h.kind_of(recv)),
+            Some(
+                ObjKind::Array
+                    | ObjKind::Map
+                    | ObjKind::Set
+                    | ObjKind::Generator
+                    | ObjKind::Promise
+                    | ObjKind::Iter
+                    | ObjKind::RegExp
+            )
+        )
+    {
+        return Ok(recv.clone());
+    }
     // Only the tag is needed to pick the branch — cloning the receiver here made
     // every `arr.push(x)` copy the whole array, so a fill loop was O(n^2).
     match with_host(|h| h.kind_of(recv)) {
@@ -4367,18 +4537,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             } else {
                 with_host(|h| h.str_of(&args[0]))
             };
-            let items = array_items(recv);
-            let s = with_host(|h| {
-                items
-                    .iter()
-                    .map(|x| match x {
-                        Value::Undef => String::new(),
-                        _ if h.is_null(x) => String::new(),
-                        _ => h.str_of(x),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(&sep)
-            });
+            let s = join_parts(&array_items(recv))?.join(&sep);
             Ok(with_host(|h| h.new_str(s)))
         }
         "indexOf" => {
@@ -4788,12 +4947,51 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             }))
         }
         "splice" => array_splice(recv, args),
+        // `Array.prototype.toString` IS `join()` with the default separator
+        // (23.1.3.36), so it converts each element with `ToString` too.
         "toString" => {
-            let s = with_host(|h| h.str_of(recv));
+            let s = join_parts(&array_items(recv))?.join(",");
             Ok(with_host(|h| h.new_str(s)))
         }
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
+}
+
+/// `Array.prototype.join`'s per-element conversion (23.1.3.18 step 4): a
+/// `null`/`undefined` element contributes the empty string, every other element
+/// is `ToString(element)` — which for an object means invoking its `toString`,
+/// so `[{ toString() { return 'x' } }].join()` is `"x"` and not
+/// `"[object Object]"`.
+///
+/// The all-primitive array — the overwhelmingly common one — is rendered under
+/// a single host borrow; only an array actually holding an object pays for the
+/// re-entrant per-element conversion.
+fn join_parts(items: &[Value]) -> Result<Vec<String>, String> {
+    let fast = with_host(|h| {
+        items
+            .iter()
+            .map(|x| match x {
+                Value::Undef => Some(String::new()),
+                _ if h.is_null(x) => Some(String::new()),
+                _ if host::is_primitive(h, x) => Some(h.str_of(x)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    if fast.iter().all(Option::is_some) {
+        return Ok(fast.into_iter().flatten().collect());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (x, p) in items.iter().zip(fast) {
+        match p {
+            Some(s) => out.push(s),
+            None => {
+                let s = host::to_string_value(x)?;
+                out.push(with_host(|h| h.str_of(&s)));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// In-place sort of `items` (shared by `sort` and `toSorted`). Uses insertion

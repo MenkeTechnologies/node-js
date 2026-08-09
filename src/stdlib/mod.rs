@@ -537,6 +537,7 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
         ],
         "IncomingMessage" => &["pause", "resume", "setEncoding", "destroy"],
         "Buffer" => buffer::INSTANCE_METHODS,
+        "Date" => date::INSTANCE_METHODS,
         "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" => &[
             "read",
             "write",

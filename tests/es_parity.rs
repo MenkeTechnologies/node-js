@@ -765,3 +765,194 @@ fn unhandled_rejection_is_fatal() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ── ToPrimitive (7.1.1): `valueOf` / `Symbol.toPrimitive` really run ─────────
+
+#[test]
+fn to_primitive_consults_value_of_and_symbol_to_primitive() {
+    // Arithmetic, relational, `==`, `ToPropertyKey` and `Array.prototype.join`
+    // all convert an object through ToPrimitive. node-js used to read the raw
+    // `str_of` instead, so a user `valueOf` was never invoked: `o + 1` was
+    // `"[object Object]1"` and `+o` was `NaN`. A `Date` overrides the DEFAULT
+    // hint to `"string"` (21.4.4.45), which is why `d + 1` concatenates while
+    // `d - 0` is arithmetic.
+    let src = r#"
+        const o = { valueOf() { return 7; }, toString() { return 'x'; } };
+        const s = { toString() { return 'S'; } };
+        const v = { valueOf() { return 3; } };
+        console.log([
+          o + 1, 1 + o, o * 2, o - 1, +o, Number(o), o | 0,
+          o == 7, o < 8, `${o}`, String(o), [o] + '', [o].join('-'),
+          s + 1, `${s}`, v + 1, `${v}`,
+        ].join('|'));
+        const k = {}; k[o] = 1; console.log(Object.keys(k).join(','));
+        const d = new Date(0);
+        console.log([typeof (d + 1), d - 0, +d, d * 1].join('|'));
+        const p = { [Symbol.toPrimitive](h) { return h === 'number' ? 42 : 'str:' + h; } };
+        console.log([+p, `${p}`, p + '', p * 2].join('|'));
+        try { Object.create(null) + 1; } catch (e) { console.log(e.constructor.name + ': ' + e.message); }
+        console.log(typeof Object.create(null).toString);
+    "#;
+    assert_eq!(
+        run(src),
+        "8|8|14|6|7|7|7|true|true|x|x|x|x|S1|S|4|[object Object]\n\
+         x\n\
+         string|0|0|0\n\
+         42|str:string|str:default|84\n\
+         TypeError: Cannot convert object to primitive value\n\
+         undefined"
+    );
+}
+
+// ── Symbol.toStringTag / well-known symbols / symbol-keyed properties ────────
+
+#[test]
+fn to_string_tag_and_symbol_keyed_properties() {
+    // `Symbol.toStringTag` overrides the builtin brand (20.1.3.6 steps 16-17),
+    // generator/async functions carry their own, and `Math`/`JSON`/`Reflect`
+    // brand by name rather than as callables. Symbol-keyed own properties are
+    // invisible to `Object.keys`/`JSON.stringify` but ARE copied by spread and
+    // `Object.assign` (7.3.25) and listed by `Reflect.ownKeys` (7.3.23).
+    let src = r#"
+        const T = (x) => Object.prototype.toString.call(x);
+        console.log([
+          T({ [Symbol.toStringTag]: 'Zed' }),
+          T(new (class { get [Symbol.toStringTag]() { return 'Cee'; } })()),
+          T(function* () {}), T((function* () {})()), T(async function () {}),
+          T(async function* () {}), T((async function* () {})()),
+          T(Math), T(JSON), T(Reflect),
+          T(new WeakRef({})), T(new FinalizationRegistry(() => {})),
+          T(new TextEncoder()), T(new TextDecoder()),
+          T(new URL('http://a/')), T(new URLSearchParams('a=1')),
+          T(new (require('events'))()), T(require('crypto').createHash('sha256')),
+          String(new Map()), String(new Set()),
+        ].join('\n'));
+        console.log(String(Symbol.iterator), String(Symbol.toStringTag), typeof Symbol.toPrimitive);
+        console.log(Symbol.for('Symbol.iterator') === Symbol.iterator);
+        const s = Symbol('k');
+        const src = { a: 1, [s]: 2, [Symbol.iterator]: 3 };
+        console.log(Object.keys(src).join(','), JSON.stringify(src));
+        console.log(Object.getOwnPropertySymbols(src).map(String).join(','));
+        console.log(Reflect.ownKeys(src).map(String).join(','));
+        console.log({ ...src }[s], Object.assign({}, src)[s]);
+        const hid = {}; Object.defineProperty(hid, s, { value: 1, enumerable: false });
+        console.log(Object.getOwnPropertySymbols(hid).length, { ...hid }[s]);
+    "#;
+    assert_eq!(
+        run(src),
+        "[object Zed]\n[object Cee]\n[object GeneratorFunction]\n[object Generator]\n\
+         [object AsyncFunction]\n[object AsyncGeneratorFunction]\n[object AsyncGenerator]\n\
+         [object Math]\n[object JSON]\n[object Reflect]\n\
+         [object WeakRef]\n[object FinalizationRegistry]\n\
+         [object TextEncoder]\n[object TextDecoder]\n\
+         [object URL]\n[object URLSearchParams]\n\
+         [object Object]\n[object Object]\n\
+         [object Map]\n[object Set]\n\
+         Symbol(Symbol.iterator) Symbol(Symbol.toStringTag) symbol\n\
+         false\n\
+         a {\"a\":1}\n\
+         Symbol(k),Symbol(Symbol.iterator)\n\
+         a,Symbol(k),Symbol(Symbol.iterator)\n\
+         2 2\n\
+         1 undefined"
+    );
+}
+
+// ── util.inspect: symbol keys, the `[Tag]` prefix, and quote selection ───────
+
+#[test]
+fn inspect_renders_symbol_keys_tags_and_picks_its_quote() {
+    // A symbol-keyed own enumerable property prints as `Symbol(desc): value`;
+    // an INHERITED `Symbol.toStringTag` prints as a `Ctor [Tag] ` prefix (an
+    // own enumerable one does not, since it is already listed as a property).
+    // The constructor prefix now also covers `function F(){}` instances, and
+    // `strEscape` picks `'`, `"` or a backtick so the contents need the least
+    // escaping.
+    let src = r#"
+        const u = require('util');
+        const s = Symbol('k');
+        const base = { [Symbol.toStringTag]: 'Base' };
+        function F() { this.y = 2; }
+        class C { constructor() { this.x = 1; } }
+        const o = Object.create(base); o.z = 3;
+        console.log([
+          u.inspect({ [s]: 1 }),
+          u.inspect({ a: 1, [s]: 2 }),
+          u.inspect({ [Symbol.toStringTag]: 'Zed', a: 1 }),
+          u.inspect(o),
+          u.inspect(Object.create(base)),
+          u.inspect(new F()),
+          u.inspect(new C()),
+          u.inspect(Object.create({})),
+        ].join('\n'));
+        console.log([
+          u.inspect("plain"), u.inspect("has'single"), u.inspect('has"double'),
+          u.inspect("has'both\"kinds"), u.inspect("a'b\"c`d"),
+          u.inspect("tab\there"), u.inspect("\u0000nul"), u.inspect("\u000Bvt"),
+          u.inspect({ a: "it's" }),
+        ].join('\n'));
+    "#;
+    assert_eq!(
+        run(src),
+        "{ Symbol(k): 1 }\n\
+         { a: 1, Symbol(k): 2 }\n\
+         { a: 1, Symbol(Symbol.toStringTag): 'Zed' }\n\
+         Object [Base] { z: 3 }\n\
+         Object [Base] {}\n\
+         F { y: 2 }\n\
+         C { x: 1 }\n\
+         {}\n\
+         'plain'\n\
+         \"has'single\"\n\
+         'has\"double'\n\
+         `has'both\"kinds`\n\
+         'a\\'b\"c`d'\n\
+         'tab\\there'\n\
+         '\\x00nul'\n\
+         '\\x0Bvt'\n\
+         { a: \"it's\" }"
+    );
+}
+
+// ── Date instance methods are reachable past `Object.prototype` ─────────────
+
+#[test]
+fn date_value_of_returns_the_time_value() {
+    // `valueOf`/`toString` exist on `Object.prototype` too, and node-js routed a
+    // Date to that generic implementation — `d.valueOf()` returned the Date
+    // itself, so `+d` and `d - 0` were NaN.
+    let src = r#"
+        const d = new Date(86400000);
+        console.log([
+          d.valueOf(), d.getTime(), typeof d.toString(), d.toISOString(),
+          JSON.stringify({ d }), new Date(0) - new Date(-1000),
+        ].join('|'));
+    "#;
+    assert_eq!(
+        run(src),
+        "86400000|86400000|string|1970-01-02T00:00:00.000Z|{\"d\":\"1970-01-02T00:00:00.000Z\"}|1000"
+    );
+}
+
+// ── `arguments` is lexical inside an arrow ──────────────────────────────────
+
+#[test]
+fn an_arrow_sees_the_enclosing_functions_arguments() {
+    // 10.2.11 creates the `arguments` binding only for a non-arrow function.
+    // node-js bound a fresh empty one in EVERY call frame, so an arrow saw zero
+    // arguments. A nested non-arrow still gets its own.
+    let src = r#"
+        function f() {
+          const spread = () => [...arguments].join('-');
+          const len = () => arguments.length;
+          const forOf = () => { const o = []; for (const x of arguments) o.push(x); return o.join('-'); };
+          const nestedArrow = () => (() => arguments.length)();
+          const ownFn = function () { return arguments.length; };
+          return [spread(), len(), forOf(), nestedArrow(), ownFn(9, 9)].join('|');
+        }
+        console.log(f(1, 2, 3));
+        function g() { return Array.prototype.slice.call(arguments).join('-') + '/' + arguments.length; }
+        console.log(g('a', 'b'));
+    "#;
+    assert_eq!(run(src), "1-2-3|3|1-2-3|3|2\na-b/2");
+}

@@ -15,6 +15,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const STATIC_METHODS: &[&str] = &["now", "parse", "UTC"];
 
+/// Every method `instance_call` below answers. `valueOf` and `toString` are on
+/// this list because `Object.prototype` has methods by those names too: without
+/// the entry, `host::call_method` hands a Date to `object_builtin_method` and
+/// `date.valueOf()` returns the Date itself instead of its time value (so `+d`
+/// and `d - 0` were `NaN`).
+pub const INSTANCE_METHODS: &[&str] = &[
+    "getTime",
+    "valueOf",
+    "toISOString",
+    "toJSON",
+    "toUTCString",
+    "toGMTString",
+    "toString",
+    "toDateString",
+    "getFullYear",
+    "getUTCFullYear",
+    "getMonth",
+    "getUTCMonth",
+    "getDate",
+    "getUTCDate",
+    "getDay",
+    "getUTCDay",
+    "getHours",
+    "getUTCHours",
+    "getMinutes",
+    "getUTCMinutes",
+    "getSeconds",
+    "getUTCSeconds",
+    "getMilliseconds",
+    "getUTCMilliseconds",
+    "getTimezoneOffset",
+    "setTime",
+];
+
 const MS_PER_DAY: f64 = 86_400_000.0;
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = [
