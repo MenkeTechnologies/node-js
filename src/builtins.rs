@@ -602,14 +602,16 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 Value::Undef
             }
         }),
-        Some(JsObj::Map { entries, .. }) => match name {
-            "size" => Value::Float(entries.len() as f64),
+        // A WeakMap/WeakSet has NO `size` (its contents are not observable), so
+        // the read must be `undefined` rather than a live count.
+        Some(JsObj::Map { entries, weak }) => match name {
+            "size" if !weak => Value::Float(entries.len() as f64),
             "@@iterator" => bound_method(recv, name),
             _ if is_map_method(name) => bound_method(recv, name),
             _ => Value::Undef,
         },
-        Some(JsObj::Set { entries, .. }) => match name {
-            "size" => Value::Float(entries.len() as f64),
+        Some(JsObj::Set { entries, weak }) => match name {
+            "size" if !weak => Value::Float(entries.len() as f64),
             "@@iterator" => bound_method(recv, name),
             _ if is_set_method(name) => bound_method(recv, name),
             _ => Value::Undef,
@@ -3234,33 +3236,14 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
     // non-enumerable ones, plus the exotic `length` an array carries.
     let entries: Vec<(String, Value)> = with_host(|h| {
         if mode == 3 {
-            let mut names: Vec<(String, Value)> = match h.get(&v) {
-                Some(JsObj::Object(props))
-                    if props.get("@@native").map(|t| h.str_of(t)).as_deref() != Some("Buffer") =>
-                {
-                    props
-                        .iter()
-                        .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
-                        .map(|(k, val)| (k.clone(), val.clone()))
-                        .collect()
-                }
-                Some(JsObj::Array(items)) => {
-                    let n = items.len();
-                    let mut v: Vec<(String, Value)> = items
-                        .iter()
-                        .enumerate()
-                        .map(|(i, val)| (i.to_string(), val.clone()))
-                        .collect();
-                    v.push(("length".into(), Value::Float(n as f64)));
-                    v
-                }
-                _ => h.own_enum_entries(&v),
-            };
-            // Accessor-only properties own no slot in the map but are own keys.
-            for k in h.own_accessor_keys(&v) {
-                if !names.iter().any(|(n, _)| *n == k) {
-                    names.push((k, Value::Undef));
-                }
+            let mut names: Vec<(String, Value)> = h
+                .own_key_names(&v, false)
+                .into_iter()
+                .map(|k| (k, Value::Undef))
+                .collect();
+            // An array's `length` is an own (non-enumerable) property.
+            if matches!(h.get(&v), Some(JsObj::Array(_))) {
+                names.push(("length".into(), Value::Undef));
             }
             return names;
         }
@@ -3465,12 +3448,40 @@ fn apply_to_json(v: &Value, path: &mut Vec<Value>) -> Result<Value, String> {
     let out = (|| match obj {
         Some(JsObj::Array(items)) => {
             let mut out = Vec::with_capacity(items.len());
+            let mut changed = false;
             for it in &items {
-                out.push(apply_to_json(it, path)?);
+                let nv = apply_to_json(it, path)?;
+                changed |= !with_host(|h| h.strict_eq(&nv, it));
+                out.push(nv);
             }
-            Ok(with_host(|h| h.new_array(out)))
+            // Keep identity when nothing changed, so an enclosing object is not
+            // needlessly rebuilt (which would drop its property attributes).
+            if changed {
+                Ok(with_host(|h| h.new_array(out)))
+            } else {
+                Ok(v.clone())
+            }
         }
         Some(JsObj::Object(props)) => {
+            // An enumerable own accessor must have its getter RUN and the result
+            // serialized. That cannot happen inside `json_str` (which holds the
+            // host borrow), so materialize here — the same reason `toJSON` is
+            // applied in this pass.
+            let has_accessor = with_host(|h| {
+                h.own_accessor_keys(v)
+                    .iter()
+                    .any(|k| h.prop_attrs(v, k).enumerable)
+            });
+            if has_accessor {
+                let mut next: IndexMap<String, Value> = IndexMap::new();
+                for (k, val) in host::own_enum_entries_deep(v) {
+                    next.insert(k, apply_to_json(&val, path)?);
+                }
+                return {
+                    path.pop();
+                    Ok(with_host(|h| h.new_object(next)))
+                };
+            }
             // Only rebuild when a descendant actually changed, so plain data keeps
             // its identity (and its prototype / native tag).
             let mut next: IndexMap<String, Value> = IndexMap::new();
@@ -3481,7 +3492,11 @@ fn apply_to_json(v: &Value, path: &mut Vec<Value>) -> Result<Value, String> {
                 next.insert(k.clone(), nv);
             }
             if changed {
-                Ok(with_host(|h| h.new_object(next)))
+                Ok(with_host(|h| {
+                    let o = h.new_object(next);
+                    h.copy_prop_attrs(v, &o);
+                    o
+                }))
             } else {
                 Ok(v.clone())
             }
@@ -5352,6 +5367,7 @@ fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
         "set" => {
             let kv = arg0(&args);
             let vv = args.get(1).cloned().unwrap_or(Value::Undef);
+            reject_non_object_weak_key(recv, &kv, "WeakMap")?;
             let key = with_host(|h| host::map_key(h, &kv));
             with_host(|h| {
                 if let Some(JsObj::Map { entries, .. }) = h.get_mut(recv) {
@@ -5413,10 +5429,37 @@ fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
     }
 }
 
+/// A weak collection can only hold objects (and unregistered symbols) — a
+/// primitive key is a `TypeError`, which is how packages probe for weak support.
+fn reject_non_object_weak_key(recv: &Value, key: &Value, kind: &str) -> Result<(), String> {
+    let weak = with_host(|h| {
+        matches!(
+            h.get(recv),
+            Some(JsObj::Map { weak: true, .. }) | Some(JsObj::Set { weak: true, .. })
+        )
+    });
+    if !weak {
+        return Ok(());
+    }
+    let is_object = with_host(|h| match key {
+        Value::Obj(_) => !h.is_null(key) && h.as_str(key).is_none() && h.as_bigint(key).is_none(),
+        _ => false,
+    });
+    if is_object {
+        return Ok(());
+    }
+    Err(host::type_error(if kind == "WeakMap" {
+        "Invalid value used as weak map key"
+    } else {
+        "Invalid value used in weak set"
+    }))
+}
+
 fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "add" => {
             let vv = arg0(&args);
+            reject_non_object_weak_key(recv, &vv, "WeakSet")?;
             let key = with_host(|h| host::map_key(h, &vv));
             with_host(|h| {
                 if let Some(JsObj::Set { entries, .. }) = h.get_mut(recv) {
@@ -5787,19 +5830,92 @@ pub fn has_property(obj: &Value, key: &str) -> bool {
 }
 
 /// `structuredClone` — a deep copy of plain data (objects/arrays/primitives).
+/// `structuredClone` — the HTML structured-clone algorithm's shape: a deep copy
+/// that preserves the *reference graph*. Two properties pointing at the same
+/// object clone to two properties pointing at the same clone, and a cycle clones
+/// to a cycle instead of recursing forever. `seen` maps each source heap index
+/// to its clone, which is what buys both.
 fn deep_clone(v: &Value) -> Value {
+    deep_clone_seen(v, &mut std::collections::HashMap::new())
+}
+
+fn deep_clone_seen(v: &Value, seen: &mut std::collections::HashMap<u32, Value>) -> Value {
+    let idx = match v {
+        Value::Obj(i) => *i,
+        _ => return v.clone(),
+    };
+    if let Some(done) = seen.get(&idx) {
+        return done.clone();
+    }
     match with_host(|h| h.get(v).cloned()) {
         Some(JsObj::Array(items)) => {
-            let cloned: Vec<Value> = items.iter().map(deep_clone).collect();
-            with_host(|h| h.new_array(cloned))
+            // Register the (empty) clone BEFORE recursing so a self-reference
+            // resolves to it.
+            let out = with_host(|h| h.new_array(Vec::new()));
+            seen.insert(idx, out.clone());
+            let cloned: Vec<Value> = items.iter().map(|x| deep_clone_seen(x, seen)).collect();
+            with_host(|h| {
+                if let Some(JsObj::Array(a)) = h.get_mut(&out) {
+                    *a = cloned;
+                }
+            });
+            out
         }
         Some(JsObj::Object(props)) => {
+            let out = with_host(|h| h.new_object(IndexMap::new()));
+            seen.insert(idx, out.clone());
             let cloned: IndexMap<String, Value> = props
                 .iter()
-                .map(|(k, val)| (k.clone(), deep_clone(val)))
+                .map(|(k, val)| (k.clone(), deep_clone_seen(val, seen)))
                 .collect();
-            with_host(|h| h.new_object(cloned))
+            with_host(|h| {
+                if let Some(JsObj::Object(p)) = h.get_mut(&out) {
+                    *p = cloned;
+                }
+                // A native exotic (Buffer, typed array, …) keeps its prototype so
+                // the clone passes the same brand checks as the source.
+                if let Some(p) = h.proto_of(v) {
+                    h.set_proto(&out, p);
+                }
+                h.copy_prop_attrs(v, &out);
+            });
+            out
         }
+        // Map/Set are structured types: clone the entries, keep the kind.
+        Some(JsObj::Map { entries, weak }) => {
+            let out = with_host(|h| {
+                h.alloc(JsObj::Map {
+                    entries: IndexMap::new(),
+                    weak,
+                })
+            });
+            seen.insert(idx, out.clone());
+            let pairs: Vec<(Value, Value)> = entries.values().cloned().collect();
+            for (k, val) in pairs {
+                let ck = deep_clone_seen(&k, seen);
+                let cv = deep_clone_seen(&val, seen);
+                let _ = map_method(&out, "set", vec![ck, cv]);
+            }
+            out
+        }
+        Some(JsObj::Set { entries, weak }) => {
+            let out = with_host(|h| {
+                h.alloc(JsObj::Set {
+                    entries: IndexMap::new(),
+                    weak,
+                })
+            });
+            seen.insert(idx, out.clone());
+            let vals: Vec<Value> = entries.values().cloned().collect();
+            for x in vals {
+                let cx = deep_clone_seen(&x, seen);
+                let _ = set_method(&out, "add", vec![cx]);
+            }
+            out
+        }
+        // Strings/BigInts/RegExps/dates are immutable-enough to share, and a
+        // function is not cloneable at all (Node throws DataCloneError; node-js
+        // passes it through rather than inventing that error class).
         _ => v.clone(),
     }
 }

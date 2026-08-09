@@ -369,6 +369,10 @@ pub type Env = Rc<RefCell<EnvData>>;
 /// An accessor property: `(getter, setter)`, either optional.
 pub type Accessor = (Option<Value>, Option<Value>);
 
+/// Prefix of the hidden property-map entry that reserves an accessor's slot in
+/// own-key insertion order (see `set_accessor`).
+pub const ORD_MARKER: &str = "@@ord:";
+
 /// The three ECMAScript own-property attributes. `PropAttrs::default()` is the
 /// all-true shape a plain `o.k = v` assignment produces, which is why only
 /// deviations need storing.
@@ -824,6 +828,17 @@ impl JsHost {
         set: Option<Value>,
     ) {
         if let Value::Obj(i) = owner {
+            // Accessors live in their own table, but JS reports own keys in a
+            // single insertion order across data AND accessor properties. Drop an
+            // ordering marker into the property map so
+            // `{ a: 1, get b() {}, c: 3 }` enumerates a, b, c — not a, c, b.
+            // The marker is `@@`-prefixed, so it is invisible to every reader.
+            let marker = format!("{ORD_MARKER}{key}");
+            if let Some(JsObj::Object(props)) = self.get_mut(owner) {
+                if !props.contains_key(key) && !props.contains_key(&marker) {
+                    props.insert(marker, Value::Undef);
+                }
+            }
             let slot = self
                 .accessors
                 .entry(*i)
@@ -874,6 +889,19 @@ impl JsHost {
                     .entry(*i)
                     .or_default()
                     .insert(key.to_string(), attrs);
+            }
+        }
+    }
+
+    /// Copy every recorded property attribute from `from` to `to`. A pass that
+    /// rebuilds an object (`JSON.stringify`'s `toJSON` walk) must carry them
+    /// across or the copy silently re-exposes non-enumerable slots.
+    pub fn copy_prop_attrs(&mut self, from: &Value, to: &Value) {
+        if let (Value::Obj(f), Value::Obj(_)) = (from, to) {
+            if let Some(m) = self.prop_attrs.get(f).cloned() {
+                for (k, a) in m {
+                    self.set_prop_attrs(to, &k, a);
+                }
             }
         }
     }
@@ -2691,20 +2719,27 @@ impl JsHost {
     /// (`@@…`), private fields (`#…`) and anything marked non-enumerable via
     /// `prop_attrs` are excluded.
     pub fn own_enum_key_names(&self, v: &Value) -> Vec<String> {
-        let mut keys = self.own_enum_data_keys(v);
-        // An own accessor installed with `enumerable: true` enumerates too. Class
-        // `get x()`/`set x()` are marked non-enumerable at install, matching V8.
+        self.own_key_names(v, true)
+    }
+
+    /// Own string keys of `v` in insertion order. `enum_only` drops the
+    /// non-enumerable ones (`Object.keys`); otherwise every own key is reported
+    /// (`getOwnPropertyNames`/`Reflect.ownKeys`).
+    pub fn own_key_names(&self, v: &Value, enum_only: bool) -> Vec<String> {
+        let mut keys = self.own_enum_data_keys(v, enum_only);
+        // An accessor defined before its object had any ordering marker (a class
+        // prototype accessor, say) still has to appear.
         for k in self.own_accessor_keys(v) {
-            if self.prop_attrs(v, &k).enumerable && !keys.contains(&k) {
+            if (!enum_only || self.prop_attrs(v, &k).enumerable) && !keys.contains(&k) {
                 keys.push(k);
             }
         }
         keys
     }
 
-    /// `own_enum_key_names` minus accessor properties: the enumerable keys that
-    /// own a slot in the object's property map.
-    fn own_enum_data_keys(&self, v: &Value) -> Vec<String> {
+    /// The keys that own a slot in the object's property map, in insertion
+    /// order, resolving accessor ordering markers back to their real key.
+    fn own_enum_data_keys(&self, v: &Value, enum_only: bool) -> Vec<String> {
         match self.get(v) {
             // A `Buffer` is an index-keyed exotic: its own enumerable keys are
             // `"0".."len-1"` (the bytes live in the hidden `@@bytes` slot), never
@@ -2721,8 +2756,12 @@ impl JsHost {
             }
             Some(JsObj::Object(props)) => props
                 .keys()
-                .filter(|k| self.is_enumerable(v, k))
-                .cloned()
+                .filter_map(|k| match k.strip_prefix(ORD_MARKER) {
+                    Some(real) => Some(real.to_string()),
+                    None if !k.starts_with("@@") && !k.starts_with('#') => Some(k.clone()),
+                    None => None,
+                })
+                .filter(|k| !enum_only || self.prop_attrs(v, k).enumerable)
                 .collect(),
             Some(JsObj::Array(items)) => (0..items.len()).map(|i| i.to_string()).collect(),
             // A builtin namespace (`require('buffer')`, `Buffer`) enumerates the
@@ -3432,6 +3471,8 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
             "Set" => return Ok(matches!(kind, Some(JsObj::Set { weak: false, .. }))),
             "WeakSet" => return Ok(matches!(kind, Some(JsObj::Set { weak: true, .. }))),
             "Promise" => return Ok(matches!(kind, Some(JsObj::Promise { .. }))),
+            // A RegExp is its own heap variant too, not a prototype-linked object.
+            "RegExp" => return Ok(matches!(kind, Some(JsObj::RegExp(_)))),
             "Object" => {
                 // Everything object-typed except a null-prototype object is an
                 // Object instance.
@@ -3445,6 +3486,7 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
                         | Some(JsObj::Set { .. })
                         | Some(JsObj::Promise { .. })
                         | Some(JsObj::Generator { .. })
+                        | Some(JsObj::RegExp(_))
                 );
                 if is_obj {
                     // A null-prototype object (Object.create(null) or
