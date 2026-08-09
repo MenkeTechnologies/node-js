@@ -156,6 +156,10 @@ pub struct FuncDef {
     /// True for an `async` function/method/arrow: calling it drives a coroutine
     /// and returns a Promise; `await` inside suspends via the same yielder.
     pub is_async: bool,
+    /// True for a MethodDefinition (`{ m(){} }`, a class method/accessor). A
+    /// non-generator method is not a constructor, so it owns no `prototype`.
+    #[serde(default)]
+    pub is_method: bool,
     /// True for a NAMED function *expression* (`const f = function fact(n) {…}`):
     /// the closure gets an extra environment binding its own name to itself, so
     /// the body can recurse through that name even when the outer binding differs.
@@ -937,6 +941,21 @@ impl JsHost {
         String::new()
     }
 
+    /// Whether a callable owns a `prototype` property. `MakeConstructor`
+    /// (10.2.5) runs for an ordinary function definition and for every
+    /// generator; an arrow, a `MethodDefinition`, an async function and a bound
+    /// function are not constructors and own none.
+    pub fn owns_prototype(&self, v: &Value) -> bool {
+        match self.get(v) {
+            Some(JsObj::Class(_)) => true,
+            Some(JsObj::Func(f)) => match self.funcs.get(f.def_id) {
+                Some(d) => d.is_generator || !(d.is_arrow || d.is_async || d.is_method),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     /// A function's own-property table (created on demand).
     pub fn fn_prop(&self, v: &Value, name: &str) -> Option<Value> {
         if let Value::Obj(i) = v {
@@ -967,6 +986,28 @@ impl JsHost {
                 .or_default()
                 .insert(name.to_string(), val);
         }
+        // `name` and `prototype` are own properties of every function/class, but
+        // never enumerable ones (SetFunctionName 10.2.9, MakeConstructor
+        // 10.2.5), so `Object.keys(fn)` and `for (k in fn)` report only what a
+        // script assigned. An ARRAY receiver reaching the same side table has no
+        // such exotic keys — `arr.name = 'x'` is an ordinary enumerable property.
+        if !matches!(self.kind_of(v), Some(ObjKind::Func) | Some(ObjKind::Class)) {
+            return;
+        }
+        let attrs = match name {
+            "name" => PropAttrs {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+            "prototype" => PropAttrs {
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+            _ => return,
+        };
+        self.set_prop_attrs(v, name, attrs);
     }
     /// A user-assigned static on a builtin namespace (`Error.prepareStackTrace`).
     pub fn builtin_static(&self, ns: &str, name: &str) -> Option<Value> {
@@ -981,6 +1022,18 @@ impl JsHost {
             .entry(ns.to_string())
             .or_default()
             .insert(name.to_string(), val);
+    }
+    /// Drop an own property from the side table (`delete arr.foo`,
+    /// `delete fn.tag`). Reports whether the key was there.
+    pub fn remove_fn_prop(&mut self, v: &Value, name: &str) -> bool {
+        match v {
+            Value::Obj(i) => self
+                .fn_props
+                .get_mut(i)
+                .map(|m| m.shift_remove(name).is_some())
+                .unwrap_or(false),
+            _ => false,
+        }
     }
     pub fn fn_prop_keys(&self, v: &Value) -> Vec<String> {
         if let Value::Obj(i) = v {
@@ -1082,6 +1135,15 @@ impl JsHost {
 
     /// The attributes of own property `owner[key]` (all-true when unrecorded).
     pub fn prop_attrs(&self, owner: &Value, key: &str) -> PropAttrs {
+        // An array's `length` is the array exotic's own property (10.4.2):
+        // writable, but never enumerated and never configurable.
+        if key == "length" && matches!(self.get(owner), Some(JsObj::Array(_))) {
+            return PropAttrs {
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            };
+        }
         match owner {
             Value::Obj(i) => self
                 .prop_attrs
@@ -1200,7 +1262,11 @@ impl JsHost {
     pub fn own_symbol_keys(&self, v: &Value) -> Vec<Value> {
         let keys: Vec<String> = match self.get(v) {
             Some(JsObj::Object(p)) => p.keys().cloned().collect(),
-            _ => return Vec::new(),
+            // An Array/Function receiver has no property map: its non-index own
+            // properties — symbol-keyed ones included — live in the fn-prop side
+            // table, and are just as much own properties as an object's.
+            Some(_) => self.fn_prop_keys(v),
+            None => return Vec::new(),
         };
         keys.iter().filter_map(|k| self.symbol_of_key(k)).collect()
     }
@@ -1216,7 +1282,17 @@ impl JsHost {
                 .filter(|(k, _)| is_symbol_key(k) && self.prop_attrs(v, k).enumerable)
                 .map(|(k, val)| (k.clone(), val.clone()))
                 .collect(),
-            _ => Vec::new(),
+            // Array/Function: the side table (see `own_symbol_keys`).
+            Some(_) => self
+                .fn_prop_keys(v)
+                .into_iter()
+                .filter(|k| is_symbol_key(k) && self.prop_attrs(v, k).enumerable)
+                .map(|k| {
+                    let val = self.fn_prop(v, &k).unwrap_or(Value::Undef);
+                    (k, val)
+                })
+                .collect(),
+            None => Vec::new(),
         }
     }
     /// The shared `Symbol.for(key)` value (interned by description).
@@ -2095,9 +2171,17 @@ impl JsHost {
                     let prop_keys: Vec<String> = self
                         .fn_prop_keys(v)
                         .into_iter()
-                        .filter(|k| !k.starts_with("@@") && !k.starts_with('#'))
+                        .filter(|k| {
+                            !k.starts_with("@@")
+                                && !k.starts_with('#')
+                                && self.prop_attrs(v, k).enumerable
+                        })
                         .collect();
-                    if items.is_empty() && prop_keys.is_empty() {
+                    // An own enumerable SYMBOL-keyed property renders after the
+                    // string keys as `Symbol(desc): value`, as it does on an
+                    // object receiver.
+                    let sym_entries = self.own_symbol_entries(v);
+                    if items.is_empty() && prop_keys.is_empty() && sym_entries.is_empty() {
                         return "[]".into();
                     }
                     // Node's default inspect depth is 2 (root = depth 0); deeper
@@ -2109,7 +2193,7 @@ impl JsHost {
                         .iter()
                         .map(|x| self.inspect_lvl(x, indent + 2))
                         .collect();
-                    let has_props = !prop_keys.is_empty();
+                    let has_props = !prop_keys.is_empty() || !sym_entries.is_empty();
                     for k in &prop_keys {
                         let val = self.fn_prop(v, k).unwrap_or(Value::Undef);
                         inner.push(format!(
@@ -2117,6 +2201,13 @@ impl JsHost {
                             fmt_key(k),
                             self.inspect_lvl(&val, indent + 2)
                         ));
+                    }
+                    for (k, val) in &sym_entries {
+                        let label = match self.symbol_of_key(k) {
+                            Some(s) => self.inspect(&s),
+                            None => continue,
+                        };
+                        inner.push(format!("{label}: {}", self.inspect_lvl(val, indent + 2)));
                     }
                     self.render_array(&inner, items, indent, has_props)
                 }
@@ -2238,7 +2329,7 @@ impl JsHost {
                     None => "Symbol()".into(),
                 },
                 Some(JsObj::Class(c)) => {
-                    if c.parent.is_some() {
+                    let base = if c.parent.is_some() {
                         let pname = c
                             .parent
                             .as_ref()
@@ -2247,7 +2338,8 @@ impl JsHost {
                         format!("[class {} extends {}]", c.name, pname)
                     } else {
                         format!("[class {}]", c.name)
-                    }
+                    };
+                    self.with_callable_props(v, base, indent)
                 }
                 Some(JsObj::Map { entries, .. }) => {
                     if entries.is_empty() {
@@ -2279,17 +2371,18 @@ impl JsHost {
                     },
                     None => "Promise { <pending> }".into(),
                 },
-                Some(JsObj::Func(f)) => {
-                    let name = self
-                        .funcs
-                        .get(f.def_id)
-                        .map(|d| d.name.clone())
-                        .unwrap_or_default();
-                    if name.is_empty() {
-                        "[Function (anonymous)]".into()
+                Some(JsObj::Func(_)) => {
+                    // `callable_name`, not the FuncDef name: an anonymous
+                    // function expression gets its name by inference from the
+                    // binding it initialises (`const f = function(){}`), and
+                    // that lands as an own `name` property.
+                    let name = self.callable_name(v);
+                    let base = if name.is_empty() {
+                        "[Function (anonymous)]".to_string()
                     } else {
                         format!("[Function: {name}]")
-                    }
+                    };
+                    self.with_callable_props(v, base, indent)
                 }
                 Some(JsObj::Builtin(n)) => {
                     let short = n.rsplit('.').next().unwrap_or(n);
@@ -2308,6 +2401,33 @@ impl JsHost {
             },
             _ => "undefined".into(),
         }
+    }
+
+    /// Append a callable's own enumerable properties to its `[Function: f]` /
+    /// `[class C]` base, the way `util.inspect` does: `[Function: f] { a: 1 }`.
+    /// A callable with none renders as the bare base.
+    fn with_callable_props(&self, v: &Value, base: String, indent: usize) -> String {
+        let mut inner: Vec<String> = self
+            .own_enum_key_names(v)
+            .into_iter()
+            .map(|k| {
+                let val = self.fn_prop(v, &k).unwrap_or(Value::Undef);
+                format!("{}: {}", fmt_key(&k), self.inspect_lvl(&val, indent + 2))
+            })
+            .collect();
+        for (k, val) in self.own_symbol_entries(v) {
+            if let Some(sym) = self.symbol_of_key(&k) {
+                inner.push(format!(
+                    "{}: {}",
+                    self.inspect(&sym),
+                    self.inspect_lvl(&val, indent + 2)
+                ));
+            }
+        }
+        if inner.is_empty() {
+            return base;
+        }
+        self.render_object(&inner, &format!("{base} "), indent)
     }
 
     /// Render a non-empty array's already-formatted element strings, applying
@@ -3080,7 +3200,11 @@ impl JsHost {
                 } else {
                     "@@elems"
                 };
-                match props.get(field).cloned().and_then(|b| self.get(&b).cloned()) {
+                match props
+                    .get(field)
+                    .cloned()
+                    .and_then(|b| self.get(&b).cloned())
+                {
                     Some(JsObj::Array(items)) => Ok(items),
                     _ => Ok(Vec::new()),
                 }
@@ -3166,7 +3290,51 @@ impl JsHost {
                 })
                 .filter(|k| !enum_only || self.prop_attrs(v, k).enumerable)
                 .collect(),
-            Some(JsObj::Array(items)) => (0..items.len()).map(|i| i.to_string()).collect(),
+            // `OrdinaryOwnPropertyKeys` on an array exotic: the integer indices
+            // ascending, then the exotic non-enumerable `length`, then the
+            // ordinary string keys in insertion order. Those ordinary keys have
+            // no property map to live in — a `str.match()` result's
+            // `index`/`input`/`groups` and any user-assigned `arr.foo` are kept
+            // in the fn-prop side table — so they are read back from there.
+            Some(JsObj::Array(items)) => {
+                let mut keys: Vec<String> = (0..items.len()).map(|i| i.to_string()).collect();
+                if !enum_only {
+                    keys.push("length".into());
+                }
+                keys.extend(self.fn_prop_keys(v).into_iter().filter(|k| {
+                    !k.starts_with("@@")
+                        && !k.starts_with('#')
+                        && (!enum_only || self.prop_attrs(v, k).enumerable)
+                }));
+                keys
+            }
+            // A function/class keeps every own property in the side table. Its
+            // exotic `name`/`length`/`prototype` and its class methods are all
+            // non-enumerable, so under `enum_only` what is left is exactly what
+            // a script assigned; `getOwnPropertyNames` reports the exotics too,
+            // in V8's order (`length`, `name`, `prototype`, then the rest).
+            Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => {
+                let mut keys: Vec<String> = Vec::new();
+                if !enum_only {
+                    keys.push("length".into());
+                    keys.push("name".into());
+                    if self.owns_prototype(v) {
+                        keys.push("prototype".into());
+                    }
+                }
+                let rest: Vec<String> = self
+                    .fn_prop_keys(v)
+                    .into_iter()
+                    .filter(|k| {
+                        !k.starts_with("@@")
+                            && !k.starts_with('#')
+                            && !keys.contains(k)
+                            && (!enum_only || self.prop_attrs(v, k).enumerable)
+                    })
+                    .collect();
+                keys.extend(rest);
+                keys
+            }
             // A builtin namespace (`require('buffer')`, `Buffer`) enumerates the
             // members node-js implements, so a package that copies a namespace
             // key-by-key gets the working set instead of an empty object.
@@ -3199,11 +3367,17 @@ impl JsHost {
                                 _ => Value::Undef,
                             }
                         }),
+                        // An index reads the element; any other own key (`foo`,
+                        // a match result's `index`) lives in the side table.
                         Some(JsObj::Array(items)) => k
                             .parse::<usize>()
                             .ok()
                             .and_then(|i| items.get(i).cloned())
+                            .or_else(|| self.fn_prop(v, &k))
                             .unwrap_or(Value::Undef),
+                        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => {
+                            self.fn_prop(v, &k).unwrap_or(Value::Undef)
+                        }
                         _ => Value::Undef,
                     };
                 (k, val)

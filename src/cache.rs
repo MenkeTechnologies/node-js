@@ -26,7 +26,11 @@ use std::path::PathBuf;
 /// v2: BigInt/RegExp/tagged-template/for-await lowering — new builtin ops
 ///     (MKBIGINT/MKREGEX/NUM_STEP/TAG_TMPL/…) and the type-preserving `++`/`--`
 ///     codegen; old cached bytecode would run the stale POS-based increment.
-const SCHEMA: u64 = 5;
+/// v6: `FuncDef.is_method` (a method owns no `prototype`) and the class-body
+///     emission order (methods before static fields). A v5 blob deserializes
+///     with `is_method: false` and replays the old source order, so every class
+///     and every object method would report the wrong own-property set.
+const SCHEMA: u64 = 6;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

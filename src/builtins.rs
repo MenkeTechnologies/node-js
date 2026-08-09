@@ -168,7 +168,22 @@ fn b_tag_tmpl(vm: &mut VM, argc: u8) -> Value {
     // mutates it).
     let strings = with_host(|h| h.new_array(cooked));
     let raw_arr = with_host(|h| h.new_array(raw));
-    with_host(|h| h.set_fn_prop(&strings, "raw", raw_arr));
+    // `GetTemplateObject` (13.2.8.4) defines `raw` as an own property that is
+    // neither writable, enumerable, nor configurable, then integrity-seals the
+    // template object. So `raw` stays out of `Object.keys(strings)` while
+    // `getOwnPropertyNames` still reports it.
+    with_host(|h| {
+        h.set_fn_prop(&strings, "raw", raw_arr);
+        h.set_prop_attrs(
+            &strings,
+            "raw",
+            host::PropAttrs {
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+    });
     let mut call_args = vec![strings];
     call_args.extend(values);
     let r = host::invoke(&tag, call_args, None);
@@ -1056,12 +1071,12 @@ fn ensure_fn_prototype(recv: &Value) -> Value {
     if let Some(p) = with_host(|h| h.fn_prop(recv, "prototype")) {
         return p;
     }
-    // Arrows / classes: no auto prototype (classes set their own).
-    let is_arrow = with_host(|h| matches!(h.get(recv), Some(JsObj::Func(f)) if f.is_arrow));
-    if is_arrow {
+    // Only a constructor gets one: an arrow, a method definition and an async
+    // function are not constructors, and a class sets its own (10.2.5).
+    if with_host(|h| h.kind_of(recv)) != Some(ObjKind::Func) {
         return Value::Undef;
     }
-    if with_host(|h| h.kind_of(recv)) != Some(ObjKind::Func) {
+    if !with_host(|h| h.owns_prototype(recv)) {
         return Value::Undef;
     }
     with_host(|h| {
@@ -1476,43 +1491,56 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
     val
 }
 
+/// `[[Delete]]` (10.1.10) for an already-resolved property key: the one place
+/// `delete o[k]`, `delete o.k` and `Reflect.deleteProperty` all go through, so
+/// the three cannot drift. Reports `false` for a non-configurable property
+/// (sloppy mode ignores the failure rather than throwing) and `true` otherwise,
+/// which is also what deleting an absent key reports.
+pub fn delete_property(recv: &Value, key: &str) -> bool {
+    if !with_host(|h| h.prop_attrs(recv, key).configurable) {
+        return false;
+    }
+    with_host(|h| {
+        let index = key.parse::<usize>();
+        match h.get_mut(recv) {
+            Some(JsObj::Object(props)) => {
+                props.shift_remove(key);
+                return;
+            }
+            Some(JsObj::Array(items)) => {
+                if let Ok(i) = index {
+                    if i < items.len() {
+                        items[i] = Value::Undef;
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+        // A non-index key on an array (`arr.foo`, `arr[sym]`), or any own key on
+        // a function/class, is an ordinary own property kept in the side table.
+        h.remove_fn_prop(recv, key);
+    });
+    true
+}
+
 fn b_delitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
-    let key = with_host(|h| h.str_of(&idx));
-    // A non-configurable property cannot be deleted; in sloppy mode the delete
-    // simply reports false rather than throwing.
-    if !with_host(|h| h.prop_attrs(&recv, &key).configurable) {
-        return Value::Bool(false);
-    }
-    with_host(|h| match h.get_mut(&recv) {
-        Some(JsObj::Object(props)) => {
-            props.shift_remove(&key);
-        }
-        Some(JsObj::Array(items)) => {
-            if let Ok(i) = key.parse::<usize>() {
-                if i < items.len() {
-                    items[i] = Value::Undef;
-                }
-            }
-        }
-        _ => {}
-    });
-    Value::Bool(true)
+    // `delete o[k]` keys through ToPropertyKey (7.1.19), exactly as the read and
+    // the write do: `String(k)` would turn a Symbol into its `Symbol(desc)`
+    // description and delete a key nothing ever wrote.
+    let key = match host::to_property_key(&idx) {
+        Ok(k) => k,
+        Err(e) => return abort(vm, e),
+    };
+    Value::Bool(delete_property(&recv, &key))
 }
 
 fn b_delprop_name(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let recv = vm.pop();
-    if !with_host(|h| h.prop_attrs(&recv, &name).configurable) {
-        return Value::Bool(false);
-    }
-    with_host(|h| {
-        if let Some(JsObj::Object(props)) = h.get_mut(&recv) {
-            props.shift_remove(&name);
-        }
-    });
-    Value::Bool(true)
+    Value::Bool(delete_property(&recv, &name))
 }
 
 // ── constructors ──────────────────────────────────────────────────────────────
@@ -2889,12 +2917,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.deleteProperty" => {
             let obj = arg0(&args);
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            with_host(|h| {
-                if let Some(JsObj::Object(props)) = h.get_mut(&obj) {
-                    props.shift_remove(&k);
-                }
-            });
-            Ok(Value::Bool(true))
+            Ok(Value::Bool(delete_property(&obj, &k)))
         }
         "Reflect.setPrototypeOf" => {
             let obj = arg0(&args);
@@ -3646,16 +3669,13 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
     // non-enumerable ones, plus the exotic `length` an array carries.
     let entries: Vec<(String, Value)> = with_host(|h| {
         if mode == 3 {
-            let mut names: Vec<(String, Value)> = h
+            // An array's exotic `length` is already placed (after the indices,
+            // before the ordinary string keys) by `own_key_names`.
+            return h
                 .own_key_names(&v, false)
                 .into_iter()
                 .map(|k| (k, Value::Undef))
                 .collect();
-            // An array's `length` is an own (non-enumerable) property.
-            if matches!(h.get(&v), Some(JsObj::Array(_))) {
-                names.push(("length".into(), Value::Undef));
-            }
-            return names;
         }
         Vec::new()
     });
@@ -6439,6 +6459,13 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
             }
         }
         Some(JsObj::Object(p)) => p.get(&key).cloned(),
+        // An array's index keys read the elements; `length` is the exotic own
+        // property; anything else is an ordinary own key in the side table.
+        Some(JsObj::Array(items)) => match key.parse::<usize>() {
+            Ok(i) => items.get(i).cloned(),
+            Err(_) if key == "length" => Some(Value::Float(items.len() as f64)),
+            Err(_) => h.fn_prop(&obj, &key),
+        },
         // A function/class own prop lives in the fn-prop side table.
         Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => h.fn_prop(&obj, &key),
         _ => None,
@@ -6511,7 +6538,11 @@ pub fn has_property(obj: &Value, key: &str) -> bool {
                     .parse::<usize>()
                     .map(|i| i < items.len())
                     .unwrap_or(false)
+                // A non-index own property (`arr.foo`, `arr[sym]`) lives in the
+                // side table, and `in` must see it.
+                || h.fn_prop(obj, key).is_some()
         }
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => h.fn_prop(obj, key).is_some(),
         _ => false,
     })
 }

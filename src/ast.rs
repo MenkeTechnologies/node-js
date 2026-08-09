@@ -200,6 +200,10 @@ pub enum Expr {
         name: Option<String>,
         is_generator: bool,
         is_async: bool,
+        /// True for a MethodDefinition (`{ m(){} }`, `{ get x(){} }`) rather
+        /// than an ordinary function expression. A non-generator method owns no
+        /// `prototype` property (10.2.5 runs only for ordinary functions).
+        is_method: bool,
     },
 
     /// `,`-sequence expression: evaluate all, yield the last.

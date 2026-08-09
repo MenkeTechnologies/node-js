@@ -382,6 +382,10 @@ fn build_match_array(re: &Regex, caps: &Captures, s: &str) -> Value {
         }
         with_host(|h| {
             let obj = h.new_object(g);
+            // `groups` is an `OrdinaryObjectCreate(null)` (22.2.7.2 step 30), so
+            // it inherits nothing and inspects as `[Object: null prototype]`.
+            let null = h.null();
+            h.set_proto(&obj, null);
             h.set_fn_prop(&arr, "groups", obj);
         });
     }

@@ -452,7 +452,9 @@ pub fn bytes_like(v: &Value) -> Option<Vec<u8>> {
     }
     // A plain JS array of byte values.
     with_host(|h| match h.get(v) {
-        Some(JsObj::Array(items)) => Some(items.iter().map(|x| h.to_number(x) as i64 as u8).collect()),
+        Some(JsObj::Array(items)) => {
+            Some(items.iter().map(|x| h.to_number(x) as i64 as u8).collect())
+        }
         _ => None,
     })
 }
@@ -462,10 +464,12 @@ pub fn bytes_like(v: &Value) -> Option<Vec<u8>> {
 /// Int32Array([1,2,3]))` is 12, not 3. Verified against node v26.7.0.
 fn view_byte_length(v: &Value) -> Option<f64> {
     match super::native_tag(v).as_deref() {
-        Some("Buffer") | Some("TypedArray") | Some("ArrayBuffer") => with_host(|h| match h.get(v) {
-            Some(JsObj::Object(p)) => p.get("byteLength").map(|b| h.to_number(b)),
-            _ => None,
-        }),
+        Some("Buffer") | Some("TypedArray") | Some("ArrayBuffer") => {
+            with_host(|h| match h.get(v) {
+                Some(JsObj::Object(p)) => p.get("byteLength").map(|b| h.to_number(b)),
+                _ => None,
+            })
+        }
         _ => None,
     }
 }

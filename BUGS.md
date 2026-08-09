@@ -572,12 +572,21 @@ cases the fuzzer is scoped away from)
   `Object.prototype.toString.call(x)` DOES run the getter and reports
   `[object Cee]` — that path is not inside the borrow.
 
-- **Symbol-keyed properties on an ARRAY are not enumerated.** An array's extra
-  own properties live in the function-property side table rather than the
-  object property map, so `const a=[1]; a[sym]=5` READS back correctly (`a[sym]`
-  is `5`) but `console.log(a)` prints `[ 1 ]` where Node prints
-  `[ 1, Symbol(k): 5 ]`, and `Object.getOwnPropertySymbols(a)` is empty where
-  Node reports `Symbol(k)`. Object receivers do both correctly.
+- **A function's `.name` is inferred only from a `const`/`let`/`var`
+  initializer.** NamedEvaluation (8.4.5) also runs for a plain assignment
+  (`h = function(){}`), an object-literal property (`{ m: function(){} }`) and a
+  class field (`static s = function(){}`); in those three the name stays `""`
+  where Node reports `h` / `m` / `s`. The `const f = function(){}` /
+  `const g = () => {}` forms are correct, and so is a named function
+  expression. Verified against `node v26.7.0`.
+
+- **A class name is not in scope inside its own body.** `class C { static x =
+  C.m(); static m(){ return 5 } }` throws `ReferenceError: C is not defined`
+  where Node evaluates it to `5`: ClassDefinitionEvaluation (15.7.14) binds the
+  class name in an inner scope before running the static initializers, and
+  node-js binds it only after the whole `class` expression completes. The
+  ORDER is now right (methods install before static fields, so the method
+  exists by the time the field runs) — only the name binding is missing.
 
 - **A `Timeout`/`Immediate` handle has no reachable prototype object and no own
   `Symbol.toPrimitive`.** The handle's methods dispatch through the native
@@ -746,3 +755,61 @@ against `node v26.5.0`:
   `Immediate`, carrying `ref`/`unref`/`hasRef`/`refresh`/`close`; both coerce to
   their integer timer id, so code that stored the previously returned number
   still clears correctly. The absent `clearImmediate` global was added.
+
+- **An array's and a function's non-index own properties are real own
+  properties.** Verified against `node v26.7.0`. Those keys (`arr.foo`,
+  `arr[sym]`, a `str.match()` result's `index`/`input`/`groups`, anything
+  assigned to a function) live in node-js's fn-prop side table rather than in an
+  object property map, and every reflection path read only the property map — so
+  `Object.keys`, `Object.entries`, `Object.getOwnPropertyNames`,
+  `Object.getOwnPropertyDescriptor(s)`, `Reflect.ownKeys`,
+  `Object.getOwnPropertySymbols`, object spread, `Object.assign`, `for-in`, the
+  `in` operator and `delete` all behaved as though the property did not exist,
+  and `console.log` dropped it. All of them now read the side table.
+  - `Object.getOwnPropertyNames(arr)` reports the indices, then the exotic
+    `length`, then the string keys — `OrdinaryOwnPropertyKeys` order, which is
+    also where `length` sits in Node (it used to be appended last).
+  - An array's `length` is now the array exotic's own property (10.4.2):
+    writable, non-enumerable, non-configurable, so `delete a.length` reports
+    `false` and its descriptor matches Node's.
+  - A function's exotic `length`/`name`/`prototype` and a class's methods are
+    non-enumerable, so `Object.keys(fn)` is exactly what a script assigned while
+    `getOwnPropertyNames(fn)` reports `length,name,prototype,…` as V8 orders it.
+  - `util.inspect` renders both halves: `[ 1, foo: 'bar', Symbol(k): 5 ]` for an
+    array, `[Function: f] { z: 1 }` and `[class C] { x: 1 }` for a callable. An
+    anonymous function expression also inspects under its INFERRED name
+    (`const f = function(){}` → `[Function: f]`); inspect read the raw FuncDef
+    name and printed `[Function (anonymous)]`.
+
+- **`delete o[k]` keyed through `String(k)` instead of ToPropertyKey.**
+  `delete o[Symbol('k')]` deleted a property literally named `"Symbol(k)"` and
+  left the symbol-keyed one in place; an object with a `Symbol.toPrimitive` /
+  `valueOf` key never reached its conversion. The read and the write already
+  went through ToPropertyKey (7.1.19); `delete` now does too, and
+  `Reflect.deleteProperty` shares the same `[[Delete]]` implementation instead
+  of its own array-blind copy.
+
+- **Only a constructor owns a `prototype` property.** MakeConstructor (10.2.5)
+  runs for an ordinary function definition and for every generator; an arrow, a
+  MethodDefinition (`{ m(){} }`, a class method/accessor) and an async function
+  are not constructors. node-js materialised a `prototype` object on first read
+  for ANY function, so `({m(){}}).m.prototype` was an object where Node has
+  `undefined`. A new `FuncDef.is_method` flag (set by the parser for object
+  methods/accessors and by the compiler for class members) drives it, and the
+  bytecode-cache SCHEMA is bumped so no v5 blob replays the old shape.
+
+- **A class body installs its methods before its static fields.**
+  ClassDefinitionEvaluation (15.7.14) evaluates methods and accessors with the
+  class body and runs the static-field initializers afterwards (step 32).
+  node-js emitted members in source order, so `class C { static x = 1; static
+  m(){} }` reported own keys `x,m` where Node reports `m,x`.
+
+- **A match result's `groups` is a null-prototype object.** 22.2.7.2 builds it
+  with `OrdinaryObjectCreate(null)`, so `m.groups instanceof Object` is `false`
+  and `console.log(m)` tags it `[Object: null prototype] { … }`. It was an
+  ordinary object.
+
+- **A tagged template's `raw` is a frozen, non-enumerable own property.**
+  GetTemplateObject (13.2.8.4) defines it non-writable, non-enumerable and
+  non-configurable. It was an ordinary enumerable property, which put it in
+  `Object.keys(strings)`.

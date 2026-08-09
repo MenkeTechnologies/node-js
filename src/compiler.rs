@@ -1124,6 +1124,7 @@ impl Compiler {
             is_arrow: false,
             is_generator,
             is_async,
+            is_method: false,
             self_name: false,
         };
         self.functions.push((name.to_string(), def));
@@ -1175,7 +1176,21 @@ impl Compiler {
         }
         b.emit(Op::CallBuiltin(ops::MKCLASS, 3), 0); // -> [class]
 
-        for m in &node.members {
+        // `ClassDefinitionEvaluation` (15.7.14) installs every method and
+        // accessor while evaluating the class body, and only then runs the
+        // static-field initializers (step 32). So a static field may call a
+        // static method declared after it, and `getOwnPropertyNames(C)` lists
+        // the methods before the fields regardless of source order.
+        let ordered = node
+            .members
+            .iter()
+            .filter(|m| !matches!(m.kind, MemberKind::Field))
+            .chain(
+                node.members
+                    .iter()
+                    .filter(|m| matches!(m.kind, MemberKind::Field)),
+            );
+        for m in ordered {
             match m.kind {
                 MemberKind::Constructor => {}
                 MemberKind::Field if m.is_static => {
@@ -1231,6 +1246,9 @@ impl Compiler {
                         m.is_generator,
                         m.is_async,
                     )?;
+                    // A class method/accessor is a MethodDefinition: not a
+                    // constructor, so it owns no `prototype` property.
+                    self.functions[def_id].1.is_method = true;
                     self.emit_mkfunc(b, def_id);
                     b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0);
                 }
@@ -1504,6 +1522,7 @@ impl Compiler {
                 name,
                 is_generator,
                 is_async,
+                is_method,
             } => {
                 let def_id = if *is_arrow {
                     self.build_arrow(params, body, *is_async)?
@@ -1520,6 +1539,7 @@ impl Compiler {
                     if name.is_some() {
                         self.functions[id].1.self_name = true;
                     }
+                    self.functions[id].1.is_method = *is_method;
                     id
                 };
                 self.emit_mkfunc(b, def_id);

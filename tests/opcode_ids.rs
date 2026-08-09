@@ -140,7 +140,11 @@ fn registrations() -> Vec<(String, String)> {
         let Some(rest) = code.split_once("register_builtin(") else {
             continue;
         };
-        let args = rest.1.trim_end().trim_end_matches(';').trim_end_matches(')');
+        let args = rest
+            .1
+            .trim_end()
+            .trim_end_matches(';')
+            .trim_end_matches(')');
         let Some((op, handler)) = args.split_once(',') else {
             panic!("unparsable register_builtin call: {line}");
         };

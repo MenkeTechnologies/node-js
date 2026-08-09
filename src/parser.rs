@@ -333,6 +333,7 @@ impl Parser {
             name,
             is_generator,
             is_async,
+            is_method: false,
         })
     }
 
@@ -1336,6 +1337,7 @@ impl Parser {
                     name: None,
                     is_generator: false,
                     is_async: false,
+                    is_method: true,
                 };
                 props.push(Prop::Accessor {
                     key,
@@ -1376,6 +1378,7 @@ impl Parser {
                     name: None,
                     is_generator: m_gen,
                     is_async: m_async,
+                    is_method: true,
                 };
                 props.push(Prop::KeyValue {
                     key,
@@ -1484,6 +1487,7 @@ impl Parser {
                     name: None,
                     is_generator: false,
                     is_async,
+                    is_method: false,
                 }));
             }
         }
@@ -1506,6 +1510,7 @@ impl Parser {
                         name: None,
                         is_generator: false,
                         is_async,
+                        is_method: false,
                     }));
                 }
             }

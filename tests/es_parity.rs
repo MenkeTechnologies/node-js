@@ -956,3 +956,199 @@ fn an_arrow_sees_the_enclosing_functions_arguments() {
     "#;
     assert_eq!(run(src), "1-2-3|3|1-2-3|3|2\na-b/2");
 }
+
+// ── an array's / a function's non-index own properties ──────────────────────
+
+#[test]
+fn an_arrays_non_index_own_properties_are_real_own_properties() {
+    // A node-js array keeps its non-index own keys (`arr.foo`, `arr[sym]`, a
+    // match result's `index`/`input`) in the fn-prop side table, and every
+    // reflection path read only the property map — so `Object.keys`, `entries`,
+    // `getOwnPropertyNames`, `Reflect.ownKeys`, spread, `for-in`, `in` and
+    // `delete` all behaved as if the property did not exist.
+    let src = r#"
+        const s = Symbol('k');
+        const a = [1, 2];
+        a.foo = 'bar';
+        a[s] = 5;
+        console.log([
+          Object.keys(a).join(','),
+          Object.getOwnPropertyNames(a).join(','),
+          Reflect.ownKeys(a).map(String).join(','),
+          Object.getOwnPropertySymbols(a).map(String).join(','),
+          JSON.stringify(Object.entries(a)),
+          JSON.stringify({ ...a }),
+          'foo' in a, s in a, 'nope' in a,
+          JSON.stringify(a),
+        ].join('|'));
+        const seen = []; for (const k in a) seen.push(k);
+        console.log(seen.join(','));
+        console.log(delete a[s], delete a.foo, Object.keys(a).join(','), Object.getOwnPropertySymbols(a).length);
+    "#;
+    assert_eq!(
+        run(src),
+        "0,1,foo|0,1,length,foo|0,1,length,foo,Symbol(k)|Symbol(k)\
+         |[[\"0\",1],[\"1\",2],[\"foo\",\"bar\"]]|{\"0\":1,\"1\":2,\"foo\":\"bar\"}\
+         |true|true|false|[1,2]\n\
+         0,1,foo\n\
+         true true 0,1 0"
+    );
+}
+
+#[test]
+fn an_arrays_symbol_keys_inspect_after_the_elements() {
+    // `console.log([1, 2])` with an own symbol key prints it as a trailing
+    // `Symbol(desc): value`, the way an object receiver already did.
+    let src = r#"
+        const a = [1, 2];
+        a[Symbol('k')] = 5;
+        console.log(a);
+        const empty = [];
+        empty[Symbol('e')] = 1;
+        console.log(empty);
+    "#;
+    assert_eq!(run(src), "[ 1, 2, Symbol(k): 5 ]\n[ Symbol(e): 1 ]");
+}
+
+#[test]
+fn deleting_a_symbol_key_does_not_delete_the_string_of_the_same_name() {
+    // `delete o[k]` keyed through `String(k)` rather than ToPropertyKey, so
+    // `delete o[Symbol('k')]` removed a property literally named "Symbol(k)"
+    // and left the symbol-keyed one in place.
+    let src = r#"
+        const s = Symbol('k');
+        const o = { a: 1 };
+        o[s] = 2;
+        o['Symbol(k)'] = 'decoy';
+        delete o[s];
+        console.log(Object.getOwnPropertySymbols(o).length, o['Symbol(k)'], JSON.stringify(o));
+    "#;
+    assert_eq!(run(src), "0 decoy {\"a\":1,\"Symbol(k)\":\"decoy\"}");
+}
+
+#[test]
+fn a_functions_own_properties_enumerate_and_inspect() {
+    // A function's own properties live in the same side table, and its exotic
+    // `length`/`name`/`prototype` are non-enumerable — so `Object.keys(f)` is
+    // exactly what a script assigned while `getOwnPropertyNames(f)` reports the
+    // exotics first, and `util.inspect` appends the rest in braces.
+    let src = r#"
+        const s = Symbol('k');
+        function f(a, b) {}
+        f.z = 1; f[s] = 7;
+        console.log(f);
+        console.log([
+          Object.keys(f).join(','),
+          Object.getOwnPropertyNames(f).join(','),
+          Object.getOwnPropertySymbols(f).map(String).join(','),
+          f.name, f.length,
+        ].join('|'));
+        class C { m(){} static sm(){} static x = 1; }
+        console.log(C, Object.keys(C).join(','), Object.getOwnPropertyNames(C).join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "[Function: f] { z: 1, Symbol(k): 7 }\n\
+         z|length,name,prototype,z|Symbol(k)|f|2\n\
+         [class C] { x: 1 } x length,name,prototype,sm,x"
+    );
+}
+
+#[test]
+fn only_a_constructor_owns_a_prototype_property() {
+    // MakeConstructor (10.2.5) runs for an ordinary function definition and for
+    // every generator. An arrow, a method definition and an async function are
+    // not constructors and own no `prototype` — node-js materialised one for any
+    // function on first read.
+    let src = r#"
+        const o = { m(){}, *g(){}, async a(){}, async *ag(){} };
+        class C { m(){} }
+        const names = x => Object.getOwnPropertyNames(x).join(',');
+        console.log([names(o.m), names(o.g), names(o.a), names(o.ag)].join('|'));
+        console.log([names(() => {}), names(function(){}), names(function*(){}), names(async function(){})].join('|'));
+        console.log([typeof C.prototype.m.prototype, typeof o.m.prototype, typeof o.g.prototype].join('|'));
+    "#;
+    assert_eq!(
+        run(src),
+        "length,name|length,name,prototype|length,name|length,name,prototype\n\
+         length,name|length,name,prototype|length,name,prototype|length,name\n\
+         undefined|undefined|object"
+    );
+}
+
+#[test]
+fn a_class_body_installs_methods_before_static_fields() {
+    // ClassDefinitionEvaluation installs the methods while evaluating the class
+    // body and runs the static-field initializers afterwards, so the own-key
+    // order is methods-then-fields no matter how the source is written.
+    let src = r#"
+        class D { static a = 1; static m(){} static b = 2; }
+        console.log(Object.getOwnPropertyNames(D).join(','));
+        const E = class { static m(){} static a = 1; };
+        console.log(Object.getOwnPropertyNames(E).join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "length,name,prototype,m,a,b\nlength,name,prototype,m,a"
+    );
+}
+
+#[test]
+fn a_match_results_groups_is_a_null_prototype_object() {
+    // 22.2.7.2 builds `groups` with OrdinaryObjectCreate(null), so it inherits
+    // nothing and inspects with the `[Object: null prototype]` tag.
+    let src = r#"
+        const m = 'abc'.match(/(?<x>b)/);
+        console.log(Object.keys(m).join(','), Object.getOwnPropertyNames(m).join(','));
+        console.log(m.groups instanceof Object, Object.getPrototypeOf(m.groups));
+        console.log(m);
+    "#;
+    assert_eq!(
+        run(src),
+        "0,1,index,input,groups 0,1,length,index,input,groups\n\
+         false null\n\
+         [\n  'b',\n  'b',\n  index: 1,\n  input: 'abc',\n  \
+         groups: [Object: null prototype] { x: 'b' }\n]"
+    );
+}
+
+#[test]
+fn a_template_objects_raw_is_a_frozen_non_enumerable_own_property() {
+    // GetTemplateObject (13.2.8.4) defines `raw` non-writable, non-enumerable
+    // and non-configurable, so it stays out of `Object.keys` while
+    // `getOwnPropertyNames` still reports it.
+    let src = r#"
+        function tag(strings) {
+          return [
+            Object.keys(strings).join(','),
+            Object.getOwnPropertyNames(strings).join(','),
+            JSON.stringify(Object.getOwnPropertyDescriptor(strings, 'raw').writable),
+            JSON.stringify(Object.getOwnPropertyDescriptor(strings, 'raw').enumerable),
+            JSON.stringify(Object.getOwnPropertyDescriptor(strings, 'raw').configurable),
+            strings.raw.join('|'),
+          ].join('/');
+        }
+        console.log(tag`a\n${1}b`);
+    "#;
+    assert_eq!(run(src), "0,1/0,1,length,raw/false/false/false/a\\n|b");
+}
+
+#[test]
+fn an_arrays_length_is_a_non_enumerable_non_configurable_own_property() {
+    // The array exotic's `length` (10.4.2): writable, never enumerated, never
+    // configurable — so `delete a.length` reports false and leaves it alone.
+    let src = r#"
+        const a = [1, 2];
+        const d = Object.getOwnPropertyDescriptor(a, 'length');
+        console.log([d.value, d.writable, d.enumerable, d.configurable].join(','));
+        console.log(delete a.length, a.length);
+        console.log(JSON.stringify(Object.getOwnPropertyDescriptors([1])));
+    "#;
+    assert_eq!(
+        run(src),
+        "2,true,false,false\n\
+         false 2\n\
+         {\"0\":{\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true},\
+         \"length\":{\"value\":1,\"writable\":true,\"enumerable\":false,\"configurable\":false}}"
+    );
+}
