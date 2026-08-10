@@ -79,3 +79,57 @@ pub struct Cli {
 pub fn parse() -> Cli {
     Cli::parse()
 }
+
+/// How Node divides the command line, which is NOT the raw `argv` the OS handed
+/// over: the flags the RUNTIME consumed go to `process.execArgv`, and
+/// `process.argv` is `[execPath, entryScript, ...userArgs]` with those flags
+/// removed. The split is entry-point dependent and observably so —
+/// `node -e 'src' z` reports `execArgv = ["-e","src"]` and `argv = [exec,"z"]`,
+/// with NO `argv[1]`, while `node s.js z` reports `execArgv = []` and
+/// `argv = [exec, "/abs/s.js", "z"]`. Measured on node v26.7.0.
+pub struct Argv {
+    /// Runtime flags, including `-e`/`--eval` and its source.
+    pub exec: Vec<String>,
+    /// The entry script as given, or `None` for `-e` and for stdin.
+    pub script: Option<String>,
+    /// Everything after the entry point, passed through to the program.
+    pub user: Vec<String>,
+}
+
+/// Compute [`Argv`] from the raw command line.
+///
+/// This walks the raw arguments rather than reading the parsed [`Cli`], because
+/// clap assigns the FIRST positional to `file` even under `-e`, where that
+/// positional is really the program's own first argument.
+pub fn split_argv<I: IntoIterator<Item = String>>(raw: I) -> Argv {
+    let mut out = Argv {
+        exec: Vec::new(),
+        script: None,
+        user: Vec::new(),
+    };
+    let mut it = raw.into_iter().skip(1);
+    let mut eval_seen = false;
+    while let Some(a) = it.next() {
+        if a == "-e" || a == "--eval" {
+            out.exec.push(a);
+            if let Some(src) = it.next() {
+                out.exec.push(src);
+            }
+            eval_seen = true;
+        } else if a.starts_with('-') && a != "-" {
+            // `-` is Node's "read stdin" entry point, not a flag.
+            out.exec.push(a);
+        } else {
+            // The first non-flag ends the runtime's own arguments. Under `-e`
+            // there is no entry script, so it is already a program argument.
+            if !eval_seen {
+                out.script = Some(a);
+            } else {
+                out.user.push(a);
+            }
+            out.user.extend(it);
+            break;
+        }
+    }
+    out
+}

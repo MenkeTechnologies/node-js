@@ -273,6 +273,14 @@ fn cwd() -> String {
 // resolve
 // ---------------------------------------------------------------------------
 
+/// `path.resolve(p)` against the current directory, for callers outside the JS
+/// dispatcher. `process.argv[1]` is the resolved entry script, not the spelling
+/// the user typed (`node ./x.js` reports `/cwd/x.js`), and reusing the ported
+/// resolver keeps that agreeing with what `path.resolve` reports in-language.
+pub(crate) fn resolve_one(p: &str) -> String {
+    resolve_posix(&[p.to_string()])
+}
+
 fn resolve(flavor: Flavor, args: &[String]) -> String {
     match flavor {
         Flavor::Posix => resolve_posix(args),

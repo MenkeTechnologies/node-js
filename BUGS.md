@@ -245,8 +245,97 @@ an extracted half differs. Closing that last gap means replacing `String` with
 a WTF-8 buffer inside `fusevm` and all of `src/stdlib`, which the pinned
 `fusevm` dependency does not allow.
 
-`Buffer.byteLength`, `Buffer.from(s)` and `StringDecoder` across a split
-multi-byte sequence work in UTF-8 bytes and were never affected.
+The UTF-8 arm of `Buffer.byteLength` / `Buffer.from(s)` and `StringDecoder`
+across a split multi-byte sequence work in UTF-8 bytes and were never affected.
+The rest of the Buffer surface *was*, and this file said otherwise until the
+sweep below — see the next section.
+
+## FIXED — Buffer encodings that count code units, and the argument forms that reach them
+
+Three of Node's buffer encodings are defined over the string's UTF-16 CODE
+UNITS, not over its UTF-8 bytes, so the UTF-16 sweep above did not finish at
+`String.prototype`: `utf16le` (and its `ucs2` spellings) is those units written
+little-endian, and `latin1`/`ascii` take the low byte of each unit. `utf16le`
+had no arm at all and fell through to UTF-8 — silent corruption rather than an
+error — and `latin1` encoded one byte per code POINT. Measured on node v26.7.0:
+
+| expression | node v26.7.0 | node-js (was) | node-js (now) |
+| --- | --- | --- | --- |
+| `Buffer.byteLength("abc","utf16le")` | `6` | `3` | `6` |
+| `Buffer.from("abc","utf16le").toString("hex")` | `610062006300` | `616263` | `610062006300` |
+| `Buffer.from("61006200","hex").toString("utf16le")` | `"ab"` | `"a\0b\0"` | `"ab"` |
+| `Buffer.from("A\u00ff\u0100\u{1D4B3}","latin1").toString("hex")` | `41ff0035b3` | `41ff00b3` | `41ff0035b3` |
+| `[...Buffer.from([65,255,128]).toString("ascii")]` codes | `65,127,0` | `65,255,128` | `65,127,0` |
+| `Buffer.from([251,255,190]).toString("base64url")` | `-_--` | `+/++` | `-_--` |
+| `Buffer.from("-_-_","base64").toString("hex")` | `fbffbf` | `""` | `fbffbf` |
+| `new StringDecoder("ucs2").encoding` | `utf16le` | `ucs2` | `utf16le` |
+
+`base64url` was an alias of `base64` in both directions. Encoding it must use
+the URL-safe alphabet with the padding dropped; decoding must accept `-_` under
+*either* name, and dropping them produced an EMPTY buffer because an
+unrecognized character is skipped rather than rejected.
+
+The argument forms that select an encoding were being ignored outright, so even
+the encodings that did work were unreachable through most of the API:
+
+| expression | node v26.7.0 | node-js (was) | node-js (now) |
+| --- | --- | --- | --- |
+| `Buffer.from("abcdef").toString("utf8",1,3)` | `"bc"` | `"abcdef"` | `"bc"` |
+| `Buffer.from("abcdef").indexOf("b",2)` | `-1` | `1` | `-1` |
+| `Buffer.from("abcdef").lastIndexOf("b",0)` | `-1` | `1` | `-1` |
+| `Buffer.alloc(6,0x2e).write("ZZZZ",1,2)` | `2`, `.ZZ...` | `4`, `.ZZZZ.` | `2`, `.ZZ...` |
+| `Buffer.alloc(6).write("ab","hex")` | `1`, `ab0000000000` | `2`, `616200000000` | `1`, `ab0000000000` |
+| `Buffer.alloc(4).fill("ff","hex").toString("hex")` | `ffffffff` | `66666666` | `ffffffff` |
+| `Buffer.from([1,2,3,4]).swap16().toString("hex")` | `02010403` | `TypeError` | `02010403` |
+
+`write` truncates at a CHARACTER boundary — node reports 2, not 4, for
+`Buffer.alloc(4).write('é€')`, dropping the 3-byte `€` whole rather than
+half-writing it — and a `write` offset past the end is a `RangeError`, not a
+silent no-op. `fill`'s overload resolution is node's own: a STRING in the
+`offset` slot is the encoding *and resets the range to the whole buffer*, so
+`fill('41','hex',1,3)` fills all of it.
+
+`StringDecoder` now buffers every encoding that has a chunk boundary, not just
+UTF-8: UTF-16LE holds an odd trailing byte and a trailing high surrogate, and
+base64 holds up to two bytes so it emits whole 3-byte groups
+(`AQID`/`BA==`, never `AQI=`/`AwQ=`). Its `encoding` property reports the
+canonical name (`ucs2` → `utf16le`, `UTF-8` → `utf8`).
+
+## FIXED — relational comparison and default `sort` order by code unit
+
+The same code-unit/code-point split reaches string ORDER, which the UTF-16
+sweep did not cover: 7.2.13 IsLessThan and 23.1.3.30.2 SortCompare both compare
+code units, and Rust's `str: Ord` is UTF-8 byte order (code-point order). A
+surrogate is `0xD800..0xE000`, so every astral character sorts BELOW every BMP
+character from `U+E000` up, and the two orders disagree on exactly those pairs.
+Measured on node v26.7.0:
+
+| expression | node v26.7.0 | node-js (was) | node-js (now) |
+| --- | --- | --- | --- |
+| `"\u{1D4B3}" < "￿"` | `true` | `false` | `true` |
+| `["￿","\u{1D4B3}","","a"].sort()` | `a,𝒳,,￿` | `a,,￿,𝒳` | `a,𝒳,,￿` |
+
+`utf16::cmp_units` is that comparison, and both call sites now use it.
+`localeCompare` is deliberately NOT routed through it — it is documented as an
+ASCII approximation of ICU collation and needs real collation data, not a
+different code-unit order.
+
+## FIXED — `escape` / `unescape` and `String.prototype.isWellFormed` / `toWellFormed`
+
+`escape`/`unescape` (Annex B.2.1) were absent, so calling either was a
+`ReferenceError`. They are code-UNIT encoders, which is what separates `escape`
+from `encodeURIComponent`: `escape("\u{1D4B3}")` is `"%uD835%uDCB3"`, the two
+surrogates, where `encodeURIComponent` gives the UTF-8 bytes `%F0%9D%92%B3`.
+`unescape` never throws — a `%` that starts no valid escape passes through
+(`unescape("%u0041%42%zz%2")` is `"AB%zz%2"`).
+
+`String.prototype.isWellFormed`/`toWellFormed` (ES2024) were absent
+(`TypeError: isWellFormed is not a function`). Every string this runtime can
+hold is well-formed by construction — a Rust `char` excludes
+`U+D800..=U+DFFF` — so `isWellFormed` is `true` and `toWellFormed` is the
+identity, both exact for every representable value. The one case node answers
+differently is a surrogate half extracted by `charAt`/`slice`, which is already
+`U+FFFD` here: the lone-surrogate boundary above, not a separate gap.
 
 ## `globalThis` is not backed by the global scope
 
@@ -254,6 +343,64 @@ multi-byte sequence work in UTF-8 bytes and were never affected.
 `var y = 2` does not appear as `globalThis.y`; the two live in separate tables
 (`JsHost.globals` versus the `globalThis` object). Node's `global` alias is
 absent entirely (`ReferenceError`).
+
+## Entry points: `node f.js` vs `node -e` vs `node -` / piped stdin
+
+These are three DIFFERENT entry points, and Node reports different values at
+each of them. A harness that only ever exercises one cannot see a regression in
+the others, and an expectation captured at the wrong one is measuring something
+it did not mean to. The table below is the full observable set, measured on node
+v26.7.0; every row marked **agrees** is now pinned by a test.
+
+| observable | `node f.js` | `node -e src` | `node -` / piped | node-js |
+| --- | --- | --- | --- | --- |
+| `typeof module` / `exports` | `object` | `object` | `object` | agrees |
+| `exports === module.exports` | `true` | `true` | `true` | agrees |
+| `__filename` | resolved abs path | `[eval]` | `[stdin]` | agrees |
+| `__dirname` | its directory | `.` | `.` | agrees |
+| `module.id` | `.` | `[eval]` | `[stdin]` | agrees |
+| `module.path` | its directory | `.` | `.` | agrees |
+| `Object.keys(module)` | `id,path,exports,filename,loaded,children,paths` | same | same | agrees |
+| `process.argv[1]` | resolved abs path | *absent* | `-` | agrees |
+| `process.execArgv` | runtime flags | flags + `-e` + src | runtime flags | agrees |
+| `require.main === module` | `true` | `false` | `false` | **`require.main` absent** |
+| top-level `this` | `module.exports` | `globalThis` | `globalThis` | **`undefined`** |
+| top-level `arguments` | the wrapper's 5 | *undefined* | *undefined* | **undefined at both** |
+| sloppy/strict | sloppy | sloppy | sloppy | **strict at all three** |
+| stack frame file | `file:L:C` | `[eval]:L:C` | `[stdin]:L:C` | **no `file:line:col`** |
+
+The four remaining rows all follow from one thing: node-js runs the entry
+source directly rather than through the CommonJS wrapper function, and evaluates
+it as strict-mode Script. `module`/`exports`/`__filename`/`__dirname` are
+installed as globals per entry point (`module::install_entry_globals`), which
+fixes what packages actually read — a UMD header's
+`typeof module !== 'undefined' && module.exports` now takes the CommonJS branch
+at every entry point instead of the browser branch — but top-level `this`,
+`arguments` and sloppy-mode binding need the wrapper itself. See the two
+sections below for what else the missing wrapper costs.
+
+A `require`d module gets the same seven-key `module` object — `id`, `path`,
+`exports`, `filename`, `loaded`, `children`, `paths`, in that order — where it
+used to carry `exports` alone, so `module.id`/`module.filename`/`module.path`
+were `undefined` inside every dependency. A required module's `id` IS its
+absolute filename; only the entry module's is `.`. `loaded` flips to `true` once
+the body returns. Still missing on the loader side: `module.children` is always
+empty (populating it needs the loader to thread the REQUIRING module through
+`require`, which it does not), and `require.main` and `require.cache` are absent.
+
+`__filename` is the entry script's REALPATH, matching Node's `toRealPath` on the
+main module, while `process.argv[1]` keeps the spelling that was passed —
+`node link/a.js` through a symlinked directory reports the link in `argv[1]` and
+the target in `__filename`. `require.resolve` normalizes the joined path, so
+`require('./d.js')` and `require('d.js')` from one directory are a single cache
+entry rather than `<dir>/./d.js` and `<dir>/d.js`.
+
+Two harnesses in this repo compare against DIFFERENT entry points on purpose:
+`parity-scripts/run.sh` runs each corpus case as a script FILE, and
+`src/bin/parity_fuzz.rs` runs each generated case through `-e`. Neither
+generates any of the observables above, so the split is coverage rather than
+contamination — but a case added to either that touches this table would be
+measuring that harness's entry point, not "node".
 
 ## `node -e` evaluates a Script, not a CommonJS module
 

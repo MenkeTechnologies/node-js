@@ -192,7 +192,7 @@ pub fn constant(name: &str) -> Option<Value> {
         "argv" => argv(),
         "argv0" => with_host(|h| h.new_str(exec_path())),
         "execPath" => with_host(|h| h.new_str(exec_path())),
-        "execArgv" => with_host(|h| h.new_array(Vec::new())),
+        "execArgv" => exec_argv(),
         "platform" => with_host(|h| h.new_str(super::os::platform())),
         "arch" => with_host(|h| h.new_str(super::os::arch())),
         "pid" => Value::Float(std::process::id() as f64),
@@ -464,10 +464,58 @@ fn env_object() -> Value {
     })
 }
 
-/// `process.argv`: `[execPath, entryScript, ...userArgs]` (best effort).
+/// The `(execArgv, argv)` split installed by the binary's entry point.
+///
+/// Unset when the library is embedded (or driven by a sibling binary such as
+/// `parity-fuzz`, whose own command line is not a `node` command line), and the
+/// accessors below then fall back to the raw process arguments.
+static ARGV: std::sync::OnceLock<(Vec<String>, Vec<String>)> = std::sync::OnceLock::new();
+
+/// Publish Node's `process.argv` / `process.execArgv` split for this run, read
+/// off the real command line. Called once by the `node` binary's entry point;
+/// first call wins.
+///
+/// `argv[1]` is the entry script RESOLVED against the current directory, so
+/// `node ./x.js` reports the same absolute path `path.resolve` would — not the
+/// spelling that was typed.
+pub fn install_argv() {
+    let split = crate::cli::split_argv(std::env::args());
+    let mut argv = vec![exec_path()];
+    if let Some(s) = &split.script {
+        // `-` is Node's stdin entry point, not a path; it stays verbatim.
+        argv.push(if s == "-" {
+            s.clone()
+        } else {
+            super::path::resolve_one(s)
+        });
+    }
+    argv.extend(split.user);
+    let _ = ARGV.set((split.exec, argv));
+}
+
+/// `process.argv`: `[execPath, entryScript, ...userArgs]`.
+///
+/// The runtime's OWN flags are not in it — they are `process.execArgv` — and
+/// under `-e` there is no `argv[1]` at all. Returning the raw OS arguments put
+/// `-e` and the whole one-liner source into `argv`, which is what any script
+/// that reads `process.argv.slice(2)` for its options would have parsed.
 fn argv() -> Value {
     with_host(|h| {
-        let items: Vec<Value> = std::env::args().map(|a| h.new_str(a)).collect();
+        let items: Vec<Value> = match ARGV.get() {
+            Some((_, argv)) => argv.iter().map(|a| h.new_str(a.clone())).collect(),
+            None => std::env::args().map(|a| h.new_str(a)).collect(),
+        };
+        h.new_array(items)
+    })
+}
+
+/// `process.execArgv`: the runtime flags, `-e`/`--eval` and its source included.
+fn exec_argv() -> Value {
+    with_host(|h| {
+        let items: Vec<Value> = ARGV
+            .get()
+            .map(|(e, _)| e.iter().map(|a| h.new_str(a.clone())).collect())
+            .unwrap_or_default();
         h.new_array(items)
     })
 }

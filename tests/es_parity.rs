@@ -1380,3 +1380,405 @@ fn querystring_parse_treats_an_explicit_undefined_separator_as_default() {
          a:1;b:2"
     );
 }
+
+// ── Buffer encodings that are defined over UTF-16 code units ────────────────
+
+#[test]
+fn buffer_utf16le_and_single_byte_encodings_count_code_units() {
+    // `utf16le`/`ucs2` is the string's code units written little-endian, and
+    // `latin1`/`ascii` take the LOW BYTE of each unit — so an astral character
+    // contributes two units in all three, not one code point. `utf16le` had no
+    // arm at all and fell through to UTF-8, which is silent corruption rather
+    // than a missing feature. Expected values from `node v26.7.0`.
+    let src = r#"
+        const S = "ab\u{1D4B3}";
+        console.log([Buffer.byteLength(S, "utf16le"), Buffer.byteLength(S, "utf8"),
+                     Buffer.byteLength(S, "latin1")].join(','));
+        console.log(Buffer.from(S, "utf16le").toString("hex"));
+        console.log(Buffer.from(S, "utf16le").toString("utf16le") === S);
+        console.log(Buffer.from(S, "latin1").toString("hex"));
+        console.log(Buffer.from("61006200", "hex").toString("ucs2"));
+        console.log(Buffer.from("610062006300", "hex").toString("utf16le", 2));
+        console.log([...Buffer.from([65, 255, 128]).toString("ascii")].map(c => c.charCodeAt(0)).join(','));
+        console.log([...Buffer.from([65, 255, 128]).toString("latin1")].map(c => c.charCodeAt(0)).join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "8,6,4\n\
+         6100620035d8b3dc\n\
+         true\n\
+         616235b3\n\
+         ab\n\
+         bc\n\
+         65,127,0\n\
+         65,255,128"
+    );
+}
+
+#[test]
+fn base64url_is_a_distinct_alphabet_in_both_directions() {
+    // `base64url` is not an alias: it encodes with `-_` and no padding. Decoding
+    // accepts BOTH alphabets under EITHER name — and getting that wrong was not
+    // an error but an EMPTY buffer, because an unrecognized base64 character is
+    // skipped rather than rejected. Expected values from `node v26.7.0`.
+    let src = r#"
+        const b = Buffer.from([251, 255, 190, 1]);
+        console.log([b.toString("base64"), b.toString("base64url")].join(' '));
+        console.log([Buffer.from([1]).toString("base64"), Buffer.from([1]).toString("base64url")].join(' '));
+        console.log([Buffer.from("-_-_", "base64url").toString("hex"),
+                     Buffer.from("-_-_", "base64").toString("hex"),
+                     Buffer.from("+/+/", "base64url").toString("hex")].join(' '));
+        console.log(Buffer.byteLength("-_-_", "base64url"));
+    "#;
+    assert_eq!(
+        run(src),
+        "+/++AQ== -_--AQ\n\
+         AQ== AQ\n\
+         fbffbf fbffbf fbffbf\n\
+         3"
+    );
+}
+
+#[test]
+fn buffer_read_arguments_select_a_range_and_an_encoding() {
+    // `toString`'s range and `indexOf`/`lastIndexOf`/`includes`'s `byteOffset`
+    // and `encoding` were all ignored, so every partial read returned the whole
+    // buffer and every search started at 0 with a UTF-8 needle. A negative
+    // offset counts back from the end; an empty needle matches AT the offset.
+    // Expected values from `node v26.7.0`.
+    let src = r#"
+        const b = Buffer.from("abcdef");
+        console.log([b.toString("utf8", 1, 3), b.toString("hex", 1, 3), b.toString("utf8", 4, 2) === ""].join(' '));
+        console.log([b.toString("utf8", -1), b.toString("utf8", 4, 99)].join(' '));
+        const c = Buffer.from("abcabc");
+        console.log([c.indexOf("b", 2), c.indexOf("b", -2), c.indexOf("62", "hex"), c.indexOf("62", 2, "hex")].join(','));
+        console.log([c.lastIndexOf("b"), c.lastIndexOf("b", 2), c.lastIndexOf("b", -4), c.includes("b", 2)].join(','));
+        console.log([c.indexOf("", 2), c.indexOf("", 99), c.lastIndexOf("", 2), c.indexOf("a", 99)].join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "bc 6263 true\n\
+         abcdef ef\n\
+         4,4,1,4\n\
+         4,1,1,true\n\
+         2,6,2,-1"
+    );
+}
+
+#[test]
+fn buffer_write_and_fill_resolve_their_overloads_like_node() {
+    // `write(string[, offset[, length]][, encoding])` and `fill(value[, offset[,
+    // end]][, encoding])` decide what each trailing argument MEANS from its
+    // runtime type. Two consequences worth pinning: `write` stops at a CHARACTER
+    // boundary (2 bytes of `é€` in a 4-byte buffer, not a half-written `€`), and
+    // a STRING in `fill`'s `offset` slot is the encoding AND resets the range to
+    // the whole buffer, so `fill('41','hex',1,3)` fills all of it rather than
+    // `1..3`. An out-of-range `write` offset is a RangeError, not a no-op.
+    // Expected values from `node v26.7.0`.
+    let src = r#"
+        const w = (...a) => { const x = Buffer.alloc(6, 0x2e); const n = x.write(...a); return n + ":" + x.toString("latin1"); };
+        console.log([w("abcd"), w("abcd", 2), w("abcd", 1, 2)].join(' '));
+        const h = (...a) => { const x = Buffer.alloc(6, 0); const n = x.write(...a); return n + ":" + x.toString("hex"); };
+        console.log([h("4142", "hex"), h("4142", 1, "hex"), h("4142", 0, 2, "hex")].join(' '));
+        const u = Buffer.alloc(6, 0); console.log(u.write("ab", 0, "utf16le") + ":" + u.toString("hex"));
+        const t = Buffer.alloc(4, 0); console.log(t.write("é€") + ":" + t.toString("hex"));
+        try { Buffer.alloc(2, 0).write("ab", 5); console.log("no throw"); }
+        catch (e) { console.log(e.constructor.name); }
+        console.log([Buffer.alloc(4).fill("4142", "hex").toString("hex"),
+                     Buffer.alloc(4).fill("QUI=", "base64").toString("hex"),
+                     Buffer.alloc(6).fill("ab", "utf16le").toString("hex"),
+                     Buffer.alloc(6, 0x2e).fill("41", "hex", 1, 3).toString("hex")].join(' '));
+        console.log(Buffer.alloc(6, 0x2e).fill("Z", 2, 4).toString("latin1"));
+    "#;
+    assert_eq!(
+        run(src),
+        "4:abcd.. 4:..abcd 2:.ab...\n\
+         2:414200000000 2:004142000000 2:414200000000\n\
+         4:610062000000\n\
+         2:c3a90000\n\
+         RangeError\n\
+         41424142 41424142 610062006100 414141414141\n\
+         ..ZZ.."
+    );
+}
+
+#[test]
+fn buffer_swaps_reverse_groups_in_place() {
+    // swap16/32/64 mutate the receiver and return it (so `b.swap16()` changes
+    // `b`), and a length that is not a whole number of groups is a RangeError
+    // rather than a partial swap. Expected values from `node v26.7.0`.
+    let src = r#"
+        console.log([Buffer.from([1,2,3,4]).swap16().toString("hex"),
+                     Buffer.from([1,2,3,4]).swap32().toString("hex"),
+                     Buffer.from([1,2,3,4,5,6,7,8]).swap64().toString("hex")].join(' '));
+        const b = Buffer.from([1,2]); console.log([b.swap16() === b, b.toString("hex")].join(','));
+        try { Buffer.from([1,2,3]).swap16(); console.log("no throw"); }
+        catch (e) { console.log(e.constructor.name + ": " + e.message); }
+    "#;
+    assert_eq!(
+        run(src),
+        "02010403 04030201 0807060504030201\n\
+         true,0201\n\
+         RangeError: Buffer size must be a multiple of 16-bits"
+    );
+}
+
+#[test]
+fn string_decoder_buffers_every_encoding_that_has_a_chunk_boundary() {
+    // UTF-8 was the only encoding that held a partial tail. UTF-16LE must hold
+    // an odd trailing byte AND a trailing high surrogate; base64 must hold up to
+    // two bytes so it emits whole 3-byte groups (`AQID`/`BA==`, never the
+    // early-padded `AQI=`/`AwQ=`). `encoding` reports the CANONICAL name, which
+    // is what code branching on `decoder.encoding` reads. A dangling odd byte is
+    // dropped at `end()` with no replacement char. From `node v26.7.0`.
+    let src = r#"
+        const { StringDecoder } = require("string_decoder");
+        const B = h => Buffer.from(h, "hex");
+        console.log([new StringDecoder("ucs2").encoding, new StringDecoder("UTF-8").encoding,
+                     new StringDecoder("binary").encoding, new StringDecoder("utf-16le").encoding].join(','));
+        const a = new StringDecoder("utf16le");
+        console.log([a.write(B("6100620063")), a.write(B("00")), a.end()].join('|'));
+        const b = new StringDecoder("utf16le");
+        console.log([b.write(B("35d8")).length, b.write(B("b3dc")), b.end()].join('|'));
+        const c = new StringDecoder("utf16le");
+        console.log([c.write(B("61")), c.end()].join('|') + "<");
+        const d = new StringDecoder("base64");
+        console.log([d.write(B("0102")), d.write(B("0304")), d.end()].join('|'));
+        const e = new StringDecoder("base64url");
+        console.log([e.write(B("fbffbe")), e.end()].join('|') + "<");
+    "#;
+    assert_eq!(
+        run(src),
+        "utf16le,utf8,latin1,utf16le\n\
+         ab|c|\n\
+         0|𝒳|\n\
+         |<\n\
+         |AQID|BA==\n\
+         -_--|<"
+    );
+}
+
+// ── code-unit string ORDER, and the Annex B / ES2024 string globals ─────────
+
+#[test]
+fn string_relational_order_is_by_code_unit() {
+    // 7.2.13 IsLessThan and the default `sort` comparator order by CODE UNIT.
+    // Rust's `str: Ord` is code-point order, and the two disagree on exactly the
+    // pairs where an astral character meets a BMP character at or above U+E000
+    // (a surrogate is 0xD800..0xE000, so astral sorts BELOW them all).
+    // Expected values from `node v26.7.0`.
+    let src = r#"
+        const A = "\u{1D4B3}";
+        console.log([A < "\uFFFF", A < "\uE000", A > "\uD7FF", "\u{10FFFF}" < "\uE000"].join(','));
+        console.log(JSON.stringify(["\uFFFF", A, "\uE000", "a"].sort().map(s => s.codePointAt(0))));
+        console.log(["b", "a", "B"].sort().join(''));
+        console.log([("café" < "cafz"), ("café" < "cagz")].join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "true,true,true,true\n\
+         [97,119987,57344,65535]\n\
+         Bab\n\
+         false,true"
+    );
+}
+
+#[test]
+fn legacy_escape_unescape_and_well_formed_string_methods() {
+    // `escape`/`unescape` (Annex B.2.1) work in CODE UNITS, which is what
+    // separates `escape` from `encodeURIComponent`: an astral character becomes
+    // the two `%uXXXX` escapes of its surrogate pair, not its UTF-8 bytes.
+    // `unescape` never throws — a `%` starting no valid escape passes through.
+    // `isWellFormed`/`toWellFormed` (ES2024) are exact for every string this
+    // runtime can hold, since a Rust `char` cannot be an unpaired surrogate.
+    // Expected values from `node v26.7.0`.
+    let src = r#"
+        console.log([escape("a b+/@*_-.c"), escape("café"), escape("\u{1D4B3}")].join(' '));
+        console.log(escape("\x00\x7f\xff"));
+        console.log(unescape(escape("a b café \u{1D4B3}")) === "a b café \u{1D4B3}");
+        console.log([unescape("%u0041%42%zz%2"), unescape("%")].join(' '));
+        console.log([typeof escape, typeof unescape].join(','));
+        console.log(["abc".isWellFormed(), "\u{1D4B3}".isWellFormed(), "ab\u{1D4B3}".toWellFormed()].join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "a%20b+/@*_-.c caf%E9 %uD835%uDCB3\n\
+         %00%7F%FF\n\
+         true\n\
+         AB%zz%2 %\n\
+         function,function\n\
+         true,true,ab𝒳"
+    );
+}
+
+// ── entry points: file vs `-e` vs stdin ─────────────────────────────────────
+
+/// Run `src` through the built binary at a NON-file entry point, either
+/// `node -e <src>` or `node -` with `src` on stdin, and return trimmed stdout.
+///
+/// `run` above only ever exercises the script-file entry point, and the three
+/// entry points are observably different in Node — `__filename`, `module.id`,
+/// `process.argv` and `process.execArgv` all carry which one is running. A
+/// harness that pins only one of them cannot see a regression in the others.
+fn run_at(entry: &str, src: &str, args: &[&str]) -> String {
+    use std::process::Stdio;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_node"));
+    if entry == "-e" {
+        cmd.arg("-e").arg(src);
+    } else {
+        cmd.arg("-");
+    }
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn node binary");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        if entry == "-" {
+            stdin.write_all(src.as_bytes()).expect("write stdin");
+        }
+    }
+    let out = child.wait_with_output().expect("wait");
+    if !out.status.success() {
+        panic!(
+            "program failed at entry {entry}:\n--- stderr ---\n{}\n--- stdout ---\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+}
+
+const ENTRY_PROBE: &str = r#"
+    console.log([typeof module, typeof exports, exports === module.exports].join(','));
+    console.log([__filename, __dirname, module.id, module.path].join(' '));
+    console.log(JSON.stringify(Object.keys(module)));
+"#;
+
+#[test]
+fn eval_and_stdin_entry_points_report_their_own_names() {
+    // `-e` and `-` are DIFFERENT entry points and Node names them differently.
+    // Both give the CJS wrapper variables (a UMD header's
+    // `typeof module !== 'undefined'` must take the CommonJS branch), with
+    // `__dirname` `.` and `module.id` the entry name. `node v26.7.0`.
+    let keys = "[\"id\",\"path\",\"exports\",\"filename\",\"loaded\",\"children\",\"paths\"]";
+    assert_eq!(
+        run_at("-e", ENTRY_PROBE, &[]),
+        format!("object,object,true\n[eval] . [eval] .\n{keys}")
+    );
+    assert_eq!(
+        run_at("-", ENTRY_PROBE, &[]),
+        format!("object,object,true\n[stdin] . [stdin] .\n{keys}")
+    );
+}
+
+#[test]
+fn a_script_file_entry_point_reports_its_resolved_path() {
+    // The file entry point differs from `-e` on every one of these: `__filename`
+    // is the RESOLVED path (not the spelling passed), `__dirname` is its
+    // directory, and `module.id` is `.` rather than the entry name. `node v26.7.0`.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("entry.js");
+    std::fs::write(&path, ENTRY_PROBE).expect("write script");
+    let out = Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(&path)
+        .output()
+        .expect("spawn node binary");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    assert_eq!(lines[0], "object,object,true");
+    // `__filename` is the entry script's REALPATH — Node's loader calls
+    // `toRealPath` on the main module, so a temp dir reached through a symlink
+    // (`/var` → `/private/var` on macOS) reports the target. Canonicalizing the
+    // expectation is what makes that assertion, not a way around it: an
+    // implementation that skipped the realpath would report the link path and
+    // fail here.
+    let real = std::fs::canonicalize(&path).expect("canonicalize");
+    let want_dir = real.parent().expect("parent").to_string_lossy().to_string();
+    assert_eq!(
+        lines[1],
+        format!("{} {want_dir} . {want_dir}", real.to_string_lossy())
+    );
+    assert_eq!(
+        lines[2],
+        "[\"id\",\"path\",\"exports\",\"filename\",\"loaded\",\"children\",\"paths\"]"
+    );
+}
+
+#[test]
+fn runtime_flags_land_in_exec_argv_not_argv() {
+    // `process.argv` is `[execPath, entryScript, ...userArgs]` with the RUNTIME's
+    // own flags removed — they are `process.execArgv`, and under `-e` the
+    // one-liner source is one of them and there is no `argv[1]` at all. Anything
+    // reading `process.argv.slice(2)` for its options depends on this split.
+    // `node v26.7.0`.
+    let src =
+        "console.log(JSON.stringify(process.execArgv), JSON.stringify(process.argv.slice(1)))";
+    assert_eq!(
+        run_at("-e", src, &["z"]),
+        format!("[\"-e\",{}] [\"z\"]", serde_json_string(src))
+    );
+    assert_eq!(run_at("-", src, &["q"]), "[] [\"-\",\"q\"]");
+}
+
+/// Minimal JSON string encoding for the one expected value above.
+fn serde_json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[test]
+fn a_required_module_gets_the_full_module_object() {
+    // A `require`d module's `module` used to carry `exports` and nothing else,
+    // so `module.id` / `module.filename` / `module.path` / `module.loaded` were
+    // all `undefined` there. Node's `id` for a required module is its ABSOLUTE
+    // filename (only the entry module's is `.`), and `loaded` is `false` while
+    // the body runs. `node v26.7.0`.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dep = dir.path().join("dep.js");
+    std::fs::write(
+        &dep,
+        "module.exports = { keys: Object.keys(module), id: module.id, path: module.path,\n\
+          filename: module.filename, loaded: module.loaded, same: module.filename === __filename,\n\
+          paths0: module.paths[0] };",
+    )
+    .expect("write dep");
+    let main = dir.path().join("main.js");
+    std::fs::write(
+        &main,
+        "const d = require('./dep.js');\n\
+         console.log(JSON.stringify(d.keys));\n\
+         console.log([d.id === d.filename, d.same, d.loaded, d.path === __dirname].join(','));\n\
+         console.log(d.paths0 === __dirname + '/node_modules');",
+    )
+    .expect("write main");
+    let out = Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(&main)
+        .output()
+        .expect("spawn node binary");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        "[\"id\",\"path\",\"exports\",\"filename\",\"loaded\",\"children\",\"paths\"]\n\
+         true,true,false,true\n\
+         true"
+    );
+}

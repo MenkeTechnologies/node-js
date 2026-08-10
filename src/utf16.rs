@@ -6,6 +6,13 @@
 //! `substring`, `substr`, `split`, `padStart`/`padEnd`, `s[i]`, and a RegExp's
 //! `.index`/`lastIndex`.
 //!
+//! Indices are not the only place the unit sequence is observable. Relational
+//! comparison (`< <= > >=`, 7.2.13 IsLessThan) and the default `Array.prototype
+//! .sort` comparator order strings by *code unit* too, which is a different
+//! order than Rust's `str: Ord` (code point / UTF-8 byte order) for any pair
+//! that straddles `U+E000`: a surrogate is `0xD800..0xE000`, so every astral
+//! character sorts BELOW every BMP character from `U+E000` up. See [`cmp_units`].
+//!
 //! node-js stores a JS string as a Rust `String` (UTF-8): `fusevm::Value::Str`
 //! and the host heap's `JsObj::Str` are both `String`, and `fusevm` is a pinned
 //! external dependency, so the storage type is not ours to change. Every
@@ -134,6 +141,21 @@ pub fn to_uint16(n: f64) -> u16 {
     (n.trunc().rem_euclid(65536.0)) as u16
 }
 
+/// Lexicographic order over UTF-16 code units — the order JS's `<`/`<=`/`>`/`>=`
+/// and the default `sort` comparator use (7.2.13 IsLessThan step 3.d compares
+/// "the code unit at index k").
+///
+/// Rust's `str: Ord` compares UTF-8 bytes, which is code-point order. The two
+/// disagree exactly when one string reaches an astral character where the other
+/// has a BMP character at or above `U+E000`: `"\u{1D4B3}" < "\u{FFFF}"` is
+/// `true` in JS (leading surrogate `0xD835` < `0xFFFF`) and `false` by code
+/// point (`0x1D4B3` > `0xFFFF`).
+///
+/// Decoding is lazy per unit, so the common all-BMP case never allocates.
+pub fn cmp_units(a: &str, b: &str) -> std::cmp::Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
+}
+
 /// The UTF-16 index corresponding to a UTF-8 *byte* offset into `s`.
 pub fn index_of_byte(s: &str, byte: usize) -> U16Index {
     let byte = byte.min(s.len());
@@ -206,6 +228,28 @@ mod tests {
         assert_eq!(byte_of_index(s, U16Index::new(99)), s.len());
         // Index 3 splits the surrogate pair: round down to the pair's start.
         assert_eq!(byte_of_index(s, U16Index::new(3)), 2);
+    }
+
+    /// Code-unit order, not code-point order. Measured on node v26.7.0:
+    /// `["￿","\u{1D4B3}","","a"].sort()` → `["a","𝒳","","￿"]`.
+    #[test]
+    fn relational_order_is_by_code_unit() {
+        use std::cmp::Ordering;
+        // The pair that separates the two orders: an astral char vs a high BMP
+        // char. Rust's own `str` comparison gets this backwards.
+        assert_eq!(cmp_units("𝒳", "\u{FFFF}"), Ordering::Less);
+        assert_eq!("𝒳".cmp("\u{FFFF}"), Ordering::Greater);
+        assert_eq!(cmp_units("𝒳", "\u{E000}"), Ordering::Less);
+        assert_eq!(cmp_units("\u{10FFFF}", "\u{E000}"), Ordering::Less);
+        // Below U+E000 the two orders agree, and equality/prefixes are ordinary.
+        assert_eq!(cmp_units("a", "b"), Ordering::Less);
+        // node: `"café" < "cafz"` is false, `"café" < "cagz"` is true — 'é' is
+        // U+00E9, above 'z', so the tie breaks on the fourth unit either way.
+        assert_eq!(cmp_units("café", "cafz"), Ordering::Greater);
+        assert_eq!(cmp_units("café", "cagz"), Ordering::Less);
+        assert_eq!(cmp_units("ab", "ab"), Ordering::Equal);
+        assert_eq!(cmp_units("ab", "abc"), Ordering::Less);
+        assert_eq!(cmp_units("", "a"), Ordering::Less);
     }
 
     #[test]

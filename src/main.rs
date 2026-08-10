@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let cli = nodejs::cli::parse();
+    nodejs::stdlib::process::install_argv();
 
     if cli.lsp {
         return match nodejs::lsp::run() {
@@ -27,6 +28,13 @@ fn main() -> ExitCode {
 
     if let Some(src) = cli.eval {
         return run_source(&src);
+    }
+
+    // `node -` is Node's EXPLICIT stdin entry point: `-` is the entry argument,
+    // not a filename, and everything after it is a program argument. Treating it
+    // as a path made `echo … | node - q` fail with `cannot read -`.
+    if cli.file.as_deref() == Some("-") {
+        return run_stdin();
     }
 
     if let Some(file) = cli.file {
@@ -70,8 +78,17 @@ fn main() -> ExitCode {
     }
 
     // No file and non-interactive stdin: run stdin as a script.
+    run_stdin()
+}
+
+/// Read the whole of stdin and run it as a script. Node names this entry point
+/// `[stdin]` (not `[eval]`) in `__filename`, `module.id` and stack frames.
+fn run_stdin() -> ExitCode {
     let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
-    run_source(&src)
+    match nodejs::eval_str_from(&src, "[stdin]") {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
 }
 
 fn run_source(src: &str) -> ExitCode {

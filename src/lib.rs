@@ -124,12 +124,23 @@ pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
 }
 
 /// Parse/load, compile, and run a JS source string on a fresh host (rkyv-cached).
+///
+/// This is the `node -e` entry point; [`eval_str_from`] names the other
+/// source-on-the-command-line one, which reports a different `__filename`.
 pub fn eval_str(src: &str) -> Result<Value, String> {
+    eval_str_from(src, "[eval]")
+}
+
+/// [`eval_str`] with the entry-point NAME node reports for it: `[eval]` for
+/// `-e`, `[stdin]` for source piped in. The two are observably different —
+/// `__filename`, `module.id` and a stack frame's file all carry it.
+pub fn eval_str_from(src: &str, origin: &str) -> Result<Value, String> {
     host::reset_host();
     // `node -e` resolves top-level `require` from the current working directory.
     if let Ok(cwd) = std::env::current_dir() {
         module::set_entry_dir(cwd);
     }
+    module::install_entry_globals(origin);
     run_compiled(compile_or_load(src)?)
 }
 
@@ -189,6 +200,14 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         .unwrap_or_default();
     let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     module::set_entry_dir(dir);
+    // `__filename` is the entry script's REALPATH, not the path that was typed:
+    // Node's loader calls `toRealPath` on the main module, so a script reached
+    // through a symlinked directory reports the link TARGET. (`process.argv[1]`
+    // is the opposite — it keeps the spelling; both measured on node v26.7.0.)
+    let entry = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| stdlib::path::resolve_one(path));
+    module::install_entry_globals(&entry);
     run_compiled(compile_or_load(&src)?)
 }
 

@@ -877,9 +877,40 @@ pub(crate) fn to_base64(bytes: &[u8]) -> String {
     out
 }
 
-/// Decode a standard base64 string to bytes (ignores whitespace and padding).
+/// URL-safe base64 (RFC 4648 §5) of `bytes`: `+/` become `-_` and the `=`
+/// padding is dropped. This is `buf.toString('base64url')`, which is a distinct
+/// encoding from `'base64'` — not an alias. Node emits `Buffer.from([251,255,
+/// 190,1]).toString('base64url')` as `-_--AQ` where `'base64'` gives `+/++AQ==`.
+pub(crate) fn to_base64url(bytes: &[u8]) -> String {
+    to_base64(bytes)
+        .chars()
+        .filter(|c| *c != '=')
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// Decode a base64 string to bytes (ignores whitespace and padding).
+///
+/// BOTH alphabets are accepted, in either direction: node decodes `-_` under
+/// `'base64'` and `+/` under `'base64url'` (measured — `Buffer.from('-_-_',
+/// 'base64').toString('hex')` and `Buffer.from('+/+/','base64url')
+/// .toString('hex')` are both `fbffbf` on v26.7.0), so the decoder does not need
+/// to know which name it was reached by. Refusing the URL-safe characters here
+/// silently produced an EMPTY buffer, because an unrecognized character is
+/// dropped rather than rejected.
 pub(crate) fn from_base64(s: &str) -> Vec<u8> {
-    let rev = |c: u8| -> Option<u32> { B64.iter().position(|&x| x == c).map(|p| p as u32) };
+    let rev = |c: u8| -> Option<u32> {
+        let c = match c {
+            b'-' => b'+',
+            b'_' => b'/',
+            c => c,
+        };
+        B64.iter().position(|&x| x == c).map(|p| p as u32)
+    };
     let vals: Vec<u32> = s.bytes().filter_map(rev).collect();
     let mut out = Vec::new();
     for chunk in vals.chunks(4) {

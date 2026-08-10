@@ -2462,6 +2462,10 @@ const GLOBAL_FUNCS: &[&str] = &[
     "decodeURIComponent",
     "encodeURI",
     "decodeURI",
+    // Annex B legacy encoders. Still globals on every engine, and still called
+    // by pre-`encodeURIComponent` library code.
+    "escape",
+    "unescape",
     "eval",
     "String",
     "Number",
@@ -2776,6 +2780,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "encodeURI" => uri_encode(&with_host(|h| h.str_of(&arg0(&args))), true),
         "decodeURIComponent" => uri_decode(&with_host(|h| h.str_of(&arg0(&args))), false),
         "decodeURI" => uri_decode(&with_host(|h| h.str_of(&arg0(&args))), true),
+        "escape" => legacy_escape(&with_host(|h| h.str_of(&arg0(&args)))),
+        "unescape" => legacy_unescape(&with_host(|h| h.str_of(&arg0(&args)))),
         // Reaching `eval` through this table means the eval FUNCTION VALUE was
         // called — `(0, eval)(src)`, `const e = eval; e(src)`, `[eval][0](src)`.
         // Those are INDIRECT evals and run in the global scope. A literal
@@ -3491,6 +3497,82 @@ fn uri_decode(s: &str, uri: bool) -> Result<Value, String> {
         Ok(decoded) => Ok(with_host(|h| h.new_str(decoded))),
         Err(_) => Err("URIError: URI malformed".into()),
     }
+}
+
+/// `escape` (Annex B.2.1.1) — the pre-`encodeURIComponent` legacy encoder, still
+/// present in every engine and still reached by old libraries (jQuery's cookie
+/// plugin, `querystring`-era code). It works on UTF-16 CODE UNITS, not UTF-8
+/// bytes, which is what separates it from `encodeURIComponent`: a unit below
+/// `0x100` becomes `%XX`, anything above becomes `%uXXXX`, so an astral
+/// character yields the two escapes of its surrogate pair
+/// (`escape("\u{1D4B3}")` is `"%uD835%uDCB3"` on node v26.7.0).
+///
+/// The unescaped set is frozen by the spec and is NOT the URI unreserved set —
+/// it keeps `@*_+-./` and drops `!~'()`.
+fn legacy_escape(s: &str) -> Result<Value, String> {
+    const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+    let mut out = String::with_capacity(s.len());
+    for u in s.encode_utf16() {
+        if u < 0x100 {
+            if KEEP.contains(&(u as u8)) {
+                out.push(u as u8 as char);
+            } else {
+                out.push_str(&format!("%{u:02X}"));
+            }
+        } else {
+            out.push_str(&format!("%u{u:04X}"));
+        }
+    }
+    Ok(with_host(|h| h.new_str(out)))
+}
+
+/// `unescape` (Annex B.2.1.2) — the inverse of [`legacy_escape`]. Unlike
+/// `decodeURIComponent` it never throws: a `%` that does not begin a well-formed
+/// `%XX` or `%uXXXX` escape is passed through literally
+/// (`unescape("%u0041%42%zz%2")` is `"AB%zz%2"` on node v26.7.0).
+///
+/// Decoding is done in code-unit space and re-joined at the end so a
+/// `%uD835%uDCB3` pair recomposes into the one astral character it came from.
+fn legacy_unescape(s: &str) -> Result<Value, String> {
+    let b = s.as_bytes();
+    let hex = |i: usize, n: usize| -> Option<u16> {
+        if i + n > b.len() {
+            return None;
+        }
+        let mut v: u16 = 0;
+        for &c in &b[i..i + n] {
+            v = v.checked_mul(16)? + (c as char).to_digit(16)? as u16;
+        }
+        Some(v)
+    };
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < b.len() {
+        // Escapes are pure ASCII, so a byte index is a unit index up to here —
+        // but the tail may not be, so non-`%` bytes are re-decoded as chars.
+        if b[i] == b'%' {
+            if let Some(u) = hex(i + 1, 2) {
+                out.push(u);
+                i += 3;
+                continue;
+            }
+            if b.get(i + 1) == Some(&b'u') {
+                if let Some(u) = hex(i + 2, 4) {
+                    out.push(u);
+                    i += 6;
+                    continue;
+                }
+            }
+        }
+        let c = s[i..].chars().next().unwrap_or('%');
+        let mut buf = [0u16; 2];
+        out.extend_from_slice(c.encode_utf16(&mut buf));
+        i += c.len_utf8();
+    }
+    Ok(with_host(|h| {
+        h.new_str(crate::utf16::to_string_lossy(&out))
+    }))
 }
 
 fn parse_int(args: &[Value]) -> f64 {
@@ -4619,6 +4701,8 @@ fn is_string_method(name: &str) -> bool {
             | "search"
             | "normalize"
             | "localeCompare"
+            | "isWellFormed"
+            | "toWellFormed"
     )
 }
 
@@ -5288,9 +5372,12 @@ fn sort_values(items: &mut [Value], cmp: Option<&Value>) -> Result<(), String> {
                     with_host(|h| h.to_number(&v))
                 }
                 None => {
+                    // 23.1.3.30.2 SortCompare with no comparator: compare the
+                    // ToString of each element by CODE UNIT (`utf16::cmp_units`),
+                    // which differs from Rust's `String` order off the BMP.
                     let a = with_host(|h| h.str_of(&items[j - 1]));
                     let b = with_host(|h| h.str_of(&items[j]));
-                    if a > b {
+                    if crate::utf16::cmp_units(&a, &b) == std::cmp::Ordering::Greater {
                         1.0
                     } else {
                         -1.0
@@ -5415,6 +5502,16 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             Ok(Value::Float(r))
         }
         "normalize" => Ok(new_s(s.to_string())),
+        // ES2024 well-formedness (22.1.3.9 / 22.1.3.29). A `String` here is a
+        // Rust `String`, whose `char` type EXCLUDES `U+D800..=U+DFFF`, so every
+        // value this runtime can hold is well-formed by construction and
+        // `toWellFormed` has nothing to replace. Both answers are therefore
+        // exact for every string that survives storage; the one case node
+        // answers differently is a surrogate half extracted by `charAt`/`slice`,
+        // which is already `U+FFFD` here — the documented lone-surrogate
+        // boundary in `utf16`, not a separate gap.
+        "isWellFormed" => Ok(Value::Bool(true)),
+        "toWellFormed" => Ok(new_s(s.to_string())),
         "trim" => Ok(new_s(s.trim().to_string())),
         "trimStart" => Ok(new_s(s.trim_start().to_string())),
         "trimEnd" => Ok(new_s(s.trim_end().to_string())),

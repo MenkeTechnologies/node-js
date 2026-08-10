@@ -130,7 +130,13 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
   `"ab𝒳cd".indexOf("c")` is `4`. `[Symbol.iterator]` still yields code points
   (`[..."𝒳"]` is one element). `src/utf16.rs` is the single UTF-8 ⇄ UTF-16
   boundary; see BUGS.md for the one remaining gap (a value holding an unpaired
-  surrogate, which a Rust `String` cannot represent).
+  surrogate, which a Rust `String` cannot represent). The same unit count drives
+  relational comparison and the default `sort` order (an astral character sorts
+  BELOW every BMP character from `U+E000` up), and the Buffer encodings defined
+  over code units — `utf16le`/`ucs2` and the low byte each unit contributes to
+  `latin1`/`ascii`.
+- Annex B `escape`/`unescape` and ES2024
+  `String.prototype.isWellFormed`/`toWellFormed`.
 - `class` declarations and expressions: inheritance and `super`, static and
   instance fields, getters/setters, private `#` names, and a class body that
   evaluates in its own environment (so a static initializer can name its class).
@@ -173,6 +179,12 @@ installed.
 diffs `node -e` against the reference `node -e`, delta-debugging every divergence
 to a minimal repro. It is subprocess-only (never links the lib), std-only (no
 `rand`), and needs `node` on `PATH`, so CI never runs it.
+
+The two tools deliberately drive DIFFERENT entry points — the corpus runs each
+case as a script FILE, the fuzzer through `-e` — because Node itself answers
+differently at each (`__filename`, `module.id`, `process.argv`,
+`process.execArgv`, top-level `this`). BUGS.md tabulates the full set; a case
+that touches any of it is measuring one entry point, not "node".
 
 ```sh
 cargo build --bin parity --bin parity-fuzz

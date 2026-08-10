@@ -67,6 +67,51 @@ pub fn entry_dir() -> PathBuf {
     ENTRY_DIR.with(|d| d.borrow().clone())
 }
 
+/// Install the CJS wrapper variables the ENTRY script sees.
+///
+/// A `require`d module already receives `exports`/`require`/`module`/`__dirname`
+/// /`__filename` as wrapper parameters (see [`compile_wrapper`]); the entry
+/// script used to receive none of them, so `typeof module` was `"undefined"`
+/// there and every UMD header took its browser branch. Node gives the entry
+/// script the same five names, with values that DEPEND ON THE ENTRY POINT:
+///
+/// | | `node f.js` | `node -e` | `node -` / piped |
+/// | --- | --- | --- | --- |
+/// | `__filename` | resolved abs path | `[eval]` | `[stdin]` |
+/// | `__dirname` | its directory | `.` | `.` |
+/// | `module.id` | `.` | `[eval]` | `[stdin]` |
+/// | `module.path` | its directory | `.` | `.` |
+///
+/// `module.filename` is `path.resolve(__filename)` in every case, so under `-e`
+/// it is `<cwd>/[eval]` — a path that does not exist, which is Node's own
+/// value. Measured on node v26.7.0.
+///
+/// `origin` is the `__filename` value: an absolute script path, or `[eval]` /
+/// `[stdin]` for the two source-on-the-command-line entry points.
+pub fn install_entry_globals(origin: &str) {
+    let from_file = origin != "[eval]" && origin != "[stdin]";
+    let (dirname, id) = if from_file {
+        let dir = Path::new(origin)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".into());
+        (dir, ".".to_string())
+    } else {
+        (".".to_string(), origin.to_string())
+    };
+    let filename = crate::stdlib::path::resolve_one(origin);
+    let module = new_module(&id, &dirname, &filename);
+    let exports = module_exports(&module);
+    with_host(|h| {
+        let origin_str = h.new_str(origin.to_string());
+        let dirname = h.new_str(dirname);
+        h.set_global("__filename", origin_str);
+        h.set_global("__dirname", dirname);
+        h.set_global("module", module.clone());
+        h.set_global("exports", exports);
+    });
+}
+
 // ── resolution ───────────────────────────────────────────────────────────────
 
 /// Append `.ext` to a path (Node appends the extension, it does not replace an
@@ -198,11 +243,16 @@ pub fn resolve(spec: &str, from_dir: &Path) -> Option<PathBuf> {
         spec.starts_with("./") || spec.starts_with("../") || spec == "." || spec == "..";
     let is_absolute = spec.starts_with('/');
     if is_relative || is_absolute {
-        let base = if is_absolute {
-            PathBuf::from(spec)
+        // NORMALIZED, not merely joined: `Path::join` keeps the `.` in
+        // `<dir>/./d.js`, and that string is what `require.resolve` returns and
+        // what keys the module cache — so `./d.js` and `d.js` from the same
+        // directory would be two cache entries of one file.
+        let joined = if is_absolute {
+            spec.to_string()
         } else {
-            from_dir.join(spec)
+            from_dir.join(spec).to_string_lossy().into_owned()
         };
+        let base = PathBuf::from(crate::stdlib::path::resolve_one(&joined));
         return load_as_file(&base).or_else(|| load_as_dir(&base));
     }
     resolve_bare(spec, from_dir)
@@ -241,7 +291,15 @@ fn load_file(path: &Path) -> Result<Value, String> {
         let val = crate::builtins::call_builtin_function("JSON.parse", vec![src])?;
         // A JSON module's value IS the parsed data; cache a synthetic wrapper so
         // repeated requires share it.
-        let module = new_module(val.clone());
+        let abs = path.to_string_lossy().into_owned();
+        let dir = path.parent().unwrap_or(Path::new("")).to_string_lossy();
+        let module = new_module(&abs, &dir, &abs);
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(&module) {
+                p.insert("exports".to_string(), val.clone());
+                p.insert("loaded".to_string(), Value::Bool(true));
+            }
+        });
         CACHE.with(|c| c.borrow_mut().insert(path.to_path_buf(), module));
         return Ok(val);
     }
@@ -255,9 +313,11 @@ fn load_file(path: &Path) -> Result<Value, String> {
     let wrapper = compile_wrapper(&source)
         .map_err(|e| format!("{e}\n    while loading {}", path.display()))?;
 
-    // `module = { exports: {} }`, plus the aliases the wrapper receives.
-    let exports = with_host(|h| h.new_object(indexmap::IndexMap::new()));
-    let module = new_module(exports.clone());
+    // The `module` object, plus the aliases the wrapper receives. A required
+    // module's `id` IS its absolute filename (only the entry module's is `.`).
+    let abs = path.to_string_lossy().into_owned();
+    let module = new_module(&abs, &dir.to_string_lossy(), &abs);
+    let exports = module_exports(&module);
     let require_fn = make_require(&dir)?;
     let (dirname, filename) = with_host(|h| {
         (
@@ -275,17 +335,53 @@ fn load_file(path: &Path) -> Result<Value, String> {
         vec![exports, require_fn, module.clone(), dirname, filename],
         None,
     )?;
+    mark_loaded(&module);
 
     Ok(module_exports(&module))
 }
 
-/// A fresh `module` object holding `exports`.
-fn new_module(exports: Value) -> Value {
+/// A fresh `module` object: `{ id, path, exports, filename, loaded, children,
+/// paths }`, in that key order.
+///
+/// The order is observable (`Object.keys(module)`) and this is node's. Only
+/// `exports` used to be present, so a module reading `module.id` or
+/// `module.filename` — both of which a bundler-emitted or `__dirname`-avoiding
+/// package does — got `undefined`.
+///
+/// `paths` is the `node_modules` chain from `dir` up to the root, the same walk
+/// `require` performs to resolve a bare specifier. `loaded` starts `false`; it
+/// is set once the body returns.
+fn new_module(id: &str, dir: &str, filename: &str) -> Value {
+    let mut node_modules: Vec<String> = Vec::new();
+    let mut cur = Some(Path::new(dir));
+    while let Some(d) = cur.filter(|d| !d.as_os_str().is_empty()) {
+        node_modules.push(d.join("node_modules").to_string_lossy().into_owned());
+        cur = d.parent();
+    }
     with_host(|h| {
+        let exports = h.new_object(indexmap::IndexMap::new());
         let mut props = indexmap::IndexMap::new();
+        props.insert("id".to_string(), h.new_str(id.to_string()));
+        props.insert("path".to_string(), h.new_str(dir.to_string()));
         props.insert("exports".to_string(), exports);
+        props.insert("filename".to_string(), h.new_str(filename.to_string()));
+        props.insert("loaded".to_string(), Value::Bool(false));
+        let children = h.new_array(Vec::new());
+        props.insert("children".to_string(), children);
+        let paths: Vec<Value> = node_modules.into_iter().map(|p| h.new_str(p)).collect();
+        let paths = h.new_array(paths);
+        props.insert("paths".to_string(), paths);
         h.new_object(props)
     })
+}
+
+/// Flip `module.loaded` once the body has run, as Node's loader does.
+fn mark_loaded(module: &Value) {
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(module) {
+            p.insert("loaded".to_string(), Value::Bool(true));
+        }
+    });
 }
 
 /// Read `module.exports` (falls back to `undefined` for a malformed module).

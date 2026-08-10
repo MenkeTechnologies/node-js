@@ -3,9 +3,10 @@
 //! string, holding back an incomplete trailing multibyte sequence until the next
 //! chunk completes it.
 //!
-//! node-js decodes each chunk whole (buffering a split UTF-8 tail): enough for the
-//! iconv-lite `internal` codec that requires this module, and correct for any
-//! single-chunk decode.
+//! Every encoding that has a chunk boundary buffers across it: UTF-8 holds an
+//! incomplete trailing sequence, UTF-16LE holds an odd byte and a trailing high
+//! surrogate, and base64 holds up to two bytes so it only ever emits whole
+//! 3-byte groups. The single-byte encodings consume everything.
 
 use crate::host::{with_host, JsObj};
 use fusevm::Value;
@@ -15,6 +16,20 @@ use indexmap::IndexMap;
 /// prototype object is built from, so a read (`sd.write`), a call (`sd.write(b)`)
 /// and a prototype lookup (`StringDecoder.prototype.write`) cannot disagree.
 pub const INSTANCE_METHODS: &[&str] = &["write", "end"];
+
+/// Node's `normalizeEncoding`: the `encoding` property reports the CANONICAL
+/// name, not the spelling that was passed — `new StringDecoder('ucs2').encoding`
+/// is `'utf16le'` and `new StringDecoder('UTF-8').encoding` is `'utf8'`. Code
+/// that branches on `decoder.encoding` (iconv-lite does) sees the canonical set.
+fn normalize_encoding(enc: &str) -> String {
+    match enc.to_ascii_lowercase().as_str() {
+        "utf8" | "utf-8" => "utf8",
+        "ucs2" | "ucs-2" | "utf16le" | "utf-16le" => "utf16le",
+        "latin1" | "binary" => "latin1",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
 
 /// `new StringDecoder([encoding])`.
 pub fn construct(args: &[Value]) -> Result<Value, String> {
@@ -26,7 +41,7 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("StringDecoder"));
-        m.insert("encoding".into(), h.new_str(enc.to_ascii_lowercase()));
+        m.insert("encoding".into(), h.new_str(normalize_encoding(&enc)));
         // Held-back bytes from a UTF-8 sequence split across chunks.
         let empty = h.new_array(Vec::new());
         m.insert("@@pending".into(), empty);
@@ -94,13 +109,8 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 buf.extend(bytes_of(v));
             }
             set_pending(recv, &[]);
-            // Flush the completed head; a dangling incomplete multibyte sequence
-            // becomes a single U+FFFD replacement char (matching Node, which emits
-            // one replacement for the whole held-back sequence, not one per byte).
             let (mut decoded, tail) = decode(&enc, &buf);
-            if !tail.is_empty() {
-                decoded.push('\u{FFFD}');
-            }
+            decoded.push_str(&flush(&enc, &tail));
             Ok(with_host(|h| h.new_str(decoded)))
         }
         _ => Err(crate::host::type_error(&format!(
@@ -109,14 +119,77 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
     }
 }
 
+/// What `end()` emits for bytes still held when the stream closes. Each encoding
+/// resolves its own remainder, so this is not one blanket replacement char:
+///
+/// * UTF-8 — one `U+FFFD` for the whole truncated sequence (not one per byte).
+/// * UTF-16LE — a held HIGH SURROGATE is emitted as a code unit; a dangling odd
+///   byte is dropped silently, with no replacement char (measured on node
+///   v26.7.0: `d.write(Buffer.from([0x61])); d.end()` is `''`). The lone
+///   surrogate itself becomes `U+FFFD` here — the `utf16` storage boundary.
+/// * base64 — the short group is padded and emitted (`AQ==`), which is the whole
+///   reason the bytes were held rather than encoded early.
+fn flush(enc: &str, tail: &[u8]) -> String {
+    if tail.is_empty() {
+        return String::new();
+    }
+    match enc {
+        "base64" => super::to_base64(tail),
+        "base64url" => super::to_base64url(tail),
+        "utf16le" => {
+            let units: Vec<u16> = tail
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            crate::utf16::to_string_lossy(&units)
+        }
+        _ => "\u{FFFD}".to_string(),
+    }
+}
+
 /// Decode `buf` in `enc`, returning (decoded string, held-back trailing bytes).
-/// Only UTF-8 holds back an incomplete trailing sequence; single-byte encodings
-/// consume everything.
+/// Single-byte encodings consume everything; the rest hold back the partial tail
+/// that only the next chunk can complete.
 fn decode(enc: &str, buf: &[u8]) -> (String, Vec<u8>) {
     match enc {
-        "ascii" | "latin1" | "binary" => (buf.iter().map(|b| *b as char).collect(), Vec::new()),
+        // `ascii` masks the high bit, `latin1`/`binary` keep the whole byte.
+        "ascii" => (
+            buf.iter().map(|b| (*b & 0x7f) as char).collect(),
+            Vec::new(),
+        ),
+        "latin1" => (buf.iter().map(|b| *b as char).collect(), Vec::new()),
         "hex" => (super::to_hex(buf), Vec::new()),
-        "base64" | "base64url" => (super::to_base64(buf), Vec::new()),
+        // Base64 is 3 bytes → 4 characters. Emitting a short group would pad it
+        // mid-stream (`AQ==` then `AgM=` instead of `AQID`), so the remainder is
+        // held until the group closes or `end()` pads it.
+        "base64" | "base64url" => {
+            let keep = buf.len() % 3;
+            let (head, tail) = buf.split_at(buf.len() - keep);
+            let s = if enc == "base64url" {
+                super::to_base64url(head)
+            } else {
+                super::to_base64(head)
+            };
+            (s, tail.to_vec())
+        }
+        // UTF-16LE: an odd trailing byte is half a code unit, and a trailing HIGH
+        // surrogate is half a code point — both wait for the next chunk.
+        "utf16le" => {
+            let mut keep = buf.len() % 2;
+            let whole = buf.len() - keep;
+            if whole >= 2 {
+                let last = u16::from_le_bytes([buf[whole - 2], buf[whole - 1]]);
+                if (0xD800..0xDC00).contains(&last) {
+                    keep += 2;
+                }
+            }
+            let (head, tail) = buf.split_at(buf.len() - keep);
+            let units: Vec<u16> = head
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            (crate::utf16::to_string_lossy(&units), tail.to_vec())
+        }
         // utf8 / utf-8 (and anything else): keep a split multibyte tail pending.
         _ => {
             let split = incomplete_utf8_tail(buf);

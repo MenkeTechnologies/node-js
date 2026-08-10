@@ -2704,7 +2704,9 @@ impl JsHost {
             // BigInt < BigInt: exact (no f64 precision loss for large magnitudes).
             x.cmp(&y)
         } else if let (Some(x), Some(y)) = (self.as_str(a), self.as_str(b)) {
-            x.cmp(&y)
+            // 7.2.13 IsLessThan compares CODE UNITS, which is not Rust's `str`
+            // order once an astral character meets a BMP one — see `utf16`.
+            crate::utf16::cmp_units(&x, &y)
         } else {
             let x = self.to_number(a);
             let y = self.to_number(b);

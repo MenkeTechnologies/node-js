@@ -75,6 +75,9 @@ pub const INSTANCE_METHODS: &[&str] = &[
     "values",
     "keys",
     "entries",
+    "swap16",
+    "swap32",
+    "swap64",
 ];
 
 /// Free functions of the `buffer` module itself (`require('buffer').atob`, …), as
@@ -151,9 +154,17 @@ fn bytes_to_string(bytes: &[u8], enc: &str) -> String {
 }
 
 /// Encode a Rust string into `enc` bytes (for `transcode`).
+///
+/// `transcode` is ICU, not `Buffer.from`, so its `ascii` arm SUBSTITUTES rather
+/// than truncates: node renders `transcode(Buffer.from('aÿ'),'utf8','ascii')` as
+/// `61 3f` — an unrepresentable character becomes `?`.
 fn string_to_bytes(s: &str, enc: &str) -> Vec<u8> {
     match enc.to_ascii_lowercase().as_str() {
-        "ascii" | "latin1" | "binary" => s.chars().map(|c| c as u32 as u8).collect(),
+        "ascii" => s
+            .chars()
+            .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
+            .collect(),
+        "latin1" | "binary" => s.chars().map(|c| c as u32 as u8).collect(),
         "utf16le" | "utf-16le" | "ucs2" | "ucs-2" => {
             s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
         }
@@ -392,8 +403,14 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         "alloc" => {
             let n = super::arg_num(args, 0).max(0.0) as usize;
             // A string fill repeats to length n; a numeric fill is a single byte.
+            // alloc(size[, fill[, encoding]]).
             let pat = if args.len() > 1 {
-                fill_pattern(args, 1)
+                let enc = if args.len() > 2 {
+                    arg_str(args, 2)
+                } else {
+                    "utf8".into()
+                };
+                fill_pattern(args, 1, &enc)
             } else {
                 vec![0]
             };
@@ -559,13 +576,31 @@ fn concat(args: &[Value]) -> Result<Value, String> {
 pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     let bytes = bytes_of(recv);
     match method {
+        // toString([encoding[, start[, end]]]) — the range was ignored, so every
+        // partial read (`buf.toString('utf8', 1, 3)`) returned the WHOLE buffer.
         "toString" => {
-            let enc = if args.is_empty() {
-                "utf8".into()
-            } else {
-                arg_str(args, 0)
+            let enc = match args.first() {
+                None | Some(Value::Undef) => "utf8".into(),
+                _ => arg_str(args, 0),
             };
-            Ok(with_host(|h| h.new_str(encode_bytes(&bytes, &enc))))
+            let len = bytes.len();
+            let clamp = |i: usize| -> usize {
+                let n = super::arg_num(args, i);
+                if n.is_nan() {
+                    0
+                } else {
+                    n.clamp(0.0, len as f64) as usize
+                }
+            };
+            let start = if args.len() > 1 { clamp(1) } else { 0 };
+            let end = if args.len() > 2 { clamp(2) } else { len };
+            // An inverted range is empty, not reversed.
+            let slice = if start < end {
+                &bytes[start..end]
+            } else {
+                &[][..]
+            };
+            Ok(with_host(|h| h.new_str(encode_bytes(slice, &enc))))
         }
         "toJSON" => Ok(with_host(|h| {
             let data = h.new_array(bytes.iter().map(|b| Value::Float(*b as f64)).collect());
@@ -587,30 +622,54 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let i = super::arg_num(args, 0).max(0.0) as usize;
             Ok(Value::Float(*bytes.get(i).unwrap_or(&0) as f64))
         }
+        // indexOf/lastIndexOf/includes(value[, byteOffset][, encoding]) — both
+        // trailing arguments used to be ignored, so a search always started at 0
+        // and always read the needle as UTF-8.
         "includes" | "indexOf" | "lastIndexOf" => {
+            let len = bytes.len();
+            let last = method == "lastIndexOf";
+            // `byteOffset` is a string when it is really the encoding.
+            let (from, enc) = match args.get(1) {
+                None | Some(Value::Undef) => (None, arg_str(args, 2)),
+                Some(v) if with_host(|h| h.as_str(v)).is_some() => (None, arg_str(args, 1)),
+                _ => (Some(super::arg_num(args, 1)), arg_str(args, 2)),
+            };
+            let enc = if enc.is_empty() { "utf8".into() } else { enc };
             // The needle is a string, a byte value, or another Buffer.
             let target = args.first().cloned().unwrap_or(Value::Undef);
             let needle = match &target {
                 Value::Int(_) | Value::Float(_) => vec![super::arg_num(args, 0) as u8],
                 // A Buffer or any other typed array searches by its bytes.
                 _ if bytes_like(&target).is_some() => bytes_like(&target).unwrap_or_default(),
-                _ => decode_str(&arg_str(args, 0), "utf8"),
+                _ => decode_str(&arg_str(args, 0), &enc),
             };
-            // An empty needle matches at 0 (indexOf) / len (lastIndexOf), like Node.
-            let pos = if needle.is_empty() {
-                Some(if method == "lastIndexOf" {
-                    bytes.len()
-                } else {
+            // A negative offset counts back from the end; NaN is 0. Out of range
+            // means "no room to match" forwards, and "whole buffer" backwards.
+            let from = from.map(|n| {
+                if n.is_nan() {
                     0
-                })
-            } else if method == "lastIndexOf" {
-                bytes
+                } else if n < 0.0 {
+                    (len as f64 + n).max(0.0) as usize
+                } else {
+                    (n as usize).min(len)
+                }
+            });
+            // An empty needle matches at the offset itself, clamped to the length.
+            let pos = if needle.is_empty() {
+                Some(from.unwrap_or(if last { len } else { 0 }).min(len))
+            } else if last {
+                // lastIndexOf searches at or before the offset, so the match may
+                // start at `from` itself and run past it.
+                let hi = (from.unwrap_or(len) + needle.len()).min(len);
+                bytes[..hi]
                     .windows(needle.len())
                     .rposition(|w| w == needle.as_slice())
             } else {
-                bytes
+                let lo = from.unwrap_or(0);
+                bytes[lo..]
                     .windows(needle.len())
                     .position(|w| w == needle.as_slice())
+                    .map(|p| p + lo)
             };
             if method == "includes" {
                 Ok(Value::Bool(pos.is_some()))
@@ -743,39 +802,77 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             Ok(Value::Float((off + 4) as f64))
         }
         // write(string[, offset[, length]][, encoding]) — returns bytes written.
+        // `length` and `encoding` used to be ignored entirely: every write was
+        // UTF-8 and ran to the end of the buffer.
         "write" => {
             let mut b = bytes.clone();
-            let src = decode_str(&arg_str(args, 0), "utf8");
-            let off = if args.len() > 1 {
-                super::arg_num(args, 1).max(0.0) as usize
-            } else {
-                0
+            let Some((off, max, enc)) = write_args(args, b.len()) else {
+                return Err(crate::host::range_error(&format!(
+                    "The value of \"offset\" is out of range. It must be >= 0 && <= {}. Received {}",
+                    b.len(),
+                    super::arg_num(args, 1)
+                )));
             };
-            let mut n = 0;
-            for (k, &byte) in src.iter().enumerate() {
-                if off + k < b.len() {
-                    b[off + k] = byte;
-                    n += 1;
-                }
-            }
+            let src = truncate_chars(&arg_str(args, 0), &enc, max);
+            let n = src.len().min(b.len().saturating_sub(off));
+            b[off..off + n].copy_from_slice(&src[..n]);
             set_bytes(recv, &b);
             Ok(Value::Float(n as f64))
         }
+        // swap16/32/64 reverse each 2/4/8-byte group IN PLACE and return the
+        // same Buffer, so `b.swap16()` mutates `b`. A length that is not a whole
+        // number of groups is a RangeError rather than a partial swap.
+        "swap16" | "swap32" | "swap64" => {
+            let group = match method {
+                "swap16" => 2,
+                "swap32" => 4,
+                _ => 8,
+            };
+            if bytes.len() % group != 0 {
+                return Err(crate::host::range_error(&format!(
+                    "Buffer size must be a multiple of {}-bits",
+                    group * 8
+                )));
+            }
+            let mut b = bytes.clone();
+            for c in b.chunks_mut(group) {
+                c.reverse();
+            }
+            set_bytes(recv, &b);
+            Ok(recv.clone())
+        }
         // fill(value[, start[, end]]) — value is a byte or a repeated string.
+        // fill(value[, offset[, end]][, encoding]). A STRING in the `offset` or
+        // `end` slot is the encoding, and node then resets the range to the
+        // whole buffer rather than shifting the remaining arguments left — so
+        // `fill('41','hex',1,3)` fills all of it, not `1..3`.
         "fill" => {
             let mut b = bytes.clone();
             let len = b.len();
-            let start = if args.len() > 1 {
-                super::arg_num(args, 1).max(0.0) as usize
+            let (start, end, enc) = if arg_is_str(args, 1) {
+                (0, len, arg_str(args, 1))
+            } else if arg_is_str(args, 2) {
+                let s = (super::arg_num(args, 1).max(0.0) as usize).min(len);
+                (s, len, arg_str(args, 2))
             } else {
-                0
+                let s = if args.len() > 1 {
+                    (super::arg_num(args, 1).max(0.0) as usize).min(len)
+                } else {
+                    0
+                };
+                let e = if args.len() > 2 {
+                    (super::arg_num(args, 2).max(0.0) as usize).min(len)
+                } else {
+                    len
+                };
+                let enc = if args.len() > 3 {
+                    arg_str(args, 3)
+                } else {
+                    "utf8".into()
+                };
+                (s, e, enc)
             };
-            let end = if args.len() > 2 {
-                (super::arg_num(args, 2) as usize).min(len)
-            } else {
-                len
-            };
-            let pat = fill_pattern(args, 0);
+            let pat = fill_pattern(args, 0, &enc);
             if !pat.is_empty() {
                 for (k, slot) in b[start..end.max(start)].iter_mut().enumerate() {
                     *slot = pat[k % pat.len()];
@@ -847,19 +944,26 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
 }
 
 /// The fill pattern at `args[idx]`: a string's utf-8 bytes, else a single byte.
-fn fill_pattern(args: &[Value], idx: usize) -> Vec<u8> {
+fn fill_pattern(args: &[Value], idx: usize, enc: &str) -> Vec<u8> {
     match args.get(idx) {
         None => vec![0],
         Some(v) => {
             let is_str = matches!(v, Value::Str(_))
                 || with_host(|h| matches!(h.get(v), Some(JsObj::Str(_))));
             if is_str {
-                decode_str(&arg_str(args, idx), "utf8")
+                decode_str(&arg_str(args, idx), enc)
             } else {
                 vec![super::arg_num(args, idx) as u8]
             }
         }
     }
+}
+
+/// Whether `args[i]` is a string — the test that separates a positional
+/// `offset`/`end` from a trailing `encoding` in `fill`/`write`/`indexOf`.
+fn arg_is_str(args: &[Value], i: usize) -> bool {
+    args.get(i)
+        .is_some_and(|v| with_host(|h| h.as_str(v)).is_some())
 }
 
 /// Overwrite `recv`'s backing `@@bytes` array (for in-place buffer writes).
@@ -898,11 +1002,27 @@ fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
     (s.min(e), e.max(s))
 }
 
+/// String → bytes under a Node buffer encoding.
+///
+/// The `utf16le` family and `base64url` used to fall through to the UTF-8 arm,
+/// which is silent corruption rather than a missing feature: `Buffer.from('abc',
+/// 'utf16le')` produced the 3 bytes `616263` instead of node's 6 bytes
+/// `610062006300`, and every `byteLength`/`write`/`fill` that funnels through
+/// here inherited the wrong count.
 fn decode_str(s: &str, enc: &str) -> Vec<u8> {
     match enc.to_ascii_lowercase().as_str() {
         "hex" => from_hex(s),
         "base64" | "base64url" => from_base64(s),
-        "ascii" | "latin1" | "binary" => s.chars().map(|c| c as u8).collect(),
+        // One byte per UTF-16 CODE UNIT, not per code point: node writes
+        // `Buffer.from("\u{1D4B3}","latin1")` as the low bytes of the surrogate
+        // pair (`35 b3`), two bytes, not the one low byte of U+1D4B3. Encoding
+        // does NOT mask to 7 bits even for `ascii` — only decoding does.
+        "ascii" | "latin1" | "binary" => s.encode_utf16().map(|u| u as u8).collect(),
+        // A JS string IS UTF-16, so this encoding is the identity on its code
+        // units, written little-endian — not a transcode of the UTF-8 bytes.
+        "utf16le" | "utf-16le" | "ucs2" | "ucs-2" => {
+            s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+        }
         _ => s.as_bytes().to_vec(),
     }
 }
@@ -910,8 +1030,82 @@ fn decode_str(s: &str, enc: &str) -> Vec<u8> {
 pub(crate) fn encode_bytes(bytes: &[u8], enc: &str) -> String {
     match enc.to_ascii_lowercase().as_str() {
         "hex" => to_hex(bytes),
-        "base64" | "base64url" => to_base64(bytes),
-        "ascii" | "latin1" | "binary" => bytes.iter().map(|b| *b as char).collect(),
+        "base64" => to_base64(bytes),
+        "base64url" => super::to_base64url(bytes),
+        // Decoding `ascii` masks off the high bit (node: `Buffer.from([0xff])
+        // .toString('ascii')` is `U+007F`); `latin1` keeps the whole byte.
+        "ascii" => bytes.iter().map(|b| (*b & 0x7f) as char).collect(),
+        "latin1" | "binary" => bytes.iter().map(|b| *b as char).collect(),
+        // A trailing odd byte has no code unit and is dropped, as node does.
+        "utf16le" | "utf-16le" | "ucs2" | "ucs-2" => {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            crate::utf16::to_string_lossy(&units)
+        }
         _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Resolve the `(offset, length, encoding)` triple of `buf.write(string[,
+/// offset[, length]][, encoding])`, whose trailing arguments are positional-
+/// or-encoding depending on their runtime type (node's own `Buffer.prototype
+/// .write` does exactly this dispatch).
+///
+/// `args[0]` is the string; this reads from `args[1]` on. Returns `None` when
+/// the offset is out of range, which is a `RangeError` at the call site.
+fn write_args(args: &[Value], len: usize) -> Option<(usize, usize, String)> {
+    let num = |i: usize| super::arg_num(args, i);
+    // write(string) / write(string, encoding)
+    if args.len() < 2 {
+        return Some((0, len, "utf8".into()));
+    }
+    if arg_is_str(args, 1) {
+        return Some((0, len, arg_str(args, 1)));
+    }
+    let off = num(1);
+    if !(0.0..=len as f64).contains(&off) {
+        return None;
+    }
+    let off = off as usize;
+    // write(string, offset) / write(string, offset, encoding)
+    if args.len() < 3 {
+        return Some((off, len - off, "utf8".into()));
+    }
+    if arg_is_str(args, 2) {
+        return Some((off, len - off, arg_str(args, 2)));
+    }
+    let max = len - off;
+    let n = (num(2).max(0.0) as usize).min(max);
+    let enc = if args.len() > 3 {
+        arg_str(args, 3)
+    } else {
+        "utf8".into()
+    };
+    Some((off, n, enc))
+}
+
+/// Truncate `bytes` to at most `max`, never splitting a multi-byte character.
+///
+/// `buf.write` writes whole characters only: node reports 2, not 4, for
+/// `Buffer.alloc(4).write('é€')` — the 2-byte `é` fits and the 3-byte `€` is
+/// dropped whole rather than half-written. Only the variable-width encodings
+/// need this; the fixed-width ones are already aligned by construction.
+fn truncate_chars(s: &str, enc: &str, max: usize) -> Vec<u8> {
+    let bytes = decode_str(s, enc);
+    if bytes.len() <= max {
+        return bytes;
+    }
+    match enc.to_ascii_lowercase().as_str() {
+        "utf16le" | "utf-16le" | "ucs2" | "ucs-2" => bytes[..max - max % 2].to_vec(),
+        "hex" | "base64" | "base64url" | "ascii" | "latin1" | "binary" => bytes[..max].to_vec(),
+        _ => {
+            let mut end = max;
+            while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+                end -= 1;
+            }
+            bytes[..end].to_vec()
+        }
     }
 }
