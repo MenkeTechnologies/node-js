@@ -1,11 +1,26 @@
 #compdef node
 # zsh completion for node-js `node`.
+#
+# Every flag `src/cli.rs` declares appears here. The list used to hold six of
+# sixteen — nothing it named was rejected, but ten working flags could not be
+# completed, and it disagreed with man/node.1, which named a different subset.
 _node() {
   _arguments -s \
     '(-e --eval)'{-e,--eval}'[evaluate a one-liner instead of a file]:source' \
+    '(-p --print)'{-p,--print}'[evaluate a one-liner and print its result]:source' \
+    '--repl[start the interactive REPL]' \
+    '--lsp[speak the Language Server Protocol over stdio]' \
+    '--dap[speak the Debug Adapter Protocol over stdio]' \
+    '--build[ahead-of-time compile the script to a native executable]' \
+    '--tiers[run it, then report which fusevm tiers took each chunk]' \
+    '--dump-bytecode[print the compiled fusevm bytecode and exit]' \
     '--dump-tokens[print the lexer token stream for the script and exit]' \
     '--dump-ast[print the parsed AST for the script and exit]' \
     '--disasm[print a fusevm bytecode disassembly listing and exit]' \
+    '--no-warnings[silence all process.emitWarning output]' \
+    '--no-deprecation[silence DeprecationWarnings only]' \
+    '--trace-warnings[suppress the one-time --trace-warnings hint]' \
+    '--trace-deprecation[suppress that hint for DeprecationWarnings]' \
     '(-h --help)'{-h,--help}'[show help]' \
     '(-V --version)'{-V,--version}'[show version]' \
     '*:JavaScript file:_files -g "*.js"'

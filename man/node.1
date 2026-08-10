@@ -27,6 +27,56 @@ reads a script from standard input and runs it.
 .B \-e \fISRC\fR, \-\-eval \fISRC\fR
 Evaluate a one\-liner instead of a file.
 .TP
+.B \-p \fISRC\fR, \-\-print \fISRC\fR
+Evaluate a one\-liner and print its completion value, as
+.B node \-p
+does. With both
+.B \-e
+and
+.B \-p
+present, the last one on the command line wins.
+.TP
+.B \-\-repl
+Start the interactive REPL. This is also the default with no
+.I FILE
+argument on a terminal.
+.TP
+.B \-\-lsp
+Speak the Language Server Protocol over stdio. Takes no
+.IR FILE .
+.TP
+.B \-\-dap
+Speak the Debug Adapter Protocol over stdio. Takes no
+.IR FILE .
+.TP
+.B \-\-build
+Ahead\-of\-time compile
+.I FILE
+to a standalone native executable instead of running it.
+.TP
+.B \-\-dump\-bytecode
+Print the compiled fusevm bytecode for
+.I FILE
+and exit, instead of running it. Distinct from
+.BR \-\-disasm ,
+which prints a formatted disassembly listing.
+.TP
+.B \-\-no\-warnings
+Silence all
+.B process.emitWarning
+output.
+.TP
+.B \-\-no\-deprecation
+Silence DeprecationWarnings only.
+.TP
+.B \-\-trace\-warnings
+Suppress the one\-time
+.RB "(Use `" "node \-\-trace\-warnings ..." "`)"
+hint. Unlike Node, this does not add a creation stack to the warning.
+.TP
+.B \-\-trace\-deprecation
+The same, for DeprecationWarnings.
+.TP
 .B \-\-dump\-tokens
 Print the lexer token stream for
 .I FILE

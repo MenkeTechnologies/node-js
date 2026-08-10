@@ -13,11 +13,17 @@
 //! mutual SyntaxErrors that agree on both sides and teach nothing.
 //!
 //! Determinism invariant: the generator NEVER emits a construct whose output is
-//! nondeterministic for reasons unrelated to parity (`Math.random`, `Date`,
-//! `performance.now`, `Symbol()` identity, object addresses, unstably-ordered
-//! iteration). Every probe is wrapped in `console.log`, and object/array
-//! iteration order is insertion order on both sides, so every reported divergence
-//! is a real parity gap, not a false positive.
+//! nondeterministic for reasons unrelated to parity — `Math.random`,
+//! `performance.now`, `Date.now`, `Symbol()` identity, object addresses,
+//! unstably-ordered iteration. A FIXED `Date` epoch is fine and is emitted
+//! (`new Date(0)`, `new Date(86400000)`, `structuredClone(new Date(…))`); what
+//! is excluded is the reading of a clock, not the type. The environment is
+//! pinned too — both children run with `TZ=UTC` and `LANG=LC_ALL=en_US.UTF-8`
+//! rather than inheriting the developer's, since reference `node` is not
+//! locale- or TZ-invariant. Every probe is wrapped in `console.log` or observed
+//! through the exit status, and object/array iteration order is insertion order
+//! on both sides, so every reported divergence is a real parity gap, not a false
+//! positive.
 //!
 //! Scope invariant: the generator only emits constructs node-js actually
 //! implements. The implemented surface now includes ES6 `class`
@@ -29,10 +35,15 @@
 //! Rust-`regex`-supported subset: char classes, quantifiers, anchors, groups,
 //! alternation, `\d\w\s`, flags `g`/`i`/`m` — NOT backreferences/lookaround) —
 //! all exercised by the `class`, `generator`, `mapset`, `proto`, `async`,
-//! `bigint`, and `regex` modes. The `regex` mode deliberately emits ONLY patterns
-//! Rust `regex` can represent (see BUGS.md for the exact subset and divergences);
-//! it never generates backreferences or lookaround, which node-js honestly
-//! rejects rather than mis-executes. The async mode emits ONLY
+//! `bigint`, and `regex` modes. The `regex` mode emits the subset the engine can
+//! represent (see BUGS.md for the exact set and the divergences). It does not
+//! generate backreferences or lookaround — not because those are rejected, which
+//! was true of the old `regex`-crate engine and is no longer: the engine is
+//! `fancy-regex`, and `/(a)\1/`, `/(?=a)a/`, `/a(?!b)/` and `/(?<=a)b/` all
+//! execute correctly today. They stay out of the generator because the
+//! REMAINING divergences live there (a JS forward reference such as `/\1(a)/`
+//! matches the empty string in JS and fails here), and a generator that emitted
+//! them would report the same known gap on every run. The async mode emits ONLY
 //! deterministically-schedulable output (fixed microtask/timer ordering,
 //! resolved-value chains) — never wall-clock- or identity-dependent results.
 //!

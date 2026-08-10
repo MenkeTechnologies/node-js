@@ -92,11 +92,14 @@ source ──▶ lexer ──▶ parser ──▶ compiler ──▶ fusevm::Chu
 ```sh
 node script.js                       # run a file
 node -e 'console.log(1 + 1)'         # evaluate a one-liner
+node -p '6 * 7'                      # evaluate and print the result
 echo 'console.log(6 * 7)' | node     # read a script from stdin
 node --tiers script.js               # run it, then report which fusevm tiers took it
 ```
 
-Errors go to stderr in terse `node: <reason>` form; nothing else is printed.
+Errors go to stderr in terse `node: <reason>` form; nothing else is printed. A
+program that ran to completion exits with `process.exitCode` if it set one, and
+the `beforeExit`/`exit` events fire as they do in Node.
 Runnable `examples/*.js` ship with the crate.
 
 ## [0x03] SUPPORTED TODAY
@@ -159,9 +162,12 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
 
 ## [0x04] NOT YET (LATER WAVES)
 
-ES modules: neither the static `import`/`export` forms nor dynamic `import()`
-parse, so a `.mjs` entry point is a `SyntaxError` and every module boundary has
-to go through CommonJS `require`. `Proxy` and `Intl` are absent by design rather
+ES modules: the static `import`/`export` forms do not parse, so every module
+boundary has to go through CommonJS `require`. The file EXTENSION is not
+consulted — a `.mjs` file holding only CommonJS-compatible code runs — so what
+fails is module syntax, not the suffix. Dynamic `import()` does parse (it lexes
+as an ordinary call) and fails at run time with
+`ReferenceError: import is not defined`. `Proxy` and `Intl` are absent by design rather
 than by omission — the reasoning for each is in `BUGS.md`, which also lists the
 remaining behavioural divergences from the reference `node`.
 
@@ -193,9 +199,16 @@ cargo build --bin parity --bin parity-fuzz
 ./target/debug/parity-fuzz --once --seed 1234  # replay one case, show both sides
 ```
 
+All three compare the exit STATUS exactly rather than as zero-vs-nonzero, and
+run both children with `TZ=UTC` and `LANG=LC_ALL=en_US.UTF-8` pinned rather than
+inherited: reference `node` is not locale- or TZ-invariant, and a status
+collapsed to a boolean cannot see `process.exitCode`, which prints nothing.
+`parity --bless` re-records the frozen snapshot from the REFERENCE process — the
+only supported way to regenerate it, and never from node-js's own output.
+
 A third harness, `parity-scripts/run.sh`, byte-compares every
-`parity-scripts/**/*.js` file against the reference `node` (stdout AND
-success/failure agreement) and prints the pass rate:
+`parity-scripts/**/*.js` file against the reference `node` (stdout AND exit
+status) and prints the pass rate:
 
 ```sh
 bash parity-scripts/run.sh      # byte-parity rate over the whole corpus
@@ -212,12 +225,14 @@ reads, `structuredClone`'s reference graph, error own-property shape, abrupt
 completions (`unwind`), and promise-resolution / async-iteration microtask
 ordering (`thenable`). Select one with `--mode <name>`.
 
-The run summary reports three counts next to the divergence total: **ref
-timeout** (the reference timed out, so the case is skipped entirely), **ref
-failed** (the reference exited non-zero) and **ref silent** (the reference
-printed nothing). All three are zero when every case is a real comparison; a
-mode scoring zero divergences while any of them is high is comparing failures,
-not behavior.
+The run summary reports four counts next to the divergence total: **ref timeout**
+(the reference timed out, so the case is skipped entirely), **ref failed** (the
+reference exited non-zero), **ref silent** (the reference printed nothing on
+stdout) and **ref inert** (both — the only condition under which a case observed
+nothing at all). A mode scoring zero divergences while **ref inert** is high is
+comparing nothing; `ref failed` on its own is not that signal any more, since
+the exit code is itself a compared value and the `exit` mode consists of
+programs that print nothing and exit non-zero deliberately.
 
 ## [0x06] BUILD
 
@@ -228,7 +243,7 @@ cargo test
 
 node-js is a standalone crate (an explicit empty `[workspace]` stops cargo
 walking up to the meta parent). `fusevm` is pulled from crates.io with the `jit`,
-`jit-disk-cache`, and `aot` features.
+`jit-disk-cache`, `aot`, and `ffi` features.
 
 ## [0x07] DOCUMENTATION
 

@@ -6,27 +6,61 @@ Implemented natively (verified vs node v26): `assert`(+`/strict`), `buffer`,
 streaming ChildProcess), `console`, `crypto` (hashes/hmac), `dns` (lookup/resolve
 via std), `diagnostics_channel`, `events`, `fs`, `http`, `net`, `os`, `path`
 (+`/posix` +`/win32` — both flavors are a faithful port of Node's `lib/path.js`,
-differentially verified over 33,600 cases), `perf_hooks`, `process`, `punycode`,
+differentially verified against the reference over a generated cross-product of
+every method × posix/win32), `perf_hooks`, `process`, `punycode`,
 `querystring`, `stream`,
 `string_decoder`, `timers`(+`/promises`), `tty`, `url` (both the WHATWG `URL`
 and the legacy `parse`/`format` API — the latter a faithful port of Node's
-`Url.prototype.parse`/`.format`, differentially verified over 15,808 cases),
+`Url.prototype.parse`/`.format`, differentially verified against the reference
+over a generated cross-product of inputs × `parseQueryString` ×
+`slashesDenoteHost`, dumping every `Url` field),
 `util`(+`/types`), `v8`
 (serialize = JSON, not V8 binary; heap stats are a shim), `async_hooks`
 (AsyncLocalStorage sync-only; hooks are no-ops), `zlib`.
 
 `process.emitWarning` writes to stderr in Node's format
 (`(node:PID) [CODE] Name: message`, plus the one-time
-`(Use \`node --trace-… ...\`)` hint), honoring `--no-warnings`,
-`--no-deprecation`, `--trace-warnings` and `--trace-deprecation`. `url.parse`
-emits `DEP0169` through it.
+`(Use \`node --trace-… ...\`)` hint). `url.parse` emits `DEP0169` through it.
 
-Known-but-UNIMPLEMENTED (require() returns a namespace so import-then-conditional
-code loads; calling a method throws `Error: <mod>.<method> is not implemented in
-node-js` — honest, never a silent fake): `tls`, `http2`, `https`, `worker_threads`,
-`cluster`, `dgram`, `inspector`, `wasi`, `trace_events`, `domain`, `repl`,
-`readline`, `dns/promises` (use `require('dns').promises`). These need real
-TLS/HTTP2/OS-threads/sandboxing substrate.
+`--no-warnings` and `--no-deprecation` behave as in Node (the warning is
+suppressed entirely). `--trace-warnings` / `--trace-deprecation` are ACCEPTED
+and suppress the one-time hint, but do not add the creation stack Node prints
+under them — node-js keeps no allocation-site stack for a warning:
+
+| command | node v26.7.0 | node-js |
+| --- | --- | --- |
+| `--trace-warnings -e 'process.emitWarning("m")'` | `(node:N) Warning: m` then a stack | `(node:N) Warning: m`, no stack |
+
+Known-but-UNIMPLEMENTED: `inspector` and `wasi`. `require()` returns a namespace
+so import-then-conditional code loads, and calling a method throws
+`Error: <mod>.<method> is not implemented in node-js` — honest, never a silent
+fake. Verified: `require("inspector").url()` and `require("wasi").WASI()` each
+throw exactly that.
+
+**This list used to name thirteen modules. Eleven of them are implemented and
+the entry was simply never retired** — a doc-only staleness, found by running
+every module in it. Each was checked against the reference, not merely
+required:
+
+| module | evidence it is implemented |
+| --- | --- |
+| `tls` | `tls.getCiphers().length > 0` is `true` on both; the namespace carries 9 real members |
+| `https` | `https.get("https://example.com", …)` reports `status 200` on both |
+| `http2` | server side works (`createSecureServer` validates `key`/`cert`); only `http2.connect` (the CLIENT) throws |
+| `worker_threads` | real OS threads — a `new Worker(__filename, {workerData})` round trip is byte-identical to node |
+| `cluster` | `cluster.fork()` really forks; primary and worker both run |
+| `dgram` | real UDP — bind, send to self, receive `message` works on both |
+| `trace_events` | `createTracing({categories})` + `enable`/`getEnabled` match node exactly |
+| `domain` | `d.run()` executes and `on('error')` catches a thrown error |
+| `repl` | `repl.start({input, output})` returns a server object on both |
+| `readline` | `createInterface({input, output})` returns an interface on both |
+| `dns/promises` | full 21-member API; `lookup("localhost")` matches node. The old "(use `require('dns').promises`)" workaround is obsolete |
+
+The uniform `<mod>.<method> is not implemented in node-js` message applies to
+`inspector` and `wasi` only. The implemented modules raise their own errors for
+bad arguments (`tls.createServer()` → `TypeError: tls.createServer requires an
+options object with 'key' and 'cert'`), which is Node-shaped behavior rather
+than a stand-in.
 
 `vm` is NOT in that list — it is implemented (`src/stdlib/vm.rs`), because the
 engine has a real runtime source evaluator. `runInThisContext`, `Script`,
@@ -92,7 +126,9 @@ timers, promises or sockets, so `executionAsyncId()` inside a `setTimeout`/
   settled rejected with no handler is reported on stderr and the process exits
   non-zero. `process.on('unhandledRejection', fn)` intercepts it —
   `process.on`/`once`/`off`/`removeListener`/`removeAllListeners`/`listeners`/
-  `emit` now keep a real listener table instead of discarding registrations.
+  `emit` keep a real listener table instead of discarding registrations. (`once`
+  was in that list while behaving exactly like `on` — the listener fired on
+  every emit and stayed registered. It deregisters before running now.)
 
 ## Abrupt completions (`break` / `continue` / `return` / `throw`)
 
@@ -154,12 +190,19 @@ real `.prototype` object, built on first read from the same
 `stdlib::instance_method_lists` table a method *read* consults, so the prototype
 cannot advertise a name the dispatcher does not implement. `Ctor.prototype` used
 to read `undefined` for everything outside the hand-written `is_builtin_ctor`
-list.
+list. (`Hash` was in that sentence for a round while `instance_method_lists`
+listed only its twin `Hmac`, so `crypto.Hash.prototype` really did read
+`undefined` — the table now carries both, which is the whole point of building
+the prototype from it.)
 
 `NativeCtor.call(obj, …)` — ES5 "constructor stealing" — initializes `obj`
 instead of returning a fresh instance, but ONLY when `obj` already inherits from
 that constructor's prototype. Without that guard `Date.call(x)` and
 `Buffer.call(x)`, which in JS ignore `this`, would start mutating `x`.
+
+`Buffer.poolSize` (65536) is a DATA property rather than a method and was
+missing from both tables, so it read `undefined`; it is served from
+`stdlib::constant` now.
 
 `Buffer.copyBytesFrom` is the one `Buffer` static still missing, and is
 deliberately absent from `buffer::STATIC_METHODS` rather than advertised: it
@@ -183,14 +226,16 @@ differs between macOS and Linux above `SIGTERM` (`SIGUSR1` is 30 on Darwin, 10
 on Linux). `os.constants.signals` still reports the Darwin numbers and is the
 remaining literal table.
 
-## Sloppy-mode `this` is `undefined`, not `globalThis`
+## Sloppy-mode `this` in a plain CALL is `undefined`, not `globalThis`
 
 A plain (unbound, non-method) function call binds `this` to `undefined` here; in
 sloppy mode Node binds it to `globalThis` and boxes a primitive `this`
 (10.2.1.2 `OrdinaryCallBindThis`). Measured on node v26.7.0,
 `function f(){ return typeof this } ; [f(), f.call(null), f.call(5)]` is
 `['object','object','object']` there and `['undefined','object','number']` here.
-This affects every unbound call, not just dynamically compiled ones.
+
+Scoped to a CALL. The TOP-LEVEL `this` was `undefined` too and is now correct at
+all three entry points — see the FIXED section below.
 
 ## FIXED — strings are indexed by UTF-16 code unit
 
@@ -337,12 +382,34 @@ identity, both exact for every representable value. The one case node answers
 differently is a surrogate half extracted by `charAt`/`slice`, which is already
 `U+FFFD` here: the lone-surrogate boundary above, not a separate gap.
 
-## `globalThis` is not backed by the global scope
+## FIXED — `globalThis` is one object, and top-level `this` is bound
 
-`globalThis.x = 1` does not create a readable binding `x`, and a top-level
-`var y = 2` does not appear as `globalThis.y`; the two live in separate tables
-(`JsHost.globals` versus the `globalThis` object). Node's `global` alias is
-absent entirely (`ReferenceError`).
+`globalThis` used to mint a FRESH object on every read, so it failed the two
+things an identity is for: `globalThis === globalThis` was `false`, and
+`globalThis.x = 1` was unreadable through the next `globalThis.x`. It is a
+singleton on the host now, and `global` is an alias for the same object rather
+than a `ReferenceError`.
+
+Top-level `this` was `undefined` at every entry point. Node answers
+`module.exports` from a FILE (a CommonJS module) and `globalThis` from `-e` and
+from stdin (a Script); all three now agree, so `this.x = 1` at module scope
+populates the exports object instead of throwing. Measured on node v26.7.0 with
+`console.log(this === globalThis, this === module.exports)`:
+
+| entry point | node v26.7.0 | node-js (was) | node-js (now) |
+| --- | --- | --- | --- |
+| `node f.js` | `false true` | `false false` | `false true` |
+| `node -e` | `true false` | `false false` | `true false` |
+| `node -` | `true false` | `false false` | `true false` |
+
+**Remaining:** `globalThis` is still not backed by the global SCOPE. A top-level
+`var y = 2` does not appear as `globalThis.y`, and `globalThis.x = 1` does not
+create a bare readable binding `x` — the two live in separate tables
+(`JsHost.globals` versus the `globalThis` object). A property written through
+`globalThis` is readable through `globalThis`, which is what the identity fix
+bought; joining the two tables is a separate change. `globalThis.Error` and the
+other builtin names likewise read `undefined`, since the builtins are resolved by
+name at the `GetLocal` site rather than stored as properties of a global object.
 
 ## Entry points: `node f.js` vs `node -e` vs `node -` / piped stdin
 
@@ -364,20 +431,30 @@ v26.7.0; every row marked **agrees** is now pinned by a test.
 | `process.argv[1]` | resolved abs path | *absent* | `-` | agrees |
 | `process.execArgv` | runtime flags | flags + `-e` + src | runtime flags | agrees |
 | `require.main === module` | `true` | `false` | `false` | **`require.main` absent** |
-| top-level `this` | `module.exports` | `globalThis` | `globalThis` | **`undefined`** |
-| top-level `arguments` | the wrapper's 5 | *undefined* | *undefined* | **undefined at both** |
-| sloppy/strict | sloppy | sloppy | sloppy | **strict at all three** |
+| top-level `this` | `module.exports` | `globalThis` | `globalThis` | agrees |
+| top-level `arguments` | the wrapper's 5 | *undefined* | *undefined* | **undefined at all three** |
+| `arguments.callee` in a function | the function | same | same | **`undefined`** |
 | stack frame file | `file:L:C` | `[eval]:L:C` | `[stdin]:L:C` | **no `file:line:col`** |
 
-The four remaining rows all follow from one thing: node-js runs the entry
-source directly rather than through the CommonJS wrapper function, and evaluates
-it as strict-mode Script. `module`/`exports`/`__filename`/`__dirname` are
+A row that used to sit in this table said node-js was **strict at all three**
+entry points. That was never true and is removed: by every testable strict-mode
+restriction node-js is SLOPPY, exactly as Node is. An implicit global assignment
+succeeds, `01` is a legal octal literal, duplicate parameter names are accepted,
+and a write to a frozen object is silently discarded — all four matching node.
+The one strict-SHAPED behavior was `this === undefined` in a plain call, which
+is its own gap (see the sloppy-mode section above) rather than a mode. `with`
+is rejected, but with a generic parse error, which is a parser gap and not a
+strict-mode rejection.
+
+The remaining rows follow from one thing: node-js runs the entry
+source directly rather than through the CommonJS wrapper function.
+`module`/`exports`/`__filename`/`__dirname` are
 installed as globals per entry point (`module::install_entry_globals`), which
 fixes what packages actually read — a UMD header's
 `typeof module !== 'undefined' && module.exports` now takes the CommonJS branch
 at every entry point instead of the browser branch — but top-level `this`,
-`arguments` and sloppy-mode binding need the wrapper itself. See the two
-sections below for what else the missing wrapper costs.
+`arguments` needs the wrapper itself. See the two sections below for what else
+the missing wrapper costs.
 
 A `require`d module gets the same seven-key `module` object — `id`, `path`,
 `exports`, `filename`, `loaded`, `children`, `paths`, in that order — where it
@@ -392,15 +469,24 @@ empty (populating it needs the loader to thread the REQUIRING module through
 main module, while `process.argv[1]` keeps the spelling that was passed —
 `node link/a.js` through a symlinked directory reports the link in `argv[1]` and
 the target in `__filename`. `require.resolve` normalizes the joined path, so
-`require('./d.js')` and `require('d.js')` from one directory are a single cache
-entry rather than `<dir>/./d.js` and `<dir>/d.js`.
+`require('./d.js')`, `require('././d.js')` and `require('../<dir>/d.js')` from
+one directory are a single cache entry rather than three. (An earlier wording
+here contrasted `'./d.js'` with a BARE `'d.js'`; that is not the same
+comparison — a bare specifier is a package lookup in both runtimes and resolves
+to neither, `MODULE_NOT_FOUND` on each side.)
 
 Two harnesses in this repo compare against DIFFERENT entry points on purpose:
 `parity-scripts/run.sh` runs each corpus case as a script FILE, and
-`src/bin/parity_fuzz.rs` runs each generated case through `-e`. Neither
-generates any of the observables above, so the split is coverage rather than
-contamination — but a case added to either that touches this table would be
-measuring that harness's entry point, not "node".
+`src/bin/parity_fuzz.rs` runs each generated case through `-e`. The split is
+coverage rather than contamination, but for two rounds it also meant NOBODY
+measured this table: no generator emitted a bare `this`, `globalThis`,
+`arguments` or `require.main`, so "unreachable by both" was mistaken for
+"covered by one". Top-level `this` was wrong at all three entry points the whole
+time. Both sides are now driven deliberately — the fuzzer's `entry` mode emits
+the entry-point-INVARIANT relations plus the `-e`-specific ones, and
+`parity-scripts/lang/27_top_level_this.js` carries the FILE answers, which the
+fuzzer cannot reach. A case added to either that touches an entry-point-VARIANT
+row is still measuring that harness's entry point, not "node".
 
 ## `node -e` evaluates a Script, not a CommonJS module
 
@@ -431,8 +517,28 @@ uses — it no longer prints an object literal exposing the internal
 context-window rule for the default form (the whole input quoted when it is 20
 characters or shorter, otherwise a 10-character window either side of the error
 elided with `...`), the positional forms, and JSON's number grammar (`01` parses
-as `0` and then reports the stray digit, exactly as V8 does). 87/87 differential
-cases match.
+as `0` and then reports the stray digit, exactly as V8 does). Every case in
+`parity-scripts/data/22_json_parse_errors.js` matches byte-for-byte; the count
+is whatever that file currently holds and is not restated here, because a number
+typed into prose goes stale the first time a case is added.
+
+**Except the ESCAPE family, which is missing and fails OPEN.** V8 raises
+`Bad escaped character in JSON at position N` and `Bad Unicode escape in JSON at
+position N`; node-js has neither, and the malformed escape is silently accepted
+with the character DROPPED — silent corruption rather than a rejection. Measured
+on node v26.7.0:
+
+| input | node v26.7.0 | node-js |
+| --- | --- | --- |
+| `JSON.parse('"\\x"')` | `SyntaxError: Bad escaped character in JSON at position 2` | `""` (parses, character lost) |
+| `JSON.parse('"\\a"')` | `SyntaxError: Bad escaped character in JSON at position 2` | `""` |
+| `JSON.parse('"\\uZZZZ"')` | `SyntaxError: Bad Unicode escape in JSON at position 3` | `""` |
+| `JSON.parse('"\\u12"')` | `SyntaxError: Bad Unicode escape in JSON at position 5` | `SyntaxError: Unterminated string in JSON at position 7 (line 1 column 7)` |
+
+The last row is doubly wrong: the message is the wrong family, and its
+`position 7 (line 1 column 7)` breaks V8's own `column = position + 1`
+convention. The corpus file has no bad-escape case, which is why this went
+unreported while the rest of the family was being pinned.
 
 A `Buffer` is a real `Uint8Array` subclass instance:
 `Object.getPrototypeOf(buf) === Buffer.prototype` holds, that prototype is a
@@ -471,8 +577,8 @@ Two divergences remain:
    parent, and two views over one `ArrayBuffer` are independent). An
    `ArrayBuffer` here carries only a byte length, and a typed array's elements
    live in a per-object hidden array; making views alias means re-basing both
-   onto one shared byte store and moving all 54 `@@bytes`/`@@elems` call sites
-   across 15 files onto it. That is a real refactor, not a patch — doing it
+   onto one shared byte store and moving every `@@bytes`/`@@elems` call site
+   (15 files, by `grep -rln`) onto it. That is a real refactor, not a patch — doing it
    partially would leave some views aliasing and others not, which is worse
    than the honest gap. `express.json()` does not depend on it (verified: a
    live POST round-trips byte-identically).
@@ -663,9 +769,25 @@ dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
 
 ## Regular expressions — supported subset and known divergences
 
-node-js translates the **overlapping** subset of JS regex that the Rust `regex`
-crate can represent and **rejects the rest at RegExp-construction time** with a
-`SyntaxError` — it never silently mis-executes a pattern.
+node-js translates the **overlapping** subset of JS regex that `fancy-regex` can
+represent and rejects most of the rest at RegExp-construction time with a
+`SyntaxError`.
+
+**"It never silently mis-executes a pattern" is what this section used to say,
+and it is not true.** Two counterexamples, both accepted and both producing the
+wrong answer, measured on node v26.7.0:
+
+| pattern | node v26.7.0 | node-js |
+| --- | --- | --- |
+| `new RegExp("(?i)abc")` | `SyntaxError: Invalid regular expression: /(?i)abc/: Invalid group` | compiles; `.test("ABC")` is `true` while `.ignoreCase` reports `false` |
+| `/\1(a)/.test("xa")` | `true` — a JS forward reference matches the empty string | `false` |
+
+`(?i)` is a Rust INLINE-FLAG group with no meaning in JS, which the reference
+rejects outright; here it reaches the engine and changes matching behind a flag
+reflector that denies it. The forward reference is the opposite shape: valid JS
+that `fancy-regex` fails. The rejection rule below is still the rule for
+everything the translator does not recognise — it is the boundary that is
+imperfect, not the policy.
 
 **Supported:** character classes (`[a-z]`, `[^0-9]`), the predefined classes
 `\d \w \s \D \W \S` and word-boundary `\b`/`\B`, quantifiers (`* + ? {n} {n,}
@@ -678,7 +800,7 @@ crate can represent and **rejects the rest at RegExp-construction time** with a
 `test`/`exec`/`match`/`matchAll`/`replace`/`replaceAll`/`split`/`search` and the
 `$1`/`$&`/`` $` ``/`$'`/`$<name>`/`$$` replacement patterns + function replacers.
 
-**Rejected (construction throws `SyntaxError`, never a wrong match):** any pattern
+**Rejected (construction throws `SyntaxError`):** any pattern
 `fancy-regex` cannot compile is rejected at RegExp-construction time
 (`regexp.rs` maps the compile error to a JS `SyntaxError`) rather than silently
 mis-executed. Backreferences and lookahead/lookbehind — previously listed here —
@@ -706,7 +828,7 @@ Per-element access to a JS array, object, or `Buffer` used to cost quadratic
 time. An earlier revision of this file blamed `fusevm::Value::Array` holding a
 by-value `Vec<Value>`. **That attribution was wrong.** node-js never constructs a
 `fusevm::Value::Array` at all — its arrays are `JsObj::Array(Vec<Value>)` in its
-own heap, reached through a `Value::Obj(u32)` handle (`src/host.rs:205`). The
+own heap, reached through a `Value::Obj(u32)` handle (`JsObj` in `src/host.rs`). The
 fusevm `Arc`-backed array added in 0.19.0 therefore changed nothing here.
 
 The real cause was four node-js sites that cloned an **entire heap cell just to
@@ -717,19 +839,19 @@ whole backing `Vec`/`IndexMap`/`String` every time:
 
 | site | cost before |
 | --- | --- |
-| `get_property` (`src/builtins.rs:515`) | every property read copied the whole receiver, so `a[i]` and `a.length` were O(len) |
-| `set_property` (`src/builtins.rs:1236`) | up to five whole-receiver copies per assignment |
-| `call_method` (`src/host.rs:3023`) + `call_type_method` (`src/builtins.rs:4235`) | every `a.push(x)` copied the whole array before dispatching |
-| `buffer::byte_get` / `byte_set` (`src/stdlib/buffer.rs:322`, `:345`) | one `buf[i]` materialised the whole buffer as a `Vec<u8>`; one `buf[i] = n` wrote every byte back |
+| `get_property` (`src/builtins.rs`) | every property read copied the whole receiver, so `a[i]` and `a.length` were O(len) |
+| `set_property` (`src/builtins.rs`) | up to five whole-receiver copies per assignment |
+| `call_method` (`src/host.rs`) + `call_type_method` (`src/builtins.rs`) | every `a.push(x)` copied the whole array before dispatching |
+| `buffer::byte_get` / `byte_set` (`src/stdlib/buffer.rs`) | one `buf[i]` materialised the whole buffer as a `Vec<u8>`; one `buf[i] = n` wrote every byte back |
 
 The fix is not `Arc`/copy-on-write — JS arrays are mutable and aliased
 (`const a=[1]; const b=a; b.push(2)` must be visible through `a`), and the heap
 already gives correct aliasing because every handle points at one canonical cell.
-The fix is to stop copying in order to *look*: `ObjKind` (`src/host.rs:274`) and
-`JsHost::kind_of` (`src/host.rs:1158`) return the discriminant alone, and `peek`
-(`src/builtins.rs:511`) hands back only the one field an arm needs. `push`/
+The fix is to stop copying in order to *look*: `ObjKind` (`src/host.rs`) and
+`JsHost::kind_of` (`src/host.rs`) return the discriminant alone, and `peek`
+(`src/builtins.rs`) hands back only the one field an arm needs. `push`/
 `unshift` take their return length from the same mutable borrow via `array_len`
-(`src/builtins.rs:4315`) instead of copying the array out to count it, and the
+(`src/builtins.rs`) instead of copying the array out to count it, and the
 Buffer paths read and write the single element in place.
 
 Summing every element of an array of `n` integers (`for-of` plus an indexed
@@ -753,6 +875,139 @@ concatenates the socket chunks and hands a STRING to `JSON.parse`, so no
 per-element JS loop runs over the body. Real express 5 POSTs of 25 KB → 207 KB
 are flat in both builds (0.16–0.18 s before, 0.06–0.07 s after); the improvement
 there is general property-access speedup, not a change in body-size scaling.
+
+## FIXED — the process's own observables: exit status, exit events, raw stdout
+
+Four things about how a program ENDS, and one about how it writes, none of
+which any harness could report. `parity-scripts/run.sh` and `parity_fuzz` both
+compared the exit status as zero-vs-nonzero, and `process.exitCode = 3` prints
+nothing — so with stdout empty on both sides and the status collapsed to a
+boolean, there was nothing left to compare. Both harnesses now compare the code
+exactly (see the harness section in README).
+
+- **`process.exitCode` was a decoration.** It stored and read back, and the
+  process still exited 0. It is Node's accessor now, ported from
+  `lib/internal/bootstrap/node.js`: a numeric string coerces (`"0x10"` exits 16,
+  `"  "` exits 0), a non-numeric or empty string is `ERR_INVALID_ARG_TYPE`, a
+  non-integer is `ERR_OUT_OF_RANGE`, and `null`/`undefined` clear the slot.
+  `process.exit()` with no argument uses it.
+- **`process.on('exit')` and `process.on('beforeExit')` never fired at all.**
+  Both run now: `beforeExit` when the loop drains on its own (again if a
+  listener schedules more work), `exit` exactly once — on the normal path, on
+  `process.exit()`, and on an uncaught exception. A code an `exit` listener
+  assigns wins; an uncaught exception forces 1 first, as Node does.
+- **`process.once` was an alias of `process.on`.** The listener fired on every
+  emit and stayed in `process.listeners()`.
+- **`process.stdout.write` put every chunk through `ToString`.**
+  `write(Buffer.from([0xff,0xfe,0x41]))` printed the 15 bytes of
+  `[object Object]`; `write('4142','hex')` printed the four characters of the
+  literal instead of the two bytes `AB`. Byte views go out untouched now and a
+  string chunk is decoded with its encoding, with Node's `ERR_INVALID_ARG_TYPE`
+  for anything else. The host's capture buffer became `Vec<u8>` so the byte path
+  is real rather than a `String` round trip that would reintroduce `U+FFFD`.
+- **`-p`/`--print` did not exist** — `node -p '1+1'` was
+  `error: unexpected argument '-p' found`.
+
+Two corpus assertions that were green throughout are worth recording, because
+each was shaped so it could not fail: `parity-scripts/lang/26_process_exit.js`
+registered `process.on("exit", () => {})` with an EMPTY body, which cannot tell
+"fires" from "never fires"; and `parity-scripts/stdlib/20_process.js` asserted
+`typeof process.exitCode === "undefined" || … === "number"`, a disjunction
+satisfied whether or not the property does anything. Both are strengthened, and
+neither original assertion was removed.
+
+## FIXED — object-model gaps reachable from a one-line `-e`
+
+- **`Error.prototype.toString` did not exist.** `Object.prototype.toString`
+  inherited through to errors instead — and merely READING `Error.prototype` or
+  `Object.prototype` materialises that thunk. `x instanceof Error` performs that
+  read, so ordinary code flipped `String(err)` from `Error: m` to
+  `[object Error]` for the rest of the process, retroactively, including errors
+  created earlier.
+- **`Error.prototype` read as a THUNK, not the object errors link to.** `typeof
+  Error.prototype` was `"function"`, and
+  `Object.getPrototypeOf(new Error("x")) === Error.prototype` was false. Fixing
+  it also fixed `Object.getPrototypeOf(TypeError.prototype) === Error.prototype`
+  and `Object.getPrototypeOf(new TypeError("x")) === TypeError.prototype`.
+- **`/` never ran `ToPrimitive`.** It is a builtin rather than a native op
+  (fusevm's `Op::Div` disagrees with JS on a zero divisor), so it bypassed the
+  numeric hook that `+ - * % **` go through: `({valueOf(){return 7}}) / 2` was
+  `NaN` where `* 2` was `14`, and `new Date(2) / 1` was `NaN` instead of `2`.
+- **A computed object-literal key skipped `ToPropertyKey`.** `{ [obj]: 1 }` keyed
+  on `"[object Object]"` while `a[obj] = 1` keyed on the `toString` result.
+- **`Symbol.keyFor` returned the DESCRIPTION**, so every symbol looked
+  registered: `Symbol.keyFor(Symbol("k"))` was `"k"` rather than `undefined`.
+- **`__proto__` answered only for plain objects and only from an explicit
+  link.** `[].__proto__` was `undefined` and `({}).__proto__` was `null`, while
+  `Object.getPrototypeOf` was right for both. The setter re-linked
+  unconditionally, so `o.__proto__ = 5` set the prototype to the number 5; it
+  takes only an Object or `null` now, and on a null-prototype object (which
+  inherits no such accessor) the assignment is an ordinary own-property write.
+- **`RegExp.prototype.flags` returned the literal's spelling** rather than the
+  spec's canonical order — `/a/gid.flags` was `"gid"`, node says `"dgi"` — and
+  `hasIndices`/`unicodeSets` were absent.
+- **`Boolean.prototype` had no methods.** A boolean is not a heap object here, so
+  `true.toString()` threw `is not a function`.
+- **`BigInt(1e21)` threw** (`Number.prototype.toString` goes exponential at
+  1e21 and `parse_bytes` cannot read `"1e+21"`), and
+  **`(1e21).toLocaleString()` printed `1e,+21`** — the thousands separator
+  applied to the exponent. Note the two take deliberately DIFFERENT sources:
+  `BigInt` uses the f64's exact decimal expansion, so `BigInt(1e30)` is
+  `1000000000000000019884624838656n` as in node, while `toLocaleString` expands
+  the SHORTEST repr, so `(1e100).toLocaleString()` is 1 followed by a hundred
+  zeros. Both measured, neither assumed.
+
+## FIXED — the locale surface, and why it is machine-independent
+
+Most of `toLocale*` was missing outright: `String.prototype.toLocaleLowerCase`/
+`toLocaleUpperCase`/`toLocaleString`, `Object.prototype.toLocaleString`,
+`Array.prototype.toLocaleString`, and all three `Date.prototype.toLocale*` forms
+threw `is not a function`, and `BigInt.prototype.toLocaleString` skipped
+thousands grouping. All are implemented, in the fixed en-US shape this runtime
+already used for `Number.prototype.toLocaleString`, at UTC, with the
+`locales`/`options` arguments accepted and ignored.
+
+`String.prototype.normalize` remains the identity (no normalization tables) but
+now VALIDATES the form: node throws `RangeError` outside NFC/NFD/NFKC/NFKD, and
+a try/catch support probe used to be told every form worked.
+
+**node-js reads no `LANG`, `LC_ALL` or `TZ` anywhere**, and that is a property
+worth stating rather than a coincidence: `Date` is hardwired to UTC, the number
+formats to en-US, `normalize` to the identity, and `toUpperCase`/`toLowerCase`
+to Rust's locale-INDEPENDENT Default Case Conversion, which is what the spec
+mandates for the non-`Locale` forms. So node-js's output is byte-identical on
+every machine. Reference `node` is NOT — `(1234.5).toLocaleString()` is
+`1.234,5` under `de_DE`, `'ä'.localeCompare('z')` is `1` under `sv_SE` and `-1`
+under `de_DE`, and `new Date(0).getHours()` is `9` under `Asia/Tokyo`. All three
+harnesses therefore PIN `TZ=UTC LANG=LC_ALL=en_US.UTF-8` rather than inheriting
+the developer's, so a corpus case touching the locale surface cannot pass on one
+machine and fail on another.
+
+`localeCompare` is unchanged and still the ASCII approximation documented above:
+it diverges from ICU for any non-ASCII input (`'ä'.localeCompare('z')` is `1`
+here, `-1` in node), ignores the `locales` and `options` arguments, and does not
+raise node's `RangeError: Invalid language tag` for a malformed tag.
+
+## Still open — found by the round-5 doc audit, not yet fixed
+
+Each of these was verified against node v26.7.0 and is a real divergence; none
+is claimed fixed anywhere in this file.
+
+| gap | node v26.7.0 | node-js |
+| --- | --- | --- |
+| `DataView` | `function` | `undefined` — the constructor does not exist |
+| `arguments.callee` | the running function | `undefined` |
+| a tagged template's object and its `raw` | frozen, elements non-writable | mutable, elements writable (the DESCRIPTOR triple is already correct) |
+| a class body's own binding for the class name | immutable — `class E { static z = (E = 1) }` throws | assignment succeeds |
+| `/(?i)abc/` | `SyntaxError: Invalid group` | accepted; matches case-insensitively while `.ignoreCase` reports `false` |
+| `/\1(a)/` (a forward reference) | `true` — matches the empty string | `false` |
+| `/\cA/` (a control escape), `/\052/` (an octal escape) | valid patterns, both match | `SyntaxError` — over-rejected |
+| `new URL("/x")` error | `.code === 'ERR_INVALID_URL'` | `.code` is `undefined` |
+| `Buffer.alloc(-1)`, `Buffer.alloc('x')`, `path.join(1)` | throw a coded error | do not throw |
+| `Buffer.alloc(2**40)` | returns promptly (the allocation is lazy) | hangs — killed at 8s, materialising a 1 TiB byte vector |
+| `url.resolve` with an uppercase scheme, an empty port, or a Unicode host | lowercases / strips / punycodes | leaves the input as-is |
+| `Object.getPrototypeOf(class B extends A {})` | `A` | not `A` (static-method LOOKUP still works) |
+| `FinalizationRegistry` error text | `register: invalid target` | `register: target must be an object` |
 
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
