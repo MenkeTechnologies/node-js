@@ -220,18 +220,39 @@ fn translate(pat: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// The flags string in the spec's canonical order (22.2.6.4 reads the six
+/// reflectors in a fixed sequence), independent of how the literal spelled
+/// them.
+fn canonical_flags(flags: &str) -> String {
+    "dgimsuvy"
+        .chars()
+        .filter(|c| flags.contains(*c))
+        .collect::<String>()
+}
+
 /// A `RegExp` own data property (`source`/`flags`/`global`/…/`lastIndex`), or
 /// `None` if `name` is not one (so the caller tries methods).
 pub fn regexp_property(r: &RegExpObj, name: &str) -> Option<Value> {
     Some(match name {
         "source" => with_host(|h| h.new_str(r.source.clone())),
-        "flags" => with_host(|h| h.new_str(r.flags.clone())),
+        // `RegExp.prototype.flags` (22.2.6.4) is a GETTER that rebuilds the
+        // string in the spec's fixed `dgimsuvy` order, not the spelling the
+        // literal used: `/a/gid.flags` is `"dgi"` in node and was `"gid"` here,
+        // so any code keyed on the flags string (a cache key, a `new
+        // RegExp(src, flags)` round-trip comparison) disagreed.
+        "flags" => with_host(|h| h.new_str(canonical_flags(&r.flags))),
         "global" => Value::Bool(r.global),
         "ignoreCase" => Value::Bool(r.ignore_case),
         "multiline" => Value::Bool(r.multiline),
         "dotAll" => Value::Bool(r.dot_all),
         "sticky" => Value::Bool(r.sticky),
         "unicode" => Value::Bool(r.unicode),
+        // `d` is accepted and its match-indices output ignored (BUGS.md), but
+        // the flag reflector still has to report it; it read `undefined` where
+        // node says `true`/`false`. `v` is rejected at construction time, so
+        // `unicodeSets` is `false` for every regex that exists here.
+        "hasIndices" => Value::Bool(r.flags.contains('d')),
+        "unicodeSets" => Value::Bool(r.flags.contains('v')),
         "lastIndex" => Value::Float(r.last_index.get() as f64),
         _ => return None,
     })

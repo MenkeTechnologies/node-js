@@ -348,10 +348,20 @@ fn b_yield(vm: &mut VM, _: u8) -> Value {
     }
 }
 
+/// `PROPKEY` — ToPropertyKey (7.1.19) for an object literal's COMPUTED key.
+///
+/// It called `JsHost::property_key` directly, which is the primitive-only half
+/// of the conversion, so an object key never ran `ToPrimitive`:
+/// `{ [{toString(){return "TS"}}]: 1 }` keyed on `"[object Object]"` while the
+/// member form `a[o] = 1` — which does go through `host::to_property_key` —
+/// keyed on `"TS"`. The two forms are the same abstract operation and now share
+/// the same implementation.
 fn b_propkey(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
-    let k = with_host(|h| h.property_key(&v));
-    with_host(|h| h.new_str(k))
+    match host::to_property_key(&v) {
+        Ok(k) => with_host(|h| h.new_str(k)),
+        Err(e) => abort(vm, e),
+    }
 }
 
 fn b_new_target(_vm: &mut VM, _: u8) -> Value {
@@ -361,12 +371,17 @@ fn b_new_target(_vm: &mut VM, _: u8) -> Value {
 /// `a / b` with JS/IEEE-754 semantics. fusevm's native `Op::Div` returns `Undef`
 /// for a zero divisor (so a frontend whose `/` differs must lower to a builtin —
 /// its own documented guidance), but JavaScript requires `x/0 === ±Infinity` and
-/// `0/0 === NaN`, so `/` is lowered here instead. Non-number operands are coerced
-/// via `ToNumber`, exactly as the numeric hook's `arith(Div)` path does.
+/// `0/0 === NaN`, so `/` is lowered here instead.
+///
+/// Being a builtin rather than a native op means it does NOT reach the numeric
+/// hook, so `/` was the one arithmetic operator that never ran `ToPrimitive`:
+/// `({valueOf(){return 7}}) / 2` was `NaN` where every other operator gave
+/// `3.5`, and `new Date(2) / 1` was `NaN` instead of `2`. It goes through the
+/// hook now, so `/` coerces exactly as `*` and `-` do.
 fn b_div(vm: &mut VM, _: u8) -> Value {
     let b = vm.pop();
     let a = vm.pop();
-    let r = with_host(|h| h.arith(NumOp::Div, &a, &b));
+    let r = numeric_hook(NumOp::Div, &a, &b);
     finish(vm, r)
 }
 
@@ -576,6 +591,21 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
             return Ok(with_host(|h| h.alloc(JsObj::Builtin(cn.to_string()))));
         }
     }
+    // `__proto__` (Annex B B.2.2.1) is an accessor on `Object.prototype`, so it
+    // answers for EVERY object that inherits from it, not only plain ones —
+    // `[].__proto__` is `Array.prototype`. Only the plain-object arm handled it,
+    // so an array, function or builtin instance read `undefined`. An object with
+    // a null prototype inherits no such accessor and reads `undefined`, which is
+    // why this is skipped there rather than answering `null`.
+    if name == "__proto__"
+        && !with_host(|h| h.has_null_proto(recv))
+        && peek(recv, |o| match o {
+            JsObj::Object(p) => Some(p.contains_key("__proto__")),
+            _ => Some(false),
+        }) != Some(true)
+    {
+        return Ok(prototype_of(recv));
+    }
     let kind = with_host(|h| h.kind_of(recv));
     Ok(match kind {
         Some(ObjKind::Object) => {
@@ -606,8 +636,6 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
             } else if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
                 // A method / data property inherited from the prototype chain.
                 v
-            } else if name == "__proto__" {
-                with_host(|h| h.proto_of(recv)).unwrap_or_else(|| with_host(|h| h.null()))
             } else if crate::stdlib::native_tag(recv)
                 .map(|tag| crate::stdlib::instance_has_method(&tag, name))
                 .unwrap_or(false)
@@ -900,6 +928,7 @@ fn is_object_method(name: &str) -> bool {
             | "isPrototypeOf"
             | "propertyIsEnumerable"
             | "toString"
+            | "toLocaleString"
             | "valueOf"
             | "constructor"
     )
@@ -920,7 +949,12 @@ pub const OBJECT_PROTO_METHODS: &[&str] = &[
 pub fn is_object_builtin_method(name: &str) -> bool {
     matches!(
         name,
-        "hasOwnProperty" | "isPrototypeOf" | "propertyIsEnumerable" | "toString" | "valueOf"
+        "hasOwnProperty"
+            | "isPrototypeOf"
+            | "propertyIsEnumerable"
+            | "toString"
+            | "toLocaleString"
+            | "valueOf"
     )
 }
 
@@ -973,6 +1007,14 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             let s = h.str_of(recv);
             h.new_str(s)
         })),
+        // `Object.prototype.toLocaleString` (20.1.3.5) is defined as
+        // `Invoke(this, "toString")` — no locale behavior of its own. It was
+        // installed as a thunk on `Object.prototype` but had no dispatch arm, so
+        // calling it threw `is not a function` on every plain object.
+        "toLocaleString" => {
+            let v = host::call_method(recv, "toString", Vec::new())?;
+            Ok(v)
+        }
         "valueOf" => Ok(recv.clone()),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
@@ -1142,6 +1184,21 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // thunks (`Object.prototype.toString.call(x)` is a load-time idiom in the
     // `get-intrinsic`/`function-bind` family).
     if name == "prototype" && is_builtin_ctor(ns) {
+        // Same reasoning as the native prototypes below, for the error
+        // hierarchy: `new Error(...)` links its `[[Prototype]]` to the REAL
+        // `error_protos` object, so `Error.prototype` has to read back that same
+        // object. It resolved to a fresh `Builtin("Error.prototype")` thunk
+        // instead, which is a FUNCTION — so `Object.getPrototypeOf(new
+        // Error("x")) === Error.prototype` was false, and `typeof
+        // Error.prototype` was `"function"` where node says `"object"`.
+        if host::ERROR_NAMES.contains(&ns) {
+            if let Some(p) = with_host(|h| {
+                h.ensure_error_protos();
+                host::error_proto_of(h, ns)
+            }) {
+                return p;
+            }
+        }
         // `Buffer`/`Uint8Array` have real prototype *objects* — a Buffer's
         // `[[Prototype]]` points at one, so `Object.getPrototypeOf(buf) ===
         // Buffer.prototype` must compare equal, which a freshly-allocated
@@ -1191,6 +1248,26 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
 /// dispatch on `recv`.
 pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result<Value, String> {
     let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
+    // `Error.prototype.toString` (20.5.3.4): `name`, `message`, or `name:
+    // message`, read off the chain so a subclass's `this.name = 'E'` is honored.
+    if ctor == "Error" && method == "toString" {
+        let s = with_host(|h| h.error_to_string(recv)).unwrap_or_else(|| {
+            with_host(|h| {
+                let name = host::lookup_chain(h, recv, "name")
+                    .map(|n| h.str_of(&n))
+                    .unwrap_or_else(|| "Error".into());
+                let msg = host::lookup_chain(h, recv, "message")
+                    .map(|m| h.str_of(&m))
+                    .unwrap_or_default();
+                if msg.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {msg}")
+                }
+            })
+        });
+        return Ok(with_host(|h| h.new_str(s)));
+    }
     if ctor == "Object" && method == "toString" {
         // Steps 16-17 of 20.1.3.6: a `Symbol.toStringTag` STRING on the receiver
         // (own or inherited, data property or getter) replaces the builtin brand,
@@ -1426,10 +1503,24 @@ fn b_named_eval(vm: &mut VM, _: u8) -> Value {
 }
 
 fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
-    // `obj.__proto__ = p` re-links the prototype.
+    // `obj.__proto__ = p` re-links the prototype — but only for the two values
+    // the Annex B setter accepts, an Object or `null`. Everything else is a
+    // silent no-op in Node (`o.__proto__ = 5` leaves `Object.getPrototypeOf(o)`
+    // untouched and creates no own key), and a null-prototype object inherits
+    // no such setter at all, so there the assignment is an ORDINARY own
+    // property write. Re-linking unconditionally made `o.__proto__ = 5` set the
+    // prototype to the number 5.
     if name == "__proto__" && with_host(|h| h.kind_of(recv)) == Some(ObjKind::Object) {
-        with_host(|h| h.set_proto(recv, val));
-        return Ok(());
+        if with_host(|h| h.has_null_proto(recv)) {
+            // falls through to the ordinary own-property write below
+        } else {
+            let assignable =
+                with_host(|h| h.is_null(&val) || matches!(h.kind_of(&val), Some(ObjKind::Object)));
+            if assignable {
+                with_host(|h| h.set_proto(recv, val));
+            }
+            return Ok(());
+        }
     }
     // A non-writable own property, or a new key on a non-extensible object,
     // silently discards the write (sloppy mode — the mode every script runs in).
@@ -2947,37 +3038,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(Value::Bool(r))
         }
         "Object.fromEntries" => object_from_entries(args),
-        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => {
-            let v = arg0(&args);
-            // Constructor-side inheritance: `Buffer extends Uint8Array`, so
-            // `Object.getPrototypeOf(Buffer)` is the `Uint8Array` constructor
-            // itself, not `Function.prototype`. This is the class-side half of
-            // the subclass link — the instance-side half is
-            // `Buffer.prototype`'s `[[Prototype]]`.
-            if matches!(with_host(|h| h.get(&v).cloned()), Some(JsObj::Builtin(ref n)) if n == "Buffer")
-            {
-                return Ok(with_host(|h| h.alloc(JsObj::Builtin("Uint8Array".into()))));
-            }
-            // `Object.create(null)` and friends really do have a null prototype.
-            if with_host(|h| h.has_null_proto(&v)) {
-                return Ok(with_host(|h| h.null()));
-            }
-            if let Some(p) = with_host(|h| h.proto_of(&v)) {
-                return Ok(p);
-            }
-            // A builtin exotic with no explicit `[[Prototype]]` link reports its
-            // constructor's prototype namespace (`Object.getPrototypeOf([]) ===
-            // Array.prototype`), which `strict_eq` compares by name. A plain
-            // object reports the one real `Object.prototype` object.
-            Ok(with_host(|h| {
-                h.ensure_native_protos();
-                match default_ctor_name(h, &v) {
-                    Some("Object") => h.object_proto(),
-                    Some(c) => h.alloc(JsObj::Builtin(format!("{c}.prototype"))),
-                    None => h.null(),
-                }
-            }))
-        }
+        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => Ok(prototype_of(&arg0(&args))),
         "Object.setPrototypeOf" => {
             let obj = arg0(&args);
             let proto = args.get(1).cloned().unwrap_or(Value::Undef);
@@ -3017,12 +3078,11 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             let key = h.str_of(&arg0(&args));
             h.symbol_for(&key)
         })),
-        "Symbol.keyFor" => Ok(with_host(|h| match h.get(&arg0(&args)) {
-            Some(JsObj::Symbol { desc, .. }) => {
-                desc.clone().map(|d| h.new_str(d)).unwrap_or(Value::Undef)
-            }
-            _ => Value::Undef,
-        })),
+        // `Symbol.keyFor(sym)` (20.4.2.6) is a REGISTRY lookup, not a
+        // description read: it answers only for symbols `Symbol.for` created.
+        // Returning the description made every symbol look registered —
+        // `Symbol.keyFor(Symbol("k"))` was `"k"` where node says `undefined`.
+        "Symbol.keyFor" => Ok(with_host(|h| h.symbol_registry_key(&arg0(&args)))),
         "Map" | "WeakMap" | "Set" | "WeakSet" | "Promise" => construct_builtin(name, args),
         // `Reflect.ownKeys` reports EVERY own key, non-enumerable included —
         // the same set as `getOwnPropertyNames` (node-js has no symbol-keyed
@@ -4712,12 +4772,15 @@ fn is_string_method(name: &str) -> bool {
             | "concat"
             | "at"
             | "toString"
+            | "toLocaleString"
             | "valueOf"
             | "match"
             | "matchAll"
             | "search"
             | "normalize"
             | "localeCompare"
+            | "toLocaleUpperCase"
+            | "toLocaleLowerCase"
             | "isWellFormed"
             | "toWellFormed"
     )
@@ -4846,6 +4909,21 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
             if let Some(s) = with_host(|h| h.as_str(recv)) {
                 return string_method(&s, name, args);
             }
+            // `Boolean.prototype` (20.3.3): a boolean is not a heap object here,
+            // so it reached no branch at all and `true.toString()` threw `is not
+            // a function`. Its three methods are `toString`, `valueOf`, and the
+            // inherited `Object.prototype.toLocaleString` — which
+            // `[1,'a',true].toLocaleString()` invokes per element, so the hole
+            // was reachable from the array form too.
+            if let Value::Bool(b) = recv {
+                return match name {
+                    "toString" | "toLocaleString" => {
+                        Ok(new_s(if *b { "true" } else { "false" }.to_string()))
+                    }
+                    "valueOf" => Ok(Value::Bool(*b)),
+                    _ => Err(host::type_error(&format!("{name} is not a function"))),
+                };
+            }
             Err(host::type_error(&format!("{} is not a function", name)))
         }
     }
@@ -4921,6 +4999,23 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             };
             let s = join_parts(&array_items(recv))?.join(&sep);
             Ok(with_host(|h| h.new_str(s)))
+        }
+        // `Array.prototype.toLocaleString` (23.1.3.32): comma-join the elements'
+        // OWN `toLocaleString` results, with `null`/`undefined` contributing the
+        // empty string. It threw `is not a function` — the whole method was
+        // missing — so `[1234.5, 'x'].toLocaleString()` was unreachable.
+        "toLocaleString" => {
+            let items = array_items(recv);
+            let mut parts: Vec<String> = Vec::with_capacity(items.len());
+            for it in &items {
+                if with_host(|h| h.is_nullish(it)) {
+                    parts.push(String::new());
+                    continue;
+                }
+                let v = host::call_method(it, "toLocaleString", Vec::new())?;
+                parts.push(with_host(|h| h.str_of(&v)));
+            }
+            Ok(with_host(|h| h.new_str(parts.join(","))))
         }
         "indexOf" => {
             let items = array_items(recv);
@@ -5497,6 +5592,21 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         }
         "toUpperCase" => Ok(new_s(s.to_uppercase())),
         "toLowerCase" => Ok(new_s(s.to_lowercase())),
+        // `toLocaleUpperCase`/`toLocaleLowerCase` (22.1.3.26/22.1.3.24) differ
+        // from the plain forms only for the locale-specific mappings (Turkish
+        // dotless i, Lithuanian accents); with no locale argument they are the
+        // Unicode Default Case Conversion, which is exactly `to_uppercase`/
+        // `to_lowercase`. They threw `is not a function` before, so the common
+        // no-argument call — the only form this runtime can answer, since it
+        // carries no ICU — failed outright rather than agreeing with node.
+        // A locale ARGUMENT is accepted and ignored; `'I'.toLocaleLowerCase('tr')`
+        // is `'i'` here and `'ı'` in node.
+        // `String.prototype.toLocaleString` (22.1.3.27) is `toString` — a string
+        // has no locale rendering. Missing it made an ARRAY of strings fail too,
+        // since `Array.prototype.toLocaleString` invokes it per element.
+        "toLocaleString" => Ok(new_s(s.to_string())),
+        "toLocaleUpperCase" => Ok(new_s(s.to_uppercase())),
+        "toLocaleLowerCase" => Ok(new_s(s.to_lowercase())),
         // Locale comparison (ASCII approximation of ICU collation): primary by
         // case-folded order, then lowercase sorts before uppercase at a tie.
         "localeCompare" => {
@@ -5518,7 +5628,22 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             };
             Ok(Value::Float(r))
         }
-        "normalize" => Ok(new_s(s.to_string())),
+        // `normalize` is the identity here (no Unicode normalization tables),
+        // but the FORM argument is still validated: node throws for anything
+        // outside the four canonical names, and code that probes support with a
+        // try/catch was told every form was fine.
+        "normalize" => {
+            let form = match args.first() {
+                Some(v) if !matches!(v, Value::Undef) => with_host(|h| h.str_of(v)),
+                _ => "NFC".to_string(),
+            };
+            if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+                return Err(host::range_error(
+                    "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
+                ));
+            }
+            Ok(new_s(s.to_string()))
+        }
         // ES2024 well-formedness (22.1.3.9 / 22.1.3.29). A `String` here is a
         // Rust `String`, whose `char` type EXCLUDES `U+D800..=U+DFFF`, so every
         // value this runtime can hold is well-formed by construction and
@@ -5874,7 +5999,20 @@ fn bigint_method(b: &num_bigint::BigInt, name: &str, args: Vec<Value>) -> Result
             }
             Ok(new_s(b.to_str_radix(radix)))
         }
-        "toLocaleString" => Ok(new_s(b.to_string())),
+        // `BigInt.prototype.toLocaleString` groups thousands like the Number
+        // one does — `(1234567n).toLocaleString()` is `1,234,567` in node, and
+        // returning the bare digits made it the only numeric type that skipped
+        // grouping. Same en-US-shaped output as `Number.prototype`; the
+        // `locales`/`options` arguments are ignored (no ICU here).
+        "toLocaleString" => {
+            let digits = b.magnitude().to_string();
+            let sign = if b.sign() == num_bigint::Sign::Minus {
+                "-"
+            } else {
+                ""
+            };
+            Ok(new_s(format!("{sign}{}", group_thousands(&digits))))
+        }
         "valueOf" => Ok(with_host(|h| h.new_bigint(b.clone()))),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
@@ -6940,6 +7078,43 @@ pub fn error_string(h: &host::JsHost, v: &Value) -> String {
 
 fn make_builtin(name: String) -> Value {
     with_host(|h| h.alloc(JsObj::Builtin(name)))
+}
+
+/// `[[GetPrototypeOf]]` (10.1.1) — the answer `Object.getPrototypeOf`,
+/// `Reflect.getPrototypeOf` and a `__proto__` READ all have to agree on.
+///
+/// `__proto__` used to answer from `JsHost::proto_of` alone, which records only
+/// an EXPLICIT link, so an object on the default prototype reported `null`:
+/// `({}).__proto__ === Object.prototype` was false while
+/// `Object.getPrototypeOf({}) === Object.prototype` was true. One function, so
+/// the three cannot drift apart again.
+pub fn prototype_of(v: &Value) -> Value {
+    // Constructor-side inheritance: `Buffer extends Uint8Array`, so
+    // `Object.getPrototypeOf(Buffer)` is the `Uint8Array` constructor itself,
+    // not `Function.prototype`. This is the class-side half of the subclass
+    // link — the instance-side half is `Buffer.prototype`'s `[[Prototype]]`.
+    if matches!(with_host(|h| h.get(v).cloned()), Some(JsObj::Builtin(ref n)) if n == "Buffer") {
+        return with_host(|h| h.alloc(JsObj::Builtin("Uint8Array".into())));
+    }
+    // `Object.create(null)` and friends really do have a null prototype.
+    if with_host(|h| h.has_null_proto(v)) {
+        return with_host(|h| h.null());
+    }
+    if let Some(p) = with_host(|h| h.proto_of(v)) {
+        return p;
+    }
+    // A builtin exotic with no explicit `[[Prototype]]` link reports its
+    // constructor's prototype namespace (`Object.getPrototypeOf([]) ===
+    // Array.prototype`), which `strict_eq` compares by name. A plain object
+    // reports the one real `Object.prototype` object.
+    with_host(|h| {
+        h.ensure_native_protos();
+        match default_ctor_name(h, v) {
+            Some("Object") => h.object_proto(),
+            Some(c) => h.alloc(JsObj::Builtin(format!("{c}.prototype"))),
+            None => h.null(),
+        }
+    })
 }
 
 /// `new Promise((resolve, reject) => …)` — run the executor synchronously with

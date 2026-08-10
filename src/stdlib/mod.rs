@@ -350,6 +350,12 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "path" => path::constant(path::Flavor::Posix, name),
         "path/win32" => path::constant(path::Flavor::Win32, name),
         "os" => os::constant(name),
+        // `Buffer.poolSize` is a DATA property, not a method, so it belongs here
+        // rather than in `STATIC_METHODS` (which would make it read as a
+        // function). It was absent entirely: `Buffer.poolSize` was `undefined`
+        // where node v26.7.0 reports 65536. node-js allocates each Buffer on its
+        // own, so this is the documented constant, not a live allocator figure.
+        "Buffer" if name == "poolSize" => Some(Value::Float(65536.0)),
         "buffer" if name == "Buffer" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into()))))
         }
@@ -587,7 +593,12 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
             "uncork",
             "setEncoding",
         ],
-        "Hmac" => &["update", "digest"],
+        // `Hash` and `Hmac` answer the same two methods (both route to
+        // `crypto::hashlike_call`). Only `Hmac` was listed, so
+        // `ensure_ctor_proto("Hash")` found nothing and `crypto.Hash.prototype`
+        // read `undefined` — the ES5-subclassing hole this table exists to
+        // close, still open for one of the two constructors it documents.
+        "Hash" | "Hmac" => &["update", "digest"],
         "StringDecoder" => string_decoder::INSTANCE_METHODS,
         "Interface" => readline::INTERFACE_METHODS,
         "Script" => vm::SCRIPT_METHODS,

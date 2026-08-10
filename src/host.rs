@@ -578,9 +578,8 @@ pub struct JsHost {
     /// Promises that settled REJECTED this tick. Drained at each microtask
     /// checkpoint: any still without a handler is an unhandled rejection.
     pub pending_rejections: Vec<u32>,
-    /// `process.on(event, fn)` listeners, by event name. Only the events the
-    /// runtime actually emits (`unhandledRejection`) can fire.
-    pub process_listeners: IndexMap<String, Vec<Value>>,
+    /// `process.on(event, fn)` listeners, by event name.
+    pub process_listeners: IndexMap<String, Vec<ProcListener>>,
     /// The canonical `null` handle (allocated once).
     null_val: Value,
     /// `[[Prototype]]` link per heap object, by heap index. Absent = default
@@ -687,6 +686,18 @@ pub struct JsHost {
     /// written through one read is visible through the next. Minting a fresh
     /// object per read made both false.
     global_obj: Value,
+}
+
+/// One `process.on`/`process.once` registration. `once` is not decoration: a
+/// `once` listener must be UNREGISTERED before it runs, so a second `emit` of
+/// the same event does not reach it. Treating `once` as an alias of `on` made
+/// `process.once('e', f); process.emit('e'); process.emit('e')` call `f` twice
+/// and leave it in `process.listeners('e')` — node v26.7.0 calls it once and
+/// reports zero listeners afterwards.
+#[derive(Clone)]
+pub struct ProcListener {
+    pub f: Value,
+    pub once: bool,
 }
 
 /// A queued unit of work: either a JS callback invocation (`queueMicrotask`,
@@ -1339,6 +1350,25 @@ impl JsHost {
         self.symbol_registry.insert(key.to_string(), s.clone());
         s
     }
+    /// `Symbol.keyFor(sym)`: the registry key `Symbol.for` interned `sym` under,
+    /// or `undefined` for a symbol that is not in the registry at all.
+    ///
+    /// Matched by symbol IDENTITY, not by description — `Symbol.for('k')` and
+    /// `Symbol('k')` share a description and only the first is registered. The
+    /// `@@Symbol.*` well-known entries are registry-internal and never a
+    /// `keyFor` answer, matching node: `Symbol.keyFor(Symbol.iterator)` is
+    /// `undefined` there.
+    pub fn symbol_registry_key(&mut self, sym: &Value) -> Value {
+        let Some(key) = self
+            .symbol_registry
+            .iter()
+            .find(|(k, v)| self.strict_eq(v, sym) && !k.starts_with("@@Symbol."))
+            .map(|(k, _)| k.clone())
+        else {
+            return Value::Undef;
+        };
+        self.new_str(key)
+    }
     /// The well-known `Symbol.iterator` (a fixed shared symbol whose internal
     /// property key is `@@iterator`).
     pub fn well_known_iterator(&mut self) -> Value {
@@ -1703,6 +1733,18 @@ impl JsHost {
     pub fn current_this(&self) -> Option<Value> {
         self.frame().this_obj.clone()
     }
+    /// The callbacks to run for `event`, consuming any `once` registration in
+    /// the same step — so a listener that re-emits the event cannot re-enter a
+    /// one-shot handler.
+    pub fn take_process_listeners(&mut self, event: &str) -> Vec<Value> {
+        let Some(list) = self.process_listeners.get_mut(event) else {
+            return Vec::new();
+        };
+        let fired: Vec<Value> = list.iter().map(|l| l.f.clone()).collect();
+        list.retain(|l| !l.once);
+        fired
+    }
+
     /// Bind the TOP-LEVEL `this` — the value a `this` outside any function sees.
     ///
     /// Node answers differently per entry point and both answers are objects:
@@ -5009,7 +5051,7 @@ impl JsHost {
     /// `Error.prototype`: `"Name"` with an empty message, else `"Name: message"`.
     /// `None` for anything that is not an error, so the caller keeps its own
     /// stringification.
-    pub(crate) fn error_to_string(&self, v: &Value) -> Option<String> {
+    pub fn error_to_string(&self, v: &Value) -> Option<String> {
         let base = self.error_protos.get("Error")?;
         let mut cur = self.proto_of(v);
         let mut is_error = false;
@@ -5237,13 +5279,24 @@ impl JsHost {
         let nm = self.new_str("Error");
         let empty = self.new_str("");
         let ctor = self.alloc(JsObj::Builtin("Error".into()));
+        // `Error.prototype.toString` (20.5.3.4) has to be an OWN property here,
+        // not a fallback the stringifier applies when nothing else matches: it
+        // exists precisely to shadow `Object.prototype.toString`. Without it,
+        // the first read of `Error.prototype` or `Object.prototype` — which
+        // `x instanceof Error` performs, so ordinary code triggers it —
+        // materialised `Object.prototype.toString`, the chain lookup started
+        // finding it, and `String(err)` flipped from `Error: m` to
+        // `[object Error]` for the REST OF THE PROCESS, including errors
+        // created before the read.
+        let to_string = self.alloc(JsObj::Builtin("@proto:Error:toString".into()));
         if let Some(JsObj::Object(p)) = self.get_mut(&err_proto) {
             p.insert("name".into(), nm);
             p.insert("message".into(), empty);
             p.insert("constructor".into(), ctor);
+            p.insert("toString".into(), to_string);
         }
         // Everything on `Error.prototype` is non-enumerable in V8.
-        for k in ["name", "message", "constructor"] {
+        for k in ["name", "message", "constructor", "toString"] {
             self.hide_prop(&err_proto, k);
         }
         self.error_protos.insert("Error".into(), err_proto.clone());
@@ -6005,12 +6058,7 @@ fn check_unhandled_rejections() -> Result<(), String> {
             // Report each promise at most once, however many checkpoints pass.
             with_host(|h| h.promise_mark_handled(id));
             let val = with_host(|h| h.promise_value(id));
-            let listeners = with_host(|h| {
-                h.process_listeners
-                    .get("unhandledRejection")
-                    .cloned()
-                    .unwrap_or_default()
-            });
+            let listeners = with_host(|h| h.take_process_listeners("unhandledRejection"));
             if listeners.is_empty() {
                 let msg = with_host(|h| crate::builtins::error_string(h, &val));
                 with_host(|h| h.exc = Some(val));

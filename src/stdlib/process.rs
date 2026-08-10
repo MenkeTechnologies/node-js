@@ -303,7 +303,13 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "on" | "once" | "addListener" => {
             let (event, f) = (event_name(args), args.get(1).cloned());
             if let Some(f) = f {
-                with_host(|h| h.process_listeners.entry(event).or_default().push(f));
+                let once = method == "once";
+                with_host(|h| {
+                    h.process_listeners
+                        .entry(event)
+                        .or_default()
+                        .push(crate::host::ProcListener { f, once })
+                });
             }
             Ok(with_host(|h| h.alloc(JsObj::Builtin("process".into()))))
         }
@@ -312,7 +318,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             if let Some(f) = f {
                 with_host(|h| {
                     if let Some(l) = h.process_listeners.get_mut(&event) {
-                        if let Some(i) = l.iter().position(|x| x == &f) {
+                        if let Some(i) = l.iter().position(|x| x.f == f) {
                             l.remove(i);
                         }
                     }
@@ -334,15 +340,18 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "listeners" => {
             let event = event_name(args);
             Ok(with_host(|h| {
-                let l = h.process_listeners.get(&event).cloned().unwrap_or_default();
+                let l = h
+                    .process_listeners
+                    .get(&event)
+                    .map(|v| v.iter().map(|x| x.f.clone()).collect())
+                    .unwrap_or_default();
                 h.new_array(l)
             }))
         }
         "emit" => {
             let event = event_name(args);
             let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
-            let listeners =
-                with_host(|h| h.process_listeners.get(&event).cloned().unwrap_or_default());
+            let listeners = with_host(|h| h.take_process_listeners(&event));
             let any = !listeners.is_empty();
             let mut r = Ok(Value::Bool(any));
             for f in listeners {
@@ -725,7 +734,7 @@ pub fn emit_exit_event(code: i32) -> Result<(), String> {
     if with_host(|h| std::mem::replace(&mut h.exiting, true)) {
         return Ok(());
     }
-    let listeners = with_host(|h| h.process_listeners.get("exit").cloned().unwrap_or_default());
+    let listeners = with_host(|h| h.take_process_listeners("exit"));
     for f in listeners {
         crate::host::invoke(&f, vec![Value::Float(code as f64)], None)?;
     }
@@ -740,12 +749,7 @@ pub fn emit_exit_event(code: i32) -> Result<(), String> {
 ///
 /// Reports whether any listener ran, so the caller knows to re-drain.
 pub fn emit_before_exit(code: i32) -> Result<bool, String> {
-    let listeners = with_host(|h| {
-        h.process_listeners
-            .get("beforeExit")
-            .cloned()
-            .unwrap_or_default()
-    });
+    let listeners = with_host(|h| h.take_process_listeners("beforeExit"));
     let any = !listeners.is_empty();
     for f in listeners {
         crate::host::invoke(&f, vec![Value::Float(code as f64)], None)?;

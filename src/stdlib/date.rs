@@ -29,6 +29,9 @@ pub const INSTANCE_METHODS: &[&str] = &[
     "toGMTString",
     "toString",
     "toDateString",
+    "toLocaleString",
+    "toLocaleDateString",
+    "toLocaleTimeString",
     "getFullYear",
     "getUTCFullYear",
     "getMonth",
@@ -180,6 +183,34 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             })
         }),
         "toDateString" => with_host(|h| h.new_str(date_string(ms))),
+        // The three `toLocale*` forms threw `is not a function` — absent
+        // entirely, so `new Date(0).toLocaleString()` failed where node prints
+        // `1/1/1970, 12:00:00 AM`. Rendered in node's default en-US shape
+        // (`M/D/YYYY` and 12-hour `h:mm:ss AM/PM`) at UTC, consistent with the
+        // rest of this module running as if `TZ=UTC`. The `locales`/`options`
+        // arguments are accepted and ignored: without ICU there is nothing to
+        // vary, and answering the default form beats throwing.
+        "toLocaleString" => with_host(|h| {
+            h.new_str(if ms.is_nan() {
+                "Invalid Date".into()
+            } else {
+                format!("{}, {}", locale_date(ms), locale_time(ms))
+            })
+        }),
+        "toLocaleDateString" => with_host(|h| {
+            h.new_str(if ms.is_nan() {
+                "Invalid Date".into()
+            } else {
+                locale_date(ms)
+            })
+        }),
+        "toLocaleTimeString" => with_host(|h| {
+            h.new_str(if ms.is_nan() {
+                "Invalid Date".into()
+            } else {
+                locale_time(ms)
+            })
+        }),
         "getFullYear" | "getUTCFullYear" => Value::Float(field(ms, Field::Year)),
         "getMonth" | "getUTCMonth" => Value::Float(field(ms, Field::Month)),
         "getDate" | "getUTCDate" => Value::Float(field(ms, Field::Day)),
@@ -315,6 +346,32 @@ fn date_string(ms: f64) -> String {
     let (y, mo, d) = civil_from_days(day);
     let wd = (((day % 7) + 4 + 7) % 7) as usize;
     format!("{} {} {:02} {:04}", DAYS[wd], MONTHS[mo as usize], d, y)
+}
+
+/// `1/2/2020` — the `toLocaleDateString` default (en-US `M/D/YYYY`, no padding).
+fn locale_date(ms: f64) -> String {
+    let (day, _) = split_day(ms);
+    let (y, mo, d) = civil_from_days(day);
+    format!("{}/{}/{:04}", mo + 1, d, y)
+}
+
+/// `3:04:05 PM` — the `toLocaleTimeString` default (en-US 12-hour). Hour 0 and
+/// hour 12 both render as `12`, which is why this is not `h % 12`.
+fn locale_time(ms: f64) -> String {
+    let h24 = field(ms, Field::Hours) as i64;
+    let (h12, meridiem) = match h24 {
+        0 => (12, "AM"),
+        1..=11 => (h24, "AM"),
+        12 => (12, "PM"),
+        _ => (h24 - 12, "PM"),
+    };
+    format!(
+        "{}:{:02}:{:02} {}",
+        h12,
+        field(ms, Field::Minutes) as i64,
+        field(ms, Field::Seconds) as i64,
+        meridiem
+    )
 }
 
 /// `2015-10-21T07:28:00.000Z` — the ISO-8601 / `toISOString` form.
