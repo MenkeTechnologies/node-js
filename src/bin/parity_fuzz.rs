@@ -344,6 +344,12 @@ const FLOATS: &[&str] = &[
 ];
 // Values that exercise NaN / Infinity / -0 propagation.
 const SPECIALS: &[&str] = &["NaN", "Infinity", "-Infinity", "0/0", "1/0", "-1/0", "-0"];
+/// String receivers. The last three are ASTRAL: every JS string index counts
+/// UTF-16 code units, so a supplementary-plane character occupies TWO of them
+/// and shifts every index past it. A pool of BMP-only strings makes that
+/// impossible to observe — `'café'` is non-ASCII but still one code unit — so
+/// the whole class of code-unit bugs was unreachable no matter how many cases
+/// ran. These entries are what give the index arms below something to catch.
 const STRS: &[&str] = &[
     "'hello'",
     "'World'",
@@ -355,7 +361,17 @@ const STRS: &[&str] = &[
     "'  pad  '",
     "'AbC'",
     "'café'",
+    "'𝒳'",
+    "'ab𝒳cd'",
+    "'😀🎉'",
 ];
+
+/// Argument lists for `String.fromCharCode` / `fromCodePoint`. `fromCharCode`
+/// truncates each argument to a uint16 (so a supplementary code point comes out
+/// as a *different* BMP character) while `fromCodePoint` does not — the two
+/// disagree on exactly these inputs, which is the point of testing both.
+const CHAR_CODES: &[&str] = &["65", "97, 98", "0x263A", "0xD835, 0xDCB3", "0x1D4B3"];
+const CODE_POINTS: &[&str] = &["65", "97, 98", "0x263A", "0x1D4B3", "0x1F600, 0x41"];
 
 /// Number formatting / float repr — the historically weakest surface of a
 /// from-scratch JS number printer (exponential threshold, `toFixed`/`toPrecision`
@@ -446,14 +462,16 @@ fn gen_equality(seed: u64) -> Vec<String> {
 }
 
 /// String methods — slicing with negative/OOB indices, pad/repeat/split/replace,
-/// and template-literal interpolation of mixed types.
+/// template-literal interpolation of mixed types, and the code-unit-indexed
+/// family (`length`, `charCodeAt`/`codePointAt`, `charAt`, `s[i]`, the search
+/// quartet's position argument, `String.fromCharCode`/`fromCodePoint`).
 fn gen_strmeth(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let s = pick(r, STRS);
     let idx = &["0", "1", "2", "-1", "-2", "3", "10"];
     let a = pick(r, idx);
     let b = pick(r, idx);
-    let e = match r.below(14) {
+    let e = match r.below(25) {
         0 => format!("{s}.slice({a}, {b})"),
         1 => format!("{s}.substring({a}, {b})"),
         2 => format!("{s}.substr({a}, {b})"),
@@ -464,6 +482,13 @@ fn gen_strmeth(seed: u64) -> Vec<String> {
         // split('') on a SHORT string: a >6-element array triggers node's
         // util.inspect multi-line grouping, a documented known gap (BUGS.md), so
         // keep the result within the single-line regime.
+        //
+        // This pool stays BMP-only, and NOT to dodge a fixable bug: splitting an
+        // astral character yields two UNPAIRED surrogates, and `util.inspect`
+        // renders those as `'\ud835'` — a value a Rust `String` cannot hold, so
+        // no amount of index work can make this arm agree (BUGS.md records the
+        // boundary). It is pinned by an asserting test instead of fuzzed,
+        // because an arm that can never go green is a permanently red gate.
         7 => format!(
             "{}.split('')",
             pick(r, &["'abc'", "'a'", "''", "'hi'", "'abcde'", "'Wor'"])
@@ -473,7 +498,24 @@ fn gen_strmeth(seed: u64) -> Vec<String> {
         10 => format!("{s}.indexOf('o')"),
         11 => format!("{s}.at({a})"),
         12 => format!("`[${{{s}}}]-[${{{}}}]`", pick(r, INTS)),
-        _ => format!("`${{{}}}${{{}}}`", pick(r, INTS), s),
+        13 => format!("`${{{}}}${{{}}}`", pick(r, INTS), s),
+        // ── Code-unit-sensitive arms ────────────────────────────────────────
+        // Everything below reports or consumes a UTF-16 INDEX. On BMP input each
+        // agrees with a code-point implementation by coincidence; on the astral
+        // entries of STRS they diverge, which is what makes them worth emitting.
+        // Each yields a number, a boolean, or a single string written straight
+        // to stdout, so none of them depends on `util.inspect` escaping.
+        14 => format!("{s}.length"),
+        15 => format!("{s}.charCodeAt({a})"),
+        16 => format!("{s}.codePointAt({a})"),
+        17 => format!("{s}.charAt({a})"),
+        18 => format!("{s}[{a}]"),
+        19 => format!("{s}.indexOf('o', {a})"),
+        20 => format!("{s}.lastIndexOf('o', {a})"),
+        21 => format!("{s}.includes('o', {a})"),
+        22 => format!("{s}.startsWith('a', {a})"),
+        23 => format!("String.fromCharCode({})", pick(r, CHAR_CODES)),
+        _ => format!("String.fromCodePoint({})", pick(r, CODE_POINTS)),
     };
     vec![format!("console.log({e})")]
 }
@@ -995,8 +1037,8 @@ fn gen_bigint(seed: u64) -> Vec<String> {
 }
 
 /// Regex — ONLY the Rust-`regex`-supported subset (char classes, quantifiers,
-/// anchors, groups, alternation, `\d\w\s`, flags `g`/`i`/`m`), with fixed ASCII
-/// inputs so output is deterministic. Never emits backreferences/lookaround
+/// anchors, groups, alternation, `\d\w\s`, flags `g`/`i`/`m`), with a fixed
+/// input set so output is deterministic. Never emits backreferences/lookaround
 /// (node-js rejects those by design). Probes access `[0]`/`.index`/`.length`/
 /// `.groups` rather than printing a raw match array (whose extra-prop inspect is a
 /// documented gap).
@@ -1014,6 +1056,15 @@ fn gen_regex(seed: u64) -> Vec<String> {
         (r"\s+", "a  b   c"),
         (r"[0-9]{4}", "year 2024 end"),
         (r"[A-Z]\w*", "Foo bar Baz"),
+        // Astral inputs: `.index`, `lastIndex` and a replace callback's offset
+        // are UTF-16 code-unit offsets, so a supplementary character BEFORE the
+        // match shifts every one of them by one. The patterns here are
+        // digit/ASCII-letter classes that cannot match the astral character
+        // itself, which keeps this probing the INDEX and not the separate
+        // question of what `\w`/`.` mean outside the BMP.
+        (r"\d+", "a𝒳b123def"),
+        (r"[a-z]+", "𝒳Hello World"),
+        (r"[0-9]{4}", "😀year 2024 end"),
     ];
     let (pat, input) = *pick(r, cases);
     let e = match r.below(10) {
