@@ -735,8 +735,10 @@ pub fn finalization_registry_call(
             let held = args.get(1).cloned().unwrap_or(Value::Undef);
             let token = args.get(2).cloned().unwrap_or(Value::Undef);
             if !is_object_value(&target) {
+                // V8's wording is `invalid target`; the "must be an object"
+                // phrasing was this file's own, not any engine's.
                 return Err(crate::host::type_error(
-                    "FinalizationRegistry.prototype.register: target must be an object",
+                    "FinalizationRegistry.prototype.register: invalid target",
                 ));
             }
             if with_host(|h| h.strict_eq(&target, &held)) {
@@ -748,9 +750,10 @@ pub fn finalization_registry_call(
             // `unregister` can find (and drop) this registration.
             if !matches!(token, Value::Undef) {
                 if !is_object_value(&token) {
-                    return Err(crate::host::type_error(
-                        "FinalizationRegistry.prototype.register: unregister token must be an object",
-                    ));
+                    return Err(crate::host::type_error(&format!(
+                        "Invalid unregisterToken ('{}')",
+                        with_host(|h| h.str_of(&token))
+                    )));
                 }
                 with_host(|h| {
                     let toks = registry_tokens(h, recv);
@@ -764,9 +767,11 @@ pub fn finalization_registry_call(
         "unregister" => {
             let token = args.first().cloned().unwrap_or(Value::Undef);
             if !is_object_value(&token) {
-                return Err(crate::host::type_error(
-                    "FinalizationRegistry.prototype.unregister: unregister token must be an object",
-                ));
+                // V8 names the token and does not mention the method.
+                return Err(crate::host::type_error(&format!(
+                    "Invalid unregisterToken ('{}')",
+                    with_host(|h| h.str_of(&token))
+                )));
             }
             Ok(Value::Bool(with_host(|h| {
                 let toks = registry_tokens(h, recv);

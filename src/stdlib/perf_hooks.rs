@@ -212,9 +212,9 @@ const TIMERIFY_SRC: &str = "(function(original, record){\n\
 fn timerify(args: &[Value]) -> Result<Value, String> {
     let orig = args.first().cloned().unwrap_or(Value::Undef);
     if !with_host(|h| crate::host::is_callable(h, &orig)) {
-        return Err(
-            "TypeError [ERR_INVALID_ARG_TYPE]: The \"fn\" argument must be of type function".into(),
-        );
+        return Err(crate::host::invalid_arg_type(
+            "fn", "argument", "function", &orig,
+        ));
     }
     let factory = run_completion(TIMERIFY_SRC)?;
     let record = with_host(|h| h.alloc(JsObj::Builtin("performance.@@timerify_record".into())));

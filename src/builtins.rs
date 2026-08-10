@@ -51,6 +51,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::APPLY_METHOD, b_apply_method);
     vm.register_builtin(ops::OBJ_REST, b_obj_rest);
     vm.register_builtin(ops::DIV, b_div);
+    vm.register_builtin(ops::POW, b_pow);
     vm.register_builtin(ops::MKCLASS, b_mkclass);
     vm.register_builtin(ops::DEF_MEMBER, b_def_member);
     vm.register_builtin(ops::DEF_FIELD, b_def_field);
@@ -382,6 +383,17 @@ fn b_div(vm: &mut VM, _: u8) -> Value {
     let b = vm.pop();
     let a = vm.pop();
     let r = numeric_hook(NumOp::Div, &a, &b);
+    finish(vm, r)
+}
+
+/// `a ** b`. Same reason `/` is a builtin: fusevm's native `Op::Pow` is IEEE-754
+/// `pow`, which returns 1 for `(-1) ** Infinity` and for `1 ** NaN` where the
+/// spec says NaN. Routing through the numeric hook also keeps BigInt `**` on the
+/// one code path that already handles it.
+fn b_pow(vm: &mut VM, _: u8) -> Value {
+    let b = vm.pop();
+    let a = vm.pop();
+    let r = numeric_hook(NumOp::Pow, &a, &b);
     finish(vm, r)
 }
 
@@ -1961,9 +1973,16 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
 fn b_contains(vm: &mut VM, _: u8) -> Value {
     let container = vm.pop();
     let key = vm.pop();
-    // `x in y` requires y to be an object.
+    // `x in y` requires y to be an object. V8 names both operands:
+    // `Cannot use 'in' operator to search for 'a' in 5`.
     if !matches!(container, Value::Obj(_)) {
-        return abort(vm, host::type_error("Cannot use 'in' operator to search"));
+        let (k, c) = with_host(|h| (h.property_key(&key), h.str_of(&container)));
+        return abort(
+            vm,
+            host::type_error(&format!(
+                "Cannot use 'in' operator to search for '{k}' in {c}"
+            )),
+        );
     }
     let k = with_host(|h| h.property_key(&key));
     Value::Bool(has_property(&container, &k))
@@ -2175,23 +2194,42 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
         Some((n, c)) if c.ends_with(']') => (n, Some(c[..c.len() - 1].to_string())),
         _ => (head, None),
     };
-    let (name, message) = if host::ERROR_NAMES.contains(&base) {
+    let (name, mut message) = if host::ERROR_NAMES.contains(&base) {
         (base.to_string(), rest)
     } else {
         ("Error".to_string(), e.to_string())
     };
+    // A `host::plain_coded_error` marker: the code rides at the head of the
+    // MESSAGE rather than in the class, because Node's native-layer errors set
+    // `.code` while leaving `String(err)` unbracketed (`TypeError: Invalid URL`
+    // with `code === 'ERR_INVALID_URL'`). Strip it back off here — the marker is
+    // internal and must never reach a user-visible `.message`.
+    let mut code = code;
+    // Whether `String(err)`/`err.stack` show `Name [CODE]:` — true for the
+    // bracketed head, false for the marker form.
+    let mut bracketed = code.is_some();
+    if let Some(rest) = message.strip_prefix(host::CODE_MARK) {
+        if let Some((c, m)) = rest.split_once('\u{1}') {
+            code = Some(c.to_string());
+            bracketed = false;
+            message = m.to_string();
+        }
+    }
     let mut props: IndexMap<String, Value> = IndexMap::new();
     let mv = h.new_str(message.clone());
     props.insert("message".into(), mv);
     if let Some(c) = &code {
         let cv = h.new_str(c.clone());
         props.insert("code".into(), cv);
-        // Marks this as a Node internal error, whose `toString` brackets the code.
-        props.insert("@@nodeError".into(), Value::Bool(true));
+        if bracketed {
+            // Marks this as a Node JS-layer error, whose `toString` brackets the
+            // code. A native-layer error has the same `.code` and does not.
+            props.insert("@@nodeError".into(), Value::Bool(true));
+        }
     }
-    let label = match &code {
-        Some(c) => format!("{name} [{c}]"),
-        None => name.clone(),
+    let label = match (&code, bracketed) {
+        (Some(c), true) => format!("{name} [{c}]"),
+        _ => name.clone(),
     };
     let frames = h.stack_frames();
     let stack = if message.is_empty() {
@@ -2645,6 +2683,15 @@ const NS_METHODS: &[&str] = &[
     "Math.hypot",
     "Math.clz32",
     "Math.fround",
+    "Math.imul",
+    "Math.sinh",
+    "Math.cosh",
+    "Math.tanh",
+    "Math.asinh",
+    "Math.acosh",
+    "Math.atanh",
+    "Math.log1p",
+    "Math.expm1",
     "Math.log",
     "Math.log2",
     "Math.log10",
@@ -2826,7 +2873,11 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         return match crate::module::resolve(&spec, &crate::module::entry_dir()) {
             Some(p) => Ok(with_host(|h| h.new_str(p.to_string_lossy().to_string()))),
-            None => Err(format!("Error: Cannot find module '{spec}'")),
+            None => Err(crate::host::plain_coded_error(
+                "Error",
+                "MODULE_NOT_FOUND",
+                &format!("Cannot find module '{spec}'"),
+            )),
         };
     }
     // `__cjs_resolve(spec, fromDir)`: `require.resolve` — the resolved absolute
@@ -2839,7 +2890,11 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         return match crate::module::resolve(&spec, std::path::Path::new(&from)) {
             Some(p) => Ok(with_host(|h| h.new_str(p.to_string_lossy().to_string()))),
-            None => Err(format!("Error: Cannot find module '{spec}'")),
+            None => Err(crate::host::plain_coded_error(
+                "Error",
+                "MODULE_NOT_FOUND",
+                &format!("Cannot find module '{spec}'"),
+            )),
         };
     }
     // `Error.captureStackTrace(target[, ctor])`: V8's stack capture. Sets
@@ -3212,6 +3267,14 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
 /// `BigInt(x)`: convert a boolean/number/string/bigint to a BigInt. A
 /// non-integer number is a `RangeError`; an unparseable string a `SyntaxError`
 /// (matching Node's messages).
+/// V8 names the offending value: `BigInt(undefined)` is `Cannot convert
+/// undefined to a BigInt`, `BigInt({})` is `Cannot convert [object Object] to a
+/// BigInt`. The old text said "value" literally, for every input.
+fn bigint_convert_error(v: &Value) -> String {
+    let shown = with_host(|h| h.str_of(v));
+    host::type_error(&format!("Cannot convert {shown} to a BigInt"))
+}
+
 fn bigint_ctor(v: &Value) -> Result<Value, String> {
     use num_bigint::BigInt;
     let big = match v {
@@ -3234,7 +3297,7 @@ fn bigint_ctor(v: &Value) -> Result<Value, String> {
             // `1000000000000000019884624838656n` in both).
             match BigInt::parse_bytes(format!("{f:.0}").as_bytes(), 10) {
                 Some(b) => b,
-                None => return Err(host::type_error("Cannot convert value to a BigInt")),
+                None => return Err(bigint_convert_error(v)),
             }
         }
         Value::Str(s) => match host::parse_bigint_str(s) {
@@ -3247,9 +3310,9 @@ fn bigint_ctor(v: &Value) -> Result<Value, String> {
                 Some(b) => b,
                 None => return Err(format!("SyntaxError: Cannot convert {s} to a BigInt")),
             },
-            _ => return Err(host::type_error("Cannot convert value to a BigInt")),
+            _ => return Err(bigint_convert_error(v)),
         },
-        _ => return Err(host::type_error("Cannot convert value to a BigInt")),
+        _ => return Err(bigint_convert_error(v)),
     };
     Ok(with_host(|h| h.new_bigint(big)))
 }
@@ -3657,11 +3720,18 @@ fn legacy_unescape(s: &str) -> Result<Value, String> {
 
 fn parse_int(args: &[Value]) -> f64 {
     let s = with_host(|h| h.str_of(&arg0(args)));
-    let radix = args
+    // 19.2.5 step 8: an EXPLICIT radix outside 2..=36 is `NaN`, it does not fall
+    // back to auto-detection. The old `.filter()` silently discarded a bad radix,
+    // so `parseInt("10", 37)` answered 10 where every engine says NaN.
+    let radix_arg = args
         .get(1)
-        .map(|r| with_host(|h| h.to_number(r)) as u32)
-        .filter(|r| (2..=36).contains(r));
-    let t = s.trim();
+        .map(|r| with_host(|h| host::to_int32(h.to_number(r))));
+    let radix = match radix_arg {
+        Some(0) | None => None,
+        Some(r) if (2..=36).contains(&r) => Some(r as u32),
+        Some(_) => return f64::NAN,
+    };
+    let t = crate::utf16::js_trim_start(&s);
     let (neg, digits) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
@@ -3690,9 +3760,24 @@ fn parse_int(args: &[Value]) -> f64 {
     if valid.is_empty() {
         return f64::NAN;
     }
-    let n = i64::from_str_radix(&valid, radix)
-        .map(|n| n as f64)
-        .unwrap_or(f64::NAN);
+    // Accumulate in `f64`, not `i64`. `i64::from_str_radix` OVERFLOWS past ~19
+    // digits and the error was mapped to `NaN`, so
+    // `parseInt("999999999999999999999999")` was NaN instead of 1e+24. The spec
+    // asks for the mathematical value rounded to a Number, which is what
+    // repeated multiply-accumulate in `f64` produces.
+    let n = if radix == 10 {
+        // Rust's decimal float parser is correctly rounded; digit-by-digit
+        // multiply-accumulate is not, and drifted a ULP on long inputs
+        // (`parseInt("999999999999999999999999")` came out
+        // 1.0000000000000003e+24 rather than 1e+24).
+        valid.parse::<f64>().unwrap_or(f64::NAN)
+    } else {
+        let mut n = 0.0f64;
+        for c in valid.chars() {
+            n = n * radix as f64 + c.to_digit(radix).unwrap_or(0) as f64;
+        }
+        n
+    };
     if neg {
         -n
     } else {
@@ -3702,7 +3787,7 @@ fn parse_int(args: &[Value]) -> f64 {
 
 fn parse_float(args: &[Value]) -> f64 {
     let s = with_host(|h| h.str_of(&arg0(args)));
-    let t = s.trim_start();
+    let t = crate::utf16::js_trim_start(&s);
     // `Infinity` / `+Infinity` / `-Infinity` are valid parseFloat prefixes.
     let inf_body = t
         .strip_prefix('+')
@@ -3715,27 +3800,61 @@ fn parse_float(args: &[Value]) -> f64 {
             f64::INFINITY
         };
     }
-    // Longest numeric prefix.
+    // The LONGEST prefix that is itself a complete `StrDecimalLiteral`, which is
+    // not the same as the longest run of characters that could appear in one:
+    // `"1e"` and `"1e+"` are `1` in every engine, because the exponent part is
+    // only valid once a digit follows `e`. Tracking `end` at every character
+    // accepted the dangling `e`, `parse::<f64>` then failed, and the whole call
+    // came back NaN.
     let mut end = 0;
     let bytes = t.as_bytes();
     let mut seen_dot = false;
     let mut seen_e = false;
+    let mut digits_before_dot = false;
     for (i, &c) in bytes.iter().enumerate() {
         match c {
-            b'0'..=b'9' => end = i + 1,
-            b'+' | b'-' if i == 0 || bytes[i - 1] == b'e' || bytes[i - 1] == b'E' => end = i + 1,
+            b'0'..=b'9' => {
+                if !seen_dot && !seen_e {
+                    digits_before_dot = true;
+                }
+                end = i + 1;
+            }
+            // A sign is only meaningful leading, or straight after the exponent
+            // marker; it never completes a literal on its own.
+            b'+' | b'-' if i == 0 || bytes[i - 1] == b'e' || bytes[i - 1] == b'E' => {}
+            // `1.` is a complete literal; a bare `.` is not.
             b'.' if !seen_dot && !seen_e => {
                 seen_dot = true;
-                end = i + 1;
+                if digits_before_dot {
+                    end = i + 1;
+                }
             }
-            b'e' | b'E' if !seen_e && i > 0 => {
-                seen_e = true;
-                end = i + 1;
-            }
+            b'e' | b'E' if !seen_e && end > 0 => seen_e = true,
             _ => break,
         }
     }
+    if end == 0 {
+        return f64::NAN;
+    }
     t[..end].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// ECMA-262 `Number::exponentiate` (6.1.6.1.3), backing both `Math.pow` and the
+/// `**` operator. Three clauses differ from IEEE-754 `pow`, which is what Rust's
+/// `powf` implements: a NaN exponent is NaN even for base 1, a NaN base is NaN
+/// for any non-zero exponent, and `|base| == 1` with an infinite exponent is NaN
+/// rather than 1.
+pub(crate) fn js_pow(base: f64, exp: f64) -> f64 {
+    if exp == 0.0 {
+        return 1.0;
+    }
+    if base.is_nan() || exp.is_nan() {
+        return f64::NAN;
+    }
+    if base.abs() == 1.0 && exp.is_infinite() {
+        return f64::NAN;
+    }
+    base.powf(exp)
 }
 
 fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
@@ -3743,14 +3862,30 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
     let r = match fname {
         "floor" => x.floor(),
         "ceil" => x.ceil(),
+        // ECMA-262 `Math.round` (21.3.2.28) transcribed clause by clause. The
+        // obvious `(x + 0.5).floor()` is NOT this function: the addition rounds
+        // before the floor sees it, so it answers 1 for the largest double below
+        // 0.5 (`Math.round(0.49999999999999994)` is 0 in every engine) and it
+        // perturbs integers above 2^52, where `x + 0.5` is no longer
+        // representable (`Math.round(4503599627370497)` must be the input).
+        // Splitting the zero-band cases out first also carries the signed zero
+        // the spec asks for without a post-hoc patch.
         "round" => {
-            // JS rounds half up toward +Infinity, but preserves the sign of a
-            // zero result: Math.round(-0.5) === -0, Math.round(-0.4) === -0.
-            let r = (x + 0.5).floor();
-            if r == 0.0 && x.is_sign_negative() {
+            if !x.is_finite() || x == 0.0 {
+                x
+            } else if x > 0.0 && x < 0.5 {
+                0.0
+            } else if (-0.5..0.0).contains(&x) {
                 -0.0
             } else {
-                r
+                // |x| >= 0.5, so `floor` and the subtraction are both exact
+                // (every double >= 2^52 is already an integer and yields 0 here).
+                let f = x.floor();
+                if x - f >= 0.5 {
+                    f + 1.0
+                } else {
+                    f
+                }
             }
         }
         "trunc" => x.trunc(),
@@ -3779,7 +3914,24 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
         "acos" => x.acos(),
         "atan" => x.atan(),
         "atan2" => x.atan2(arg_num(args, 1)),
-        "pow" => x.powf(arg_num(args, 1)),
+        // Rust `powf` is IEEE-754 `pow`, which is NOT JS `**`/`Math.pow`: IEEE
+        // makes `pow(x, ±0)` and `pow(±1, y)` return 1 unconditionally, so
+        // `(-1) ** Infinity` and `1 ** NaN` come back 1 where the spec
+        // (6.1.6.1.3 Number::exponentiate) says NaN. Only the exponent-is-zero
+        // clause is shared.
+        "pow" => js_pow(x, arg_num(args, 1)),
+        // Hyperbolics and the two precision-preserving log/exp forms.
+        "sinh" => x.sinh(),
+        "cosh" => x.cosh(),
+        "tanh" => x.tanh(),
+        "asinh" => x.asinh(),
+        "acosh" => x.acosh(),
+        "atanh" => x.atanh(),
+        "log1p" => x.ln_1p(),
+        "expm1" => x.exp_m1(),
+        // C-style 32-bit integer multiply: ToInt32 both operands, multiply with
+        // wraparound, reinterpret as a signed 32-bit result.
+        "imul" => (host::to_int32(x).wrapping_mul(host::to_int32(arg_num(args, 1)))) as f64,
         "hypot" => {
             // Scale by the largest magnitude before squaring — this avoids the
             // last-ULP error of the naive `sqrt(Σ xᵢ²)` and matches V8's result.
@@ -3810,7 +3962,10 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
                     if n.is_nan() {
                         return Ok(Value::Float(f64::NAN));
                     }
-                    if n > m {
+                    // `>` cannot separate the zeroes (`0.0 > -0.0` is false), but
+                    // the spec ranks +0 above -0, so `Math.max(-0, 0)` is +0 and
+                    // must not keep the -0 the first iteration installed.
+                    if n > m || (n == m && n == 0.0 && n.is_sign_positive()) {
                         m = n;
                     }
                 }
@@ -3827,7 +3982,9 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
                     if n.is_nan() {
                         return Ok(Value::Float(f64::NAN));
                     }
-                    if n < m {
+                    // Mirror of `max`: -0 ranks below +0 even though `<` says
+                    // they are equal, so `Math.min(0, -0)` is -0.
+                    if n < m || (n == m && n == 0.0 && n.is_sign_negative()) {
                         m = n;
                     }
                 }
@@ -5478,6 +5635,19 @@ fn join_parts(items: &[Value]) -> Result<Vec<String>, String> {
 /// sort so the fallible JS comparator can be called; default order is by the
 /// string form of each element. Propagates a comparator error.
 fn sort_values(items: &mut [Value], cmp: Option<&Value>) -> Result<(), String> {
+    // 23.1.3.30 step 1: a comparator that is neither `undefined` nor callable is
+    // rejected BEFORE any comparison runs. `[2,1].sort(null)` was reaching the
+    // invoke path and reporting the generic `null is not a function`.
+    let cmp = match cmp {
+        Some(Value::Undef) => None,
+        Some(v) if !with_host(|h| host::is_callable(h, v)) => {
+            let shown = with_host(|h| h.inspect(v));
+            return Err(host::type_error(&format!(
+                "The comparison function must be either a function or undefined: {shown}"
+            )));
+        }
+        other => other,
+    };
     for i in 1..items.len() {
         let mut j = i;
         while j > 0 {
@@ -5657,9 +5827,10 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         // boundary in `utf16`, not a separate gap.
         "isWellFormed" => Ok(Value::Bool(true)),
         "toWellFormed" => Ok(new_s(s.to_string())),
-        "trim" => Ok(new_s(s.trim().to_string())),
-        "trimStart" => Ok(new_s(s.trim_start().to_string())),
-        "trimEnd" => Ok(new_s(s.trim_end().to_string())),
+        // The JS `WhiteSpace` set, not Rust's — they differ on `U+FEFF`.
+        "trim" => Ok(new_s(crate::utf16::js_trim(s).to_string())),
+        "trimStart" => Ok(new_s(crate::utf16::js_trim_start(s).to_string())),
+        "trimEnd" => Ok(new_s(crate::utf16::js_trim_end(s).to_string())),
         "toString" | "valueOf" => Ok(new_s(s.to_string())),
         "charAt" => {
             let at = unit_pos(arg_num(&args, 0)).and_then(|i| u.unit_str(i));
@@ -5787,8 +5958,13 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         }
         "repeat" => {
             let n = arg_num(&args, 0);
+            // `RangeError`, not `TypeError`, and the count is named:
+            // `"x".repeat(-1)` is `RangeError: Invalid count value: -1`.
             if n < 0.0 || !n.is_finite() {
-                return Err(host::type_error("Invalid count value"));
+                return Err(host::range_error(&format!(
+                    "Invalid count value: {}",
+                    host::fmt_number(n)
+                )));
             }
             Ok(new_s(s.repeat(n as usize)))
         }
@@ -5992,14 +6168,26 @@ fn pad(s: &str, args: &[Value], start: bool) -> String {
     }
 }
 
+/// V8's radix rejection, shared by `Number.prototype.toString` and
+/// `BigInt.prototype.toString` — one string, because they are one message and
+/// the two sites had drifted apart ("radix must be" vs V8's "radix argument
+/// must be").
+const RADIX_RANGE: &str = "toString() radix argument must be between 2 and 36";
+
 /// `BigInt.prototype` methods: `toString([radix])`, `valueOf`, `toLocaleString`.
 fn bigint_method(b: &num_bigint::BigInt, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "toString" => {
-            let radix = args.first().map(|_| arg_num(&args, 0) as u32).unwrap_or(10);
-            if !(2..=36).contains(&radix) {
-                return Err("RangeError: toString() radix must be between 2 and 36".into());
-            }
+            let radix = match args.first() {
+                None | Some(Value::Undef) => 10,
+                Some(_) => {
+                    let t = arg_num(&args, 0).trunc();
+                    if !(2.0..=36.0).contains(&t) {
+                        return Err(host::range_error(RADIX_RANGE));
+                    }
+                    t as u32
+                }
+            };
             Ok(new_s(b.to_str_radix(radix)))
         }
         // `BigInt.prototype.toLocaleString` groups thousands like the Number
@@ -6049,8 +6237,21 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
             Ok(new_s(to_exponential(n, f)))
         }
         "toString" => {
-            let radix = args.first().map(|_| arg_num(&args, 0) as u32).unwrap_or(10);
-            if radix == 10 || !(2..=36).contains(&radix) {
+            // An out-of-range radix THROWS; it does not silently fall back to
+            // base 10. `(1).toString(37)` returned "1" here, so a support probe
+            // was told every radix worked.
+            let radix = match args.first() {
+                None | Some(Value::Undef) => 10,
+                Some(_) => {
+                    let r = arg_num(&args, 0);
+                    let t = r.trunc();
+                    if !(2.0..=36.0).contains(&t) {
+                        return Err(host::range_error(RADIX_RANGE));
+                    }
+                    t as u32
+                }
+            };
+            if radix == 10 {
                 Ok(new_s(host::fmt_number(n)))
             } else {
                 Ok(new_s(to_radix(n, radix)))

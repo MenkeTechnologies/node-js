@@ -269,6 +269,17 @@ fn promises_object() -> Value {
 
 /// `dns.lookup(hostname[, options|family], cb)` → `cb(null, address, family)`.
 fn lookup(args: &[Value]) -> Result<Value, String> {
+    // Node validates the hostname's TYPE before doing anything else; coercing it
+    // meant `dns.lookup(1, cb)` quietly looked up the string "1".
+    match args.first() {
+        None | Some(Value::Undef) => {}
+        Some(v) if with_host(|h| h.as_str(v)).is_some() => {}
+        Some(v) => {
+            return Err(crate::host::invalid_arg_type(
+                "hostname", "argument", "string", v,
+            ))
+        }
+    }
     let hostname = arg_str(args, 0);
     let want = opt_family(args);
     let Some(cb) = args.last().cloned() else {

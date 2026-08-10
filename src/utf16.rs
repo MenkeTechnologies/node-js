@@ -182,6 +182,49 @@ pub fn byte_of_index(s: &str, idx: U16Index) -> usize {
     s.len()
 }
 
+/// ECMA-262 `WhiteSpace` (11.2) + `LineTerminator` (11.3): the exact character
+/// set `String.prototype.trim`, `ToNumber(string)`, `parseInt` and `parseFloat`
+/// skip.
+///
+/// Written out rather than delegated to `char::is_whitespace`, which follows the
+/// Unicode `White_Space` property. The two sets are NOT the same and they differ
+/// in BOTH directions:
+///
+/// * `U+FEFF` (ZWNBSP/BOM) is JS whitespace and is not Unicode `White_Space`, so
+///   `"\u{FEFF} x".trim()` kept the BOM and `Number("\u{FEFF}1")` was `NaN`.
+/// * `U+0085` (NEL) is Unicode `White_Space` and is NOT JS whitespace, so
+///   `"\u{85}x".trim()` stripped a character node keeps.
+///
+/// `U+180E` is in neither set (Unicode 6.3 dropped it from `White_Space`,
+/// ES2016 dropped it from `WhiteSpace`), which both engines already agreed on.
+pub fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        // WhiteSpace: TAB, VT, FF, SP, NBSP, ZWNBSP
+        '\u{9}' | '\u{B}' | '\u{C}' | '\u{20}' | '\u{A0}' | '\u{FEFF}'
+        // WhiteSpace: the rest of general category Zs
+        | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+        // LineTerminator: LF, CR, LS, PS
+        | '\u{A}' | '\u{D}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// `s` with leading and trailing JS whitespace removed.
+pub fn js_trim(s: &str) -> &str {
+    s.trim_matches(is_js_whitespace)
+}
+
+/// `s` with leading JS whitespace removed.
+pub fn js_trim_start(s: &str) -> &str {
+    s.trim_start_matches(is_js_whitespace)
+}
+
+/// `s` with trailing JS whitespace removed.
+pub fn js_trim_end(s: &str) -> &str {
+    s.trim_end_matches(is_js_whitespace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

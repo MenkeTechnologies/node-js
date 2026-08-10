@@ -1987,7 +1987,15 @@ impl Compiler {
                 return Ok(());
             }
             BinOp::Mod => native!(Op::Mod),
-            BinOp::Pow => native!(Op::Pow),
+            // NOT native `Op::Pow`, for the same reason `/` is a builtin above:
+            // fusevm's is IEEE-754 `pow`, where `(-1) ** Infinity` and `1 ** NaN`
+            // come back 1 rather than the spec's NaN.
+            BinOp::Pow => {
+                self.compile_expr(b, l)?;
+                self.compile_expr(b, r)?;
+                b.emit(Op::CallBuiltin(ops::POW, 2), 0);
+                return Ok(());
+            }
             BinOp::Lt => native!(Op::NumLt),
             BinOp::Le => native!(Op::NumLe),
             BinOp::Gt => native!(Op::NumGt),

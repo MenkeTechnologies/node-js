@@ -547,6 +547,35 @@ impl Lexer {
 }
 
 /// Append one escape sequence's decoded character(s) to `out`. `\xNN` and
+/// The value of a `\uDC00..\uDFFF` escape sitting at the lexer's cursor, without
+/// consuming it. Used to rejoin a surrogate PAIR written as two escapes.
+fn peek_low_surrogate(lx: &Lexer) -> Option<u32> {
+    if lx.peek() != Some('\\') || lx.peek_at(1) != Some('u') {
+        return None;
+    }
+    let mut n = 0u32;
+    for i in 0..4 {
+        let c = lx.peek_at(2 + i)?;
+        n = n * 16 + c.to_digit(16)?;
+    }
+    (0xDC00..=0xDFFF).contains(&n).then_some(n)
+}
+
+/// Append the code point `n` to a string literal's value.
+///
+/// `char::from_u32` rejects `U+D800..=U+DFFF`, and the old code simply dropped
+/// what it rejected — so `"\ud800".length` was 0 where every engine says 1, and
+/// `"a\ud800b".length` was 2 instead of 3. This runtime's documented policy for
+/// an unpaired surrogate is to substitute `U+FFFD` (see `utf16`), which is ONE
+/// code unit and therefore keeps the length arithmetic exact; dropping the unit
+/// broke that invariant rather than implementing it.
+fn push_code_point(out: &mut String, n: u32) {
+    match char::from_u32(n) {
+        Some(ch) => out.push(ch),
+        None => out.push('\u{FFFD}'),
+    }
+}
+
 /// `\uNNNN` / `\u{...}` are decoded; unknown escapes keep the literal char.
 fn push_escape(out: &mut String, e: char, lx: &mut Lexer) {
     match e {
@@ -591,9 +620,7 @@ fn push_escape(out: &mut String, e: char, lx: &mut Lexer) {
                     lx.bump();
                 }
                 if let Ok(n) = u32::from_str_radix(&h, 16) {
-                    if let Some(ch) = char::from_u32(n) {
-                        out.push(ch);
-                    }
+                    push_code_point(out, n);
                 }
             } else {
                 let mut h = String::new();
@@ -606,9 +633,21 @@ fn push_escape(out: &mut String, e: char, lx: &mut Lexer) {
                     }
                 }
                 if let Ok(n) = u32::from_str_radix(&h, 16) {
-                    if let Some(ch) = char::from_u32(n) {
-                        out.push(ch);
+                    // A HIGH surrogate followed by a `\uXXXX` LOW surrogate is one
+                    // astral character, and `"\ud83d\ude00"` is the ordinary
+                    // ASCII-safe way to write one. Decoding each half on its own
+                    // turned every such literal into two `U+FFFD`s.
+                    if (0xD800..=0xDBFF).contains(&n) {
+                        if let Some(lo) = peek_low_surrogate(lx) {
+                            for _ in 0..6 {
+                                lx.bump();
+                            }
+                            let cp = 0x10000 + ((n - 0xD800) << 10) + (lo - 0xDC00);
+                            push_code_point(out, cp);
+                            return;
+                        }
                     }
+                    push_code_point(out, n);
                 }
             }
         }

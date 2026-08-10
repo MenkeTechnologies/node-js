@@ -262,8 +262,13 @@ fn finished(args: &[Value]) -> Value {
 /// the destination stream.
 fn pipeline(args: &[Value]) -> Result<Value, String> {
     if args.is_empty() {
-        return Err(crate::host::type_error(
-            "pipeline requires at least one stream",
+        // Node validates the LAST argument (the callback slot) first, so an
+        // empty call reports that property, not a bespoke arity sentence.
+        return Err(crate::host::invalid_arg_type(
+            "streams[stream.length - 1]",
+            "property",
+            "function",
+            &Value::Undef,
         ));
     }
     let cb_idx = args

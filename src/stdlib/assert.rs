@@ -3,7 +3,7 @@
 
 use crate::host::{
     call_method, invoke, is_callable, promise_of, reject_promise_val, resolve_promise_val,
-    subscribe_native, take_exc_or_error, type_error, with_host, JsObj, PromiseState,
+    subscribe_native, take_exc_or_error, with_host, JsObj, PromiseState,
 };
 use fusevm::Value;
 
@@ -101,8 +101,14 @@ fn assert_match(args: &[Value], want_match: bool) -> Result<Value, String> {
     let s = args.first().cloned().unwrap_or(Value::Undef);
     let re = args.get(1).cloned().unwrap_or(Value::Undef);
     if !with_host(|h| matches!(h.get(&re), Some(JsObj::RegExp(_)))) {
-        return Err(type_error(
-            "The \"regexp\" argument must be an instance of RegExp.",
+        // Node names the instance, not a type, and appends the received value.
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"regexp\" argument must be an instance of RegExp. Received {}",
+                crate::stdlib::received_desc(&re)
+            ),
         ));
     }
     let matched = call_method(&re, "test", vec![s.clone()])?;

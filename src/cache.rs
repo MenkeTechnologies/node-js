@@ -40,7 +40,15 @@ use std::path::PathBuf;
 ///     class-body environment (15.7.14 step 17), whose `PUSH_SCOPE`/`DECLARE`
 ///     pair a v6 blob does not emit, so a static initializer reading the class
 ///     by name would still throw `ReferenceError`.
-const SCHEMA: u64 = 7;
+/// v8: `**` lowers to `CallBuiltin(ops::POW, 2)` instead of the native
+///     `Op::Pow`. fusevm's native op is IEEE-754 `pow`, which answers 1 for
+///     `(-1) ** Infinity` and `1 ** NaN` where the spec says NaN; a v7 blob
+///     still carries `Op::Pow` and would keep replaying the IEEE answer from
+///     cache long after the source fix. (The `Math.*` additions in the same
+///     change need no bump: a `Math.f(..)` call emits the name as a constant
+///     and dispatches on the string at run time, so `--dump-bytecode` for a
+///     known and an unknown method name is byte-identical.)
+const SCHEMA: u64 = 8;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

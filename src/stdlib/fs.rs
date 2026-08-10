@@ -1808,6 +1808,44 @@ fn syscall_name(op: &str) -> &str {
     }
 }
 
+/// The `CODE: reason` half of a libuv error message (`ENOENT: no such file or
+/// directory`), shared by every syscall wrapper that has to render one.
+///
+/// Deliberately NOT Rust's `io::Error` `Display`: Rust capitalizes and appends
+/// its own `(os error 2)`, so `No such file or directory (os error 2)` is a
+/// string no Node has ever printed. `process.chdir` was assembling its message
+/// that way.
+pub(crate) fn libuv_message(e: &std::io::Error) -> String {
+    use std::io::ErrorKind::*;
+    let code = match e.kind() {
+        NotFound => "ENOENT",
+        PermissionDenied => "EACCES",
+        AlreadyExists => "EEXIST",
+        NotADirectory => "ENOTDIR",
+        IsADirectory => "EISDIR",
+        DirectoryNotEmpty => "ENOTEMPTY",
+        InvalidInput => "EINVAL",
+        BrokenPipe => "EPIPE",
+        _ => "EIO",
+    };
+    format!("{code}: {}", libuv_reason(code))
+}
+
+/// libuv's own lowercase reason string for a code.
+fn libuv_reason(code: &str) -> &'static str {
+    match code {
+        "ENOENT" => "no such file or directory",
+        "EACCES" => "permission denied",
+        "EEXIST" => "file already exists",
+        "ENOTDIR" => "not a directory",
+        "EISDIR" => "illegal operation on a directory",
+        "ENOTEMPTY" => "directory not empty",
+        "EINVAL" => "invalid argument",
+        "EPIPE" => "broken pipe",
+        _ => "i/o error",
+    }
+}
+
 fn err_str(op: &str, path: &str, e: &std::io::Error) -> String {
     use std::io::ErrorKind::*;
     let code = match e.kind() {
@@ -1824,17 +1862,7 @@ fn err_str(op: &str, path: &str, e: &std::io::Error) -> String {
     // libuv's own reason strings, not Rust's `io::Error` `Display` — Rust
     // capitalizes ("No such file or directory") where libuv (and therefore
     // Node's `err.message`) does not.
-    let reason = match code {
-        "ENOENT" => "no such file or directory",
-        "EACCES" => "permission denied",
-        "EEXIST" => "file already exists",
-        "ENOTDIR" => "not a directory",
-        "EISDIR" => "illegal operation on a directory",
-        "ENOTEMPTY" => "directory not empty",
-        "EINVAL" => "invalid argument",
-        "EPIPE" => "broken pipe",
-        _ => "i/o error",
-    };
+    let reason = libuv_reason(code);
     let op = syscall_name(op);
     if path.is_empty() {
         format!("Error: {code}: {reason}, {op}")

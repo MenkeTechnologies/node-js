@@ -264,14 +264,17 @@ pub fn set_exit_code(val: &Value) -> Result<(), String> {
             with_host(|h| h.exit_code = Some(n as i32));
             Ok(())
         }
-        Some(n) => Err(crate::host::range_error(&format!(
-            "The value of \"code\" is out of range. It must be an integer. Received {}",
-            crate::host::fmt_number(n)
-        ))),
-        None => Err(crate::host::type_error(&format!(
-            "The \"code\" argument must be of type number. Received {}",
-            super::received_desc(val)
-        ))),
+        Some(n) => Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!(
+                "The value of \"code\" is out of range. It must be an integer. Received {}",
+                crate::host::fmt_number(n)
+            ),
+        )),
+        None => Err(crate::host::invalid_arg_type(
+            "code", "argument", "number", val,
+        )),
     }
 }
 
@@ -411,7 +414,19 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let dir = super::arg_str(args, 0);
             std::env::set_current_dir(&dir)
                 .map(|()| Value::Undef)
-                .map_err(|e| format!("Error: ENOENT: {e}, chdir '{dir}'"))
+                // Node reports the libuv message and BOTH directories:
+                // `ENOENT: no such file or directory, chdir <cwd> -> <dir>`.
+                // The old text spliced in Rust's `io::Error` Display, whose
+                // `No such file or directory (os error 2)` no Node ever printed.
+                .map_err(|e| {
+                    let from = std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    format!(
+                        "Error: {}, chdir '{from}' -> '{dir}'",
+                        crate::stdlib::fs::libuv_message(&e)
+                    )
+                })
         }
         // `process.kill(pid[, signal])` really signals the process. Node's default
         // is SIGTERM, and a numeric or `'SIGxxx'` signal is accepted; signal `0`
@@ -420,9 +435,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let pid = with_host(|h| args.first().map(|v| h.to_number(v)).unwrap_or(0.0)) as i32;
             let sig: Result<libc::c_int, String> = match args.get(1) {
                 Some(v) if !matches!(v, Value::Undef) => match with_host(|h| h.as_str(v)) {
-                    Some(name) => {
-                        signal_number(&name).ok_or(format!("Error: Unknown signal: {name}"))
-                    }
+                    Some(name) => signal_number(&name).ok_or(crate::host::coded_error(
+                        "TypeError",
+                        "ERR_UNKNOWN_SIGNAL",
+                        &format!("Unknown signal: {name}"),
+                    )),
                     None => Ok(with_host(|h| h.to_number(v)) as libc::c_int),
                 },
                 _ => Ok(libc::SIGTERM),

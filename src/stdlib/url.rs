@@ -218,7 +218,13 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
                 None
             }
         })
-        .ok_or_else(|| format!("TypeError: Invalid URL: {input}"))?;
+        // Node's message is the bare `Invalid URL` and it carries
+        // `code === 'ERR_INVALID_URL'`; the input is exposed as `err.input`, not
+        // appended to the text. `url_legacy::invalid_url` was already emitting
+        // the current form — this site was the one still hardcoding an older one.
+        .ok_or_else(|| {
+            crate::host::plain_coded_error("TypeError", "ERR_INVALID_URL", "Invalid URL")
+        })?;
     Ok(build(&parts))
 }
 
@@ -338,9 +344,13 @@ fn url_href(v: &Value) -> String {
 fn file_url_to_path(args: &[Value]) -> Result<String, String> {
     let v = args.first().cloned().unwrap_or(Value::Undef);
     let href = url_href(&v);
-    let rest = href
-        .strip_prefix("file://")
-        .ok_or_else(|| crate::host::type_error("The URL must be of scheme file"))?;
+    let rest = href.strip_prefix("file://").ok_or_else(|| {
+        crate::host::plain_coded_error(
+            "TypeError",
+            "ERR_INVALID_URL_SCHEME",
+            "The URL must be of scheme file",
+        )
+    })?;
     // The authority runs up to the first '/'; the remainder is the path.
     let path = match rest.find('/') {
         Some(0) => rest,

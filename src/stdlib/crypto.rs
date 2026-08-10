@@ -117,7 +117,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "createHash" => {
             let algo = arg_str(args, 0).to_ascii_lowercase();
             if !supported(&algo) {
-                return Some(Err(format!("Error: Digest method not supported: {algo}")));
+                // Node names no algorithm here — the reference message is the bare
+                // `Digest method not supported`, and it carries no `code`.
+                return Some(Err("Error: Digest method not supported".into()));
             }
             Ok(with_host(|h| {
                 let data = h.new_array(Vec::new());
@@ -131,7 +133,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "createHmac" => {
             let algo = arg_str(args, 0).to_ascii_lowercase();
             if !supported(&algo) {
-                return Some(Err(format!("Error: Digest method not supported: {algo}")));
+                // Node names no algorithm here — the reference message is the bare
+                // `Digest method not supported`, and it carries no `code`.
+                return Some(Err("Error: Digest method not supported".into()));
             }
             // Key may be a Buffer (raw bytes) or a string (utf8 by default).
             let key = key_bytes(args.get(1));
@@ -197,7 +201,14 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             };
             let (min, max) = (min as i64, max as i64);
             if max <= min {
-                return Some(Err("Error: The value of \"max\" is out of range. It must be greater than the value of \"min\".".into()));
+                return Some(Err(crate::host::coded_error(
+                    "RangeError",
+                    "ERR_OUT_OF_RANGE",
+                    &format!(
+                        "The value of \"max\" is out of range. It must be greater than \
+                         the value of \"min\" ({min}). Received {max}"
+                    ),
+                )));
             }
             let range = (max - min) as u64;
             match random_below(range) {
@@ -305,9 +316,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let a = val_bytes_at(args, 0);
             let b = val_bytes_at(args, 1);
             if a.len() != b.len() {
-                return Some(Err(
-                    "Error: Input buffers must have the same byte length".into()
-                ));
+                return Some(Err(crate::host::plain_coded_error(
+                    "RangeError",
+                    "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH",
+                    "Input buffers must have the same byte length",
+                )));
             }
             Ok(Value::Bool(a.ct_eq(&b).into()))
         }
@@ -353,7 +366,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "hash" => {
             let algo = arg_str(args, 0).to_ascii_lowercase();
             if !supported(&algo) {
-                return Some(Err(format!("Error: Digest method not supported: {algo}")));
+                // Node names no algorithm here — the reference message is the bare
+                // `Digest method not supported`, and it carries no `code`.
+                return Some(Err("Error: Digest method not supported".into()));
             }
             // args[1] is the data (utf8 string or Buffer); there is no input-encoding param.
             let data = val_bytes_at(args, 1);

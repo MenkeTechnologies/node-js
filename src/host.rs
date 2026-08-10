@@ -102,6 +102,7 @@ pub mod ops {
     pub const COPY_SCOPE: u16 = 67; // [] -> replace the innermost block scope with a COPY (per-iteration `let`)
     pub const DECLARE_VAR: u16 = 68; // [name, value] -> declare at FUNCTION scope, ignoring block scopes (`var`)
     pub const NAMED_EVAL: u16 = 69; // [key, kind, fn] -> fn; SetFunctionName for a COMPUTED key (kind picks the `get `/`set ` prefix)
+    pub const POW: u16 = 70; // [a, b] -> JS `a ** b` (NOT native `Op::Pow`: IEEE pow answers 1 for `(-1) ** Infinity` and `1 ** NaN`)
 }
 
 /// `SIG_UNWIND` scope tags: what the emitting site is nested in.
@@ -1834,6 +1835,57 @@ pub fn range_error(msg: &str) -> String {
     format!("RangeError: {msg}")
 }
 
+/// A Node *coded* error raised from the JS layer: `Name [ERR_CODE]: message`.
+///
+/// `builtins::synth_error` parses that head back apart, so the bracketed code
+/// becomes the enumerable `err.code` that `err.code === 'ERR_INVALID_URL'`-style
+/// handling reads. Writing the head by hand at each throw site is what left a
+/// dozen of them with `err.code === undefined` while the message matched.
+///
+/// Use this for errors Node raises from `lib/internal/errors.js`, whose `.name`
+/// is left bracketed while the stack is captured and therefore shows up in both
+/// `String(err)` and `err.stack` — measured on v26.7.0:
+///
+/// ```text
+/// process.exit(1.5) -> RangeError [ERR_OUT_OF_RANGE]: The value of "code" …
+/// ```
+pub fn coded_error(class: &str, code: &str, msg: &str) -> String {
+    format!("{class} [{code}]: {msg}")
+}
+
+/// The marker `plain_coded_error` hides a code behind, and `synth_error` strips.
+pub const CODE_MARK: &str = "\u{1}code:";
+
+/// A Node coded error raised from the *native* layer: `.code` is set, but the
+/// name is never bracketed, so `String(err)` is the plain `Name: message`.
+///
+/// The distinction is observable and is not a stylistic choice — on v26.7.0,
+/// `String(new URL("/x") error)` is `TypeError: Invalid URL` with
+/// `.code === 'ERR_INVALID_URL'`, while the JS-layer `process.exit(1.5)` error
+/// brackets its code into the very same two reads. Encoding both through one
+/// `Name [CODE]:` head would have to pick one and be wrong about the other.
+///
+/// The code rides in a marker at the head of the message rather than in the
+/// error class, because the class text is exactly what must NOT carry it. The
+/// marker is an internal wire format between a throw site and `synth_error`; it
+/// never survives into a `.message`.
+pub fn plain_coded_error(class: &str, code: &str, msg: &str) -> String {
+    format!("{class}: {CODE_MARK}{code}\u{1}{msg}")
+}
+
+/// `TypeError [ERR_INVALID_ARG_TYPE]: The "<name>" <kind> must be of type
+/// <expected>. Received …` — Node's single most common argument rejection.
+pub fn invalid_arg_type(name: &str, kind: &str, expected: &str, v: &Value) -> String {
+    coded_error(
+        "TypeError",
+        "ERR_INVALID_ARG_TYPE",
+        &format!(
+            "The \"{name}\" {kind} must be of type {expected}. Received {}",
+            crate::stdlib::received_desc(v)
+        ),
+    )
+}
+
 // ── the fusevm run plumbing ──────────────────────────────────────────────────
 
 thread_local! {
@@ -2814,7 +2866,10 @@ impl JsHost {
             Mul => Ok(Value::Float(self.to_number(a) * self.to_number(b))),
             Div => Ok(Value::Float(self.to_number(a) / self.to_number(b))),
             Mod => Ok(Value::Float(js_mod(self.to_number(a), self.to_number(b)))),
-            Pow => Ok(Value::Float(self.to_number(a).powf(self.to_number(b)))),
+            Pow => Ok(Value::Float(crate::builtins::js_pow(
+                self.to_number(a),
+                self.to_number(b),
+            ))),
             Neg if self.is_bigint_val(a) => self.bigint_arith(op, a, b),
             Neg => Ok(Value::Float(-self.to_number(a))),
             Lt | Le | Gt | Ge => Ok(Value::Bool(self.relational(op, a, b))),
@@ -3039,7 +3094,7 @@ impl JsHost {
 /// Parse a string to a BigInt under JS `StringToBigInt` rules: trimmed, empty →
 /// `0n`, decimal or `0x`/`0o`/`0b` prefixed; any junk → `None`.
 pub fn parse_bigint_str(s: &str) -> Option<num_bigint::BigInt> {
-    let t = s.trim();
+    let t = crate::utf16::js_trim(s);
     if t.is_empty() {
         return Some(num_bigint::BigInt::from(0));
     }
@@ -3087,23 +3142,28 @@ fn inspect_max_depth() -> usize {
     INSPECT_MAX_DEPTH.with(|c| c.get())
 }
 
-fn to_int32(f: f64) -> i32 {
-    if !f.is_finite() {
-        return 0;
-    }
-    let n = f.trunc();
-    (n as i64 as u32) as i32
+/// ECMA-262 `ToInt32` (7.1.6): truncate toward zero, reduce modulo 2^32, then
+/// reinterpret as signed.
+///
+/// The reduction has to happen in `f64`, not by casting through `i64`. Rust
+/// saturates an out-of-range float-to-int cast, so `1e300 as i64` is `i64::MAX`
+/// and `1e300 | 0` came out `-1` where every engine says `0`; the same
+/// saturation made `1e300 >>> 0` report `4294967295`. `rem_euclid` on a
+/// power-of-two modulus is exact for every finite double, so this is the whole
+/// fix — and it is the form `Math.clz32` already used.
+pub(crate) fn to_int32(f: f64) -> i32 {
+    to_uint32(f) as i32
 }
-fn to_uint32(f: f64) -> u32 {
+pub(crate) fn to_uint32(f: f64) -> u32 {
     if !f.is_finite() {
         return 0;
     }
-    f.trunc() as i64 as u32
+    f.trunc().rem_euclid(4294967296.0) as u32
 }
 
 /// Parse a string in numeric context (`ToNumber`): trimmed, empty -> 0.
 fn str_to_number(s: &str) -> f64 {
-    let t = s.trim();
+    let t = crate::utf16::js_trim(s);
     if t.is_empty() {
         return 0.0;
     }
@@ -3363,7 +3423,13 @@ impl JsHost {
                     _ => Ok(Vec::new()),
                 }
             }
-            _ => Err(type_error(&format!("{} is not iterable", self.type_of(v)))),
+            // V8 names the VALUE, not its type: `[...5]` is `5 is not iterable`,
+            // `[...{}]` is `{} is not iterable`. Reporting `typeof` instead
+            // produced `number is not iterable`, which no engine emits.
+            _ => {
+                let shown = self.inspect(v);
+                Err(type_error(&format!("{shown} is not iterable")))
+            }
         }
     }
 
@@ -4350,10 +4416,9 @@ fn ctor_prototype(h: &JsHost, ctor: &Value) -> Option<Value> {
 /// `obj instanceof ctor` — walk `obj`'s prototype chain looking for
 /// `ctor.prototype`.
 pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
-    // Not an object → never an instance (no error for our purposes).
-    if !matches!(obj, Value::Obj(_)) {
-        return Ok(false);
-    }
+    // 13.10.2 InstanceofOperator validates the RIGHT-hand side FIRST, so
+    // `1 instanceof 3` throws even though the left side could never match.
+    // Returning early on the left side skipped that check entirely.
     let ctor_callable = with_host(|h| {
         matches!(
             h.get(ctor),
@@ -4364,9 +4429,20 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
         )
     });
     if !ctor_callable {
-        return Err(type_error(
-            "Right-hand side of 'instanceof' is not callable",
-        ));
+        // V8 has TWO messages here and they are not interchangeable: a primitive
+        // right-hand side is "not an object", an object that is merely not
+        // callable is "not callable". Only the second was implemented, so
+        // `1 instanceof 3` reported nothing at all.
+        return Err(type_error(if matches!(ctor, Value::Obj(_)) {
+            "Right-hand side of 'instanceof' is not callable"
+        } else {
+            "Right-hand side of 'instanceof' is not an object"
+        }));
+    }
+    // A non-object left-hand side is never an instance — but only after the
+    // right-hand side has been validated above.
+    if !matches!(obj, Value::Obj(_)) {
+        return Ok(false);
     }
     // Builtin constructors whose instances aren't prototype-linked in our model
     // (arrays/plain objects/functions) get a structural instanceof.

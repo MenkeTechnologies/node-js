@@ -239,9 +239,11 @@ fn validate_header_name(args: &[Value]) -> Result<Value, String> {
     if is_valid_token(&name) {
         Ok(Value::Undef)
     } else {
-        Err(crate::host::type_error(&format!(
-            "Header name must be a valid HTTP token [\"{name}\"]"
-        )))
+        Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_HTTP_TOKEN",
+            &format!("Header name must be a valid HTTP token [\"{name}\"]"),
+        ))
     }
 }
 
@@ -252,15 +254,19 @@ fn validate_header_value(args: &[Value]) -> Result<Value, String> {
     let name = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
     let raw = args.get(1).cloned().unwrap_or(Value::Undef);
     if matches!(raw, Value::Undef) {
-        return Err(crate::host::type_error(&format!(
-            "Invalid value \"undefined\" for header \"{name}\""
-        )));
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_HTTP_INVALID_HEADER_VALUE",
+            &format!("Invalid value \"undefined\" for header \"{name}\""),
+        ));
     }
     let value = with_host(|h| h.str_of(&raw));
     if value.bytes().any(|b| b != b'\t' && (b < 0x20 || b == 0x7f)) {
-        return Err(crate::host::type_error(&format!(
-            "Invalid character in header content [\"{name}\"]"
-        )));
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_CHAR",
+            &format!("Invalid character in header content [\"{name}\"]"),
+        ));
     }
     Ok(Value::Undef)
 }

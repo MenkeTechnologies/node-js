@@ -619,8 +619,8 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             Ok(from_bytes(&bytes[s..e]))
         }
         "readUInt8" => {
-            let i = super::arg_num(args, 0).max(0.0) as usize;
-            Ok(Value::Float(*bytes.get(i).unwrap_or(&0) as f64))
+            let i = read_offset(args, 1, bytes.len())?;
+            Ok(Value::Float(bytes[i] as f64))
         }
         // indexOf/lastIndexOf/includes(value[, byteOffset][, encoding]) — both
         // trailing arguments used to be ignored, so a search always started at 0
@@ -688,22 +688,20 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
         // Big-endian / little-endian integer reads.
         "readUInt16BE" => {
-            let i = super::arg_num(args, 0).max(0.0) as usize;
-            let v = ((*bytes.get(i).unwrap_or(&0) as u16) << 8)
-                | *bytes.get(i + 1).unwrap_or(&0) as u16;
+            let i = read_offset(args, 2, bytes.len())?;
+            let v = ((bytes[i] as u16) << 8) | bytes[i + 1] as u16;
             Ok(Value::Float(v as f64))
         }
         "readUInt16LE" => {
-            let i = super::arg_num(args, 0).max(0.0) as usize;
-            let v = (*bytes.get(i).unwrap_or(&0) as u16)
-                | ((*bytes.get(i + 1).unwrap_or(&0) as u16) << 8);
+            let i = read_offset(args, 2, bytes.len())?;
+            let v = (bytes[i] as u16) | ((bytes[i + 1] as u16) << 8);
             Ok(Value::Float(v as f64))
         }
         // 32-bit and signed reads. `readIntXX` reinterprets the same bytes as
         // two's complement.
         "readUInt32BE" | "readUInt32LE" | "readInt32BE" | "readInt32LE" => {
-            let i = super::arg_num(args, 0).max(0.0) as usize;
-            let at = |k: usize| *bytes.get(i + k).unwrap_or(&0) as u32;
+            let i = read_offset(args, 4, bytes.len())?;
+            let at = |k: usize| bytes[i + k] as u32;
             let v = if method.ends_with("BE") {
                 (at(0) << 24) | (at(1) << 16) | (at(2) << 8) | at(3)
             } else {
@@ -716,12 +714,12 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             }))
         }
         "readInt8" => {
-            let i = super::arg_num(args, 0).max(0.0) as usize;
-            Ok(Value::Float(*bytes.get(i).unwrap_or(&0) as i8 as f64))
+            let i = read_offset(args, 1, bytes.len())?;
+            Ok(Value::Float(bytes[i] as i8 as f64))
         }
         "readInt16BE" | "readInt16LE" => {
-            let i = super::arg_num(args, 0).max(0.0) as usize;
-            let at = |k: usize| *bytes.get(i + k).unwrap_or(&0) as u16;
+            let i = read_offset(args, 2, bytes.len())?;
+            let at = |k: usize| bytes[i + k] as u16;
             let v = if method.ends_with("BE") {
                 (at(0) << 8) | at(1)
             } else {
@@ -829,10 +827,11 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 _ => 8,
             };
             if bytes.len() % group != 0 {
-                return Err(crate::host::range_error(&format!(
-                    "Buffer size must be a multiple of {}-bits",
-                    group * 8
-                )));
+                return Err(crate::host::coded_error(
+                    "RangeError",
+                    "ERR_INVALID_BUFFER_SIZE",
+                    &format!("Buffer size must be a multiple of {}-bits", group * 8),
+                ));
             }
             let mut b = bytes.clone();
             for c in b.chunks_mut(group) {
@@ -1108,4 +1107,58 @@ fn truncate_chars(s: &str, enc: &str, max: usize) -> Vec<u8> {
             bytes[..end].to_vec()
         }
     }
+}
+
+/// The validated byte offset for a fixed-width `buf.readXxx(offset)`.
+///
+/// Every read used to be `arg_num(args, 0).max(0.0) as usize` with
+/// `bytes.get(i).unwrap_or(&0)` behind it, so an out-of-range read silently
+/// produced zeroes instead of throwing — and a negative offset silently became
+/// 0. Node raises one of two coded errors, and which one depends on whether the
+/// buffer could hold the value at all:
+///
+/// ```text
+/// Buffer.alloc(4).readUInt8(5)     RangeError [ERR_OUT_OF_RANGE]
+///     The value of "offset" is out of range. It must be >= 0 and <= 3. Received 5
+/// Buffer.alloc(0).readUInt8(0)     RangeError [ERR_BUFFER_OUT_OF_BOUNDS]
+///     Attempt to access memory outside buffer bounds
+/// ```
+fn read_offset(args: &[Value], size: usize, len: usize) -> Result<usize, String> {
+    if len < size {
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_BUFFER_OUT_OF_BOUNDS",
+            "Attempt to access memory outside buffer bounds",
+        ));
+    }
+    let max = len - size;
+    let raw = match args.first() {
+        None | Some(Value::Undef) => 0.0,
+        Some(_) => super::arg_num(args, 0),
+    };
+    // A non-integer offset is its own rejection, with a different tail than the
+    // range one — `readUInt8(1.5)` is "It must be an integer", not a bound.
+    if raw.fract() != 0.0 || raw.is_nan() {
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!(
+                "The value of \"offset\" is out of range. It must be an integer. Received {}",
+                crate::host::fmt_number(raw)
+            ),
+        ));
+    }
+    let off = raw;
+    if off < 0.0 || off > max as f64 {
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!(
+                "The value of \"offset\" is out of range. It must be >= 0 and <= {max}. \
+                 Received {}",
+                crate::host::fmt_number(raw)
+            ),
+        ));
+    }
+    Ok(off as usize)
 }

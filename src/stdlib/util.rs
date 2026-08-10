@@ -481,53 +481,86 @@ fn style_names(v: &Value) -> Vec<String> {
 }
 
 /// `(open, close)` SGR parameter numbers for a `util.inspect.colors` name.
+/// `util.inspect.colors`: every SGR style name Node accepts, as
+/// `(name, open, close)`, in `Object.keys(util.inspect.colors)` order.
+///
+/// One table rather than a `match`, because `styleText`'s rejection message
+/// ENUMERATES these names and the enumeration has to come from the same source
+/// the lookup does. The old code had a `match` for the lookup and a
+/// hand-written sentence for the message, so the sentence could not go stale
+/// visibly — and it had: it said "must be a valid util.inspect.colors key",
+/// a wording no Node emits.
+pub(crate) const STYLES: &[(&str, u16, u16)] = &[
+    ("reset", 0, 0),
+    ("bold", 1, 22),
+    ("dim", 2, 22),
+    ("italic", 3, 23),
+    ("underline", 4, 24),
+    ("blink", 5, 25),
+    ("inverse", 7, 27),
+    ("hidden", 8, 28),
+    ("strikethrough", 9, 29),
+    ("doubleunderline", 21, 24),
+    ("black", 30, 39),
+    ("red", 31, 39),
+    ("green", 32, 39),
+    ("yellow", 33, 39),
+    ("blue", 34, 39),
+    ("magenta", 35, 39),
+    ("cyan", 36, 39),
+    ("white", 37, 39),
+    ("bgBlack", 40, 49),
+    ("bgRed", 41, 49),
+    ("bgGreen", 42, 49),
+    ("bgYellow", 43, 49),
+    ("bgBlue", 44, 49),
+    ("bgMagenta", 45, 49),
+    ("bgCyan", 46, 49),
+    ("bgWhite", 47, 49),
+    ("framed", 51, 54),
+    ("overlined", 53, 55),
+    ("gray", 90, 39),
+    ("redBright", 91, 39),
+    ("greenBright", 92, 39),
+    ("yellowBright", 93, 39),
+    ("blueBright", 94, 39),
+    ("magentaBright", 95, 39),
+    ("cyanBright", 96, 39),
+    ("whiteBright", 97, 39),
+    ("bgGray", 100, 49),
+    ("bgRedBright", 101, 49),
+    ("bgGreenBright", 102, 49),
+    ("bgYellowBright", 103, 49),
+    ("bgBlueBright", 104, 49),
+    ("bgMagentaBright", 105, 49),
+    ("bgCyanBright", 106, 49),
+    ("bgWhiteBright", 107, 49),
+];
+
+/// The aliases Node accepts but does not list in `inspect.colors`' own keys. It
+/// still names them in the rejection message, after the listed keys.
+pub(crate) const STYLE_ALIASES: &[(&str, u16, u16)] = &[
+    ("grey", 90, 39),
+    ("blackBright", 90, 39),
+    ("bgGrey", 100, 49),
+    ("bgBlackBright", 100, 49),
+    ("faint", 2, 22),
+    ("crossedout", 9, 29),
+    ("strikeThrough", 9, 29),
+    ("crossedOut", 9, 29),
+    ("conceal", 8, 28),
+    ("swapColors", 7, 27),
+    ("swapcolors", 7, 27),
+    ("doubleUnderline", 21, 24),
+];
+
+/// The `(open, close)` SGR pair for a style name, or `None` if unknown.
 fn style_codes(name: &str) -> Option<(u16, u16)> {
-    Some(match name {
-        "reset" => (0, 0),
-        "bold" => (1, 22),
-        "dim" => (2, 22),
-        "italic" => (3, 23),
-        "underline" => (4, 24),
-        "blink" => (5, 25),
-        "inverse" => (7, 27),
-        "hidden" => (8, 28),
-        "strikethrough" => (9, 29),
-        "doubleunderline" => (21, 24),
-        "overline" => (53, 55),
-        "black" => (30, 39),
-        "red" => (31, 39),
-        "green" => (32, 39),
-        "yellow" => (33, 39),
-        "blue" => (34, 39),
-        "magenta" => (35, 39),
-        "cyan" => (36, 39),
-        "white" => (37, 39),
-        "gray" | "grey" | "blackBright" => (90, 39),
-        "redBright" => (91, 39),
-        "greenBright" => (92, 39),
-        "yellowBright" => (93, 39),
-        "blueBright" => (94, 39),
-        "magentaBright" => (95, 39),
-        "cyanBright" => (96, 39),
-        "whiteBright" => (97, 39),
-        "bgBlack" => (40, 49),
-        "bgRed" => (41, 49),
-        "bgGreen" => (42, 49),
-        "bgYellow" => (43, 49),
-        "bgBlue" => (44, 49),
-        "bgMagenta" => (45, 49),
-        "bgCyan" => (46, 49),
-        "bgWhite" => (47, 49),
-        "bgGray" | "bgGrey" | "bgBlackBright" => (100, 49),
-        "bgRedBright" => (101, 49),
-        "bgGreenBright" => (102, 49),
-        "bgYellowBright" => (103, 49),
-        "bgBlueBright" => (104, 49),
-        "bgMagentaBright" => (105, 49),
-        "bgCyanBright" => (106, 49),
-        "bgWhiteBright" => (107, 49),
-        _ => return None,
-    })
+    STYLES
+        .iter()
+        .chain(STYLE_ALIASES.iter())
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, o, c)| (*o, *c))
 }
 
 /// `util.styleText(format, text)` — wrap `text` in the SGR codes for `format`
@@ -541,9 +574,20 @@ fn style_text(args: &[Value]) -> Result<Value, String> {
             continue;
         }
         let (open, close) = style_codes(name).ok_or_else(|| {
-            format!(
-                "TypeError [ERR_INVALID_ARG_VALUE]: The argument 'format' must be a valid \
-                 util.inspect.colors key. Received '{name}'"
+            // Node spells out every accepted name. Generated from the same table
+            // the lookup reads, so a style can never be accepted-but-unlisted.
+            let listed: Vec<String> = STYLES
+                .iter()
+                .chain(STYLE_ALIASES.iter())
+                .map(|(n, _, _)| format!("'{n}'"))
+                .collect();
+            crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_VALUE",
+                &format!(
+                    "The argument 'format' must be one of: {}. Received '{name}'",
+                    listed.join(", ")
+                ),
             )
         })?;
         result = format!("\u{1b}[{open}m{result}\u{1b}[{close}m");
@@ -761,7 +805,7 @@ fn parse_args(config_args: &[Value]) -> Result<Value, String> {
             match lookup_long(&name) {
                 None if strict => {
                     return Err(format!(
-                        "Error [ERR_PARSE_ARGS_UNKNOWN_OPTION]: Unknown option '--{name}'"
+                        "TypeError [ERR_PARSE_ARGS_UNKNOWN_OPTION]: Unknown option '--{name}'"
                     ))
                 }
                 None => {
@@ -775,7 +819,7 @@ fn parse_args(config_args: &[Value]) -> Result<Value, String> {
                             i += 1;
                             tokens.get(i).cloned().ok_or_else(|| {
                                 format!(
-                                    "Error [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
+                                    "TypeError [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
                                      Option '--{name} <value>' argument missing"
                                 )
                             })?
@@ -786,7 +830,7 @@ fn parse_args(config_args: &[Value]) -> Result<Value, String> {
                 Some(cfg) => {
                     if inline.is_some() && strict {
                         return Err(format!(
-                            "Error [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
+                            "TypeError [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
                              Option '--{}' does not take an argument",
                             cfg.long
                         ));
@@ -802,7 +846,7 @@ fn parse_args(config_args: &[Value]) -> Result<Value, String> {
                 match lookup_short(&short) {
                     None if strict => {
                         return Err(format!(
-                            "Error [ERR_PARSE_ARGS_UNKNOWN_OPTION]: Unknown option '-{short}'"
+                            "TypeError [ERR_PARSE_ARGS_UNKNOWN_OPTION]: Unknown option '-{short}'"
                         ))
                     }
                     None => {
@@ -817,7 +861,7 @@ fn parse_args(config_args: &[Value]) -> Result<Value, String> {
                             i += 1;
                             tokens.get(i).cloned().ok_or_else(|| {
                                 format!(
-                                    "Error [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
+                                    "TypeError [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
                                      Option '-{short}, --{} <value>' argument missing",
                                     cfg.long
                                 )
@@ -835,7 +879,7 @@ fn parse_args(config_args: &[Value]) -> Result<Value, String> {
         } else {
             if !allow_positionals && strict {
                 return Err(format!(
-                    "Error [ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL]: \
+                    "TypeError [ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL]: \
                      Unexpected argument '{tok}'. This command does not take positional arguments"
                 ));
             }

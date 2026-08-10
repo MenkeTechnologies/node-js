@@ -278,8 +278,13 @@ pub fn require(spec: &str, from_dir: &Path) -> Result<Value, String> {
     if let Some(ns) = crate::stdlib::resolve(spec) {
         return Ok(with_host(|h| h.alloc(JsObj::Builtin(ns.to_string()))));
     }
-    let path =
-        resolve(spec, from_dir).ok_or_else(|| format!("Error: Cannot find module '{spec}'"))?;
+    let path = resolve(spec, from_dir).ok_or_else(|| {
+        crate::host::plain_coded_error(
+            "Error",
+            "MODULE_NOT_FOUND",
+            &format!("Cannot find module '{spec}'"),
+        )
+    })?;
     // A canonical absolute key so the same file required via different relative
     // specifiers shares one cache entry.
     let path = std::fs::canonicalize(&path).unwrap_or(path);
