@@ -566,11 +566,9 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
     // inherits `'Uint8Array'` from the typed-array prototype it now really has.
     // Anything the receiver's own chain provides wins (a class may define its
     // own getter), so this is only the fallback.
-    if name == "@@toStringTag" {
-        if with_host(|h| host::lookup_chain(h, recv, name)).is_none() {
-            if let Some(tag) = with_host(|h| well_known_tag(h, recv)) {
-                return Ok(with_host(|h| h.new_str(tag)));
-            }
+    if name == "@@toStringTag" && with_host(|h| host::lookup_chain(h, recv, name)).is_none() {
+        if let Some(tag) = with_host(|h| well_known_tag(h, recv)) {
+            return Ok(with_host(|h| h.new_str(tag)));
         }
     }
     // `constructor`: a user class/function sets it on the prototype chain, and
@@ -1482,10 +1480,9 @@ fn b_named_eval(vm: &mut VM, _: u8) -> Value {
     // description gives the empty name, not `[undefined]`.
     let base = match with_host(|h| h.symbol_of_key(&key)) {
         Some(sym) => match with_host(|h| h.get(&sym).cloned()) {
-            Some(JsObj::Symbol { desc, .. }) => match desc {
-                Some(d) => format!("[{d}]"),
-                None => String::new(),
-            },
+            Some(JsObj::Symbol {
+                desc: Some(desc), ..
+            }) => format!("[{desc}]"),
             _ => String::new(),
         },
         None => key,
