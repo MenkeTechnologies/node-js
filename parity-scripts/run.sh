@@ -10,6 +10,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NODEJS="$ROOT/target/debug/node"
 CORPUS="$ROOT/parity-scripts"
 ORACLE="${NODE_JS_PARITY_NODE:-node}"
+# Pin the locale and timezone rather than inheriting the developer's. Reference
+# `node` is not invariant under either — `(1234.5).toLocaleString()` is
+# `1.234,5` under de_DE and `new Date(0).getHours()` is 9 under Asia/Tokyo — so
+# a corpus case touching them would pass on one machine and fail on another with
+# nothing in the report to say why. node-js reads no LANG/LC_ALL/TZ anywhere, so
+# the pin costs it nothing. UTC specifically because this runtime hardwires
+# `Date` to UTC: pinning any other zone would turn every local-time getter into
+# a standing divergence the harness cannot act on (a documented missing feature,
+# not something to rediscover per run).
+export TZ=UTC LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 VERBOSE="${1:-}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -44,8 +54,16 @@ while IFS= read -r f; do
     barren=$((barren+1)); barrens+=("$rel|$nrc|$jrc"); printf '%s\n' "$rel" >>"$TMP/classified.txt"
     continue
   fi
-  # success-agreement: both exit 0, or both non-zero
-  ok_rc=0; { [ $nrc -eq 0 ] && [ $jrc -eq 0 ]; } || { [ $nrc -ne 0 ] && [ $jrc -ne 0 ]; } || ok_rc=1
+  # Exit status compared EXACTLY, not collapsed to zero-vs-nonzero.
+  #
+  # The looser test treated 1 and 7 as agreement, on the reasoning that an
+  # interpreter may pick its own code for a failure. node-js reproduces Node's
+  # codes exactly, and the loose form hid a whole observable: `process.exitCode
+  # = 3` prints nothing, so with stdout empty on both sides and the status
+  # collapsed to a boolean there was nothing left to compare — which is how
+  # `process.exitCode` came to be stored and then ignored at exit, with this
+  # corpus green throughout.
+  ok_rc=0; [ "$nrc" -eq "$jrc" ] || ok_rc=1
   printf '%s\n' "$rel" >>"$TMP/classified.txt"
   if cmp -s "$TMP/n.out" "$TMP/j.out" && [ $ok_rc -eq 0 ]; then
     pass=$((pass+1))
@@ -54,6 +72,7 @@ while IFS= read -r f; do
     if [ "$VERBOSE" = "-v" ]; then
       echo "=== DIFF $rel  (node rc=$nrc, node-js rc=$jrc) ==="
       diff <(cat "$TMP/n.out") <(cat "$TMP/j.out") | head -20
+      [ "$nrc" -ne "$jrc" ] && echo "  exit status: node=$nrc node-js=$jrc"
     fi
   fi
 done < <(find "$CORPUS" -name '*.js' | sort)

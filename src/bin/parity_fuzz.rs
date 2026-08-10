@@ -209,12 +209,22 @@ fn norm_stderr(s: &[u8]) -> Vec<u8> {
     last.into_bytes()
 }
 
-/// A parity gap: stdout bytes differ, OR one side accepted the program (exit 0)
-/// while the other rejected it. We compare success-ness, not the exact exit
-/// code — a from-scratch interpreter is free to pick its own nonzero code for
-/// an uncaught exception, so "both rejected it" is agreement, not a gap.
+/// A parity gap: stdout bytes differ, OR the two processes exited with
+/// different STATUS CODES.
+///
+/// This used to compare success-ness only — `(exit == 0) != (exit == 0)` — on
+/// the argument that a from-scratch interpreter may pick its own nonzero code
+/// for an uncaught exception. That argument is now false in both directions.
+/// It is false about node-js, which reproduces Node's codes exactly (1 for an
+/// uncaught throw and an unhandled rejection, the requested code for
+/// `process.exit(n)`, `n & 0xff` for `process.exitCode = n`). And it made an
+/// entire observable unreachable: `process.exitCode = 3` prints NOTHING, so a
+/// harness that collapses the status to a boolean cannot see it at all — which
+/// is exactly how `process.exitCode` came to be stored, read back, and then
+/// ignored at exit without either harness noticing. Comparing the code exactly
+/// is what makes the `exit` mode below able to report anything.
 fn differs(oracle: &RunOut, ours: &RunOut) -> bool {
-    if (oracle.exit == 0) != (ours.exit == 0) {
+    if oracle.exit != ours.exit {
         return true;
     }
     if oracle.stdout != ours.stdout {
@@ -238,6 +248,29 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Pin the locale and timezone rather than inheriting the developer's.
+    //
+    // Both were an axis this harness silently held at whatever the author's
+    // shell happened to export. Reference `node` is NOT locale- or TZ-invariant
+    // — `(1234.5).toLocaleString()` is `1.234,5` under `de_DE` and
+    // `new Date(0).getHours()` is `9` under `Asia/Tokyo` — so a case touching
+    // either would have agreed on the author's machine and diverged on a
+    // colleague's, or vice versa, with nothing in the report to say why.
+    // node-js reads no `LANG`/`LC_ALL`/`TZ` anywhere, so pinning costs it
+    // nothing and makes every run reproducible.
+    //
+    // `UTC` is the honest choice rather than a convenient one: this runtime
+    // hardwires `Date` to UTC, so pinning any OTHER zone would make every
+    // local-time getter a permanent divergence that the report could not act
+    // on. That gap is real and documented in BUGS.md; it is a missing feature,
+    // not something a fuzz run should rediscover on every case.
+    for (k, v) in [
+        ("TZ", "UTC"),
+        ("LANG", "en_US.UTF-8"),
+        ("LC_ALL", "en_US.UTF-8"),
+    ] {
+        cmd.env(k, v);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => {
@@ -699,7 +732,14 @@ fn gen_arith(seed: u64) -> Vec<String> {
         0 => format!("{a} {op} {b}"),
         1 => format!("{a} + {b} * {c}"),
         2 => format!("({a} + {b}) * {c}"),
-        3 => format!("(-{a}) ** {exp}"),
+        // `(-{a})` with a NEGATIVE `a` spells `(--3)`, which is `--` applied to
+        // a literal — an invalid assignment target, so both sides raised the
+        // same SyntaxError and the case compared two failures instead of two
+        // values. That single template is the whole source of this mode's
+        // `ref failed` / `ref silent` counters. Parenthesising the operand
+        // keeps the intended probe (unary minus directly before `**`, which
+        // needs the parens to parse at all) and never produces `--`.
+        3 => format!("(-({a})) ** {exp}"),
         4 => format!("{a} % {b} + {c}"),
         _ => format!("{a} {op} {b} {op} {c}"),
     };
@@ -1569,6 +1609,196 @@ fn gen_thenable(seed: u64) -> Vec<String> {
     ]
 }
 
+/// Process EXIT status: `process.exitCode`, `process.exit`, and the `exit` /
+/// `beforeExit` events.
+///
+/// This mode exists because the two harnesses shared a blind spot with an exact
+/// shape: neither ever emitted `process.exitCode`, and both collapsed the exit
+/// status to zero-vs-nonzero. `process.exitCode = 3` produces no stdout, so it
+/// was invisible on the only other axis either one compares — and the property
+/// was in fact stored, readable, and then ignored at exit. The generator half
+/// only works alongside the exact-code comparison in `differs`.
+///
+/// Everything printed is fixed text; the varying part is the STATUS, which is
+/// now a compared observable.
+fn gen_exit(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let code = *pick(r, &["0", "1", "3", "7", "42", "255", "300", "-1"]);
+    let strcode = *pick(r, &["'3'", "'0x10'", "'  '", "'1e3'"]);
+    match r.below(10) {
+        0 => vec![format!("process.exitCode = {code};")],
+        1 => vec![format!("process.exitCode = {strcode};")],
+        2 => vec![format!("console.log('a'); process.exit({code});")],
+        3 => vec![format!(
+            "process.exitCode = {code}; process.exit(); console.log('unreachable');"
+        )],
+        4 => vec![
+            "process.on('exit', c => console.log('exit', c));".into(),
+            format!("process.exitCode = {code};"),
+        ],
+        5 => vec![
+            "process.on('exit', c => console.log('exit', c));".into(),
+            format!("process.exit({code});"),
+        ],
+        6 => vec![format!(
+            "process.on('exit', () => {{ process.exitCode = {code}; }});"
+        )],
+        7 => vec![
+            "process.on('beforeExit', c => console.log('beforeExit', c));".into(),
+            "process.on('exit', c => console.log('exit', c));".into(),
+            format!("process.exitCode = {code};"),
+        ],
+        8 => vec![
+            "process.once('e', () => console.log('once'));".into(),
+            "process.on('e', () => console.log('on'));".into(),
+            "process.emit('e'); process.emit('e');".into(),
+            "console.log('left', process.listeners('e').length);".into(),
+        ],
+        _ => vec![
+            "process.on('exit', c => console.log('exit', c));".into(),
+            format!("setTimeout(() => {{ process.exitCode = {code}; }}, 0);"),
+        ],
+    }
+}
+
+/// Raw STDIO writes: `process.stdout.write` / `process.stderr.write` with every
+/// chunk form, including bytes that are not valid UTF-8 and chunks with no
+/// trailing newline.
+///
+/// No generator emitted `process.stdout.write` at all, so the whole
+/// ToString-the-chunk path went unmeasured — a `Buffer` chunk printed the 15
+/// bytes of `[object Object]`, and `write('4142','hex')` printed the literal.
+/// The comparison side was always ready for this: the fuzzer compares raw
+/// stdout BYTES, and run.sh uses `cmp`.
+fn gen_stdio(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let enc = *pick(r, &["'utf8'", "'hex'", "'base64'", "'latin1'", "'utf16le'"]);
+    let text = *pick(r, &["'4142'", "'QUJD'", "'ab'", "'\\u00e9'", "'0f10'"]);
+    match r.below(9) {
+        0 => vec![format!("process.stdout.write({text}, {enc});")],
+        1 => vec!["process.stdout.write('a'); process.stdout.write('b');".into()],
+        2 => vec!["process.stdout.write(Buffer.from([0xff, 0xfe, 0x41, 0x00, 0x7f]));".into()],
+        3 => vec![format!(
+            "process.stdout.write(new Uint8Array([{}, {}, 65]));",
+            r.below(256),
+            r.below(256)
+        )],
+        4 => vec![
+            "console.log('before');".into(),
+            "process.stdout.write(Buffer.from('mid'));".into(),
+            "console.log('after');".into(),
+        ],
+        5 => vec!["process.stdout.end('tail');".into()],
+        6 => vec![format!(
+            "try {{ process.stdout.write({}); }} catch (e) {{ console.log(e.constructor.name, e.message); }}",
+            pick(r, &["[65, 66]", "65", "undefined", "null", "{}"])
+        )],
+        7 => vec![format!(
+            "process.stdout.write(Buffer.from({text}, {enc}));"
+        )],
+        _ => vec!["process.stdout.write(''); console.log('empty-ok');".into()],
+    }
+}
+
+/// Entry-point observables: top-level `this`, `globalThis` identity, and the
+/// module bindings a `-e` script sees.
+///
+/// Round 4 established that these differ BY ENTRY POINT, and used that to argue
+/// the two harnesses should stay on different ones. That is right, and it also
+/// left the values unmeasured at BOTH: every generator avoided them, so
+/// `typeof this` was `undefined` at all three entry points, and `globalThis`
+/// minted a fresh object per read, undetected. What is emitted here is only
+/// what is entry-point INVARIANT (identity relations, `typeof`) or specific to
+/// `-e`, which is the entry point this harness drives.
+fn gen_entry(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let probe = *pick(
+        r,
+        &[
+            "typeof this",
+            "this === globalThis",
+            "this === module.exports",
+            "globalThis === globalThis",
+            "globalThis === global",
+            "typeof globalThis",
+            "typeof global",
+            "typeof require",
+            "typeof module",
+            "typeof exports",
+            "typeof arguments",
+            "typeof __filename",
+            "typeof __dirname",
+            "module.id",
+            "require.main === module",
+            "process.argv.length",
+            "Array.isArray(process.argv)",
+            "typeof process.exitCode",
+        ],
+    );
+    match r.below(4) {
+        0 => vec![format!("console.log({probe});")],
+        1 => vec![
+            "globalThis.__probe = 7;".into(),
+            "console.log(globalThis.__probe, typeof globalThis.__probe);".into(),
+        ],
+        2 => vec![
+            "this.__x = 5;".into(),
+            "console.log(this.__x, module.exports.__x);".into(),
+        ],
+        _ => vec![
+            "const g = globalThis;".into(),
+            format!("g.__y = 1; console.log(globalThis.__y, {probe});"),
+        ],
+    }
+}
+
+/// The locale/`toLocale*` surface, plus the case and normalization methods that
+/// sit next to it.
+///
+/// Deliberately EXCLUDED from the determinism invariant's reach: node-js reads
+/// no `LANG`, `LC_ALL` or `TZ` anywhere (verified by grep over `src/`) and
+/// hardwires `Date` to UTC and the number formats to en-US, so these outputs
+/// are fixed on every machine. Reference `node` is not locale-invariant, which
+/// is why the harness now pins the environment before comparing — see the env
+/// block in `run_prog`. Without both halves this mode would be a machine-
+/// dependent test, which is the failure it is meant to prevent.
+fn gen_locale(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = *pick(
+        r,
+        &[
+            "0",
+            "1234.5",
+            "1234567.891",
+            "-9876.5",
+            "1e21",
+            "0.000001",
+            "123456789012345",
+            "-0",
+        ],
+    );
+    let s = *pick(
+        r,
+        &["'abc'", "'Straße'", "'ÄÖÜ'", "'I'", "'i'", "'\\u00e9'"],
+    );
+    let ms = *pick(r, &["0", "86400000", "1700000000123", "-86400000", "NaN"]);
+    let e = match r.below(12) {
+        0 => format!("({n}).toLocaleString()"),
+        1 => format!("({n}).toLocaleString('en-US')"),
+        2 => format!("BigInt(Math.trunc({n} || 0)).toLocaleString()"),
+        3 => format!("[{n}, {s}, null, undefined].toLocaleString()"),
+        4 => format!("({s}).toLocaleUpperCase()"),
+        5 => format!("({s}).toLocaleLowerCase()"),
+        6 => format!("({s}).toLocaleString()"),
+        7 => format!("new Date({ms}).toLocaleDateString()"),
+        8 => format!("new Date({ms}).toLocaleTimeString()"),
+        9 => format!("new Date({ms}).toLocaleString()"),
+        10 => format!("({s}).normalize('NFC') === ({s})"),
+        _ => "({}).toLocaleString()".to_string(),
+    };
+    vec![format!("console.log({e});")]
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -1603,6 +1833,10 @@ enum Mode {
     ErrorShape,
     Unwind,
     Thenable,
+    Exit,
+    Stdio,
+    Entry,
+    Locale,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -1633,6 +1867,10 @@ const REAL_MODES: &[Mode] = &[
     Mode::ErrorShape,
     Mode::Unwind,
     Mode::Thenable,
+    Mode::Exit,
+    Mode::Stdio,
+    Mode::Entry,
+    Mode::Locale,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1670,6 +1908,10 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::ErrorShape => gen_error(seed),
         Mode::Unwind => gen_unwind(seed),
         Mode::Thenable => gen_thenable(seed),
+        Mode::Exit => gen_exit(seed),
+        Mode::Stdio => gen_stdio(seed),
+        Mode::Entry => gen_entry(seed),
+        Mode::Locale => gen_locale(seed),
     }
 }
 
@@ -1703,6 +1945,10 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::ErrorShape => "error",
         Mode::Unwind => "unwind",
         Mode::Thenable => "thenable",
+        Mode::Exit => "exit",
+        Mode::Stdio => "stdio",
+        Mode::Entry => "entry",
+        Mode::Locale => "locale",
     }
 }
 
@@ -1735,6 +1981,10 @@ const ALL_MODES: &[Mode] = &[
     Mode::ErrorShape,
     Mode::Unwind,
     Mode::Thenable,
+    Mode::Exit,
+    Mode::Stdio,
+    Mode::Entry,
+    Mode::Locale,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {
@@ -1966,15 +2216,31 @@ fn parse_args() -> Args {
     }
 }
 
+/// The `--help` mode list is DERIVED from [`ALL_MODES`], never typed out. The
+/// literal it replaced listed 13 of the then-27 real modes: every mode added
+/// after it was written (`class` through `thenable`) worked, was accepted by
+/// `mode_from_name`, and was undiscoverable. A hand-maintained copy of a list
+/// that lives in the source goes stale the first time the source changes.
+fn mode_list() -> String {
+    let names: Vec<&str> = ALL_MODES.iter().copied().map(mode_name).collect();
+    let mut out = String::new();
+    for chunk in names.chunks(8) {
+        if !out.is_empty() {
+            out.push_str("\n                  ");
+        }
+        out.push_str(&chunk.join(", "));
+    }
+    out
+}
+
 fn print_help() {
     eprintln!(
         "parity-fuzz — differential node/node-js parity fuzzer\n\
          \n\
          --count N        number of cases (default 2000)\n\
          --seed N         base seed; case i uses seed+i (default 1)\n\
-         --mode M         mixed (default; rotates all modes), num, bitwise,\n\
-         equality, strmeth, array, plus, json, logic, parse,\n\
-         object, arith, math, control\n\
+         --mode M         one of ({} modes; `mixed` rotates every other one):\n\
+         \x20                 {}\n\
          (each also accepted as a `--<mode>` shorthand)\n\
          --stderr         also require the normalized error line to match\n\
          --once           run a single case (seed) and print both outputs\n\
@@ -1987,7 +2253,11 @@ fn print_help() {
          divergence (not in FILE) fails the run (exit 1)\n\
          \n\
          env  NODE_JS_FUZZ_NODE=PATH  the reference Node to compare against\n\
-         (HARD ERROR if set but unusable). Every run prints the oracle it used."
+         (HARD ERROR if set but unusable). Every run prints the oracle it used.\n\
+         Both children run with TZ=UTC LANG=LC_ALL=en_US.UTF-8, pinned rather\n\
+         than inherited, so a run reproduces on any machine.",
+        ALL_MODES.len(),
+        mode_list()
     );
 }
 
@@ -2040,6 +2310,14 @@ fn main() {
     // whose zero-divergence score is built on them is measuring nothing at all.
     let oracle_failed = AtomicU64::new(0);
     let oracle_silent = AtomicU64::new(0);
+    // The only condition under which a case really observed NOTHING: the
+    // reference printed nothing AND exited 0, so neither compared channel
+    // carried a value. `ref failed` and `ref silent` each catch one channel
+    // being empty, which stopped being the same thing once the exit code became
+    // a compared observable — the whole `exit` mode consists of programs that
+    // print nothing and exit non-zero on purpose, and it would otherwise report
+    // 100% "compared two failures" while comparing exactly what it means to.
+    let oracle_inert = AtomicU64::new(0);
     // An ORACLE timeout is not a comparison: the case is skipped, so a run full
     // of them would otherwise report a clean zero. Counted on its own line.
     let oracle_timeouts = AtomicU64::new(0);
@@ -2083,6 +2361,9 @@ fn main() {
                 }
                 if !o.timed_out && o.stdout.is_empty() {
                     oracle_silent.fetch_add(1, Ordering::Relaxed);
+                }
+                if !o.timed_out && o.stdout.is_empty() && o.exit == 0 {
+                    oracle_inert.fetch_add(1, Ordering::Relaxed);
                 }
                 // oracle-side timeout ⇒ pathological case; not a parity gap.
                 if !o.timed_out && differs(&o, &r) {
@@ -2186,14 +2467,18 @@ fn main() {
     let oracle = oracle_id(&oracle);
     let oracle_failed = oracle_failed.load(Ordering::Relaxed);
     let oracle_silent = oracle_silent.load(Ordering::Relaxed);
+    let oracle_inert = oracle_inert.load(Ordering::Relaxed);
     println!(
         "\nfuzzed {checked} cases in {:.1}s ({:.0}/s)\n\
          oracle      : {}\n\
          divergences : {} ({} known / {} new)\n\
          timeouts    : {}\n\
          ref timeout : {} (reference timed out — SKIPPED, never counted as agreement)\n\
-         ref failed  : {} (reference exited non-zero — those cases compare two failures)\n\
-         ref silent  : {} (reference printed nothing — no value was observed)",
+         ref failed  : {} (reference exited non-zero — a COMPARED value since\n\
+         \x20             exit codes are matched exactly; only `ref inert` means nothing was seen)\n\
+         ref silent  : {} (reference printed nothing on stdout)\n\
+         ref inert   : {} (reference printed nothing AND exited 0 — no value was\n\
+         \x20             observed on either compared channel)",
         elapsed.as_secs_f64(),
         checked as f64 / elapsed.as_secs_f64().max(0.001),
         oracle,
@@ -2204,6 +2489,7 @@ fn main() {
         oracle_timeouts.load(Ordering::Relaxed),
         oracle_failed,
         oracle_silent,
+        oracle_inert,
     );
 
     if !divergences.is_empty() {
