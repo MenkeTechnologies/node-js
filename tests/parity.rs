@@ -32,6 +32,12 @@ fn example_files() -> Vec<PathBuf> {
 }
 
 /// Parse the frozen snapshot into (basename, stdout) records.
+///
+/// Two shapes the format cannot hold, both refused at record time by
+/// `parity --bless` so the file can never contain one: a record with no
+/// trailing newline (this splits on lines and re-adds one, so `"a"` and `"a\n"`
+/// parse identically), and a body line that looks like a header (it would start
+/// a new record here).
 fn parse_expected(text: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
@@ -74,14 +80,38 @@ fn examples_match_frozen_node_output() {
         let base = f.file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(&base, exp_name, "snapshot ordering mismatch");
 
+        // The environment is pinned rather than inherited. The snapshot was
+        // recorded from a reference `node` that is NOT locale- or TZ-invariant
+        // (`toLocaleString`, the local-time `Date` getters), so a replay under a
+        // different LANG/LC_ALL/TZ would be comparing against a transcript taken
+        // under different conditions. node-js reads none of the three, so this
+        // costs nothing and makes the test machine-independent by construction
+        // rather than by luck.
         let out = Command::new(&bin)
             .arg(f)
+            .env("TZ", "UTC")
+            .env("LANG", "en_US.UTF-8")
+            .env("LC_ALL", "en_US.UTF-8")
             .output()
             .unwrap_or_else(|e| panic!("failed to run {}: {e}", bin.display()));
-        let got = String::from_utf8_lossy(&out.stdout).into_owned();
-        if &got != exp_out {
+        // Compared as BYTES. `String::from_utf8_lossy` maps every invalid
+        // sequence to `U+FFFD`, so two different invalid outputs compare equal —
+        // an example writing raw bytes could diverge unreportably.
+        if out.stdout != exp_out.as_bytes() {
             failures.push(format!(
-                "DIFF {base}\n  frozen node: {exp_out:?}\n  node-js    : {got:?}"
+                "DIFF {base}\n  frozen node: {exp_out:?}\n  node-js    : {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            ));
+        }
+        // The exit STATUS is part of what an example asserts and was not checked
+        // at all. Every example in the corpus runs to completion under the
+        // reference, so a non-zero status here is node-js failing where node did
+        // not — including the silent form, `process.exitCode` left set, which
+        // prints nothing and would otherwise pass.
+        if out.status.code() != Some(0) {
+            failures.push(format!(
+                "EXIT {base}: node-js exited {:?}, the reference exits 0",
+                out.status.code()
             ));
         }
     }
