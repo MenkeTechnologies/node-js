@@ -442,7 +442,11 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
         "undefined" => return Value::Undef,
         "NaN" => return Value::Float(f64::NAN),
         "Infinity" => return Value::Float(f64::INFINITY),
-        "globalThis" => return with_host(|h| h.new_object(IndexMap::new())),
+        // One object, not a fresh one per read: `globalThis === globalThis` is
+        // `true` in JS, and `globalThis.x = 1` is readable back as
+        // `globalThis.x`. Both were false while each read minted a new object.
+        // `global` is Node's alias for the same object.
+        "globalThis" | "global" => return with_host(|h| h.global_object()),
         _ => {}
     }
     if is_namespace(&name) || is_known_builtin(&name) {
@@ -1375,7 +1379,9 @@ fn b_setattr(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = sval(&vm.pop());
     let recv = vm.pop();
-    set_property(&recv, &name, val.clone());
+    if let Err(e) = set_property(&recv, &name, val.clone()) {
+        return abort(vm, e);
+    }
     val
 }
 
@@ -1419,25 +1425,25 @@ fn b_named_eval(vm: &mut VM, _: u8) -> Value {
     func
 }
 
-fn set_property(recv: &Value, name: &str, val: Value) {
+fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     // `obj.__proto__ = p` re-links the prototype.
     if name == "__proto__" && with_host(|h| h.kind_of(recv)) == Some(ObjKind::Object) {
         with_host(|h| h.set_proto(recv, val));
-        return;
+        return Ok(());
     }
     // A non-writable own property, or a new key on a non-extensible object,
     // silently discards the write (sloppy mode — the mode every script runs in).
     if !with_host(|h| h.can_write_prop(recv, name)) {
-        return;
+        return Ok(());
     }
     // An inherited/own setter accessor intercepts the write.
     if let Some((_, Some(setter))) = with_host(|h| host::lookup_accessor(h, recv, name)) {
         let _ = host::invoke(&setter, vec![val], Some(recv.clone()));
-        return;
+        return Ok(());
     }
     // A set-only-elsewhere getter (accessor with no setter): ignore the write.
     if let Some((Some(_), None)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
-        return;
+        return Ok(());
     }
     // Writing `name`/`prototype`/statics on a function value.
     if matches!(
@@ -1445,7 +1451,7 @@ fn set_property(recv: &Value, name: &str, val: Value) {
         Some(ObjKind::Func) | Some(ObjKind::Class)
     ) {
         with_host(|h| h.set_fn_prop(recv, name, val));
-        return;
+        return Ok(());
     }
     // Writing a static onto a builtin namespace/ctor (`Error.prepareStackTrace`).
     // Each bare reference is a fresh `Builtin` handle, so route to the stable
@@ -1454,8 +1460,16 @@ fn set_property(recv: &Value, name: &str, val: Value) {
         JsObj::Builtin(ns) => Some(ns.clone()),
         _ => None,
     }) {
+        // `process.exitCode` is an accessor in Node, not a data property: the
+        // setter validates and stores the code the process will finally exit
+        // with. Landing it in the generic static table made it a write-only
+        // decoration — `process.exitCode = 3` read back as 3 and the process
+        // still exited 0.
+        if ns == "process" && name == "exitCode" {
+            return crate::stdlib::process::set_exit_code(&val);
+        }
         with_host(|h| h.set_builtin_static(&ns, name, val));
-        return;
+        return Ok(());
     }
     // `re.lastIndex = n` on a RegExp advances/resets its match cursor.
     if name == "lastIndex" {
@@ -1472,18 +1486,18 @@ fn set_property(recv: &Value, name: &str, val: Value) {
                     };
                 }
             });
-            return;
+            return Ok(());
         }
     }
     // Typed-array element write (`ta[i] = v`): coerce + store into `@@elems`.
     if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
         let is_ta = crate::stdlib::native_tag(recv).as_deref() == Some("TypedArray");
         if is_ta && crate::stdlib::typedarray::elem_set(recv, name, &val) {
-            return;
+            return Ok(());
         }
         // `buf[i] = n` writes through to the Buffer's hidden byte array.
         if crate::stdlib::buffer::byte_set(recv, name, &val) {
-            return;
+            return Ok(());
         }
     }
     // An arbitrary own prop on an array (e.g. exec-result `.index`/`.input`).
@@ -1492,7 +1506,7 @@ fn set_property(recv: &Value, name: &str, val: Value) {
         && name.parse::<usize>().is_err()
     {
         with_host(|h| h.set_fn_prop(recv, name, val));
-        return;
+        return Ok(());
     }
     with_host(|h| match h.get_mut(recv) {
         Some(JsObj::Object(props)) => {
@@ -1517,6 +1531,7 @@ fn set_property(recv: &Value, name: &str, val: Value) {
         }
         _ => {}
     });
+    Ok(())
 }
 
 fn h_val_to_len(v: &Value) -> usize {
@@ -1548,7 +1563,9 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
         Ok(k) => k,
         Err(e) => return abort(vm, e),
     };
-    set_property(&recv, &key, val.clone());
+    if let Err(e) = set_property(&recv, &key, val.clone()) {
+        return abort(vm, e);
+    }
     val
 }
 
@@ -1747,7 +1764,7 @@ fn b_typeof_name(vm: &mut VM, _: u8) -> Value {
     let t = match name.as_str() {
         "undefined" => "undefined".to_string(),
         "NaN" | "Infinity" => "number".to_string(),
-        "globalThis" => "object".to_string(),
+        "globalThis" | "global" => "object".to_string(),
         n if is_namespace(n) || is_known_builtin(n) => {
             let v = with_host(|h| h.alloc(JsObj::Builtin(name.clone())));
             with_host(|h| h.type_of(&v)).to_string()
@@ -2756,7 +2773,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             }
             _ => with_host(|h| h.new_str("")),
         };
-        set_property(&target, "stack", stack);
+        let _ = set_property(&target, "stack", stack);
         return Ok(Value::Undef);
     }
     // Native stdlib module methods (path/os/fs/util/assert/crypto/buffer/url).
@@ -3073,7 +3090,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             let obj = arg0(&args);
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
             let v = args.get(2).cloned().unwrap_or(Value::Undef);
-            set_property(&obj, &k, v);
+            let _ = set_property(&obj, &k, v);
             Ok(Value::Bool(true))
         }
         "JSON.stringify" => json_stringify(args),

@@ -14,6 +14,10 @@ pub struct Cli {
     #[arg(short = 'e', long = "eval", value_name = "SRC")]
     pub eval: Option<String>,
 
+    /// Evaluate a one-liner and print its result (`node -p '1+1'` → `2`).
+    #[arg(short = 'p', long = "print", value_name = "SRC")]
+    pub print: Option<String>,
+
     /// Start the interactive REPL.
     #[arg(long = "repl")]
     pub repl: bool,
@@ -110,7 +114,7 @@ pub fn split_argv<I: IntoIterator<Item = String>>(raw: I) -> Argv {
     let mut it = raw.into_iter().skip(1);
     let mut eval_seen = false;
     while let Some(a) = it.next() {
-        if a == "-e" || a == "--eval" {
+        if a == "-e" || a == "--eval" || a == "-p" || a == "--print" {
             out.exec.push(a);
             if let Some(src) = it.next() {
                 out.exec.push(src);

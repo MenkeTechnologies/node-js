@@ -26,8 +26,20 @@ fn main() -> ExitCode {
         };
     }
 
-    if let Some(src) = cli.eval {
-        return run_source(&src);
+    // `-p`/`--print` is `-e` plus a print of the completion value. When both are
+    // given Node keeps the LAST one on the command line; clap does not preserve
+    // that order, so the raw argv decides.
+    match (cli.eval, cli.print) {
+        (Some(e), Some(p)) => {
+            return if last_eval_flag_is_print() {
+                run_print(&p)
+            } else {
+                run_source(&e)
+            }
+        }
+        (Some(e), None) => return run_source(&e),
+        (None, Some(p)) => return run_print(&p),
+        (None, None) => {}
     }
 
     // `node -` is Node's EXPLICIT stdin entry point: `-` is the entry argument,
@@ -67,8 +79,8 @@ fn main() -> ExitCode {
             };
         }
         return match nodejs::eval_file(&file) {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(e) => fail(&e),
+            Ok(_) => program_status(),
+            Err(e) => fail_program(&e),
         };
     }
 
@@ -86,16 +98,32 @@ fn main() -> ExitCode {
 fn run_stdin() -> ExitCode {
     let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
     match nodejs::eval_str_from(&src, "[stdin]") {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(e) => fail(&e),
+        Ok(_) => program_status(),
+        Err(e) => fail_program(&e),
     }
 }
 
 fn run_source(src: &str) -> ExitCode {
     match nodejs::eval_str(src) {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(e) => fail(&e),
+        Ok(_) => program_status(),
+        Err(e) => fail_program(&e),
     }
+}
+
+fn run_print(src: &str) -> ExitCode {
+    match nodejs::eval_str_print(src, "[eval]") {
+        Ok(()) => program_status(),
+        Err(e) => fail_program(&e),
+    }
+}
+
+/// Whether the last of the `-e`/`-p` family on the command line was a print
+/// form. `node -e 'console.log(9)' -p '1+1'` prints only `2` on node v26.7.0.
+fn last_eval_flag_is_print() -> bool {
+    std::env::args()
+        .rfind(|a| matches!(a.as_str(), "-e" | "--eval" | "-p" | "--print"))
+        .map(|a| a == "-p" || a == "--print")
+        .unwrap_or(false)
 }
 
 fn dump(file: &str) -> Result<(), String> {
@@ -179,4 +207,28 @@ fn atty_stdin() -> bool {
 fn fail(msg: &str) -> ExitCode {
     eprintln!("node: {msg}");
     ExitCode::FAILURE
+}
+
+/// A PROGRAM that died on an uncaught exception, as opposed to the runtime
+/// failing to start one. Node still runs the `exit` listeners on this path, and
+/// a code one of them assigns is the one the process leaves with.
+fn fail_program(msg: &str) -> ExitCode {
+    let code = nodejs::exit_code_after_failure();
+    eprintln!("node: {msg}");
+    ExitCode::from((code & 0xff) as u8)
+}
+
+/// The status a program that ran to completion leaves behind: `process.exitCode`
+/// if the script (or an `exit` listener) set one, else 0.
+///
+/// This is the whole point of `process.exitCode` and it was not wired: a script
+/// whose only failure signal is `process.exitCode = 1` — the shape every test
+/// runner and lint wrapper uses, because it lets the loop drain first — exited
+/// 0, reporting success. Measured on node v26.7.0, `node -e 'process.exitCode
+/// = 3'` exits 3.
+fn program_status() -> ExitCode {
+    match nodejs::exit_code() {
+        Some(c) => ExitCode::from((c & 0xff) as u8),
+        None => ExitCode::SUCCESS,
+    }
 }

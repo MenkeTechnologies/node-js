@@ -1009,7 +1009,7 @@ fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
 /// 'utf16le')` produced the 3 bytes `616263` instead of node's 6 bytes
 /// `610062006300`, and every `byteLength`/`write`/`fill` that funnels through
 /// here inherited the wrong count.
-fn decode_str(s: &str, enc: &str) -> Vec<u8> {
+pub(crate) fn decode_str(s: &str, enc: &str) -> Vec<u8> {
     match enc.to_ascii_lowercase().as_str() {
         "hex" => from_hex(s),
         "base64" | "base64url" => from_base64(s),

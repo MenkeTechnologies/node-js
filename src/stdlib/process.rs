@@ -205,8 +205,74 @@ pub fn constant(name: &str) -> Option<Value> {
         "stdout" => std_stream(1),
         "stderr" => std_stream(2),
         "stdin" => std_stream(0),
+        // Unset reads back as `undefined`, not `0` — `process.exitCode` starts
+        // life absent and a script may test for that.
+        "exitCode" => match with_host(|h| h.exit_code) {
+            Some(c) => Value::Float(c as f64),
+            None => Value::Undef,
+        },
         _ => return None,
     })
+}
+
+/// The `process.exitCode` setter, ported from Node's
+/// `lib/internal/bootstrap/node.js` accessor:
+///
+/// ```js
+/// set(code) {
+///   if (code !== null && code !== undefined) {
+///     let value = code;
+///     if (typeof code === 'string' && code !== '' &&
+///       NumberIsNaN((value = Number(code)))) {
+///       value = code;
+///     }
+///     validateInteger(value, 'code');
+///     …
+///   } else { /* clear */ }
+/// }
+/// ```
+///
+/// So a NUMERIC string is accepted and coerced (`"3"` → 3, `"0x10"` → 16,
+/// `"  "` → 0), a non-numeric or empty string keeps its string identity and
+/// fails `validateInteger` as a TYPE error, a non-integer number fails as a
+/// RANGE error, and `null`/`undefined` clear the slot. Verified on node
+/// v26.7.0: `process.exitCode = "0x10"` exits 16, `= 3.7` throws
+/// `ERR_OUT_OF_RANGE`, `= ""` throws `ERR_INVALID_ARG_TYPE`, `= "  "` exits 0.
+pub fn set_exit_code(val: &Value) -> Result<(), String> {
+    if matches!(val, Value::Undef) || with_host(|h| h.is_null(val)) {
+        with_host(|h| h.exit_code = None);
+        return Ok(());
+    }
+    // A numeric string coerces; anything else keeps its own type for the error.
+    let numeric = match with_host(|h| h.as_str(val)) {
+        Some(s) if !s.is_empty() => {
+            let n = with_host(|h| h.to_number(val));
+            if n.is_nan() {
+                None
+            } else {
+                Some(n)
+            }
+        }
+        Some(_) => None,
+        None => match val {
+            Value::Float(_) | Value::Int(_) => Some(with_host(|h| h.to_number(val))),
+            _ => None,
+        },
+    };
+    match numeric {
+        Some(n) if n.fract() == 0.0 && n.is_finite() => {
+            with_host(|h| h.exit_code = Some(n as i32));
+            Ok(())
+        }
+        Some(n) => Err(crate::host::range_error(&format!(
+            "The value of \"code\" is out of range. It must be an integer. Received {}",
+            crate::host::fmt_number(n)
+        ))),
+        None => Err(crate::host::type_error(&format!(
+            "The \"code\" argument must be of type number. Received {}",
+            super::received_desc(val)
+        ))),
+    }
 }
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
@@ -305,11 +371,25 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // exactly as it is in Node — there is no "exit but keep going" in the API.
         // stdout/stderr are flushed first because `std::process::exit` runs no
         // destructors.
+        //
+        // Port of Node's `process.exit`: an argument (even `undefined`) is
+        // ASSIGNED to `process.exitCode` first — through the validating setter,
+        // so `process.exit(3.7)` throws instead of exiting — then the `exit`
+        // event fires with the resulting code, then the process leaves. With no
+        // argument the already-set `process.exitCode` decides, which is why
+        // `process.exitCode = 3; process.exit()` exits 3 on node v26.7.0.
         "exit" | "reallyExit" => {
-            let code = match args.first() {
-                Some(v) if !matches!(v, Value::Undef) => with_host(|h| h.to_number(v)) as i32,
-                _ => 0,
-            };
+            if !args.is_empty() {
+                if let Err(e) = set_exit_code(&args[0]) {
+                    return Some(Err(e));
+                }
+            }
+            let code = with_host(|h| h.exit_code).unwrap_or(0);
+            if let Err(e) = emit_exit_event(code) {
+                return Some(Err(e));
+            }
+            // An `exit` listener may raise the code; re-read before leaving.
+            let code = with_host(|h| h.exit_code).unwrap_or(0);
             use std::io::Write;
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
@@ -570,8 +650,13 @@ pub fn stream_instance_call(recv: &Value, method: &str, args: &[Value]) -> Resul
                 Some(JsObj::Object(p)) => p.get("fd").map(|v| h.to_number(v)).unwrap_or(1.0),
                 _ => 1.0,
             });
-            let chunk = super::arg_str(args, 0);
-            with_host(|h| h.write_out(&chunk, fd == 2.0));
+            // `end()` with no chunk closes without writing; `write()` with no
+            // chunk is the argument error below.
+            if method == "end" && args.first().map(|v| matches!(v, Value::Undef)) != Some(false) {
+                return Ok(Value::Bool(true));
+            }
+            let bytes = chunk_bytes(args)?;
+            with_host(|h| h.write_out_bytes(&bytes, fd == 2.0));
             Ok(Value::Bool(true))
         }
         // A no-op stream surface so `.on('data')`/`.once`/`.end()` chaining loads.
@@ -625,6 +710,88 @@ fn memory_usage() -> Value {
         }
         h.new_object(m)
     })
+}
+
+/// Emit `process.on('exit', code)` exactly once per process, the way Node's
+/// `process._exiting` latch does — `process.exit()` inside an `exit` handler
+/// must not re-enter it.
+///
+/// The handlers run SYNCHRONOUSLY and nothing they schedule ever runs: Node
+/// leaves the loop straight after them, so a `setTimeout` or `.then` queued
+/// here is dropped. An `exit` listener may still raise `process.exitCode`, and
+/// that later value is the one the process uses, which is why the caller reads
+/// the slot back after this returns.
+pub fn emit_exit_event(code: i32) -> Result<(), String> {
+    if with_host(|h| std::mem::replace(&mut h.exiting, true)) {
+        return Ok(());
+    }
+    let listeners = with_host(|h| h.process_listeners.get("exit").cloned().unwrap_or_default());
+    for f in listeners {
+        crate::host::invoke(&f, vec![Value::Float(code as f64)], None)?;
+    }
+    Ok(())
+}
+
+/// Emit `process.on('beforeExit', code)`. Node fires this when the loop has
+/// drained but the process has NOT been told to exit, and — unlike `exit` —
+/// work scheduled from a handler is honoured, so the loop runs again and
+/// `beforeExit` can fire repeatedly. It never fires after an explicit
+/// `process.exit()` or an uncaught exception.
+///
+/// Reports whether any listener ran, so the caller knows to re-drain.
+pub fn emit_before_exit(code: i32) -> Result<bool, String> {
+    let listeners = with_host(|h| {
+        h.process_listeners
+            .get("beforeExit")
+            .cloned()
+            .unwrap_or_default()
+    });
+    let any = !listeners.is_empty();
+    for f in listeners {
+        crate::host::invoke(&f, vec![Value::Float(code as f64)], None)?;
+    }
+    Ok(any)
+}
+
+/// The bytes a `stream.write(chunk[, encoding])` call puts on the wire.
+///
+/// Node writes a `Buffer`/`TypedArray`/`DataView` chunk through UNTOUCHED, and
+/// decodes a string chunk with the named encoding (default `utf8`). Both were
+/// funnelled through `ToString` here, which is lossy in two separate ways:
+/// `process.stdout.write(Buffer.from([0xff,0xfe,0x41]))` printed the 15 bytes of
+/// `[object Object]` instead of `ff fe 41`, and even once the Buffer path
+/// existed, a `String` round-trip would have replaced each non-UTF-8 byte with
+/// `U+FFFD` (3 bytes out, 7 bytes on the wire). `write("4142","hex")` likewise
+/// printed the four characters of the literal instead of the two bytes `AB`.
+///
+/// Anything that is neither a string nor a byte view is the same
+/// `ERR_INVALID_ARG_TYPE` Node raises — a JS array of byte values included,
+/// which is why this does NOT reuse `buffer::bytes_like` (that helper
+/// deliberately accepts plain arrays, which `write` rejects).
+fn chunk_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
+    let chunk = args.first().cloned().unwrap_or(Value::Undef);
+    if with_host(|h| h.is_null(&chunk)) {
+        return Err(crate::host::type_error(
+            "May not write null values to stream",
+        ));
+    }
+    if let Some(s) = with_host(|h| h.as_str(&chunk)) {
+        let enc = match args.get(1) {
+            Some(v) if !matches!(v, Value::Undef) => with_host(|h| h.str_of(v)),
+            _ => "utf8".to_string(),
+        };
+        return Ok(super::buffer::decode_str(&s, &enc));
+    }
+    match super::native_tag(&chunk).as_deref() {
+        Some("Buffer") | Some("TypedArray") | Some("DataView") => {
+            Ok(super::buffer::bytes_like(&chunk).unwrap_or_default())
+        }
+        _ => Err(crate::host::type_error(&format!(
+            "The \"chunk\" argument must be of type string or an instance of \
+             Buffer, TypedArray, or DataView. Received {}",
+            super::received_desc(&chunk)
+        ))),
+    }
 }
 
 /// The `fd` numeric property of a stream stand-in (default stdout).

@@ -108,7 +108,16 @@ pub fn install_entry_globals(origin: &str) {
         h.set_global("__filename", origin_str);
         h.set_global("__dirname", dirname);
         h.set_global("module", module.clone());
-        h.set_global("exports", exports);
+        h.set_global("exports", exports.clone());
+        // Top-level `this`: the module's `exports` from a file (CommonJS
+        // module), `globalThis` from `-e` and from stdin (a Script). See
+        // `JsHost::set_top_this` for the measurements.
+        let top = if from_file {
+            exports
+        } else {
+            h.global_object()
+        };
+        h.set_top_this(top);
     });
 }
 

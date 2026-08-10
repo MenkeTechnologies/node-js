@@ -70,6 +70,32 @@ pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
     host::run_main(load_merged(prog))
 }
 
+/// `process.exitCode` as the program left it, or `None` if it was never set.
+///
+/// The binary reads this after a run completes to pick its own status — Node
+/// exits with `process.exitCode` when the loop drains normally, so a script
+/// that signals failure that way (rather than by throwing or calling
+/// `process.exit`) is reported as a failure rather than as success.
+pub fn exit_code() -> Option<i32> {
+    host::with_host(|h| h.exit_code)
+}
+
+/// Run the `exit` event for a program that died on an uncaught exception, and
+/// report the status to leave with.
+///
+/// Node fires `exit` on this path too, and an uncaught exception FORCES the
+/// code to 1 — overriding any `process.exitCode` the script had already set —
+/// while a code the handler itself assigns still wins. Verified on node
+/// v26.7.0: `process.exitCode = 3; process.on('exit', c => console.log(c));
+/// throw new Error('z')` prints `1` and exits 1, and
+/// `process.on('exit', () => { process.exitCode = 9 }); throw new Error('z')`
+/// exits 9.
+pub fn exit_code_after_failure() -> i32 {
+    host::with_host(|h| h.exit_code = Some(1));
+    let _ = stdlib::process::emit_exit_event(1);
+    host::with_host(|h| h.exit_code).unwrap_or(1)
+}
+
 /// Compile `src` and run it on the LIVE host — no reset, no event-loop drain —
 /// in the GLOBAL scope, returning its completion value.
 ///
@@ -142,6 +168,27 @@ pub fn eval_str_from(src: &str, origin: &str) -> Result<Value, String> {
     }
     module::install_entry_globals(origin);
     run_compiled(compile_or_load(src)?)
+}
+
+/// `node -p <src>`: evaluate as `-e` does, then write the program's COMPLETION
+/// value through the `console.log` formatter, exactly as Node's
+/// `--print` does (`node -p '[1,2]'` prints `[ 1, 2 ]`, `node -p '"s"'` prints
+/// the bare `s`). Side effects still happen, so `node -p 'console.log("x")'`
+/// prints `x` and then `undefined`.
+///
+/// Deliberately compiled with [`compile_completion`] rather than through the
+/// source-keyed rkyv cache: the cache is keyed by source TEXT alone, so a
+/// `-p`-shaped chunk and an `-e`-shaped chunk for the same string would alias.
+pub fn eval_str_print(src: &str, origin: &str) -> Result<(), String> {
+    host::reset_host();
+    if let Ok(cwd) = std::env::current_dir() {
+        module::set_entry_dir(cwd);
+    }
+    module::install_entry_globals(origin);
+    let value = run_compiled(compile_completion(src)?)?;
+    let line = stdlib::util::format(std::slice::from_ref(&value));
+    host::with_host(|h| h.write_out(&format!("{line}\n"), false));
+    Ok(())
 }
 
 /// Run a JS source string on a fresh host with `globals` bound and the

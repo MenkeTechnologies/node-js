@@ -670,7 +670,23 @@ pub struct JsHost {
     /// what an embedder (a TUI that owns the terminal) needs so a `console.log`
     /// cannot corrupt its display. `None` (the default) is the ordinary
     /// standalone `node` behaviour: writes go straight to the real streams.
-    capture: Option<String>,
+    ///
+    /// Bytes, not `String`: a program may legitimately write output that is not
+    /// valid UTF-8 (`process.stdout.write(Buffer.from([0xff]))`), and a `String`
+    /// buffer can only hold the lossy `U+FFFD` transcription of it.
+    capture: Option<Vec<u8>>,
+    /// `process.exitCode`: the code the process exits with when the event loop
+    /// drains, or `None` while unset. Separate from an explicit
+    /// `process.exit(n)`, which exits immediately with `n`.
+    pub exit_code: Option<i32>,
+    /// Whether the `exit` event has already been emitted, so the `process.exit`
+    /// path and the end-of-loop path cannot both fire it (Node's `_exiting`).
+    pub exiting: bool,
+    /// The one `globalThis` object. It has to be a singleton: `globalThis` is an
+    /// identity in JS, so `globalThis === globalThis` is `true` and a property
+    /// written through one read is visible through the next. Minting a fresh
+    /// object per read made both false.
+    global_obj: Value,
 }
 
 /// A queued unit of work: either a JS callback invocation (`queueMicrotask`,
@@ -858,11 +874,24 @@ impl JsHost {
             io_rx: Some(io_rx),
             open_handles: 0,
             capture: None,
+            exit_code: None,
+            exiting: false,
+            global_obj: Value::Undef,
         };
         h.null_val = h.alloc(JsObj::Null);
         // `Object.prototype`: the chain root, its own `[[Prototype]]` is null.
         h.object_proto = h.new_object(IndexMap::new());
+        h.global_obj = h.new_object(IndexMap::new());
         h
+    }
+
+    /// The `globalThis` object — one per host, so its identity and its
+    /// properties both survive across reads.
+    pub fn global_object(&mut self) -> Value {
+        if matches!(self.global_obj, Value::Undef) {
+            self.global_obj = self.new_object(IndexMap::new());
+        }
+        self.global_obj.clone()
     }
 
     // ── prototype chain ──────────────────────────────────────────────────
@@ -1598,14 +1627,26 @@ impl JsHost {
     /// Start capturing program output in-process. Any text already captured is
     /// discarded, so each run starts clean.
     pub fn begin_capture(&mut self) {
-        self.capture = Some(String::new());
+        self.capture = Some(Vec::new());
     }
 
     /// Stop capturing and take everything written since [`begin_capture`],
-    /// returning the empty string when capture was not on.
+    /// returning the empty string when capture was not on. The captured bytes
+    /// are rendered lossily: this API hands back a `String`, so a program that
+    /// wrote non-UTF-8 gets `U+FFFD` here even though the same write reaches a
+    /// real stdout byte-exact. Use [`end_capture_bytes`] to keep those bytes.
     ///
     /// [`begin_capture`]: JsHost::begin_capture
+    /// [`end_capture_bytes`]: JsHost::end_capture_bytes
     pub fn end_capture(&mut self) -> String {
+        String::from_utf8_lossy(&self.capture.take().unwrap_or_default()).into_owned()
+    }
+
+    /// Stop capturing and take the raw bytes, without the lossy transcription
+    /// [`end_capture`] applies.
+    ///
+    /// [`end_capture`]: JsHost::end_capture
+    pub fn end_capture_bytes(&mut self) -> Vec<u8> {
         self.capture.take().unwrap_or_default()
     }
 
@@ -1620,18 +1661,29 @@ impl JsHost {
     /// their own line ending, as `console.log` does and `process.stdout.write`
     /// does not.
     pub fn write_out(&mut self, s: &str, stderr: bool) {
+        self.write_out_bytes(s.as_bytes(), stderr);
+    }
+
+    /// Write program output as raw BYTES. `process.stdout.write(buf)` hands Node
+    /// a byte string and Node writes it through untouched, so a `Buffer` holding
+    /// `ff fe 41` reaches stdout as those three bytes. Routing it through a Rust
+    /// `String` first replaced every non-UTF-8 byte with `U+FFFD` — three bytes
+    /// became seven — so the byte path exists separately from [`write_out`].
+    ///
+    /// [`write_out`]: JsHost::write_out
+    pub fn write_out_bytes(&mut self, bytes: &[u8], stderr: bool) {
         if let Some(buf) = &mut self.capture {
-            buf.push_str(s);
+            buf.extend_from_slice(bytes);
             return;
         }
         use std::io::Write as _;
         if stderr {
             let mut e = std::io::stderr();
-            let _ = e.write_all(s.as_bytes());
+            let _ = e.write_all(bytes);
             let _ = e.flush();
         } else {
             let mut o = std::io::stdout();
-            let _ = o.write_all(s.as_bytes());
+            let _ = o.write_all(bytes);
             let _ = o.flush();
         }
     }
@@ -1650,6 +1702,24 @@ impl JsHost {
 
     pub fn current_this(&self) -> Option<Value> {
         self.frame().this_obj.clone()
+    }
+    /// Bind the TOP-LEVEL `this` — the value a `this` outside any function sees.
+    ///
+    /// Node answers differently per entry point and both answers are objects:
+    /// `node f.js` runs a CommonJS module, so top-level `this` is
+    /// `module.exports`; `node -e` and `node -` run a Script, so it is
+    /// `globalThis`. Verified on node v26.7.0 —
+    /// `console.log(this === globalThis, this === module.exports)` is
+    /// `false true` from a file and `true false` from `-e` and from stdin. It
+    /// was `undefined` at every entry point here, so `this.x = 1` at module
+    /// scope threw instead of populating the exports object.
+    ///
+    /// Only the base frame is touched: a plain function call still gets its own
+    /// (`undefined`) binding rather than inheriting this one.
+    pub fn set_top_this(&mut self, v: Value) {
+        if let Some(f) = self.frames.first_mut() {
+            f.this_obj = Some(v);
+        }
     }
     pub fn current_env_capture(&self) -> Env {
         self.frame().env.clone()
@@ -1805,8 +1875,42 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     with_host(|h| h.signal = None);
     if r.is_ok() {
         run_event_loop()?;
+        finish_process_events()?;
     }
     r
+}
+
+/// The shutdown sequence Node runs once the loop has drained on its own: fire
+/// `beforeExit` (which MAY schedule more work, in which case the loop runs
+/// again and `beforeExit` fires again), then fire `exit` exactly once.
+///
+/// Neither event fired at all before this existed, so `process.on('exit', …)`
+/// was a registration with no delivery — a listener whose body printed was
+/// silently dropped, and one that set `process.exitCode` could not affect the
+/// status. Measured on node v26.7.0,
+/// `process.on('exit', c => console.log('exit', c))` prints `exit 0`.
+///
+/// An explicit `process.exit()` never reaches here (it leaves the process from
+/// inside the builtin), and neither does an uncaught exception — matching
+/// Node, where `beforeExit` is skipped on both paths.
+fn finish_process_events() -> Result<(), String> {
+    // Bounded: a `beforeExit` listener that re-arms work every time would spin
+    // forever, exactly as it does in Node, but a runaway here would hang a
+    // parity run with no output, so it is capped and then treated as drained.
+    for _ in 0..1000 {
+        let code = with_host(|h| h.exit_code).unwrap_or(0);
+        if !crate::stdlib::process::emit_before_exit(code)? {
+            break;
+        }
+        let more =
+            with_host(|h| h.has_microtasks() || h.open_handles() > 0 || h.has_refed_macrotasks());
+        if !more {
+            break;
+        }
+        run_event_loop()?;
+    }
+    let code = with_host(|h| h.exit_code).unwrap_or(0);
+    crate::stdlib::process::emit_exit_event(code)
 }
 
 // ── formatting ───────────────────────────────────────────────────────────────
