@@ -3227,9 +3227,15 @@ fn bigint_ctor(v: &Value) -> Result<Value, String> {
                     "RangeError: The number {disp} cannot be converted to a BigInt because it is not an integer"
                 ));
             }
-            // Exact for the integer f64 range; larger integers round-trip via the
-            // decimal string.
-            match BigInt::parse_bytes(host::fmt_number(*f).as_bytes(), 10) {
+            // The decimal EXPANSION, not `fmt_number`: `Number.prototype
+            // .toString` switches to exponential notation at 1e21, and
+            // `BigInt::parse_bytes` cannot read `"1e+21"` — so `BigInt(1e21)`
+            // threw `Cannot convert value to a BigInt` where node returns
+            // `1000000000000000000000n`. `{:.0}` prints an integral f64's exact
+            // value, which is also what node reports for a magnitude past the
+            // exactly-representable range (`BigInt(1e30)` is
+            // `1000000000000000019884624838656n` in both).
+            match BigInt::parse_bytes(format!("{f:.0}").as_bytes(), 10) {
                 Some(b) => b,
                 None => return Err(host::type_error("Cannot convert value to a BigInt")),
             }
@@ -6090,7 +6096,15 @@ fn to_locale_string(n: f64) -> String {
     let neg = n.is_sign_negative();
     // Round the magnitude to at most 3 fraction digits, then drop trailing zeros
     // (and a bare trailing point). `to_fixed` rounds half away from zero.
-    let fixed = to_fixed(n.abs(), 3);
+    // `to_fixed` falls back to `ToString` at |x| ≥ 1e21 (spec 21.1.3.3 step 6),
+    // which is exponential — and the grouping below then chopped up the
+    // exponent, so `(1e21).toLocaleString()` was `1e,+21` instead of node's
+    // `1,000,000,000,000,000,000,000`. Expanding the SHORTEST repr is the right
+    // source: node groups the shortest decimal form, so `(1e100)
+    // .toLocaleString()` is 1 followed by a hundred zeros rather than the exact
+    // binary value `1000…159028911…`. (`BigInt(1e100)` is the exact value, a
+    // deliberately different rule — see `bigint_ctor`.)
+    let fixed = expand_exponential(&to_fixed(n.abs(), 3));
     let trimmed = match fixed.split_once('.') {
         Some(_) => fixed.trim_end_matches('0').trim_end_matches('.'),
         None => fixed.as_str(),
@@ -6109,6 +6123,34 @@ fn to_locale_string(n: f64) -> String {
         out.push_str(f);
     }
     out
+}
+
+/// Write a nonnegative decimal string in plain positional form, expanding an
+/// `e+NN` exponent into zeros. `"1e+21"` → `"1000000000000000000000"`,
+/// `"1.5e+21"` → `"1500000000000000000000"`. A string with no exponent, or a
+/// negative exponent (a magnitude below 1, which the caller has already rounded
+/// to zero), is returned unchanged.
+fn expand_exponential(s: &str) -> String {
+    let Some((mantissa, exp)) = s.split_once(['e', 'E']) else {
+        return s.to_string();
+    };
+    let Ok(exp) = exp.trim_start_matches('+').parse::<i32>() else {
+        return s.to_string();
+    };
+    if exp <= 0 {
+        return s.to_string();
+    }
+    let (int_digits, frac_digits) = match mantissa.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (mantissa.to_string(), String::new()),
+    };
+    let mut digits = int_digits;
+    digits.push_str(&frac_digits);
+    // The exponent consumes the fractional digits first; whatever is left
+    // becomes trailing zeros.
+    let zeros = exp as usize - frac_digits.len().min(exp as usize);
+    digits.push_str(&"0".repeat(zeros));
+    digits
 }
 
 /// Insert `,` as a thousands separator into a nonnegative integer digit string.
