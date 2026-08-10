@@ -740,19 +740,20 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
             }
         }
         Some(ObjKind::Str) => {
+            // `.length` and `s[i]` count UTF-16 code units, not code points.
             if name == "length" {
                 let n = peek(recv, |o| match o {
-                    JsObj::Str(s) => Some(s.chars().count()),
+                    JsObj::Str(s) => Some(crate::utf16::len(s)),
                     _ => None,
                 })
                 .unwrap_or(0);
                 Value::Float(n as f64)
             } else if let Ok(i) = name.parse::<usize>() {
                 match peek(recv, |o| match o {
-                    JsObj::Str(s) => s.chars().nth(i),
+                    JsObj::Str(s) => crate::utf16::Units::of(s).unit_str(i),
                     _ => None,
                 }) {
-                    Some(c) => with_host(|h| h.new_str(c.to_string())),
+                    Some(c) => with_host(|h| h.new_str(c)),
                     None => Value::Undef,
                 }
             } else if name == "@@iterator" || is_string_method(name) {
@@ -1465,9 +1466,9 @@ fn set_property(recv: &Value, name: &str, val: Value) {
             with_host(|h| {
                 if let Some(JsObj::RegExp(r)) = h.get_mut(recv) {
                     r.last_index = if n.is_finite() && n >= 0.0 {
-                        n as usize
+                        crate::utf16::U16Index::new(n as usize)
                     } else {
-                        0
+                        crate::utf16::U16Index::ZERO
                     };
                 }
             });
@@ -2831,13 +2832,41 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "RegExp" => regexp_ctor(&args),
         "BigInt.asIntN" | "BigInt.asUintN" => bigint_as_n(name.ends_with("asUintN"), &args),
         "Boolean" => Ok(Value::Bool(with_host(|h| h.truthy(&arg0(&args))))),
+        // Each argument is truncated to a uint16 and taken as one code UNIT, so
+        // `String.fromCharCode(0x1D4B3)` is U+D4B3, NOT the astral U+1D4B3, and
+        // a surrogate PAIR of arguments composes into one character.
         "String.fromCharCode" => Ok(with_host(|h| {
-            let s: String = args
+            let units: Vec<u16> = args
                 .iter()
-                .filter_map(|a| char::from_u32(h.to_number(a) as u32))
+                .map(|a| crate::utf16::to_uint16(h.to_number(a)))
                 .collect();
+            let s = crate::utf16::to_string_lossy(&units);
             h.new_str(s)
         })),
+        // `fromCodePoint` takes whole code POINTS and rejects anything that is
+        // not one — including a lone surrogate, which `fromCharCode` accepts.
+        "String.fromCodePoint" => {
+            let mut s = String::new();
+            for a in &args {
+                let n = with_host(|h| h.to_number(a));
+                let cp = if n.is_finite() && n.trunc() == n && (0.0..=0x10FFFF as f64).contains(&n)
+                {
+                    char::from_u32(n as u32)
+                } else {
+                    None
+                };
+                match cp {
+                    Some(c) => s.push(c),
+                    None => {
+                        return Err(format!(
+                            "RangeError: Invalid code point {}",
+                            with_host(|h| h.str_of(a))
+                        ))
+                    }
+                }
+            }
+            Ok(new_s(s))
+        }
         "String.raw" => string_raw(&args),
         // `Array(5)` === `new Array(5)` (length-5 empty), but `Array.of(5)` is `[5]`.
         "Array" => construct_builtin("Array", args),
@@ -5349,10 +5378,17 @@ fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
 }
 
 fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String> {
-    let chars: Vec<char> = s.chars().collect();
+    // Every index-bearing method below counts UTF-16 code units, so they all
+    // work off this one decoding rather than off `s.chars()` (code points),
+    // which agrees only on the BMP. `@@iterator` is the deliberate exception.
+    let u = crate::utf16::Units::of(s);
     match name {
+        // `for…of` / spread over a string iterates CODE POINTS, not code units:
+        // `[..."𝒳"]` is one element in node even though `"𝒳".length` is 2. This
+        // is the one string operation that is specified in chars, so it stays
+        // on `s.chars()` on purpose — do not "fix" it to match the others.
         "@@iterator" => {
-            let items: Vec<Value> = chars.iter().map(|c| new_s(c.to_string())).collect();
+            let items: Vec<Value> = s.chars().map(|c| new_s(c.to_string())).collect();
             Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
         }
         "toUpperCase" => Ok(new_s(s.to_uppercase())),
@@ -5384,108 +5420,128 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         "trimEnd" => Ok(new_s(s.trim_end().to_string())),
         "toString" | "valueOf" => Ok(new_s(s.to_string())),
         "charAt" => {
-            let i = arg_num(&args, 0) as usize;
-            Ok(new_s(
-                chars.get(i).map(|c| c.to_string()).unwrap_or_default(),
-            ))
+            let at = unit_pos(arg_num(&args, 0)).and_then(|i| u.unit_str(i));
+            Ok(new_s(at.unwrap_or_default()))
         }
         "at" => {
-            let mut i = arg_num(&args, 0) as i64;
-            if i < 0 {
-                i += chars.len() as i64;
-            }
-            if i >= 0 && (i as usize) < chars.len() {
-                Ok(new_s(chars[i as usize].to_string()))
+            let n = arg_num(&args, 0);
+            // A negative position counts back from the end; `NaN` is 0. An
+            // infinite position is out of range in either direction.
+            let i = if n.is_nan() {
+                Some(0i64)
+            } else if n.is_finite() {
+                let i = n.trunc() as i64;
+                Some(if i < 0 { i + u.len() as i64 } else { i })
             } else {
-                Ok(Value::Undef)
+                None
+            };
+            match i
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| u.unit_str(i))
+            {
+                Some(c) => Ok(new_s(c)),
+                None => Ok(Value::Undef),
             }
         }
-        "charCodeAt" | "codePointAt" => {
-            let i = arg_num(&args, 0) as usize;
-            match chars.get(i) {
-                Some(c) => Ok(Value::Float(*c as u32 as f64)),
-                None => Ok(Value::Float(f64::NAN)),
-            }
+        // `charCodeAt` reports the bare code UNIT — the high surrogate of an
+        // astral character, not the character. `codePointAt` looks ahead one
+        // unit and reports the whole scalar when the pair is well formed. They
+        // agree everywhere on the BMP, which is why they used to share an arm.
+        // They also disagree OUT of range: `charCodeAt` yields `NaN` while
+        // `codePointAt` yields `undefined` (measured on node v26.7.0).
+        "charCodeAt" => {
+            let unit = unit_pos(arg_num(&args, 0)).and_then(|i| u.unit(i));
+            Ok(Value::Float(unit.map(f64::from).unwrap_or(f64::NAN)))
         }
+        "codePointAt" => match unit_pos(arg_num(&args, 0)).and_then(|i| u.code_point(i)) {
+            Some(cp) => Ok(Value::Float(f64::from(cp))),
+            None => Ok(Value::Undef),
+        },
         // The search quartet all honor their optional position argument.
         // `"a&b&c".indexOf("&", 2)` must be 3, not 1 — body-parser's
         // parameterCount walks a query string with exactly that call.
         "indexOf" => {
-            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
-            let from = clamp_pos(arg_num(&args, 1), chars.len());
+            let needle = needle_units(&args);
+            let from = clamp_pos(arg_num(&args, 1), u.len());
             Ok(Value::Float(
-                search_from(&chars, &needle, from)
+                search_from(u.as_slice(), needle.as_slice(), from)
                     .map(|i| i as f64)
                     .unwrap_or(-1.0),
             ))
         }
         "lastIndexOf" => {
-            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
+            let needle = needle_units(&args);
             // An absent or NaN position means "search the whole string".
             let n = arg_num(&args, 1);
             let upto = if n.is_nan() {
-                chars.len()
+                u.len()
             } else {
-                clamp_pos(n, chars.len())
+                clamp_pos(n, u.len())
             };
             Ok(Value::Float(
-                search_last(&chars, &needle, upto)
+                search_last(u.as_slice(), needle.as_slice(), upto)
                     .map(|i| i as f64)
                     .unwrap_or(-1.0),
             ))
         }
         "includes" => {
-            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
-            let from = clamp_pos(arg_num(&args, 1), chars.len());
-            Ok(Value::Bool(search_from(&chars, &needle, from).is_some()))
+            let needle = needle_units(&args);
+            let from = clamp_pos(arg_num(&args, 1), u.len());
+            Ok(Value::Bool(
+                search_from(u.as_slice(), needle.as_slice(), from).is_some(),
+            ))
         }
         "startsWith" => {
-            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
-            let from = clamp_pos(arg_num(&args, 1), chars.len());
-            Ok(Value::Bool(chars[from..].starts_with(&needle)))
+            let needle = needle_units(&args);
+            let from = clamp_pos(arg_num(&args, 1), u.len());
+            Ok(Value::Bool(
+                u.as_slice()[from..].starts_with(needle.as_slice()),
+            ))
         }
         "endsWith" => {
-            let needle: Vec<char> = with_host(|h| h.str_of(&arg0(&args))).chars().collect();
+            let needle = needle_units(&args);
             // The 2nd argument is where the string is treated as ENDING.
             let end = if args.len() < 2 || matches!(args[1], Value::Undef) {
-                chars.len()
+                u.len()
             } else {
-                clamp_pos(arg_num(&args, 1), chars.len())
+                clamp_pos(arg_num(&args, 1), u.len())
             };
-            Ok(Value::Bool(chars[..end].ends_with(&needle)))
+            Ok(Value::Bool(
+                u.as_slice()[..end].ends_with(needle.as_slice()),
+            ))
         }
         "slice" => {
-            let (lo, hi) = slice_bounds(&args, chars.len());
-            Ok(new_s(chars[lo..hi].iter().collect()))
+            let (lo, hi) = slice_bounds(&args, u.len());
+            Ok(new_s(u.slice(lo, hi)))
         }
         "substring" => {
             let mut a = arg_num(&args, 0).max(0.0) as usize;
             let mut b = if args.len() < 2 || matches!(args[1], Value::Undef) {
-                chars.len()
+                u.len()
             } else {
-                (arg_num(&args, 1).max(0.0) as usize).min(chars.len())
+                (arg_num(&args, 1).max(0.0) as usize).min(u.len())
             };
-            a = a.min(chars.len());
+            a = a.min(u.len());
             if a > b {
                 std::mem::swap(&mut a, &mut b);
             }
-            Ok(new_s(chars[a..b].iter().collect()))
+            Ok(new_s(u.slice(a, b)))
         }
         "substr" => {
             // A negative start counts from the end: max(len + start, 0).
-            let len = chars.len() as i64;
+            let len = u.len() as i64;
             let mut start = arg_num(&args, 0) as i64;
             if start < 0 {
                 start = (len + start).max(0);
             }
-            let start = (start as usize).min(chars.len());
+            let start = (start as usize).min(u.len());
             let count = if args.len() >= 2 {
                 arg_num(&args, 1).max(0.0) as usize
             } else {
-                chars.len()
+                u.len()
             };
-            let end = (start + count).min(chars.len());
-            Ok(new_s(chars[start..end].iter().collect()))
+            let end = start.saturating_add(count).min(u.len());
+            Ok(new_s(u.slice(start, end)))
         }
         "repeat" => {
             let n = arg_num(&args, 0);
@@ -5515,7 +5571,7 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                 // a plain substring search, which agrees for non-metacharacter
                 // needles.
                 let needle = with_host(|h| h.str_of(&arg0(&args)));
-                Ok(Value::Float(byte_to_char_index(s, s.find(&needle))))
+                Ok(Value::Float(byte_to_unit_index(s, s.find(&needle))))
             }
         }
         "replace" => {
@@ -5567,7 +5623,12 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             } else {
                 let sep = with_host(|h| h.str_of(&args[0]));
                 if sep.is_empty() {
-                    chars.iter().map(|c| new_s(c.to_string())).collect()
+                    // `split('')` yields one element per code UNIT, so an astral
+                    // character becomes its two surrogate halves.
+                    (0..u.len())
+                        .filter_map(|i| u.unit_str(i))
+                        .map(new_s)
+                        .collect()
                 } else {
                     s.split(&sep as &str)
                         .map(|p| new_s(p.to_string()))
@@ -5603,9 +5664,28 @@ fn clamp_pos(n: f64, len: usize) -> usize {
     }
 }
 
+/// `ToIntegerOrInfinity(n)` as a code-unit position, or `None` when there can be
+/// no such unit. `NaN` (an absent argument) is 0; a negative or infinite
+/// position is out of range — `"abc".charCodeAt(-1)` is `NaN`, not `'a'`.
+fn unit_pos(n: f64) -> Option<usize> {
+    if n.is_nan() {
+        Some(0)
+    } else if n < 0.0 || !n.is_finite() {
+        None
+    } else {
+        Some(n.trunc() as usize)
+    }
+}
+
+/// The search argument of `indexOf`/`includes`/`startsWith`/… as code units, so
+/// the needle is compared in the same alphabet the haystack is indexed by.
+fn needle_units(args: &[Value]) -> crate::utf16::Units {
+    crate::utf16::Units::of(&with_host(|h| h.str_of(&arg0(args))))
+}
+
 /// The lowest index `>= from` at which `needle` occurs in `hay`. An empty
 /// needle matches at `from` itself, as JS specifies.
-fn search_from(hay: &[char], needle: &[char], from: usize) -> Option<usize> {
+fn search_from(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from.min(hay.len()));
     }
@@ -5616,7 +5696,7 @@ fn search_from(hay: &[char], needle: &[char], from: usize) -> Option<usize> {
 }
 
 /// The highest index `<= upto` at which `needle` occurs in `hay`.
-fn search_last(hay: &[char], needle: &[char], upto: usize) -> Option<usize> {
+fn search_last(hay: &[u16], needle: &[u16], upto: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(upto.min(hay.len()));
     }
@@ -5629,16 +5709,20 @@ fn search_last(hay: &[char], needle: &[char], upto: usize) -> Option<usize> {
         .find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
-fn byte_to_char_index(s: &str, byte: Option<usize>) -> f64 {
+/// A UTF-8 byte offset reported back to JS as a string position — a UTF-16
+/// code-unit index — or `-1` for "not found".
+fn byte_to_unit_index(s: &str, byte: Option<usize>) -> f64 {
     match byte {
-        Some(b) => s[..b].chars().count() as f64,
+        Some(b) => crate::utf16::index_of_byte(s, b).get() as f64,
         None => -1.0,
     }
 }
 
 fn pad(s: &str, args: &[Value], start: bool) -> String {
     let target = arg_num(args, 0) as usize;
-    let cur = s.chars().count();
+    // `targetLength` and the padding both count code units: `'𝒳'.padStart(3,'-')`
+    // is `'-𝒳'` in node, not `'--𝒳'`.
+    let cur = crate::utf16::len(s);
     if cur >= target {
         return s.to_string();
     }
@@ -5651,10 +5735,14 @@ fn pad(s: &str, args: &[Value], start: bool) -> String {
         return s.to_string();
     }
     let need = target - cur;
-    let fill_chars: Vec<char> = filler.chars().collect();
-    let padding: String = (0..need)
-        .map(|i| fill_chars[i % fill_chars.len()])
+    let fill = crate::utf16::Units::of(&filler);
+    // The filler repeats and is TRUNCATED to the exact unit count, which can cut
+    // a surrogate pair — node yields a lone surrogate there, we yield U+FFFD
+    // (see src/utf16.rs).
+    let units: Vec<u16> = (0..need)
+        .filter_map(|i| fill.unit(i % fill.len()))
         .collect();
+    let padding = crate::utf16::to_string_lossy(&units);
     if start {
         format!("{padding}{s}")
     } else {

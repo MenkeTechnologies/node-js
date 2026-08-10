@@ -1238,3 +1238,119 @@ fn a_class_name_is_bound_inside_its_own_body() {
     "#;
     assert_eq!(run(src), "5,N,2\nInner,Inner,Inner2,F\nundefined undefined");
 }
+
+// ── UTF-16 code-unit string indexing ────────────────────────────────────────
+
+#[test]
+fn string_indices_count_utf16_code_units() {
+    // Every expected value measured on `node v26.7.0`. "𝒳" is U+1D4B3: one code
+    // point, TWO code units, so a code-point implementation agrees with node on
+    // the whole BMP and is off by one for every index past it.
+    let src = r#"
+        const S = "𝒳", M = "ab𝒳cd";
+        console.log([S.length, M.length, "😀🎉".length].join(','));
+        console.log([S.charCodeAt(0), S.charCodeAt(1)].join(','));
+        console.log([S.codePointAt(0), S.codePointAt(1)].join(','));
+        console.log([M.indexOf("c"), M.lastIndexOf("c"), M.indexOf("c", 3)].join(','));
+        console.log([M.includes("c", 5), M.startsWith("c", 4), M.endsWith("𝒳", 4)].join(','));
+        console.log([M.substring(2,4), M.substr(2,2), M.slice(2,4)].join(','));
+        console.log(JSON.stringify(S.padStart(3, "-")));
+        console.log([M.search("c"), M.match(/c/).index].join(','));
+        console.log((() => { const r = /./g; r.exec(M); r.exec(M); return r.lastIndex; })());
+        console.log((() => { let o = -1; M.replace(/c/, (m, i) => { o = i; return m; }); return o; })());
+    "#;
+    assert_eq!(
+        run(src),
+        "2,6,4\n\
+         55349,56499\n\
+         119987,56499\n\
+         4,4,4\n\
+         false,true,true\n\
+         𝒳,𝒳,𝒳\n\
+         \"-𝒳\"\n\
+         4,4\n\
+         2\n\
+         4"
+    );
+}
+
+#[test]
+fn char_code_at_and_code_point_at_differ_out_of_range() {
+    // They agree on every in-range BMP index, which is why they shared one
+    // implementation and one bug: out of range `charCodeAt` is NaN but
+    // `codePointAt` is `undefined`, and a negative or infinite position is out
+    // of range for both even though `NaN` means 0. `node v26.7.0`.
+    let src = r#"
+        const S = "abc";
+        // `String(...)`, not `join`'s own coercion: `join` renders `undefined`
+        // as the empty string, which would hide the very distinction under test.
+        for (const v of [-1, NaN, Infinity, -Infinity, 1.7, 0]) {
+          console.log([JSON.stringify(S.charAt(v)), String(S.charCodeAt(v)),
+                       String(S.codePointAt(v)), String(S.at(v))].join(' '));
+        }
+    "#;
+    assert_eq!(
+        run(src),
+        "\"\" NaN undefined c\n\
+         \"a\" 97 97 a\n\
+         \"\" NaN undefined undefined\n\
+         \"\" NaN undefined undefined\n\
+         \"b\" 98 98 b\n\
+         \"a\" 97 97 a"
+    );
+}
+
+#[test]
+fn from_char_code_truncates_to_uint16_and_from_code_point_does_not() {
+    // `fromCharCode` takes code UNITS (each argument wrapped to uint16), so a
+    // supplementary code point comes out as a different BMP character and a
+    // surrogate PAIR of arguments composes. `fromCodePoint` takes whole code
+    // points and throws on anything else. `node v26.7.0`.
+    let src = r#"
+        console.log(String.fromCharCode(0x1D4B3) === "\u{D4B3}");
+        console.log(String.fromCharCode(0xD835, 0xDCB3) === "𝒳");
+        console.log(String.fromCodePoint(0x1D4B3, 0x41) === "𝒳A");
+        console.log(String.fromCharCode(65, 66));
+        try { String.fromCodePoint(0x110000); console.log("no throw"); }
+        catch (e) { console.log(e.constructor.name); }
+    "#;
+    assert_eq!(run(src), "true\ntrue\ntrue\nAB\nRangeError");
+}
+
+#[test]
+fn string_iteration_stays_in_code_points() {
+    // The deliberate exception: `[Symbol.iterator]` yields code POINTS, so a
+    // spread of an astral character is ONE element even though `.length` is 2.
+    // Making this match the index methods would be a regression, not a fix.
+    let src = r#"
+        console.log([[..."𝒳"].length, Array.from("𝒳").length, "𝒳".length].join(','));
+        console.log(JSON.stringify([..."ab𝒳cd"]));
+        console.log((() => { let n = 0; for (const c of "😀🎉") n++; return n; })());
+    "#;
+    assert_eq!(run(src), "1,1,2\n[\"a\",\"b\",\"𝒳\",\"c\",\"d\"]\n2");
+}
+
+#[test]
+fn splitting_a_surrogate_pair_yields_the_replacement_char() {
+    // The documented boundary (BUGS.md, src/utf16.rs). A Rust `String` cannot
+    // hold an unpaired surrogate, so cutting a pair in half gives U+FFFD where
+    // node gives the lone surrogate. This test PINS the gap rather than
+    // asserting node's value, so the day the storage type can represent a lone
+    // surrogate this fails loudly and gets updated instead of drifting.
+    //
+    // What must NOT drift: the unit COUNT is still 1, every surrounding index
+    // still lines up, and writing the value to stdout is byte-identical to node
+    // (node also emits U+FFFD for a lone surrogate on stdout — verified with
+    // `node -e 'process.stdout.write("𝒳".charAt(0))' | xxd` → `ef bf bd`).
+    let src = r#"
+        const S = "𝒳";
+        console.log([S.charAt(0).length, S.slice(0,1).length, S.split("").length].join(','));
+        console.log([S.charAt(0) === "�", S.charAt(1) === "�"].join(','));
+        console.log([S.charCodeAt(0), S.charCodeAt(1)].join(','));
+        process.stdout.write(S.charAt(0));
+        console.log("");
+    "#;
+    // Line 3 is the load-bearing one: reading the units off the INTACT string
+    // is exact — only an extracted half degrades.
+    assert_eq!(run(src), "1,1,2\ntrue,true\n55349,56499\n\u{FFFD}");
+}

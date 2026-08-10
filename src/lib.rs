@@ -26,6 +26,7 @@ pub mod repl;
 pub mod rust_ffi;
 pub mod stdlib;
 pub mod tiers;
+pub mod utf16;
 
 pub use fusevm::Value;
 

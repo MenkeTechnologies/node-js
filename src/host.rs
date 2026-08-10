@@ -363,9 +363,10 @@ pub struct RegExpObj {
     pub dot_all: bool,
     pub sticky: bool,
     pub unicode: bool,
-    /// `lastIndex`, in UTF-16 code units-approximated-as-chars; advanced by
-    /// `exec`/`test` under the `g`/`y` flags.
-    pub last_index: usize,
+    /// `lastIndex`, in UTF-16 code units; advanced by `exec`/`test` under the
+    /// `g`/`y` flags. The newtype keeps it from being confused with the regex
+    /// engine's byte offsets, which are the same shape and differ off the BMP.
+    pub last_index: crate::utf16::U16Index,
 }
 
 /// A Promise's settled state and pending reactions.

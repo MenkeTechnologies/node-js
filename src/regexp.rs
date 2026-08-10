@@ -24,6 +24,7 @@
 //! `lastIndex` here (fancy-regex has no global flag); `u`/`d` are accepted.
 
 use crate::host::{self, with_host, JsObj, RegExpObj};
+use crate::utf16::{self, U16Index};
 use fancy_regex::{Captures, Regex};
 use fusevm::Value;
 use indexmap::IndexMap;
@@ -104,7 +105,7 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
         dot_all,
         sticky,
         unicode,
-        last_index: 0,
+        last_index: U16Index::ZERO,
     };
     Ok(with_host(|h| h.alloc(JsObj::RegExp(Box::new(obj)))))
 }
@@ -231,7 +232,7 @@ pub fn regexp_property(r: &RegExpObj, name: &str) -> Option<Value> {
         "dotAll" => Value::Bool(r.dot_all),
         "sticky" => Value::Bool(r.sticky),
         "unicode" => Value::Bool(r.unicode),
-        "lastIndex" => Value::Float(r.last_index as f64),
+        "lastIndex" => Value::Float(r.last_index.get() as f64),
         _ => return None,
     })
 }
@@ -262,14 +263,14 @@ pub fn regexp_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value
 }
 
 /// Snapshot the fields we need without holding the host borrow across a match.
-fn regexp_snapshot(recv: &Value) -> Option<(Regex, bool, bool, usize)> {
+fn regexp_snapshot(recv: &Value) -> Option<(Regex, bool, bool, U16Index)> {
     with_host(|h| match h.get(recv) {
         Some(JsObj::RegExp(r)) => Some((r.re.clone(), r.global, r.sticky, r.last_index)),
         _ => None,
     })
 }
 
-fn set_last_index(recv: &Value, idx: usize) {
+fn set_last_index(recv: &Value, idx: U16Index) {
     with_host(|h| {
         if let Some(JsObj::RegExp(r)) = h.get_mut(recv) {
             r.last_index = idx;
@@ -277,13 +278,17 @@ fn set_last_index(recv: &Value, idx: usize) {
     });
 }
 
-/// Byte offset of the `n`-th char (clamped to the string length).
-fn byte_of_char(s: &str, n: usize) -> usize {
-    s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len())
+/// Byte offset of a UTF-16 index (clamped to the string length).
+///
+/// `lastIndex` and `.index` are UTF-16 code-unit offsets in JS, while the regex
+/// engine works in UTF-8 byte offsets. Both are `usize`-shaped, so the newtype
+/// is what stops one being passed where the other belongs.
+fn byte_of_index(s: &str, n: U16Index) -> usize {
+    utf16::byte_of_index(s, n)
 }
-/// Char index of a byte offset.
-fn char_of_byte(s: &str, byte: usize) -> usize {
-    s[..byte.min(s.len())].chars().count()
+/// UTF-16 index of a byte offset.
+fn index_of_byte(s: &str, byte: usize) -> U16Index {
+    utf16::index_of_byte(s, byte)
 }
 
 /// `re.test(s)` — honoring `g`/`y` `lastIndex` advancement, exactly like `exec`.
@@ -291,26 +296,30 @@ pub fn regexp_test(recv: &Value, s: &str) -> bool {
     let Some((re, global, sticky, last)) = regexp_snapshot(recv) else {
         return false;
     };
-    let start_char = if global || sticky { last } else { 0 };
-    if start_char > s.chars().count() {
+    let start_idx = if global || sticky {
+        last
+    } else {
+        U16Index::ZERO
+    };
+    if start_idx.get() > utf16::len(s) {
         if global || sticky {
-            set_last_index(recv, 0);
+            set_last_index(recv, U16Index::ZERO);
         }
         return false;
     }
-    let start_byte = byte_of_char(s, start_char);
+    let start_byte = byte_of_index(s, start_idx);
     // A backtracking match can fail (catastrophic backtracking guard); treat an
     // engine error as "no match" so a pathological pattern never panics the VM.
     match re.find_from_pos(s, start_byte) {
         Ok(Some(m)) if !sticky || m.start() == start_byte => {
             if global || sticky {
-                set_last_index(recv, char_of_byte(s, m.end()));
+                set_last_index(recv, index_of_byte(s, m.end()));
             }
             true
         }
         _ => {
             if global || sticky {
-                set_last_index(recv, 0);
+                set_last_index(recv, U16Index::ZERO);
             }
             false
         }
@@ -323,27 +332,31 @@ pub fn regexp_exec(recv: &Value, s: &str) -> Result<Value, String> {
     let Some((re, global, sticky, last)) = regexp_snapshot(recv) else {
         return Ok(with_host(|h| h.null()));
     };
-    let start_char = if global || sticky { last } else { 0 };
-    if start_char > s.chars().count() {
+    let start_idx = if global || sticky {
+        last
+    } else {
+        U16Index::ZERO
+    };
+    if start_idx.get() > utf16::len(s) {
         if global || sticky {
-            set_last_index(recv, 0);
+            set_last_index(recv, U16Index::ZERO);
         }
         return Ok(with_host(|h| h.null()));
     }
-    let start_byte = byte_of_char(s, start_char);
+    let start_byte = byte_of_index(s, start_idx);
     let caps = re.captures_from_pos(s, start_byte).ok().flatten();
     let caps = match caps {
         Some(c) if !sticky || c.get(0).map(|m| m.start()) == Some(start_byte) => c,
         _ => {
             if global || sticky {
-                set_last_index(recv, 0);
+                set_last_index(recv, U16Index::ZERO);
             }
             return Ok(with_host(|h| h.null()));
         }
     };
     let whole = caps.get(0).unwrap();
     if global || sticky {
-        set_last_index(recv, char_of_byte(s, whole.end()));
+        set_last_index(recv, index_of_byte(s, whole.end()));
     }
     Ok(build_match_array(&re, &caps, s))
 }
@@ -360,7 +373,7 @@ fn build_match_array(re: &Regex, caps: &Captures, s: &str) -> Value {
     }
     let whole = caps.get(0).unwrap();
     let arr = with_host(|h| h.new_array(items));
-    let index = char_of_byte(s, whole.start());
+    let index = index_of_byte(s, whole.start()).get();
     with_host(|h| {
         let idx = Value::Float(index as f64);
         h.set_fn_prop(&arr, "index", idx);
@@ -402,7 +415,7 @@ pub fn str_match(s: &str, re_val: &Value) -> Result<Value, String> {
     };
     if !global {
         // Non-global match ignores lastIndex and searches from the start.
-        set_last_index(re_val, 0);
+        set_last_index(re_val, U16Index::ZERO);
         return regexp_exec_from_zero(&re, s);
     }
     let matches: Vec<Value> = re
@@ -445,7 +458,7 @@ pub fn str_search(s: &str, re_val: &Value) -> Result<Value, String> {
         return Ok(Value::Float(-1.0));
     };
     Ok(match re.find(s).ok().flatten() {
-        Some(m) => Value::Float(char_of_byte(s, m.start()) as f64),
+        Some(m) => Value::Float(index_of_byte(s, m.start()).get() as f64),
         None => Value::Float(-1.0),
     })
 }
@@ -516,7 +529,7 @@ pub fn str_replace_regex(
                     None => Value::Undef,
                 });
             }
-            call_args.push(Value::Float(char_of_byte(s, m.start()) as f64));
+            call_args.push(Value::Float(index_of_byte(s, m.start()).get() as f64));
             call_args.push(with_host(|h| h.new_str(s.to_string())));
             let r = host::invoke(repl, call_args, None)?;
             out.push_str(&with_host(|h| h.str_of(&r)));

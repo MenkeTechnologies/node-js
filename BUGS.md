@@ -192,25 +192,61 @@ sloppy mode Node binds it to `globalThis` and boxes a primitive `this`
 `['object','object','object']` there and `['undefined','object','number']` here.
 This affects every unbound call, not just dynamically compiled ones.
 
-## Strings are indexed by code point, not by UTF-16 code unit
+## FIXED — strings are indexed by UTF-16 code unit
 
-A JS string is a sequence of UTF-16 code units; a node-js string is a Rust
-`String` indexed by code point. The two agree on all of the BMP and diverge on
-every astral character. Measured on node v26.7.0 with `a = "𝒳"`:
+Strings used to be indexed by code POINT, so every index agreed with node
+across the whole BMP and shifted by one for each astral character past it.
+They are now indexed by UTF-16 code unit, which is what JS counts. Measured on
+node v26.7.0 with `a = "𝒳"`:
+
+| expression | node v26.7.0 | node-js (was) | node-js (now) |
+| --- | --- | --- | --- |
+| `a.length` | `2` | `1` | `2` |
+| `a.charCodeAt(0)` | `55349` | `119987` | `55349` |
+| `a.charCodeAt(1)` | `56499` | `NaN` | `56499` |
+| `a.codePointAt(0)` | `119987` | `119987` | `119987` |
+| `a.split("").length` | `2` | `1` | `2` |
+| `"ab𝒳cd".indexOf("c")` | `4` | `3` | `4` |
+| `"𝒳".padStart(3, "-")` | `"-𝒳"` | `"--𝒳"` | `"-𝒳"` |
+| `String.fromCharCode(0x1D4B3)` | `"\u{D4B3}"` | `"𝒳"` | `"\u{D4B3}"` |
+| `/c/.exec("ab𝒳cd").index` | `4` | `3` | `4` |
+
+`String.fromCodePoint` was listed in the builtin name table but had no dispatch
+arm, so calling it threw `is not a function`; it is implemented now, including
+the `RangeError` on a non-code-point argument.
+
+`src/utf16.rs` is the single UTF-8 ⇄ UTF-16 boundary; `String.prototype`'s
+index arms, `s[i]`, `.length`, `padStart`/`padEnd`, and the RegExp
+`.index`/`lastIndex` path all translate through it. A `U16Index` newtype keeps
+a code-unit index from being passed where the regex engine wants a byte offset.
+`[Symbol.iterator]` still iterates code POINTS — that is what the spec says, so
+`[..."𝒳"]` is one element even though `"𝒳".length` is 2.
+
+**Remaining boundary — a value containing an unpaired surrogate.** A Rust
+`String` cannot hold one (`char` excludes `U+D800..=U+DFFF`), and both
+`fusevm::Value::Str` and the host heap's `JsObj::Str` are `String`. An
+operation that cuts a surrogate pair in half therefore yields `U+FFFD` where
+node yields the lone surrogate:
 
 | expression | node v26.7.0 | node-js |
 | --- | --- | --- |
-| `a.length` | `2` | `1` |
-| `a.charCodeAt(0)` | `55349` | `119987` |
-| `a.charCodeAt(1)` | `56499` | `NaN` |
-| `a[0]` | `"\ud835"` | `"𝒳"` |
-| `a.split("").length` | `2` | `1` |
-| `"ab𝒳cd".indexOf("c")` | `4` | `3` |
+| `console.log("𝒳".charAt(0))` | `ef bf bd` | `ef bf bd` — agrees |
+| `"𝒳".charAt(0).length` | `1` | `1` — agrees |
+| `"𝒳".charAt(0).charCodeAt(0)` | `55349` | `65533` |
+| `JSON.stringify("𝒳".charAt(0))` | `"\ud835"` | `"�"` |
+| `"𝒳".slice(0,1) + "𝒳".slice(1,2)` | `"𝒳"` | `"��"` |
+| `console.log("𝒳".split(""))` | `[ '\ud835', '\udcb3' ]` | `[ '�', '�' ]` |
 
-`codePointAt`, UTF-8 byte handling (`Buffer.byteLength`, `Buffer.from(s)`,
-`StringDecoder` across a split multi-byte sequence) and all BMP text agree.
-Closing this means giving the string layer UTF-16 semantics throughout, not
-patching `.length`.
+Note the first two rows: node itself writes `U+FFFD` when a lone surrogate
+reaches stdout (`node -e 'process.stdout.write("𝒳".charAt(0))' | xxd`), and a
+lone surrogate and `U+FFFD` are both one code unit, so PRINTING is
+byte-identical and every surrounding index still lines up. Only re-inspecting
+an extracted half differs. Closing that last gap means replacing `String` with
+a WTF-8 buffer inside `fusevm` and all of `src/stdlib`, which the pinned
+`fusevm` dependency does not allow.
+
+`Buffer.byteLength`, `Buffer.from(s)` and `StringDecoder` across a split
+multi-byte sequence work in UTF-8 bytes and were never affected.
 
 ## `globalThis` is not backed by the global scope
 
@@ -509,9 +545,14 @@ are **now supported** (see the Supported list above); verified against
   `\s` match Unicode digit/word/space code points, whereas JS *without* the `u`
   flag matches only the ASCII sets. Identical on ASCII input (the fuzzer's
   `regex` mode uses ASCII inputs).
-- **`.index` on non-BMP input.** `exec`/`match` report the match position as a
-  Unicode *char* offset; JS uses UTF-16 code-unit offsets, so an astral-plane
-  character before the match shifts the index by one. Identical on BMP text.
+- **The match alphabet is code points, not code units.** `.index`, `lastIndex`
+  and a replace callback's offset are now UTF-16 code-unit offsets and agree
+  with node on astral input. What still differs is what a single-character
+  pattern MATCHES: `fancy-regex` steps by Unicode scalar, JS (without the `u`
+  flag) steps by code unit, so `"ab𝒳cd".match(/./g)` is 6 elements in node —
+  the astral character split into its two surrogate halves — and 5 here. This
+  is the regex engine's alphabet, a separate axis from string indexing, and it
+  runs into the same lone-surrogate boundary documented above.
 ## FIXED — collection access was O(n^2), and the cause was local to node-js
 
 Per-element access to a JS array, object, or `Buffer` used to cost quadratic

@@ -125,6 +125,12 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
   `join`/`concat`/`includes`/`indexOf`/`flat`/`flatMap`/`reverse`/`fill`/`at`,
   `charAt`/`charCodeAt`/`padStart`/`padEnd`/`repeat`/`replace`/`replaceAll`/
   `startsWith`/`endsWith`, …).
+- Strings are indexed by **UTF-16 code unit**, as JS specifies, so a
+  supplementary-plane character counts as two: `"𝒳".length` is `2` and
+  `"ab𝒳cd".indexOf("c")` is `4`. `[Symbol.iterator]` still yields code points
+  (`[..."𝒳"]` is one element). `src/utf16.rs` is the single UTF-8 ⇄ UTF-16
+  boundary; see BUGS.md for the one remaining gap (a value holding an unpaired
+  surrogate, which a Rust `String` cannot represent).
 - `class` declarations and expressions: inheritance and `super`, static and
   instance fields, getters/setters, private `#` names, and a class body that
   evaluates in its own environment (so a static initializer can name its class).
