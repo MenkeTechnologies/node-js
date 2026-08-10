@@ -620,22 +620,6 @@ cases the fuzzer is scoped away from)
   `Object.prototype.toString.call(x)` DOES run the getter and reports
   `[object Cee]` — that path is not inside the borrow.
 
-- **A function's `.name` is inferred only from a `const`/`let`/`var`
-  initializer.** NamedEvaluation (8.4.5) also runs for a plain assignment
-  (`h = function(){}`), an object-literal property (`{ m: function(){} }`) and a
-  class field (`static s = function(){}`); in those three the name stays `""`
-  where Node reports `h` / `m` / `s`. The `const f = function(){}` /
-  `const g = () => {}` forms are correct, and so is a named function
-  expression. Verified against `node v26.7.0`.
-
-- **A class name is not in scope inside its own body.** `class C { static x =
-  C.m(); static m(){ return 5 } }` throws `ReferenceError: C is not defined`
-  where Node evaluates it to `5`: ClassDefinitionEvaluation (15.7.14) binds the
-  class name in an inner scope before running the static initializers, and
-  node-js binds it only after the whole `class` expression completes. The
-  ORDER is now right (methods install before static fields, so the method
-  exists by the time the field runs) — only the name binding is missing.
-
 - **A `Timeout`/`Immediate` handle has no reachable prototype object and no own
   `Symbol.toPrimitive`.** The handle's methods dispatch through the native
   `instance_call` table rather than sitting on a real prototype, so
@@ -885,3 +869,35 @@ against `node v26.5.0`:
   node-js implements (node's 18th, `ReadableStreamTee`, is not implemented, and
   `namespace_keys` deliberately advertises the working set rather than node's
   full export list).
+
+- **NamedEvaluation runs at every site the grammar calls for it.** 10.2.9
+  SetFunctionName used to fire only for a `const`/`let`/`var` declarator and a
+  named function expression, so a function defined anywhere else kept `.name ===
+  ""`. It now also fires for assignment to an identifier (`h = function(){}`),
+  every object property definition — `key: value`, concise method, and
+  `get`/`set` accessor, which carry the `get `/`set ` prefix — class fields
+  static and instance, class accessors, parameter defaults and destructuring
+  defaults. A COMPUTED key resolves at run time through the new `NAMED_EVAL`
+  builtin, so `{ [k]: () => {} }` is named after the key's value and a symbol
+  key gives `[description]`. It is applied from the SYNTAX, never from the
+  value: `const anon = (0, function(){}); ({ m: anon }).m.name` stays `""` in
+  node v26.7.0, and renaming by value would rewrite `.name` on a function the
+  program still holds under another binding.
+
+  Two sites remain unnamed. A computed ACCESSOR key (`{ get [k](){} }`) is the
+  one member position whose key is no longer reachable on the stack when the
+  function is pushed — `kind` sits between them — so it keeps the empty name.
+  And logical assignment (`h ||= function(){}`, which node names `h`) is parsed
+  by desugaring to `h = h || function(){}`, a form node deliberately leaves
+  unnamed; the two are indistinguishable in the AST, so naming it would trade
+  one divergence for another.
+
+- **A class name is bound inside its own body.** 15.7.14 steps 8-17 evaluate a
+  class body in its own environment holding an immutable binding for the class
+  name, initialized to the class itself before the static-field initializers of
+  step 32. node-js had no such environment: the only binding was the outer one a
+  class DECLARATION installs after the body has already run, and a class
+  EXPRESSION never gets one at all, so `class C { static x = C.m(); static
+  m(){return 5} }` and `const K = class Inner { static self = Inner.name }` both
+  threw `ReferenceError`. The binding does not leak outward — `typeof Inner` is
+  still `undefined` outside the expression.

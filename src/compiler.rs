@@ -417,6 +417,12 @@ impl Compiler {
                 let jf = b.emit(Op::JumpIfFalse(0), 0);
                 b.emit(Op::Pop, 0); // drop the undefined
                 self.compile_expr(b, value)?;
+                // 8.6.3 / 14.3.3: a destructuring default whose target is a
+                // single binding identifier names an anonymous function after
+                // it — `const {a = function(){}} = {}` gives `a.name === "a"`.
+                if let Expr::Ident(n) = &**target {
+                    self.infer_name(b, value, n);
+                }
                 let end = b.current_pos();
                 b.patch_jump(jf, end);
                 self.compile_bind(b, target, declare)?;
@@ -1176,6 +1182,24 @@ impl Compiler {
         }
         b.emit(Op::CallBuiltin(ops::MKCLASS, 3), 0); // -> [class]
 
+        // 15.7.14 steps 8-17: the class body runs inside its OWN environment,
+        // holding one immutable binding for the class name, initialized to the
+        // class itself at step 17 — before the static-field initializers of step
+        // 32. So `class C { static x = C.m(); static m(){return 5} }` is 5, and a
+        // class EXPRESSION's name (`const K = class Inner { static s = Inner.name }`)
+        // is reachable from inside the body even though it is never a binding
+        // outside it. node-js had no such scope: both threw `ReferenceError: C is
+        // not defined`, because the only binding was the outer one the class
+        // DECLARATION installs afterwards. An instance method's body already
+        // worked, but only by accident — it runs late enough for the outer
+        // binding to exist, which a class expression never gets.
+        let body_scope = node.name.is_some();
+        if let Some(name) = &node.name {
+            self.emit_push_scope(b);
+            b.emit(Op::Dup, 0); // [class, class]
+            self.declare_as(b, &Expr::Ident(name.clone()), BindMode::Lexical); // [class]
+        }
+
         // `ClassDefinitionEvaluation` (15.7.14) installs every method and
         // accessor while evaluating the class body, and only then runs the
         // static-field initializers (step 32). So a static field may call a
@@ -1200,7 +1224,11 @@ impl Compiler {
                     b.emit(Op::Dup, 0); // [class, class]
                     self.emit_member_key(b, m)?; // [class, class, name]
                     match &m.field_init {
-                        Some(e) => self.compile_expr(b, e)?,
+                        // 15.7.10: a static field's initializer is named after
+                        // the field (`static s = function(){}` → `s`).
+                        Some(e) => {
+                            self.emit_keyed_value(b, &m.key, e, m.computed, member::METHOD)?
+                        }
                         None => {
                             b.emit(Op::LoadUndef, 0);
                         }
@@ -1210,13 +1238,27 @@ impl Compiler {
                     b.emit(Op::Pop, 0); // drop the returned value -> [class]
                 }
                 MemberKind::Field => {
-                    // [class] name thunk -> DEF_FIELD -> [class]
+                    // [class] name thunk name_anon -> DEF_FIELD -> [class]
                     self.emit_member_key(b, m)?;
                     let init = m.field_init.clone().unwrap_or(Expr::Undefined);
+                    // 15.7.10: `class C { f = function(){} }` names the function
+                    // `f`. An instance field's initializer runs per-instance from
+                    // a thunk, and under a computed key the key is only known at
+                    // class-definition time, so the decision travels to the host
+                    // as a flag rather than as an emitted rename.
+                    let name_anon = Self::is_anon_fn_def(&init);
                     let stmts = vec![Stmt::from(StmtKind::Return(Some(init)))];
                     let def_id = self.build_function("", &[], &stmts, false, false)?;
                     self.emit_mkfunc(b, def_id);
-                    b.emit(Op::CallBuiltin(ops::DEF_FIELD, 3), 0);
+                    b.emit(
+                        if name_anon {
+                            Op::LoadTrue
+                        } else {
+                            Op::LoadFalse
+                        },
+                        0,
+                    );
+                    b.emit(Op::CallBuiltin(ops::DEF_FIELD, 4), 0);
                 }
                 MemberKind::Method | MemberKind::Get | MemberKind::Set => {
                     // [class] name kind static fn -> DEF_MEMBER -> [class]
@@ -1235,8 +1277,15 @@ impl Compiler {
                         },
                         0,
                     );
+                    // 10.2.9 step 4: an accessor's function name carries the
+                    // `get `/`set ` prefix — `class C { get gg(){} }` gives
+                    // `get gg`, not `gg`.
                     let mname = match &m.key {
-                        Expr::Str(s) if !m.computed => s.clone(),
+                        Expr::Str(s) if !m.computed => match m.kind {
+                            MemberKind::Get => format!("get {s}"),
+                            MemberKind::Set => format!("set {s}"),
+                            _ => s.clone(),
+                        },
                         _ => String::new(),
                     };
                     let def_id = self.build_function(
@@ -1254,15 +1303,31 @@ impl Compiler {
                 }
             }
         }
+        if body_scope {
+            self.emit_pop_scope(b);
+        }
         Ok(())
+    }
+
+    /// `IsAnonymousFunctionDefinition(expr)` — the SYNTACTIC predicate that
+    /// decides whether NamedEvaluation applies. It is deliberately not a runtime
+    /// "does this function have an empty name" test: measured against node
+    /// v26.7.0, `const anon = (0, function(){}); ({ m: anon }).m.name` is `""`,
+    /// because the property definition's right-hand side is an
+    /// IdentifierReference, not a function definition. Renaming by value would
+    /// also mutate a function the program still holds under another binding.
+    fn is_anon_fn_def(init: &Expr) -> bool {
+        match init {
+            Expr::Function { name: None, .. } => true,
+            Expr::Class(node) => node.name.is_none(),
+            _ => false,
+        }
     }
 
     /// If `init` is an anonymous function/arrow/class (value already on TOS), set
     /// its `.name` to `name` (JS binding name-inference). No-op otherwise.
     fn infer_name(&mut self, b: &mut ChunkBuilder, init: &Expr, name: &str) {
-        let anon = matches!(init, Expr::Function { name: None, .. } | Expr::Class(_))
-            && !matches!(init, Expr::Class(node) if node.name.is_some());
-        if !anon {
+        if !Self::is_anon_fn_def(init) {
             return;
         }
         // [fn] Dup; .name = name; drop the SETATTR result.
@@ -1271,6 +1336,46 @@ impl Compiler {
         self.strlit(b, name);
         b.emit(Op::CallBuiltin(ops::SETATTR, 3), 0);
         b.emit(Op::Pop, 0);
+    }
+
+    /// Compile a member's VALUE with the key already on the stack, applying
+    /// NamedEvaluation (10.2.9 SetFunctionName) when the value is an anonymous
+    /// function definition — `{ m: function(){} }`, `{ m(){} }`, `{ [k]: () => {} }`,
+    /// `class C { static [k] = function(){} }`.
+    ///
+    /// A literal key resolves at compile time; a computed one is only known at
+    /// run time, so the key already on the stack is duplicated and handed to
+    /// `NAMED_EVAL` along with `kind` (which supplies the `get `/`set ` prefix).
+    /// Leaves exactly one value on the stack either way, so every caller's
+    /// arity is unchanged.
+    fn emit_keyed_value(
+        &mut self,
+        b: &mut ChunkBuilder,
+        key: &Expr,
+        value: &Expr,
+        computed: bool,
+        kind: i64,
+    ) -> Result<(), String> {
+        match (Self::is_anon_fn_def(value), computed, key) {
+            (true, false, Expr::Str(s)) => {
+                self.compile_expr(b, value)?;
+                let name = match kind {
+                    member::GET => format!("get {s}"),
+                    member::SET => format!("set {s}"),
+                    _ => s.clone(),
+                };
+                self.infer_name(b, value, &name);
+            }
+            // [.., key] -> [.., key, key, kind, fn] -> NAMED_EVAL -> [.., key, fn]
+            (true, true, _) => {
+                b.emit(Op::Dup, 0);
+                b.emit(Op::LoadInt(kind), 0);
+                self.compile_expr(b, value)?;
+                b.emit(Op::CallBuiltin(ops::NAMED_EVAL, 3), 0);
+            }
+            _ => self.compile_expr(b, value)?,
+        }
+        Ok(())
     }
 
     /// Push a class/object member's property key: a computed expression coerced
@@ -1495,6 +1600,12 @@ impl Compiler {
             }
             Expr::Assign { target, value } => {
                 self.compile_expr(b, value)?;
+                // 13.15.2 step 1.e: `h = function(){}` names the function `h`.
+                // Only an IdentifierReference target counts — `o.p = function(){}`
+                // leaves the name empty in node too.
+                if let Expr::Ident(n) = &**target {
+                    self.infer_name(b, value, n);
+                }
                 b.emit(Op::Dup, 0); // assignment yields the value
                 self.compile_bind(b, target, BindMode::Assign)?;
             }
@@ -1674,11 +1785,16 @@ impl Compiler {
         if data.len() * 3 > u8::MAX as usize && !has_spread {
             b.emit(Op::CallBuiltin(ops::MKOBJ, 0), 0); // [obj]
             for p in &data {
-                if let Prop::KeyValue { key, value, .. } = p {
+                if let Prop::KeyValue {
+                    key,
+                    value,
+                    computed,
+                } = p
+                {
                     b.emit(Op::Dup, 0); // [obj, obj]
                     self.compile_expr(b, key)?;
                     b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0); // [obj, obj, key]
-                    self.compile_expr(b, value)?; // [obj, obj, key, val]
+                    self.emit_keyed_value(b, key, value, *computed, member::METHOD)?;
                     b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0); // -> [obj, val]
                     b.emit(Op::Pop, 0); // [obj]
                 }
@@ -1687,13 +1803,17 @@ impl Compiler {
         }
         for p in &data {
             match p {
-                Prop::KeyValue { key, value, .. } => {
+                Prop::KeyValue {
+                    key,
+                    value,
+                    computed,
+                } => {
                     b.emit(Op::LoadInt(0), 0);
                     // Key coerces to a property key (Symbol-aware: a Symbol maps to
                     // its internal `@@…` key rather than a `String()` coercion).
                     self.compile_expr(b, key)?;
                     b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
-                    self.compile_expr(b, value)?;
+                    self.emit_keyed_value(b, key, value, *computed, member::METHOD)?;
                 }
                 Prop::Spread(src) => {
                     b.emit(Op::LoadInt(1), 0);
@@ -1731,11 +1851,21 @@ impl Compiler {
                     self.compile_expr(b, key)?;
                     b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
                 }
-                b.emit(
-                    Op::LoadInt(if *is_getter { member::GET } else { member::SET }),
-                    0,
-                );
-                self.compile_expr(b, func)?;
+                let kind = if *is_getter { member::GET } else { member::SET };
+                b.emit(Op::LoadInt(kind), 0);
+                // `{ get g(){} }` names the getter `get g` (10.2.9 step 4 via
+                // 13.2.5.5). A COMPUTED accessor key is the one member position
+                // whose key is not still reachable on the stack here — `kind`
+                // sits between it and the function — so it keeps the empty name.
+                if *computed {
+                    self.compile_expr(b, func)?;
+                } else if let Expr::Str(s) = key {
+                    self.compile_expr(b, func)?;
+                    let prefix = if *is_getter { "get" } else { "set" };
+                    self.infer_name(b, func, &format!("{prefix} {s}"));
+                } else {
+                    self.compile_expr(b, func)?;
+                }
                 b.emit(Op::CallBuiltin(ops::DEF_ACCESSOR, 4), 0);
             }
         }

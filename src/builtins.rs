@@ -77,6 +77,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::POP_SCOPE, b_pop_scope);
     vm.register_builtin(ops::COPY_SCOPE, b_copy_scope);
     vm.register_builtin(ops::DECLARE_VAR, b_declare_var);
+    vm.register_builtin(ops::NAMED_EVAL, b_named_eval);
 }
 
 /// `ITER_CLOSE`: close the iterator on the stack (a for-of `break`). A generator
@@ -276,10 +277,14 @@ fn b_def_member(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_def_field(vm: &mut VM, _: u8) -> Value {
+    // `name_anon`: the initializer was an anonymous function definition, so
+    // 15.7.10 NamedEvaluation names its result after the field. Syntactic —
+    // decided by the compiler, not re-derived from the produced value.
+    let name_anon = matches!(vm.pop(), Value::Bool(true));
     let thunk = vm.pop();
     let name = sval(&vm.pop());
     let class_val = vm.pop();
-    host::define_field(&class_val, &name, thunk);
+    host::define_field(&class_val, &name, thunk, name_anon);
     class_val
 }
 
@@ -304,14 +309,9 @@ fn b_super_call(vm: &mut VM, argc: u8) -> Value {
         return abort(vm, e);
     }
     // Run this (derived) class's own instance-field initializers after super.
-    for (name, thunk) in fields {
-        match host::invoke(&thunk, Vec::new(), Some(this.clone())) {
-            Ok(val) => with_host(|h| {
-                if let Some(JsObj::Object(props)) = h.get_mut(&this) {
-                    props.insert(name, val);
-                }
-            }),
-            Err(e) => return abort(vm, e),
+    for (name, thunk, name_anon) in fields {
+        if let Err(e) = host::init_one_field(&this, &name, &thunk, name_anon) {
+            return abort(vm, e);
         }
     }
     Value::Undef
@@ -1376,6 +1376,46 @@ fn b_setattr(vm: &mut VM, _: u8) -> Value {
     let recv = vm.pop();
     set_property(&recv, &name, val.clone());
     val
+}
+
+/// `NAMED_EVAL` — SetFunctionName (10.2.9) for a function whose name is only
+/// known at run time, i.e. one defined under a COMPUTED key: `{ [k]: () => {} }`,
+/// `class C { static [k] = function(){} }`.
+///
+/// The compiler emits this ONLY where the grammar says NamedEvaluation applies
+/// (`IsAnonymousFunctionDefinition` is a syntactic predicate, not a runtime one:
+/// `{ m: someAlreadyAnonymousFn }` must NOT be renamed), so the name is set
+/// unconditionally here.
+///
+/// A symbol key becomes `[description]` per step 2 of SetFunctionName; `kind`
+/// contributes the accessor prefix, so `{ get [k](){} }` is `get <key>`.
+fn b_named_eval(vm: &mut VM, _: u8) -> Value {
+    let func = vm.pop();
+    let kind = vm.pop().to_int();
+    let key = vm.pop();
+    let key = sval(&key);
+    // `@@sym:<id>` / `@@iterator` — an internal symbol key. Step 2: an empty
+    // description gives the empty name, not `[undefined]`.
+    let base = match with_host(|h| h.symbol_of_key(&key)) {
+        Some(sym) => match with_host(|h| h.get(&sym).cloned()) {
+            Some(JsObj::Symbol { desc, .. }) => match desc {
+                Some(d) => format!("[{d}]"),
+                None => String::new(),
+            },
+            _ => String::new(),
+        },
+        None => key,
+    };
+    let name = match kind {
+        host::member::GET => format!("get {base}"),
+        host::member::SET => format!("set {base}"),
+        _ => base,
+    };
+    with_host(|h| {
+        let s = h.new_str(name);
+        h.set_fn_prop(&func, "name", s);
+    });
+    func
 }
 
 fn set_property(recv: &Value, name: &str, val: Value) {

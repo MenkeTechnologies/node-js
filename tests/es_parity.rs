@@ -1152,3 +1152,89 @@ fn an_arrays_length_is_a_non_enumerable_non_configurable_own_property() {
          \"length\":{\"value\":1,\"writable\":true,\"enumerable\":false,\"configurable\":false}}"
     );
 }
+
+#[test]
+fn named_evaluation_sets_a_function_name_at_every_syntactic_site() {
+    // 10.2.9 SetFunctionName, reached from NamedEvaluation at each position the
+    // grammar calls for it. Only the `const`/`let`/`var` declarator and the
+    // named function expression used to fire; everything else left `.name` as
+    // `""`. Every expectation below is `node v26.7.0`'s output.
+    let src = r#"
+        let h; h = function(){};
+        const o = { m: function(){}, a: ()=>{}, g: function*(){}, c: class{} };
+        const o2 = { sh(){}, async as(){}, *gen(){} };
+        const acc = Object.getOwnPropertyDescriptors({ get g(){return 1}, set s(v){} });
+        const k = 'ck'; const sym = Symbol('sd');
+        const o3 = { [k]: function(){}, [sym]: ()=>{} };
+        class C {
+          static s = function(){};
+          f = function(){};
+          static ['sc'] = function(){};
+          get gg(){ return 1 }
+          set ss(v){}
+        }
+        const cd = Object.getOwnPropertyDescriptors(C.prototype);
+        function pf(x = function(){}) { return x.name }
+        const { dd = function(){} } = {}; const [ ee = ()=>{} ] = [];
+        console.log([h.name, o.m.name, o.a.name, o.g.name, o.c.name].join(','));
+        console.log([o2.sh.name, o2.as.name, o2.gen.name].join(','));
+        console.log([acc.g.get.name, acc.s.set.name, cd.gg.get.name, cd.ss.set.name].join(','));
+        console.log([o3.ck.name, o3[sym].name].join(','));
+        console.log([C.s.name, new C().f.name, C.sc.name].join(','));
+        console.log([pf(), dd.name, ee.name].join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "h,m,a,g,c\n\
+         sh,as,gen\n\
+         get g,set s,get gg,set ss\n\
+         ck,[sd]\n\
+         s,f,sc\n\
+         x,dd,ee"
+    );
+}
+
+#[test]
+fn named_evaluation_is_syntactic_not_a_check_on_the_value() {
+    // `IsAnonymousFunctionDefinition` is a property of the SOURCE, so a
+    // property whose value is merely an *expression* that happens to evaluate
+    // to a nameless function keeps the empty name — renaming by value would
+    // also rewrite `.name` on a function the program still holds elsewhere.
+    // `node v26.7.0` prints exactly these.
+    let src = r#"
+        const anon = (0, function(){});
+        const named = function realName(){};
+        const obj = {};
+        obj.p = function(){};
+        console.log(JSON.stringify([
+          ({ m: anon }).m.name,
+          ({ m: true ? function(){} : 1 }).m.name,
+          ({ m: named }).m.name,
+          obj.p.name,
+          anon.name,
+        ]));
+    "#;
+    assert_eq!(run(src), r#"["","","realName","",""]"#);
+}
+
+#[test]
+fn a_class_name_is_bound_inside_its_own_body() {
+    // 15.7.14 steps 8-17: the class body evaluates in its own environment
+    // holding an immutable binding for the class name, initialized to the class
+    // BEFORE the static-field initializers of step 32. Both forms used to throw
+    // `ReferenceError`, because the only binding was the outer one a class
+    // DECLARATION installs after the body has already run — which a class
+    // EXPRESSION never gets at all. The binding must not leak outward.
+    let src = r#"
+        class C { static x = C.m(); static m(){ return 5 } }
+        class N { static n = N.name }
+        class Seq { static a = 1; static b = Seq.a + 1 }
+        const K = class Inner { static self = Inner.name; m(){ return Inner.name } };
+        class Outer { static i = class Inner2 { static v = Inner2.name } }
+        class F { f = () => F.name }
+        console.log([C.x, N.n, Seq.b].join(','));
+        console.log([K.self, new K().m(), Outer.i.v, new F().f()].join(','));
+        console.log(typeof globalThis.Inner, typeof globalThis.Inner2);
+    "#;
+    assert_eq!(run(src), "5,N,2\nInner,Inner,Inner2,F\nundefined undefined");
+}

@@ -101,6 +101,7 @@ pub mod ops {
     pub const POP_SCOPE: u16 = 66; // [] -> leave the innermost block scope
     pub const COPY_SCOPE: u16 = 67; // [] -> replace the innermost block scope with a COPY (per-iteration `let`)
     pub const DECLARE_VAR: u16 = 68; // [name, value] -> declare at FUNCTION scope, ignoring block scopes (`var`)
+    pub const NAMED_EVAL: u16 = 69; // [key, kind, fn] -> fn; SetFunctionName for a COMPUTED key (kind picks the `get `/`set ` prefix)
 }
 
 /// `SIG_UNWIND` scope tags: what the emitting site is nested in.
@@ -412,9 +413,13 @@ pub struct ClassVal {
     pub proto: Value,
     /// Static own properties (static methods/fields), plus `name`/`prototype`.
     pub statics: IndexMap<String, Value>,
-    /// Instance field initializers: `(name, thunk_fn)`, run per-instance after
-    /// `super()` (or at construction start for a base class).
-    pub fields: Vec<(String, Value)>,
+    /// Instance field initializers: `(name, thunk_fn, name_anon_init)`, run
+    /// per-instance after `super()` (or at construction start for a base class).
+    /// `name_anon_init` records the SYNTACTIC fact that the initializer was an
+    /// anonymous function definition, so 15.7.10 NamedEvaluation applies to its
+    /// result — it cannot be re-derived at run time (a field initialised from an
+    /// already-anonymous function held elsewhere must not be renamed).
+    pub fields: Vec<(String, Value, bool)>,
 }
 
 /// The result of resolving `super.name`: a getter to invoke (accessor property)
@@ -1657,7 +1662,7 @@ impl JsHost {
 
     /// The `(parent_ctor, this_class_fields)` for a running constructor's
     /// `super(...)`, derived from the frame's home class.
-    pub fn super_context(&self) -> (Option<Value>, Vec<(String, Value)>) {
+    pub fn super_context(&self) -> (Option<Value>, Vec<(String, Value, bool)>) {
         match self.current_home_class() {
             Some(cv) => match self.get(&cv) {
                 Some(JsObj::Class(c)) => (c.parent.clone(), c.fields.clone()),
@@ -3965,20 +3970,44 @@ fn run_class_ctor(
 
 /// Evaluate and assign a class's instance-field initializers on `inst`.
 fn init_fields(cv: &ClassVal, inst: &Value) -> Result<(), String> {
-    for (name, thunk) in &cv.fields {
-        // The thunk is an arrow capturing the class scope; run it with `this`=inst
-        // so `this.other`-referencing initializers work.
-        let val = invoke(thunk, Vec::new(), Some(inst.clone()))?;
-        with_host(|h| {
-            if let Some(JsObj::Object(props)) = h.get_mut(inst) {
-                let is_new = !props.contains_key(name);
-                props.insert(name.clone(), val);
-                if is_new && array_index(name).is_some() {
-                    canonicalize_own_keys(props);
-                }
-            }
-        });
+    for (name, thunk, name_anon) in &cv.fields {
+        init_one_field(inst, name, thunk, *name_anon)?;
     }
+    Ok(())
+}
+
+/// Evaluate ONE instance-field initializer thunk and install the result on
+/// `inst`.
+///
+/// Shared by the base-class path ([`init_fields`]) and the derived-class path
+/// that runs after `super(...)`; the two used to be separate loops, and only the
+/// first canonicalized an array-index key.
+///
+/// `name_anon` carries 15.7.10's NamedEvaluation: `class C { f = function(){} }`
+/// gives the function the name `f`. It is decided by the compiler from the
+/// syntax, never from the value.
+pub fn init_one_field(
+    inst: &Value,
+    name: &str,
+    thunk: &Value,
+    name_anon: bool,
+) -> Result<(), String> {
+    // The thunk is an arrow capturing the class scope; run it with `this`=inst
+    // so `this.other`-referencing initializers work.
+    let val = invoke(thunk, Vec::new(), Some(inst.clone()))?;
+    with_host(|h| {
+        if name_anon {
+            let s = h.new_str(name.to_string());
+            h.set_fn_prop(&val, "name", s);
+        }
+        if let Some(JsObj::Object(props)) = h.get_mut(inst) {
+            let is_new = !props.contains_key(name);
+            props.insert(name.to_string(), val);
+            if is_new && array_index(name).is_some() {
+                canonicalize_own_keys(props);
+            }
+        }
+    });
     Ok(())
 }
 
@@ -4138,10 +4167,10 @@ pub fn define_member(class_val: &Value, name: &str, kind: i64, is_static: bool, 
 }
 
 /// Register an instance-field initializer thunk on a class (`DEF_FIELD`).
-pub fn define_field(class_val: &Value, name: &str, thunk: Value) {
+pub fn define_field(class_val: &Value, name: &str, thunk: Value, name_anon: bool) {
     with_host(|h| {
         if let Some(JsObj::Class(c)) = h.get_mut(class_val) {
-            c.fields.push((name.to_string(), thunk));
+            c.fields.push((name.to_string(), thunk, name_anon));
         }
     });
 }

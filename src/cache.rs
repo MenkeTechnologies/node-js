@@ -30,7 +30,17 @@ use std::path::PathBuf;
 ///     emission order (methods before static fields). A v5 blob deserializes
 ///     with `is_method: false` and replays the old source order, so every class
 ///     and every object method would report the wrong own-property set.
-const SCHEMA: u64 = 6;
+/// v7: NamedEvaluation (10.2.9 SetFunctionName) at every site the grammar calls
+///     for it — assignment to an identifier, object property definitions and
+///     concise methods/accessors, class fields, and destructuring/parameter
+///     defaults — plus the new `NAMED_EVAL` builtin and `DEF_FIELD`'s fourth
+///     argument. A v6 blob calls `DEF_FIELD` with three arguments and emits no
+///     naming, so every affected function would keep the empty `.name` and the
+///     field's flag would be read off the wrong stack slot. v7 also carries the
+///     class-body environment (15.7.14 step 17), whose `PUSH_SCOPE`/`DECLARE`
+///     pair a v6 blob does not emit, so a static initializer reading the class
+///     by name would still throw `ReferenceError`.
+const SCHEMA: u64 = 7;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
