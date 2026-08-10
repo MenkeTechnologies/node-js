@@ -772,6 +772,15 @@ struct GenCell {
     queue: std::collections::VecDeque<(GenReq, u32)>,
     /// True while a queued request is being driven.
     running: bool,
+    /// The [`stack_floor`] that applies while this generator's body is running.
+    ///
+    /// A corosensei coroutine executes on its OWN mmap'd stack, so the address
+    /// range the thread's pthread record describes says nothing about how much
+    /// room the body has left. Recorded from the coroutine's `Stack::limit()` at
+    /// construction and swapped in around every resume; without it the guard
+    /// compared a coroutine stack pointer against the main stack's floor and
+    /// (depending on where mmap landed) either fired immediately or never.
+    stack_floor: usize,
 }
 
 /// A forced completion pushed into a suspended generator by `.return()`/`.throw()`.
@@ -1840,6 +1849,48 @@ pub fn range_error(msg: &str) -> String {
     format!("RangeError: {msg}")
 }
 
+/// V8's `String::kMaxLength` on a 64-bit build, in UTF-16 code units — the
+/// largest string the engine will materialize.
+///
+/// Measured on node v26.7.0 (darwin arm64):
+/// `require('buffer').constants.MAX_STRING_LENGTH` is `536870888`,
+/// `'a'.repeat(536870888)` succeeds with that length, and
+/// `'a'.repeat(536870889)` is `RangeError: Invalid string length`.
+pub const MAX_STRING_LENGTH: usize = 536_870_888;
+
+/// The error V8 raises for a string operation whose RESULT would exceed
+/// [`MAX_STRING_LENGTH`]. It is raised from the length arithmetic, before any
+/// allocation: `'a'.repeat(2**40)` throws promptly on node where node-js used to
+/// sit building a 1 TiB `String` until it was killed.
+pub fn invalid_string_length() -> String {
+    range_error("Invalid string length")
+}
+
+/// `ToUint32`-validated array length — ECMA-262 10.4.2.2 `ArrayCreate` step 1
+/// and 10.4.2.4 `ArraySetLength` step 3.
+///
+/// A length is legal only if `ToUint32(v)` equals `ToNumber(v)` exactly, so
+/// `-1`, `1.5`, `NaN`, `Infinity`, `'x'` and `2**32` are all
+/// `RangeError: Invalid array length` while `'3'` is `3` and `-0` is `0`
+/// (measured on node v26.7.0: `new Array(-0).length` is `0`, `a.length = '3'`
+/// leaves `3`, `a.length = 'x'` throws). node-js validated none of them — it
+/// built `[-1]` from `new Array(-1)`, silently ignored `a.length = -1`, and sat
+/// materializing four billion elements for `a.length = 2**32`.
+pub fn to_array_length(v: &Value) -> Result<usize, String> {
+    let n = to_number_value(v)?;
+    // `ToUint32`: truncate toward zero, then modulo 2^32.
+    let u = if n.is_finite() {
+        (n.trunc() as i64).rem_euclid(1i64 << 32) as u32
+    } else {
+        0
+    };
+    // `-0` compares equal to `0` here, which is what makes `new Array(-0)` legal.
+    if (u as f64) != n {
+        return Err(range_error("Invalid array length"));
+    }
+    Ok(u as usize)
+}
+
 /// A Node *coded* error raised from the JS layer: `Name [ERR_CODE]: message`.
 ///
 /// `builtins::synth_error` parses that head back apart, so the bracketed code
@@ -1902,8 +1953,216 @@ pub fn set_debug_mode(on: bool) {
     DEBUG_MODE.with(|d| d.set(on));
 }
 
+// ── join cycle detection ─────────────────────────────────────────────────────
+
+thread_local! {
+    /// Heap handles whose join is in progress, innermost last — V8's JoinStack.
+    static JOIN_STACK: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// V8's `JoinStackPush`: record that `v` is being joined, or report `false` if
+/// it already is.
+///
+/// `Array.prototype.join` (and `toString`/`toLocaleString`, which route through
+/// it) is the one place the language walks an object graph with no depth bound,
+/// so every engine cuts re-entrance here: a receiver already on the stack
+/// contributes the EMPTY STRING rather than recursing. Measured on node v26.7.0,
+/// `const a=[1]; a.push(a); a.push(2); a.join('-')` is `"1--2"`, and
+/// `String(a)`/`` `${a}` `` on `a=[a]` are both `""`. node-js had no such cut and
+/// recursed until the native stack overflowed, ABORTING the process (exit 134) —
+/// uncatchable, where node returns a string.
+///
+/// Only re-entrance is cut, not repetition: `[a,a].join('|')` still renders `a`
+/// twice, because the first render pops before the second pushes.
+///
+/// A `true` return MUST be paired with [`join_stack_pop`].
+pub fn join_stack_push(v: &Value) -> bool {
+    match v {
+        Value::Obj(i) => JOIN_STACK.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.contains(i) {
+                false
+            } else {
+                s.push(*i);
+                true
+            }
+        }),
+        _ => true,
+    }
+}
+
+/// Pop the innermost [`join_stack_push`].
+pub fn join_stack_pop() {
+    JOIN_STACK.with(|s| {
+        s.borrow_mut().pop();
+    });
+}
+
+// ── native stack guard ───────────────────────────────────────────────────────
+
+thread_local! {
+    /// Lowest stack address a nested run may start from, or 0 before the
+    /// running thread's bounds have been measured. Cached because the pthread
+    /// query is a syscall-free but non-trivial read and this is on every call.
+    static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Stack left unusable below the floor, as a fraction of the whole stack: the
+/// throw itself still has to unwind, build an `Error`, capture `.stack` and run
+/// whatever `catch` receives it, all of which needs room *below* the deepest
+/// call that was allowed.
+const STACK_RESERVE_DIVISOR: usize = 8;
+/// Floor of that reserve, for a thread whose stack is small enough that an
+/// eighth of it would not cover the unwind.
+const STACK_RESERVE_MIN: usize = 512 * 1024;
+/// Reserve assumed on a platform whose stack bounds cannot be queried. Deliberately
+/// large relative to a default 8 MiB stack — over-reserving costs recursion
+/// depth, under-reserving costs the process.
+const STACK_RESERVE_FALLBACK: usize = 1024 * 1024;
+
+/// The address of a local in the caller's frame — how far down the stack
+/// execution currently is. `black_box` keeps the probe from being optimized into
+/// a different frame.
+fn stack_pointer() -> usize {
+    let probe = 0u8;
+    std::hint::black_box(&probe) as *const u8 as usize
+}
+
+/// The running thread's `(lowest address, size)` stack bounds.
+///
+/// Asked of pthread rather than assumed, because the three threads that run JS
+/// have three different stacks: the `node` binary's own (`main.rs` reserves
+/// [`crate::JS_STACK_SIZE`]), a `worker_threads` thread's, and a `cargo test`
+/// harness thread's. A fixed byte budget would be wrong on two of the three.
+fn stack_bounds() -> Option<(usize, usize)> {
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: both calls are pure reads of the calling thread's own
+        // pthread record; neither allocates nor can fail.
+        unsafe {
+            let me = libc::pthread_self();
+            let top = libc::pthread_get_stackaddr_np(me) as usize;
+            let size = libc::pthread_get_stacksize_np(me);
+            if size == 0 || top < size {
+                return None;
+            }
+            Some((top - size, size))
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `attr` is initialized by `pthread_getattr_np` before it is
+        // read, only read on the success path, and destroyed on every path.
+        unsafe {
+            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+            if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+                return None;
+            }
+            let mut low: *mut libc::c_void = std::ptr::null_mut();
+            let mut size: libc::size_t = 0;
+            let ok = libc::pthread_attr_getstack(&attr, &mut low, &mut size) == 0;
+            libc::pthread_attr_destroy(&mut attr);
+            if ok && size != 0 {
+                return Some((low as usize, size));
+            }
+            None
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// The stack address below which a further nested VM run must throw instead of
+/// recursing.
+///
+/// Every JS call is a Rust-level recursion — `run_user_func_nt` pushes a
+/// [`Frame`], then `run_chunk_on` builds a whole new `fusevm::VM` on the stack
+/// and runs the body, whose own calls land back here. Unbounded JS recursion
+/// therefore used to exhaust the OS stack and ABORT: `fatal runtime error:
+/// stack overflow`, exit 134, which no `try`/`catch` can see. V8 throws a
+/// catchable `RangeError: Maximum call stack size exceeded` instead (measured on
+/// node v26.7.0: `let d=0; function f(){d++;f()}` reports depth 9901).
+///
+/// The floor is derived from the thread's real bounds rather than a frame count
+/// because a node-js frame has no fixed size — a debug build spends ~98 KiB per
+/// JS call (measured: `node -e 'function f(n){…f(n-1)}'` survived 83 on an 8 MiB
+/// stack and no more), a release build far less, and a native builtin recursing
+/// through a user callback spends a different amount again.
+fn stack_floor() -> usize {
+    let cached = STACK_FLOOR.with(|c| c.get());
+    if cached != 0 {
+        return cached;
+    }
+    let floor = match stack_bounds() {
+        Some((low, size)) => low + (size / STACK_RESERVE_DIVISOR).max(STACK_RESERVE_MIN),
+        None => stack_pointer().saturating_sub(STACK_RESERVE_FALLBACK),
+    };
+    STACK_FLOOR.with(|c| c.set(floor));
+    floor
+}
+
+/// Stack given to each generator/async coroutine.
+///
+/// corosensei's default is 1 MiB, which at a debug build's ~98 KiB per JS call
+/// left a `function*` body barely ten frames of recursion before it walked off
+/// the end. The mapping is `PROT_NONE` reserved and `mprotect`ed, so the cost of
+/// a larger one is address space, not resident memory — but it IS per live
+/// generator, so this stays far below the entry thread's
+/// [`crate::JS_STACK_SIZE`]: a program with thousands of concurrent async calls
+/// has thousands of these.
+const CORO_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// The [`stack_floor`] that applies while a coroutine on `stack` is running.
+fn coro_stack_floor(stack: &impl corosensei::stack::Stack) -> usize {
+    stack.limit().get() + (CORO_STACK_SIZE / STACK_RESERVE_DIVISOR).max(STACK_RESERVE_MIN)
+}
+
+/// corosensei's own `DefaultStack::default()` size, used only when the
+/// [`CORO_STACK_SIZE`] reservation is refused and the coroutine therefore runs
+/// on a stack whose bounds are not ours to read.
+const CORO_FALLBACK_STACK_SIZE: usize = 1024 * 1024;
+
+/// Give a coroutine whose stack bounds are unknown a floor measured from where
+/// its body starts. Called once, at body entry, on the coroutine's own stack.
+fn ensure_coroutine_floor() {
+    if STACK_FLOOR.with(|c| c.get()) != 0 {
+        return;
+    }
+    let budget = CORO_FALLBACK_STACK_SIZE
+        - (CORO_FALLBACK_STACK_SIZE / STACK_RESERVE_DIVISOR).max(STACK_RESERVE_MIN);
+    STACK_FLOOR.with(|c| c.set(stack_pointer().saturating_sub(budget)));
+}
+
+/// Install `floor` as the current stack floor, returning the previous one.
+///
+/// Used around a coroutine resume, which switches to a stack the thread's
+/// pthread record knows nothing about. A floor of 0 means "not known" and makes
+/// the next [`stack_floor`] measure again, which is the right answer for the
+/// entry thread and a conservative one for a fallback coroutine stack.
+fn swap_stack_floor(floor: usize) -> usize {
+    STACK_FLOOR.with(|c| c.replace(floor))
+}
+
+/// Whether the native stack is too close to its floor for one more nested run.
+pub fn stack_exhausted() -> bool {
+    stack_pointer() <= stack_floor()
+}
+
+/// The error V8 raises when the call stack is exhausted. Catchable, and with the
+/// `RangeError` constructor node uses — not a `panic!`.
+pub fn stack_overflow_error() -> String {
+    range_error("Maximum call stack size exceeded")
+}
+
 /// Register every node-js builtin + the numeric hook on a VM, then run it.
 pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
+    // Checked before the `VM` is built: `VM::new` + `install` are themselves
+    // several KiB of frame, so a check after them could already have overflowed.
+    if stack_exhausted() {
+        return Err(stack_overflow_error());
+    }
     let mut vm = VM::new(chunk);
     crate::builtins::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
@@ -2259,6 +2518,12 @@ impl JsHost {
                 Some(JsObj::RegExp(r)) => format!("/{}/{}", r.source, r.flags),
                 Some(JsObj::Array(items)) => {
                     // Array.prototype.toString: comma-join, null/undefined -> "".
+                    // Guarded by the JoinStack (see `join_stack_push`) so a
+                    // self-referential array yields "" instead of recursing until
+                    // the native stack aborts the process.
+                    if !join_stack_push(v) {
+                        return String::new();
+                    }
                     let parts: Vec<String> = items
                         .iter()
                         .map(|x| match x {
@@ -2267,6 +2532,7 @@ impl JsHost {
                             _ => self.str_of(x),
                         })
                         .collect();
+                    join_stack_pop();
                     parts.join(",")
                 }
                 Some(JsObj::Object(props)) => {
@@ -2550,13 +2816,34 @@ impl JsHost {
                     };
                     self.with_callable_props(v, base, indent)
                 }
+                // A Map/Set renders its members at the NEXT nesting level, and
+                // collapses to `[Map]`/`[Set]` past the depth limit exactly as an
+                // array collapses to `[Array]`. Both used to recurse through
+                // `inspect`, which restarts at indent 0, so the depth gate never
+                // fired: nesting printed one level too deep at every depth
+                // (measured on node v26.7.0, four nested Maps print
+                // `Map(1) { 'a' => Map(1) { 'b' => Map(1) { 'c' => [Map] } } }`),
+                // and a SELF-referential Map or Set recursed forever and aborted
+                // the process — `const m=new Map(); m.set('m',m); console.log(m)`
+                // died with `fatal runtime error: stack overflow`, which no
+                // `try`/`catch` can see. An empty one still prints in full at any
+                // depth, as `[]`/`{}` do.
                 Some(JsObj::Map { entries, .. }) => {
                     if entries.is_empty() {
                         return "Map(0) {}".into();
                     }
+                    if indent > 2 * inspect_max_depth() {
+                        return "[Map]".into();
+                    }
                     let inner: Vec<String> = entries
                         .values()
-                        .map(|(k, val)| format!("{} => {}", self.inspect(k), self.inspect(val)))
+                        .map(|(k, val)| {
+                            format!(
+                                "{} => {}",
+                                self.inspect_lvl(k, indent + 2),
+                                self.inspect_lvl(val, indent + 2)
+                            )
+                        })
                         .collect();
                     format!("Map({}) {{ {} }}", entries.len(), inner.join(", "))
                 }
@@ -2564,7 +2851,13 @@ impl JsHost {
                     if entries.is_empty() {
                         return "Set(0) {}".into();
                     }
-                    let inner: Vec<String> = entries.values().map(|v| self.inspect(v)).collect();
+                    if indent > 2 * inspect_max_depth() {
+                        return "[Set]".into();
+                    }
+                    let inner: Vec<String> = entries
+                        .values()
+                        .map(|v| self.inspect_lvl(v, indent + 2))
+                        .collect();
                     format!("Set({}) {{ {} }}", entries.len(), inner.join(", "))
                 }
                 Some(JsObj::Generator { .. }) => "Object [Generator] {}".into(),
@@ -4064,6 +4357,24 @@ pub fn construct_nt(ctor: &Value, args: Vec<Value>, new_target: Value) -> Result
     match obj {
         Some(JsObj::Class(_)) => construct_class(ctor, args, new_target),
         Some(JsObj::Func(fv)) => {
+            // Only an ORDINARY function has a `[[Construct]]` slot. An arrow, a
+            // `function*` and an `async function` are callable but not
+            // constructable (10.2.2 is installed only for the ordinary case), so
+            // `new` on one is a TypeError — node-js instead ran the body and
+            // handed back a half-built instance (for a generator, an object whose
+            // constructor had returned a suspended generator).
+            let non_ctor = with_host(|h| {
+                h.funcs
+                    .get(fv.def_id)
+                    // A MethodDefinition is in the same boat: `new ({m(){}}).m()`
+                    // is `TypeError: o.m is not a constructor` on node v26.7.0,
+                    // which is also why a method owns no `prototype`.
+                    .map(|d| d.is_generator || d.is_async || d.is_method)
+                    .unwrap_or(false)
+            });
+            if fv.is_arrow || non_ctor {
+                return Err(not_a_constructor(ctor));
+            }
             // A plain constructor function: instance delegates to `fn.prototype`
             // (auto-created with a `.constructor` back-link if not yet accessed).
             let inst = with_host(|h| {
@@ -4096,11 +4407,22 @@ pub fn construct_nt(ctor: &Value, args: Vec<Value>, new_target: Value) -> Result
             all.extend(args);
             construct_nt(&target, all, new_target)
         }
-        _ => Err(type_error(&format!(
-            "{} is not a constructor",
-            with_host(|h| h.str_of(ctor))
-        ))),
+        _ => Err(not_a_constructor(ctor)),
     }
+}
+
+/// `TypeError: <callee> is not a constructor`.
+///
+/// V8 names the callee by its SOURCE TEXT (`new g()` reports `g`, `new o.m()`
+/// reports `o.m`); node-js keeps no spans, so a named callable is reported by
+/// its name — the same string in the common case — and anything else by its
+/// value.
+fn not_a_constructor(ctor: &Value) -> String {
+    let name = with_host(|h| match h.callable_name(ctor) {
+        n if n.is_empty() => h.str_of(ctor),
+        n => n,
+    });
+    type_error(&format!("{name} is not a constructor"))
 }
 
 /// Whether a constructor's return value is an object (so `new` yields it instead
@@ -4605,25 +4927,41 @@ fn make_generator(
             async_gen: false,
             queue: std::collections::VecDeque::new(),
             running: false,
+            stack_floor: 0,
         });
         id
     });
-    let coro = corosensei::Coroutine::new(
-        move |yielder: &corosensei::Yielder<Value, Value>, _first: Value| {
-            // Same thread → publish the yielder so `yield` (deep in the body's VM)
-            // can reach it. Valid for the whole body lifetime.
-            with_host(|h| h.generators[id as usize].yielder = yielder as *const _ as *const ());
-            let r = run_chunk_on(chunk);
-            // A `return` inside the body leaves a Return signal carrying the final
-            // value; capture it so `.next()` reports it as the completion value.
-            let ret = with_host(|h| match h.signal.take() {
-                Some(Signal::Return(v)) => v,
-                _ => Value::Undef,
-            });
-            r.map(|_| ret)
-        },
-    );
-    with_host(|h| h.generators[id as usize].coro = Some(coro));
+    let body = move |yielder: &corosensei::Yielder<Value, Value>, _first: Value| {
+        ensure_coroutine_floor();
+        // Same thread → publish the yielder so `yield` (deep in the body's VM)
+        // can reach it. Valid for the whole body lifetime.
+        with_host(|h| h.generators[id as usize].yielder = yielder as *const _ as *const ());
+        let r = run_chunk_on(chunk);
+        // A `return` inside the body leaves a Return signal carrying the final
+        // value; capture it so `.next()` reports it as the completion value.
+        let ret = with_host(|h| match h.signal.take() {
+            Some(Signal::Return(v)) => v,
+            _ => Value::Undef,
+        });
+        r.map(|_| ret)
+    };
+    // The body's stack is allocated here rather than left to `Coroutine::new` so
+    // that its size is ours to choose and, above all, so its `limit()` is known:
+    // that address is what `stack_exhausted` must compare against while the body
+    // runs, since a coroutine does NOT run on the thread stack pthread reports.
+    // A refused reservation still yields a working generator on corosensei's own
+    // 1 MiB default, with a floor derived on entry instead.
+    let (coro, floor) = match corosensei::stack::DefaultStack::new(CORO_STACK_SIZE) {
+        Ok(stack) => {
+            let floor = coro_stack_floor(&stack);
+            (corosensei::Coroutine::with_stack(stack, body), floor)
+        }
+        Err(_) => (corosensei::Coroutine::new(body), 0),
+    };
+    with_host(|h| {
+        h.generators[id as usize].coro = Some(coro);
+        h.generators[id as usize].stack_floor = floor;
+    });
     with_host(|h| h.alloc(JsObj::Generator { id }))
 }
 
@@ -4723,9 +5061,20 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<GenStep, String> {
     let gen_ctx = with_host(|h| std::mem::take(&mut h.generators[id as usize].ctx));
     let caller_ctx = with_host(|h| h.install_gen_ctx(gen_ctx));
     let prev = CUR_GEN.with(|c| c.replace(Some(id)));
+    // The body runs on the coroutine's OWN stack, so the guard's floor has to
+    // move with it and move back on suspend — generators nest, and a resume from
+    // inside another generator must restore that one's floor, not the thread's.
+    let coro_floor = with_host(|h| h.generators[id as usize].stack_floor);
+    let caller_floor = swap_stack_floor(coro_floor);
 
     let out = coro.resume(send); // no host borrow held; body drives its own VM
 
+    let measured = swap_stack_floor(caller_floor);
+    // A coroutine on corosensei's default stack has no known bounds, so the
+    // floor it measured for itself on first entry is kept for later resumes.
+    if coro_floor == 0 && measured != 0 {
+        with_host(|h| h.generators[id as usize].stack_floor = measured);
+    }
     CUR_GEN.with(|c| c.set(prev));
     let mut gen_ctx = with_host(|h| h.install_gen_ctx(caller_ctx));
     // A `throw` inside the body left the thrown VALUE in the generator's context,
@@ -4743,7 +5092,17 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<GenStep, String> {
     match out {
         corosensei::CoroutineResult::Yield(y) => Ok(GenStep::Yield(y)),
         corosensei::CoroutineResult::Return(r) => {
-            with_host(|h| h.generators[id as usize].done = true);
+            // Release the coroutine — and with it the mmap'd stack it owns —
+            // the moment the body completes. `h.generators` only ever grows (an
+            // id is never reused), so a program that awaits in a loop otherwise
+            // accumulates one whole [`CORO_STACK_SIZE`] reservation per call for
+            // the life of the process. A finished generator is never resumed:
+            // `gen_resume` returns `Done` on the `done` flag before it looks.
+            with_host(|h| {
+                let g = &mut h.generators[id as usize];
+                g.done = true;
+                g.coro = None;
+            });
             match r {
                 Ok(v) => Ok(GenStep::Done(v)),
                 Err(e) => Err(e),
@@ -5020,10 +5379,30 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
 /// Returns a heap string value.
 pub fn to_string_value(v: &Value) -> Result<Value, String> {
     let p = to_primitive(v, "string")?;
+    // `ToString(symbol)` throws (7.1.17 step 2) — the ONLY conversion a symbol
+    // refuses. `String(sym)` is the documented exception and is handled at that
+    // call site, not here, so every implicit coercion (`sym + ''`, `` `${sym}` ``,
+    // `[sym].join()`) rejects the way node does instead of silently rendering
+    // `Symbol(desc)`.
+    if with_host(|h| matches!(h.get(&p), Some(JsObj::Symbol { .. }))) {
+        return Err(type_error("Cannot convert a Symbol value to a string"));
+    }
     Ok(with_host(|h| {
         let s = h.str_of(&p);
         h.new_str(s)
     }))
+}
+
+/// `String(v)` — 22.1.1.1. Identical to [`to_string_value`] except that a
+/// SYMBOL argument is allowed and renders as `Symbol(desc)` (step 2a).
+pub fn string_ctor_value(v: &Value) -> Result<Value, String> {
+    if with_host(|h| matches!(h.get(v), Some(JsObj::Symbol { .. }))) {
+        return Ok(with_host(|h| {
+            let s = h.str_of(v);
+            h.new_str(s)
+        }));
+    }
+    to_string_value(v)
 }
 
 /// `ToNumber(v)` — ECMA-262 7.1.4 — with the object case going through
@@ -5031,6 +5410,12 @@ pub fn to_string_value(v: &Value) -> Result<Value, String> {
 /// `+new Date(0)` is `0`. `JsHost::to_number` alone cannot do this: it runs
 /// under the host borrow and so can never invoke a JS `valueOf`.
 pub fn to_number_value(v: &Value) -> Result<f64, String> {
+    // `ToNumber(symbol)` throws (7.1.4 step 2). It is primitive, so without this
+    // it fell into `to_number` and quietly produced `NaN` — `Number(Symbol())`
+    // and `+Symbol()` are both `TypeError` on node v26.7.0.
+    if with_host(|h| matches!(h.get(v), Some(JsObj::Symbol { .. }))) {
+        return Err(type_error("Cannot convert a Symbol value to a number"));
+    }
     if let Some(n) = with_host(|h| is_primitive(h, v).then(|| h.to_number(v))) {
         return Ok(n);
     }

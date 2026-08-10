@@ -9,7 +9,16 @@
 
 use std::process::ExitCode;
 
+/// Hop onto the deep-stack JS thread before touching anything.
+///
+/// Everything below runs there, including `cli::parse` and the host itself: the
+/// object heap is a `thread_local`, so the thread that parses the command line
+/// has to be the thread that runs the program.
 fn main() -> ExitCode {
+    nodejs::run_on_js_stack(run)
+}
+
+fn run() -> ExitCode {
     let cli = nodejs::cli::parse();
     nodejs::stdlib::process::install_argv();
 

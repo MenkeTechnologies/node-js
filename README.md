@@ -159,6 +159,15 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
 - An LSP server (`--lsp`) and a DAP debug adapter (`--dap`) — source-line and
   function breakpoints, stepping, call stack, locals, and expression
   `evaluate` — are wired.
+- **Running out of stack is a catchable error.** A JS call is a Rust recursion
+  (each one builds a `fusevm::VM` on the stack), so the program runs on a
+  dedicated deep-stack thread and every nested run checks the live stack pointer
+  against the running stack's real bounds. Unbounded recursion — direct, through
+  a recursive `valueOf`/`toString`, or inside a generator body on its own
+  coroutine stack — raises `RangeError: Maximum call stack size exceeded`, the
+  error V8 raises, rather than aborting the process. Depth is a byte budget, not
+  a frame count, so it tracks the build's real frame size; BUGS.md records the
+  measured numbers.
 
 ## [0x04] NOT YET (LATER WAVES)
 

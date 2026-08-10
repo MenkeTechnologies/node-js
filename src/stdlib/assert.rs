@@ -71,7 +71,15 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         ),
         "throws" => throws(args, true),
         "doesNotThrow" => throws(args, false),
-        "fail" => Err(fail_msg(args, 0, "Failed")),
+        // `fail` carries no operands: `actual`/`expected` are own properties
+        // holding `undefined`, and `operator` is the literal `"fail"`.
+        "fail" => Err(throw_assertion(
+            &message(args, 0).unwrap_or_else(|| "Failed".to_string()),
+            message(args, 0).is_none(),
+            "fail",
+            Value::Undef,
+            Value::Undef,
+        )),
         "match" => assert_match(args, true),
         "doesNotMatch" => assert_match(args, false),
         "ifError" => if_error(&a()),
@@ -247,31 +255,90 @@ pub fn construct_assertion_error(args: &[Value]) -> Value {
         let op = operator.clone().unwrap_or_else(|| "==".to_string());
         format!("{sa} {op} {se}")
     });
+    assertion_error_object(
+        &msg,
+        generated,
+        operator.as_deref(),
+        actual.unwrap_or(Value::Undef),
+        expected.unwrap_or(Value::Undef),
+    )
+}
+
+/// Node's `diff` field. Every failure form measured on node v26.7.0 — `ok`,
+/// `equal`, `strictEqual`, `notStrictEqual`, `deepEqual`, `deepStrictEqual`,
+/// `match`, `throws`, `fail` — reports the same `"simple"`; it names the diff
+/// MODE the error was built under, not a rendered diff.
+const DIFF_MODE: &str = "simple";
+
+/// Build the `AssertionError` object a failing assertion throws.
+///
+/// The own-property set is what a test runner reads, and node-js carried only
+/// `code`/`message`/`stack`: `err.actual`, `err.expected`, `err.operator` and
+/// `err.generatedMessage` were all `undefined`, so every framework that reports
+/// "expected X, got Y" from a caught `AssertionError` had nothing to report.
+/// Measured on node v26.7.0, `Object.keys(err)` is
+/// `["generatedMessage","code","actual","expected","operator","diff"]` — in that
+/// order — while `name`, `message` and `stack` are own but NOT enumerable.
+fn assertion_error_object(
+    msg: &str,
+    generated: bool,
+    operator: Option<&str>,
+    actual: Value,
+    expected: Value,
+) -> Value {
     let stack = format!("AssertionError [ERR_ASSERTION]: {msg}\n    at <anonymous>");
-    let op_val = operator
-        .map(|o| with_host(|h| h.new_str(o)))
-        .unwrap_or(Value::Undef);
+    let op_val = match operator {
+        Some(o) => with_host(|h| h.new_str(o)),
+        None => Value::Undef,
+    };
     let name_v = with_host(|h| h.new_str("AssertionError"));
     let msg_v = with_host(|h| h.new_str(msg));
     let code_v = with_host(|h| h.new_str("ERR_ASSERTION"));
     let stack_v = with_host(|h| h.new_str(stack));
+    let diff_v = with_host(|h| h.new_str(DIFF_MODE));
     let mut props: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+    // Enumerable, in node's order, first.
+    props.insert("generatedMessage".into(), Value::Bool(generated));
+    props.insert("code".into(), code_v);
+    props.insert("actual".into(), actual);
+    props.insert("expected".into(), expected);
+    props.insert("operator".into(), op_val);
+    props.insert("diff".into(), diff_v);
     props.insert("name".into(), name_v);
     props.insert("message".into(), msg_v);
-    props.insert("code".into(), code_v);
-    props.insert("actual".into(), actual.unwrap_or(Value::Undef));
-    props.insert("expected".into(), expected.unwrap_or(Value::Undef));
-    props.insert("operator".into(), op_val);
-    props.insert("generatedMessage".into(), Value::Bool(generated));
     props.insert("stack".into(), stack_v);
     let obj = with_host(|h| h.new_object(props));
     with_host(|h| {
+        for k in ["name", "message", "stack"] {
+            h.hide_prop(&obj, k);
+        }
         h.ensure_error_protos();
-        if let Some(p) = crate::host::error_proto_of(h, "Error") {
+        // The `AssertionError` prototype, not `Error`'s: `e.constructor.name`
+        // is what a test runner branches on, and linking straight to `Error`
+        // reported `Error` there while `e.name` still said `AssertionError`.
+        if let Some(p) = crate::host::error_proto_of(h, "AssertionError") {
             h.set_proto(&obj, p);
         }
     });
     obj
+}
+
+/// Raise a failing assertion as a REAL `AssertionError` object.
+///
+/// The internal `Name [CODE]: message` string is still what propagates (it is
+/// what an uncaught failure prints), but the live thrown VALUE is parked in
+/// `host.exc` so a `catch` receives the object with its full property set rather
+/// than one synthesized from the message alone.
+fn throw_assertion(
+    msg: &str,
+    generated: bool,
+    operator: &str,
+    actual: Value,
+    expected: Value,
+) -> String {
+    let err = assertion_error_object(msg, generated, Some(operator), actual, expected);
+    with_host(|h| h.exc = Some(err));
+    assertion_error(msg)
 }
 
 fn settle_rejects(rid: u32, rejected: bool, want_reject: bool) {
@@ -292,16 +359,23 @@ fn settle_rejects(rid: u32, rejected: bool, want_reject: bool) {
 pub fn assert_ok(args: &[Value]) -> Result<Value, String> {
     let v = args.first().cloned().unwrap_or(Value::Undef);
     if with_host(|h| h.truthy(&v)) {
-        Ok(Value::Undef)
-    } else {
-        Err(fail_msg(
-            args,
-            1,
-            // Node's heading ends with a colon and is followed by an echo of
-            // the failing source line, which needs the call site's text.
-            "The expression evaluated to a falsy value:",
-        ))
+        return Ok(Value::Undef);
     }
+    let custom = message(args, 1);
+    let msg = custom.clone().unwrap_or_else(||
+        // Node's heading ends with a colon and is followed by an echo of
+        // the failing source line, which needs the call site's text.
+        "The expression evaluated to a falsy value:".to_string());
+    // `ok` reports the operand as `actual` against a literal `true`, under the
+    // `==` operator (measured on node v26.7.0: `assert.ok(0)` gives
+    // `actual: 0`, `expected: true`, `operator: '=='`).
+    Err(throw_assertion(
+        &msg,
+        custom.is_none(),
+        "==",
+        v,
+        Value::Bool(true),
+    ))
 }
 
 fn check(
@@ -315,9 +389,7 @@ fn check(
     if pass {
         return Ok(Value::Undef);
     }
-    if let Some(m) = message(args, msg_idx) {
-        return Err(assertion_error(&m));
-    }
+    let custom = message(args, msg_idx);
     let (sa, sb) = with_host(|h| (h.inspect(a), h.inspect(b)));
     // Each comparison has its OWN generated-message shape in Node; `{a} {op} {b}`
     // is only right for the two loose forms. `strictEqual(1, 2)` produced
@@ -346,16 +418,51 @@ fn check(
         }
         _ => format!("{sa} {op} {sb}"),
     };
-    Err(assertion_error(&msg))
+    // Node names the METHOD for the strict/deep forms and the OPERATOR for the
+    // two loose ones: `strictEqual` reports `operator: 'strictEqual'` while
+    // `equal` reports `'=='`. A custom message replaces the generated text but
+    // keeps every other field, and flips `generatedMessage` to false.
+    let operator = match op {
+        "===" => "strictEqual",
+        "!==" => "notStrictEqual",
+        other => other,
+    };
+    Err(throw_assertion(
+        &custom.clone().unwrap_or(msg),
+        custom.is_none(),
+        operator,
+        a.clone(),
+        b.clone(),
+    ))
 }
 
 fn throws(args: &[Value], want_throw: bool) -> Result<Value, String> {
     let f = args.first().cloned().unwrap_or(Value::Undef);
-    let threw = invoke(&f, Vec::new(), None).is_err();
+    // The thrown value becomes `err.actual` on a `doesNotThrow` failure, so it
+    // has to be captured rather than discarded with `.is_err()`.
+    let caught = match invoke(&f, Vec::new(), None) {
+        Ok(_) => None,
+        Err(e) => Some(crate::host::take_exc_or_error(&e)),
+    };
+    let threw = caught.is_some();
     match (threw, want_throw) {
         (true, true) | (false, false) => Ok(Value::Undef),
-        (false, true) => Err(assertion_error("Missing expected exception.")),
-        (true, false) => Err(assertion_error("Got unwanted exception.")),
+        // `generatedMessage` is FALSE for both, which is what node reports even
+        // though it wrote the sentence itself (v26.7.0, `assert.throws(()=>{})`).
+        (false, true) => Err(throw_assertion(
+            "Missing expected exception.",
+            false,
+            "throws",
+            Value::Undef,
+            Value::Undef,
+        )),
+        (true, false) => Err(throw_assertion(
+            "Got unwanted exception.",
+            false,
+            "doesNotThrow",
+            caught.unwrap_or(Value::Undef),
+            Value::Undef,
+        )),
     }
 }
 
@@ -364,10 +471,6 @@ fn message(args: &[Value], idx: usize) -> Option<String> {
         Some(Value::Undef) | None => None,
         Some(v) => Some(with_host(|h| h.str_of(v))),
     }
-}
-
-fn fail_msg(args: &[Value], idx: usize, default: &str) -> String {
-    assertion_error(&message(args, idx).unwrap_or_else(|| default.to_string()))
 }
 
 /// An `AssertionError` as an internal error string.

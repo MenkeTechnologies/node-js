@@ -1153,6 +1153,171 @@ independently turned every such literal into two `U+FFFD`s. Two SEPARATE
 literals still cannot rejoin (`"\ud83d" + "\ude00"`), which is the documented
 Rust-`String` boundary above, not a new gap.
 
+## FIXED in round 7 — the divergences user code cannot catch
+
+Every entry below was a `fatal runtime error: stack overflow` abort (exit 134),
+a hang, or a silent success where node throws. A panic is a parity divergence
+even when the happy path matches, because `try`/`catch` cannot see it.
+
+### The native stack is bounded, and running out of it is a `RangeError`
+
+A JS call is a Rust recursion — `host::run_user_func_nt` pushes a `Frame`, then
+`run_chunk_on` builds a whole `fusevm::VM` on the stack and runs the body, whose
+own calls land back there. Nothing bounded that, so unbounded JS recursion
+walked off the end of the OS stack and killed the process. Two changes:
+
+- **`main` runs the program on a 256 MiB thread** (`lib.rs::run_on_js_stack`),
+  and each generator/async coroutine gets 16 MiB instead of corosensei's 1 MiB
+  default. Both are `PROT_NONE` reservations faulted in on use, and a refused
+  reservation falls back rather than failing. On the OS default 8 MiB stack a
+  debug build managed **83** frames — measured, `node -e 'function
+  f(n){if(n<=0)return 0;return 1+f(n-1)} f(84)'` aborted.
+- **`host::stack_exhausted` throws before the stack runs out**, comparing the
+  live stack pointer against a floor derived from the RUNNING stack's real
+  bounds (pthread on the entry thread, `Stack::limit()` on a coroutine). A frame
+  count would have been wrong: a node-js frame is ~98 KiB in a debug build and
+  far less in release.
+
+| case | node v26.7.0 | node-js before | node-js now |
+| --- | --- | --- | --- |
+| `function f(){return f()}; f()` | `RangeError: Maximum call stack size exceeded` | abort, exit 134 | same `RangeError`, catchable, `instanceof RangeError` |
+| `({valueOf(){return this+1}}) + 1` | same `RangeError` | abort | same `RangeError` |
+| `p={toString(){return String(p)}}; String(p)` | same `RangeError` | abort | same `RangeError` |
+| deep recursion inside a `function*` body | same `RangeError` | abort at ~10 frames (1 MiB coroutine stack) | same `RangeError` |
+| `a=[1]; a.push(a); a.flat(Infinity)` | same `RangeError` | abort | same `RangeError` |
+| `f(1000)` (ordinary recursion) | `1000` | abort above 83 | `1000` |
+
+A finished generator now releases its coroutine — and its stack mapping — as
+soon as the body returns. `host.generators` only ever grows, so without that a
+20 000-iteration `await` loop held 20 000 stack reservations for the life of the
+process.
+
+### `Array.prototype.join` cuts its own cycle
+
+`join`, `toString` and `toLocaleString` are the one graph walk the language
+leaves unbounded, and every engine keeps a JoinStack: a receiver already being
+joined contributes the EMPTY STRING instead of recursing. node-js had no such
+cut and aborted. Only RE-ENTRANCE is cut, not repetition.
+
+| case | node v26.7.0 | node-js before |
+| --- | --- | --- |
+| `a=[1]; a.push(a); a.push(2); a.join('-')` | `"1--2"` | abort |
+| `d=[]; d.push(d); String(d)` / `d.toString()` / `` `${d}` `` | `""` | abort |
+| `e=[1]; e.push(e); [e,e].join('|')` | `"1,|1,"` | abort |
+| `g=[1]; g.push(g); g.toLocaleString()` | `"1,"` | abort |
+
+### A Map/Set inspects at its nesting depth
+
+Both rendered their members through `inspect`, which restarts at indent 0, so
+the depth gate never fired. Two consequences, one cosmetic and one fatal: nested
+Maps printed a level too deep at every depth, and a self-referential Map or Set
+recursed until the process aborted.
+
+| case | node v26.7.0 | node-js before |
+| --- | --- | --- |
+| four nested `Map`s | `Map(1) { 'a' => Map(1) { 'b' => Map(1) { 'c' => [Map] } } }` | one level deeper, no `[Map]` |
+| `new Map([['k',[1,[2,[3,[4]]]]]])` | `Map(1) { 'k' => [ 1, [ 2, [Array] ] ] }` | `[ 1, [ 2, [ 3, [Array] ] ] ]` |
+| `m=new Map(); m.set('m',m); console.log(m)` | `<ref *1> Map(1) { 'm' => [Circular *1] }` | abort |
+
+### Length arithmetic is checked before the allocation
+
+| case | node v26.7.0 | node-js before |
+| --- | --- | --- |
+| `'a'.repeat(2**40)` | `RangeError: Invalid string length` | hang — building a 1 TiB `String`, killed at 10s |
+| `'abc'.padStart(2**40,'x')`, `'ab'.padEnd(536870889,'x')` | same | hang |
+| `new Array(2**32)`, `a.length = 2**32` | `RangeError: Invalid array length` | hang — four billion elements |
+| `new Array(-1)`, `new Array(1.5)` | same | `[ -1 ]` / `[ 1.5 ]` — the argument became an ELEMENT |
+| `a.length = -1`, `a.length = 'x'` | same | silently ignored |
+
+`host::MAX_STRING_LENGTH` is `536870888` — V8's `String::kMaxLength` on a 64-bit
+build, and the value `require('buffer').constants.MAX_STRING_LENGTH` reports on
+node v26.7.0. What is bounded is the RESULT, so `''.repeat(2**53)` is still `''`
+and `'ab'.padStart(2**40,'')` is still `'ab'` (the empty-filler short-circuit
+comes first, as it does in V8). The array test is `ToUint32(len) === ToNumber(len)`
+(10.4.2.4), so `a.length = '3'` is `3` and `new Array(-0).length` is `0`.
+
+### Error SHAPE: the constructor, not the message
+
+Each of these was a silent SUCCESS in node-js — a right-looking program with no
+error at all, which no message audit can see.
+
+| case | node v26.7.0 | node-js before |
+| --- | --- | --- |
+| `Object.create(1)` / `('s')` / `(undefined)` | `TypeError: Object prototype may only be an Object or null: …` | built a normal object |
+| `Object.defineProperty(1, 'a', {})` | `TypeError: Object.defineProperty called on non-object` | returned, wrote nothing |
+| `Object.defineProperty({}, 'a', 1)` | `TypeError: Property description must be an object: 1` | returned, wrote nothing |
+| `Object.setPrototypeOf(null, {})` | `TypeError: Object.setPrototypeOf called on null or undefined` | returned `null` |
+| `Object.setPrototypeOf({}, 1)` | `TypeError: Object prototype may only be an Object or null: 1` | linked the primitive |
+| `Object.setPrototypeOf(Object.freeze({}), {})` | `TypeError: #<Object> is not extensible` | re-linked the frozen object |
+| `Object.keys/values/entries/getOwnPropertyNames/getOwnPropertySymbols/getOwnPropertyDescriptor/assign` on `null` | `TypeError: Cannot convert undefined or null to object` | empty result |
+| `Symbol() + ''`, `` `${sym}` ``, `[sym].join()` | `TypeError: Cannot convert a Symbol value to a string` | rendered `Symbol(desc)` |
+| `Symbol() + 1`, `Symbol() * 1`, `-Symbol()`, `Number(Symbol())` | `TypeError: Cannot convert a Symbol value to a number` | `NaN` / concatenation |
+| `new (function*(){})()`, `new (async function(){})()`, `new (()=>{})()`, `new ({m(){}}).m()` | `TypeError: … is not a constructor` | ran the body, returned a half-built instance |
+
+The checks do not over-reject, and that half is pinned too: a primitive is
+object-coercible (`Object.keys(1)` is `[]`), a nullish SOURCE to `assign` is
+skipped, re-setting the SAME prototype stays legal on a frozen object
+(`Object.setPrototypeOf(Object.freeze({}), Object.prototype)`), and
+`String(sym)`, `sym.toString()`, `sym.description` and a symbol PROPERTY KEY all
+still work — those are the documented exceptions (22.1.1.1 step 2a).
+
+### `AssertionError` carries node's whole property set
+
+A failing assertion raised an internal `Name [CODE]: message` string, and the
+error a `catch` received was synthesized from that string alone: `code`,
+`message` and `stack` and nothing else. Everything a test runner reports —
+`err.actual`, `err.expected`, `err.operator`, `err.generatedMessage` — was
+`undefined`, and `err.constructor.name` said `Error` while `err.name` said
+`AssertionError`. The failure now parks a real object in `host.exc`, so the
+thrown VALUE is the object and the string stays only for the uncaught print.
+
+Measured on node v26.7.0, `Object.keys(err)` is
+`["generatedMessage","code","actual","expected","operator","diff"]` — in that
+order — while `name`, `message` and `stack` are own but non-enumerable. The
+`operator` is the METHOD name for the strict/deep forms (`strictEqual`,
+`notStrictEqual`, `deepStrictEqual`, …) and the OPERATOR for the two loose ones
+(`==`, `!=`); `ok(x)` reports `actual: x` against `expected: true` under `==`;
+`fail`/`throws`/`doesNotThrow` report `operator` as their own method name with
+`generatedMessage: false`. `diff` is `"simple"` for every failure form measured.
+
+### Test-suite census (round 7 theme B)
+
+101 test functions across the seven files in `tests/` were checked for a body
+that can execute ZERO assertions. Two could, and both were in `tests/ffi.rs`:
+`rust_block_exports_are_callable_across_all_v1_signatures` and
+`rust_block_with_no_exports_errors` each `return`ed early when `rustc` was not
+runnable, reporting PASS having asserted nothing. The guard is now a hard
+`assert!`: `cargo test` built the binary under test with the very toolchain
+being probed, so an absent compiler is a broken environment rather than a reason
+to pass.
+
+`tests/parity.rs` had a subtler form — the corpus is walked off disk, and an
+empty `examples/` satisfies `files.len() == expected.len()` as `0 == 0` and then
+loops zero times. It now asserts a floor on the corpus size. The parser helpers
+in `name_registry.rs` and `opcode_ids.rs` already carried that floor
+(`out.len() > 40`, `> 60`, `> 30`, `> 50`, `!out.is_empty()`), so those tests
+could not go vacuous; `embed.rs`, `timers.rs` and `es_parity.rs` have no
+conditional assertion paths at all.
+
+## Still open — found in round 7
+
+| gap | node v26.7.0 | node-js |
+| --- | --- | --- |
+| recursion depth before `RangeError` | 9901 for `function f(){f()}` | ~2400 in a debug build — the floor is a STACK BUDGET, not a frame count, so the number moves with frame size (release reaches far more). Both throw; only the depth differs |
+| `console.log` of a circular structure | `<ref *1> [ [Circular *1] ]` | `[ [ [ [Array] ] ] ]` — the depth gate terminates it, but there is no reference-tracking renderer |
+| `new Array(4294967295)` | `4294967295` (holes are lazy) | killed at 10s — a dense `Vec` cannot hold 2^32-1 elements. The LENGTH is legal, so the spec check above lets it through; this is the documented dense-array model, not a missing validation |
+| `JSON.stringify` of a 20 000-deep object | prints promptly | killed at 60s (5 000 deep completes) |
+| `async function f(){ return f() }; f()` | `RangeError: Maximum call stack size exceeded` | hangs — each call starts a coroutine and returns a promise, so the recursion is an unbounded MICROTASK chain rather than stack growth, and the stack guard never sees it |
+| `new g()` where `g` is a `function*` | message names the callee's SOURCE TEXT (`o.m is not a constructor`) | names it by function NAME (`m is not a constructor`) — the class, `.name` and catchability all match; node-js keeps no spans |
+| `new URL('/x')` error own properties | `["code","input","message","stack"]` | `["code","message","stack"]` — no `input` |
+| `class B extends A { constructor(){ this.x = 1 } }` | `ReferenceError: Must call super constructor in derived class before accessing 'this' …` | no error — `this` is bound before `super()` |
+| `'use strict'; const c = 1; c = 2` | `TypeError: Assignment to constant variable.` | assignment succeeds |
+| `structuredClone(function(){})` | `DOMException` / `DataCloneError`, `code: 25` | no error |
+| `Number.prototype.toFixed.call({})` | `TypeError: Number.prototype.toFixed requires that 'this' be a Number` | `TypeError: toFixed is not a function` — right class, wrong message |
+| `String.prototype.at.call(null)` | `TypeError: String.prototype.at called on null or undefined` | `TypeError: at is not a function` |
+| `const {a} = null` | `TypeError: Cannot destructure property 'a' of 'null' as it is null.` | `TypeError: Cannot read properties of null (reading 'a')` |
+| `eval('await 1')` | `SyntaxError: await is only valid in async functions …` | `SyntaxError: expected ';' but found Num(1.0) (line 1)` |
+
 ## Still open — found by the round-5 doc audit, not yet fixed
 
 Each of these was verified against node v26.7.0 and is a real divergence; none

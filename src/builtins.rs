@@ -1654,6 +1654,14 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         with_host(|h| h.set_fn_prop(recv, name, val));
         return Ok(());
     }
+    // `arr.length = n` (10.4.2.4 `ArraySetLength`) validates BEFORE it resizes,
+    // and does so outside the host borrow because `ToNumber` may run a user
+    // `valueOf`. An invalid length throws instead of being silently coerced to 0.
+    let new_len = if name == "length" && with_host(|h| h.kind_of(recv)) == Some(ObjKind::Array) {
+        Some(host::to_array_length(&val)?)
+    } else {
+        None
+    };
     with_host(|h| match h.get_mut(recv) {
         Some(JsObj::Object(props)) => {
             // Adding a *new* array-index key must re-place it into ascending
@@ -1665,8 +1673,7 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             }
         }
         Some(JsObj::Array(items)) => {
-            if name == "length" {
-                let n = h_val_to_len(&val);
+            if let Some(n) = new_len {
                 items.resize(n, Value::Undef);
             } else if let Ok(i) = name.parse::<usize>() {
                 if i >= items.len() {
@@ -1678,14 +1685,6 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         _ => {}
     });
     Ok(())
-}
-
-fn h_val_to_len(v: &Value) -> usize {
-    match v {
-        Value::Float(f) if f.is_finite() && *f >= 0.0 => *f as usize,
-        Value::Int(n) if *n >= 0 => *n as usize,
-        _ => 0,
-    }
 }
 
 fn b_getitem(vm: &mut VM, _: u8) -> Value {
@@ -2603,7 +2602,39 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             host::to_primitive(b, "number")?,
         ),
     };
+    reject_symbol_operand(op, &a, &b)?;
     with_host(|h| h.arith(op, &a, &b))
+}
+
+/// A symbol has no `ToNumber` and no `ToString`, so every operator except the
+/// equality family rejects it (7.1.4 step 2, 7.1.17 step 2). node-js instead
+/// concatenated `Symbol(desc)` into the result.
+///
+/// Which of the two messages V8 uses is decided by whether the operation is
+/// STRING concatenation — measured on node v26.7.0, `Symbol() + ''` is
+/// `Cannot convert a Symbol value to a string` while `Symbol() + 1`,
+/// `Symbol() + Symbol()` and `Symbol() * 1` are all
+/// `Cannot convert a Symbol value to a number`. `==`/`===` never convert
+/// (`Symbol() == 1` is `false`), so they are left alone.
+fn reject_symbol_operand(op: NumOp, a: &Value, b: &Value) -> Result<(), String> {
+    use NumOp::*;
+    if matches!(op, Eq | Ne) {
+        return Ok(());
+    }
+    let (sym, concat) = with_host(|h| {
+        let is_sym = |v: &Value| matches!(h.get(v), Some(JsObj::Symbol { .. }));
+        let is_str =
+            |v: &Value| matches!(v, Value::Str(_)) || matches!(h.get(v), Some(JsObj::Str(_)));
+        (is_sym(a) || is_sym(b), is_str(a) || is_str(b))
+    });
+    if !sym {
+        return Ok(());
+    }
+    Err(host::type_error(if matches!(op, Add) && concat {
+        "Cannot convert a Symbol value to a string"
+    } else {
+        "Cannot convert a Symbol value to a number"
+    }))
 }
 
 /// Whether a primitive `v` makes `==` against an object convert that object
@@ -3031,7 +3062,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             } else {
                 // A symbol argument stringifies to `Symbol(desc)` (explicit String()
                 // is allowed); everything else via ToString method dispatch.
-                host::to_string_value(&args[0])
+                host::string_ctor_value(&args[0])
             }
         }
         "Number" => Ok(Value::Float(if args.is_empty() {
@@ -3140,13 +3171,38 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.setPrototypeOf" => {
             let obj = arg0(&args);
             let proto = args.get(1).cloned().unwrap_or(Value::Undef);
-            with_host(|h| h.set_proto(&obj, proto));
+            // 20.1.2.23: `RequireObjectCoercible` on the target, then the
+            // prototype type check, then — only for an actual object target —
+            // the extensibility check. A PRIMITIVE target is returned untouched
+            // (`Object.setPrototypeOf(1, {})` is `1`), which is why the
+            // extensibility test cannot come first.
+            if with_host(|h| matches!(obj, Value::Undef) || h.is_null(&obj)) {
+                return Err(host::type_error(
+                    "Object.setPrototypeOf called on null or undefined",
+                ));
+            }
+            reject_bad_prototype(&proto)?;
+            if with_host(|h| is_object_like(h, &obj)) {
+                // Setting the SAME prototype is a no-op and stays legal even on a
+                // frozen object: node v26.7.0 accepts
+                // `Object.setPrototypeOf(Object.freeze({}), Object.prototype)`.
+                // `prototype_of`, not `proto_of`: an object with no EXPLICIT
+                // link still has `Object.prototype`, and comparing against the
+                // absent link would call that a change.
+                let cur = prototype_of(&obj);
+                let same = with_host(|h| h.strict_eq(&cur, &proto));
+                if !same && !with_host(|h| h.is_extensible(&obj)) {
+                    return Err(host::type_error("#<Object> is not extensible"));
+                }
+                with_host(|h| h.set_proto(&obj, proto));
+            }
             Ok(obj)
         }
         "Object.create" => object_create(args),
         "Object.getOwnPropertyNames" => object_keys(args, 3),
         "Object.getOwnPropertySymbols" => {
             let v = arg0(&args);
+            require_object_coercible(&v)?;
             Ok(with_host(|h| {
                 let syms = h.own_symbol_keys(&v);
                 h.new_array(syms)
@@ -3463,12 +3519,15 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
     }
     match name {
         "Array" => {
-            // new Array(n) -> length-n array; new Array(a, b) -> [a, b].
+            // `new Array(n)` -> length-n array; `new Array(a, b)` -> [a, b].
+            // A single NUMBER argument is a length and is validated as one
+            // (23.1.1.1 step 6), so `new Array(-1)` / `new Array(1.5)` /
+            // `new Array(2**32)` are all `RangeError: Invalid array length` on
+            // node v26.7.0; only a non-number single argument is an element.
             if args.len() == 1 {
-                if let Value::Float(f) = args[0] {
-                    if f.fract() == 0.0 && f >= 0.0 {
-                        return Ok(with_host(|h| h.new_array(vec![Value::Undef; f as usize])));
-                    }
+                if let Value::Float(_) | Value::Int(_) = args[0] {
+                    let n = host::to_array_length(&args[0])?;
+                    return Ok(with_host(|h| h.new_array(vec![Value::Undef; n])));
                 }
             }
             Ok(with_host(|h| h.new_array(args)))
@@ -4072,6 +4131,7 @@ fn pseudo_random() -> f64 {
 
 fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
     let v = arg0(&args);
+    require_object_coercible(&v)?;
     // A builtin prototype namespace that exposes enumerable methods for copying
     // (`Object.getOwnPropertyNames(EventEmitter.prototype)` — express's mixin).
     if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(&v).cloned()) {
@@ -4175,6 +4235,9 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
 
 fn object_assign(args: Vec<Value>) -> Result<Value, String> {
     let target = arg0(&args);
+    // 20.1.2.1 step 1 is `ToObject(target)`, so a nullish TARGET throws while a
+    // nullish SOURCE is skipped (`Object.assign({}, null)` is `{}`).
+    require_object_coercible(&target)?;
     for src in args.iter().skip(1) {
         // `Object.assign` copies own *enumerable* properties, running any getter
         // — symbol-keyed ones included (7.3.25).
@@ -5203,14 +5266,18 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             } else {
                 with_host(|h| h.str_of(&args[0]))
             };
-            let s = join_parts(&array_items(recv))?.join(&sep);
-            Ok(with_host(|h| h.new_str(s)))
+            join_array(recv, &sep)
         }
         // `Array.prototype.toLocaleString` (23.1.3.32): comma-join the elements'
         // OWN `toLocaleString` results, with `null`/`undefined` contributing the
         // empty string. It threw `is not a function` — the whole method was
         // missing — so `[1234.5, 'x'].toLocaleString()` was unreachable.
         "toLocaleString" => {
+            // Shares `join`'s JoinStack: measured on node v26.7.0, `h=[1]`
+            // `h.push(h)` makes `h.toLocaleString()` `"1,"`, not a stack overflow.
+            if !host::join_stack_push(recv) {
+                return Ok(with_host(|h| h.new_str(String::new())));
+            }
             let items = array_items(recv);
             let mut parts: Vec<String> = Vec::with_capacity(items.len());
             for it in &items {
@@ -5218,9 +5285,16 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                     parts.push(String::new());
                     continue;
                 }
-                let v = host::call_method(it, "toLocaleString", Vec::new())?;
+                let v = match host::call_method(it, "toLocaleString", Vec::new()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        host::join_stack_pop();
+                        return Err(e);
+                    }
+                };
                 parts.push(with_host(|h| h.str_of(&v)));
             }
+            host::join_stack_pop();
             Ok(with_host(|h| h.new_str(parts.join(","))))
         }
         "indexOf" => {
@@ -5603,7 +5677,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 raw.trunc()
             };
             let mut out = Vec::new();
-            flatten_into(array_items(recv), depth, &mut out);
+            flatten_into(array_items(recv), depth, &mut out)?;
             Ok(with_host(|h| h.new_array(out)))
         }
         "keys" => {
@@ -5631,13 +5705,28 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         }
         "splice" => array_splice(recv, args),
         // `Array.prototype.toString` IS `join()` with the default separator
-        // (23.1.3.36), so it converts each element with `ToString` too.
-        "toString" => {
-            let s = join_parts(&array_items(recv))?.join(",");
-            Ok(with_host(|h| h.new_str(s)))
-        }
+        // (23.1.3.36), so it converts each element with `ToString` too — and
+        // shares its cycle cut, which is the whole reason it must not call
+        // `join_parts` directly: `ToString` of a nested array lands back here.
+        "toString" => join_array(recv, ","),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
+}
+
+/// `Array.prototype.join` (23.1.3.18) and, with the default separator,
+/// `Array.prototype.toString` (23.1.3.36) — one body so both share the cycle
+/// cut, which is not optional here: `ToString` of an element that is itself an
+/// array re-enters through `toString`, so guarding only `join` left
+/// `a=[]; a.push(a); a.join('-')` recursing until the native stack aborted the
+/// process. On node v26.7.0 that expression is `""`.
+fn join_array(recv: &Value, sep: &str) -> Result<Value, String> {
+    if !host::join_stack_push(recv) {
+        return Ok(with_host(|h| h.new_str(String::new())));
+    }
+    let parts = join_parts(&array_items(recv));
+    host::join_stack_pop();
+    let s = parts?.join(sep);
+    Ok(with_host(|h| h.new_str(s)))
 }
 
 /// `Array.prototype.join`'s per-element conversion (23.1.3.18 step 4): a
@@ -5656,6 +5745,10 @@ fn join_parts(items: &[Value]) -> Result<Vec<String>, String> {
             .map(|x| match x {
                 Value::Undef => Some(String::new()),
                 _ if h.is_null(x) => Some(String::new()),
+                // A SYMBOL element is primitive but has no `ToString`, so it must
+                // fall through to the fallible path and throw there:
+                // `[Symbol()].join()` is a TypeError on node v26.7.0.
+                _ if matches!(h.get(x), Some(JsObj::Symbol { .. })) => None,
                 _ if host::is_primitive(h, x) => Some(h.str_of(x)),
                 _ => None,
             })
@@ -5728,7 +5821,16 @@ fn sort_values(items: &mut [Value], cmp: Option<&Value>) -> Result<(), String> {
 
 /// Recursively flatten `items` up to `depth` levels into `out`. `depth` is an
 /// f64 so `Infinity` (full flatten) and finite counts share one path.
-fn flatten_into(items: Vec<Value>, depth: f64, out: &mut Vec<Value>) {
+///
+/// `flat` has NO cycle cut — unlike `join`, V8 lets it run out of stack, and
+/// `a=[1]; a.push(a); a.flat(Infinity)` is `RangeError: Maximum call stack size
+/// exceeded` on node v26.7.0. That is reproduced by checking the same native
+/// stack floor the VM does, so the answer is a catchable error rather than the
+/// `fatal runtime error: stack overflow` abort this used to produce.
+fn flatten_into(items: Vec<Value>, depth: f64, out: &mut Vec<Value>) -> Result<(), String> {
+    if host::stack_exhausted() {
+        return Err(host::stack_overflow_error());
+    }
     for it in items {
         let inner = if depth > 0.0 {
             match with_host(|h| h.get(&it).cloned()) {
@@ -5739,10 +5841,11 @@ fn flatten_into(items: Vec<Value>, depth: f64, out: &mut Vec<Value>) {
             None
         };
         match inner {
-            Some(inner) => flatten_into(inner, depth - 1.0, out),
+            Some(inner) => flatten_into(inner, depth - 1.0, out)?,
             None => out.push(it),
         }
     }
+    Ok(())
 }
 
 fn array_splice(recv: &Value, args: Vec<Value>) -> Result<Value, String> {
@@ -6012,6 +6115,13 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                     host::fmt_number(n)
                 )));
             }
+            // The PRODUCT is what V8 bounds, so `''.repeat(2**53)` is legal (and
+            // `''`) while `'ab'.repeat(268435445)` is not: measured on node
+            // v26.7.0, `'ab'.repeat(268435444).length` is 536870888 and one more
+            // is `RangeError: Invalid string length`.
+            if n * crate::utf16::len(s) as f64 > host::MAX_STRING_LENGTH as f64 {
+                return Err(host::invalid_string_length());
+            }
             Ok(new_s(s.repeat(n as usize)))
         }
         "concat" => {
@@ -6021,8 +6131,8 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             }
             Ok(new_s(out))
         }
-        "padStart" => Ok(new_s(pad(s, &args, true))),
-        "padEnd" => Ok(new_s(pad(s, &args, false))),
+        "padStart" => Ok(new_s(pad(s, &args, true)?)),
+        "padEnd" => Ok(new_s(pad(s, &args, false)?)),
         // Regex-taking string methods: dispatch to the regexp module when the
         // argument is a RegExp; otherwise keep the plain-string behavior.
         "match" => crate::regexp::str_match(s, &arg0(&args)),
@@ -6182,13 +6292,18 @@ fn byte_to_unit_index(s: &str, byte: Option<usize>) -> f64 {
     }
 }
 
-fn pad(s: &str, args: &[Value], start: bool) -> String {
-    let target = arg_num(args, 0) as usize;
+fn pad(s: &str, args: &[Value], start: bool) -> Result<String, String> {
+    let target_f = arg_num(args, 0);
+    let target = if target_f.is_finite() && target_f > 0.0 {
+        target_f as usize
+    } else {
+        0
+    };
     // `targetLength` and the padding both count code units: `'𝒳'.padStart(3,'-')`
     // is `'-𝒳'` in node, not `'--𝒳'`.
     let cur = crate::utf16::len(s);
     if cur >= target {
-        return s.to_string();
+        return Ok(s.to_string());
     }
     let filler = if args.len() >= 2 {
         with_host(|h| h.str_of(&args[1]))
@@ -6196,7 +6311,13 @@ fn pad(s: &str, args: &[Value], start: bool) -> String {
         " ".to_string()
     };
     if filler.is_empty() {
-        return s.to_string();
+        return Ok(s.to_string());
+    }
+    // Checked only AFTER the two short-circuits, which is the order V8 uses:
+    // measured on node v26.7.0, `'ab'.padStart(2**40, '')` is `'ab'` while
+    // `'ab'.padStart(536870889, 'x')` is `RangeError: Invalid string length`.
+    if target_f > host::MAX_STRING_LENGTH as f64 {
+        return Err(host::invalid_string_length());
     }
     let need = target - cur;
     let fill = crate::utf16::Units::of(&filler);
@@ -6207,11 +6328,11 @@ fn pad(s: &str, args: &[Value], start: bool) -> String {
         .filter_map(|i| fill.unit(i % fill.len()))
         .collect();
     let padding = crate::utf16::to_string_lossy(&units);
-    if start {
+    Ok(if start {
         format!("{padding}{s}")
     } else {
         format!("{s}{padding}")
-    }
+    })
 }
 
 /// V8's radix rejection, shared by `Number.prototype.toString` and
@@ -7016,12 +7137,15 @@ fn symbol_method(recv: &Value, name: &str, _args: Vec<Value>) -> Result<Value, S
 
 fn object_create(args: Vec<Value>) -> Result<Value, String> {
     let proto = arg0(&args);
+    // 20.1.2.2 step 1: the prototype must be an Object or exactly `null`.
+    // `undefined` is NOT accepted — measured on node v26.7.0,
+    // `Object.create(undefined)` is
+    // `TypeError: Object prototype may only be an Object or null: undefined`,
+    // where node-js quietly built a normal object.
+    reject_bad_prototype(&proto)?;
     let obj = with_host(|h| h.new_object(IndexMap::new()));
-    // `set_proto` records a null proto as an explicit null-prototype object;
-    // undefined leaves the object with the default (bare-object) prototype.
-    if !matches!(proto, Value::Undef) {
-        with_host(|h| h.set_proto(&obj, proto));
-    }
+    // `set_proto` records a null proto as an explicit null-prototype object.
+    with_host(|h| h.set_proto(&obj, proto));
     // Optional second arg: a property-descriptor map.
     if let Some(descs) = args.get(1).filter(|d| !matches!(d, Value::Undef)) {
         let entries: Vec<(String, Value)> = with_host(|h| match h.get(descs) {
@@ -7047,10 +7171,59 @@ fn builtin_proto_method_names(ns: &str) -> Option<&'static [&'static str]> {
 
 fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
-    let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+    // 20.1.2.4 steps 1-3, both of which node-js skipped entirely: a non-object
+    // target and a non-object descriptor each throw before anything is written.
+    if !with_host(|h| is_object_like(h, &obj)) {
+        return Err(host::type_error(
+            "Object.defineProperty called on non-object",
+        ));
+    }
     let desc = args.get(2).cloned().unwrap_or(Value::Undef);
+    if !with_host(|h| is_object_like(h, &desc)) {
+        return Err(host::type_error(&format!(
+            "Property description must be an object: {}",
+            with_host(|h| h.str_of(&desc))
+        )));
+    }
+    let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
     apply_descriptor(&obj, &key, &desc);
     Ok(obj)
+}
+
+/// Whether `v` is an Object in the language sense — anything `typeof` calls
+/// `"object"` (bar `null`) or `"function"`. Used by the argument checks that
+/// distinguish "an object" from a primitive.
+fn is_object_like(h: &host::JsHost, v: &Value) -> bool {
+    matches!(v, Value::Obj(_)) && !h.is_null(v) && !host::is_primitive(h, v)
+}
+
+/// `RequireObjectCoercible(v)` — 7.2.1. The check in front of every `ToObject`,
+/// which node-js was missing on the whole `Object.keys`/`values`/`entries`/
+/// `getOwnPropertyNames`/`getOwnPropertySymbols`/`getOwnPropertyDescriptor`/
+/// `assign` family: each returned an empty result for `null` where node v26.7.0
+/// throws `TypeError: Cannot convert undefined or null to object`. A PRIMITIVE
+/// is coercible and keeps working (`Object.keys(1)` is `[]`).
+fn require_object_coercible(v: &Value) -> Result<(), String> {
+    if with_host(|h| matches!(v, Value::Undef) || h.is_null(v)) {
+        return Err(host::type_error(
+            "Cannot convert undefined or null to object",
+        ));
+    }
+    Ok(())
+}
+
+/// 10.1.2 / 20.1.2.2 step 1: reject a `[[Prototype]]` that is neither an Object
+/// nor `null`, with V8's wording. Measured on node v26.7.0:
+/// `Object.create("s")` is
+/// `TypeError: Object prototype may only be an Object or null: s`.
+fn reject_bad_prototype(proto: &Value) -> Result<(), String> {
+    if with_host(|h| h.is_null(proto) || is_object_like(h, proto)) {
+        return Ok(());
+    }
+    Err(host::type_error(&format!(
+        "Object prototype may only be an Object or null: {}",
+        with_host(|h| h.str_of(proto))
+    )))
 }
 
 /// Apply a `{ value | get | set }` descriptor object to `obj[key]`.
@@ -7115,6 +7288,7 @@ fn object_define_properties(args: Vec<Value>) -> Result<Value, String> {
 
 fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
+    require_object_coercible(&obj)?;
     let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
     // A method read off an enumerable builtin prototype (`EventEmitter.prototype`)
     // yields a `{ value: <method thunk> }` data descriptor so `mixin` can copy it.

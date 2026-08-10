@@ -1,7 +1,14 @@
 //! End-to-end inline Rust FFI: a `rust { ... }` block is desugared, compiled to
 //! a cdylib via `rustc`, dlopened, and its exports called from JavaScript.
-//! Requires `rustc` on PATH (always present in a Rust CI); skips cleanly
-//! otherwise so a toolchain-less environment never reports a false failure.
+//!
+//! `rustc` is REQUIRED, not optional. Both tests used to `return` early when it
+//! was absent, executing zero assertions and reporting PASS — a green run that
+//! proved nothing, and the exact shape (a blind skip guard) that has now been
+//! found in more than one frontend. The guard is a hard assertion instead: the
+//! binary under test was produced by the very toolchain being probed, and
+//! `fusevm::ffi` resolves the same `$RUSTC`-or-`rustc` that `rustc_available`
+//! does (fusevm-0.22.0 `src/ffi.rs:328`), so an absent compiler means the
+//! environment is broken, not that the feature is untestable.
 //!
 //! Drives the built `node` binary as a subprocess (`CARGO_BIN_EXE_node`):
 //! `console.log` writes straight to the process stdout, and running out of
@@ -38,12 +45,19 @@ fn run_js(src: &str) -> (String, String, bool) {
     )
 }
 
+/// The compiler this suite needs. Fails the test rather than skipping it.
+fn require_rustc() {
+    assert!(
+        rustc_available(),
+        "rustc is not runnable (checked $RUSTC, else `rustc` on PATH), so the FFI \
+         path cannot be exercised. This is a broken environment, not a reason to \
+         pass: `cargo test` built this binary with a Rust toolchain moments ago."
+    );
+}
+
 #[test]
 fn rust_block_exports_are_callable_across_all_v1_signatures() {
-    if !rustc_available() {
-        eprintln!("skipping FFI test: rustc not on PATH");
-        return;
-    }
+    require_rustc();
     // Distinct names so this test's registry entries never collide with another
     // test's. Exercises int-arity, float-arity, and string->int marshalling
     // (the string arg rides as a JS heap handle and is marshalled to a native
@@ -67,9 +81,7 @@ console.log(ffi_slen("hello world"))
 
 #[test]
 fn rust_block_with_no_exports_errors() {
-    if !rustc_available() {
-        return;
-    }
+    require_rustc();
     // A block with no `pub extern "C" fn` is a hard error — v1 requires at least
     // one exported function.
     let src = "rust { fn helper() -> i64 { 1 } }\nconsole.log(1)\n";

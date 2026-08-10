@@ -67,6 +67,18 @@ fn examples_match_frozen_node_output() {
     let bin = node_bin();
     let files = example_files();
 
+    // An EMPTY corpus satisfies every check below — the count comparison is
+    // `0 == 0` and the loop runs zero times — so the whole test would report
+    // PASS having replayed nothing. A vanished `examples/` dir, a snapshot
+    // truncated to zero records, or a glob that stops matching `.js` all reduce
+    // to that, and each is a failure of the harness rather than of node-js.
+    assert!(
+        files.len() >= 10,
+        "only {} example programs found under examples/ — the corpus is missing \
+         or the walker is stale; a replay over nothing is not a passing parity run",
+        files.len()
+    );
+
     assert_eq!(
         files.len(),
         expected.len(),

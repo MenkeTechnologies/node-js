@@ -1782,3 +1782,363 @@ fn a_required_module_gets_the_full_module_object() {
          true"
     );
 }
+
+// ── round 7: a stack overflow is a catchable error, not an abort ─────────────
+
+/// Every JS call is a Rust recursion (`run_user_func_nt` -> `run_chunk_on` -> a
+/// fresh `fusevm::VM` on the stack), so unbounded recursion used to exhaust the
+/// OS stack and kill the process: `fatal runtime error: stack overflow`, exit
+/// 134, which no `try`/`catch` can observe. V8 throws a catchable `RangeError`.
+///
+/// `run` panics on a non-zero exit, so a returning abort fails this outright;
+/// the assertions then pin the CONSTRUCTOR, the `instanceof` chain and the
+/// message. The last two lines matter as much as the first: a guard that fires
+/// too eagerly would break ordinary recursion (depth 1000) and a generator body,
+/// which runs on its own coroutine stack the thread's bounds say nothing about.
+/// Expected values from node v26.7.0.
+#[test]
+fn unbounded_recursion_throws_instead_of_aborting() {
+    let src = r#"
+        function f() { return f(); }
+        try { f(); console.log('no throw'); } catch (e) {
+          console.log(e.constructor.name, e.name, e instanceof RangeError, e instanceof Error, e.message);
+        }
+        const o = { valueOf() { return this + 1; } };
+        try { o + 1; } catch (e) { console.log(e.name, e.message); }
+        const p = { toString() { return String(p); } };
+        try { String(p); } catch (e) { console.log(e.name, e.message); }
+        function* g() { function r(n) { return n <= 0 ? 0 : 1 + r(n - 1); } try { yield r(1000000); } catch (e) { yield e.name + ' ' + e.message; } }
+        console.log(g().next().value);
+        function d(n) { return n <= 0 ? 0 : 1 + d(n - 1); }
+        console.log(d(1000));
+        const cyc = [1]; cyc.push(cyc);
+        try { cyc.flat(Infinity); } catch (e) { console.log('flat', e.name, e.message); }
+        console.log('still running');
+    "#;
+    assert_eq!(
+        run(src),
+        "RangeError RangeError true true Maximum call stack size exceeded\n\
+         RangeError Maximum call stack size exceeded\n\
+         RangeError Maximum call stack size exceeded\n\
+         RangeError Maximum call stack size exceeded\n\
+         1000\n\
+         flat RangeError Maximum call stack size exceeded\n\
+         still running"
+    );
+}
+
+/// `Array.prototype.join` is the one graph walk the language leaves unbounded,
+/// so every engine keeps a JoinStack and renders a receiver already being joined
+/// as the empty string. node-js had no such cut: `String(a)` on a
+/// self-referential array recursed until the process aborted. Only RE-ENTRANCE
+/// is cut, not repetition — `[a,a].join('|')` still renders `a` twice.
+/// Expected values from node v26.7.0.
+#[test]
+fn a_cyclic_array_joins_to_the_empty_string_at_the_cycle() {
+    let src = r#"
+        const a = [1]; a.push(a); a.push(2);
+        console.log(JSON.stringify(a.join('-')));
+        const b = [1, 2]; const c = [3, b]; b.push(c);
+        console.log(JSON.stringify(b.join(',')));
+        const d = []; d.push(d);
+        console.log(JSON.stringify(String(d)), JSON.stringify(d.toString()), JSON.stringify(`${d}`));
+        const e = [1]; e.push(e);
+        console.log(JSON.stringify([e, e].join('|')));
+        const f = [1];
+        console.log(JSON.stringify([f, f].join('|')));
+        const g = [1]; g.push(g);
+        console.log(JSON.stringify(g.toLocaleString()));
+        console.log(JSON.stringify([1, [2, 3], null, undefined, 4].join('-')));
+    "#;
+    assert_eq!(
+        run(src),
+        "\"1--2\"\n\
+         \"1,2,3,\"\n\
+         \"\" \"\" \"\"\n\
+         \"1,|1,\"\n\
+         \"1|1\"\n\
+         \"1,\"\n\
+         \"1-2,3---4\""
+    );
+}
+
+/// A Map/Set rendered its members through `inspect`, which restarts at indent 0,
+/// so the depth gate never fired: nesting printed one level too deep, and a
+/// self-referential Map or Set recursed until the process aborted. The last two
+/// lines pin that a cycle now terminates at all. Expected values from
+/// node v26.7.0.
+#[test]
+fn map_and_set_inspect_at_their_nesting_depth() {
+    let src = r#"
+        const m4 = new Map([['d', 1]]), m3 = new Map([['c', m4]]), m2 = new Map([['b', m3]]), m1 = new Map([['a', m2]]);
+        console.log(m1);
+        const s4 = new Set([1]), s3 = new Set([s4]), s2 = new Set([s3]), s1 = new Set([s2]);
+        console.log(s1);
+        console.log({ a: { b: new Map([['c', new Map([['d', 1]])]]) } });
+        console.log(new Map([['k', [1, [2, [3, [4]]]]]]));
+        console.log([[[new Map(), new Set(), [], {}]]]);
+        const cm = new Map(); cm.set('m', cm);
+        console.log(typeof require('util').inspect(cm));
+        console.log('survived');
+    "#;
+    assert_eq!(
+        run(src),
+        "Map(1) { 'a' => Map(1) { 'b' => Map(1) { 'c' => [Map] } } }\n\
+         Set(1) { Set(1) { Set(1) { [Set] } } }\n\
+         { a: { b: Map(1) { 'c' => [Map] } } }\n\
+         Map(1) { 'k' => [ 1, [ 2, [Array] ] ] }\n\
+         [ [ [ Map(0) {}, Set(0) {}, [], {} ] ] ]\n\
+         string\n\
+         survived"
+    );
+}
+
+/// The length arithmetic is checked BEFORE the allocation. `'a'.repeat(2**40)`
+/// and `new Array(2**32)` used to sit building a 1 TiB string / four billion
+/// elements until they were killed, and `new Array(-1)` / `a.length = -1` were
+/// accepted outright. What is bounded is the RESULT, so `''.repeat(2**53)` stays
+/// legal, and `ToUint32(len) === ToNumber(len)` is the array test, so `'3'` is 3
+/// and `-0` is 0. Expected values from node v26.7.0.
+#[test]
+fn string_and_array_length_limits_throw_rather_than_allocate() {
+    let src = r#"
+        const t = (f) => { try { return String(f()); } catch (e) { return e.constructor.name + ': ' + e.message; } };
+        console.log(t(() => 'a'.repeat(2 ** 40)));
+        console.log(t(() => 'abc'.padStart(2 ** 40, 'x')));
+        console.log(t(() => 'ab'.padEnd(536870889, 'x')));
+        console.log(t(() => ''.repeat(2 ** 53).length));
+        console.log(t(() => 'ab'.padStart(2 ** 40, '').length));
+        console.log(t(() => new Array(-1)));
+        console.log(t(() => new Array(1.5)));
+        console.log(t(() => new Array(2 ** 32)));
+        console.log(t(() => new Array(-0).length), t(() => new Array(3).length), t(() => new Array('x').length));
+        console.log(t(() => { const a = []; a.length = -1; return 'set'; }));
+        console.log(t(() => { const a = []; a.length = 'x'; return 'set'; }));
+        console.log(t(() => { const a = [1]; a.length = 2 ** 32; return 'set'; }));
+        console.log(t(() => { const a = []; a.length = '3'; return a.length; }));
+        console.log(t(() => { const a = [1, 2, 3]; a.length = 1; return JSON.stringify(a); }));
+        console.log(t(() => { const a = []; a.length = { valueOf() { return 2; } }; return a.length; }));
+    "#;
+    assert_eq!(
+        run(src),
+        "RangeError: Invalid string length\n\
+         RangeError: Invalid string length\n\
+         RangeError: Invalid string length\n\
+         0\n\
+         2\n\
+         RangeError: Invalid array length\n\
+         RangeError: Invalid array length\n\
+         RangeError: Invalid array length\n\
+         0 3 1\n\
+         RangeError: Invalid array length\n\
+         RangeError: Invalid array length\n\
+         RangeError: Invalid array length\n\
+         3\n\
+         [1]\n\
+         2"
+    );
+}
+
+// ── round 7: error SHAPE — the constructor, not just the message ─────────────
+
+/// Every line here was a silent success in node-js: `Object.create(1)` built a
+/// normal object, `Object.defineProperty(1, ...)` wrote nothing and returned,
+/// `Object.keys(null)` answered `[]`, and `setPrototypeOf` ignored both the
+/// prototype type check and the target's extensibility. The passing rows at the
+/// end pin that the checks did not over-reject: a primitive IS object-coercible
+/// (`Object.keys(1)` is `[]`), a nullish SOURCE to `assign` is skipped, and
+/// re-setting the SAME prototype stays legal on a frozen object.
+/// Expected values from node v26.7.0.
+#[test]
+fn object_statics_reject_their_bad_arguments() {
+    let src = r#"
+        const t = (f) => { try { const r = f(); return typeof r === 'object' && r !== null ? JSON.stringify(r) : String(r); } catch (e) { return e.constructor.name + ': ' + e.message; } };
+        console.log(t(() => Object.create(1)));
+        console.log(t(() => Object.create('s')));
+        console.log(t(() => Object.create(undefined)));
+        console.log(t(() => Object.getPrototypeOf(Object.create(null))));
+        console.log(t(() => Object.create({ a: 1 }).a));
+        console.log(t(() => Object.setPrototypeOf(1, {})));
+        console.log(t(() => Object.setPrototypeOf(null, {})));
+        console.log(t(() => Object.setPrototypeOf({}, 1)));
+        console.log(t(() => Object.setPrototypeOf(Object.freeze({}), {})));
+        console.log(t(() => Object.setPrototypeOf(Object.preventExtensions({}), {})));
+        console.log(t(() => Object.setPrototypeOf(Object.freeze({}), Object.prototype)));
+        console.log(t(() => { const p = { a: 9 }, o = {}; Object.setPrototypeOf(o, p); return o.a; }));
+        console.log(t(() => Object.defineProperty(1, 'a', {})));
+        console.log(t(() => Object.defineProperty(null, 'a', {})));
+        console.log(t(() => Object.defineProperty({}, 'a', 1)));
+        console.log(t(() => Object.defineProperty({}, 'a', undefined)));
+        console.log(t(() => { const o = {}; Object.defineProperty(o, 'a', { value: 7, enumerable: true }); return o.a; }));
+        console.log(t(() => Object.keys(null)));
+        console.log(t(() => Object.values(undefined)));
+        console.log(t(() => Object.entries(null)));
+        console.log(t(() => Object.getOwnPropertyNames(null)));
+        console.log(t(() => Object.getOwnPropertySymbols(null)));
+        console.log(t(() => Object.getOwnPropertyDescriptor(null, 'a')));
+        console.log(t(() => Object.assign(null, {})));
+        console.log(t(() => Object.keys(1)));
+        console.log(t(() => Object.keys({ a: 1 })));
+        console.log(t(() => Object.assign({}, null)));
+        console.log(t(() => Object.assign({ a: 1 }, { b: 2 })));
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError: Object prototype may only be an Object or null: 1\n\
+         TypeError: Object prototype may only be an Object or null: s\n\
+         TypeError: Object prototype may only be an Object or null: undefined\n\
+         null\n\
+         1\n\
+         1\n\
+         TypeError: Object.setPrototypeOf called on null or undefined\n\
+         TypeError: Object prototype may only be an Object or null: 1\n\
+         TypeError: #<Object> is not extensible\n\
+         TypeError: #<Object> is not extensible\n\
+         {}\n\
+         9\n\
+         TypeError: Object.defineProperty called on non-object\n\
+         TypeError: Object.defineProperty called on non-object\n\
+         TypeError: Property description must be an object: 1\n\
+         TypeError: Property description must be an object: undefined\n\
+         7\n\
+         TypeError: Cannot convert undefined or null to object\n\
+         TypeError: Cannot convert undefined or null to object\n\
+         TypeError: Cannot convert undefined or null to object\n\
+         TypeError: Cannot convert undefined or null to object\n\
+         TypeError: Cannot convert undefined or null to object\n\
+         TypeError: Cannot convert undefined or null to object\n\
+         TypeError: Cannot convert undefined or null to object\n\
+         []\n\
+         [\"a\"]\n\
+         {}\n\
+         {\"a\":1,\"b\":2}"
+    );
+}
+
+/// A symbol has no `ToString` and no `ToNumber`, so it is the one primitive that
+/// throws on coercion (7.1.4 step 2, 7.1.17 step 2). node-js rendered
+/// `Symbol(desc)` into the result instead. Which message V8 picks is decided by
+/// whether the operation is string concatenation. `String(sym)`, `sym.toString()`
+/// and a symbol PROPERTY KEY are the documented exceptions and still work.
+/// Expected values from node v26.7.0.
+#[test]
+fn a_symbol_refuses_every_implicit_conversion() {
+    let src = r#"
+        const t = (f) => { try { return String(f()); } catch (e) { return e.constructor.name + ': ' + e.message; } };
+        const s = Symbol('d');
+        console.log(t(() => s + ''));
+        console.log(t(() => '' + s));
+        console.log(t(() => `${s}`));
+        console.log(t(() => [s].join(',')));
+        console.log(t(() => [s].toString()));
+        console.log(t(() => s + s));
+        console.log(t(() => s + 1));
+        console.log(t(() => s * 1));
+        console.log(t(() => -s));
+        console.log(t(() => s < 1));
+        console.log(t(() => Number(s)));
+        console.log(t(() => +s));
+        console.log(t(() => String(s)));
+        console.log(t(() => s.toString()));
+        console.log(t(() => s.description));
+        console.log(t(() => s === s), t(() => s == 1));
+        console.log(t(() => { const o = {}; o[s] = 1; return Object.getOwnPropertySymbols(o).length; }));
+        console.log(t(() => JSON.stringify(s)));
+        console.log(t(() => [s].map(String).join('|')));
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError: Cannot convert a Symbol value to a string\n\
+         TypeError: Cannot convert a Symbol value to a string\n\
+         TypeError: Cannot convert a Symbol value to a string\n\
+         TypeError: Cannot convert a Symbol value to a string\n\
+         TypeError: Cannot convert a Symbol value to a string\n\
+         TypeError: Cannot convert a Symbol value to a number\n\
+         TypeError: Cannot convert a Symbol value to a number\n\
+         TypeError: Cannot convert a Symbol value to a number\n\
+         TypeError: Cannot convert a Symbol value to a number\n\
+         TypeError: Cannot convert a Symbol value to a number\n\
+         TypeError: Cannot convert a Symbol value to a number\n\
+         TypeError: Cannot convert a Symbol value to a number\n\
+         Symbol(d)\n\
+         Symbol(d)\n\
+         d\n\
+         true false\n\
+         1\n\
+         undefined\n\
+         Symbol(d)"
+    );
+}
+
+/// Only an ordinary function has a `[[Construct]]` slot. An arrow, a
+/// `function*`, an `async function` and a MethodDefinition are callable but not
+/// constructable; node-js ran their bodies and handed back a half-built
+/// instance. The message names the callee by source text in V8 and by name here
+/// (node-js keeps no spans), so this pins the CLASS, which is the part that
+/// diverged. Expected values from node v26.7.0.
+#[test]
+fn new_on_a_non_constructor_is_a_type_error() {
+    let src = r#"
+        const t = (f) => { try { return String(f()); } catch (e) { return e.constructor.name + ': ' + e.name; } };
+        console.log(t(() => { const g = function* () {}; return new g(); }));
+        console.log(t(() => { const a = async function () {}; return new a(); }));
+        console.log(t(() => { const a = () => {}; return new a(); }));
+        console.log(t(() => { const o = { m() {} }; return new o.m(); }));
+        console.log(t(() => { function F() { this.x = 1; } return new F().x; }));
+        console.log(t(() => { class C { constructor() { this.y = 2; } } return new C().y; }));
+        console.log(t(() => { function F() { this.z = 3; } const B = F.bind(null); return new B().z; }));
+        console.log(t(() => new Math.max()));
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError: TypeError\n\
+         TypeError: TypeError\n\
+         TypeError: TypeError\n\
+         TypeError: TypeError\n\
+         1\n\
+         2\n\
+         3\n\
+         TypeError: TypeError"
+    );
+}
+
+/// What a test runner reads off a caught `AssertionError` is `actual`,
+/// `expected`, `operator` and `generatedMessage` — and node-js carried only
+/// `code`/`message`/`stack`, so all four were `undefined` and
+/// `e.constructor.name` said `Error`. The operator is the METHOD name for the
+/// strict/deep forms and the OPERATOR for the two loose ones. `Object.keys`
+/// order is part of the pin. Expected values from node v26.7.0.
+#[test]
+fn a_failing_assertion_carries_nodes_whole_property_set() {
+    let src = r#"
+        const a = require('assert');
+        const d = (f) => { try { f(); return 'NO-THROW'; } catch (e) {
+          return [e.constructor.name, e.name, e.code, JSON.stringify(e.operator), JSON.stringify(e.actual),
+            JSON.stringify(e.expected), e.generatedMessage, JSON.stringify(e.diff),
+            JSON.stringify(Object.keys(e)), e instanceof Error].join(' ');
+        } };
+        console.log(d(() => a.equal(1, 2)));
+        console.log(d(() => a.notEqual(1, 1)));
+        console.log(d(() => a.strictEqual(1, 2)));
+        console.log(d(() => a.notStrictEqual(1, 1)));
+        console.log(d(() => a.deepStrictEqual({ a: 1 }, { a: 2 })));
+        console.log(d(() => a.ok(0)));
+        console.log(d(() => a.fail('boom')));
+        console.log(d(() => a.throws(() => {})));
+        console.log(d(() => a.strictEqual(1, 2, 'cm')));
+        console.log(d(() => a.strictEqual(1, 1)));
+    "#;
+    assert_eq!(
+        run(src),
+        "AssertionError AssertionError ERR_ASSERTION \"==\" 1 2 true \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         AssertionError AssertionError ERR_ASSERTION \"!=\" 1 1 true \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         AssertionError AssertionError ERR_ASSERTION \"strictEqual\" 1 2 true \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         AssertionError AssertionError ERR_ASSERTION \"notStrictEqual\" 1 1 true \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         AssertionError AssertionError ERR_ASSERTION \"deepStrictEqual\" {\"a\":1} {\"a\":2} true \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         AssertionError AssertionError ERR_ASSERTION \"==\" 0 true true \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         AssertionError AssertionError ERR_ASSERTION \"fail\"   false \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         AssertionError AssertionError ERR_ASSERTION \"throws\"   false \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         AssertionError AssertionError ERR_ASSERTION \"strictEqual\" 1 2 false \"simple\" [\"generatedMessage\",\"code\",\"actual\",\"expected\",\"operator\",\"diff\"] true\n\
+         NO-THROW"
+    );
+}

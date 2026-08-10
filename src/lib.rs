@@ -30,6 +30,43 @@ pub mod utf16;
 
 pub use fusevm::Value;
 
+/// Stack reserved for the thread JS runs on ([`run_on_js_stack`]).
+///
+/// A JS call is a Rust recursion (`host::run_user_func_nt` → `run_chunk_on` →
+/// a fresh `fusevm::VM` on the stack), so recursion depth is bounded by the
+/// native stack rather than by a frame counter. On the OS default 8 MiB this
+/// bought only 83 frames in a debug build — measured, `node -e 'function
+/// f(n){if(n<=0)return 0;return 1+f(n-1)} f(84)'` aborted — where node v26.7.0
+/// reaches 9901. Reserving 256 MiB is virtual address space, faulted in only as
+/// deep recursion actually uses it, and `host::stack_exhausted` still turns the
+/// far end into a catchable `RangeError` rather than an abort. The reservation
+/// is capped rather than sized to match node's depth exactly so that a runaway
+/// recursion's peak RSS stays bounded; the resulting depth is documented in
+/// BUGS.md.
+pub const JS_STACK_SIZE: usize = 256 * 1024 * 1024;
+
+/// Run `f` on a thread with [`JS_STACK_SIZE`] of stack, falling back to the
+/// calling thread if the reservation is refused (a `ulimit`ed or memory-capped
+/// environment must still run programs, just at a lower recursion ceiling —
+/// `host::stack_exhausted` measures whatever stack it ends up on).
+///
+/// Takes a plain `fn` pointer, not a closure: `Builder::spawn` consumes what it
+/// is given and does not hand it back on failure, and a `fn` is `Copy`, so the
+/// fallback can still call the same entry point.
+pub fn run_on_js_stack(f: fn() -> std::process::ExitCode) -> std::process::ExitCode {
+    match std::thread::Builder::new()
+        .name("node-js".into())
+        .stack_size(JS_STACK_SIZE)
+        .spawn(f)
+    {
+        // A panic on the JS thread has already written its message to stderr;
+        // re-raising keeps the process dying exactly as it would have without
+        // the hop, rather than turning an abort into a quiet exit code.
+        Ok(h) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        Err(_) => f(),
+    }
+}
+
 /// Compile a source string to a runnable program.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
