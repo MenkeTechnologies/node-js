@@ -897,6 +897,11 @@ impl JsHost {
         h
     }
 
+    /// Whether `v` IS the one `globalThis` object (not merely an object).
+    pub fn is_global_object(&self, v: &Value) -> bool {
+        !matches!(self.global_obj, Value::Undef) && self.global_obj == *v
+    }
+
     /// The `globalThis` object — one per host, so its identity and its
     /// properties both survive across reads.
     pub fn global_object(&mut self) -> Value {

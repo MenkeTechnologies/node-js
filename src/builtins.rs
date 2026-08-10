@@ -459,27 +459,39 @@ fn finish(vm: &mut VM, r: Result<Value, String>) -> Value {
 
 // ── name handlers ─────────────────────────────────────────────────────────────
 
-fn b_getlocal(vm: &mut VM, _: u8) -> Value {
-    let name = sval(&vm.pop());
-    if let Some(v) = with_host(|h| h.read_name(&name)) {
-        return v;
+/// The value a bare global identifier resolves to, or `None` if unbound.
+///
+/// Shared by `b_getlocal` (the `x` form) and the `globalThis.x` property read,
+/// which must agree: a name reachable one way and not the other is exactly the
+/// discrepancy that left `globalThis.process` undefined while `process` worked.
+pub(crate) fn global_binding(name: &str) -> Option<Value> {
+    if let Some(v) = with_host(|h| h.read_name(name)) {
+        return Some(v);
     }
     // Globals bound lazily: numeric sentinels + builtin namespaces.
-    match name.as_str() {
-        "undefined" => return Value::Undef,
-        "NaN" => return Value::Float(f64::NAN),
-        "Infinity" => return Value::Float(f64::INFINITY),
+    match name {
+        "undefined" => return Some(Value::Undef),
+        "NaN" => return Some(Value::Float(f64::NAN)),
+        "Infinity" => return Some(Value::Float(f64::INFINITY)),
         // One object, not a fresh one per read: `globalThis === globalThis` is
         // `true` in JS, and `globalThis.x = 1` is readable back as
         // `globalThis.x`. Both were false while each read minted a new object.
         // `global` is Node's alias for the same object.
-        "globalThis" | "global" => return with_host(|h| h.global_object()),
+        "globalThis" | "global" => return Some(with_host(|h| h.global_object())),
         _ => {}
     }
-    if is_namespace(&name) || is_known_builtin(&name) {
-        return with_host(|h| h.alloc(JsObj::Builtin(name.clone())));
+    if is_namespace(name) || is_known_builtin(name) {
+        return Some(with_host(|h| h.alloc(JsObj::Builtin(name.to_string()))));
     }
-    abort(vm, host::ref_error(&name))
+    None
+}
+
+fn b_getlocal(vm: &mut VM, _: u8) -> Value {
+    let name = sval(&vm.pop());
+    match global_binding(&name) {
+        Some(v) => v,
+        None => abort(vm, host::ref_error(&name)),
+    }
 }
 
 fn b_setlocal(vm: &mut VM, _: u8) -> Value {
@@ -564,6 +576,34 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
             "Cannot read properties of {} (reading '{name}')",
             with_host(|h| h.str_of(recv))
         )));
+    }
+    // A read off `globalThis` for a name the object does not own falls back to
+    // the same lazy global binding the bare identifier gets. Without it the
+    // global object was an empty bag: `globalThis.process`, `.console`, `.Math`
+    // and `.JSON` were all `undefined`, so `process === globalThis.process` was
+    // `false` and any `globalThis.X` feature probe reported the feature missing.
+    if with_host(|h| h.is_global_object(recv)) {
+        let own = with_host(|h| match h.get(recv) {
+            Some(JsObj::Object(p)) => p.contains_key(name),
+            _ => false,
+        });
+        // The CommonJS wrapper's parameters are function locals in Node, not
+        // global-object properties: `typeof globalThis.require` is `undefined`
+        // there even though the bare `require` works.
+        const CJS_WRAPPER_LOCALS: &[&str] = &[
+            "require",
+            "module",
+            "exports",
+            "__filename",
+            "__dirname",
+            "__cjs_require",
+            "__cjs_resolve",
+        ];
+        if !own && !CJS_WRAPPER_LOCALS.contains(&name) {
+            if let Some(v) = global_binding(name) {
+                return Ok(v);
+            }
+        }
     }
     // Accessor (own or inherited getter) takes precedence over the chain walk.
     if let Some((getter, _)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
@@ -1512,6 +1552,12 @@ fn b_named_eval(vm: &mut VM, _: u8) -> Value {
 }
 
 fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
+    // `globalThis.x = 1` creates a real global binding, so the bare `x` reads it
+    // back. Writing only the own property left the two views disagreeing:
+    // `globalThis.zz` was 7 while `zz` was still a `ReferenceError`.
+    if with_host(|h| h.is_global_object(recv)) && !name.starts_with("@@") {
+        with_host(|h| h.set_name(name, val.clone()));
+    }
     // `obj.__proto__ = p` re-links the prototype — but only for the two values
     // the Annex B setter accepts, an Object or `null`. Everything else is a
     // silent no-op in Node (`o.__proto__ = 5` leaves `Object.getPrototypeOf(o)`

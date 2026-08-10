@@ -39,7 +39,12 @@ fn every_write_path_is_captured() {
 fn output_before_a_throw_is_kept() {
     let (result, out) =
         nodejs::eval_str_captured("console.log('before'); throw new Error('boom');", &[]);
-    assert!(result.is_err(), "expected the throw to surface");
+    // `is_err()` alone cannot tell this apart from a run that never reached the
+    // `throw` — a parse failure, an unbound name, a panic in the host — all of
+    // which are also `Err`, and the `out` assertion below would then be the only
+    // thing failing. Pin the error the program actually raised.
+    let err = result.expect_err("expected the throw to surface");
+    assert_eq!(err, "Uncaught Error: boom", "wrong error surfaced: {err:?}");
     assert_eq!(out, "before\n");
 }
 

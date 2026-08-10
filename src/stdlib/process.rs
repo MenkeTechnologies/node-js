@@ -16,6 +16,11 @@ pub const METHODS: &[&str] = &[
     "chdir",
     "exit",
     "hrtime",
+    // `process.hrtime.bigint()` is a real member, not just a property that
+    // answers `typeof "function"`. It resolves as the qualified builtin
+    // `process.hrtime.bigint` (`namespace_property` composes `ns` + `name`),
+    // so it has to be declared here for `is_method` to route the call.
+    "hrtime.bigint",
     "uptime",
     "memoryUsage",
     "cpuUsage",
@@ -186,13 +191,33 @@ fn emit_warning_args(args: &[Value]) {
 }
 
 /// Data properties, served through `namespace_property` → `stdlib::constant`.
+/// Memoize an OBJECT-valued `process` property for the host's lifetime.
+///
+/// `process.env`, `process.argv` and the std streams were rebuilt on every read,
+/// so `process.env === process.env` was `false` and — much worse —
+/// `process.env.NODE_ENV = "production"` wrote to a throwaway object and read
+/// back `undefined`. Node hands out one object per property, and packages both
+/// mutate it and compare it by identity.
+///
+/// `builtin_static` is the existing side table for exactly this: state that must
+/// survive the fresh `Builtin` handle each `process` reference allocates. It is
+/// per-host, so `reset_host` clears it and a stale handle cannot outlive its heap.
+fn memo(name: &str, make: impl FnOnce() -> Value) -> Value {
+    if let Some(v) = with_host(|h| h.builtin_static("process", name)) {
+        return v;
+    }
+    let v = make();
+    with_host(|h| h.set_builtin_static("process", name, v.clone()));
+    v
+}
+
 pub fn constant(name: &str) -> Option<Value> {
     Some(match name {
-        "env" => env_object(),
-        "argv" => argv(),
+        "env" => memo("env", env_object),
+        "argv" => memo("argv", argv),
         "argv0" => with_host(|h| h.new_str(exec_path())),
         "execPath" => with_host(|h| h.new_str(exec_path())),
-        "execArgv" => exec_argv(),
+        "execArgv" => memo("execArgv", exec_argv),
         "platform" => with_host(|h| h.new_str(super::os::platform())),
         "arch" => with_host(|h| h.new_str(super::os::arch())),
         "pid" => Value::Float(std::process::id() as f64),
@@ -201,10 +226,10 @@ pub fn constant(name: &str) -> Option<Value> {
         // A best-effort Node-compatible version string. Kept low so a dep's
         // `if (semver.lt(process.version, ...))` gate takes the conservative path.
         "version" => with_host(|h| h.new_str("v26.5.0")),
-        "versions" => versions(),
-        "stdout" => std_stream(1),
-        "stderr" => std_stream(2),
-        "stdin" => std_stream(0),
+        "versions" => memo("versions", versions),
+        "stdout" => memo("stdout", || std_stream(1)),
+        "stderr" => memo("stderr", || std_stream(2)),
+        "stdin" => memo("stdin", || std_stream(0)),
         // Unset reads back as `undefined`, not `0` — `process.exitCode` starts
         // life absent and a script may test for that.
         "exitCode" => match with_host(|h| h.exit_code) {
@@ -290,6 +315,13 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // monotonic clock via `Instant` is unavailable statically, so use the
         // system clock — sufficient for the timing scaffolding deps set up).
         "hrtime" => Ok(hrtime(args)),
+        // Nanoseconds since an arbitrary epoch, as a BigInt.
+        "hrtime.bigint" => Ok(with_host(|h| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            h.new_bigint(num_bigint::BigInt::from(now.as_nanos()))
+        })),
         "uptime" => Ok(Value::Float(0.0)),
         "memoryUsage" => Ok(memory_usage()),
         "cpuUsage" => Ok(with_host(|h| {

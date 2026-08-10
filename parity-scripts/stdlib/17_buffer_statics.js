@@ -38,3 +38,26 @@ console.log(Buffer(3).length === Buffer.alloc(3).length, Buffer([3]).length);
 // The exact conjunction `safe-buffer` evaluates.
 const buffer = require("buffer");
 console.log(!!(buffer.Buffer.from && buffer.Buffer.alloc && buffer.Buffer.allocUnsafe && buffer.Buffer.allocUnsafeSlow));
+// That conjunction is satisfied by any four truthy values, so it passes whether
+// or not the four do anything. Each is now also CALLED and its result compared.
+console.log(buffer.Buffer.from("ab").toString("hex"), buffer.Buffer.alloc(2).toString("hex"));
+console.log(buffer.Buffer.allocUnsafe(3).length, buffer.Buffer.allocUnsafeSlow(3).length);
+console.log(buffer.Buffer === Buffer, buffer.Buffer.from("ab").equals(Buffer.from("ab")));
+
+// A fixed-width read past the end THROWS; it used to answer 0, which is
+// indistinguishable from a buffer that really holds a zero there.
+const four = Buffer.from([1, 2, 3, 4]);
+console.log(four.readUInt8(3), four.readUInt16BE(2), four.readInt32BE(0));
+for (const [label, f] of [
+  ["past-end", () => four.readUInt8(4)],
+  ["negative", () => four.readUInt8(-1)],
+  ["no-room", () => four.readUInt32LE(1)],
+  ["fractional", () => four.readUInt8(1.5)],
+  ["empty-buffer", () => Buffer.alloc(0).readUInt8(0)],
+]) {
+  try {
+    console.log(label, "=", f());
+  } catch (e) {
+    console.log(label, e.name, e.code, e.message);
+  }
+}

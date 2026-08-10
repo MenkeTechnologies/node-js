@@ -988,6 +988,135 @@ it diverges from ICU for any non-ASCII input (`'ä'.localeCompare('z')` is `1`
 here, `-1` in node), ignores the `locales` and `options` arguments, and does not
 raise node's `RangeError: Invalid language tag` for a malformed tag.
 
+## FIXED in round 6 — the reference wordings that were frozen in the source
+
+Round 6 audited every string literal in `src/` that purports to be node's own
+words. Each row was measured against node v26.7.0 before and after.
+
+**The round's theme, found here exactly once.** `new URL("/x")` threw
+`TypeError: Invalid URL: /x` from `src/stdlib/url.rs` while the sibling
+`url_legacy::invalid_url` was already emitting the current
+`TypeError [ERR_INVALID_URL]: Invalid URL`. One code path had been updated and
+the other had not, and no version gate can see a string frozen in the source.
+
+**Fabricated — text no node ever printed:**
+
+| site | was | node v26.7.0 |
+| --- | --- | --- |
+| `process.chdir("/nope")` | `ENOENT: No such file or directory (os error 2), chdir '/nope'` (Rust's `io::Error` Display) | `ENOENT: no such file or directory, chdir '<cwd>' -> '/nope'` |
+| `crypto.createHash("nope")` | `Digest method not supported: nope` | `Digest method not supported` |
+| `[...5]` | `number is not iterable` (the `typeof`) | `5 is not iterable` (the VALUE) |
+| `FinalizationRegistry#register(1,2)` | `…register: target must be an object` | `…register: invalid target` |
+| `FinalizationRegistry#unregister(1)` | `…unregister: unregister token must be an object` | `Invalid unregisterToken ('1')` |
+| `util.styleText("nope","x")` | `must be a valid util.inspect.colors key` | enumerates every accepted name |
+| `stream.pipeline()` | `pipeline requires at least one stream` | `The "streams[stream.length - 1]" property must be of type function. Received undefined` |
+
+`styleText`'s list is now GENERATED from the same `(name, open, close)` table the
+lookup reads, so a style cannot be accepted-but-unlisted, and the count is never
+written down.
+
+**Stale — a real wording that had drifted from its sibling.**
+`BigInt.prototype.toString(37)` said `radix must be between 2 and 36` where V8
+says `radix argument must be`. Both `toString` sites now share one constant —
+and `Number.prototype.toString` gained the validation it never had at all: an
+out-of-range radix silently fell back to base 10, so `(1).toString(37)` returned
+`"1"` and a support probe was told every radix worked.
+
+**Missing `code` — the message matched, `err.code` was `undefined`** at
+`new URL`, `fileURLToPath`, `require()` (`MODULE_NOT_FOUND`),
+`validateHeaderName`/`validateHeaderValue` (both forms), `buf.swap16`,
+`timingSafeEqual`, `randomInt`, `process.exit` (both forms) and `process.kill`.
+
+Node does NOT bracket the code uniformly, and the difference is observable:
+
+| | `String(err)` | `err.code` |
+| --- | --- | --- |
+| JS layer (`process.exit(1.5)`) | `RangeError [ERR_OUT_OF_RANGE]: …` | set |
+| native layer (`new URL("/x")`) | `TypeError: Invalid URL` | set |
+
+So there are two constructors (`host::coded_error` and
+`host::plain_coded_error`); one head form would have to pick one and be wrong
+about the other.
+
+**Deliberate divergences, deliberately left alone:** the terse `node: <reason>`
+where node prints a V8 stack, `localeCompare`'s ASCII approximation,
+`normalize` as the identity, and a lone surrogate rendering as `U+FFFD`.
+
+## FIXED in round 6 — Rust names that look like the reference's
+
+| lookalike | symptom |
+| --- | --- |
+| `(x + 0.5).floor()` as `Math.round` | `Math.round(0.49999999999999994)` was 1 (must be 0); `Math.round(4503599627370497)` perturbed an exact integer |
+| `f64::powf` as `Math.pow`/`**` | IEEE `pow` makes `(-1) ** Infinity` and `1 ** NaN` equal 1; the spec says NaN |
+| `f64 as i64 as u32` as `ToInt32` | Rust SATURATES an out-of-range float cast, so `1e300 | 0` was -1 and `1e300 >>> 0` was 4294967295 — both are 0 in every engine |
+| `>` / `<` for `Math.max`/`min` | cannot separate +0 from -0, so `Math.max(-0, 0)` kept the -0 |
+| `char::is_whitespace` as ECMA `WhiteSpace` | differs in BOTH directions: `U+FEFF` is JS whitespace and not Unicode `White_Space`; `U+0085` is the reverse |
+| `i64::from_str_radix` in `parseInt` | overflowed past ~19 digits into `NaN` |
+| longest plausible run in `parseFloat` | is not the longest VALID prefix: `parseFloat("1e")` was `NaN`, not 1 |
+
+Nine `Math` members did not exist at all — `imul`, `log1p`, `expm1` and the six
+hyperbolics; `typeof Math.imul` was `undefined`. Their results are within 1 ULP
+of node over a 2178-point sweep. That residue is macOS libm against V8's fdlibm
+and is not specific to the new members: it also affects `tan` (39 points),
+`atan` (19) and `cbrt` (12), which this round did not touch.
+
+`**` moved off fusevm's native `Op::Pow` onto a builtin, so `cache::SCHEMA` went
+7 → 8; a v7 blob still carries `Op::Pow` and would replay the IEEE answer from
+cache. The `Math.*` additions needed no bump, and that is measured rather than
+assumed: `--dump-bytecode` is byte-identical for a known and an unknown `Math`
+method name, because the name is a constant and dispatch happens at run time.
+
+## FIXED in round 6 — identity, and the assertions that could not see it
+
+`process.env`, `process.argv`, `process.execArgv`, `process.versions` and the
+three std streams were rebuilt on every read. `process.env === process.env` was
+`false`, and `process.env.NODE_ENV = "production"` wrote to a throwaway object
+and read back `undefined`. They are memoized for the host's lifetime now.
+
+`globalThis` was an empty bag: `globalThis.process`, `.console`, `.Math` and
+`.JSON` were all `undefined`, so `process === globalThis.process` was `false`
+and any `globalThis.X` feature probe reported the feature missing. A read off
+the global object now falls through to the same lazy binding the bare
+identifier gets, and `globalThis.x = 1` creates a real global binding (it used
+to set an own property that the bare `x` could not see). The CommonJS wrapper
+locals (`require`, `module`, `exports`, `__filename`, `__dirname`) stay OFF the
+global object, as in node.
+
+None of that was visible to the corpus, because `parity-scripts/stdlib/20_process.js`
+checked the whole surface with `typeof x === "string"` — satisfied by any
+string. Those lines are kept and each is now paired with a check that re-derives
+the same read from an independent source (`process.argv[0] === process.execPath`,
+`process.version.slice(1) === process.versions.node`) or compares identity.
+
+The same sweep found `typeof process.hrtime.bigint === "function"` answering
+`true` while CALLING it threw `bigint is not a function` — an existence check
+that a missing implementation satisfies. `hrtime.bigint` is implemented, and the
+corpus now calls it.
+
+A `buf.readXxx(offset)` past the end returned 0 rather than throwing, which is
+indistinguishable from a buffer that really holds a zero there. All six
+fixed-width reads validate now (`ERR_OUT_OF_RANGE`, or
+`ERR_BUFFER_OUT_OF_BOUNDS` when the buffer could never hold the value), and
+`parity-scripts/stdlib/17_buffer_statics.js` exercises each failure mode instead
+of only the truthiness conjunction `safe-buffer` evaluates.
+
+`tests/embed.rs::output_before_a_throw_is_kept` asserted `result.is_err()`,
+which a parse failure or an unbound name satisfies just as well as the `throw`
+under test. It pins the error text now.
+
+## FIXED in round 6 — lone surrogates in a string literal
+
+A `\uD800` escape was DROPPED by the lexer rather than substituted, so
+`"\ud800".length` was 0 where this runtime's own documented `U+FFFD` policy
+requires 1 — the policy exists precisely to keep the code-unit arithmetic exact,
+and dropping the unit broke the invariant instead of implementing it.
+
+An in-literal surrogate PAIR is also rejoined now: `"\ud83d\ude00"` is the
+ordinary ASCII-safe way to write an astral character, and decoding each half
+independently turned every such literal into two `U+FFFD`s. Two SEPARATE
+literals still cannot rejoin (`"\ud83d" + "\ude00"`), which is the documented
+Rust-`String` boundary above, not a new gap.
+
 ## Still open — found by the round-5 doc audit, not yet fixed
 
 Each of these was verified against node v26.7.0 and is a real divergence; none
@@ -1002,12 +1131,10 @@ is claimed fixed anywhere in this file.
 | `/(?i)abc/` | `SyntaxError: Invalid group` | accepted; matches case-insensitively while `.ignoreCase` reports `false` |
 | `/\1(a)/` (a forward reference) | `true` — matches the empty string | `false` |
 | `/\cA/` (a control escape), `/\052/` (an octal escape) | valid patterns, both match | `SyntaxError` — over-rejected |
-| `new URL("/x")` error | `.code === 'ERR_INVALID_URL'` | `.code` is `undefined` |
-| `Buffer.alloc(-1)`, `Buffer.alloc('x')`, `path.join(1)` | throw a coded error | do not throw |
+| `Buffer.alloc(-1)`, `Buffer.alloc('x')`, `path.join(1)` | throw a coded error | do not throw (the fixed-width `buf.readXxx` reads DO throw as of round 6) |
 | `Buffer.alloc(2**40)` | returns promptly (the allocation is lazy) | hangs — killed at 8s, materialising a 1 TiB byte vector |
 | `url.resolve` with an uppercase scheme, an empty port, or a Unicode host | lowercases / strips / punycodes | leaves the input as-is |
 | `Object.getPrototypeOf(class B extends A {})` | `A` | not `A` (static-method LOOKUP still works) |
-| `FinalizationRegistry` error text | `register: invalid target` | `register: target must be an object` |
 
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
