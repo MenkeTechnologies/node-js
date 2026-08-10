@@ -47,14 +47,21 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 
 /// `querystring.parse(str[, sep[, eq]])` → an object of decoded key/value pairs.
 /// A repeated key collects its values into an array, matching Node.
+///
+/// An explicitly-passed `undefined` separator means "use the default", not the
+/// STRING `"undefined"` — `body-parser` calls
+/// `parse(body, undefined, undefined, { maxKeys })`, and coercing those to text
+/// made the whole body one key.
 fn parse(s: &str, args: &[Value]) -> Value {
     let sep = args
         .get(1)
+        .filter(|v| !matches!(v, Value::Undef))
         .map(|_| super::arg_str(args, 1))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "&".into());
     let eq = args
         .get(2)
+        .filter(|v| !matches!(v, Value::Undef))
         .map(|_| super::arg_str(args, 2))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "=".into());
@@ -98,11 +105,13 @@ fn stringify(args: &[Value]) -> Value {
     let obj = args.first().cloned().unwrap_or(Value::Undef);
     let sep = args
         .get(1)
+        .filter(|v| !matches!(v, Value::Undef))
         .map(|_| super::arg_str(args, 1))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "&".into());
     let eq = args
         .get(2)
+        .filter(|v| !matches!(v, Value::Undef))
         .map(|_| super::arg_str(args, 2))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "=".into());

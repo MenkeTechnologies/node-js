@@ -1354,3 +1354,29 @@ fn splitting_a_surrogate_pair_yields_the_replacement_char() {
     // is exact — only an extracted half degrades.
     assert_eq!(run(src), "1,1,2\ntrue,true\n55349,56499\n\u{FFFD}");
 }
+
+#[test]
+fn querystring_parse_treats_an_explicit_undefined_separator_as_default() {
+    // `body-parser`'s simple urlencoded parser calls
+    // `querystring.parse(body, undefined, undefined, { maxKeys: 1000 })`.
+    // Coercing an explicit `undefined` to the string "undefined" made it the
+    // separator, so nothing split and the entire body became a single key —
+    // express 4's `urlencoded({ extended: false })` returned
+    // `{"a=1&b=2&c=3":""}`. Expected values from `node v26.7.0`.
+    let src = r#"
+        const qs = require('querystring');
+        console.log(JSON.stringify(qs.parse('a=1&b=2')));
+        console.log(JSON.stringify(qs.parse('a=1&b=2', undefined, undefined, { maxKeys: 1000 })));
+        console.log(JSON.stringify(qs.parse('a:1;b:2', ';', ':')));
+        console.log(qs.stringify({ a: '1', b: '2' }, undefined, undefined));
+        console.log(qs.stringify({ a: '1', b: '2' }, ';', ':'));
+    "#;
+    assert_eq!(
+        run(src),
+        "{\"a\":\"1\",\"b\":\"2\"}\n\
+         {\"a\":\"1\",\"b\":\"2\"}\n\
+         {\"a\":\"1\",\"b\":\"2\"}\n\
+         a=1&b=2\n\
+         a:1;b:2"
+    );
+}
