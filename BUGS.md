@@ -1104,6 +1104,42 @@ of only the truthiness conjunction `safe-buffer` evaluates.
 which a parse failure or an unbound name satisfies just as well as the `throw`
 under test. It pins the error text now.
 
+## FIXED in round 6 — `assert`'s error class and generated messages
+
+`e.name` was `Error` and `e.message` was
+`AssertionError [ERR_ASSERTION]: 1 strictEqual 2`. Two separate faults:
+
+1. `"AssertionError"` was not in `host::ERROR_NAMES`, so `synth_error` failed
+   the class check on the `AssertionError [ERR_ASSERTION]: …` head and fell into
+   the `Error` branch keeping the WHOLE head as the message — a prefix node
+   keeps out of `.message` entirely (it appears only in `.stack`). It is a
+   recognized name now, and still NOT a global: node exposes the class only as
+   `assert.AssertionError`, and `GLOBAL_FUNCS` is a separate table.
+2. Every comparison generated `{actual} {op} {expected}`, so `strictEqual(1, 2)`
+   produced `1 strictEqual 2` — the operator NAME substituted where node writes
+   a heading. That shape is correct only for the two loose forms.
+
+Each comparison now carries node's own shape, measured on v26.7.0:
+
+| call | node v26.7.0 `.message` |
+| --- | --- |
+| `equal(1,2)` | `1 == 2` |
+| `strictEqual(1,2)` | `Expected values to be strictly equal:\n\n1 !== 2\n` |
+| `notStrictEqual(1,1)` | `Expected "actual" to be strictly unequal to: 1` |
+| `deepEqual(x,y)` | `Expected values to be loosely deep-equal:` + both sides |
+| `notDeepStrictEqual(x,x)` | `Expected "actual" not to be strictly deep-equal to:` + the value |
+
+Two residues, both narrower than the wording gap they replaced:
+
+- **`ok(false)`** — node appends an echo of the failing SOURCE LINE
+  (`\n\n  a.ok(false)\n`), which needs the call site's text. The heading matches.
+- **A non-primitive operand renders single-line.** Node's assert calls
+  `util.inspect` with `compact: false`, so `{a: 1}` becomes `{\n  a: 1\n}`;
+  here it stays `{ a: 1 }`. The message STRUCTURE matches; only the inspect
+  mode differs. `deepStrictEqual` between two objects additionally renders a
+  `+ actual - expected` structural diff, which needs a line-oriented differ over
+  inspect output and is not reproduced; its primitive form is exact.
+
 ## FIXED in round 6 — lone surrogates in a string literal
 
 A `\uD800` escape was DROPPED by the lexer rather than substituted, so

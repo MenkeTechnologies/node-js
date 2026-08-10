@@ -35,8 +35,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "ok" => assert_ok(args),
         "equal" => check(loose_eq(&a(), &b()), args, 2, "==", &a(), &b()),
         "notEqual" => check(!loose_eq(&a(), &b()), args, 2, "!=", &a(), &b()),
-        "strictEqual" => check(strict(&a(), &b()), args, 2, "strictEqual", &a(), &b()),
-        "notStrictEqual" => check(!strict(&a(), &b()), args, 2, "notStrictEqual", &a(), &b()),
+        "strictEqual" => check(strict(&a(), &b()), args, 2, "===", &a(), &b()),
+        "notStrictEqual" => check(!strict(&a(), &b()), args, 2, "!==", &a(), &b()),
         "deepEqual" => check(
             deep_equal(&a(), &b(), false),
             args,
@@ -297,7 +297,9 @@ pub fn assert_ok(args: &[Value]) -> Result<Value, String> {
         Err(fail_msg(
             args,
             1,
-            "The expression evaluated to a falsy value",
+            // Node's heading ends with a colon and is followed by an echo of
+            // the failing source line, which needs the call site's text.
+            "The expression evaluated to a falsy value:",
         ))
     }
 }
@@ -317,7 +319,34 @@ fn check(
         return Err(assertion_error(&m));
     }
     let (sa, sb) = with_host(|h| (h.inspect(a), h.inspect(b)));
-    Err(assertion_error(&format!("{sa} {op} {sb}")))
+    // Each comparison has its OWN generated-message shape in Node; `{a} {op} {b}`
+    // is only right for the two loose forms. `strictEqual(1, 2)` produced
+    // `1 strictEqual 2` here, which is not a sentence any Node emits — the
+    // operator name was being substituted where Node writes a whole heading.
+    let msg = match op {
+        "==" | "!=" => format!("{sa} {op} {sb}"),
+        "===" => format!("Expected values to be strictly equal:\n\n{sa} !== {sb}\n"),
+        "!==" => format!("Expected \"actual\" to be strictly unequal to: {sa}"),
+        "deepEqual" => format!(
+            "Expected values to be loosely deep-equal:\n\n{sa}\n\nshould loosely \
+             deep-equal\n\n{sb}"
+        ),
+        "notDeepEqual" => {
+            format!("Expected \"actual\" not to be loosely deep-equal to:\n\n{sa}")
+        }
+        // The `+ actual - expected` structural DIFF Node renders between two
+        // non-primitive operands is not reproduced (it needs a line-oriented
+        // differ over `util.inspect` output); the primitive form, which is the
+        // whole message when neither side is an object, is exact.
+        "deepStrictEqual" => {
+            format!("Expected values to be strictly deep-equal:\n\n{sa} !== {sb}\n")
+        }
+        "notDeepStrictEqual" => {
+            format!("Expected \"actual\" not to be strictly deep-equal to:\n\n{sa}\n")
+        }
+        _ => format!("{sa} {op} {sb}"),
+    };
+    Err(assertion_error(&msg))
 }
 
 fn throws(args: &[Value], want_throw: bool) -> Result<Value, String> {
@@ -341,8 +370,14 @@ fn fail_msg(args: &[Value], idx: usize, default: &str) -> String {
     assertion_error(&message(args, idx).unwrap_or_else(|| default.to_string()))
 }
 
+/// An `AssertionError` as an internal error string.
+///
+/// `Name [CODE]: message` is the shared encoding `synth_error` parses back into
+/// `.name`/`.code`/`.message`, so the prefix must be built by the one
+/// constructor rather than written out here — spelling it inline is what let
+/// this site keep a form the parser did not recognize.
 fn assertion_error(msg: &str) -> String {
-    format!("AssertionError [ERR_ASSERTION]: {msg}")
+    crate::host::coded_error("AssertionError", "ERR_ASSERTION", msg)
 }
 
 fn strict(a: &Value, b: &Value) -> bool {

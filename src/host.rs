@@ -5182,6 +5182,13 @@ pub const ERROR_NAMES: &[&str] = &[
     "EvalError",
     "URIError",
     "AggregateError",
+    // `assert`'s error class. It is NOT a global (node exposes it only as
+    // `assert.AssertionError`, and `GLOBAL_FUNCS` is a separate table), but it
+    // has to be a name `synth_error` recognizes: without it the head
+    // `AssertionError [ERR_ASSERTION]: …` failed the class check and fell into
+    // the `Error` branch with the WHOLE head kept as the message, so `e.name`
+    // was `Error` and `e.message` carried a prefix node keeps out of it.
+    "AssertionError",
 ];
 
 impl JsHost {
