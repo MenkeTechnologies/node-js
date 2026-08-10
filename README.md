@@ -125,18 +125,33 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
   `join`/`concat`/`includes`/`indexOf`/`flat`/`flatMap`/`reverse`/`fill`/`at`,
   `charAt`/`charCodeAt`/`padStart`/`padEnd`/`repeat`/`replace`/`replaceAll`/
   `startsWith`/`endsWith`, …).
+- `class` declarations and expressions: inheritance and `super`, static and
+  instance fields, getters/setters, private `#` names, and a class body that
+  evaluates in its own environment (so a static initializer can name its class).
+- `async` / `await` and the microtask queue, generators and `yield` /
+  `yield*`, async generators and `for await`, `Promise` (including
+  `all`/`allSettled`/`race`/`any`).
+- Destructuring patterns (array, object, nested, `...rest`) with defaults;
+  default and rest parameters; labeled `break`/`continue`.
+- `RegExp` (literals and constructor, named groups, the `String.prototype`
+  regex methods), `Map` / `Set` / `WeakMap` / `WeakSet`, `Symbol`, `BigInt`,
+  typed arrays and `Buffer`.
+- CommonJS `require` and the Node standard library — see `BUGS.md` for the
+  module-by-module coverage list and the honest not-implemented set.
+- The persistent bytecode cache runs on EVERY invocation (schema-versioned, so
+  an older cached script never replays incompatible bytecode), and AOT
+  native-executable emission is on the CLI as `--build`.
+- An LSP server (`--lsp`) and a DAP debug adapter (`--dap`) — source-line and
+  function breakpoints, stepping, call stack, locals, and expression
+  `evaluate` — are wired.
 
 ## [0x04] NOT YET (LATER WAVES)
 
-`class` (declarations, inheritance, methods), `async` / `await`, generators
-(`yield`), ES modules (`import` / `export`), destructuring patterns, default and
-rest parameters, labeled statements, `RegExp`, `Map` / `Set` / `Promise`, and the
-Node.js standard library (`fs`, `path`, `process`, `require`, event loop). The
-crate is built as a `staticlib` with fusevm's `aot` and `jit-disk-cache` features
-enabled (mirroring `pythonrs`), but **AOT native-executable emission and the
-persistent bytecode cache are not yet exposed on the CLI**. An LSP server
-(`--lsp`) and a DAP debug adapter (`--dap`) — source-line and function
-breakpoints, stepping, call stack, locals, and expression `evaluate` — are wired.
+ES modules: neither the static `import`/`export` forms nor dynamic `import()`
+parse, so a `.mjs` entry point is a `SyntaxError` and every module boundary has
+to go through CommonJS `require`. `Proxy` and `Intl` are absent by design rather
+than by omission — the reasoning for each is in `BUGS.md`, which also lists the
+remaining behavioural divergences from the reference `node`.
 
 ## [0x05] PARITY HARNESS & FUZZER
 
