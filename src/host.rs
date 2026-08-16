@@ -281,10 +281,15 @@ pub enum JsObj {
 /// under the sentinel string `@@<name>` (`property_key`) so the internal
 /// lookups (`@@iterator`, `@@toPrimitive`, …) can find it without a symbol
 /// table walk. Symbols V8 defines but node-js does not act on are deliberately
-/// absent: `Symbol.hasInstance` reading as a symbol while `instanceof` ignored
-/// it would be a silent fake.
-pub const WELL_KNOWN_SYMBOLS: &[&str] =
-    &["iterator", "asyncIterator", "toPrimitive", "toStringTag"];
+/// absent: a symbol that reads back while the operator it names ignores it would
+/// be a silent fake. `hasInstance` is listed because `instance_of` consults it.
+pub const WELL_KNOWN_SYMBOLS: &[&str] = &[
+    "iterator",
+    "asyncIterator",
+    "toPrimitive",
+    "toStringTag",
+    "hasInstance",
+];
 
 /// Whether the internal key `k` came from a SYMBOL used as a property key
 /// (`@@sym:<id>`, or a well-known `@@iterator`), as opposed to one of node-js's
@@ -2619,12 +2624,42 @@ impl JsHost {
 
     /// `util.inspect`-style rendering (nested; strings quoted).
     pub fn inspect(&self, v: &Value) -> String {
-        self.inspect_lvl(v, 0)
+        self.inspect_lvl(v, 0, &mut InspectCycles::default())
     }
 
-    /// `util.inspect` at a given indentation level (drives array multi-line
-    /// grouping and nested indentation).
-    fn inspect_lvl(&self, v: &Value, indent: usize) -> String {
+    /// `util.inspect` at a given indentation level, with the cycle guard applied
+    /// around the object cases.
+    ///
+    /// A value already being rendered further up the chain is a CYCLE, and Node
+    /// marks both ends of it: the back-edge prints `[Circular *N]` and the
+    /// object it points back at is prefixed `<ref *N>`. Without this the walk
+    /// only stopped when the depth limit turned the back-edge into `[Object]`,
+    /// so `const c={a:1}; c.c=c` printed the misleading
+    /// `{ a: 1, c: { a: 1, c: { a: 1, c: [Object] } } }` instead of
+    /// `<ref *1> { a: 1, c: [Circular *1] }`.
+    ///
+    /// The `*N` id is only assigned when the back-edge is reached, i.e. while
+    /// the target's own children are being rendered — so the prefix can only be
+    /// decided after `inspect_value` returns.
+    fn inspect_lvl(&self, v: &Value, indent: usize, st: &mut InspectCycles) -> String {
+        if !matches!(v, Value::Obj(_)) {
+            return self.inspect_value(v, indent, st);
+        }
+        if st.seen.iter().any(|p| self.strict_eq(p, v)) {
+            return format!("[Circular *{}]", st.mark(self, v));
+        }
+        st.seen.push(v.clone());
+        let body = self.inspect_value(v, indent, st);
+        st.seen.pop();
+        match st.id_of(self, v) {
+            Some(id) => format!("<ref *{id}> {body}"),
+            None => body,
+        }
+    }
+
+    /// The rendering itself, once `inspect_lvl` has established that `v` is not
+    /// a back-edge into an object already on the stack.
+    fn inspect_value(&self, v: &Value, indent: usize, st: &mut InspectCycles) -> String {
         match v {
             Value::Undef => "undefined".into(),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
@@ -2666,7 +2701,7 @@ impl JsHost {
                     }
                     let mut inner: Vec<String> = items
                         .iter()
-                        .map(|x| self.inspect_lvl(x, indent + 2))
+                        .map(|x| self.inspect_lvl(x, indent + 2, st))
                         .collect();
                     let has_props = !prop_keys.is_empty() || !sym_entries.is_empty();
                     for k in &prop_keys {
@@ -2674,7 +2709,7 @@ impl JsHost {
                         inner.push(format!(
                             "{}: {}",
                             fmt_key(k),
-                            self.inspect_lvl(&val, indent + 2)
+                            self.inspect_lvl(&val, indent + 2, st)
                         ));
                     }
                     for (k, val) in &sym_entries {
@@ -2682,7 +2717,10 @@ impl JsHost {
                             Some(s) => self.inspect(&s),
                             None => continue,
                         };
-                        inner.push(format!("{label}: {}", self.inspect_lvl(val, indent + 2)));
+                        inner.push(format!(
+                            "{label}: {}",
+                            self.inspect_lvl(val, indent + 2, st)
+                        ));
                     }
                     self.render_array(&inner, items, indent, has_props)
                 }
@@ -2732,7 +2770,11 @@ impl JsHost {
                                 }
                                 _ => Value::Undef,
                             });
-                            format!("{}: {}", fmt_key(&k), self.inspect_lvl(&val, indent + 2))
+                            format!(
+                                "{}: {}",
+                                fmt_key(&k),
+                                self.inspect_lvl(&val, indent + 2, st)
+                            )
                         })
                         .collect();
                     if extra.is_empty() {
@@ -2795,7 +2837,7 @@ impl JsHost {
                     }
                     let inner: Vec<String> = shown
                         .iter()
-                        .map(|(k, val)| format!("{k}: {}", self.inspect_lvl(val, indent + 2)))
+                        .map(|(k, val)| format!("{k}: {}", self.inspect_lvl(val, indent + 2, st)))
                         .collect();
                     self.render_object(&inner, &prefix, indent)
                 }
@@ -2814,7 +2856,7 @@ impl JsHost {
                     } else {
                         format!("[class {}]", c.name)
                     };
-                    self.with_callable_props(v, base, indent)
+                    self.with_callable_props(v, base, indent, st)
                 }
                 // A Map/Set renders its members at the NEXT nesting level, and
                 // collapses to `[Map]`/`[Set]` past the depth limit exactly as an
@@ -2838,11 +2880,11 @@ impl JsHost {
                     let inner: Vec<String> = entries
                         .values()
                         .map(|(k, val)| {
-                            format!(
-                                "{} => {}",
-                                self.inspect_lvl(k, indent + 2),
-                                self.inspect_lvl(val, indent + 2)
-                            )
+                            // Sequenced, not nested in one `format!`: both arms
+                            // need the same `&mut` cycle state.
+                            let ks = self.inspect_lvl(k, indent + 2, st);
+                            let vs = self.inspect_lvl(val, indent + 2, st);
+                            format!("{ks} => {vs}")
                         })
                         .collect();
                     format!("Map({}) {{ {} }}", entries.len(), inner.join(", "))
@@ -2856,7 +2898,7 @@ impl JsHost {
                     }
                     let inner: Vec<String> = entries
                         .values()
-                        .map(|v| self.inspect_lvl(v, indent + 2))
+                        .map(|v| self.inspect_lvl(v, indent + 2, st))
                         .collect();
                     format!("Set({}) {{ {} }}", entries.len(), inner.join(", "))
                 }
@@ -2865,10 +2907,13 @@ impl JsHost {
                     Some(c) => match c.state {
                         PromiseState::Pending => "Promise { <pending> }".into(),
                         PromiseState::Fulfilled => {
-                            format!("Promise {{ {} }}", self.inspect(&c.value))
+                            format!("Promise {{ {} }}", self.inspect_lvl(&c.value, 0, st))
                         }
                         PromiseState::Rejected => {
-                            format!("Promise {{ <rejected> {} }}", self.inspect(&c.value))
+                            format!(
+                                "Promise {{ <rejected> {} }}",
+                                self.inspect_lvl(&c.value, 0, st)
+                            )
                         }
                     },
                     None => "Promise { <pending> }".into(),
@@ -2884,7 +2929,7 @@ impl JsHost {
                     } else {
                         format!("[Function: {name}]")
                     };
-                    self.with_callable_props(v, base, indent)
+                    self.with_callable_props(v, base, indent, st)
                 }
                 Some(JsObj::Builtin(n)) => {
                     let short = n.rsplit('.').next().unwrap_or(n);
@@ -2908,13 +2953,23 @@ impl JsHost {
     /// Append a callable's own enumerable properties to its `[Function: f]` /
     /// `[class C]` base, the way `util.inspect` does: `[Function: f] { a: 1 }`.
     /// A callable with none renders as the bare base.
-    fn with_callable_props(&self, v: &Value, base: String, indent: usize) -> String {
+    fn with_callable_props(
+        &self,
+        v: &Value,
+        base: String,
+        indent: usize,
+        st: &mut InspectCycles,
+    ) -> String {
         let mut inner: Vec<String> = self
             .own_enum_key_names(v)
             .into_iter()
             .map(|k| {
                 let val = self.fn_prop(v, &k).unwrap_or(Value::Undef);
-                format!("{}: {}", fmt_key(&k), self.inspect_lvl(&val, indent + 2))
+                format!(
+                    "{}: {}",
+                    fmt_key(&k),
+                    self.inspect_lvl(&val, indent + 2, st)
+                )
             })
             .collect();
         for (k, val) in self.own_symbol_entries(v) {
@@ -2922,7 +2977,7 @@ impl JsHost {
                 inner.push(format!(
                     "{}: {}",
                     self.inspect(&sym),
-                    self.inspect_lvl(&val, indent + 2)
+                    self.inspect_lvl(&val, indent + 2, st)
                 ));
             }
         }
@@ -3423,6 +3478,37 @@ fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
 /// JS `%` remainder (sign follows the dividend; matches `f64::rem`).
 fn js_mod(a: f64, b: f64) -> f64 {
     a % b
+}
+
+/// Cycle bookkeeping for one `util.inspect` render.
+///
+/// `seen` is the chain of objects currently being rendered (an entry appearing
+/// twice is a back-edge), and `refs` records every object a back-edge pointed
+/// at, in first-encountered order — its position + 1 is the `*N` id Node prints
+/// in `[Circular *N]` / `<ref *N>`.
+#[derive(Default)]
+struct InspectCycles {
+    seen: Vec<Value>,
+    refs: Vec<Value>,
+}
+
+impl InspectCycles {
+    /// Record `v` as a cycle target (idempotent) and return its 1-based id.
+    fn mark(&mut self, h: &JsHost, v: &Value) -> usize {
+        if let Some(id) = self.id_of(h, v) {
+            return id;
+        }
+        self.refs.push(v.clone());
+        self.refs.len()
+    }
+
+    /// The `*N` id already assigned to `v`, if any.
+    fn id_of(&self, h: &JsHost, v: &Value) -> Option<usize> {
+        self.refs
+            .iter()
+            .position(|p| h.strict_eq(p, v))
+            .map(|i| i + 1)
+    }
 }
 
 thread_local! {
@@ -4740,9 +4826,59 @@ fn ctor_prototype(h: &JsHost, ctor: &Value) -> Option<Value> {
     }
 }
 
+/// V8's "not a function" wording for a value that was expected to be callable.
+/// A number/string/boolean is named WITH its value (`number 1 is not a
+/// function`, `string "s" is not a function`); every other type is named by type
+/// alone (`object is not a function`, `symbol is not a function`).
+fn not_a_function_message(v: &Value) -> String {
+    with_host(|h| match v {
+        Value::Bool(b) => format!("boolean {b} is not a function"),
+        Value::Int(_) | Value::Float(_) => format!("number {} is not a function", h.str_of(v)),
+        Value::Str(s) => format!("string \"{s}\" is not a function"),
+        Value::Obj(_) => match h.get(v) {
+            Some(JsObj::Str(s)) => format!("string \"{s}\" is not a function"),
+            Some(JsObj::Symbol { .. }) => "symbol is not a function".into(),
+            Some(JsObj::BigInt(_)) => "bigint is not a function".into(),
+            _ => "object is not a function".into(),
+        },
+        _ => "object is not a function".into(),
+    })
+}
+
 /// `obj instanceof ctor` — walk `obj`'s prototype chain looking for
 /// `ctor.prototype`.
 pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
+    // 13.10.2 InstanceofOperator step 3: a `Symbol.hasInstance` method on the
+    // right-hand side REPLACES the prototype-chain walk entirely, and it is
+    // consulted before the callability check — which is why a plain (uncallable)
+    // object that defines it is a legal `instanceof` right-hand side.
+    if matches!(ctor, Value::Obj(_)) {
+        // `class C { static [Symbol.hasInstance](){} }` and a method defined on a
+        // plain function both land in the fn-prop side table (which
+        // `class_static` reads, following the `extends` chain), NOT in an object
+        // property map — so consulting only `lookup_chain` would find the object
+        // literal form and silently miss the two forms V8 users actually write.
+        let handler = with_host(|h| {
+            h.class_static(ctor, "@@hasInstance")
+                .or_else(|| lookup_chain(h, ctor, "@@hasInstance"))
+        });
+        // GetMethod (7.3.11) treats only `undefined`/`null` as "absent"; anything
+        // else that is not callable is a TypeError, so a data property here does
+        // NOT fall back to the prototype walk.
+        match handler {
+            Some(f) if with_host(|h| is_callable(h, &f)) => {
+                let r = invoke(&f, vec![obj.clone()], Some(ctor.clone()))?;
+                return Ok(with_host(|h| h.truthy(&r)));
+            }
+            Some(f)
+                if !matches!(f, Value::Undef)
+                    && !with_host(|h| matches!(h.get(&f), Some(JsObj::Null))) =>
+            {
+                return Err(type_error(&not_a_function_message(&f)));
+            }
+            _ => {}
+        }
+    }
     // 13.10.2 InstanceofOperator validates the RIGHT-hand side FIRST, so
     // `1 instanceof 3` throws even though the left side could never match.
     // Returning early on the left side skipped that check entirely.

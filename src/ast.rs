@@ -246,6 +246,10 @@ pub enum MemberKind {
     Get,
     Set,
     Field,
+    /// A `static { … }` initialization block (ES2022). It has no key and no
+    /// parameters: only `body` is meaningful, and it runs once at class-definition
+    /// time with `this` bound to the constructor.
+    StaticBlock,
 }
 
 /// A function/arrow body: either a brace-delimited statement list or (arrow) a

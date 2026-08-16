@@ -1,0 +1,11 @@
+const util = require('util');
+console.log(util.format('%d|%i|%f', 1.7, 1.7, 1.7));
+console.log(util.format('%d|%i|%f', '3.9abc', '3.9abc', '3.9abc'));
+console.log(util.format('%d|%i|%f', 10n, 10n, 10n));
+console.log(util.format('%d|%i|%f', -0, -0, -0));
+console.log(util.format('%d|%i|%f', 1e21, 1e21, 1e21));
+console.log(util.format('%d|%i|%f', Infinity, Infinity, Infinity));
+console.log(util.format('%d|%i|%f', NaN, NaN, NaN));
+console.log(util.format('%d|%i|%f', {}, {}, {}));
+console.log(util.format('%d|%i|%f', Symbol('s'), Symbol('s'), Symbol('s')));
+console.log(Number.MIN_VALUE, Number.MAX_VALUE, Number.EPSILON);

@@ -1205,15 +1205,16 @@ impl Compiler {
         // static-field initializers (step 32). So a static field may call a
         // static method declared after it, and `getOwnPropertyNames(C)` lists
         // the methods before the fields regardless of source order.
+        // A `static { … }` block is a static ELEMENT, not a method: it belongs in
+        // the deferred group with the field initializers and runs interleaved
+        // with them in source order (both filters are stable over `members`).
+        let deferred = |k: &MemberKind| matches!(k, MemberKind::Field | MemberKind::StaticBlock);
         let ordered = node
             .members
             .iter()
-            .filter(|m| !matches!(m.kind, MemberKind::Field))
-            .chain(
-                node.members
-                    .iter()
-                    .filter(|m| matches!(m.kind, MemberKind::Field)),
-            );
+            .filter(|m| !deferred(&m.kind))
+            .chain(node.members.iter().filter(|m| deferred(&m.kind)));
+        let mut static_block_n = 0usize;
         for m in ordered {
             match m.kind {
                 MemberKind::Constructor => {}
@@ -1259,6 +1260,36 @@ impl Compiler {
                         0,
                     );
                     b.emit(Op::CallBuiltin(ops::DEF_FIELD, 4), 0);
+                }
+                MemberKind::StaticBlock => {
+                    // `static { … }` runs ONCE at class-definition time with
+                    // `this` bound to the constructor — exactly what a static
+                    // method called as `C.m()` gets. So it is compiled as a
+                    // static method under a HIDDEN key, invoked, and removed
+                    // again; the `@@` prefix keeps it out of every enumeration
+                    // (`Object.getOwnPropertyNames(C)` and friends filter
+                    // internal slots) for the window in which it exists, and the
+                    // counter keeps sibling blocks from colliding.
+                    static_block_n += 1;
+                    let slot = format!("@@staticBlock:{static_block_n}");
+                    // [class] name kind static fn -> DEF_MEMBER -> [class]
+                    self.name_const(b, &slot);
+                    b.emit(Op::LoadInt(member::METHOD), 0);
+                    b.emit(Op::LoadTrue, 0);
+                    let def_id = self.build_function("", &[], &m.body, false, false)?;
+                    self.functions[def_id].1.is_method = true;
+                    self.emit_mkfunc(b, def_id);
+                    b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0);
+                    // [class] -> C[slot]() -> discard the result
+                    b.emit(Op::Dup, 0);
+                    self.name_const(b, &slot);
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), 0);
+                    b.emit(Op::Pop, 0);
+                    // [class] -> delete C[slot] -> discard the Bool
+                    b.emit(Op::Dup, 0);
+                    self.name_const(b, &slot);
+                    b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 2), 0);
+                    b.emit(Op::Pop, 0);
                 }
                 MemberKind::Method | MemberKind::Get | MemberKind::Set => {
                     // [class] name kind static fn -> DEF_MEMBER -> [class]

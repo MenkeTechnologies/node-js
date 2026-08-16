@@ -2142,3 +2142,274 @@ fn a_failing_assertion_carries_nodes_whole_property_set() {
          NO-THROW"
     );
 }
+
+// ── JSON.stringify: the replacer function and the toJSON key ─────────────────
+
+/// `JSON.stringify(v, fn)` ignored a FUNCTION second argument entirely — the
+/// replacer never ran, so no value was transformed, no key was dropped, and the
+/// top-level `("" , value)` call never happened. The array (key-filter) form was
+/// the only shape implemented. Expected values from node v26.7.0.
+#[test]
+fn json_stringify_runs_a_function_replacer() {
+    let src = r#"
+        const seen = [];
+        JSON.stringify({ a: 1, b: { c: 2 } }, function (k, v) {
+          seen.push(`${JSON.stringify(k)}@${JSON.stringify(this)}`);
+          return v;
+        });
+        console.log(seen.join(' | '));
+        console.log(JSON.stringify({ a: 1, b: 2 }, (k, v) => (typeof v === 'number' ? v * 2 : v)));
+        console.log(JSON.stringify([1, 2], (k, v) => (typeof v === 'number' ? v * 2 : v)));
+        console.log(JSON.stringify({ a: 1, b: 2 }, (k, v) => (k === 'b' ? undefined : v)));
+        console.log(JSON.stringify([1, 2], (k, v) => (k === '0' ? undefined : v)));
+        console.log(JSON.stringify(5, (k, v) => v * 2));
+        console.log(JSON.stringify({ a: 1, b: 2 }, ['a']));
+    "#;
+    assert_eq!(
+        run(src),
+        "\"\"@{\"\":{\"a\":1,\"b\":{\"c\":2}}} | \"a\"@{\"a\":1,\"b\":{\"c\":2}} | \"b\"@{\"a\":1,\"b\":{\"c\":2}} | \"c\"@{\"c\":2}\n\
+         {\"a\":2,\"b\":4}\n\
+         [2,4]\n\
+         {\"a\":1}\n\
+         [null,2]\n\
+         10\n\
+         {\"a\":1}"
+    );
+}
+
+/// `toJSON` was called with NO arguments (so its `key` parameter read
+/// `undefined`) and was then re-applied to its own result, which turned
+/// `{toJSON(){return {toJSON(){return 1}}}}` into `1` where V8 answers `{}`.
+/// The circular-structure guard has to survive both fixes. Expected values from
+/// node v26.7.0 (the message is compared on its first line only — node appends
+/// a `--> starting at …` trace this runtime does not build).
+#[test]
+fn to_json_receives_its_key_and_runs_once() {
+    let src = r#"
+        console.log(JSON.stringify({ a: { toJSON(k) { return 'K:' + k; } } }));
+        console.log(JSON.stringify([{ toJSON(k) { return k; } }]));
+        console.log(JSON.stringify({ toJSON(k) { return JSON.stringify(k); } }));
+        console.log(JSON.stringify({ toJSON() { return { toJSON() { return 1; } }; } }));
+        console.log(JSON.stringify({ d: { toJSON() { return 'x'; } } }, (k, v) => (v === 'x' ? 'y' : v)));
+        const c = {}; c.self = c;
+        try { JSON.stringify(c); } catch (e) { console.log(e.constructor.name + ': ' + e.message.split('\n')[0]); }
+        const g = { get a() { return g; } };
+        try { JSON.stringify(g); } catch (e) { console.log(e.constructor.name + ': ' + e.message.split('\n')[0]); }
+    "#;
+    assert_eq!(
+        run(src),
+        "{\"a\":\"K:a\"}\n\
+         [\"0\"]\n\
+         \"\\\"\\\"\"\n\
+         {}\n\
+         {\"d\":\"y\"}\n\
+         TypeError: Converting circular structure to JSON\n\
+         TypeError: Converting circular structure to JSON"
+    );
+}
+
+// ── util.format numeric directives ──────────────────────────────────────────
+
+/// `%d`, `%i` and `%f` are three DIFFERENT conversions (`Number`, `parseInt`,
+/// `parseFloat`); one truncating `to_number` served all three, which lost the
+/// fraction under `%d`, refused a numeric prefix under `%i`/`%f`, and saturated
+/// every non-finite value to `i64::MAX`. `Number.MIN_VALUE` is pinned alongside
+/// because it was the smallest NORMAL double, not the smallest subnormal.
+/// Expected values from node v26.7.0.
+#[test]
+fn format_numeric_directives_use_their_own_conversions() {
+    let src = r#"
+        const util = require('util');
+        console.log(util.format('%d|%i|%f', 1.7, 1.7, 1.7));
+        console.log(util.format('%d|%i|%f', '3.9abc', '3.9abc', '3.9abc'));
+        console.log(util.format('%d|%i|%f', 10n, 10n, 10n));
+        console.log(util.format('%d|%i|%f', -0, -0, -0));
+        console.log(util.format('%d|%i|%f', 1e21, 1e21, 1e21));
+        console.log(util.format('%d|%i|%f', Infinity, Infinity, Infinity));
+        console.log(util.format('%d|%i|%f', NaN, NaN, NaN));
+        console.log(util.format('%d|%i|%f', {}, {}, {}));
+        console.log(util.format('%d|%i|%f', Symbol('s'), Symbol('s'), Symbol('s')));
+        console.log(Number.MIN_VALUE, Number.MAX_VALUE, Number.EPSILON);
+    "#;
+    assert_eq!(
+        run(src),
+        "1.7|1|1.7\n\
+         NaN|3|3.9\n\
+         10n|10n|10\n\
+         -0|0|0\n\
+         1e+21|1|1e+21\n\
+         Infinity|NaN|Infinity\n\
+         NaN|NaN|NaN\n\
+         NaN|NaN|NaN\n\
+         NaN|NaN|NaN\n\
+         5e-324 1.7976931348623157e+308 2.220446049250313e-16"
+    );
+}
+
+// ── util.inspect cycle marking ──────────────────────────────────────────────
+
+/// A back-edge was only stopped by the DEPTH limit, so a self-referential object
+/// printed three misleading copies of itself ending in `[Object]` instead of
+/// naming the cycle. Both ends are marked: `<ref *N>` on the target and
+/// `[Circular *N]` on the edge. A merely REPEATED (acyclic) reference must stay
+/// unmarked, and the depth limit must still apply to ordinary nesting. Expected
+/// values from node v26.7.0.
+#[test]
+fn inspect_marks_both_ends_of_a_cycle() {
+    let src = r#"
+        const c = { a: 1 }; c.c = c; console.log(c);
+        const arr = [1]; arr.push(arr); console.log(arr);
+        const m = new Map(); m.set('m', m); console.log(m);
+        const s = new Set(); s.add(s); console.log(s);
+        const p = { a: {} }; p.a.up = p; p.b = p; console.log(p);
+        const n1 = {}, n2 = {}; n1.n = n2; n2.n = n1; console.log(n1);
+        const f = function () {}; f.self = f; console.log(f);
+        const shared = { s: 1 }; console.log([shared, shared]);
+        console.log({ a: { b: { c: { d: 1 } } } });
+    "#;
+    assert_eq!(
+        run(src),
+        "<ref *1> { a: 1, c: [Circular *1] }\n\
+         <ref *1> [ 1, [Circular *1] ]\n\
+         <ref *1> Map(1) { 'm' => [Circular *1] }\n\
+         <ref *1> Set(1) { [Circular *1] }\n\
+         <ref *1> { a: { up: [Circular *1] }, b: [Circular *1] }\n\
+         <ref *1> { n: { n: [Circular *1] } }\n\
+         <ref *1> [Function: f] { self: [Circular *1] }\n\
+         [ { s: 1 }, { s: 1 } ]\n\
+         { a: { b: { c: [Object] } } }"
+    );
+}
+
+// ── Symbol.hasInstance ──────────────────────────────────────────────────────
+
+/// `instanceof` walked the prototype chain unconditionally: `Symbol.hasInstance`
+/// did not even exist as a symbol, so every custom-membership class silently
+/// answered `false`. The handler is looked up on the class-static side table
+/// (following `extends`) as well as the property map, is called with the
+/// right-hand side as `this`, propagates a throw, and — per GetMethod — treats
+/// only `undefined`/`null` as absent. Expected values from node v26.7.0.
+#[test]
+fn instanceof_consults_symbol_has_instance() {
+    let src = r#"
+        console.log(typeof Symbol.hasInstance, String(Symbol.hasInstance));
+        class Even { static [Symbol.hasInstance](n) { return n % 2 === 0; } }
+        class SubEven extends Even {}
+        console.log(2 instanceof Even, 3 instanceof Even, 4 instanceof SubEven, 5 instanceof SubEven);
+        const oddish = { [Symbol.hasInstance](x) { return x > 2; } };
+        console.log([1, 2, 3, 4].filter((x) => x instanceof oddish).join(','));
+        const f = function () {}; Object.defineProperty(f, Symbol.hasInstance, { value: () => true });
+        console.log(1 instanceof f);
+        class Boom { static [Symbol.hasInstance]() { throw new Error('boom'); } }
+        try { 1 instanceof Boom; } catch (e) { console.log(e.message); }
+        for (const v of [1, 's', true, {}, null, undefined]) {
+          const o = { [Symbol.hasInstance]: v };
+          try { console.log(1 instanceof o); } catch (e) { console.log(e.constructor.name + ': ' + e.message); }
+        }
+        class A {} class B extends A {}
+        console.log(new B() instanceof A, new A() instanceof B, [] instanceof Array, ({}) instanceof Object);
+    "#;
+    assert_eq!(
+        run(src),
+        "symbol Symbol(Symbol.hasInstance)\n\
+         true false true false\n\
+         3,4\n\
+         true\n\
+         boom\n\
+         TypeError: number 1 is not a function\n\
+         TypeError: string \"s\" is not a function\n\
+         TypeError: boolean true is not a function\n\
+         TypeError: object is not a function\n\
+         TypeError: Right-hand side of 'instanceof' is not callable\n\
+         TypeError: Right-hand side of 'instanceof' is not callable\n\
+         true false true true"
+    );
+}
+
+// ── class static initialization blocks (ES2022) ─────────────────────────────
+
+/// `class C { static { … } }` was a hard `SyntaxError: bad member key Punct("{")`
+/// — the whole script failed to parse. The block runs once at class-definition
+/// time with `this` bound to the constructor, interleaved with the static field
+/// initializers in source order, and must leave NO property behind (which is
+/// what `getOwnPropertyNames` pins here). `static` as an ordinary member name
+/// still has to parse as one. Expected values from node v26.7.0.
+#[test]
+fn class_static_blocks_run_against_the_constructor() {
+    let src = r#"
+        class A {
+          static x = 1;
+          static #p = 3;
+          static { this.viaThis = 5; }
+          static { A.y = A.x + 1; A.viaPrivate = A.#p; }
+          static m() { return 7; }
+          static { A.viaMethod = A.m(); }
+        }
+        console.log(A.x, A.y, A.viaThis, A.viaPrivate, A.viaMethod);
+        console.log(Object.getOwnPropertyNames(A).join(','), Object.keys(A).join(','));
+        class Scoped { static { let v = 1; { let v = 2; void v; } Scoped.v = v; } }
+        console.log(Scoped.v);
+        const C = class { static { this.n = 9; } };
+        class Outer { static { Outer.inner = class { static { this.deep = 1; } }; } }
+        console.log(C.n, Outer.inner.deep);
+        class Named { static(){ return 'call'; } static static = 'field'; }
+        console.log(new Named().static(), Named.static);
+    "#;
+    assert_eq!(
+        run(src),
+        "1 2 5 3 7\n\
+         length,name,prototype,m,x,viaThis,y,viaPrivate,viaMethod x,viaThis,y,viaPrivate,viaMethod\n\
+         1\n\
+         9 1\n\
+         call field"
+    );
+}
+
+// ── Math argument coercion / expanded ISO years ─────────────────────────────
+
+/// Every `Math` function coerces with `ToNumber`, and `ToNumber` of a BigInt is
+/// a TypeError — but the argument reader took a BigInt's magnitude instead, so
+/// `Math.max(1n)` quietly answered `1`. `Math.random` never reads an argument
+/// and is the one function that must NOT throw. Expected values from node
+/// v26.7.0.
+#[test]
+fn math_refuses_bigint_arguments() {
+    let src = r#"
+        for (const e of ['Math.abs(1n)', 'Math.max(1n,2)', 'Math.min(1n)', 'Math.hypot(1n)',
+                         'Math.pow(2n,2)', 'Math.atan2(1,2n)', 'Math.imul(1n,2)', 'Math.clz32(1n)']) {
+          try { eval(e); console.log('NO-THROW ' + e); }
+          catch (err) { console.log(err.constructor.name + ': ' + err.message); }
+        }
+        console.log(typeof Math.random(1n));
+        console.log(Math.max(1, 2, 3), Math.hypot(3, 4), Math.min());
+    "#;
+    let want = "TypeError: Cannot convert a BigInt value to a number\n".repeat(8);
+    assert_eq!(run(src), format!("{want}number\n3 5 Infinity"));
+}
+
+/// `toISOString` formatted the year with a plain four-wide pad, which counts the
+/// sign inside the width and never emits `+`: year -1 printed `-001` and year
+/// 275760 printed unsigned. Outside 0..=9999 the spec uses the EXPANDED form —
+/// an explicit sign and exactly six digits. Expected values from node v26.7.0.
+#[test]
+fn iso_string_expands_years_outside_four_digits() {
+    let src = r#"
+        console.log(new Date(8.64e15).toISOString());
+        console.log(new Date(-8.64e15).toISOString());
+        console.log(new Date(Date.UTC(-1, 0, 1)).toISOString());
+        console.log(new Date(Date.UTC(10000, 0, 1)).toISOString());
+        console.log(new Date(Date.UTC(9999, 11, 31)).toISOString());
+        console.log(new Date(Date.UTC(0, 0, 1)).toISOString());
+        console.log(new Date(0).toISOString(), JSON.stringify(new Date(-62198755200000)));
+    "#;
+    assert_eq!(
+        run(src),
+        "+275760-09-13T00:00:00.000Z\n\
+         -271821-04-20T00:00:00.000Z\n\
+         -000001-01-01T00:00:00.000Z\n\
+         +010000-01-01T00:00:00.000Z\n\
+         9999-12-31T00:00:00.000Z\n\
+         1900-01-01T00:00:00.000Z\n\
+         1970-01-01T00:00:00.000Z \"-000001-01-01T00:00:00.000Z\""
+    );
+}

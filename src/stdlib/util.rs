@@ -191,6 +191,26 @@ fn type_predicate(pred: &str, v: Option<&Value>) -> bool {
     })
 }
 
+/// Node's `formatNumber` for the `%d`/`%i`/`%f` directives: the ordinary number
+/// rendering, except that negative zero prints as `-0` (plain string coercion
+/// would flatten it to `0`, so `console.log("%d", -0)` would lose the sign).
+fn fmt_directive_number(n: f64) -> String {
+    if n == 0.0 && n.is_sign_negative() {
+        return "-0".into();
+    }
+    crate::host::fmt_number(n)
+}
+
+/// Run one of the global numeric parsers over a directive argument. `%i` is
+/// `parseInt` and `%f` is `parseFloat` — string-prefix parses, NOT `Number()`,
+/// which is why `"3.9abc"` yields `3`/`3.9` rather than `NaN`.
+fn coerce_via(parser: &str, arg: &Value) -> f64 {
+    crate::builtins::call_builtin_function(parser, vec![arg.clone()])
+        .ok()
+        .map(|v| with_host(|h| h.to_number(&v)))
+        .unwrap_or(f64::NAN)
+}
+
 /// `util.format(fmt, ...args)` — printf-style substitution (`%s %d %i %f %j %o %O
 /// %c %%`) with any leftover arguments appended space-separated.
 pub fn format(args: &[Value]) -> String {
@@ -248,15 +268,28 @@ pub fn format(args: &[Value]) -> String {
                 });
                 out.push_str(&s);
             }
+            // The three numeric directives use three DIFFERENT conversions, and
+            // collapsing them to one truncating `to_number` got all three wrong:
+            //   %d -> Number(x)      ("%d", 1.7)      is 1.7,      not 1
+            //   %i -> parseInt(x,10) ("%i", "3.9abc") is 3,        not NaN
+            //   %f -> parseFloat(x)  ("%f", "1.5x")   is 1.5,      not NaN
+            // and `n.trunc() as i64` additionally saturated every non-finite and
+            // out-of-i64-range value to 9223372036854775807 (`Infinity`, `1e21`).
+            // BigInt keeps its `n` suffix under %d/%i (Node prints `10n`).
             'd' | 'i' => {
-                let n = with_host(|h| h.to_number(arg));
-                out.push_str(&if n.is_nan() {
-                    "NaN".into()
-                } else {
-                    (n.trunc() as i64).to_string()
+                let big = with_host(|h| match h.get(arg) {
+                    Some(JsObj::BigInt(b)) => Some(format!("{b}n")),
+                    _ => None,
                 });
+                match big {
+                    Some(s) => out.push_str(&s),
+                    None if spec == 'd' => {
+                        out.push_str(&fmt_directive_number(with_host(|h| h.to_number(arg))))
+                    }
+                    None => out.push_str(&fmt_directive_number(coerce_via("parseInt", arg))),
+                }
             }
-            'f' => out.push_str(&crate::host::fmt_number(with_host(|h| h.to_number(arg)))),
+            'f' => out.push_str(&fmt_directive_number(coerce_via("parseFloat", arg))),
             'j' => {
                 let s = crate::builtins::call_builtin_function("JSON.stringify", vec![arg.clone()])
                     .ok()

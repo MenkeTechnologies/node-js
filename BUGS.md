@@ -1304,7 +1304,6 @@ conditional assertion paths at all.
 | gap | node v26.7.0 | node-js |
 | --- | --- | --- |
 | recursion depth before `RangeError` | 9901 for `function f(){f()}` | ~2400 in a debug build — the floor is a STACK BUDGET, not a frame count, so the number moves with frame size (release reaches far more). Both throw; only the depth differs |
-| `console.log` of a circular structure | `<ref *1> [ [Circular *1] ]` | `[ [ [ [Array] ] ] ]` — the depth gate terminates it, but there is no reference-tracking renderer |
 | `new Array(4294967295)` | `4294967295` (holes are lazy) | killed at 10s — a dense `Vec` cannot hold 2^32-1 elements. The LENGTH is legal, so the spec check above lets it through; this is the documented dense-array model, not a missing validation |
 | `JSON.stringify` of a 20 000-deep object | prints promptly | killed at 60s (5 000 deep completes) |
 | `async function f(){ return f() }; f()` | `RangeError: Maximum call stack size exceeded` | hangs — each call starts a coroutine and returns a promise, so the recursion is an unbounded MICROTASK chain rather than stack growth, and the stack guard never sees it |
@@ -1507,11 +1506,12 @@ against `node v26.5.0`:
     JS `valueOf` re-enters the VM), so it lives in `host::to_primitive` /
     `to_number_value` / `to_property_key` and the ops call those before entering
     `JsHost::arith`.
-- **Well-known symbols and symbol-keyed properties.** `Symbol.toPrimitive` and
-  `Symbol.toStringTag` exist alongside `Symbol.iterator`/`asyncIterator` — and
-  only those four, because those are the ones node-js acts on (a
-  `Symbol.hasInstance` that read as a symbol while `instanceof` ignored it would
-  be a silent fake). Their description is now the ECMAScript name, so
+- **Well-known symbols and symbol-keyed properties.** `Symbol.toPrimitive`,
+  `Symbol.toStringTag` and `Symbol.hasInstance` exist alongside
+  `Symbol.iterator`/`asyncIterator` — and only those five, because those are the
+  ones node-js acts on (a symbol that read back while the operator it names
+  ignored it would be a silent fake). Their description is now the ECMAScript
+  name, so
   `String(Symbol.iterator)` is `Symbol(Symbol.iterator)`; identity is tracked by
   symbol id, so `Symbol.for('Symbol.iterator')` and `Symbol('Symbol.iterator')`
   stay distinct from the well-known one.
@@ -1672,3 +1672,42 @@ against `node v26.5.0`:
   m(){return 5} }` and `const K = class Inner { static self = Inner.name }` both
   threw `ReferenceError`. The binding does not leak outward — `typeof Inner` is
   still `undefined` outside the expression.
+
+## FIXED — the parity sweep against node v26.7.0 (`JSON` hooks, `%d`/`%i`/`%f`, cycles, `Symbol.hasInstance`, `static {}`)
+
+Each row was found by running the same source through `/opt/homebrew/bin/node`
+v26.7.0 and the built `node-js` and byte-diffing stdout, stderr and exit status.
+All are now byte-identical and are pinned by `tests/es_parity.rs` plus the
+`parity-scripts/` corpus (`data/23_json_replacer.js`, `data/24_json_tojson.js`,
+`data/25_math_bigint_iso_years.js`, `stdlib/27_format_numeric_directives.js`,
+`objects/05_inspect_cycles.js`, `objects/06_has_instance.js`,
+`lang/29_static_blocks.js`).
+
+| case | node v26.7.0 | node-js before |
+| --- | --- | --- |
+| `JSON.stringify({a:1,b:2},(k,v)=>v*2)` | `{"a":2,"b":4}` | `{"a":1,"b":2}` — a callable second argument was ignored entirely |
+| `JSON.stringify({a:1,b:2},(k,v)=>k==='b'?undefined:v)` | `{"a":1}` | `{"a":1,"b":2}` |
+| `JSON.stringify(5,(k,v)=>v*2)` | `10` | `5` — the top-level `("", value)` call never happened |
+| `JSON.stringify({a:{toJSON(k){return 'K:'+k}}})` | `{"a":"K:a"}` | `{"a":"K:undefined"}` — `toJSON` was called with no arguments |
+| `JSON.stringify({toJSON(){return {toJSON(){return 1}}}})` | `{}` | `1` — `toJSON` was re-applied to its own result |
+| `console.log(c)` for `c={a:1}; c.c=c` | `<ref *1> { a: 1, c: [Circular *1] }` | `{ a: 1, c: { a: 1, c: { a: 1, c: [Object] } } }` |
+| `util.format('%d', 1.7)` | `1.7` | `1` — `%d` is `Number(x)`, not a truncation |
+| `util.format('%i', '3.9abc')` | `3` | `NaN` — `%i` is `parseInt(x, 10)` |
+| `util.format('%f', '1.5x')` | `1.5` | `NaN` — `%f` is `parseFloat(x)` |
+| `util.format('%d', Infinity)` | `Infinity` | `9223372036854775807` — the truncation saturated `i64` |
+| `util.format('%d', 10n)` | `10n` | `10` |
+| `Number.MIN_VALUE` | `5e-324` | `2.2250738585072014e-308` — the smallest NORMAL double, not the smallest subnormal |
+| `2 instanceof Even` for `class Even { static [Symbol.hasInstance](n){return n%2===0} }` | `true` | `false` — `Symbol.hasInstance` did not exist and `instanceof` never consulted it |
+| `class A { static { A.tag = 1 } }` | runs | `SyntaxError: bad member key Punct("{")` — the whole script failed to parse |
+| `Math.max(1n)` | `TypeError: Cannot convert a BigInt value to a number` | `1` — the argument reader took the BigInt's magnitude |
+| `new Date(8.64e15).toISOString()` | `+275760-09-13T00:00:00.000Z` | `275760-09-13T00:00:00.000Z` |
+| `new Date(Date.UTC(-1,0,1)).toISOString()` | `-000001-01-01T00:00:00.000Z` | `-001-01-01T00:00:00.000Z` |
+
+Still open from the same sweep, each needing substrate that does not exist yet:
+
+| case | node v26.7.0 | node-js |
+| --- | --- | --- |
+| `new Proxy({}, handler)` | a proxy exotic object | `ReferenceError: Proxy is not defined` — no exotic-object interception layer |
+| `new DataView(buf)` | a view | `ReferenceError: DataView is not defined` (already listed above) |
+| `console.log([,1,,2])` | `[ <1 empty item>, 1, <1 empty item>, 2 ]` | `[ undefined, 1, undefined, 2 ]` — the dense-array model has no HOLE, so `0 in [,1]` also reads `true` |
+| `'café'.normalize('NFC').length` | `4` | `5` — `normalize` is the documented identity (no Unicode normalization tables) |

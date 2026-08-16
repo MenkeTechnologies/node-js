@@ -1203,7 +1203,11 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
         ("Number", "MAX_SAFE_INTEGER") => Some(9007199254740991.0),
         ("Number", "MIN_SAFE_INTEGER") => Some(-9007199254740991.0),
         ("Number", "MAX_VALUE") => Some(f64::MAX),
-        ("Number", "MIN_VALUE") => Some(f64::MIN_POSITIVE),
+        // The smallest positive value a Number can hold, which is the smallest
+        // SUBNORMAL double (`5e-324`), not Rust's `f64::MIN_POSITIVE` — that is
+        // the smallest *normal* double, `2.2250738585072014e-308`, ~256 binary
+        // orders of magnitude too large.
+        ("Number", "MIN_VALUE") => Some(f64::from_bits(1)),
         ("Number", "EPSILON") => Some(f64::EPSILON),
         ("Number", "POSITIVE_INFINITY") => Some(f64::INFINITY),
         ("Number", "NEGATIVE_INFINITY") => Some(f64::NEG_INFINITY),
@@ -3963,6 +3967,20 @@ pub(crate) fn js_pow(base: f64, exp: f64) -> f64 {
 }
 
 fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
+    // Every `Math` function coerces its arguments with `ToNumber`, and `ToNumber`
+    // of a BigInt is a TypeError (7.1.4 step 2) — the whole point of BigInt being
+    // a separate numeric type. `arg_num` reads a BigInt's magnitude instead, so
+    // `Math.max(1n)` quietly answered 1 where V8 throws. `Math.random` is the one
+    // exception: it never reads an argument, so `Math.random(1n)` is fine.
+    if fname != "random"
+        && args
+            .iter()
+            .any(|a| with_host(|h| matches!(h.get(a), Some(JsObj::BigInt(_)))))
+    {
+        return Err(host::type_error(
+            "Cannot convert a BigInt value to a number",
+        ));
+    }
     let x = arg_num(args, 0);
     let r = match fname {
         "floor" => x.floor(),
@@ -4357,10 +4375,27 @@ fn array_like_items(src: &Value) -> Vec<Value> {
 // ── JSON ──────────────────────────────────────────────────────────────────────
 
 fn json_stringify(args: Vec<Value>) -> Result<Value, String> {
-    // `toJSON` runs BEFORE serialization and may be user code, so the tree is
-    // rewritten first — outside the host borrow `json_str` holds, and before the
-    // BigInt walk, which has no cycle guard of its own.
-    let v = apply_to_json(&arg0(&args), &mut Vec::new())?;
+    // A CALLABLE second argument is the replacer function, and it is checked
+    // before the array form (`IsCallable` precedes `IsArray` in the spec), so a
+    // callable never also reaches the key-filter path below.
+    let replacer = args
+        .get(1)
+        .filter(|r| with_host(|h| host::is_callable(h, r)))
+        .cloned();
+    // `toJSON` and the replacer run BEFORE serialization and are user code, so
+    // the tree is rewritten first — outside the host borrow `json_str` holds,
+    // and before the BigInt walk, which has no cycle guard of its own.
+    //
+    // The top-level value is a property of a synthetic wrapper `{ "": value }`
+    // under key `""`, which is exactly the holder the replacer receives as
+    // `this` on its first call.
+    let root = arg0(&args);
+    let wrapper = with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert(String::new(), root.clone());
+        h.new_object(m)
+    });
+    let v = apply_to_json(&wrapper, "", &root, &mut Vec::new(), replacer.as_ref())?;
     // A BigInt anywhere in a serializable position is a TypeError (JSON has no
     // bigint form), matching Node's exact message.
     if with_host(|h| json_has_bigint(h, &v)) {
@@ -4387,11 +4422,63 @@ fn json_stringify(args: Vec<Value>) -> Result<Value, String> {
     }
 }
 
-/// Replace every value in the tree that defines `toJSON()` with its result (the
-/// `SerializeJSONProperty` step). Applies to user methods, class methods, and the
-/// native `Date`/`Buffer`/`URL` accessors alike. Returns a fresh tree; the input
-/// is never mutated. Depth-capped so a cyclic structure cannot spin forever.
-fn apply_to_json(v: &Value, path: &mut Vec<Value>) -> Result<Value, String> {
+/// One `SerializeJSONProperty(key, holder)` step: rewrite `v` (the value read
+/// from `holder[key]`) by calling its `toJSON(key)` and then the replacer
+/// function as `replacer.call(holder, key, value)`, then recurse into whatever
+/// object survives. Applies to user methods, class methods, and the native
+/// `Date`/`Buffer`/`URL` accessors alike.
+///
+/// Returns a fresh tree; the input is never mutated. `path` carries the chain of
+/// objects currently being walked so a cyclic structure is reported rather than
+/// spinning forever.
+///
+/// `toJSON` is called on the value ONCE and is NOT re-applied to its own result
+/// — `{toJSON(){ return {toJSON(){ return 1 }} }}` serializes as `{}` in Node,
+/// because the inner method is a plain (unserializable) function property of the
+/// returned object, not a second conversion hook.
+fn apply_to_json(
+    holder: &Value,
+    key: &str,
+    v: &Value,
+    path: &mut Vec<Value>,
+    rep: Option<&Value>,
+) -> Result<Value, String> {
+    let mut v = v.clone();
+    if matches!(v, Value::Obj(_)) {
+        let tag = crate::stdlib::native_tag(&v);
+        let has_to_json = with_host(|h| match host::lookup_chain(h, &v, "toJSON") {
+            Some(f) => host::is_callable(h, &f),
+            None => false,
+        }) || tag
+            .as_deref()
+            .map(crate::stdlib::has_to_json)
+            .unwrap_or(false);
+        if has_to_json {
+            let k = with_host(|h| h.new_str(key.to_string()));
+            v = host::call_method(&v, "toJSON", vec![k])?;
+        }
+    }
+    if let Some(rep) = rep {
+        let k = with_host(|h| h.new_str(key.to_string()));
+        v = host::invoke(rep, vec![k, v.clone()], Some(holder.clone()))?;
+    }
+    json_walk_children(&v, path, rep)
+}
+
+/// Whether a raw property key of a host object is one `json_str` serializes. The
+/// internal slots (`@@`-prefixed symbol keys, `#`-prefixed private fields) are
+/// invisible to JSON, so the replacer must not be invoked for them either.
+fn json_visible_key(k: &str) -> bool {
+    !k.starts_with("@@") && !k.starts_with('#')
+}
+
+/// Recurse into the elements/properties of an already-converted value, running
+/// `apply_to_json` for each with this value as the holder.
+fn json_walk_children(
+    v: &Value,
+    path: &mut Vec<Value>,
+    rep: Option<&Value>,
+) -> Result<Value, String> {
     if !matches!(v, Value::Obj(_)) {
         return Ok(v.clone());
     }
@@ -4399,29 +4486,14 @@ fn apply_to_json(v: &Value, path: &mut Vec<Value>) -> Result<Value, String> {
     if with_host(|h| path.iter().any(|p| h.strict_eq(p, v))) {
         return Err(host::type_error("Converting circular structure to JSON"));
     }
-    let tag = crate::stdlib::native_tag(v);
-    let has_to_json = with_host(|h| match host::lookup_chain(h, v, "toJSON") {
-        Some(f) => host::is_callable(h, &f),
-        None => false,
-    }) || tag
-        .as_deref()
-        .map(crate::stdlib::has_to_json)
-        .unwrap_or(false);
-    if has_to_json {
-        let r = host::call_method(v, "toJSON", Vec::new())?;
-        path.push(v.clone());
-        let out = apply_to_json(&r, path);
-        path.pop();
-        return out;
-    }
     let obj = with_host(|h| h.get(v).cloned());
     path.push(v.clone());
     let out = (|| match obj {
         Some(JsObj::Array(items)) => {
             let mut out = Vec::with_capacity(items.len());
             let mut changed = false;
-            for it in &items {
-                let nv = apply_to_json(it, path)?;
+            for (i, it) in items.iter().enumerate() {
+                let nv = apply_to_json(v, &i.to_string(), it, path, rep)?;
                 changed |= !with_host(|h| h.strict_eq(&nv, it));
                 out.push(nv);
             }
@@ -4446,19 +4518,25 @@ fn apply_to_json(v: &Value, path: &mut Vec<Value>) -> Result<Value, String> {
             if has_accessor {
                 let mut next: IndexMap<String, Value> = IndexMap::new();
                 for (k, val) in host::own_enum_entries_deep(v) {
-                    next.insert(k, apply_to_json(&val, path)?);
+                    let nv = if json_visible_key(&k) {
+                        apply_to_json(v, &k, &val, path, rep)?
+                    } else {
+                        val
+                    };
+                    next.insert(k, nv);
                 }
-                return {
-                    path.pop();
-                    Ok(with_host(|h| h.new_object(next)))
-                };
+                return Ok(with_host(|h| h.new_object(next)));
             }
             // Only rebuild when a descendant actually changed, so plain data keeps
             // its identity (and its prototype / native tag).
             let mut next: IndexMap<String, Value> = IndexMap::new();
             let mut changed = false;
             for (k, val) in &props {
-                let nv = apply_to_json(val, path)?;
+                let nv = if json_visible_key(k) {
+                    apply_to_json(v, k, val, path, rep)?
+                } else {
+                    val.clone()
+                };
                 changed |= !with_host(|h| h.strict_eq(&nv, val));
                 next.insert(k.clone(), nv);
             }

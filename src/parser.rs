@@ -383,6 +383,27 @@ impl Parser {
             self.advance();
             true
         };
+        // `static { … }` — a class static initialization block (ES2022). A brace
+        // where a member key would be is unambiguous: no member name can start
+        // with `{`, so this is checked before the key parse (which otherwise
+        // rejects it as `bad member key Punct("{")`).
+        if is_static && self.is_punct("{") {
+            self.advance();
+            // Its own function context: `yield`/`await` are plain identifiers
+            // inside a static block, whatever encloses the class.
+            let body = self.parse_fn_body_block(false, false)?;
+            return Ok(ClassMember {
+                key: Expr::Str(String::new()),
+                computed: false,
+                kind: MemberKind::StaticBlock,
+                is_static: true,
+                is_generator: false,
+                is_async: false,
+                params: Vec::new(),
+                body,
+                field_init: None,
+            });
+        }
         // Accessor / async / generator prefixes (each contextual: only a prefix
         // when followed by another member name, not itself the member name).
         let mut kind = MemberKind::Method;

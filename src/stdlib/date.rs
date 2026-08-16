@@ -374,13 +374,27 @@ fn locale_time(ms: f64) -> String {
     )
 }
 
+/// The year field of an ISO-8601 date (21.4.4.36 `Date.prototype.toISOString`).
+///
+/// Years 0..=9999 are four digits; anything outside that range uses the EXPANDED
+/// form — an explicit sign and exactly six digits, `+275760` / `-000001`. A bare
+/// `{:04}` gets both wrong, since Rust counts the sign inside the width (`-1`
+/// formats as `-001`) and never emits `+`.
+fn iso_year(y: i64) -> String {
+    if (0..=9999).contains(&y) {
+        return format!("{y:04}");
+    }
+    let sign = if y < 0 { '-' } else { '+' };
+    format!("{sign}{:06}", y.abs())
+}
+
 /// `2015-10-21T07:28:00.000Z` — the ISO-8601 / `toISOString` form.
 fn iso_string(ms: f64) -> String {
     let (day, _) = split_day(ms);
     let (y, mo, d) = civil_from_days(day);
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y,
+        "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        iso_year(y),
         mo + 1,
         d,
         field(ms, Field::Hours) as i64,
