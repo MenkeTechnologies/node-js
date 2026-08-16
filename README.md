@@ -151,6 +151,11 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
 - `RegExp` (literals and constructor, named groups, the `String.prototype`
   regex methods), `Map` / `Set` / `WeakMap` / `WeakSet`, `Symbol`, `BigInt`,
   typed arrays and `Buffer`.
+- `Proxy` — all thirteen traps plus `Proxy.revocable` — and the full `Reflect`
+  namespace. A proxy intercepts the OPERATORS, not just the `Reflect` calls:
+  reads, writes, `in`, `delete`, `for-in`, spread, `JSON.stringify`, iteration,
+  calls, `new`, `instanceof`, and use as a prototype or a superclass. `BUGS.md`
+  maps each trap to the syntax that reaches it, and states the two divergences.
 - CommonJS `require` and the Node standard library — see `BUGS.md` for the
   module-by-module coverage list and the honest not-implemented set.
 - The persistent bytecode cache runs on EVERY invocation (schema-versioned, so
@@ -176,9 +181,9 @@ boundary has to go through CommonJS `require`. The file EXTENSION is not
 consulted — a `.mjs` file holding only CommonJS-compatible code runs — so what
 fails is module syntax, not the suffix. Dynamic `import()` does parse (it lexes
 as an ordinary call) and fails at run time with
-`ReferenceError: import is not defined`. `Proxy` and `Intl` are absent by design rather
-than by omission — the reasoning for each is in `BUGS.md`, which also lists the
-remaining behavioural divergences from the reference `node`.
+`ReferenceError: import is not defined`. `Intl` is absent by design rather than by
+omission — the reasoning is in `BUGS.md`, which also lists the remaining
+behavioural divergences from the reference `node`.
 
 ## [0x05] PARITY HARNESS & FUZZER
 

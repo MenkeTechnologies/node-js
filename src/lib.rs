@@ -21,6 +21,7 @@ pub mod lexer;
 pub mod lsp;
 pub mod module;
 pub mod parser;
+pub mod proxy;
 pub mod regexp;
 pub mod repl;
 pub mod rust_ffi;

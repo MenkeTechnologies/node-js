@@ -264,6 +264,14 @@ pub enum JsObj {
     BigInt(num_bigint::BigInt),
     /// A compiled regular expression (`/pat/flags` or `new RegExp(...)`).
     RegExp(Box<RegExpObj>),
+    /// A `Proxy`: every essential internal method is diverted to `handler`'s
+    /// traps (see `crate::proxy`). `revoked` is set by the thunk
+    /// `Proxy.revocable` hands back, after which every operation throws.
+    Proxy {
+        target: Value,
+        handler: Value,
+        revoked: bool,
+    },
 }
 
 /// Which variant a heap object is, carrying none of its contents.
@@ -324,6 +332,7 @@ pub enum ObjKind {
     Promise,
     BigInt,
     RegExp,
+    Proxy,
 }
 
 impl JsObj {
@@ -347,6 +356,7 @@ impl JsObj {
             JsObj::Promise { .. } => ObjKind::Promise,
             JsObj::BigInt(_) => ObjKind::BigInt,
             JsObj::RegExp(_) => ObjKind::RegExp,
+            JsObj::Proxy { .. } => ObjKind::Proxy,
         }
     }
 }
@@ -2401,6 +2411,24 @@ impl JsHost {
             Value::Str(_) => "string",
             Value::Obj(_) => match self.get(v) {
                 Some(JsObj::Str(_)) => "string",
+                // 10.5's `[[Call]]` slot exists on a proxy exactly when its
+                // target is callable, so `typeof` classifies by the target —
+                // `typeof new Proxy(function(){}, {})` is `'function'`. The walk
+                // is bounded: a proxy of a proxy defers again.
+                Some(JsObj::Proxy { target, .. }) => {
+                    let mut cur = target;
+                    for _ in 0..100 {
+                        match self.get(cur) {
+                            Some(JsObj::Proxy { target: t, .. }) => cur = t,
+                            _ => break,
+                        }
+                    }
+                    if is_callable(self, cur) {
+                        "function"
+                    } else {
+                        "object"
+                    }
+                }
                 Some(JsObj::Func(_))
                 | Some(JsObj::BoundMethod { .. })
                 | Some(JsObj::BoundFunc { .. })
@@ -2579,6 +2607,13 @@ impl JsHost {
                 Some(JsObj::BoundMethod { .. }) | Some(JsObj::BoundFunc { .. }) => {
                     "function () { [native code] }".into()
                 }
+                // `Function.prototype.toString` refuses to expose a proxy's
+                // target: V8 reports the native-code form for a proxy of ANY
+                // callable, so `String(new Proxy(function f(){}, {}))` is
+                // `function () { [native code] }`, not `f`'s source.
+                Some(JsObj::Proxy { .. }) if is_callable(self, v) => {
+                    "function () { [native code] }".into()
+                }
                 Some(JsObj::Class(c)) => format!("class {} {{ }}", c.name),
                 Some(JsObj::Symbol { desc, .. }) => {
                     // `String(sym)` is allowed (unlike implicit coercion) and yields
@@ -2674,6 +2709,13 @@ impl JsHost {
                 // `util.inspect` renders a bigint with the `n` suffix, a regex bare.
                 Some(JsObj::BigInt(b)) => format!("{b}n"),
                 Some(JsObj::RegExp(r)) => format!("/{}/{}", r.source, r.flags),
+                // `util.inspect` on node v26.7.0 renders a proxy as
+                // `Proxy(<target>)` — the target's own rendering, wrapped. It
+                // deliberately does NOT run the handler's traps, so this stays a
+                // pure `&self` read like every other inspect arm.
+                Some(JsObj::Proxy { target, .. }) => {
+                    format!("Proxy({})", self.inspect_lvl(target, indent, st))
+                }
                 Some(JsObj::Array(items)) => {
                     // Own enumerable non-index string props (e.g. a `str.match(re)`
                     // result's `index`/`input`/`groups`, or a user-assigned
@@ -3995,6 +4037,14 @@ impl JsHost {
 /// `Object.entries`, object spread and `JSON.stringify` all need. Must be called
 /// outside a `with_host` borrow because a getter re-enters the host.
 pub fn own_enum_entries_deep(v: &Value) -> Vec<(String, Value)> {
+    // A Proxy has no property map at all: its own enumerable entries come from
+    // the `ownKeys` + `getOwnPropertyDescriptor` + `get` traps. A trap that
+    // throws surfaces as an empty result here because this signature is
+    // infallible; the callers that MUST propagate a trap throw (`Object.keys`
+    // and friends) go through `builtins::object_keys`, which does.
+    if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
+        return crate::proxy::own_enum_entries(v).unwrap_or_default();
+    }
     // A builtin namespace (`require('path')`, `Buffer`) has no property map at
     // all: its members are resolved on demand by `namespace_property`, which
     // re-enters the host and so cannot run inside `own_enum_entries`'s borrow.
@@ -4098,6 +4148,41 @@ pub fn call_named(name: &str, args: Vec<Value>) -> Result<Value, String> {
 
 /// `recv.name(args)`.
 pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // `proxy.m(…)` is 13.3.6 `EvaluateCall`: `Get(proxy, "m")` — through the
+    // `get` trap — then a call with the PROXY as `this`. The `lookup_*` shortcuts
+    // below all read a property map a proxy does not have.
+    if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy) {
+        let f = crate::builtins::get_property(recv, name)?;
+        if !with_host(|h| is_callable(h, &f)) {
+            return Err(type_error(&format!("{name} is not a function")));
+        }
+        // `Function.prototype.call`/`apply`/`bind`/`toString` and the REFLECTIVE
+        // `Object.prototype` methods are generic over `this`. node-js models each
+        // as a thunk BOUND to the object it was read off — through a proxy, that
+        // is the target — so invoking the thunk answers for the target and skips
+        // the traps entirely: `pf.call(1, 2)` never reached the `apply` trap and
+        // `p.hasOwnProperty(k)` never reached the descriptor trap. Re-dispatch
+        // those against the PROXY, which is the `this` the real method receives.
+        //
+        // `toString`/`valueOf`/`toLocaleString` are deliberately NOT re-dispatched
+        // for a non-callable proxy: they resolve by the TARGET's kind (a proxy of
+        // an array stringifies `1,2` through `Array.prototype.toString`, not
+        // `[object Object]`), which the bound thunk already gets right.
+        if with_host(|h| matches!(h.get(&f), Some(JsObj::BoundMethod { .. }))) {
+            if with_host(|h| is_callable(h, recv)) {
+                if let Some(r) = crate::builtins::function_builtin_method(recv, name, &args)? {
+                    return Ok(r);
+                }
+            }
+            if matches!(
+                name,
+                "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
+            ) {
+                return crate::builtins::object_builtin_method(recv, name, args);
+            }
+        }
+        return invoke(&f, args, Some(recv.clone()));
+    }
     // Namespace builtins (`console`, `Math`, `JSON`, ...): dispatch by qualified
     // name.
     if let Some(ns) = with_host(|h| match h.get(recv) {
@@ -4146,6 +4231,17 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
             if with_host(|h| is_callable(h, &f)) {
                 return invoke(&f, args, Some(recv.clone()));
             }
+        }
+        // A Proxy in the prototype chain serves the method through its `get`
+        // trap. `lookup_chain` below reads property maps, which a proxy has none
+        // of, so without this `child.m()` on `Object.create(proxy)` reported
+        // "m is not a function" even though `child.m` already read correctly.
+        if crate::builtins::proxy_proto_link(recv, name).is_some() {
+            let f = crate::builtins::get_property(recv, name)?;
+            if !with_host(|h| is_callable(h, &f)) {
+                return Err(type_error(&format!("{name} is not a function")));
+            }
+            return invoke(&f, args, Some(recv.clone()));
         }
         if let Some(f) = with_host(|h| lookup_chain(h, recv, name)) {
             if with_host(|h| is_callable(h, &f)) {
@@ -4233,6 +4329,11 @@ fn call_default_ctor(recv: &Value, args: &[Value]) -> Option<Result<Value, Strin
 
 /// Call any callable value.
 pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result<Value, String> {
+    // `[[Call]]` on a Proxy runs the `apply` trap (or forwards to the target).
+    // Probed by kind first so the ordinary call path never clones its arguments.
+    if with_host(|h| h.kind_of(callable)) == Some(ObjKind::Proxy) {
+        return crate::proxy::apply(callable, args, this).map(|r| r.expect("kind_of said Proxy"));
+    }
     let obj = with_host(|h| h.get(callable).cloned());
     match obj {
         // A builtin-prototype method thunk (`Object.prototype.toString`): dispatch
@@ -4439,6 +4540,11 @@ pub fn construct(ctor: &Value, args: Vec<Value>) -> Result<Value, String> {
 /// `new` with an explicit `new.target` (differs from `ctor` when a derived class
 /// calls `super(...)` — the target stays the originally-`new`ed class).
 pub fn construct_nt(ctor: &Value, args: Vec<Value>, new_target: Value) -> Result<Value, String> {
+    // `new proxy(…)` runs the `construct` trap (or forwards to the target).
+    if with_host(|h| h.kind_of(ctor)) == Some(ObjKind::Proxy) {
+        return crate::proxy::construct(ctor, args, &new_target)
+            .map(|r| r.expect("kind_of said Proxy"));
+    }
     let obj = with_host(|h| h.get(ctor).cloned());
     match obj {
         Some(JsObj::Class(_)) => construct_class(ctor, args, new_target),
@@ -4658,29 +4764,46 @@ pub fn super_construct(
             // object's own props onto the instance so the subclass instance
             // carries them.
             let built = crate::builtins::construct_builtin(&name, args)?;
-            let entries: Vec<(String, Value)> = with_host(|h| match h.get(&built) {
-                Some(JsObj::Object(p)) => p.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                _ => Vec::new(),
-            });
-            with_host(|h| {
-                let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
-                if let Some(JsObj::Object(props)) = h.get_mut(inst) {
-                    for (k, v) in entries {
-                        props.insert(k, v);
-                    }
-                    canonicalize_own_keys(props);
-                }
-                // The copied slots keep the attributes the builtin gave them, so
-                // `class E extends Error` instances hide `message`/`stack` too.
-                for k in keys {
-                    let a = h.prop_attrs(&built, &k);
-                    h.set_prop_attrs(inst, &k, a);
-                }
-            });
+            adopt_own_props(inst, &built);
+            Ok(())
+        }
+        // A Proxy parent (`class D extends new Proxy(B, {})`): `super(…)` is
+        // `[[Construct]]` on the proxy, so the `construct` trap runs (or forwards
+        // to the target). node-js initializes an ALREADY-allocated `inst` rather
+        // than adopting the constructor's return value, so what the proxy built
+        // is moved across — the same move the builtin arm makes.
+        Some(JsObj::Proxy { .. }) => {
+            let built = construct_nt(parent, args, new_target.clone())?;
+            adopt_own_props(inst, &built);
             Ok(())
         }
         _ => Err(type_error("super is not a constructor")),
     }
+}
+
+/// Move `built`'s own properties (and their attributes) onto `inst`. Used where
+/// a parent constructor produces a fresh object but node-js's class model has
+/// already allocated the instance `this` is bound to.
+fn adopt_own_props(inst: &Value, built: &Value) {
+    let entries: Vec<(String, Value)> = with_host(|h| match h.get(built) {
+        Some(JsObj::Object(p)) => p.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        _ => Vec::new(),
+    });
+    with_host(|h| {
+        let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+        if let Some(JsObj::Object(props)) = h.get_mut(inst) {
+            for (k, v) in entries {
+                props.insert(k, v);
+            }
+            canonicalize_own_keys(props);
+        }
+        // The copied slots keep the attributes the source gave them, so
+        // `class E extends Error` instances hide `message`/`stack` too.
+        for k in keys {
+            let a = h.prop_attrs(built, &k);
+            h.set_prop_attrs(inst, &k, a);
+        }
+    });
 }
 
 // ── class construction (runtime) ─────────────────────────────────────────────
@@ -4690,6 +4813,14 @@ pub fn super_construct(
 /// undefined for a default constructor); methods/getters/setters/statics/fields
 /// are installed afterward by `DEF_MEMBER`/`DEF_FIELD`.
 pub fn build_class(name: &str, parent: Value, ctor: Value) -> Value {
+    // A Proxy parent (`class D extends new Proxy(B, {})`): `D.prototype`'s
+    // `[[Prototype]]` is `Get(parent, "prototype")` — a read that runs the `get`
+    // trap and so re-enters the host, which the borrow below cannot allow.
+    // Without it the link fell back to `Object.prototype` and every inherited
+    // method went missing.
+    let proxy_parent_proto = (with_host(|h| h.kind_of(&parent)) == Some(ObjKind::Proxy))
+        .then(|| crate::builtins::get_property(&parent, "prototype").ok())
+        .flatten();
     with_host(|h| {
         let parent_opt = if matches!(parent, Value::Undef) {
             None
@@ -4700,6 +4831,9 @@ pub fn build_class(name: &str, parent: Value, ctor: Value) -> Value {
         // Object.prototype for a base class). Extending a builtin error links to
         // that error's prototype so `instanceof Error` holds for the subclass.
         let parent_proto = match &parent_opt {
+            Some(_) if proxy_parent_proto.is_some() => {
+                proxy_parent_proto.clone().expect("checked is_some")
+            }
             Some(p) => match h.get(p).cloned() {
                 Some(JsObj::Class(pc)) => pc.proto.clone(),
                 Some(JsObj::Builtin(bn)) => {
@@ -4826,6 +4960,31 @@ fn ctor_prototype(h: &JsHost, ctor: &Value) -> Option<Value> {
     }
 }
 
+/// `ctor.prototype` in the SAME representation `builtins::prototype_of` yields,
+/// so a chain walk driven by that function can compare the two with `strict_eq`.
+///
+/// `ctor_prototype` answers only for the constructors whose prototype object
+/// really exists on the heap (classes, user functions, the error and native
+/// exotics). A bare builtin like `Object`/`Array` has none there — its instances
+/// report `h.object_proto()` / a `Builtin("<C>.prototype")` handle — so this
+/// mirrors that fallback rather than reporting "no prototype" and failing every
+/// comparison.
+fn walk_target_prototype(ctor: &Value) -> Option<Value> {
+    if let Some(p) = with_host(|h| ctor_prototype(h, ctor)) {
+        return Some(p);
+    }
+    let name = with_host(|h| match h.get(ctor) {
+        Some(JsObj::Builtin(n)) => Some(n.clone()),
+        _ => None,
+    })?;
+    if name == "Object" {
+        return Some(with_host(|h| h.object_proto()));
+    }
+    Some(with_host(|h| {
+        h.alloc(JsObj::Builtin(format!("{name}.prototype")))
+    }))
+}
+
 /// V8's "not a function" wording for a value that was expected to be callable.
 /// A number/string/boolean is named WITH its value (`number 1 is not a
 /// function`, `string "s" is not a function`); every other type is named by type
@@ -4905,6 +5064,30 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
     // A non-object left-hand side is never an instance — but only after the
     // right-hand side has been validated above.
     if !matches!(obj, Value::Obj(_)) {
+        return Ok(false);
+    }
+    // A Proxy shares no heap variant with its target, so the structural arms
+    // below would misclassify it. 10.5.3 says `OrdinaryHasInstance` walks
+    // `[[GetPrototypeOf]]`, i.e. the handler's `getPrototypeOf` trap — run that
+    // walk here, which also gives a custom trap the final say.
+    if with_host(|h| h.kind_of(obj)) == Some(ObjKind::Proxy) {
+        with_host(|h| {
+            h.ensure_error_protos();
+            h.ensure_native_protos();
+        });
+        let Some(target) = walk_target_prototype(ctor) else {
+            return Ok(false);
+        };
+        let mut cur = crate::proxy::get_prototype_of(obj)?.unwrap_or(Value::Undef);
+        for _ in 0..100 {
+            if matches!(cur, Value::Undef) || with_host(|h| h.is_null(&cur)) {
+                return Ok(false);
+            }
+            if with_host(|h| h.strict_eq(&cur, &target)) {
+                return Ok(true);
+            }
+            cur = crate::builtins::prototype_of(&cur);
+        }
         return Ok(false);
     }
     // Builtin constructors whose instances aren't prototype-linked in our model
@@ -5288,6 +5471,11 @@ fn norm_num_bits(f: f64) -> u64 {
 
 /// Fully materialize any iterable into a vector of values.
 pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
+    // A Proxy iterates through its traps (see `crate::proxy::iterate`); it has
+    // no heap variant `iter_vec` could recognise.
+    if let Some(items) = crate::proxy::iterate(v)? {
+        return Ok(items);
+    }
     // Generators / user iterators must resume without a live host borrow.
     if with_host(|h| h.is_generator_val(v)) {
         let mut out = Vec::new();
@@ -5412,7 +5600,7 @@ fn user_iterator_fn(v: &Value) -> Option<Value> {
 
 /// Drive an iterator object (one with a `.next()` returning `{value, done}`) to
 /// exhaustion.
-fn drain_iterator(iterator: &Value) -> Result<Vec<Value>, String> {
+pub(crate) fn drain_iterator(iterator: &Value) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     loop {
         let step = call_method(iterator, "next", Vec::new())?;
@@ -5493,7 +5681,16 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
         if !with_host(|h| is_callable(h, &f)) {
             continue;
         }
-        let r = invoke(&f, Vec::new(), Some(v.clone()))?;
+        // On a Proxy the resolved method is a thunk bound to the TARGET, so
+        // invoking it directly would stringify the target — `String(new
+        // Proxy(function f(){}, {}))` reported `f`'s source where V8 reports the
+        // native-code form. `call_method` re-dispatches the generic
+        // `Function.prototype`/`Object.prototype` methods against the proxy.
+        let r = if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
+            call_method(v, m, Vec::new())?
+        } else {
+            invoke(&f, Vec::new(), Some(v.clone()))?
+        };
         if with_host(|h| is_primitive(h, &r)) {
             return Ok(r);
         }
@@ -5572,16 +5769,19 @@ pub fn to_property_key(v: &Value) -> Result<String, String> {
     Ok(with_host(|h| h.str_of(&p)))
 }
 
-/// Whether `h.get(v)` is any callable kind.
+/// Whether `h.get(v)` is any callable kind. A Proxy is callable exactly when its
+/// target is (10.5: the `[[Call]]` slot is installed only for a callable
+/// target), so `typeof` and every `is_callable` guard agree on one answer.
 pub fn is_callable(h: &JsHost, v: &Value) -> bool {
-    matches!(
-        h.get(v),
+    match h.get(v) {
         Some(JsObj::Func(_))
-            | Some(JsObj::Builtin(_))
-            | Some(JsObj::BoundMethod { .. })
-            | Some(JsObj::BoundFunc { .. })
-            | Some(JsObj::Class(_))
-    )
+        | Some(JsObj::Builtin(_))
+        | Some(JsObj::BoundMethod { .. })
+        | Some(JsObj::BoundFunc { .. })
+        | Some(JsObj::Class(_)) => true,
+        Some(JsObj::Proxy { target, .. }) => is_callable(h, target),
+        _ => false,
+    }
 }
 
 /// Walk `recv`'s own props then its prototype chain for `key`, returning the

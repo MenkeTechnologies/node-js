@@ -2413,3 +2413,257 @@ fn iso_string_expands_years_outside_four_digits() {
          1970-01-01T00:00:00.000Z \"-000001-01-01T00:00:00.000Z\""
     );
 }
+
+// ── Proxy ───────────────────────────────────────────────────────────────────
+
+/// Every trap that intercepts a property operation, each one observed through
+/// the operator that triggers it rather than through `Reflect` (which would only
+/// prove `Reflect` and the trap agree, not that `p.a` reaches the handler at
+/// all). The last two lines pin the two enumerations that are NOT `ownKeys`
+/// alone: `Object.keys` and `for-in` additionally filter by each key's
+/// `[[GetOwnProperty]]`, so a key the `ownKeys` trap invents survives only
+/// because `getOwnPropertyDescriptor` calls it enumerable. Expected values from
+/// node v26.7.0.
+#[test]
+fn proxy_property_traps_intercept_the_operators() {
+    let src = r#"
+        const log = [];
+        const t = { a: 1, b: 2 };
+        const p = new Proxy(t, {
+          get(tt, k)            { log.push('get:' + String(k)); return tt[k] * 10; },
+          set(tt, k, v)         { log.push('set:' + String(k)); tt[k] = v; return true; },
+          has(tt, k)            { log.push('has:' + String(k)); return k === 'ghost' || k in tt; },
+          deleteProperty(tt, k) { log.push('del:' + String(k)); delete tt[k]; return true; },
+          ownKeys()             { return ['a', 'invented']; },
+          getOwnPropertyDescriptor(tt, k) {
+            return { value: 9, enumerable: k !== 'invented' || true, configurable: true };
+          },
+        });
+        console.log(p.a, p.b);
+        p.c = 3;
+        console.log('ghost' in p, 'nope' in p, t.c);
+        console.log(delete p.b, t.b);
+        console.log(log.join('|'));
+        console.log(Object.keys(p).join(','));
+        const seen = [];
+        for (const k in p) seen.push(k);
+        console.log(seen.join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "10 20\n\
+         true false 3\n\
+         true undefined\n\
+         get:a|get:b|set:c|has:ghost|has:nope|del:b\n\
+         a,invented\n\
+         a,invented"
+    );
+}
+
+/// A handler with no traps at all must be observationally invisible: every
+/// operation forwards to the target. This is the property that makes a proxy
+/// usable as a wrapper, and it is the one most easily broken by an interception
+/// that forgets its fallback — each line below reaches the target through a
+/// DIFFERENT funnel (read, write, `in`, enumeration, JSON, spread, iteration,
+/// call, construct, `instanceof`, `Array.isArray`, brand). Expected values from
+/// node v26.7.0.
+#[test]
+fn a_trapless_proxy_is_transparent() {
+    let src = r#"
+        const p = new Proxy({ a: 1, b: 2 }, {});
+        p.c = 3;
+        console.log(p.a, 'b' in p, Object.keys(p).join(','), JSON.stringify(p));
+        console.log(JSON.stringify({ ...p }), p instanceof Object);
+        const arr = new Proxy([1, 2, 3], {});
+        console.log(arr.length, Array.isArray(arr), [...arr].join(','), arr.map(x => x * 2).join(','));
+        console.log(JSON.stringify(arr), Object.prototype.toString.call(arr));
+        function add(x, y) { return x + y; }
+        const pf = new Proxy(add, {});
+        console.log(typeof pf, pf(2, 3), pf.name, pf.length);
+        class C { constructor(n) { this.n = n; } m() { return 'm' + this.n; } }
+        const pc = new Proxy(C, {});
+        const inst = new pc(7);
+        console.log(inst.n, inst.m(), inst instanceof C);
+    "#;
+    assert_eq!(
+        run(src),
+        "1 true a,b,c {\"a\":1,\"b\":2,\"c\":3}\n\
+         {\"a\":1,\"b\":2,\"c\":3} true\n\
+         3 true 1,2,3 2,4,6\n\
+         [1,2,3] [object Array]\n\
+         function 5 add 2\n\
+         7 m7 true"
+    );
+}
+
+/// `apply` / `construct` / `getPrototypeOf` / `setPrototypeOf` / `defineProperty`
+/// / `isExtensible`, plus `typeof` on a proxy of a function (10.5 installs the
+/// `[[Call]]` slot only for a callable target, so the answer is the TARGET's).
+/// Expected values from node v26.7.0.
+#[test]
+fn proxy_call_construct_and_prototype_traps() {
+    let src = r#"
+        const pf = new Proxy(function (a, b) { return a + b; },
+                             { apply(t, self, args) { return t(...args) * 2; } });
+        console.log(pf(1, 2), typeof pf);
+        class C { constructor(x) { this.x = x; } }
+        const pc = new Proxy(C, { construct(t, args) { return new t(args[0] + 100); } });
+        console.log(new pc(1).x);
+        const pp = new Proxy({}, { getPrototypeOf() { return Array.prototype; } });
+        console.log(Object.getPrototypeOf(pp) === Array.prototype, pp instanceof Array);
+        const swallow = new Proxy({}, { setPrototypeOf() { return true; } });
+        Object.setPrototypeOf(swallow, Array.prototype);
+        console.log(Object.getPrototypeOf(swallow) === Object.prototype);
+        const pd = new Proxy({}, { defineProperty(t, k, d) { t[k] = d.value * 2; return true; } });
+        Object.defineProperty(pd, 'z', { value: 5, enumerable: true, configurable: true, writable: true });
+        console.log(pd.z);
+        console.log(Object.isExtensible(new Proxy(Object.freeze({}), {})),
+                    Object.isExtensible(new Proxy({}, { isExtensible: () => true })));
+    "#;
+    assert_eq!(
+        run(src),
+        "6 function\n\
+         101\n\
+         true true\n\
+         true\n\
+         10\n\
+         false true"
+    );
+}
+
+/// `Proxy.revocable`: after `revoke()` EVERY operation throws, naming the one it
+/// attempted, while `typeof` still answers from the slot fixed at creation.
+/// Calling `revoke` twice is a no-op, not a second teardown. Construction
+/// rejects a non-object target or handler, and `Proxy` has no `[[Call]]` slot.
+/// Expected messages verbatim from node v26.7.0.
+#[test]
+fn revoked_proxies_and_construction_errors() {
+    let src = r#"
+        const show = f => { try { f(); console.log('NO-THROW'); }
+                            catch (e) { console.log(e.constructor.name + ': ' + e.message); } };
+        show(() => Proxy({}, {}));
+        show(() => new Proxy(1, {}));
+        show(() => new Proxy({}, 'x'));
+        show(() => new Proxy({}));
+        const { proxy, revoke } = Proxy.revocable({ a: 1 }, {});
+        console.log(proxy.a);
+        revoke();
+        revoke();
+        console.log(typeof proxy);
+        show(() => proxy.a);
+        show(() => 'a' in proxy);
+        show(() => Object.keys(proxy));
+        const fr = Proxy.revocable(function () {}, {});
+        fr.revoke();
+        console.log(typeof fr.proxy);
+        show(() => fr.proxy());
+        show(() => { const q = new Proxy({}, { get: 1 }); return q.a; });
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError: Constructor Proxy requires 'new'\n\
+         TypeError: Cannot create proxy with a non-object as target or handler\n\
+         TypeError: Cannot create proxy with a non-object as target or handler\n\
+         TypeError: Cannot create proxy with a non-object as target or handler\n\
+         1\n\
+         object\n\
+         TypeError: Cannot perform 'get' on a proxy that has been revoked\n\
+         TypeError: Cannot perform 'has' on a proxy that has been revoked\n\
+         TypeError: Cannot perform 'ownKeys' on a proxy that has been revoked\n\
+         function\n\
+         TypeError: Cannot perform 'apply' on a proxy that has been revoked\n\
+         TypeError: '1' returned for property 'get' of object '#<Object>' is not a function"
+    );
+}
+
+/// A proxy used as a PROTOTYPE. `OrdinaryGet` forwards down the chain with the
+/// ORIGINAL receiver, so the trap's third argument is the child — and a getter
+/// re-dispatched through `Reflect.get(t, k, receiver)` sees the child as `this`.
+/// The method-call form is a separate funnel from the property read and was
+/// broken independently. `class D extends <proxy>` links `D.prototype` through
+/// the proxy's `prototype` read, and `super(...)` runs `[[Construct]]` on it.
+/// Expected values from node v26.7.0.
+#[test]
+fn proxy_in_a_prototype_chain_and_as_a_superclass() {
+    let src = r#"
+        const base = { get who() { return this.name; } };
+        const p = new Proxy(base, { get(t, k, r) { return Reflect.get(t, k, r); } });
+        console.log(Object.create(p, { name: { value: 'X' } }).who);
+        const proto = new Proxy({}, { get(t, k) { return k === 'greet' ? () => 'hi' : undefined; } });
+        console.log(Object.create(proto).greet());
+        class B { constructor() { this.b = 1; } m() { return 'm'; } }
+        class D extends new Proxy(B, {}) { constructor() { super(); this.d = 2; } }
+        const d = new D();
+        console.log(d.b, d.d, d.m(), d instanceof B, d instanceof D);
+        const nested = new Proxy(new Proxy({ v: 1 }, { get: (t, k) => t[k] + 10 }),
+                                 { get: (t, k) => t[k] * 2 });
+        console.log(nested.v);
+    "#;
+    assert_eq!(run(src), "X\nhi\n1 2 m true true\n22");
+}
+
+/// Symbol keys reach the traps as SYMBOLS, not as node-js's internal `@@…`
+/// strings — a trap that switches on `typeof k` (the common membrane guard) has
+/// to see `'symbol'`. `Reflect.ownKeys` reports the symbol half of the trap's
+/// answer, and `Object.prototype.toString` brands from a `Symbol.toStringTag`
+/// read through the `get` trap. `hasOwnProperty` is `[[GetOwnProperty]]`, so it
+/// consults the DESCRIPTOR trap rather than `has`. Expected values from node
+/// v26.7.0.
+#[test]
+fn proxy_traps_receive_symbol_keys() {
+    let src = r#"
+        const S = Symbol('s');
+        const seen = [];
+        const ps = new Proxy({}, {
+          get(t, k) { seen.push('get:' + typeof k); return t[k]; },
+          set(t, k, v) { seen.push('set:' + typeof k); t[k] = v; return true; },
+        });
+        ps[S] = 1; void ps[S]; void ps.a;
+        console.log(seen.join(','));
+        const po = new Proxy({ [S]: 1, a: 2 }, {});
+        console.log(Object.getOwnPropertySymbols(po).length, Reflect.ownKeys(po).map(String).join('|'));
+        const tagged = new Proxy({}, { get: (t, k) => (k === Symbol.toStringTag ? 'Zed' : undefined) });
+        console.log(Object.prototype.toString.call(tagged));
+        const own = new Proxy({}, {
+          getOwnPropertyDescriptor: (t, k) =>
+            (k === 'z' ? { value: 1, configurable: true, enumerable: true } : undefined),
+        });
+        console.log(Object.prototype.hasOwnProperty.call(own, 'z'),
+                    Object.prototype.hasOwnProperty.call(own, 'q'));
+    "#;
+    assert_eq!(
+        run(src),
+        "set:symbol,get:symbol,get:string\n\
+         1 a|Symbol(s)\n\
+         [object Zed]\n\
+         true false"
+    );
+}
+
+/// A `get` trap that lies about `length` must be honored by iteration, because
+/// `Array.prototype[Symbol.iterator]` is generic: it reads `length` and then
+/// each index through `[[Get]]`. node-js models that method as a thunk bound to
+/// the array it was read off, which would have walked the target and ignored the
+/// trap entirely. `JSON.stringify` reads through `[[Get]]` for the same reason.
+/// Expected values from node v26.7.0.
+#[test]
+fn iteration_through_a_proxy_honors_the_get_trap() {
+    let src = r#"
+        const short = new Proxy([1, 2, 3], { get: (t, k) => (k === 'length' ? 2 : t[k]) });
+        console.log(short.length, [...short].join(','), JSON.stringify(short));
+        const doubled = new Proxy([1, 2], { get: (t, k) => (k === 'length' ? t.length : t[k] * 5) });
+        console.log([...doubled].join(','), JSON.stringify(doubled));
+        const custom = new Proxy({}, { get: (t, k) => (k === Symbol.iterator ? function* () { yield 7; yield 8; } : undefined) });
+        console.log([...custom].join(','));
+        console.log(JSON.stringify(Object.assign({}, new Proxy({ x: 1, y: 2 }, { get: (t, k) => t[k] * 3 }))));
+        console.log(JSON.stringify({ ...new Proxy({ x: 1 }, { get: (t, k) => t[k] + 1 }) }));
+    "#;
+    assert_eq!(
+        run(src),
+        "2 1,2 [1,2]\n\
+         5,10 [5,10]\n\
+         7,8\n\
+         {\"x\":3,\"y\":6}\n\
+         {\"x\":2}"
+    );
+}

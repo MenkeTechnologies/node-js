@@ -570,7 +570,47 @@ fn peek<R>(recv: &Value, f: impl FnOnce(&JsObj) -> Option<R>) -> Option<R> {
     with_host(|h| h.get(recv).and_then(f))
 }
 
+/// The nearest `[[Prototype]]` link of `recv` that is a Proxy, when the chain
+/// reaches it without a closer link already owning `name`.
+///
+/// A proxy prototype answers only from the position it occupies in the chain: a
+/// nearer prototype that owns the key (as a data property or an accessor) still
+/// wins, exactly as `OrdinaryGet` walks one link at a time.
+pub(crate) fn proxy_proto_link(recv: &Value, name: &str) -> Option<Value> {
+    with_host(|h| {
+        let mut cur = h.proto_of(recv);
+        for _ in 0..100 {
+            let p = cur?;
+            match h.get(&p) {
+                Some(JsObj::Proxy { .. }) => return Some(p),
+                Some(JsObj::Object(props)) if props.contains_key(name) => return None,
+                _ => {}
+            }
+            if h.own_accessor(&p, name).is_some() {
+                return None;
+            }
+            cur = h.proto_of(&p);
+        }
+        None
+    })
+}
+
 pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
+    get_property_recv(recv, name, recv)
+}
+
+/// `[[Get]](name, receiver)` — 10.1.8. `receiver` is the object the read STARTED
+/// from and is what a getter sees as `this`; it differs from `recv` only when the
+/// read was forwarded down a prototype chain, which is why `Reflect.get(t, k, r)`
+/// and a Proxy `get` trap's third argument both need it. Every ordinary read
+/// passes `recv` itself.
+pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<Value, String> {
+    // `[[Get]]` on a Proxy: the handler's `get` trap, or a forward to the
+    // target. Checked before anything else so no ordinary-object shortcut can
+    // read past the handler.
+    if let Some(v) = crate::proxy::get(recv, name, receiver)? {
+        return Ok(v);
+    }
     if with_host(|h| h.is_nullish(recv)) {
         return Err(host::type_error(&format!(
             "Cannot read properties of {} (reading '{name}')",
@@ -606,9 +646,10 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
         }
     }
     // Accessor (own or inherited getter) takes precedence over the chain walk.
+    // The getter runs with the RECEIVER as `this`, not the object that owns it.
     if let Some((getter, _)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
         return match getter {
-            Some(g) => host::invoke(&g, Vec::new(), Some(recv.clone())),
+            Some(g) => host::invoke(&g, Vec::new(), Some(receiver.clone())),
             None => Ok(Value::Undef), // set-only property reads as undefined
         };
     }
@@ -683,6 +724,14 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
                 _ => None,
             }) {
                 v
+            } else if let Some(link) = proxy_proto_link(recv, name) {
+                // A Proxy sitting in the prototype chain. `OrdinaryGet` (10.1.8.1
+                // step 4) forwards to the parent's `[[Get]]` with the ORIGINAL
+                // receiver, so the trap sees the child as `receiver` and `this`
+                // inside a trap-served getter resolves to the child, not the
+                // proxy. `lookup_chain` cannot do this: it reads property maps,
+                // and a proxy has none.
+                return Ok(crate::proxy::get(&link, name, recv)?.expect("link is a proxy"));
             } else if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
                 // A method / data property inherited from the prototype chain.
                 v
@@ -1016,7 +1065,14 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             // A builtin namespace/prototype receiver (`Map.prototype`) reports
             // ownership via `has_property` (its methods resolve as thunks).
             if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Builtin) {
-                return Ok(Value::Bool(has_property(recv, &k)));
+                return Ok(Value::Bool(has_property(recv, &k)?));
+            }
+            // `HasOwnProperty` (7.3.12) is `[[GetOwnProperty]]`, so on a Proxy it
+            // is the `getOwnPropertyDescriptor` trap — NOT the `has` trap and not
+            // the target's property map.
+            if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy) {
+                let d = crate::proxy::get_own_descriptor(recv, &k)?.unwrap_or(Value::Undef);
+                return Ok(Value::Bool(!matches!(d, Value::Undef)));
             }
             // A Buffer's / typed array's own keys are its element indices: the
             // `length`/`byteLength` slots are internal bookkeeping, and V8
@@ -1036,7 +1092,15 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
         }
         "isPrototypeOf" => {
             let target = arg0(&args);
-            let mut cur = with_host(|h| h.proto_of(&target));
+            // The ARGUMENT is what gets walked, so a proxy there needs its
+            // `getPrototypeOf` trap for the FIRST hop: `proto_of` reads a link a
+            // proxy does not hold, which reported `false` for every proxy. From
+            // the second hop on the chain is ordinary objects again, walked by
+            // the recorded link exactly as before.
+            let mut cur = match crate::proxy::get_prototype_of(&target)? {
+                Some(p) => Some(p).filter(|p| !with_host(|h| h.is_null(p))),
+                None => with_host(|h| h.proto_of(&target)),
+            };
             while let Some(p) = cur {
                 if with_host(|h| h.strict_eq(&p, recv)) {
                     return Ok(Value::Bool(true));
@@ -1047,7 +1111,13 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
         }
         "propertyIsEnumerable" => {
             let k = with_host(|h| h.str_of(&arg0(&args)));
-            // Own *and* enumerable — a non-enumerable own slot reads false.
+            // Own *and* enumerable — a non-enumerable own slot reads false. On a
+            // Proxy that question is `[[GetOwnProperty]]`, i.e. the descriptor
+            // trap, since there is no property map to enumerate.
+            if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy) {
+                let has = crate::proxy::own_enum_string_keys(recv)?.contains(&k);
+                return Ok(Value::Bool(has));
+            }
             let has = with_host(|h| h.own_enum_key_names(recv).contains(&k));
             Ok(Value::Bool(has))
         }
@@ -1328,10 +1398,15 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         // which is how a class advertises its own (`class C { get
         // [Symbol.toStringTag]() { return 'Cee' } }` → `[object Cee]`). The read
         // runs outside the host borrow so an accessor can be invoked.
-        let tagged = with_host(|h| {
-            host::lookup_chain(h, recv, "@@toStringTag").is_some()
-                || host::lookup_accessor(h, recv, "@@toStringTag").is_some()
-        });
+        // A Proxy has no chain to probe: 20.1.3.6 step 15 is an unconditional
+        // `Get(O, @@toStringTag)`, so the `get` trap decides. Probing first (as
+        // the ordinary receiver does, to keep the read off objects that have no
+        // tag) would always miss and brand every tagged proxy `[object Object]`.
+        let tagged = with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy)
+            || with_host(|h| {
+                host::lookup_chain(h, recv, "@@toStringTag").is_some()
+                    || host::lookup_accessor(h, recv, "@@toStringTag").is_some()
+            });
         if tagged {
             let t = get_property(recv, "@@toStringTag")?;
             if let Some(s) = with_host(|h| h.as_str(&t)) {
@@ -1441,6 +1516,24 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             Some(JsObj::Null) => "Null".into(),
             Some(JsObj::Str(_)) => "String".into(),
             Some(JsObj::Array(_)) => "Array".into(),
+            // 20.1.3.6 step 3 brands by `IsArray`, which follows a Proxy to its
+            // `[[ProxyTarget]]` — `Object.prototype.toString.call(new Proxy([],
+            // {}))` is `'[object Array]'`. Everything else about a proxy brands
+            // as a plain Object (a `Symbol.toStringTag` read through the `get`
+            // trap is handled by the caller, before this).
+            Some(JsObj::Proxy { target, .. }) => {
+                let mut cur = target;
+                for _ in 0..100 {
+                    match h.get(cur) {
+                        Some(JsObj::Proxy { target: t, .. }) => cur = t,
+                        _ => break,
+                    }
+                }
+                match h.get(cur) {
+                    Some(JsObj::Array(_)) => "Array".into(),
+                    _ => "Object".into(),
+                }
+            }
             // `function*` / `async function` / `async function*` carry their own
             // `Symbol.toStringTag` in V8 (27.3.3.2, 27.7.3.2, 27.4.3.2).
             Some(JsObj::Func(f)) => match h.funcs.get(f.def_id) {
@@ -1555,7 +1648,17 @@ fn b_named_eval(vm: &mut VM, _: u8) -> Value {
     func
 }
 
+/// `[[Set]]` reachable from `crate::proxy`'s no-trap forward, which has to land
+/// on the same path a plain `o.k = v` takes.
+pub fn set_property_pub(recv: &Value, name: &str, val: Value) -> Result<(), String> {
+    set_property(recv, name, val)
+}
+
 fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
+    // `[[Set]]` on a Proxy: the handler's `set` trap, or a forward to the target.
+    if crate::proxy::set(recv, name, &val, recv)? {
+        return Ok(());
+    }
     // `globalThis.x = 1` creates a real global binding, so the bare `x` reads it
     // back. Writing only the own property left the two views disagreeing:
     // `globalThis.zz` was 7 while `zz` was still a `ReferenceError`.
@@ -1723,9 +1826,14 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
 /// the three cannot drift. Reports `false` for a non-configurable property
 /// (sloppy mode ignores the failure rather than throwing) and `true` otherwise,
 /// which is also what deleting an absent key reports.
-pub fn delete_property(recv: &Value, key: &str) -> bool {
+pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
+    // `[[Delete]]` on a Proxy runs the handler's `deleteProperty` trap, which may
+    // throw — the reason this reports a `Result` rather than a bare `bool`.
+    if let Some(b) = crate::proxy::delete(recv, key)? {
+        return Ok(b);
+    }
     if !with_host(|h| h.prop_attrs(recv, key).configurable) {
-        return false;
+        return Ok(false);
     }
     with_host(|h| {
         let index = key.parse::<usize>();
@@ -1748,7 +1856,7 @@ pub fn delete_property(recv: &Value, key: &str) -> bool {
         // a function/class, is an ordinary own property kept in the side table.
         h.remove_fn_prop(recv, key);
     });
-    true
+    Ok(true)
 }
 
 fn b_delitem(vm: &mut VM, _: u8) -> Value {
@@ -1761,13 +1869,19 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
         Ok(k) => k,
         Err(e) => return abort(vm, e),
     };
-    Value::Bool(delete_property(&recv, &key))
+    match delete_property(&recv, &key) {
+        Ok(b) => Value::Bool(b),
+        Err(e) => abort(vm, e),
+    }
 }
 
 fn b_delprop_name(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let recv = vm.pop();
-    Value::Bool(delete_property(&recv, &name))
+    match delete_property(&recv, &name) {
+        Ok(b) => Value::Bool(b),
+        Err(e) => abort(vm, e),
+    }
 }
 
 // ── constructors ──────────────────────────────────────────────────────────────
@@ -2034,7 +2148,10 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
         );
     }
     let k = with_host(|h| h.property_key(&key));
-    Value::Bool(has_property(&container, &k))
+    match has_property(&container, &k) {
+        Ok(b) => Value::Bool(b),
+        Err(e) => abort(vm, e),
+    }
 }
 
 // ── control ───────────────────────────────────────────────────────────────────
@@ -2375,6 +2492,15 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
     if with_host(|h| h.is_generator_val(&v)) {
         return v;
     }
+    // A Proxy's iterator comes from its traps, materialized eagerly: the
+    // `lookup_chain` probe below reads the property map a proxy does not have.
+    if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Proxy) {
+        return match crate::proxy::iterate(&v) {
+            Ok(Some(items)) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })),
+            Ok(None) => abort(vm, "internal: kind_of said Proxy".into()),
+            Err(e) => abort(vm, e),
+        };
+    }
     // An object with a user `Symbol.iterator`: call it to get the iterator object.
     if let Some(iter_fn) = with_host(|h| host::lookup_chain(h, &v, "@@iterator")) {
         if with_host(|h| host::is_callable(h, &iter_fn)) {
@@ -2392,6 +2518,18 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
 
 fn b_forin_keys(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
+    // `for-in` over a Proxy is 14.7.5.9 `EnumerateObjectProperties`: the
+    // `ownKeys` trap filtered by `[[GetOwnProperty]]`'s `enumerable`. Both traps
+    // are user code, so this cannot run inside `enum_keys`'s `&mut` host borrow.
+    if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Proxy) {
+        return match crate::proxy::own_enum_string_keys(&v) {
+            Ok(keys) => with_host(|h| {
+                let out: Vec<Value> = keys.into_iter().map(|k| h.new_str(k)).collect();
+                h.new_array(out)
+            }),
+            Err(e) => abort(vm, e),
+        };
+    }
     let keys = with_host(|h| h.enum_keys(&v));
     with_host(|h| h.new_array(keys))
 }
@@ -2736,6 +2874,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "clearInterval",
     "clearImmediate",
     "structuredClone",
+    "Proxy",
     "require",
     // CommonJS loader dispatch targets referenced by per-module `require`
     // closures (see `module.rs`); never written by user code.
@@ -2825,6 +2964,7 @@ const NS_METHODS: &[&str] = &[
     "Symbol.keyFor",
     "BigInt.asIntN",
     "BigInt.asUintN",
+    "Proxy.revocable",
     "Reflect.ownKeys",
     "Reflect.has",
     "Reflect.get",
@@ -3118,10 +3258,16 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `Array(5)` === `new Array(5)` (length-5 empty), but `Array.of(5)` is `[5]`.
         "Array" => construct_builtin("Array", args),
         "Array.of" => Ok(with_host(|h| h.new_array(args))),
-        "Array.isArray" => Ok(Value::Bool(matches!(
-            with_host(|h| h.get(&arg0(&args)).cloned()),
-            Some(JsObj::Array(_))
-        ))),
+        // 23.1.2.2 `IsArray` follows a Proxy to its `[[ProxyTarget]]` rather than
+        // consulting any trap, so `Array.isArray(new Proxy([], {}))` is `true`.
+        "Array.isArray" => {
+            let v = arg0(&args);
+            let subject = crate::proxy::ultimate_target(&v).unwrap_or(v);
+            Ok(Value::Bool(matches!(
+                with_host(|h| h.get(&subject).cloned()),
+                Some(JsObj::Array(_))
+            )))
+        }
         "Array.from" => array_from(args),
         "Object" => Ok(object_call(args)),
         "Object.keys" => object_keys(args, 0),
@@ -3140,12 +3286,21 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Object.preventExtensions" => {
             let v = arg0(&args);
+            if crate::proxy::prevent_extensions(&v)? {
+                return Ok(v);
+            }
             with_host(|h| h.prevent_extensions(&v));
             Ok(v)
         }
         "Object.isFrozen" => Ok(Value::Bool(with_host(|h| h.is_sealed(&arg0(&args), true)))),
         "Object.isSealed" => Ok(Value::Bool(with_host(|h| h.is_sealed(&arg0(&args), false)))),
-        "Object.isExtensible" => Ok(Value::Bool(with_host(|h| h.is_extensible(&arg0(&args))))),
+        "Object.isExtensible" => {
+            let v = arg0(&args);
+            match crate::proxy::is_extensible(&v)? {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Ok(Value::Bool(with_host(|h| h.is_extensible(&v)))),
+            }
+        }
         // Object.is — SameValue: like `===` but NaN is equal to NaN and +0 is
         // distinct from -0.
         "Object.is" => {
@@ -3171,10 +3326,23 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(Value::Bool(r))
         }
         "Object.fromEntries" => object_from_entries(args),
-        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => Ok(prototype_of(&arg0(&args))),
+        // `[[GetPrototypeOf]]`: a Proxy answers from its trap (which may throw),
+        // so the proxy form cannot share `prototype_of`'s infallible signature.
+        "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => {
+            let v = arg0(&args);
+            match crate::proxy::get_prototype_of(&v)? {
+                Some(p) => Ok(p),
+                None => Ok(prototype_of(&v)),
+            }
+        }
         "Object.setPrototypeOf" => {
             let obj = arg0(&args);
             let proto = args.get(1).cloned().unwrap_or(Value::Undef);
+            if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
+                reject_bad_prototype(&proto)?;
+                crate::proxy::set_prototype_of(&obj, &proto)?;
+                return Ok(obj);
+            }
             // 20.1.2.23: `RequireObjectCoercible` on the target, then the
             // prototype type check, then — only for an actual object target —
             // the extensibility check. A PRIMITIVE target is returned untouched
@@ -3207,10 +3375,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.getOwnPropertySymbols" => {
             let v = arg0(&args);
             require_object_coercible(&v)?;
-            Ok(with_host(|h| {
-                let syms = h.own_symbol_keys(&v);
-                h.new_array(syms)
-            }))
+            let syms = proxy_or_own_symbol_keys(&v)?;
+            Ok(with_host(|h| h.new_array(syms)))
         }
         // `Object.hasOwn(obj, key)` — the static form of `hasOwnProperty`.
         "Object.hasOwn" => {
@@ -3242,6 +3408,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `Symbol.keyFor(Symbol("k"))` was `"k"` where node says `undefined`.
         "Symbol.keyFor" => Ok(with_host(|h| h.symbol_registry_key(&arg0(&args)))),
         "Map" | "WeakMap" | "Set" | "WeakSet" | "Promise" => construct_builtin(name, args),
+        // `Proxy` has no `[[Call]]` slot: it is constructor-only (28.2.1).
+        "Proxy" => Err(host::type_error("Constructor Proxy requires 'new'")),
+        "Proxy.revocable" => crate::proxy::revocable(&args),
         // `Reflect.ownKeys` reports EVERY own key, non-enumerable included —
         // the same set as `getOwnPropertyNames` (node-js has no symbol-keyed
         // own properties, so there is no second half to append).
@@ -3250,7 +3419,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.ownKeys" => {
             let v = arg0(&args);
             let names = object_keys(args, 3)?;
-            let syms = with_host(|h| h.own_symbol_keys(&v));
+            let syms = proxy_or_own_symbol_keys(&v)?;
             if syms.is_empty() {
                 return Ok(names);
             }
@@ -3266,17 +3435,30 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.deleteProperty" => {
             let obj = arg0(&args);
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            Ok(Value::Bool(delete_property(&obj, &k)))
+            Ok(Value::Bool(delete_property(&obj, &k)?))
         }
         "Reflect.setPrototypeOf" => {
             let obj = arg0(&args);
             let p = args.get(1).cloned().unwrap_or(Value::Undef);
+            if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
+                crate::proxy::set_prototype_of(&obj, &p)?;
+                return Ok(Value::Bool(true));
+            }
             with_host(|h| h.set_proto(&obj, p));
             Ok(Value::Bool(true))
         }
-        "Reflect.isExtensible" => Ok(Value::Bool(with_host(|h| h.is_extensible(&arg0(&args))))),
+        "Reflect.isExtensible" => {
+            let v = arg0(&args);
+            match crate::proxy::is_extensible(&v)? {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Ok(Value::Bool(with_host(|h| h.is_extensible(&v)))),
+            }
+        }
         "Reflect.preventExtensions" => {
             let v = arg0(&args);
+            if crate::proxy::prevent_extensions(&v)? {
+                return Ok(Value::Bool(true));
+            }
             with_host(|h| h.prevent_extensions(&v));
             Ok(Value::Bool(true))
         }
@@ -3297,12 +3479,15 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.has" => {
             let obj = arg0(&args);
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            Ok(Value::Bool(has_property(&obj, &k)))
+            Ok(Value::Bool(has_property(&obj, &k)?))
         }
+        // `Reflect.get(target, key, receiver)` — the optional third argument is
+        // what a getter sees as `this` (28.1.6). Defaults to the target.
         "Reflect.get" => {
             let obj = arg0(&args);
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            get_property(&obj, &k)
+            let receiver = args.get(2).cloned().unwrap_or_else(|| obj.clone());
+            get_property_recv(&obj, &k, &receiver)
         }
         "Reflect.set" => {
             let obj = arg0(&args);
@@ -3349,6 +3534,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             let id: u32 = name[10..].parse().unwrap_or(0);
             host::reject_promise_val(id, arg0(&args));
             Ok(Value::Undef)
+        }
+        // The revoker `Proxy.revocable` hands back, keyed by the proxy's heap
+        // index so calling it twice is the spec's no-op rather than a re-tear.
+        _ if name.starts_with("@@prevoke:") => {
+            let i: u32 = name[10..].parse().unwrap_or(0);
+            Ok(crate::proxy::revoke(i))
         }
         _ if name.starts_with("@@finpass:") => {
             // finally(cb) on fulfill: run cb, then pass the value through.
@@ -3579,6 +3770,7 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
             Ok(s)
         }
         "Promise" => new_promise(arg0(&args)),
+        "Proxy" => crate::proxy::create(&args),
         // `new Function(p…, body)` — the same `CreateDynamicFunction` the plain
         // call form runs (20.2.1.1). `depd`'s `wrapfunction` builds its
         // deprecation wrapper this way, so `require('body-parser')` — and with it
@@ -4150,6 +4342,37 @@ fn pseudo_random() -> f64 {
 fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
     let v = arg0(&args);
     require_object_coercible(&v)?;
+    // A Proxy answers from its `ownKeys` trap. `getOwnPropertyNames` (mode 3)
+    // reports every own STRING key the trap named; the enumerating modes
+    // additionally filter by each key's `[[GetOwnProperty]]`, so both traps run.
+    if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Proxy) {
+        if mode == 3 {
+            let keys = crate::proxy::own_keys(&v)?.unwrap_or_default();
+            return Ok(with_host(|h| {
+                let out: Vec<Value> = keys
+                    .into_iter()
+                    .filter(|k| !host::is_symbol_key(k))
+                    .map(|k| h.new_str(k))
+                    .collect();
+                h.new_array(out)
+            }));
+        }
+        let entries = crate::proxy::own_enum_entries(&v)?;
+        return Ok(with_host(|h| {
+            let out: Vec<Value> = entries
+                .into_iter()
+                .map(|(k, val)| match mode {
+                    0 => h.new_str(k),
+                    1 => val,
+                    _ => {
+                        let ks = h.new_str(k);
+                        h.new_array(vec![ks, val])
+                    }
+                })
+                .collect();
+            h.new_array(out)
+        }));
+    }
     // A builtin prototype namespace that exposes enumerable methods for copying
     // (`Object.getOwnPropertyNames(EventEmitter.prototype)` — express's mixin).
     if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(&v).cloned()) {
@@ -4485,6 +4708,16 @@ fn json_walk_children(
     // A value that contains itself has no JSON form.
     if with_host(|h| path.iter().any(|p| h.strict_eq(p, v))) {
         return Err(host::type_error("Converting circular structure to JSON"));
+    }
+    // A Proxy owns no property map, so it is snapshotted through its traps into
+    // the plain array/object `SerializeJSONArray`/`SerializeJSONObject` describe
+    // — which read every member through `[[Get]]`, exactly as the snapshot does.
+    if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
+        let snap = crate::proxy::json_snapshot(v)?;
+        path.push(v.clone());
+        let out = json_walk_children(&snap, path, rep);
+        path.pop();
+        return out;
     }
     let obj = with_host(|h| h.get(v).cloned());
     path.push(v.clone());
@@ -7247,8 +7480,46 @@ fn builtin_proto_method_names(ns: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// The own SYMBOL-keyed property keys of `v` as symbol values. A Proxy's come
+/// from its `ownKeys` trap (the symbol half of the same list the string keys are
+/// filtered out of); every other receiver answers from its property map.
+fn proxy_or_own_symbol_keys(v: &Value) -> Result<Vec<Value>, String> {
+    if let Some(keys) = crate::proxy::own_keys(v)? {
+        return Ok(keys
+            .iter()
+            .filter(|k| host::is_symbol_key(k))
+            .map(|k| crate::proxy::key_value(k))
+            .collect());
+    }
+    Ok(with_host(|h| h.own_symbol_keys(v)))
+}
+
+/// `[[DefineOwnProperty]]` reachable from `crate::proxy`'s no-trap forward.
+pub fn define_property_pub(obj: &Value, key: Value, desc: Value) -> Result<Value, String> {
+    object_define_property(vec![obj.clone(), key, desc])
+}
+
+/// `[[GetOwnProperty]]` reachable from `crate::proxy`'s no-trap forward.
+pub fn own_descriptor_pub(obj: &Value, key: Value) -> Result<Value, String> {
+    object_get_own_descriptor(vec![obj.clone(), key])
+}
+
 fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
+    // A Proxy defines through its `defineProperty` trap; the target it forwards
+    // to is where the ordinary path below finally runs.
+    if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
+        let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+        let desc = args.get(2).cloned().unwrap_or(Value::Undef);
+        if !with_host(|h| is_object_like(h, &desc)) {
+            return Err(host::type_error(&format!(
+                "Property description must be an object: {}",
+                with_host(|h| h.str_of(&desc))
+            )));
+        }
+        crate::proxy::define_property(&obj, &key, &desc)?;
+        return Ok(obj);
+    }
     // 20.1.2.4 steps 1-3, both of which node-js skipped entirely: a non-object
     // target and a non-object descriptor each throw before anything is written.
     if !with_host(|h| is_object_like(h, &obj)) {
@@ -7368,6 +7639,9 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
     require_object_coercible(&obj)?;
     let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+    if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
+        return Ok(crate::proxy::get_own_descriptor(&obj, &key)?.unwrap_or(Value::Undef));
+    }
     // A method read off an enumerable builtin prototype (`EventEmitter.prototype`)
     // yields a `{ value: <method thunk> }` data descriptor so `mixin` can copy it.
     if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(&obj).cloned()) {
@@ -7463,8 +7737,17 @@ fn object_get_own_descriptors(args: Vec<Value>) -> Result<Value, String> {
     Ok(with_host(|h| h.new_object(out)))
 }
 
-/// `key in obj` respecting the prototype chain.
-pub fn has_property(obj: &Value, key: &str) -> bool {
+/// `key in obj` respecting the prototype chain. Reports a `Result` because a
+/// Proxy's `has` trap is user code and may throw.
+pub fn has_property(obj: &Value, key: &str) -> Result<bool, String> {
+    if let Some(b) = crate::proxy::has(obj, key)? {
+        return Ok(b);
+    }
+    Ok(has_property_ordinary(obj, key))
+}
+
+/// `[[HasProperty]]` for every non-Proxy receiver.
+fn has_property_ordinary(obj: &Value, key: &str) -> bool {
     // `key in <builtin namespace/prototype>`: membership matches what a property
     // read would yield. `String.prototype.indexOf` (and the rest of the builtin
     // prototype methods) resolve as callable thunks via `namespace_property`, so

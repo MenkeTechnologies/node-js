@@ -69,18 +69,15 @@ engine has a real runtime source evaluator. `runInThisContext`, `Script`,
 That limitation is stated in the module's own docs and is not the same thing as
 being unimplemented.
 
-Two ECMAScript globals are absent entirely, and reference as `ReferenceError`
+One ECMAScript global is absent entirely, and references as `ReferenceError`
 rather than pretending:
 
-- **`Proxy`.** `Reflect` is complete (all 13 methods), but `Proxy` needs
-  interception hooks in every property funnel — `get_property`,
-  `set_property`, `has_property`, both delete paths, own-key enumeration, call
-  and construct — each of which has to invoke a user trap from inside a host
-  borrow. That is a structural change to the object model, not an addition to
-  it, so it is not attempted here rather than shipped half-working.
 - **`Intl`.** Needs ICU (locale-aware number/date/collation data). There is no
   honest subset: a `Intl.NumberFormat` that only handles `en-US` would give
   wrong answers for every other locale instead of an error.
+
+`Proxy` is implemented — see "Proxy" below for the shape and the two divergences
+that remain.
 
 `async_hooks.AsyncResource` carries a real id graph. Each `new AsyncResource()`
 takes the next monotonically increasing `asyncId` (from 2 — Node reserves 1 for
@@ -1707,7 +1704,70 @@ Still open from the same sweep, each needing substrate that does not exist yet:
 
 | case | node v26.7.0 | node-js |
 | --- | --- | --- |
-| `new Proxy({}, handler)` | a proxy exotic object | `ReferenceError: Proxy is not defined` — no exotic-object interception layer |
 | `new DataView(buf)` | a view | `ReferenceError: DataView is not defined` (already listed above) |
 | `console.log([,1,,2])` | `[ <1 empty item>, 1, <1 empty item>, 2 ]` | `[ undefined, 1, undefined, 2 ]` — the dense-array model has no HOLE, so `0 in [,1]` also reads `true` |
 | `'café'.normalize('NFC').length` | `4` | `5` — `normalize` is the documented identity (no Unicode normalization tables) |
+
+## Proxy
+
+`Proxy` is implemented, with all thirteen traps and `Proxy.revocable`. It is a
+real heap variant (`JsObj::Proxy`), not an object with hidden slots, because
+`typeof`, callability and constructability all have to answer from the TARGET
+while every property operation answers from the HANDLER — a shape no property
+map can carry. `src/proxy.rs` is the single place the diversion happens; the
+funnels the rest of the runtime already routed through call into it first.
+
+| trap | reached through |
+| --- | --- |
+| `get` | `p.k`, `p[k]`, `Reflect.get`, a proxy used as a PROTOTYPE (the child is the trap's `receiver`) |
+| `set` | `p.k = v`, `p[k] = v`, `Reflect.set` |
+| `has` | `k in p`, `Reflect.has` |
+| `deleteProperty` | `delete p.k`, `delete p[k]`, `Reflect.deleteProperty` |
+| `ownKeys` | `Object.keys`/`values`/`entries`, `Object.getOwnPropertyNames`/`Symbols`, `Reflect.ownKeys`, `for-in`, object spread, `Object.assign`, `JSON.stringify` |
+| `getOwnPropertyDescriptor` | `Object.getOwnPropertyDescriptor(s)`, `Object.prototype.hasOwnProperty`, and the enumerability filter in front of `Object.keys` / `for-in` |
+| `defineProperty` | `Object.defineProperty`/`defineProperties`, `Reflect.defineProperty` |
+| `getPrototypeOf` | `Object.getPrototypeOf`, `Reflect.getPrototypeOf`, `instanceof` |
+| `setPrototypeOf` | `Object.setPrototypeOf`, `Reflect.setPrototypeOf` |
+| `isExtensible` | `Object.isExtensible`, `Reflect.isExtensible` |
+| `preventExtensions` | `Object.preventExtensions`, `Reflect.preventExtensions` |
+| `apply` | `p(…)`, `p.call`/`.apply`/`.bind`, `Reflect.apply` |
+| `construct` | `new p(…)`, `Reflect.construct`, `super(…)` from a class that extends the proxy |
+
+`Reflect.get(target, key, receiver)` now honors its third argument — a getter
+runs with the RECEIVER as `this`, which is what makes the standard
+`get(t, k, r) { return Reflect.get(t, k, r) }` membrane forward correctly when
+the proxy is a prototype.
+
+Iteration deserves a note. `Array.prototype[Symbol.iterator]` is generic: it
+reads `length` and then each index through `[[Get]]`. node-js models it as a
+thunk BOUND to the array it was read off, which read through a proxy would walk
+the target and ignore every answer the `get` trap gave. An array-backed proxy
+still holding that default therefore takes an explicit length-driven walk, so
+`[...new Proxy([1,2,3], { get: (t,k) => k === 'length' ? 2 : t[k] })]` is
+`[1, 2]` as in Node. A user-installed `Symbol.iterator` is an ordinary function
+and keeps the direct path.
+
+The same "generic method modeled as a bound thunk" correction applies to
+`Function.prototype.call`/`apply`/`bind`/`toString` and to the reflective
+`Object.prototype` methods (`hasOwnProperty`, `propertyIsEnumerable`,
+`isPrototypeOf`): read off a proxy they resolve to a thunk bound to the TARGET,
+so each is re-dispatched against the proxy. `pf.call(1, 2)` therefore reaches the
+`apply` trap, `p.hasOwnProperty(k)` reaches the descriptor trap, and
+`String(new Proxy(function f(){}, {}))` is `function () { [native code] }` —
+V8 refuses to expose a proxy's target through `Function.prototype.toString`. The
+kind-specific `toString`/`valueOf`/`toLocaleString` are deliberately left on the
+thunk, because they resolve by the target's kind: a proxy of an array
+stringifies `1,2`, not `[object Object]`.
+
+Two divergences remain, both cases where node-js is more permissive than Node:
+
+| case | node v26.7.0 | node-js |
+| --- | --- | --- |
+| `new Proxy(new Map([['a',1]]), {}).get('a')` | `TypeError: Method Map.prototype.get called on incompatible receiver #<Map>` | `1` — a builtin method read through a proxy binds to the TARGET, so the internal-slot check Node performs on `this` never runs |
+| `structuredClone(new Proxy({a:1}, {}))` | `DOMException [DataCloneError]` | `{a:1}` — `structuredClone` has no uncloneable-value rejection at all (functions and `WeakMap` clone silently too), and node-js has no `DOMException` |
+
+The spec's trap-result INVARIANT checks are not implemented: 10.5.x throws when a
+trap contradicts a non-configurable or non-extensible property of the target
+(reporting a frozen own property as absent, say). node-js reports the trap's
+answer as given. Every trap itself is real — the gap is the after-the-fact
+consistency audit, and it is listed here rather than papered over.
