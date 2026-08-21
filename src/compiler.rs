@@ -136,7 +136,7 @@ pub struct Compiler {
     /// Locals of the chunk being emitted that live in fusevm frame slots rather
     /// than the host's scope chain — see [`crate::slots`]. Empty for a chunk the
     /// analysis refused, so `slot_of` answering `None` is the old path.
-    slots: crate::slots::SlotTable,
+    slots: crate::slots::Plan,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -627,7 +627,17 @@ impl Compiler {
 
     /// The frame slot holding `name` in the chunk being emitted, if it has one.
     fn slot_of(&self, name: &str) -> Option<u16> {
-        self.slots.get(name).copied()
+        self.slots.table.get(name).copied()
+    }
+
+    /// The slot for `name` if it also provably holds a Number, so `++`/`--` can
+    /// be a native add rather than a `NUM_STEP` round-trip through the host.
+    fn numeric_slot_of(&self, name: &str) -> Option<u16> {
+        self.slots
+            .numeric
+            .contains(name)
+            .then(|| self.slot_of(name))
+            .flatten()
     }
 
     // ── control flow ─────────────────────────────────────────────────────
@@ -2231,6 +2241,26 @@ impl Compiler {
         // (`+old`/`old + 1` would throw the mix error). It pushes the coerced old
         // value and returns the new value: stack `[tag, old]` → `[oldN, new]`.
         let tag = if matches!(op, UpdateOp::Inc) { 1 } else { -1 };
+        // A slot that provably holds a Number needs none of that: `ToNumeric`
+        // is the identity on it and `Number ± 1` is a Number, so the whole
+        // update is `GetSlot`, a native `Add`, and `SetSlot`. This is what takes
+        // the last `CallBuiltin` out of a counting loop's body — and with it the
+        // reason fusevm's tiers decline the loop.
+        if let Expr::Ident(n) = target {
+            if let Some(slot) = self.numeric_slot_of(n) {
+                b.emit(Op::GetSlot(slot), 0); // [old]
+                if !prefix {
+                    b.emit(Op::Dup, 0); // [old, old]
+                }
+                b.emit(Op::LoadFloat(tag as f64), 0);
+                b.emit(Op::Add, 0); // [ (old,) new ]
+                if prefix {
+                    b.emit(Op::Dup, 0); // [new, new]
+                }
+                b.emit(Op::SetSlot(slot), 0); // stores, leaves the yielded value
+                return Ok(());
+            }
+        }
         b.emit(Op::LoadInt(tag), 0);
         self.compile_expr(b, target)?; // [tag, old]
         b.emit(Op::CallBuiltin(ops::NUM_STEP, 2), 0); // [oldN, new]

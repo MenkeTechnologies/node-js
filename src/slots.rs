@@ -49,13 +49,33 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// Name → frame slot for one chunk. Empty when the chunk is not eligible.
 pub type SlotTable = FxHashMap<String, u16>;
 
+/// What the compiler needs to know about a chunk's locals.
+#[derive(Default)]
+pub struct Plan {
+    /// The slotted names and their frame indices.
+    pub table: SlotTable,
+    /// Of those, the ones provably holding a Number, so `++`/`--` can be a
+    /// native add instead of a `NUM_STEP` call into the host.
+    pub numeric: FxHashSet<String>,
+}
+
+/// Is this initializer a literal Number? `-1` reaches the compiler as a unary
+/// negation of `1`, so it counts too.
+fn is_number_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) => true,
+        Expr::Unary(crate::ast::UnOp::Neg, inner) => matches!(**inner, Expr::Number(_)),
+        _ => false,
+    }
+}
+
 /// Plan the slots for a chunk: `params` are bound into the environment by the
 /// caller before the chunk runs (the compiler emits a prologue that copies each
 /// into its slot), `body` is the statement list about to be compiled, and
 /// `top_level` marks a script/module body, where `var` stays a global.
-pub fn plan(params: &[Param], body: &[Stmt], top_level: bool) -> SlotTable {
+pub fn plan(params: &[Param], body: &[Stmt], top_level: bool) -> Plan {
     if !chunk_is_eligible(body) {
-        return SlotTable::default();
+        return Plan::default();
     }
     // Anything a nested chunk can name resolves through the environment, so it
     // cannot move into this frame's slots.
@@ -66,10 +86,13 @@ pub fn plan(params: &[Param], body: &[Stmt], top_level: bool) -> SlotTable {
     let mut p = Planner {
         candidates: SlotTable::default(),
         rejected: escaping,
+        numeric: FxHashSet::default(),
         top_level,
         next: 0,
     };
     // Parameters are declared and assigned before the first statement runs.
+    // Their incoming type is whatever the caller passed, so they are never in
+    // the numeric set.
     for name in param_names(params) {
         p.declare(&name);
     }
@@ -78,8 +101,12 @@ pub fn plan(params: &[Param], body: &[Stmt], top_level: bool) -> SlotTable {
     }
     for name in p.rejected {
         p.candidates.remove(&name);
+        p.numeric.remove(&name);
     }
-    p.candidates
+    Plan {
+        table: p.candidates,
+        numeric: p.numeric,
+    }
 }
 
 /// The simple identifier parameters, in order. A destructuring or rest pattern
@@ -225,6 +252,11 @@ fn expr_slot_safe(e: &Expr) -> bool {
 struct Planner {
     candidates: SlotTable,
     rejected: FxHashSet<String>,
+    /// Slots whose value is provably a JS Number at every point: declared from
+    /// a numeric literal and written afterwards only by `++`/`--`, which on a
+    /// Number yields a Number. `i++` on one of these needs no `NUM_STEP` call
+    /// into the host to do `ToNumeric` and stay BigInt-aware.
+    numeric: FxHashSet<String>,
     top_level: bool,
     next: u16,
 }
@@ -264,6 +296,12 @@ impl Planner {
 
     /// The declaration target of a `let`/`var`/`for`-head binding.
     fn declare_target(&mut self, target: &Expr, kind: Option<DeclKind>) {
+        self.declare_target_init(target, kind, None)
+    }
+
+    /// As `declare_target`, plus the initializer, which decides whether the
+    /// binding starts out a Number (see `Planner::numeric`).
+    fn declare_target_init(&mut self, target: &Expr, kind: Option<DeclKind>, init: Option<&Expr>) {
         let Expr::Ident(n) = target else {
             // A destructuring pattern binds through the host; every name in it
             // is off the table.
@@ -273,7 +311,12 @@ impl Planner {
         match kind {
             // Rule 5: a top-level `var` is a global-object property.
             Some(DeclKind::Var) if self.top_level => self.reject(n),
-            Some(_) => self.declare(n),
+            Some(_) => {
+                self.declare(n);
+                if init.is_some_and(is_number_literal) {
+                    self.numeric.insert(n.clone());
+                }
+            }
             // `for (x of …)` with no declaration keyword assigns an existing
             // binding — that is a mention, not a declaration.
             None => self.mention(n),
@@ -301,7 +344,9 @@ impl Planner {
                         // unassigned, which is exactly the read-before-write
                         // case slots cannot answer for.
                         None => self.reject_names_in(&d.target),
-                        Some(_) => self.declare_target(&d.target, Some(*kind)),
+                        Some(init) => {
+                            self.declare_target_init(&d.target, Some(*kind), Some(init))
+                        }
                     }
                 }
             }
@@ -395,7 +440,12 @@ impl Planner {
             Expr::Assign { target, value } => {
                 self.walk_expr(value);
                 match &**target {
-                    Expr::Ident(n) => self.mention(n),
+                    // A plain store of an arbitrary value: whatever the slot
+                    // held, it is not provably a Number after this.
+                    Expr::Ident(n) => {
+                        self.numeric.remove(n);
+                        self.mention(n);
+                    }
                     other => self.walk_expr(other),
                 }
             }

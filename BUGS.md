@@ -1108,6 +1108,43 @@ Not yet: `reaches native code` is still `false`. The loop region holds one
 `CallBuiltin` (`NUM_STEP`) and fusevm's block tier declines any region
 containing one, so the JIT still never compiles it.
 
+## FIXED — `i++` on a proven-Number local, and what still keeps the JIT away
+
+The counting loop's last host round-trip was `i++`. It lowered to
+`CallBuiltin(NUM_STEP)`, which exists because `x++` is `ToNumeric(x)` and has to
+keep a BigInt a BigInt (`1n++` is `2n`, not `2`).
+
+A slot the compiler can prove holds a Number needs none of that: `ToNumeric` is
+the identity on it, and `Number ± 1` is a Number. `crate::slots` tracks that
+proof — a local declared from a numeric literal and afterwards written only by
+`++`/`--` — and the update lowers to `GetSlot`, a native `Add`, `SetSlot`. Any
+other write (`i = something`, `i += n`, a `for…of` binding, a parameter, a
+BigInt or string initializer) drops the name out of the numeric set and keeps
+the builtin, so `let b = 1n; b++` is still `2n`.
+
+A 5M-iteration `s += i` loop is now, in full:
+
+    GetSlot(1) LoadFloat NumLt JumpIfFalse
+    GetSlot(0) GetSlot(1) Add Dup SetSlot(0) Pop
+    GetSlot(1) Dup LoadFloat(1) Add SetSlot(1) Pop
+    Jump
+
+with no `CallBuiltin` in the loop at all, where it used to hold six.
+
+**The JIT still does not compile it.** `node --tiers` now reports the loop
+`trace-eligible=true` (it was `false` — every `CallBuiltin` in the body
+disqualified it), which is the precondition for fusevm's trace tier. But the
+tracer never installs a trace: `traced=false`, `reaches native code false`, and a
+run adds nothing to fusevm's on-disk trace cache. Removing `NUM_STEP` on its own
+measured 1.03x, exactly what taking one host call out of a sixteen-op loop is
+worth — none of the 10-50x a compiled trace would be.
+
+So the remaining gap is on fusevm's side, not in this frontend's lowering: the
+loop presents ops the tier accepts, the strict-numeric slot gate is satisfied
+(both slots are `Value::Float`), the back-edge count is far past the threshold of
+50, and it still declines. That is where the next measurement belongs, and it is
+a fusevm question — `trace_lookup` / the recorder — not a node-js one.
+
 ## FIXED — the process's own observables: exit status, exit events, raw stdout
 
 Four things about how a program ENDS, and one about how it writes, none of

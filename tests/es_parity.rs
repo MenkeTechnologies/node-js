@@ -2868,3 +2868,44 @@ fn slotted_locals_keep_their_scope_semantics() {
          6 number"
     );
 }
+
+/// `++`/`--` on a slot the compiler proved holds a Number lowers to a native
+/// add rather than the `NUM_STEP` builtin (which exists to keep `x++` on a
+/// BigInt a BigInt). The pairs below are what that rewrite must not change:
+/// prefix vs postfix values, a fractional counter, a negative start, the
+/// float boundary at 2^53, and a `let` that is reassigned — which drops out of
+/// the numeric set and keeps the builtin. Expected values from node v26.7.0.
+#[test]
+fn increment_on_a_numeric_slot_matches_node() {
+    let src = r#"
+        let i = 0;
+        console.log(i++, i, ++i, i, i--, i, --i, i);
+        let f = 0.5;
+        console.log(f++, f, ++f);
+        let n = -1;
+        console.log(n++, n);
+        let big = 9007199254740991;
+        big++;
+        console.log(big);
+        let mixed = 1;
+        mixed = "2";
+        mixed++;
+        console.log(mixed, typeof mixed);
+        let b = 1n;
+        b++;
+        console.log(b, typeof b);
+        let total = 0;
+        for (let k = 0; k < 4; k++) total += k;
+        console.log(total);
+    "#;
+    assert_eq!(
+        run(src),
+        "0 1 2 2 2 1 0 0\n\
+         0.5 1.5 2.5\n\
+         -1 0\n\
+         9007199254740992\n\
+         3 number\n\
+         2n bigint\n\
+         6"
+    );
+}
