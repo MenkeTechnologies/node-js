@@ -2667,3 +2667,77 @@ fn iteration_through_a_proxy_honors_the_get_trap() {
          {\"x\":2}"
     );
 }
+
+// ── Array.prototype.sort: order, undefined placement, comparison count ───────
+
+/// `sort` must not hand `undefined` to the comparator, must place it after
+/// every defined value, and must be stable. Expected values from node v26.7.0:
+/// `[3,undefined,1].sort((x,y)=>x-y)` is `[1,3,undefined]` after exactly ONE
+/// call. The insertion sort this replaced compared `undefined` like any other
+/// value, called the comparator twice, and left `[3,undefined,1]`.
+#[test]
+fn sort_keeps_undefined_out_of_the_comparator_and_is_stable() {
+    let src = r#"
+        const a = [3, undefined, 1];
+        let calls = 0;
+        a.sort((x, y) => { calls++; return x - y; });
+        console.log(JSON.stringify(a), calls, a.length);
+        console.log(JSON.stringify([3, undefined, 1, undefined, 2].sort()));
+        const pairs = [{k:1,i:0},{k:0,i:1},{k:1,i:2},{k:0,i:3}];
+        console.log(JSON.stringify(pairs.sort((x, y) => x.k - y.k)));
+        console.log(JSON.stringify([1, 2, 3].sort(() => NaN)));
+        console.log(JSON.stringify([10, 9, 1, 2].sort()));
+    "#;
+    assert_eq!(
+        run(src),
+        "[1,3,null] 1 3\n\
+         [1,2,3,null,null]\n\
+         [{\"k\":0,\"i\":1},{\"k\":0,\"i\":3},{\"k\":1,\"i\":0},{\"k\":1,\"i\":2}]\n\
+         [1,2,3]\n\
+         [1,10,2,9]"
+    );
+}
+
+/// The comparison COUNT is the regression guard: `sort` was quadratic, so 4096
+/// reversed elements cost 8.4M comparator calls and 200k elements did not
+/// finish inside 120s (node v26.7.0 sorts those in 70ms). A merge sort of
+/// n = 4096 is bounded by n*log2(n) = 49152; the bound below leaves headroom
+/// for a different O(n log n) algorithm but a return to O(n²) fails it by two
+/// orders of magnitude. Counting, not timing, so it cannot go flaky on a busy
+/// CI machine.
+#[test]
+fn sort_comparison_count_stays_linearithmic() {
+    let src = r#"
+        const n = 4096;
+        const a = [];
+        for (let i = 0; i < n; i++) a.push(n - i);
+        let calls = 0;
+        a.sort((x, y) => { calls++; return x - y; });
+        console.log(a[0], a[n - 1], calls <= n * 12, calls < 100000);
+    "#;
+    assert_eq!(run(src), "1 4096 true true");
+}
+
+/// A typed array sorts numerically by default and shares `Array`'s merge sort
+/// for a user comparator; a comparator returning NaN means "keep this order"
+/// (23.2.4.1 SortCompare step 3), which the old `<= 0.0` break inverted into a
+/// swap. Expected values from node v26.7.0.
+#[test]
+fn typed_array_sort_matches_node() {
+    let src = r#"
+        console.log(new Int32Array([5, 1, 4, 2, 3]).sort((a, b) => a - b).join(','));
+        console.log(new Uint8Array([10, 9, 1]).sort().join(','), [10, 9, 1].sort().join(','));
+        console.log(new Float64Array([3, 1, 2]).sort(() => NaN).join(','));
+        const big = new Int32Array(2048);
+        for (let i = 0; i < 2048; i++) big[i] = (i * 7919) % 2048;
+        big.sort((a, b) => a - b);
+        console.log(big[0], big[1024], big[2047]);
+    "#;
+    assert_eq!(
+        run(src),
+        "1,2,3,4,5\n\
+         1,9,10 1,10,9\n\
+         3,1,2\n\
+         0 1024 2047"
+    );
+}

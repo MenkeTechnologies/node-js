@@ -464,10 +464,15 @@ pub enum MapKey {
 
 // ── environments ─────────────────────────────────────────────────────────────
 
+/// The map behind a scope. Hashing these with `FxHash` instead of the default
+/// was measured SLOWER, not faster — fib went 652ms to 1086ms and a 5M-iteration
+/// counting loop 1894ms to 2381ms on the same machine — so the default stands.
+pub type VarMap = IndexMap<String, Value>;
+
 /// A local-variable environment, shared (by `Rc`) between a frame and any nested
 /// function that captures it.
 pub struct EnvData {
-    pub vars: IndexMap<String, Value>,
+    pub vars: VarMap,
     pub parent: Option<Env>,
 }
 pub type Env = Rc<RefCell<EnvData>>;
@@ -512,7 +517,7 @@ impl PropAttrs {
 
 fn new_env(parent: Option<Env>) -> Env {
     Rc::new(RefCell::new(EnvData {
-        vars: IndexMap::new(),
+        vars: VarMap::default(),
         parent,
     }))
 }
@@ -567,7 +572,7 @@ pub struct JsHost {
     /// try/catch/finally block templates, indexed by try id.
     pub tries: Vec<TryDef>,
     /// Module-level (global) names.
-    globals: IndexMap<String, Value>,
+    globals: VarMap,
     /// The frame stack (bottom = module).
     frames: Vec<Frame>,
     /// The program's top-level scope — the scope runtime-compiled source runs in
@@ -866,7 +871,7 @@ impl JsHost {
             heap: Vec::new(),
             funcs: Vec::new(),
             tries: Vec::new(),
-            globals: IndexMap::new(),
+            globals: VarMap::default(),
             frames: vec![Frame {
                 env: global_env.clone(),
                 base_env: global_env.clone(),
@@ -1598,13 +1603,22 @@ impl JsHost {
     pub fn set_name(&mut self, name: &str, val: Value) {
         let mut env = Some(self.cur_env());
         while let Some(e) = env {
-            if e.borrow().vars.contains_key(name) {
-                e.borrow_mut().vars.insert(name.to_string(), val);
+            // `get_mut`, not `contains_key` + `insert`: overwriting an existing
+            // binding hashed the name twice and allocated a fresh `String` key
+            // for a key that was already there — once per assignment, so once
+            // per loop iteration in any counting loop.
+            if let Some(slot) = e.borrow_mut().vars.get_mut(name) {
+                *slot = val;
                 return;
             }
             env = e.borrow().parent.clone();
         }
-        self.globals.insert(name.to_string(), val);
+        match self.globals.get_mut(name) {
+            Some(slot) => *slot = val,
+            None => {
+                self.globals.insert(name.to_string(), val);
+            }
+        }
     }
 
     /// Declare a new binding in the current scope (`let`/`const`). At the top of
@@ -4504,7 +4518,7 @@ pub fn run_user_func_nt(
 /// Bind positional args into a fresh call environment. The compiler emits the
 /// param names in `def.params`; a `...rest` slot collects the tail as an array.
 fn bind_params(env: &Env, def: &FuncDef, args: Vec<Value>) {
-    let mut vars: IndexMap<String, Value> = IndexMap::new();
+    let mut vars = VarMap::default();
     let mut i = 0;
     for slot in &def.params {
         if slot.rest {

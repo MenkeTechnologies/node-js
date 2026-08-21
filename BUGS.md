@@ -873,6 +873,100 @@ per-element JS loop runs over the body. Real express 5 POSTs of 25 KB → 207 KB
 are flat in both builds (0.16–0.18 s before, 0.06–0.07 s after); the improvement
 there is general property-access speedup, not a change in body-size scaling.
 
+## FIXED — `sort` was O(n^2), and `undefined` reached the comparator
+
+`Array.prototype.sort` (and `toSorted`, and the typed-array `sort` with a user
+comparator) was an insertion sort: `sort_values` in `src/builtins.rs` walked
+each element back through its predecessors one swap at a time. Every doubling of
+the input quadrupled the work. Sorting 200,000 numbers with a comparator did not
+finish inside 120 s; node v26.7.0 sorts the same array in 70 ms.
+
+Release build, same machine (Apple M5 Max), `a.sort((p, q) => p - q)` over a
+pseudo-random array:
+
+| n | before | after |
+| --- | --- | --- |
+| 1,000 | 0.21 s | 0.012 s |
+| 2,000 | 0.81 s | 0.022 s |
+| 4,000 | 3.39 s | 0.043 s |
+| 8,000 | 12.94 s | 0.086 s |
+| 16,000 | 51.36 s | 0.179 s |
+| 200,000 | did not finish in 120 s | 2.97 s |
+
+4x per doubling before, 2x after. The default (no-comparator) order was
+quadratic for the same reason — 0.039 / 0.113 / 0.444 s at n = 2,000 / 4,000 /
+8,000 — since both orders went through the same loop.
+
+`sort_values` is now a bottom-up stable merge sort. Bottom-up rather than
+recursive because the JS comparator runs on the same native stack. Ties take
+from the left run, which preserves the stability the spec requires:
+`[{k:1},{k:0},{k:1},{k:0}].sort((x,y)=>x.k-y.k)` keeps the two `k:0` entries in
+input order. A comparator result of NaN is not `> 0`, so such a pair keeps its
+order too, as `[1,2,3].sort(() => NaN)` does in node.
+
+The rewrite also fixed a semantic divergence the insertion sort had: 23.1.3.30.1
+SortIndexedProperties never passes `undefined` to the comparator — it is moved
+after every defined value once they are ordered.
+
+| expression | node v26.7.0 | node-js before | node-js now |
+| --- | --- | --- | --- |
+| `[3,undefined,1].sort((x,y)=>x-y)` | `[1,3,undefined]` | `[3,undefined,1]` | `[1,3,undefined]` |
+| comparator calls for that sort | 1 | 2 | 1 |
+
+The typed-array path had its own copy of the insertion sort in
+`src/stdlib/typedarray.rs`, with a `<= 0.0` break that turned a NaN comparator
+result into a SWAP rather than "keep this order" (23.2.4.1 step 3 reads NaN as
++0). It now converts to `Value::Float`s and calls the same `sort_values`, so
+there is one sort in the runtime and one set of semantics.
+
+`tests/es_parity.rs` guards this by COUNTING comparator calls, not by timing:
+sorting 4,096 reversed elements must stay under `n * 12` calls. The merge sort
+uses 24,576; the insertion sort used 8.4 million. node uses 4,095 — TimSort
+detects the reversed run — which is why the bound is a bound and not an equality.
+
+## FIXED — a `String` allocated for every variable read, and a `TRUTHY` call per loop condition
+
+Every identifier in this runtime is a name lookup: the compiler lowers `x` to
+`CallBuiltin(GETLOCAL)` with the name as a string constant, and the host walks
+the scope chain for it. Two costs on that path were pure waste.
+
+`sval` (`src/builtins.rs`) deep-copied the name out of its `Arc<String>` on
+every read, write, and declaration — a heap allocation and a memcpy per variable
+access, so several per loop iteration. `sname` clones the `Arc` handle instead.
+`JsHost::set_name` (`src/host.rs`) hashed the name twice and allocated a fresh
+`String` key to overwrite a binding that was already there; it now writes
+through `get_mut`.
+
+`compile_condition` (`src/compiler.rs`) wrapped every `if`/`while`/`for` test in
+`CallBuiltin(TRUTHY)` even when the test had just produced a `Value::Bool`.
+`yields_bool` skips the call for the relational and equality operators, `in`,
+`instanceof`, `delete`, `!`, and the boolean literals — one fewer host
+round-trip per condition evaluation, which in a counting loop is one per
+iteration. It also places the comparison immediately before the jump that
+consumes it, which is what fusevm's block JIT requires of a bool-producing op.
+
+Release build, wall clock, mean of 8 hyperfine runs:
+
+| workload | before | after |
+| --- | --- | --- |
+| 5M-iteration counting loop | 2400 ms | 1895 ms |
+| `fib(27)` | 722 ms | 651 ms |
+| 1M `Math.sqrt` / divide | 822 ms | 693 ms |
+| 300k array map/filter/sum | 665 ms | 624 ms |
+| 200k `Map` set + get | 457 ms | 431 ms |
+
+Not tried again: hashing the scope maps with `FxHash` instead of the default.
+It was measured and it is SLOWER — `fib(27)` went 651 ms to 1086 ms and the
+counting loop 1895 ms to 2381 ms — so `VarMap` (`src/host.rs`) keeps the default
+hasher.
+
+What none of this touches: node-js runs these programs entirely in the fusevm
+interpreter. `node --tiers` reports `reaches native code false` for every loop
+above, because each JS-level operation lowers to a `CallBuiltin` and fusevm's
+block JIT declines any region containing one. That is the remaining 20-70x, and
+it is a lowering question (slot-resolved locals instead of name lookups), not a
+tuning one.
+
 ## FIXED — the process's own observables: exit status, exit events, raw stdout
 
 Four things about how a program ENDS, and one about how it writes, none of

@@ -501,24 +501,17 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let mut out = elems.clone();
             let cmp = args.first().cloned().unwrap_or(Value::Undef);
             if with_host(|h| crate::host::is_callable(h, &cmp)) {
-                // A user comparator: insertion sort so each comparison can call
-                // back into JS (which `sort_by` cannot do — it takes a closure
-                // that must not fail).
-                for i in 1..out.len() {
-                    let mut j = i;
-                    while j > 0 {
-                        let r = crate::host::invoke(
-                            &cmp,
-                            vec![Value::Float(out[j - 1]), Value::Float(out[j])],
-                            None,
-                        )?;
-                        if with_host(|h| h.to_number(&r)) <= 0.0 {
-                            break;
-                        }
-                        out.swap(j - 1, j);
-                        j -= 1;
-                    }
-                }
+                // A user comparator goes through the same fallible merge sort
+                // `Array.prototype.sort` uses: O(n log n) rather than the
+                // insertion sort this was, and a comparator returning NaN keeps
+                // the pair's order (23.2.4.1 step 3: NaN is +0) instead of
+                // swapping, which the `<= 0.0` break got wrong.
+                let mut vals: Vec<Value> = out.iter().map(|f| Value::Float(*f)).collect();
+                crate::builtins::sort_values(&mut vals, Some(&cmp))?;
+                out = vals
+                    .iter()
+                    .map(|v| with_host(|h| h.to_number(v)))
+                    .collect();
             } else {
                 // A typed array sorts NUMERICALLY by default, unlike `Array`
                 // which sorts by string. Verified against node v26.7.0:

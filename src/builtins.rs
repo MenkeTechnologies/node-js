@@ -438,6 +438,18 @@ fn sval(v: &Value) -> String {
     with_host(|h| h.as_str(v)).unwrap_or_default()
 }
 
+/// The same string, without `sval`'s deep copy. Every identifier the compiler
+/// emits is a `Value::Str` constant, so a variable read or write that went
+/// through `sval` heap-allocated and memcpy'd the NAME once per access — on the
+/// hot path of every loop. `Value::Str` is an `Arc<String>`, so cloning the
+/// handle is a refcount bump instead.
+fn sname(v: &Value) -> std::sync::Arc<String> {
+    match v {
+        Value::Str(s) => s.clone(),
+        _ => std::sync::Arc::new(sval(v)),
+    }
+}
+
 fn abort(vm: &mut VM, e: String) -> Value {
     with_host(|h| h.error = Some(e));
     vm.ip = vm.chunk.ops.len();
@@ -487,7 +499,7 @@ pub(crate) fn global_binding(name: &str) -> Option<Value> {
 }
 
 fn b_getlocal(vm: &mut VM, _: u8) -> Value {
-    let name = sval(&vm.pop());
+    let name = sname(&vm.pop());
     match global_binding(&name) {
         Some(v) => v,
         None => abort(vm, host::ref_error(&name)),
@@ -496,14 +508,14 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
 
 fn b_setlocal(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
-    let name = sval(&vm.pop());
+    let name = sname(&vm.pop());
     with_host(|h| h.set_name(&name, val.clone()));
     val
 }
 
 fn b_declare(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
-    let name = sval(&vm.pop());
+    let name = sname(&vm.pop());
     with_host(|h| h.declare_name(&name, val.clone()));
     val
 }
@@ -512,7 +524,7 @@ fn b_declare(vm: &mut VM, _: u8) -> Value {
 /// open block scopes, so the name outlives the block it was written in.
 fn b_declare_var(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
-    let name = sval(&vm.pop());
+    let name = sname(&vm.pop());
     with_host(|h| h.declare_var_name(&name, val.clone()));
     val
 }
@@ -6081,10 +6093,17 @@ fn join_parts(items: &[Value]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// In-place sort of `items` (shared by `sort` and `toSorted`). Uses insertion
-/// sort so the fallible JS comparator can be called; default order is by the
-/// string form of each element. Propagates a comparator error.
-fn sort_values(items: &mut [Value], cmp: Option<&Value>) -> Result<(), String> {
+/// In-place sort of `items` (shared by `sort` and `toSorted`). Stable merge
+/// sort — O(n log n) comparisons — with the fallible JS comparator called from
+/// the merge step; default order is by the string form of each element.
+/// Propagates a comparator error.
+///
+/// This was an insertion sort, which is O(n²): sorting 200k numbers with a
+/// comparator did not finish inside 120s (node v26.7.0: 70ms), and each
+/// doubling of the input quadrupled the time — 1k/2k/4k/8k/16k measured at
+/// 0.21/0.81/3.39/12.94/51.36s. The comparator contract is unchanged; only the
+/// number of times it is called is.
+pub(crate) fn sort_values(items: &mut [Value], cmp: Option<&Value>) -> Result<(), String> {
     // 23.1.3.30 step 1: a comparator that is neither `undefined` nor callable is
     // rejected BEFORE any comparison runs. `[2,1].sort(null)` was reaching the
     // invoke path and reporting the generic `null is not a function`.
@@ -6098,34 +6117,95 @@ fn sort_values(items: &mut [Value], cmp: Option<&Value>) -> Result<(), String> {
         }
         other => other,
     };
-    for i in 1..items.len() {
-        let mut j = i;
-        while j > 0 {
-            let order = match cmp {
-                Some(cb) => {
-                    let v = host::invoke(cb, vec![items[j - 1].clone(), items[j].clone()], None)?;
-                    with_host(|h| h.to_number(&v))
-                }
-                None => {
-                    // 23.1.3.30.2 SortCompare with no comparator: compare the
-                    // ToString of each element by CODE UNIT (`utf16::cmp_units`),
-                    // which differs from Rust's `String` order off the BMP.
-                    let a = with_host(|h| h.str_of(&items[j - 1]));
-                    let b = with_host(|h| h.str_of(&items[j]));
-                    if crate::utf16::cmp_units(&a, &b) == std::cmp::Ordering::Greater {
-                        1.0
-                    } else {
-                        -1.0
-                    }
-                }
-            };
-            if order > 0.0 {
-                items.swap(j - 1, j);
-                j -= 1;
+    // 23.1.3.30.1 SortIndexedProperties: `undefined` is never handed to the
+    // comparator — it sorts to the end after the defined values are ordered.
+    // `[3,undefined,1].sort((x,y)=>x-y)` is `[1,3,undefined]` with ONE call on
+    // node v26.7.0; the insertion sort called the comparator twice, on
+    // `undefined`, and left `[3,undefined,1]`. Every element passed over here
+    // is `undefined`, so swapping keeps the defined values in input order.
+    let mut defined = 0;
+    for i in 0..items.len() {
+        if !matches!(items[i], Value::Undef) {
+            items.swap(defined, i);
+            defined += 1;
+        }
+    }
+    merge_sort(&mut items[..defined], cmp)
+}
+
+/// One SortCompare: `> 0` means `b` sorts before `a`. A comparator result runs
+/// through ToNumber, so a NaN (or a comparator returning `undefined`) is not
+/// `> 0` and the pair keeps its input order.
+fn sort_compare(a: &Value, b: &Value, cmp: Option<&Value>) -> Result<f64, String> {
+    match cmp {
+        Some(cb) => {
+            let v = host::invoke(cb, vec![a.clone(), b.clone()], None)?;
+            Ok(with_host(|h| h.to_number(&v)))
+        }
+        None => {
+            // 23.1.3.30.2 SortCompare with no comparator: compare the ToString
+            // of each element by CODE UNIT (`utf16::cmp_units`), which differs
+            // from Rust's `String` order off the BMP.
+            let x = with_host(|h| h.str_of(a));
+            let y = with_host(|h| h.str_of(b));
+            if crate::utf16::cmp_units(&x, &y) == std::cmp::Ordering::Greater {
+                Ok(1.0)
             } else {
-                break;
+                Ok(-1.0)
             }
         }
+    }
+}
+
+/// Bottom-up stable merge sort. Bottom-up rather than recursive so a large
+/// array cannot walk the native stack the JS comparator also runs on, and the
+/// two buffers are swapped each pass instead of copied back.
+fn merge_sort(items: &mut [Value], cmp: Option<&Value>) -> Result<(), String> {
+    let n = items.len();
+    if n < 2 {
+        return Ok(());
+    }
+    let mut src = items.to_vec();
+    let mut dst = src.clone();
+    let mut width = 1;
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = (lo + width).min(n);
+            let hi = (lo + 2 * width).min(n);
+            merge(&src[lo..mid], &src[mid..hi], &mut dst[lo..hi], cmp)?;
+            lo = hi;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        width *= 2;
+    }
+    items.clone_from_slice(&src);
+    Ok(())
+}
+
+/// Merge two sorted runs into `out`. Ties take from `left` first, which is what
+/// makes the sort stable — `[{k:1},{k:0},{k:1},{k:0}].sort((x,y)=>x.k-y.k)`
+/// keeps the two `k:0` entries in input order, as node does.
+fn merge(
+    left: &[Value],
+    right: &[Value],
+    out: &mut [Value],
+    cmp: Option<&Value>,
+) -> Result<(), String> {
+    let (mut i, mut j, mut k) = (0, 0, 0);
+    while i < left.len() && j < right.len() {
+        if sort_compare(&left[i], &right[j], cmp)? > 0.0 {
+            out[k] = right[j].clone();
+            j += 1;
+        } else {
+            out[k] = left[i].clone();
+            i += 1;
+        }
+        k += 1;
+    }
+    for v in left[i..].iter().chain(&right[j..]) {
+        out[k] = v.clone();
+        k += 1;
     }
     Ok(())
 }

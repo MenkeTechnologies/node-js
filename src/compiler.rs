@@ -182,6 +182,41 @@ fn argc(n: usize) -> Result<u8, String> {
     u8::try_from(n).map_err(|_| "too many arguments (>255) for one call".to_string())
 }
 
+/// Does this expression already leave a `Value::Bool` on the stack? A condition
+/// that does needs no `TRUTHY` call: `JumpIfFalse` reads the boolean directly.
+///
+/// The gain is one host round-trip per condition evaluation — `for (let i = 0;
+/// i < n; i++)` paid it on every iteration — and it also puts the comparison
+/// immediately before the jump that consumes it, which is what fusevm's block
+/// JIT requires of a bool-producing op (`bool_is_consumed_in_place`).
+///
+/// Every arm listed here is a lowering that ends in a `Bool`: the relational
+/// ops go to `Op::Num{Lt,Le,Gt,Ge}` (the numeric hook's `relational` returns a
+/// Rust `bool`), the equality ops to `STRICT_EQ`/`LOOSE_EQ`, `in` to
+/// `CONTAINS`, `instanceof` to `INSTANCEOF`, and `!`/`!=`/`!==` end in
+/// `Op::LogNot`. Anything else — including `&&`/`||`/`??`, which evaluate to an
+/// OPERAND and not to a boolean — keeps the call.
+fn yields_bool(e: &Expr) -> bool {
+    match e {
+        Expr::True | Expr::False => true,
+        Expr::Unary(UnOp::Not, _) | Expr::Unary(UnOp::Delete, _) => true,
+        Expr::Binary(op, _, _) => matches!(
+            op,
+            BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::EqEq
+                | BinOp::NeEq
+                | BinOp::EqEqEq
+                | BinOp::NeEqEq
+                | BinOp::In
+                | BinOp::InstanceOf
+        ),
+        _ => false,
+    }
+}
+
 impl Compiler {
     // ── emit helpers ─────────────────────────────────────────────────────
     fn name_const(&self, b: &mut ChunkBuilder, s: &str) {
@@ -559,7 +594,9 @@ impl Compiler {
     // ── control flow ─────────────────────────────────────────────────────
     fn compile_condition(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
         self.compile_expr(b, e)?;
-        b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+        if !yields_bool(e) {
+            b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+        }
         Ok(())
     }
 
