@@ -2804,3 +2804,67 @@ fn loop_and_block_scopes_survive_the_capture_analysis() {
          0,1,2"
     );
 }
+
+// ── locals in frame slots (src/slots.rs) ────────────────────────────────────
+
+/// A local that no other chunk can name is addressed as a fusevm frame slot
+/// rather than looked up in the scope chain. The cases here are the ones where
+/// that rewrite could go wrong: parameters (which arrive in the environment and
+/// are copied in), defaults and rest, `arguments`, shadowing, a closure that
+/// captures a loop variable, a `try` block (its own chunk, on its own frame),
+/// `typeof`, and calling through a slotted binding. Expected values from node
+/// v26.7.0.
+#[test]
+fn slotted_locals_keep_their_scope_semantics() {
+    let src = r#"
+        function add(a, b) { return a + b; }
+        console.log(add(2, 3), add("a", "b"));
+        function def(a, b = 7) { return a + b; }
+        console.log(def(1), def(1, 2));
+        function rest(a, ...r) { return a + r.length; }
+        console.log(rest(1, 2, 3));
+        function args() { return arguments.length; }
+        console.log(args(1, 2, 3));
+        function shadow(x) { let y = x * 2; { let y = 9; x += y; } return x + y; }
+        console.log(shadow(3));
+        function loopvar() {
+            let t = 0;
+            for (const v of [1, 2, 3]) t += v;
+            for (const k in { a: 1, b: 2 }) t += k.length;
+            return t;
+        }
+        console.log(loopvar());
+        function sw(n) { let r = "?"; switch (n) { case 1: r = "one"; break; default: r = "many"; } return r; }
+        console.log(sw(1), sw(5));
+        function withTry(n) {
+            let acc = 0;
+            try { acc += n; throw new Error("x"); } catch (e) { acc += 10; } finally { acc += 100; }
+            return acc;
+        }
+        console.log(withTry(1));
+        function capturing(n) { const fns = []; for (let i = 0; i < n; i++) fns.push(() => i); return fns.map(f => f()).join(","); }
+        console.log(capturing(3));
+        function* gen(n) { let i = 0; while (i < n) yield i++; }
+        console.log([...gen(3)].join(","));
+        const slotted = Math.abs;
+        console.log(slotted(-4), typeof slotted, typeof neverDeclared);
+        let counter = 0;
+        for (let i = 0; i < 4; i++) counter += i;
+        console.log(counter, typeof counter);
+    "#;
+    assert_eq!(
+        run(src),
+        "5 ab\n\
+         8 3\n\
+         3\n\
+         3\n\
+         18\n\
+         8\n\
+         one many\n\
+         111\n\
+         0,1,2\n\
+         0,1,2\n\
+         4 function undefined\n\
+         6 number"
+    );
+}

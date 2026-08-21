@@ -133,12 +133,23 @@ pub struct Compiler {
     /// `break`/`continue` that leaves such a loop must close and drop its iterator,
     /// otherwise the enclosing loop's `FORITER` would peek at the wrong one.
     iter_depth: usize,
+    /// Locals of the chunk being emitted that live in fusevm frame slots rather
+    /// than the host's scope chain — see [`crate::slots`]. Empty for a chunk the
+    /// analysis refused, so `slot_of` answering `None` is the old path.
+    slots: crate::slots::SlotTable,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
 pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     let mut c = Compiler {
         debug,
+        // Under `--dap` the debugger reads scopes by name out of the host, and a
+        // slot has no name, so a debug run keeps every local a binding.
+        slots: if debug {
+            Default::default()
+        } else {
+            crate::slots::plan(&[], stmts, true)
+        },
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
@@ -485,6 +496,12 @@ impl Compiler {
     /// function-scoped for `var` and hoisted function declarations.
     fn declare_as(&self, b: &mut ChunkBuilder, target: &Expr, mode: BindMode) {
         if let Expr::Ident(n) = target {
+            // A slotted local has no scope entry to declare into: the binding IS
+            // the store.
+            if let Some(slot) = self.slot_of(n) {
+                b.emit(Op::SetSlot(slot), 0);
+                return;
+            }
             let op = if mode == BindMode::Var {
                 ops::DECLARE_VAR
             } else {
@@ -501,6 +518,10 @@ impl Compiler {
     fn store_simple(&mut self, b: &mut ChunkBuilder, target: &Expr) -> Result<(), String> {
         match target {
             Expr::Ident(n) => {
+                if let Some(slot) = self.slot_of(n) {
+                    b.emit(Op::SetSlot(slot), 0);
+                    return Ok(());
+                }
                 self.name_const(b, n);
                 b.emit(Op::Swap, 0);
                 b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
@@ -596,8 +617,17 @@ impl Compiler {
     }
 
     fn load_local(&self, b: &mut ChunkBuilder, name: &str) {
+        if let Some(slot) = self.slot_of(name) {
+            b.emit(Op::GetSlot(slot), 0);
+            return;
+        }
         self.name_const(b, name);
         b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+    }
+
+    /// The frame slot holding `name` in the chunk being emitted, if it has one.
+    fn slot_of(&self, name: &str) -> Option<u16> {
+        self.slots.get(name).copied()
     }
 
     // ── control flow ─────────────────────────────────────────────────────
@@ -1130,6 +1160,11 @@ impl Compiler {
     /// moves up for the duration.
     fn compile_block_chunk(&mut self, stmts: &[Stmt]) -> Result<Chunk, String> {
         let mut cb = ChunkBuilder::new();
+        // A nested chunk runs on its OWN VM frame, so the enclosing chunk's
+        // slots are not reachable from it — everything here goes by name. (The
+        // slot analysis already refuses any chunk containing a `try`, which is
+        // what builds these; this keeps that true if another one appears.)
+        let saved_slot_table = std::mem::take(&mut self.slots);
         let base = std::mem::replace(&mut self.chunk_loop_base, self.loops.len());
         let signals = std::mem::take(&mut self.chunk_signals);
         let depth = std::mem::take(&mut self.scope_depth);
@@ -1141,6 +1176,7 @@ impl Compiler {
         self.chunk_loop_base = base;
         self.scope_depth = depth;
         self.iter_depth = iters;
+        self.slots = saved_slot_table;
         // A signal raised inside the nested chunk still has to be dispatched by a
         // loop in THIS chunk, so the flag propagates outward.
         self.chunk_signals |= signals;
@@ -1157,8 +1193,31 @@ impl Compiler {
         is_generator: bool,
         is_async: bool,
     ) -> Result<usize, String> {
-        let (slots, prologue) = self.lower_params(params)?;
+        let (param_slots, prologue) = self.lower_params(params)?;
         let mut fb = ChunkBuilder::new();
+        // Each function body is its own frame, so it gets its own slot table.
+        // The analysis sees the parameter prologue (defaults, destructuring)
+        // ahead of the body, which is the order they are emitted in.
+        let mut planned: Vec<Stmt> = prologue.clone();
+        planned.extend_from_slice(body);
+        let saved_slot_table = std::mem::replace(
+            &mut self.slots,
+            if self.debug || is_generator || is_async {
+                Default::default()
+            } else {
+                crate::slots::plan(params, &planned, false)
+            },
+        );
+        // Prologue: a parameter arrives in the call environment (`bind_params`
+        // ran before this chunk), so copy each slotted one into its slot once,
+        // and everything after it is a bare `GetSlot`.
+        for name in crate::slots::param_names(params) {
+            if let Some(slot) = self.slot_of(&name) {
+                self.name_const(&mut fb, &name);
+                fb.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+                fb.emit(Op::SetSlot(slot), 0);
+            }
+        }
         // A function body is its own control-flow universe: `break`/`continue` can
         // never target a loop in the enclosing function.
         let saved_loops = std::mem::take(&mut self.loops);
@@ -1180,10 +1239,11 @@ impl Compiler {
         self.scope_depth = saved_depth;
         self.iter_depth = saved_iters;
         self.in_async_generator = saved_agen;
+        self.slots = saved_slot_table;
         r?;
         let def = FuncDef {
             name: name.to_string(),
-            params: slots,
+            params: param_slots,
             chunk: fb.build(),
             is_arrow: false,
             is_generator,
@@ -2012,6 +2072,14 @@ impl Compiler {
                 // JS returns "undefined". Route a plain identifier through a
                 // non-throwing name read; any other operand evaluates normally.
                 if let Expr::Ident(n) = e {
+                    // A slotted local is always bound by the time it is read
+                    // (that is rule 3 of the slot analysis), so there is no
+                    // unbound case for `TYPEOF_NAME` to absorb.
+                    if let Some(slot) = self.slot_of(n) {
+                        b.emit(Op::GetSlot(slot), 0);
+                        b.emit(Op::CallBuiltin(ops::TYPEOF, 1), 0);
+                        return Ok(());
+                    }
                     self.name_const(b, n);
                     b.emit(Op::CallBuiltin(ops::TYPEOF_NAME, 1), 0);
                 } else {
@@ -2553,7 +2621,10 @@ impl Compiler {
                     b.patch_jump(j, end);
                 }
             }
-            Expr::Ident(n) => {
+            // A slotted callee has no name to resolve at run time: it falls
+            // through to the value path below, which reads the slot and calls
+            // through `CALL_VALUE`.
+            Expr::Ident(n) if self.slot_of(n).is_none() => {
                 self.name_const(b, n);
                 if has_spread {
                     self.compile_spread_args(b, args)?; // [name, argsArray]

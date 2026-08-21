@@ -79,6 +79,12 @@ source ──▶ lexer ──▶ parser ──▶ compiler ──▶ fusevm::Chu
 - **Objects, strings, and arrays** are heap objects in `JsHost`; they travel as
   `Value::Obj(u32)` handles into that heap, and property insertion order is
   preserved (observable in iteration and `JSON` round-trips).
+- **Locals** that no other chunk can reach are addressed as fusevm frame slots
+  (`Op::GetSlot`/`SetSlot`) instead of being looked up by name in the scope
+  chain — see [`src/slots.rs`](src/slots.rs) for the rules that decide which
+  ones qualify. A name a nested function, a `try` block or a direct `eval` can
+  reach stays a real binding, because those run as their own chunks and resolve
+  through the environment.
 - **Arithmetic** lowers to native fusevm ops so the JIT can trace hot loops; a
   strict **numeric hook** supplies JS coercion for the non-numeric operand cases
   (`+` string concat, `==` matrix, `ToInt32` for bitwise ops). An object operand

@@ -1040,6 +1040,74 @@ clone the value back. Nothing under that is a tuning problem; the fix is to stop
 emitting name lookups for locals and give them fusevm frame slots
 (`Op::GetSlot`/`SetSlot`, which is also what makes a block JIT-eligible).
 
+## FIXED — locals were name lookups; the ones nothing can reach are frame slots now
+
+Every identifier in a node-js program used to be a hash lookup through the host.
+`let s = 0; for (let i = 0; …)` compiled to `CallBuiltin(GETLOCAL)` /
+`CallBuiltin(SETLOCAL)` with the name as a string constant, and each one popped
+the name off the VM stack, borrowed the thread-local `JsHost`, walked the
+`Rc<RefCell<EnvData>>` chain and hashed the name in every scope on the way. An
+empty `for (let i = 0; i < 5_000_000; i++) {}` cost 178 ns per iteration for four
+of those round-trips; node runs the same loop at 6 ns.
+
+`src/slots.rs` decides which locals can live in the frame slot vector fusevm
+already keeps, addressed by index. The rules are conservative, because a name
+slotted in one place and looked up by name in another is a silent wrong answer:
+
+1. A name any OTHER chunk can reach keeps its binding. Nested functions, arrows,
+   class bodies and `try` parts each compile to their own chunk and resolve what
+   they name through the environment chain, so every identifier they mention is
+   off the table — but only those identifiers. A counting loop still gets slots
+   in a file that also passes a callback to `map`. A direct `eval` can name
+   anything at run time, so it disables the chunk outright.
+2. One declaration per name; a shadowed name is left alone rather than
+   scope-tracked.
+3. No read before the declaration, in source order. A slot reads as `undefined`
+   before its first write, which is neither node's `ReferenceError` for a `let`
+   in its temporal dead zone nor the `ReferenceError` node-js answers today, so
+   a name whose first mention is a read stays where those answers come from.
+4. Simple identifiers only — a destructuring target or `delete x` binds through
+   the host.
+5. At the top level of a script, `let`/`const` only: a top-level `var` is a
+   property of the global object (`var g = 1; globalThis.g` is `1`).
+
+A parameter arrives in the call environment, so the function prologue copies each
+slotted one into its slot once and every later use is a bare `GetSlot`.
+Generators, async functions and `--dap` runs keep names — the first two suspend
+the frame the slots live in, and the debugger reads scopes by name.
+
+The counting loop's body is now `GetSlot / GetSlot / Add / Dup / SetSlot / Pop`,
+with no host round-trip at all; what is left in it is the `NUM_STEP` builtin
+behind `i++` (which is `ToNumeric`, so it is BigInt-aware) and the loop's own
+`PUSH_SCOPE`/`POP_SCOPE` pair, once per loop rather than per iteration.
+
+Minimum-of-4 user+sys CPU seconds, release build (CPU time because this machine
+runs many builds at once):
+
+| workload | before | after |
+| --- | --- | --- |
+| 5M-iteration `s += i` | 1.90 s | 0.88 s |
+| 5M-iteration counting loop with `% 7` | 2.05 s | 1.06 s |
+| 500k property reads | 0.33 s | 0.17 s |
+| 1M `Math.sqrt` / divide | 0.62 s | 0.42 s |
+| 200k `Map` set + get | 0.56 s | 0.49 s |
+| 500k plain function calls | 0.73 s | 0.63 s |
+
+Against node on the same machine, the 5M `s += i` loop went from 33.8x slower to
+14.7x, and 500k property reads from 10.3x to 5.7x. Callback-driven work
+(`sort` with a comparator, `map`/`filter` chains, method dispatch) is unchanged:
+its time is in `host::invoke` per element, not in name lookups.
+
+Verified with the 120-script parity corpus (byte-identical to node v26.7.0),
+4,000 differential fuzzer cases (0 divergences) and a new `es_parity` test
+covering parameters, defaults, rest, `arguments`, shadowing, a closure over a
+loop variable, `try`, generators, `typeof` and calling through a slotted
+binding.
+
+Not yet: `reaches native code` is still `false`. The loop region holds one
+`CallBuiltin` (`NUM_STEP`) and fusevm's block tier declines any region
+containing one, so the JIT still never compiles it.
+
 ## FIXED — the process's own observables: exit status, exit events, raw stdout
 
 Four things about how a program ENDS, and one about how it writes, none of

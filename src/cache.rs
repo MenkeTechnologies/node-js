@@ -48,7 +48,14 @@ use std::path::PathBuf;
 ///     change need no bump: a `Math.f(..)` call emits the name as a constant
 ///     and dispatches on the string at run time, so `--dump-bytecode` for a
 ///     known and an unknown method name is byte-identical.)
-const SCHEMA: u64 = 8;
+/// v9: locals that no closure can reach are addressed as fusevm frame slots
+///     (`Op::GetSlot`/`SetSlot`) instead of `CallBuiltin(GETLOCAL)` by name —
+///     see `crate::slots`. A v8 blob is still CORRECT, since it carries the
+///     name-lookup form and nothing else changed about it; it is simply the
+///     slow bytecode, and a cache that kept replaying it would hide the whole
+///     change from every script already run once. The bump is what makes the
+///     speedup reach existing scripts.
+const SCHEMA: u64 = 9;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

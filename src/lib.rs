@@ -25,6 +25,7 @@ pub mod parser;
 pub mod proxy;
 pub mod regexp;
 pub mod repl;
+pub mod slots;
 pub mod rust_ffi;
 pub mod stdlib;
 pub mod tiers;
