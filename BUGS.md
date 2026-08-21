@@ -967,6 +967,79 @@ block JIT declines any region containing one. That is the remaining 20-70x, and
 it is a lowering question (slot-resolved locals instead of name lookups), not a
 tuning one.
 
+## FIXED — a whole VM, and a copy of the function's bytecode, per call
+
+Every JS call, every `try` block and every generator step runs its chunk through
+`host::run_chunk_on`, which built a `fusevm::VM` from scratch each time: three
+`Vec` allocations, 70 `register_builtin` writes, an `Arc` for the numeric hook
+and the JIT enable. `fib(27)` makes ~400,000 calls, so it built 400,000 VMs to
+run a 23-op body.
+
+The caller also had to hand over an OWNED `Chunk`, and `run_user_func_nt` got
+there by cloning the whole `FuncDef` — so each call also deep-copied the
+function's entire compiled body: `ops`, `constants`, `names`, `lines`,
+`sub_entries`, `block_ranges`, `source`, and `sub_chunks` recursively. Running a
+`try` cloned its `TryDef` the same way: block, handler and finalizer bytecode,
+once per entry, which inside a loop is once per iteration.
+
+Both are now pooled. `VM_POOL` (`src/host.rs`) keys idle VMs by the chunk they
+still hold — `func_key(def_id)` for a function body, `try_key(try_id, part)` for
+one part of a `try`. A repeated call takes back the VM that already holds that
+chunk and hands it straight back to `VM::reset`, which keeps the builtin table,
+the hooks and the JIT setting; no bytecode is copied at all. A key's stack grows
+to the deepest simultaneous entry into that function and no further, so a
+recursion 27 deep holds 27 VMs rather than building 400,000.
+
+`run_user_func_nt` now reads only the light fields of a `FuncDef` (params,
+generator/async/arrow flags, name); the chunk is reached exactly once per pooled
+VM. `b_try` (`src/builtins.rs`) reads `JsHost::try_shape` — has-handler, catch
+parameter name, has-finalizer — instead of cloning three chunks to learn it.
+
+Minimum-of-4 user+sys CPU seconds, release build, same machine. CPU time rather
+than wall clock because this machine runs many builds at once and a loaded
+wall clock says nothing:
+
+| workload | before | after |
+| --- | --- | --- |
+| `fib(27)` | 0.94 s | 0.65 s |
+| 200k-element `sort` with a comparator | 3.48 s | 2.41 s |
+| 300k array `map`/`filter`/sum | 0.81 s | 0.59 s |
+| 300k method calls building objects | 1.68 s | 1.34 s |
+| 5M-iteration counting loop | 2.51 s | 2.52 s |
+| 200k `Map` set + get | 0.58 s | 0.58 s |
+
+Call-heavy work gains 1.25–1.45x; a loop that never calls anything is unchanged,
+as expected — it runs one chunk.
+
+## Kept but NOT a speedup — eliding the per-iteration loop scope
+
+`for (let i = …)` re-binds its head per iteration (ForBodyEvaluation's
+CreatePerIterationEnvironment) so a closure made in one pass keeps that pass's
+value, and `{ … }` opens a scope for its lexical declarations. A profile of a
+5M-iteration counting loop put 17% of its samples in `copy_scope` and the
+`EnvData` allocate/free traffic beneath it — copies that, with no closure
+anywhere in the loop, nothing could observe.
+
+`src/capture.rs` answers "can this subtree hold on to the scope it runs in?"
+(a function, a class, or a direct `eval`), and the compiler skips the
+per-iteration copy and the block scope when the answer is no. It is CORRECT —
+`tests/es_parity.rs` pins the capturing cases against node — but it is not
+faster: measured old-vs-new binaries in the same run, 1.01x on the counting
+loop, 1.07x on array work, and inside the noise everywhere else. The allocation
+it removes is not what the loop spends its time on. It stays because it is the
+same question slot-resolved locals have to ask (pythonrs asks it as
+`fn_slots_allowed`), not because it paid for itself here.
+
+What the loop spends its time on is the host round-trip per operation. An empty
+`for (let i = 0; i < 5_000_000; i++) {}` costs 178 ns per iteration for four
+`CallBuiltin`s — `GETLOCAL i`, `NUM_STEP`, `SETLOCAL i`, plus the comparison —
+against node's 6 ns for the same loop. Every identifier in a node-js program is
+a name lookup through the host: pop the name off the VM stack, borrow the
+thread-local `JsHost`, walk the `Rc<RefCell<EnvData>>` chain, hash the string,
+clone the value back. Nothing under that is a tuning problem; the fix is to stop
+emitting name lookups for locals and give them fusevm frame slots
+(`Op::GetSlot`/`SetSlot`, which is also what makes a block JIT-eligible).
+
 ## FIXED — the process's own observables: exit status, exit events, raw stdout
 
 Four things about how a program ENDS, and one about how it writes, none of

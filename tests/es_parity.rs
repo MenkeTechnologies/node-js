@@ -2741,3 +2741,66 @@ fn typed_array_sort_matches_node() {
          0 1024 2047"
     );
 }
+
+// ── loop scopes: what the per-iteration copy is for, and what it costs ───────
+
+/// `for (let i …)` re-binds per iteration so a closure made in one pass keeps
+/// that pass's value, and a block opens a scope for its lexical declarations.
+/// Both are skipped when nothing in the subtree can capture — so the cases that
+/// CAN capture have to keep working, and the cases that cannot must not start
+/// leaking their bindings. Expected values from node v26.7.0.
+#[test]
+fn loop_and_block_scopes_survive_the_capture_analysis() {
+    let src = r#"
+        const fns = [];
+        for (let i = 0; i < 3; i++) fns.push(() => i);
+        console.log(fns.map(f => f()).join(','));
+        const g = [];
+        for (let j = 0; j < 3; j++) { const k = j * 2; g.push(() => k + j); }
+        console.log(g.map(f => f()).join(','));
+        let i = 'outer';
+        for (let i = 0; i < 3; i++) {}
+        console.log(i);
+        for (let q = 0; q < 3; q++) {}
+        console.log(typeof q);
+        { let x = 1; }
+        console.log(typeof x);
+        { var v = 5; }
+        console.log(v);
+        let s = 0;
+        for (let n = 0; n < 3; n++) { let s = 100; s++; }
+        console.log(s);
+        const vf = [];
+        for (var w = 0; w < 3; w++) vf.push(() => w);
+        console.log(vf.map(f => f()).join(','));
+        let acc = 0;
+        outer: for (let a = 0; a < 4; a++) { if (a === 2) continue outer; if (a === 3) break outer; acc += a; }
+        console.log(acc);
+        let t = 0;
+        for (let a = 0; a < 3; a++) { try { if (a === 1) throw new Error('x'); t += 1; } catch (e) { t += 10; } }
+        console.log(t);
+        const nf = [];
+        for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) nf.push(() => a * 10 + b);
+        console.log(nf.map(f => f()).join(','));
+        for (let a = 0; a < 1; a++) { eval('var ev = 7'); }
+        console.log(ev);
+        function* gen() { for (let a = 0; a < 3; a++) yield () => a; }
+        console.log([...gen()].map(f => f()).join(','));
+    "#;
+    assert_eq!(
+        run(src),
+        "0,1,2\n\
+         0,3,6\n\
+         outer\n\
+         undefined\n\
+         undefined\n\
+         5\n\
+         0\n\
+         3,3,3\n\
+         1\n\
+         12\n\
+         0,1,10,11\n\
+         7\n\
+         0,1,2"
+    );
+}

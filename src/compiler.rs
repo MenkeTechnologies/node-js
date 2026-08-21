@@ -310,10 +310,19 @@ impl Compiler {
                 }
             }
             StmtKind::Block(body) => {
-                self.emit_push_scope(b);
+                // A block that declares nothing lexical has nothing to put in a
+                // scope, and opening one costs an `EnvData` allocation and free
+                // every time control enters the block — once per iteration when
+                // the block is a loop body, which is where most of them are.
+                let scoped = crate::capture::block_needs_scope(body);
+                if scoped {
+                    self.emit_push_scope(b);
+                }
                 self.hoist_funcs(b, body)?;
                 self.compile_stmts(b, body)?;
-                self.emit_pop_scope(b);
+                if scoped {
+                    self.emit_pop_scope(b);
+                }
             }
             StmtKind::If { test, cons, alt } => self.compile_if(b, test, cons, alt)?,
             StmtKind::While { test, body } => self.compile_while(b, test, body)?,
@@ -751,7 +760,7 @@ impl Compiler {
         // A `let`/`const` head is scoped to the loop AND re-bound per iteration, so
         // a closure made in one pass keeps that pass's value (ForBodyEvaluation's
         // CreatePerIterationEnvironment). A `var` head belongs to the function.
-        let per_iteration = matches!(
+        let lexical_head = matches!(
             init.as_deref(),
             Some(Stmt {
                 kind: StmtKind::Decl {
@@ -761,13 +770,25 @@ impl Compiler {
                 ..
             })
         );
+        // The loop's own scope is not optional — it is what keeps `let i` from
+        // leaking past the loop or clobbering an outer `i`. The per-iteration
+        // COPY of that scope is: only code that can CAPTURE a binding can tell
+        // one copy per pass from one binding mutated in place, and the copy is a
+        // whole-scope clone every iteration. A 5M-iteration counting loop spent
+        // 17% of its samples cloning scopes that nothing could observe.
+        let per_iteration = lexical_head;
+        let copy_per_iteration = lexical_head
+            && (crate::capture::stmt_captures(body)
+                || init.as_deref().is_some_and(crate::capture::stmt_captures)
+                || test.as_ref().is_some_and(crate::capture::expr_captures)
+                || update.as_ref().is_some_and(crate::capture::expr_captures));
         if per_iteration {
             self.emit_push_scope(b);
         }
         if let Some(init) = init {
             self.compile_stmt(b, init)?;
         }
-        if per_iteration {
+        if copy_per_iteration {
             self.emit_copy_scope(b);
         }
         let start = b.current_pos();
@@ -789,7 +810,7 @@ impl Compiler {
         });
         self.compile_stmt(b, body)?;
         let cont_target = b.current_pos();
-        if per_iteration {
+        if copy_per_iteration {
             // Fresh copy BEFORE the update, so the update advances the NEXT pass's
             // binding and the one just captured keeps this pass's value.
             self.emit_copy_scope(b);

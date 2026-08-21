@@ -1466,6 +1466,30 @@ impl JsHost {
         self.tries.get(id).cloned()
     }
 
+    /// What `try` statement `id` HAS — `(has handler, catch parameter name, has
+    /// finalizer)` — without copying its chunks. Running a `try` used to clone
+    /// the whole `TryDef`, so a `try` inside a loop deep-copied its block, its
+    /// handler and its finalizer on every iteration just to learn its shape.
+    pub fn try_shape(&self, id: usize) -> Option<(bool, Option<String>, bool)> {
+        let t = self.tries.get(id)?;
+        Some((
+            t.handler.is_some(),
+            t.handler.as_ref().and_then(|(bind, _)| bind.clone()),
+            t.finalizer.is_some(),
+        ))
+    }
+
+    /// One `try` part's bytecode: 0 = block, 1 = handler body, 2 = finalizer.
+    /// Reached only when no pooled VM already holds that chunk.
+    pub fn try_chunk(&self, id: usize, part: u64) -> Option<Chunk> {
+        let t = self.tries.get(id)?;
+        match part {
+            0 => Some(t.block.clone()),
+            1 => t.handler.as_ref().map(|(_, body)| body.clone()),
+            _ => t.finalizer.clone(),
+        }
+    }
+
     // ── heap allocation / accessors ──────────────────────────────────────
     pub fn alloc(&mut self, obj: JsObj) -> Value {
         self.heap.push(obj);
@@ -2185,12 +2209,57 @@ pub fn stack_overflow_error() -> String {
     range_error("Maximum call stack size exceeded")
 }
 
-/// Register every node-js builtin + the numeric hook on a VM, then run it.
-pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
-    // Checked before the `VM` is built: `VM::new` + `install` are themselves
-    // several KiB of frame, so a check after them could already have overflowed.
-    if stack_exhausted() {
-        return Err(stack_overflow_error());
+/// Pool key for the body of user function `def_id`.
+pub fn func_key(def_id: usize) -> u64 {
+    1 << 40 | def_id as u64
+}
+
+/// Pool key for one part of `try` statement `try_id`: 0 = the block, 1 = the
+/// handler, 2 = the finalizer.
+pub fn try_key(try_id: usize, part: u64) -> u64 {
+    2 << 40 | (try_id as u64) << 2 | part
+}
+
+thread_local! {
+    /// VMs that have finished a run, kept for the next one — grouped by the
+    /// chunk they still hold.
+    ///
+    /// Every JS call, every `try` block and every generator step runs its chunk
+    /// through [`run_chunk_on`], which used to build a `fusevm::VM` from
+    /// scratch: three `Vec` allocations, 70 `register_builtin` writes, an `Arc`
+    /// for the numeric hook, and the JIT enable — per call. `fib(27)` makes
+    /// 400k calls, so it built 400k VMs to run 23 ops each.
+    ///
+    /// Worse, the caller had to hand over an OWNED `Chunk`, so every call also
+    /// deep-copied the function's whole compiled body: six `Vec`s, a `String`,
+    /// and `sub_chunks` recursively. Keying the pool by chunk means a repeated
+    /// call takes back the VM that already holds that body and copies nothing:
+    /// `VM::reset` is handed the chunk the VM was already carrying.
+    ///
+    /// `VM::reset` keeps the builtin table, the hooks and the JIT setting, so a
+    /// recycled VM needs none of that again. Each key holds a stack of VMs, and
+    /// a nested (or recursive) call takes the next one, so a key grows to the
+    /// deepest simultaneous entry into that function and no further.
+    static VM_POOL: RefCell<rustc_hash::FxHashMap<u64, Vec<VM>>> =
+        RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// An idle VM filed under `key`, if any.
+fn take_pooled(key: u64) -> Option<VM> {
+    VM_POOL.with(|p| p.borrow_mut().get_mut(&key).and_then(|v| v.pop()))
+}
+
+/// File a finished VM under `key` for the next run to take.
+fn put_pooled(key: u64, vm: VM) {
+    VM_POOL.with(|p| p.borrow_mut().entry(key).or_default().push(vm));
+}
+
+/// Take a VM ready to run `chunk` — recycled if one is idle, otherwise built
+/// and fitted with the builtins and hooks a fresh VM needs.
+fn acquire_vm(chunk: Chunk) -> VM {
+    if let Some(mut vm) = take_pooled(0) {
+        vm.reset(chunk);
+        return vm;
     }
     let mut vm = VM::new(chunk);
     crate::builtins::install(&mut vm);
@@ -2201,6 +2270,8 @@ pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     // per-statement `DBG_LINE` markers, so debug runs stay on the pure
     // interpreter. The `DBG_LINE` builtin fires the debugger line hook; the
     // extension seam mirrors pythonrs should the marker emission ever switch.
+    // The mode is fixed before the first chunk runs, so a pooled VM can never
+    // come back wearing the wrong one.
     if DEBUG_MODE.with(|d| d.get()) {
         vm.set_extension_handler(Box::new(|vm, id, _| {
             crate::dap::on_ext(vm, id);
@@ -2208,15 +2279,58 @@ pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     } else {
         vm.enable_tracing_jit();
     }
-    let outcome = vm.run();
-    if let Some(e) = with_host(|h| h.take_error()) {
-        return Err(e);
+    vm
+}
+
+/// Register every node-js builtin + the numeric hook on a VM, then run it.
+///
+/// For a chunk that runs once — a module body, an `eval` — there is nothing to
+/// key a pool by, so this resets a spare VM with the caller's chunk. Anything
+/// that runs repeatedly (a function body, a `try` block) goes through
+/// [`run_chunk_keyed`] instead and never copies its chunk twice.
+pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
+    // Checked before the `VM` is built: `VM::new` + `install` are themselves
+    // several KiB of frame, so a check after them could already have overflowed.
+    if stack_exhausted() {
+        return Err(stack_overflow_error());
     }
-    match outcome {
+    finish_run(0, acquire_vm(chunk))
+}
+
+/// Run the chunk filed under `key`, building it with `make` only if no VM is
+/// already holding it. A recycled VM re-runs the chunk it kept, so a repeated
+/// call copies no bytecode at all.
+pub fn run_chunk_keyed(key: u64, make: impl FnOnce() -> Chunk) -> Result<Value, String> {
+    if stack_exhausted() {
+        return Err(stack_overflow_error());
+    }
+    let vm = match take_pooled(key) {
+        Some(mut vm) => {
+            // Hand the VM back the chunk it is already carrying: `reset` takes
+            // an owned `Chunk`, and this is the one place where the owned chunk
+            // costs nothing.
+            let held = std::mem::take(&mut vm.chunk);
+            vm.reset(held);
+            vm
+        }
+        None => acquire_vm(make()),
+    };
+    finish_run(key, vm)
+}
+
+/// Run a prepared VM to completion and file it back under `key`.
+fn finish_run(key: u64, mut vm: VM) -> Result<Value, String> {
+    let outcome = vm.run();
+    let result = match outcome {
+        _ if with_host(|h| h.error.is_some()) => {
+            Err(with_host(|h| h.take_error()).expect("just checked"))
+        }
         VMResult::Ok(v) => Ok(v),
         VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
         VMResult::Error(e) => Err(e),
-    }
+    };
+    put_pooled(key, vm);
+    result
 }
 
 /// Run `chunk` in the GLOBAL scope instead of the caller's.
@@ -4461,18 +4575,31 @@ pub fn run_user_func_nt(
     this: Option<Value>,
     new_target: Option<Value>,
 ) -> Result<Value, String> {
-    let def = with_host(|h| h.funcs[fv.def_id].clone());
+    // Only the light fields: cloning the whole `FuncDef` cloned its `Chunk` —
+    // the entire compiled body, `sub_chunks` and all — on every single call.
+    // The chunk is now reached once per pooled VM, in the two arms below.
+    let (params, is_generator, is_async, is_arrow_def, def_name) = with_host(|h| {
+        let d = &h.funcs[fv.def_id];
+        (
+            d.params.clone(),
+            d.is_generator,
+            d.is_async,
+            d.is_arrow,
+            d.name.clone(),
+        )
+    });
     let env = new_env(fv.env.clone());
     // Bind the simple/rest arg slots; destructuring + defaults run in the body
     // prologue (compiled ahead of the user statements).
-    bind_params(&env, &def, args);
+    bind_params(&env, &params, args, is_arrow_def);
     // Arrow functions capture `this` lexically; regular functions receive it.
     let this_val = if fv.is_arrow { fv.this.clone() } else { this };
     // A generator function does not run its body on call — it returns a suspended
     // generator over the already-bound frame.
-    if def.is_generator {
-        let gen = make_generator(def.chunk.clone(), env, this_val, fv.home_class.clone());
-        if def.is_async {
+    if is_generator {
+        let chunk = with_host(|h| h.funcs[fv.def_id].chunk.clone());
+        let gen = make_generator(chunk, env, this_val, fv.home_class.clone());
+        if is_async {
             if let Some(JsObj::Generator { id }) = with_host(|h| h.get(&gen).cloned()) {
                 with_host(|h| h.generators[id as usize].async_gen = true);
             }
@@ -4481,8 +4608,9 @@ pub fn run_user_func_nt(
     }
     // An async function runs on a coroutine and returns a Promise: it executes
     // synchronously up to the first `await`, then continues via microtasks.
-    if def.is_async {
-        let gen = make_generator(def.chunk.clone(), env, this_val, fv.home_class.clone());
+    if is_async {
+        let chunk = with_host(|h| h.funcs[fv.def_id].chunk.clone());
+        let gen = make_generator(chunk, env, this_val, fv.home_class.clone());
         return Ok(run_async(gen));
     }
     let home = fv
@@ -4497,11 +4625,13 @@ pub fn run_user_func_nt(
             new_target,
             home_class: home,
             line: 0,
-            owner: Some(def.name.clone()),
+            owner: Some(def_name),
             is_module: false,
         })
     });
-    let r = run_chunk_on(def.chunk.clone());
+    let r = run_chunk_keyed(func_key(fv.def_id), || {
+        with_host(|h| h.funcs[fv.def_id].chunk.clone())
+    });
     let sig = with_host(|h| {
         h.frames.pop();
         h.signal.take()
@@ -4517,10 +4647,10 @@ pub fn run_user_func_nt(
 
 /// Bind positional args into a fresh call environment. The compiler emits the
 /// param names in `def.params`; a `...rest` slot collects the tail as an array.
-fn bind_params(env: &Env, def: &FuncDef, args: Vec<Value>) {
+fn bind_params(env: &Env, params: &[ParamSlot], args: Vec<Value>, is_arrow: bool) {
     let mut vars = VarMap::default();
     let mut i = 0;
-    for slot in &def.params {
+    for slot in params {
         if slot.rest {
             let rest: Vec<Value> = args.get(i..).map(|s| s.to_vec()).unwrap_or_default();
             let arr = with_host(|h| h.new_array(rest));
@@ -4537,7 +4667,7 @@ fn bind_params(env: &Env, def: &FuncDef, args: Vec<Value>) {
     // a non-arrow, so `arguments` inside an arrow resolves lexically to the
     // enclosing function's. Binding an empty one here made
     // `function f(){ const g = () => [...arguments]; }` see zero args.
-    if !def.is_arrow {
+    if !is_arrow {
         let args_arr = with_host(|h| h.new_array(args));
         vars.entry("arguments".to_string()).or_insert(args_arr);
     }

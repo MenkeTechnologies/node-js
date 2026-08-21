@@ -13,6 +13,7 @@ pub mod ast;
 pub mod banner;
 pub mod builtins;
 pub mod cache;
+pub mod capture;
 pub mod cli;
 pub mod compiler;
 pub mod dap;

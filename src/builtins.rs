@@ -2284,7 +2284,10 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n as usize,
         _ => return abort(vm, "internal: TRY id".into()),
     };
-    let td = match with_host(|h| h.try_def(id)) {
+    // Shape only. Running a `try` used to clone the whole `TryDef` — its block,
+    // its handler and its finalizer bytecode — every time control entered it,
+    // which for a `try` inside a loop is once per iteration.
+    let (has_handler, catch_bind, has_finalizer) = match with_host(|h| h.try_shape(id)) {
         Some(t) => t,
         None => return abort(vm, "internal: unknown try id".into()),
     };
@@ -2295,13 +2298,15 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
     let scope = with_host(|h| h.scope_snapshot());
 
     with_host(|h| h.push_scope()); // the try block is its own block scope
-    let body_res = host::run_chunk_on(td.block.clone());
+    let body_res = host::run_chunk_keyed(host::try_key(id, 0), || {
+        with_host(|h| h.try_chunk(id, 0)).expect("try block exists")
+    });
     with_host(|h| h.restore_scope(scope.clone()));
     let signal_after = with_host(|h| h.signal.is_some());
     if let Err(e) = body_res {
         if signal_after {
             pending = Some(e);
-        } else if let Some((bind, hbody)) = &td.handler {
+        } else if has_handler {
             // Bind the thrown value (or a synthesized error) to the catch param.
             let thrown =
                 with_host(|h| h.exc.clone()).unwrap_or_else(|| with_host(|h| synth_error(h, &e)));
@@ -2311,10 +2316,12 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
             });
             // The catch parameter is block-scoped to the handler.
             with_host(|h| h.push_scope());
-            if let Some(name) = bind {
+            if let Some(name) = &catch_bind {
                 with_host(|h| h.declare_name(name, thrown));
             }
-            let hres = host::run_chunk_on(hbody.clone());
+            let hres = host::run_chunk_keyed(host::try_key(id, 1), || {
+                with_host(|h| h.try_chunk(id, 1)).expect("handler exists")
+            });
             with_host(|h| h.restore_scope(scope.clone()));
             if let Err(e2) = hres {
                 pending = Some(e2);
@@ -2325,10 +2332,12 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
     }
 
     // finally always runs; a finally error/signal supersedes.
-    if let Some(fin) = &td.finalizer {
+    if has_finalizer {
         let sig_before = with_host(|h| h.signal.take());
         with_host(|h| h.push_scope()); // ditto for `finally`
-        let fres = host::run_chunk_on(fin.clone());
+        let fres = host::run_chunk_keyed(host::try_key(id, 2), || {
+            with_host(|h| h.try_chunk(id, 2)).expect("finalizer exists")
+        });
         with_host(|h| h.restore_scope(scope.clone()));
         match fres {
             Ok(_) => {
