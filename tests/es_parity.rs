@@ -3124,3 +3124,109 @@ fn json_stringify_uses_every_short_escape() {
          \"\u{7f}\""
     );
 }
+
+// ── Date: component setters, TimeClip, ToDateString ──────────────────────────
+
+/// Every Date component SETTER was missing — only `setTime` existed — so a Date
+/// could be read but never modified field-wise: `d.setUTCFullYear(2000)` threw
+/// `date.setUTCFullYear is not a function`. Each setter takes its own field plus
+/// every lower-order one in its group (date 0..2, time 3..6), defaults the rest
+/// from the current time value, normalizes overflow, and returns the new time
+/// value. The NaN split is the spec's: `setFullYear` on an Invalid Date starts
+/// from the epoch and so REVIVES it (21.4.4.21 step 2), every other setter
+/// leaves it invalid. Expected values from node v26.7.0 under TZ=UTC.
+#[test]
+fn date_component_setters_match_node() {
+    let src = r#"
+        const d = new Date(0);  console.log(d.setUTCFullYear(2000), d.toISOString());
+        const e = new Date(NaN);console.log(e.setUTCFullYear(2000), e.toISOString());
+        const f = new Date(NaN);console.log(f.setUTCMonth(5), String(f));
+        const g = new Date(0);  console.log(g.setUTCMonth(13), g.toISOString());
+        const h = new Date(0);  console.log(h.setUTCDate(32), h.toISOString());
+        const i = new Date(0);  console.log(i.setUTCHours(1,2,3,4), i.toISOString());
+        const j = new Date(0);  console.log(j.setUTCFullYear(2000,5,15), j.toISOString());
+        const l = new Date(0);  console.log(l.setUTCMilliseconds(1.9), l.toISOString());
+        const n = new Date(0);  console.log(n.setUTCFullYear(NaN), String(n));
+        const o = new Date(0);  console.log(o.setMinutes(30,15), o.toISOString());
+        const p = new Date(0);  console.log(p.setSeconds(61), p.toISOString());
+        const q = new Date(0);  console.log(q.setDate(0), q.toISOString());
+        const r = new Date(0);  console.log(r.setUTCFullYear(2020,1,29), r.toISOString());
+        const m = new Date(0);  console.log(m.getYear(), m.setYear(99), m.toISOString());
+    "#;
+    assert_eq!(
+        run(src),
+        "946684800000 2000-01-01T00:00:00.000Z\n\
+         946684800000 2000-01-01T00:00:00.000Z\n\
+         NaN Invalid Date\n\
+         34214400000 1971-02-01T00:00:00.000Z\n\
+         2678400000 1970-02-01T00:00:00.000Z\n\
+         3723004 1970-01-01T01:02:03.004Z\n\
+         961027200000 2000-06-15T00:00:00.000Z\n\
+         1 1970-01-01T00:00:00.001Z\n\
+         NaN Invalid Date\n\
+         1815000 1970-01-01T00:30:15.000Z\n\
+         61000 1970-01-01T00:01:01.000Z\n\
+         -86400000 1969-12-31T00:00:00.000Z\n\
+         1582934400000 2020-02-29T00:00:00.000Z\n\
+         70 915148800000 1999-01-01T00:00:00.000Z"
+    );
+}
+
+/// TimeClip (21.4.1.31): a time value beyond ±8.64e15 ms is not representable
+/// and becomes NaN. It was not applied anywhere, so `new Date(8.64e15 + 1)`
+/// kept the raw number and printed a real date (`Sat, 13 Sep 275760 …`) where
+/// node prints `Invalid Date` — the boundary every date-range check relies on.
+/// Expected values from node v26.7.0.
+#[test]
+fn date_clips_out_of_range_time_values() {
+    let src = r#"
+        console.log(new Date(8.64e15).toISOString());
+        console.log(String(new Date(8.64e15 + 1)));
+        console.log(String(new Date(-8.64e15 - 1)));
+        console.log(new Date(-8.64e15).toISOString());
+        console.log(String(new Date(Infinity)), String(new Date(-Infinity)));
+        const k = new Date(0);
+        console.log(k.setTime(8.64e15 + 1), String(k));
+        console.log(new Date(1.5).getTime());   // truncates toward zero
+    "#;
+    assert_eq!(
+        run(src),
+        "+275760-09-13T00:00:00.000Z\n\
+         Invalid Date\n\
+         Invalid Date\n\
+         -271821-04-20T00:00:00.000Z\n\
+         Invalid Date Invalid Date\n\
+         NaN Invalid Date\n\
+         1"
+    );
+}
+
+/// `Date.prototype.toString` is ToDateString (21.4.4.41) — the `toDateString`
+/// half, a space, then the `toTimeString` half. It used to answer the RFC-7231
+/// header form, which is what `toUTCString` is for, so `String(date)` and any
+/// template interpolation printed `Thu, 01 Jan 1970 00:00:00 GMT` instead of
+/// node's form. `toTimeString` was missing outright. Expected from node v26.7.0
+/// under TZ=UTC.
+#[test]
+fn date_to_string_is_not_the_utc_header_form() {
+    let src = r#"
+        const d = new Date(0);
+        console.log(d.toString());
+        console.log(String(d));
+        console.log(`${d}`);
+        console.log(d.toTimeString());
+        console.log(d.toDateString());
+        console.log(d.toUTCString());          // the RFC form, unchanged
+        console.log(String(new Date(NaN)), new Date(NaN).toTimeString());
+    "#;
+    assert_eq!(
+        run(src),
+        "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)\n\
+         Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)\n\
+         Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)\n\
+         00:00:00 GMT+0000 (Coordinated Universal Time)\n\
+         Thu Jan 01 1970\n\
+         Thu, 01 Jan 1970 00:00:00 GMT\n\
+         Invalid Date Invalid Date"
+    );
+}

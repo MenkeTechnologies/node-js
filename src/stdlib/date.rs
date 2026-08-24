@@ -2,11 +2,13 @@
 //! `@@native = "Date"` whose time value (milliseconds since the Unix epoch, or
 //! NaN for an invalid date) lives in a hidden `@@ms` field.
 //!
-//! Only the UTC-based surface HTTP libraries actually exercise is implemented —
-//! `getTime`/`valueOf`, `toISOString`/`toUTCString`/`toString`, the UTC field
-//! getters, plus the statics `Date.now`/`Date.parse`/`Date.UTC`. Local-timezone
-//! getters alias the UTC ones (node-js runs as if TZ=UTC), which is the correct
-//! answer for the machine-readable date headers express/send/fresh produce.
+//! The UTC-based surface is implemented in full: `getTime`/`valueOf`, the
+//! `toISOString`/`toUTCString`/`toString`/`toDateString`/`toTimeString`/
+//! `toLocale*` renderings, the field getters, the component SETTERS, the Annex-B
+//! `getYear`/`setYear`, and the statics `Date.now`/`Date.parse`/`Date.UTC`.
+//! Local-timezone getters and setters alias the UTC ones (node-js runs as if
+//! `TZ=UTC`), which is the correct answer for the machine-readable date headers
+//! express/send/fresh produce.
 
 use crate::host::{with_host, JsObj};
 use fusevm::Value;
@@ -49,7 +51,24 @@ pub const INSTANCE_METHODS: &[&str] = &[
     "getMilliseconds",
     "getUTCMilliseconds",
     "getTimezoneOffset",
+    "toTimeString",
     "setTime",
+    "setFullYear",
+    "setUTCFullYear",
+    "setMonth",
+    "setUTCMonth",
+    "setDate",
+    "setUTCDate",
+    "setHours",
+    "setUTCHours",
+    "setMinutes",
+    "setUTCMinutes",
+    "setSeconds",
+    "setUTCSeconds",
+    "setMilliseconds",
+    "setUTCMilliseconds",
+    "getYear",
+    "setYear",
 ];
 
 const MS_PER_DAY: f64 = 86_400_000.0;
@@ -125,7 +144,10 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
             )
         }
     };
-    Ok(from_ms(ms))
+    // TimeClip (21.4.1.31): a value beyond ±8.64e15 ms is not a representable
+    // date and becomes NaN. `new Date(8.64e15 + 1)` used to keep the raw number
+    // and print a real date where node prints `Invalid Date`.
+    Ok(from_ms(time_clip(ms)))
 }
 
 /// `Date.now()` / `Date.parse(str)` / `Date.UTC(...)`.
@@ -175,11 +197,17 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             }
         }
         "toUTCString" | "toGMTString" => with_host(|h| h.new_str(utc_string(ms))),
+        // `toString` (21.4.4.41) is NOT the RFC-7231 header form — that is
+        // `toUTCString`. It is `ToDateString`: the `toDateString` half, a space,
+        // then the `toTimeString` half. This used to answer `toUTCString`, so
+        // `String(date)` and `` `${date}` `` printed
+        // `Thu, 01 Jan 1970 00:00:00 GMT` where node prints
+        // `Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`.
         "toString" => with_host(|h| {
             h.new_str(if ms.is_nan() {
                 "Invalid Date".into()
             } else {
-                utc_string(ms)
+                format!("{} {}", date_string(ms), time_string(ms))
             })
         }),
         "toDateString" => with_host(|h| h.new_str(date_string(ms))),
@@ -220,15 +248,32 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
         "getSeconds" | "getUTCSeconds" => Value::Float(field(ms, Field::Seconds)),
         "getMilliseconds" | "getUTCMilliseconds" => Value::Float(field(ms, Field::Millis)),
         "getTimezoneOffset" => Value::Float(0.0), // node-js runs as UTC
-        "setTime" => {
-            let new_ms = super::arg_num(_args, 0);
-            with_host(|h| {
-                if let Some(JsObj::Object(p)) = h.get_mut(recv) {
-                    p.insert("@@ms".into(), Value::Float(new_ms));
-                }
-            });
-            Value::Float(new_ms)
+        "toTimeString" => with_host(|h| h.new_str(time_string(ms))),
+        "setTime" => Value::Float(store_ms(recv, time_clip(super::arg_num(_args, 0)))),
+        // The component setters (21.4.4.20-21.4.4.28). Each takes its own field
+        // plus every LOWER-order one it can reach, defaulting the rest from the
+        // current time value, then rebuilds and TimeClips. `setUTCFullYear` and
+        // friends were absent entirely, so `d.setUTCFullYear(2000)` threw
+        // `is not a function` — a Date could be read but never modified except
+        // wholesale through `setTime`.
+        "setFullYear" | "setUTCFullYear" => Value::Float(set_fields(recv, ms, 0, _args, false)),
+        "setMonth" | "setUTCMonth" => Value::Float(set_fields(recv, ms, 1, _args, false)),
+        "setDate" | "setUTCDate" => Value::Float(set_fields(recv, ms, 2, _args, false)),
+        "setHours" | "setUTCHours" => Value::Float(set_fields(recv, ms, 3, _args, false)),
+        "setMinutes" | "setUTCMinutes" => Value::Float(set_fields(recv, ms, 4, _args, false)),
+        "setSeconds" | "setUTCSeconds" => Value::Float(set_fields(recv, ms, 5, _args, false)),
+        "setMilliseconds" | "setUTCMilliseconds" => {
+            Value::Float(set_fields(recv, ms, 6, _args, false))
         }
+        // Annex B B.2.3.3 / B.2.3.4 — offset-from-1900 year accessors kept for
+        // legacy code. `setYear` maps 0..99 onto 1900..1999, which is the only
+        // way it differs from `setFullYear`.
+        "getYear" => Value::Float(if ms.is_nan() {
+            f64::NAN
+        } else {
+            field(ms, Field::Year) - 1900.0
+        }),
+        "setYear" => Value::Float(set_fields(recv, ms, 0, _args, true)),
         _ => {
             return Err(crate::host::type_error(&format!(
                 "date.{method} is not a function"
@@ -335,6 +380,90 @@ fn utc_string(ms: f64) -> String {
         field(ms, Field::Minutes) as i64,
         field(ms, Field::Seconds) as i64,
     )
+}
+
+/// `00:00:00 GMT+0000 (Coordinated Universal Time)` — the `toTimeString` form
+/// (21.4.4.42 TimeString + TimeZoneString). The offset is always `+0000`
+/// because this module runs as if `TZ=UTC`.
+fn time_string(ms: f64) -> String {
+    if ms.is_nan() {
+        return "Invalid Date".into();
+    }
+    format!(
+        "{:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+        field(ms, Field::Hours) as i64,
+        field(ms, Field::Minutes) as i64,
+        field(ms, Field::Seconds) as i64,
+    )
+}
+
+/// TimeClip (21.4.1.31): a time value more than 8.64e15 ms from the epoch is not
+/// representable and becomes NaN; anything else truncates toward zero.
+///
+/// Without this a `new Date(8.64e15 + 1)` kept the out-of-range value and
+/// printed a real date (`Sat, 13 Sep 275760 …`) where node prints
+/// `Invalid Date`, so the boundary every date-range check relies on was absent.
+fn time_clip(ms: f64) -> f64 {
+    if !ms.is_finite() || ms.abs() > 8.64e15 {
+        return f64::NAN;
+    }
+    ms.trunc()
+}
+
+/// Write a time value into the receiver's hidden `@@ms` slot, returning it (as
+/// every mutator does).
+fn store_ms(recv: &Value, ms: f64) -> f64 {
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+            p.insert("@@ms".into(), Value::Float(ms));
+        }
+    });
+    ms
+}
+
+/// The shared body of every component setter.
+///
+/// `start` indexes the field the setter names within
+/// `[year, month, date, hours, minutes, seconds, ms]`; the setter consumes that
+/// field and every LOWER-order one in its own group (date fields 0..2, time
+/// fields 3..6), defaulting anything not supplied from the current time value.
+///
+/// `legacy_year` applies Annex B `setYear`'s 0..99 → 1900..1999 mapping.
+///
+/// NaN handling follows the spec's split: `setFullYear` on an invalid date
+/// treats the time value as +0 and so can REVIVE it (21.4.4.21 step 2), while
+/// every other setter leaves an invalid date invalid.
+fn set_fields(recv: &Value, ms: f64, start: usize, args: &[Value], legacy_year: bool) -> f64 {
+    let base = if ms.is_nan() {
+        if start != 0 {
+            return store_ms(recv, f64::NAN);
+        }
+        0.0 // setFullYear/setYear on an Invalid Date starts from the epoch.
+    } else {
+        ms
+    };
+    let mut f = [
+        field(base, Field::Year),
+        field(base, Field::Month),
+        field(base, Field::Day),
+        field(base, Field::Hours),
+        field(base, Field::Minutes),
+        field(base, Field::Seconds),
+        field(base, Field::Millis),
+    ];
+    // A date setter reaches at most field 2; a time setter at most field 6.
+    let end = if start < 3 { 3 } else { 7 };
+    for (i, slot) in f.iter_mut().enumerate().take(end).skip(start) {
+        match args.get(i - start) {
+            Some(v) => *slot = with_host(|h| h.to_number(v)).trunc(),
+            None => break,
+        }
+    }
+    if legacy_year && (0.0..=99.0).contains(&f[0]) {
+        f[0] += 1900.0;
+    }
+    let t = utc_from_fields(f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+    store_ms(recv, time_clip(t))
 }
 
 /// `Wed Oct 21 2015` — the `toDateString` form.
