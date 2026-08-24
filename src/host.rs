@@ -371,7 +371,12 @@ pub struct RegExpObj {
     /// The translated regex. Construction of a pattern fancy-regex still cannot
     /// express (documented in BUGS.md) throws at `RegExp` build time, so a live
     /// `RegExpObj` always holds a compiled engine.
-    pub re: fancy_regex::Regex,
+    ///
+    /// Shared (`Rc`) rather than owned, because a regex LITERAL builds a fresh
+    /// `RegExpObj` on every evaluation — it has to, since `lastIndex` is
+    /// per-object mutable state — while the compiled engine behind it is
+    /// immutable and identical every time. See `regexp::compiled`.
+    pub re: std::rc::Rc<fancy_regex::Regex>,
     pub source: String,
     pub flags: String,
     pub global: bool,

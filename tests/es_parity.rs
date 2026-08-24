@@ -3301,3 +3301,52 @@ fn const_enforcement_does_not_over_reject() {
          number"
     );
 }
+
+// ── shared compiled regex engine, per-object regex state ────────────────────
+
+/// The compiled engine behind a regex is cached and SHARED between every
+/// evaluation of the same pattern (see `regexp::compiled` — it removed 85% of
+/// the wall time of `require("express")`). What must not be shared is anything
+/// observable: each evaluation of a literal is a distinct `RegExp` object with
+/// its own `lastIndex`, and two patterns differing only in flags are two
+/// engines. This test is the guard on that: it fails if the cache is ever keyed
+/// too loosely, or if the object itself starts being reused. Expected values
+/// from node v26.7.0.
+#[test]
+fn regex_objects_stay_distinct_while_the_engine_is_shared() {
+    let src = r#"
+        function mk(){ return /a/g }
+        const r1 = mk(), r2 = mk();
+        console.log(r1 === r2, r1.lastIndex, r2.lastIndex);
+        r1.test("aaa"); console.log(r1.lastIndex, r2.lastIndex);
+        r1.test("aaa"); console.log(r1.lastIndex, r2.lastIndex);
+        r2.test("aaa"); console.log(r1.lastIndex, r2.lastIndex);
+        const a = /x/g, b = /x/g; console.log(a === b);
+        // Same source, DIFFERENT flags: two engines, and the flags must stick.
+        const c = /x/, d = /x/g;
+        console.log(JSON.stringify([c.flags, d.flags, c.global, d.global]));
+        console.log(JSON.stringify([/a/gi.flags, /a/gi.ignoreCase, /a/g.ignoreCase]));
+        console.log(JSON.stringify(["AaA".replace(/a/gi,"-"), "AaA".replace(/a/g,"-")]));
+        const e = new RegExp("y","g"), f = new RegExp("y","g");
+        console.log(e === f);
+        e.lastIndex = 3; console.log(e.lastIndex, f.lastIndex);
+        // A literal inside a loop is re-evaluated: a fresh lastIndex each time.
+        let out = [];
+        for (let i = 0; i < 3; i++) { const g = /z/g; g.test("zz"); out.push(g.lastIndex); }
+        console.log(JSON.stringify(out));
+    "#;
+    assert_eq!(
+        run(src),
+        "false 0 0\n\
+         1 0\n\
+         2 0\n\
+         2 1\n\
+         false\n\
+         [\"\",\"g\",false,true]\n\
+         [\"gi\",true,false]\n\
+         [\"---\",\"A-A\"]\n\
+         false\n\
+         3 0\n\
+         [1,1,1]"
+    );
+}

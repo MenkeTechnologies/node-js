@@ -28,6 +28,9 @@ use crate::utf16::{self, U16Index};
 use fancy_regex::{Captures, Regex};
 use fusevm::Value;
 use indexmap::IndexMap;
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Lone-surrogate code points are not valid Unicode scalar values, so they can
 /// never appear in a Rust `&str` and `regex` refuses to compile `\x{D800}`. Map
@@ -85,12 +88,14 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     }
     prefixed.push_str(&rust_pat);
 
-    let re = Regex::new(&prefixed).map_err(|e| {
+    let re = compiled(&prefixed).map_err(|e| {
         // Collapse the multi-line error to one line for a JS-shaped message.
-        let msg = e.to_string().lines().collect::<Vec<_>>().join(" ");
+        let msg = e.lines().collect::<Vec<_>>().join(" ");
         format!("SyntaxError: Invalid regular expression: /{pattern}/: {msg}")
     })?;
 
+    // A `RegExpObj` is unavoidably fresh per evaluation (`lastIndex` is
+    // per-object mutable state), but the engine inside it is not.
     let obj = RegExpObj {
         re,
         source: if pattern.is_empty() {
@@ -108,6 +113,47 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
         last_index: U16Index::ZERO,
     };
     Ok(with_host(|h| h.alloc(JsObj::RegExp(Box::new(obj)))))
+}
+
+/// The compiled engine for an already-translated, flag-prefixed pattern,
+/// compiling it at most once per process.
+///
+/// A JS regex LITERAL is re-evaluated every time control reaches it, and each
+/// evaluation must produce a fresh `RegExp` object (`lastIndex` is per-object
+/// mutable state). Building the ENGINE each time as well is what made module
+/// loading slow: `require("express")` compiled 1,782 regexes drawn from only 59
+/// distinct patterns, and `fancy_regex::Regex::new` — not matching — accounted
+/// for 85% of the wall time. A single literal inside a hot function is the worst
+/// case: `mime-types`' `/(\.|x-).*/` cost ~1.5 ms per compile, so 2,582 loop
+/// iterations spent 4.2 s compiling one constant pattern. Hoisting that same
+/// regex out of the loop by hand took it to 27 ms, which is what identified
+/// compilation rather than matching as the cost.
+///
+/// Keyed on the translated + prefixed pattern, so two literals that differ only
+/// in spelling before translation still share one engine, and two that differ in
+/// flags do not. A compile FAILURE is not cached: it is a one-off cost on a path
+/// that immediately throws, and caching it would mean holding the error string
+/// for the life of the process.
+///
+/// Unbounded on purpose. The entries are the distinct regexes a program's source
+/// contains, which is a property of the code rather than of the input — the 59
+/// above is what a whole express dependency tree amounts to. A program that
+/// builds patterns from unbounded INPUT (`new RegExp(userString)`) is the case
+/// this would grow with, and it is also the case that gets no benefit; if that
+/// ever matters the fix is a capacity bound here, not a different design.
+fn compiled(prefixed: &str) -> Result<Rc<Regex>, String> {
+    thread_local! {
+        static CACHE: RefCell<FxHashMap<String, Rc<Regex>>> =
+            RefCell::new(FxHashMap::default());
+    }
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(prefixed).cloned()) {
+        return Ok(hit);
+    }
+    let re = Rc::new(Regex::new(prefixed).map_err(|e| e.to_string())?);
+    CACHE.with(|c| {
+        c.borrow_mut().insert(prefixed.to_string(), re.clone());
+    });
+    Ok(re)
 }
 
 /// Translate a JS regex source into fancy-regex syntax. The rewrites needed are
@@ -284,7 +330,7 @@ pub fn regexp_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value
 }
 
 /// Snapshot the fields we need without holding the host borrow across a match.
-fn regexp_snapshot(recv: &Value) -> Option<(Regex, bool, bool, U16Index)> {
+fn regexp_snapshot(recv: &Value) -> Option<(Rc<Regex>, bool, bool, U16Index)> {
     with_host(|h| match h.get(recv) {
         Some(JsObj::RegExp(r)) => Some((r.re.clone(), r.global, r.sticky, r.last_index)),
         _ => None,
