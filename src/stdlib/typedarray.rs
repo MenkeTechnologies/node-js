@@ -508,10 +508,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 // swapping, which the `<= 0.0` break got wrong.
                 let mut vals: Vec<Value> = out.iter().map(|f| Value::Float(*f)).collect();
                 crate::builtins::sort_values(&mut vals, Some(&cmp))?;
-                out = vals
-                    .iter()
-                    .map(|v| with_host(|h| h.to_number(v)))
-                    .collect();
+                out = vals.iter().map(|v| with_host(|h| h.to_number(v))).collect();
             } else {
                 // A typed array sorts NUMERICALLY by default, unlike `Array`
                 // which sorts by string. Verified against node v26.7.0:

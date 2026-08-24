@@ -330,14 +330,13 @@ fn resolve_win32(args: &[String]) -> String {
 
     let mut i = args.len() as isize - 1;
     while i >= -1 {
-        let path: Vec<char>;
-        if i >= 0 {
+        let path: Vec<char> = if i >= 0 {
             let p = &args[i as usize];
             if p.is_empty() {
                 i -= 1;
                 continue;
             }
-            path = chars(p);
+            chars(p)
         } else if resolved_device.is_empty() {
             let c = cwd();
             // Fast path for the current directory. On a POSIX host Node
@@ -347,7 +346,7 @@ fn resolve_win32(args: &[String]) -> String {
             {
                 return c.replace('/', "\\");
             }
-            path = chars(&c);
+            chars(&c)
         } else {
             // Windows keeps a per-drive cwd in a `=C:` env var; off Windows that
             // never exists, so Node falls back to `process.cwd()` and only
@@ -360,12 +359,12 @@ fn resolve_win32(args: &[String]) -> String {
             let drive_mismatch = str_of(&cc[..cc.len().min(2)]).to_lowercase()
                 != resolved_device.to_lowercase()
                 && cc.get(2) == Some(&'\\');
-            path = if drive_mismatch {
+            if drive_mismatch {
                 chars(&std::format!("{resolved_device}\\"))
             } else {
                 cc
-            };
-        }
+            }
+        };
 
         let len = path.len();
         let mut root_end: usize = 0;

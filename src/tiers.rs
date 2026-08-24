@@ -327,22 +327,42 @@ mod tests {
         );
     }
 
-    /// The loop is refused by the tracing tier before branch shape is even
-    /// reached: its body dispatches through ops the trace compiler cannot
-    /// lower, so `is_trace_eligible` says no. The report names them under
-    /// `block-ineligible ops`, which is what makes it a diagnosis rather than
-    /// a verdict — this is the list to shrink to reach native code.
+    /// The tracing tier no longer refuses this loop for its *ops*: since
+    /// `i += 1` on a proven-Number slot lowers to a native add,
+    /// `is_trace_eligible` accepts the body. What still keeps the program off
+    /// native code is the loop's *shape* — the frontend closes a `while` with
+    /// an unconditional `Jump` back to the header, and fusevm's trace compiler
+    /// bails on that close (it compiles a `JumpIfTrue`/`JumpIfFalse` one, as
+    /// `a_rotated_slot_loop_reaches_a_compiled_trace` pins). Rotating the loop
+    /// is what would take this program to native code; shrinking the
+    /// `block-ineligible ops` list is no longer the blocker.
     #[test]
-    fn the_counted_loop_is_refused_by_the_tracing_tier() {
+    fn the_counted_loop_is_trace_eligible_but_its_close_is_not_traced() {
         let report = report(PROGRAM).expect("runs");
         let looped = report
             .chunks
             .iter()
             .find(|c| !c.loops.is_empty())
             .unwrap_or_else(|| panic!("a chunk with a loop: {report}"));
-        assert!(!looped.loops[0].trace_eligible, "{report}");
+        assert!(looped.loops[0].trace_eligible, "{report}");
         assert!(!looped.loops[0].traced, "{report}");
         assert!(!looped.ineligible.is_empty(), "{report}");
         assert!(!report.reaches_native(), "{report}");
+
+        // Name the reason rather than just the verdict: the close is the
+        // unconditional backward `Jump` the trace compiler refuses.
+        let anchor = looped.loops[0].anchor;
+        let chunks = program_chunks(&crate::compile(PROGRAM).expect("compiles"));
+        let (_, chunk) = chunks
+            .iter()
+            .find(|(name, _)| name == &looped.name)
+            .expect("the looped chunk is one of the program's chunks");
+        let close = body_of(&chunk.ops, anchor)
+            .and_then(<[Op]>::last)
+            .expect("the loop is closed");
+        assert!(
+            matches!(close, Op::Jump(t) if *t == anchor),
+            "the loop closes with an unconditional Jump({anchor}), got {close:?}"
+        );
     }
 }

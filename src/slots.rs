@@ -157,7 +157,9 @@ fn stmt_slot_safe(s: &Stmt) -> bool {
                 && handler
                     .as_ref()
                     .map_or(true, |(_, b)| b.iter().all(stmt_slot_safe))
-                && finalizer.as_ref().map_or(true, |b| b.iter().all(stmt_slot_safe))
+                && finalizer
+                    .as_ref()
+                    .map_or(true, |b| b.iter().all(stmt_slot_safe))
         }
         StmtKind::Expr(e) | StmtKind::Throw(e) => expr_slot_safe(e),
         StmtKind::Return(e) => e.as_ref().map_or(true, expr_slot_safe),
@@ -190,9 +192,7 @@ fn stmt_slot_safe(s: &Stmt) -> bool {
             body,
             is_await,
             ..
-        } => {
-            !*is_await && expr_slot_safe(target) && expr_slot_safe(iter) && stmt_slot_safe(body)
-        }
+        } => !*is_await && expr_slot_safe(target) && expr_slot_safe(iter) && stmt_slot_safe(body),
         StmtKind::ForIn {
             target,
             object,
@@ -344,9 +344,7 @@ impl Planner {
                         // unassigned, which is exactly the read-before-write
                         // case slots cannot answer for.
                         None => self.reject_names_in(&d.target),
-                        Some(init) => {
-                            self.declare_target_init(&d.target, Some(*kind), Some(init))
-                        }
+                        Some(init) => self.declare_target_init(&d.target, Some(*kind), Some(init)),
                     }
                 }
             }
@@ -775,7 +773,9 @@ fn collect_all_idents_stmt(s: &Stmt, out: &mut FxHashSet<String>) {
                 if let Some(t) = &c.test {
                     collect_all_idents_expr(t, out);
                 }
-                c.body.iter().for_each(|st| collect_all_idents_stmt(st, out));
+                c.body
+                    .iter()
+                    .for_each(|st| collect_all_idents_stmt(st, out));
             }
         }
         StmtKind::Labeled { body, .. } => collect_all_idents_stmt(body, out),
@@ -811,7 +811,9 @@ fn collect_class_idents(c: &crate::ast::ClassNode, out: &mut FxHashSet<String>) 
                 collect_all_idents_expr(d, out);
             }
         }
-        m.body.iter().for_each(|st| collect_all_idents_stmt(st, out));
+        m.body
+            .iter()
+            .for_each(|st| collect_all_idents_stmt(st, out));
         if let Some(init) = &m.field_init {
             collect_all_idents_expr(init, out);
         }

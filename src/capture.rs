@@ -37,9 +37,7 @@ pub fn stmt_captures(s: &Stmt) -> bool {
             .any(|d| expr_captures(&d.target) || d.init.as_ref().is_some_and(expr_captures)),
         StmtKind::Block(body) => body.iter().any(stmt_captures),
         StmtKind::If { test, cons, alt } => {
-            expr_captures(test)
-                || stmt_captures(cons)
-                || alt.as_deref().is_some_and(stmt_captures)
+            expr_captures(test) || stmt_captures(cons) || alt.as_deref().is_some_and(stmt_captures)
         }
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
             expr_captures(test) || stmt_captures(body)
@@ -64,9 +62,7 @@ pub fn stmt_captures(s: &Stmt) -> bool {
             body,
             ..
         } => expr_captures(target) || expr_captures(object) || stmt_captures(body),
-        StmtKind::Switch { disc, cases } => {
-            expr_captures(disc) || cases.iter().any(case_captures)
-        }
+        StmtKind::Switch { disc, cases } => expr_captures(disc) || cases.iter().any(case_captures),
         StmtKind::Labeled { body, .. } => stmt_captures(body),
         StmtKind::Try {
             block,

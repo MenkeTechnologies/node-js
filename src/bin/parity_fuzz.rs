@@ -801,7 +801,7 @@ fn gen_control(seed: u64) -> Vec<String> {
             "console.log(out);".into(),
         ],
         2 => vec![
-            format!("const f = x => x < 2 ? x : f(x - 1) + f(x - 2);"),
+            "const f = x => x < 2 ? x : f(x - 1) + f(x - 2);".into(),
             format!("console.log(f({}));", 5 + r.below(8)),
         ],
         _ => vec![
@@ -821,7 +821,7 @@ fn gen_class(seed: u64) -> Vec<String> {
     let b = pick(r, INTS);
     match r.below(9) {
         0 => vec![
-            format!("class C {{ constructor(x) {{ this.x = x; }} dbl() {{ return this.x * 2; }} }}"),
+            "class C { constructor(x) { this.x = x; } dbl() { return this.x * 2; } }".into(),
             format!("console.log(new C({a}).dbl());"),
         ],
         1 => vec![
@@ -848,16 +848,16 @@ fn gen_class(seed: u64) -> Vec<String> {
             "console.log(c.reveal(), JSON.stringify(c), Object.keys(c).length);".into(),
         ],
         6 => vec![
-            format!("class Counter {{ constructor() {{ this.c = 0; }} inc() {{ this.c++; return this; }} }}"),
-            format!("const k = new Counter(); k.inc().inc().inc(); console.log(k.c);"),
+            "class Counter { constructor() { this.c = 0; } inc() { this.c++; return this; } }".into(),
+            "const k = new Counter(); k.inc().inc().inc(); console.log(k.c);".into(),
         ],
         7 => vec![
             "class P { constructor(x, y) { this.x = x; this.y = y; } toString() { return `(${this.x},${this.y})`; } }".into(),
             format!("console.log(String(new P({a}, {b})), new P({a}, {b}).constructor.name);"),
         ],
         _ => vec![
-            format!("class Shape {{ area() {{ return 0; }} }}"),
-            format!("class Sq extends Shape {{ constructor(s) {{ super(); this.s = s; }} area() {{ return this.s * this.s; }} }}"),
+            "class Shape { area() { return 0; } }".into(),
+            "class Sq extends Shape { constructor(s) { super(); this.s = s; } area() { return this.s * this.s; } }".into(),
             format!("const arr = [new Sq({}), new Sq({})]; console.log(arr.map(x => x.area()));", 1 + r.below(6), 1 + r.below(6)),
         ],
     }
@@ -891,7 +891,7 @@ fn gen_generator(seed: u64) -> Vec<String> {
             "let sum = 0; for (const v of g()) sum += v; console.log(sum);".into(),
         ],
         5 => vec![
-            format!("function* range(n) {{ for (let i = 0; i < n; i++) yield i; }}"),
+            "function* range(n) { for (let i = 0; i < n; i++) yield i; }".into(),
             format!("console.log(Math.max(...range({})));", 1 + r.below(6)),
         ],
         _ => vec![
@@ -927,9 +927,9 @@ fn gen_mapset(seed: u64) -> Vec<String> {
         5 => vec![format!(
             "const s = new Set([1, 2, 3, 4]); const doubled = [...s].map(x => x * {}); console.log(doubled);", 1 + r.below(4)
         )],
-        6 => vec![format!(
-            "const m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.clear(); console.log(m.size, [...m.keys()]);"
-        )],
+        6 => vec![
+            "const m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.clear(); console.log(m.size, [...m.keys()]);".into()
+        ],
         _ => vec![format!(
             "const wm = new WeakMap(); const k = {{}}; wm.set(k, {a}); console.log(wm.get(k), wm.has(k), wm.has({{}}));"
         )],
@@ -953,11 +953,11 @@ fn gen_proto(seed: u64) -> Vec<String> {
         ],
         2 => vec![
             "function Animal(n) { this.n = n; } Animal.prototype.speak = function() { return this.n; };".into(),
-            format!("const d = new Animal('rex'); console.log(d.speak(), d instanceof Animal, d.constructor === Animal);"),
+            "const d = new Animal('rex'); console.log(d.speak(), d instanceof Animal, d.constructor === Animal);".into(),
         ],
-        3 => vec![format!(
-            "console.log([] instanceof Array, [] instanceof Object, ({{}}) instanceof Object, (() => {{}}) instanceof Function);"
-        )],
+        3 => vec![
+            "console.log([] instanceof Array, [] instanceof Object, ({}) instanceof Object, (() => {}) instanceof Function);".into()
+        ],
         4 => vec![
             "const a = Symbol('x'), b = Symbol('x');".into(),
             "console.log(typeof a, a.description, a === b, Symbol.for('k') === Symbol.for('k'));".into(),
