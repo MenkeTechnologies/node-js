@@ -93,6 +93,35 @@ timers, promises or sockets, so `executionAsyncId()` inside a `setTimeout`/
 `.then` callback reports the root context (1), not a per-callback id, and
 `createHook` callbacks still never fire.
 
+## Array HOLES are stored as `undefined`
+
+An array is a `Vec<Value>` with no representation for an ELIDED element, so a
+hole (`[1,,3]`, `new Array(5)`, a `delete arr[i]`, an index written past the
+end) becomes a stored `undefined`. The two are distinguishable in JS, and every
+place that distinguishes them diverges. Measured against node v26.7.0:
+
+| expression | node v26.7.0 | node-js |
+| --- | --- | --- |
+| `console.log([1,,3])` | `[ 1, <1 empty item>, 3 ]` | `[ 1, undefined, 3 ]` |
+| `console.log(new Array(5))` | `[ <5 empty items> ]` | five `undefined`s |
+| `1 in [1,,3]` | `false` | `true` |
+| `Object.keys([1,,3])` | `[ '0', '2' ]` | `[ '0', '1', '2' ]` |
+| `[1,,3].forEach(f)` | skips index 1 | calls `f(undefined, 1)` |
+| `[1,,3].filter(()=>true).length` | `2` | `3` |
+
+What already AGREES, because it does not depend on the distinction: `.length`
+(3 either way), `JSON.stringify([1,,3])` (`[1,null,3]` — a hole and an
+`undefined` both serialize to `null`), `[...[1,,3]]` and `for…of` (both yield
+`undefined` for a hole per the spec), and `.map`, whose result node also reports
+as holed but which stringifies identically.
+
+Closing this needs a distinct in-heap sentinel for a hole plus a
+hole-to-`undefined` mapping at every element READ, and a skip in the iteration
+methods that skip holes. That is a wide change across the array surface, and a
+site that misses the mapping leaks the sentinel into user code — a worse failure
+than the current one, which is at least a consistent `undefined`. Left
+unimplemented deliberately rather than half-done.
+
 ## Promise resolution, async iteration and unhandled rejections
 
 - **Thenable assimilation.** Resolving a promise with any object carrying a
