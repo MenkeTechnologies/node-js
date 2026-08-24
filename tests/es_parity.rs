@@ -3230,3 +3230,74 @@ fn date_to_string_is_not_the_utc_header_form() {
          Invalid Date Invalid Date"
     );
 }
+
+// ── const bindings are immutable (8.5.2 SetMutableBinding) ──────────────────
+
+/// Assigning to a `const` used to SUCCEED, silently, through every form:
+/// `const c = 1; c = 2` left `c` as 2 with no error, so code node rejects ran
+/// on with a mutated constant. It is a RUNTIME error, not a parse error — the
+/// spec puts it in SetMutableBinding — so a `try` around it must CATCH it,
+/// which is what every case below checks. `=`, compound assignment and
+/// `++`/`--` each reach the store by a different path in the compiler, and the
+/// `++` fast path for a slot proved to hold a Number bypassed the other two, so
+/// all three are pinned here. Expected values from node v26.7.0.
+#[test]
+fn assignment_to_a_const_throws() {
+    let src = r#"
+        function t(f){ try { return String(f()) } catch(e) { return e.constructor.name + ": " + e.message } }
+        console.log(t(()=>{ const c = 1; c = 2; return c }));
+        console.log(t(()=>{ const c = 1; c += 1; return c }));
+        console.log(t(()=>{ const c = 1; c -= 1; return c }));
+        console.log(t(()=>{ const c = 1; c++; return c }));
+        console.log(t(()=>{ const c = 1; ++c; return c }));
+        console.log(t(()=>{ const c = 1; c--; return c }));
+        console.log(t(()=>{ const c = 1; { c = 2 } return c }));   // inner block
+        console.log(t(()=>{ const c = 1; return (()=>{ c = 2 })() }));  // inner fn
+        console.log(t(()=>{ const c = 1; c ||= 2; return c }));
+    "#;
+    let expect = "TypeError: Assignment to constant variable.";
+    assert_eq!(run(src), vec![expect; 9].join("\n"));
+}
+
+/// The flip side, and the more important half: everything that is NOT an
+/// assignment to the binding must keep working. A false positive here would be
+/// a REGRESSION — code that runs today would start throwing — so each of these
+/// is a shape that looks like a const store but is not one.
+#[test]
+fn const_enforcement_does_not_over_reject() {
+    let src = r#"
+        const o = {}; o.x = 1; o.x++;                 // mutating the OBJECT is fine
+        const a = [1]; a.push(2); a[0] = 9;
+        console.log(o.x, JSON.stringify(a));
+        for (const i of [1,2]) { }                    // fresh binding per iteration
+        for (const k in {a:1,b:2}) { }
+        let out = "";
+        for (const v of [1,2,3]) out += v;
+        console.log(out);
+        const c = 1; { let c = 2; c = 3; console.log(c) }   // inner LET shadows
+        { const c = 5; console.log(c) }
+        console.log(c);
+        function f(c) { c = 7; return c }             // a PARAMETER is mutable
+        console.log(f(1));
+        const g = () => { let n = 0; n++; return n };  // let inside is mutable
+        console.log(g());
+        let l = 1; l = 2; l += 1; l++; console.log(l);
+        const { p } = { p: 1 }; console.log(p);
+        const [q] = [2]; console.log(q);
+        console.log(typeof c);
+    "#;
+    assert_eq!(
+        run(src),
+        "2 [9,2]\n\
+         123\n\
+         3\n\
+         5\n\
+         1\n\
+         7\n\
+         1\n\
+         4\n\
+         1\n\
+         2\n\
+         number"
+    );
+}

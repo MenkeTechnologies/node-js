@@ -57,6 +57,11 @@ pub struct Plan {
     /// Of those, the ones provably holding a Number, so `++`/`--` can be a
     /// native add instead of a `NUM_STEP` call into the host.
     pub numeric: FxHashSet<String>,
+    /// Of those, the ones declared `const`. A slotted binding never reaches the
+    /// host's scope chain, so the host's immutable-binding check cannot see it;
+    /// the compiler rejects the assignment instead, which costs nothing at run
+    /// time and is exact (see `Planner::consts`).
+    pub consts: FxHashSet<String>,
 }
 
 /// Is this initializer a literal Number? `-1` reaches the compiler as a unary
@@ -87,6 +92,7 @@ pub fn plan(params: &[Param], body: &[Stmt], top_level: bool) -> Plan {
         candidates: SlotTable::default(),
         rejected: escaping,
         numeric: FxHashSet::default(),
+        consts: FxHashSet::default(),
         top_level,
         next: 0,
     };
@@ -102,10 +108,12 @@ pub fn plan(params: &[Param], body: &[Stmt], top_level: bool) -> Plan {
     for name in p.rejected {
         p.candidates.remove(&name);
         p.numeric.remove(&name);
+        p.consts.remove(&name);
     }
     Plan {
         table: p.candidates,
         numeric: p.numeric,
+        consts: p.consts,
     }
 }
 
@@ -257,6 +265,11 @@ struct Planner {
     /// Number yields a Number. `i++` on one of these needs no `NUM_STEP` call
     /// into the host to do `ToNumeric` and stay BigInt-aware.
     numeric: FxHashSet<String>,
+    /// Slotted names declared `const`. A slotted name is declared exactly once
+    /// in the chunk (rule 2), is unreachable from any other chunk (rule 1) and
+    /// is a simple identifier (rule 4), so a store to one is UNAMBIGUOUSLY a
+    /// store to that const binding and the compiler can reject it outright.
+    consts: FxHashSet<String>,
     top_level: bool,
     next: u16,
 }
@@ -311,10 +324,13 @@ impl Planner {
         match kind {
             // Rule 5: a top-level `var` is a global-object property.
             Some(DeclKind::Var) if self.top_level => self.reject(n),
-            Some(_) => {
+            Some(k) => {
                 self.declare(n);
                 if init.is_some_and(is_number_literal) {
                     self.numeric.insert(n.clone());
+                }
+                if k == DeclKind::Const {
+                    self.consts.insert(n.clone());
                 }
             }
             // `for (x of …)` with no declaration keyword assigns an existing

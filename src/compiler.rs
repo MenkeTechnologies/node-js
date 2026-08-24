@@ -70,7 +70,8 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
 fn bind_mode(kind: DeclKind) -> BindMode {
     match kind {
         DeclKind::Var => BindMode::Var,
-        DeclKind::Let | DeclKind::Const => BindMode::Lexical,
+        DeclKind::Let => BindMode::Lexical,
+        DeclKind::Const => BindMode::Const,
     }
 }
 
@@ -80,8 +81,11 @@ enum BindMode {
     /// Plain assignment to an existing binding (`x = 1`, a for-of head without
     /// `let`/`const`/`var`).
     Assign,
-    /// `let`/`const`/`class`: bound in the innermost BLOCK scope.
+    /// `let`/`class`: bound in the innermost BLOCK scope.
     Lexical,
+    /// `const`: block-scoped like `Lexical`, but IMMUTABLE — a later assignment
+    /// to the name throws `TypeError: Assignment to constant variable.`
+    Const,
     /// `var` / a hoisted function declaration: bound at FUNCTION scope.
     Var,
 }
@@ -502,10 +506,10 @@ impl Compiler {
                 b.emit(Op::SetSlot(slot), 0);
                 return;
             }
-            let op = if mode == BindMode::Var {
-                ops::DECLARE_VAR
-            } else {
-                ops::DECLARE
+            let op = match mode {
+                BindMode::Var => ops::DECLARE_VAR,
+                BindMode::Const => ops::DECLARE_CONST,
+                _ => ops::DECLARE,
             };
             self.name_const(b, n);
             b.emit(Op::Swap, 0);
@@ -514,10 +518,40 @@ impl Compiler {
         }
     }
 
+    /// Emit `throw new TypeError("Assignment to constant variable.")`.
+    ///
+    /// A store to a `const` is a RUNTIME error, not a parse error — the spec
+    /// puts it in SetMutableBinding (8.5.2), so `try { const c=1; c=2 } catch {}`
+    /// has to catch it. Emitting the throw in place of the store gives exactly
+    /// that, and costs nothing for every store that is not to a const.
+    fn throw_const_assignment(&mut self, b: &mut ChunkBuilder) {
+        let e = Expr::New {
+            callee: Box::new(Expr::Ident("TypeError".into())),
+            args: vec![Expr::Str("Assignment to constant variable.".into())],
+        };
+        // `New` of a known builtin with a literal argument cannot fail to
+        // compile, so the error path is unreachable rather than swallowed.
+        if self.compile_expr(b, &e).is_ok() {
+            b.emit(Op::CallBuiltin(ops::THROW, 1), 0);
+        }
+    }
+
     /// Store TOS into an lvalue (Ident/Member/Index), leaving nothing.
     fn store_simple(&mut self, b: &mut ChunkBuilder, target: &Expr) -> Result<(), String> {
         match target {
             Expr::Ident(n) => {
+                // A slotted binding never reaches the host's scope chain, so the
+                // host's immutable-binding check cannot see it. The slot plan is
+                // exact about which names are const (one declaration per name,
+                // unreachable from another chunk, simple identifiers only), so
+                // the store is rejected here instead — at run time, as the spec
+                // requires, since `try { const c=1; c=2 } catch {}` must CATCH
+                // this rather than fail to parse.
+                if self.slots.consts.contains(n) {
+                    b.emit(Op::Pop, 0); // drop the value that will never be stored
+                    self.throw_const_assignment(b);
+                    return Ok(());
+                }
                 if let Some(slot) = self.slot_of(n) {
                     b.emit(Op::SetSlot(slot), 0);
                     return Ok(());
@@ -949,7 +983,7 @@ impl Compiler {
         self.load_local(b, &step_tmp);
         self.name_const(b, "value");
         b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [value]
-        let per_iteration = declare == BindMode::Lexical;
+        let per_iteration = matches!(declare, BindMode::Lexical | BindMode::Const);
         if per_iteration {
             self.emit_push_scope(b);
         }
@@ -1004,7 +1038,7 @@ impl Compiler {
     ) -> Result<(), String> {
         // `for (const v of …)` binds a FRESH `v` each pass, so a closure made in one
         // pass keeps that pass's element.
-        let per_iteration = declare == BindMode::Lexical;
+        let per_iteration = matches!(declare, BindMode::Lexical | BindMode::Const);
         let start = b.current_pos();
         b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next]
         let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next
@@ -2247,6 +2281,15 @@ impl Compiler {
         // the last `CallBuiltin` out of a counting loop's body — and with it the
         // reason fusevm's tiers decline the loop.
         if let Expr::Ident(n) = target {
+            // `c++` on a `const` is an assignment and throws like one. The
+            // numeric fast path below writes the slot directly, and the general
+            // path reaches the check through `compile_bind`, so this has to come
+            // before both — otherwise `const c = 1; c++` silently incremented a
+            // constant while `c = 2` correctly threw.
+            if self.slots.consts.contains(n) {
+                self.throw_const_assignment(b);
+                return Ok(());
+            }
             if let Some(slot) = self.numeric_slot_of(n) {
                 b.emit(Op::GetSlot(slot), 0); // [old]
                 if !prefix {

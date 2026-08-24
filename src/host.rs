@@ -103,6 +103,7 @@ pub mod ops {
     pub const DECLARE_VAR: u16 = 68; // [name, value] -> declare at FUNCTION scope, ignoring block scopes (`var`)
     pub const NAMED_EVAL: u16 = 69; // [key, kind, fn] -> fn; SetFunctionName for a COMPUTED key (kind picks the `get `/`set ` prefix)
     pub const POW: u16 = 70; // [a, b] -> JS `a ** b` (NOT native `Op::Pow`: IEEE pow answers 1 for `(-1) ** Infinity` and `1 ** NaN`)
+    pub const DECLARE_CONST: u16 = 71; // [name, value] -> value; like DECLARE but the binding is IMMUTABLE (`const`)
 }
 
 /// `SIG_UNWIND` scope tags: what the emitting site is nested in.
@@ -473,6 +474,13 @@ pub type VarMap = IndexMap<String, Value>;
 /// function that captures it.
 pub struct EnvData {
     pub vars: VarMap,
+    /// The names in `vars` that were declared `const`, so an assignment to one
+    /// throws (16.1.3 / 8.5.2 — an immutable binding rejects SetMutableBinding).
+    ///
+    /// A separate set rather than a flag inside `VarMap`'s value, because
+    /// `set_name` is a hot path — the common case is an env with NO consts,
+    /// where `is_empty()` settles it without hashing the name a second time.
+    pub consts: rustc_hash::FxHashSet<String>,
     pub parent: Option<Env>,
 }
 pub type Env = Rc<RefCell<EnvData>>;
@@ -518,6 +526,7 @@ impl PropAttrs {
 fn new_env(parent: Option<Env>) -> Env {
     Rc::new(RefCell::new(EnvData {
         vars: VarMap::default(),
+        consts: rustc_hash::FxHashSet::default(),
         parent,
     }))
 }
@@ -573,6 +582,9 @@ pub struct JsHost {
     pub tries: Vec<TryDef>,
     /// Module-level (global) names.
     globals: VarMap,
+    /// Top-level `const` names (a module frame declares into `globals`), so an
+    /// assignment to one throws the same way a block-scoped `const` does.
+    global_consts: rustc_hash::FxHashSet<String>,
     /// The frame stack (bottom = module).
     frames: Vec<Frame>,
     /// The program's top-level scope — the scope runtime-compiled source runs in
@@ -872,6 +884,7 @@ impl JsHost {
             funcs: Vec::new(),
             tries: Vec::new(),
             globals: VarMap::default(),
+            global_consts: rustc_hash::FxHashSet::default(),
             frames: vec![Frame {
                 env: global_env.clone(),
                 base_env: global_env.clone(),
@@ -1644,24 +1657,58 @@ impl JsHost {
 
     /// Assign to an existing binding up the scope chain, else create a global
     /// (JS assignment to an undeclared name targets the global object).
-    pub fn set_name(&mut self, name: &str, val: Value) {
+    /// Assign to an existing binding, or create a global. Returns `false` when
+    /// the nearest binding is an immutable (`const`) one, which the caller turns
+    /// into `TypeError: Assignment to constant variable.` — assigning to a
+    /// `const` used to succeed SILENTLY, so code that node rejects ran on with
+    /// a mutated constant.
+    #[must_use]
+    pub fn set_name(&mut self, name: &str, val: Value) -> bool {
         let mut env = Some(self.cur_env());
         while let Some(e) = env {
             // `get_mut`, not `contains_key` + `insert`: overwriting an existing
             // binding hashed the name twice and allocated a fresh `String` key
             // for a key that was already there — once per assignment, so once
             // per loop iteration in any counting loop.
-            if let Some(slot) = e.borrow_mut().vars.get_mut(name) {
-                *slot = val;
-                return;
+            //
+            // The const check runs only at the env that OWNS the name, and the
+            // `is_empty` guard settles the common (no consts here) case without
+            // hashing the name again.
+            let mut b = e.borrow_mut();
+            if b.vars.contains_key(name) {
+                if !b.consts.is_empty() && b.consts.contains(name) {
+                    return false;
+                }
+                if let Some(slot) = b.vars.get_mut(name) {
+                    *slot = val;
+                }
+                return true;
             }
+            drop(b);
             env = e.borrow().parent.clone();
+        }
+        if self.global_consts.contains(name) {
+            return false;
         }
         match self.globals.get_mut(name) {
             Some(slot) => *slot = val,
             None => {
                 self.globals.insert(name.to_string(), val);
             }
+        }
+        true
+    }
+
+    /// Declare a `const` binding: the same placement as [`Self::declare_name`],
+    /// plus recording the name as immutable in whichever scope received it.
+    pub fn declare_const_name(&mut self, name: &str, val: Value) {
+        let f = self.frame();
+        let to_globals = f.is_module && Rc::ptr_eq(&f.env, &f.base_env);
+        self.declare_name(name, val);
+        if to_globals {
+            self.global_consts.insert(name.to_string());
+        } else {
+            self.cur_env().borrow_mut().consts.insert(name.to_string());
         }
     }
 

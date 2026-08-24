@@ -12,6 +12,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETLOCAL, b_getlocal);
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
     vm.register_builtin(ops::DECLARE, b_declare);
+    vm.register_builtin(ops::DECLARE_CONST, b_declare_const);
     vm.register_builtin(ops::DELNAME, b_delname);
     vm.register_builtin(ops::GETATTR, b_getattr);
     vm.register_builtin(ops::SETATTR, b_setattr);
@@ -509,7 +510,11 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
 fn b_setlocal(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = sname(&vm.pop());
-    with_host(|h| h.set_name(&name, val.clone()));
+    // An assignment to a `const` binding throws (8.5.2 SetMutableBinding on an
+    // immutable binding). This used to succeed silently.
+    if !with_host(|h| h.set_name(&name, val.clone())) {
+        return abort(vm, host::type_error("Assignment to constant variable."));
+    }
     val
 }
 
@@ -517,6 +522,15 @@ fn b_declare(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = sname(&vm.pop());
     with_host(|h| h.declare_name(&name, val.clone()));
+    val
+}
+
+/// `const x = …`: like `DECLARE`, but the binding is immutable, so a later
+/// assignment to the name throws instead of overwriting it.
+fn b_declare_const(vm: &mut VM, _: u8) -> Value {
+    let val = vm.pop();
+    let name = sname(&vm.pop());
+    with_host(|h| h.declare_const_name(&name, val.clone()));
     val
 }
 
