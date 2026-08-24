@@ -15,7 +15,13 @@ use std::process::ExitCode;
 /// object heap is a `thread_local`, so the thread that parses the command line
 /// has to be the thread that runs the program.
 fn main() -> ExitCode {
-    nodejs::run_on_js_stack(run)
+    // The flush happens INSIDE the closure: the bytecode cache is resident in a
+    // thread-local, and `run_on_js_stack` may not run `run` on this thread.
+    nodejs::run_on_js_stack(|| {
+        let code = run();
+        nodejs::cache::flush();
+        code
+    })
 }
 
 fn run() -> ExitCode {

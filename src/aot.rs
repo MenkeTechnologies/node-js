@@ -14,6 +14,9 @@ pub fn build(file: &str) -> Result<String, String> {
     let prog = crate::compile(&src)?;
     let (nfns, nops) = (prog.functions.len(), prog.main.ops.len());
     crate::cache::store(&src, &prog)?;
+    // `--build` warms the shard for later runs, so it must reach disk here
+    // rather than at the end of an ordinary run.
+    crate::cache::flush();
 
     // Emit the native object + link a standalone executable. The output path is
     // the source stem (`foo.js` -> `foo`).

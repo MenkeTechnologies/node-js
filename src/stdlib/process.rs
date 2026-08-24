@@ -437,6 +437,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             use std::io::Write;
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
+            // `std::process::exit` runs no destructors, so the bytecode cache
+            // has to reach disk here too — otherwise a script that ends in
+            // `process.exit()` would recompile every module it loaded, every
+            // run, and never benefit from the cache at all.
+            crate::cache::flush();
             std::process::exit(code);
         }
         // `process.chdir(dir)` really changes the working directory, and throws on

@@ -184,16 +184,58 @@ fn write_shard(shard: &Shard) -> Result<(), String> {
     })
 }
 
+/// The shard, resident in memory for the life of the process.
+///
+/// It used to be read and fully deserialized from disk on every `load`, and
+/// read-modify-WRITTEN on every `store`. That was affordable only because
+/// exactly one lookup happened per run — the top-level script. Caching each
+/// `require`d module makes it 118 lookups for an express tree, and measured on
+/// a 3 MB shard a single `load` costs 67-347 ms, so the disk-per-call design
+/// would have turned a 138 ms saving into a 16 SECOND regression. Reading once
+/// and writing once is what makes per-module caching possible at all.
+#[derive(Default)]
+struct ShardMem {
+    entries: rustc_hash::FxHashMap<u64, (u64, Vec<u8>)>,
+    /// Whether this process added anything, so an all-hits run writes nothing.
+    dirty: bool,
+}
+
+thread_local! {
+    static SHARD: std::cell::RefCell<Option<ShardMem>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` against the resident shard, loading it from disk on first use.
+fn with_shard<T>(f: impl FnOnce(&mut ShardMem) -> T) -> T {
+    SHARD.with(|c| {
+        let mut slot = c.borrow_mut();
+        let mem = slot.get_or_insert_with(|| {
+            let build = build_id();
+            let mut mem = ShardMem::default();
+            for e in load_shard().entries {
+                // Entries from another build can never be hit (the build id is
+                // part of every key), so they are not worth holding in memory
+                // and are dropped on the next write.
+                if e.build == build {
+                    mem.entries.insert(e.key, (e.verify, e.blob));
+                }
+            }
+            mem
+        });
+        f(mem)
+    })
+}
+
 /// Look up a compiled program for `src`, if present and current.
 pub fn load(src: &str) -> Option<Program> {
     let key = key_for(src);
     let verify = verify_for(src);
-    let shard = load_shard();
-    let entry = shard
-        .entries
-        .iter()
-        .find(|e| e.key == key && e.verify == verify && e.build == build_id())?;
-    let cp: CProg = bincode::deserialize(&entry.blob).ok()?;
+    let blob = with_shard(|m| {
+        m.entries
+            .get(&key)
+            .filter(|(v, _)| *v == verify)
+            .map(|(_, b)| b.clone())
+    })?;
+    let cp: CProg = bincode::deserialize(&blob).ok()?;
     Some(Program {
         main: cp.main,
         functions: cp.functions,
@@ -201,30 +243,61 @@ pub fn load(src: &str) -> Option<Program> {
     })
 }
 
-/// Store `prog` (compiled from `src`) into the shard, replacing any prior entry.
+/// Record `prog` (compiled from `src`) in the resident shard. Reaches disk at
+/// [`flush`], not here.
 pub fn store(src: &str, prog: &Program) -> Result<(), String> {
-    let key = key_for(src);
-    let verify = verify_for(src);
     let cp = CProg {
         main: prog.main.clone(),
         functions: prog.functions.clone(),
         tries: prog.tries.clone(),
     };
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
-    let build = build_id();
-    let mut shard = load_shard();
-    // Drop this source's previous entry AND everything written by a build that
-    // is no longer running. The latter can never be hit again (the build id is
-    // part of every key), so without this the shard grows by a full copy of
-    // itself on each rebuild and every lookup pays to deserialize the lot.
-    shard.entries.retain(|e| e.key != key && e.build == build);
-    shard.entries.push(Entry {
-        key,
-        verify,
-        build,
-        blob,
+    let key = key_for(src);
+    let verify = verify_for(src);
+    with_shard(|m| {
+        m.entries.insert(key, (verify, blob));
+        m.dirty = true;
     });
-    write_shard(&shard)
+    Ok(())
+}
+
+/// Write the resident shard back, once, at the end of the run.
+///
+/// The on-disk shard is re-read and MERGED rather than overwritten: up to 16
+/// instances share it, and a plain overwrite would drop whatever a peer stored
+/// while this process was running. A losing writer still only loses entries
+/// (they recompile next run); it can never corrupt the file, since the write
+/// itself is a temp-plus-rename.
+pub fn flush() {
+    let build = build_id();
+    let pending = SHARD.with(|c| {
+        let mut slot = c.borrow_mut();
+        match slot.as_mut() {
+            Some(m) if m.dirty => {
+                m.dirty = false;
+                Some(m.entries.clone())
+            }
+            _ => None,
+        }
+    });
+    let Some(mut merged) = pending else { return };
+    for e in load_shard().entries {
+        if e.build == build {
+            merged.entry(e.key).or_insert((e.verify, e.blob));
+        }
+    }
+    let shard = Shard {
+        entries: merged
+            .into_iter()
+            .map(|(key, (verify, blob))| Entry {
+                key,
+                verify,
+                build,
+                blob,
+            })
+            .collect(),
+    };
+    let _ = write_shard(&shard);
 }
 
 #[cfg(test)]
@@ -302,5 +375,6 @@ mod tests {
         assert_ne!(build_id(), 0, "build_id must read the running binary");
         // Distinct sources still land on distinct keys.
         assert_ne!(key_for(src), key_for("console.log(2)\n"));
+
     }
 }
