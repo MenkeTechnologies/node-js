@@ -2909,3 +2909,105 @@ fn increment_on_a_numeric_slot_matches_node() {
          6"
     );
 }
+
+// ── Constructor-side class inheritance (15.7.14 step 6.d) ────────────────────
+
+/// `class B extends A` links the CONSTRUCTORS, not just the prototypes:
+/// `B.[[Prototype]]` is `A`. Statics already resolved through an internal
+/// parent pointer, but the link itself was invisible, so `getPrototypeOf(B)`
+/// answered `Function.prototype` and a chain that bottomed out in a BUILTIN
+/// (`class D extends Array {}`) could not reach that builtin's statics at all.
+/// Expected values from node v26.7.0.
+#[test]
+fn class_constructor_side_inherits_from_its_parent() {
+    let src = r#"
+        class A { static sm(){ return "A.sm" } static sf = 1; }
+        class B extends A {}
+        class C extends B {}
+        console.log(Object.getPrototypeOf(B) === A, Object.getPrototypeOf(C) === B);
+        console.log(Object.getPrototypeOf(A) === Function.prototype);  // base class
+        console.log(B.sm(), B.sf, C.sm(), C.sf);                       // still inherited
+        console.log(Object.getPrototypeOf(B.prototype) === A.prototype);
+        class D extends Array {}
+        console.log(typeof D.from, Object.getPrototypeOf(D) === Array);
+        console.log(JSON.stringify(D.from([1,2])));
+    "#;
+    assert_eq!(
+        run(src),
+        "true true\ntrue\nA.sm 1 A.sm 1\ntrue\nfunction true\n[1,2]"
+    );
+}
+
+// ── CopyDataProperties over a string source (7.3.25) ─────────────────────────
+
+/// `{...str}` spreads the string's index properties, because ToObject gives a
+/// String exotic owning one enumerable property per UTF-16 code UNIT (10.4.3) —
+/// so an astral character contributes TWO. The spread path only walked heap
+/// objects, so every string source contributed nothing and `{..."ab"}` was `{}`.
+/// The other primitives box to an object with no own enumerable properties and
+/// must stay no-ops. Expected values from node v26.7.0.
+#[test]
+fn object_spread_of_a_string_copies_its_index_properties() {
+    let src = r#"
+        console.log(JSON.stringify({..."ab"}));
+        // An astral char is TWO code units, so it contributes two keys — the
+        // count is what distinguishes code-unit from code-POINT indexing. Only
+        // the key count is asserted: the two VALUES are lone surrogates, which
+        // this runtime's UTF-8 string storage cannot hold (see `toWellFormed`).
+        console.log(Object.keys({..."a\u{1F600}b"}).length);
+        console.log(JSON.stringify({..."é"}));            // non-ASCII BMP round-trips
+        console.log(JSON.stringify({...""}));
+        console.log(JSON.stringify({...[1,2]}));          // array source unchanged
+        console.log(JSON.stringify({...1, ...true, ...null, ...undefined}));
+        console.log(JSON.stringify({a:0, ..."xy"}));
+    "#;
+    assert_eq!(
+        run(src),
+        "{\"0\":\"a\",\"1\":\"b\"}\n\
+         4\n\
+         {\"0\":\"é\"}\n\
+         {}\n\
+         {\"0\":1,\"1\":2}\n\
+         {}\n\
+         {\"0\":\"x\",\"1\":\"y\",\"a\":0}"
+    );
+}
+
+// ── String.prototype.normalize (22.1.3.15, UAX-15) ───────────────────────────
+
+/// `normalize` used to return the receiver unchanged and merely validate the
+/// form argument, making all four forms no-ops. The consequence was silent and
+/// bad: the standard way to compare Unicode text for canonical equivalence
+/// answered `false` for two spellings of the same character, and NFKC never
+/// folded a compatibility character. The pairs below are chosen so an identity
+/// implementation fails every line. Expected values from node v26.7.0.
+#[test]
+fn normalize_actually_normalizes() {
+    let src = r#"
+        const composed = "\u00C5";        // LATIN CAPITAL LETTER A WITH RING ABOVE
+        const decomposed = "\u0041\u030A"; // A + COMBINING RING ABOVE
+        console.log(composed.length, decomposed.length);
+        console.log(composed.normalize("NFC").length, composed.normalize("NFD").length);
+        console.log(decomposed.normalize("NFC").length, decomposed.normalize("NFD").length);
+        console.log(composed.normalize("NFC") === decomposed.normalize("NFC"));
+        console.log(composed.normalize() === decomposed.normalize());  // default NFC
+        console.log("\uFB01".normalize("NFKC"), "\uFB01".normalize("NFKC").length);
+        console.log("\uFB01".normalize("NFC").length);                 // NFC does NOT fold
+        console.log("\u2460".normalize("NFKD"));                       // circled 1 -> "1"
+        console.log("abc".normalize("NFD"));                           // ASCII unaffected
+        try { "a".normalize("NFX") } catch (e) { console.log(e.constructor.name) }
+    "#;
+    assert_eq!(
+        run(src),
+        "1 2\n\
+         1 2\n\
+         1 2\n\
+         true\n\
+         true\n\
+         fi 2\n\
+         1\n\
+         1\n\
+         abc\n\
+         RangeError"
+    );
+}

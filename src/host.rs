@@ -1060,6 +1060,26 @@ impl JsHost {
             }
         }
     }
+
+    /// The first `extends` ancestor that is NOT a user class — the builtin
+    /// constructor a class chain bottoms out in (`class D extends Array {}` →
+    /// the `Array` builtin), or `None` for a chain of user classes only.
+    ///
+    /// `class_static` walks `ClassVal.parent` and gives up the moment the parent
+    /// stops being a `Class`, so a static declared by the BUILTIN half of the
+    /// chain was unreachable: `D.from` read `undefined` where node inherits
+    /// `Array.from`. Returning the ancestor lets the caller finish the lookup
+    /// with an ordinary property read, which is what reaches a builtin's
+    /// statics.
+    pub fn class_builtin_ancestor(&self, class_val: &Value) -> Option<Value> {
+        let mut cur = class_val.clone();
+        loop {
+            match self.get(&cur) {
+                Some(JsObj::Class(c)) => cur = c.parent.clone()?,
+                _ => return Some(cur),
+            }
+        }
+    }
     pub fn set_fn_prop(&mut self, v: &Value, name: &str, val: Value) {
         if let Value::Obj(i) = v {
             self.fn_props
@@ -4409,6 +4429,19 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
         if let Some(f) = stat {
             if with_host(|h| is_callable(h, &f)) {
                 return invoke(&f, args, Some(recv.clone()));
+            }
+        }
+        // `class_static` only walks user-class `extends` links, so a chain that
+        // bottoms out in a BUILTIN constructor (`class D extends Array {}`)
+        // could not reach that builtin's statics: `D.from([1,2])` threw
+        // "from is not a function" even though `typeof D.from` said `function`.
+        // Re-dispatch the call against that ancestor, which is what reaches a
+        // builtin namespace's methods.
+        if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Class) {
+            if let Some(anc) = with_host(|h| h.class_builtin_ancestor(recv)) {
+                if with_host(|h| h.kind_of(&anc)) == Some(ObjKind::Builtin) {
+                    return call_method(&anc, name, args);
+                }
             }
         }
         // A method inherited via the function's [[Prototype]] chain (set with

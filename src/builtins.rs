@@ -1222,6 +1222,17 @@ fn function_property(recv: &Value, name: &str) -> Value {
         if let Some(v) = with_host(|h| h.class_static(recv, name)) {
             return v;
         }
+        // The chain may bottom out in a BUILTIN constructor (`class D extends
+        // Array {}`), whose statics `class_static` cannot see — it only walks
+        // `ClassVal.parent` links between user classes. Finish the lookup with an
+        // ordinary read on that ancestor so `D.from` inherits `Array.from`.
+        if let Some(anc) = with_host(|h| h.class_builtin_ancestor(recv)) {
+            if let Ok(v) = get_property(&anc, name) {
+                if !matches!(v, Value::Undef) {
+                    return v;
+                }
+            }
+        }
     } else if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
         return v;
     }
@@ -1922,6 +1933,23 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
         let spread = matches!(flat[i], Value::Int(1));
         if spread {
             let src = flat[i + 1].clone();
+            // A STRING source spreads its index properties (`{..."ab"}` is
+            // `{0:'a',1:'b'}`): CopyDataProperties (7.3.25) calls ToObject, and a
+            // String exotic object owns one enumerable property per UTF-16 code
+            // UNIT (10.4.3). `own_enum_entries_deep` only walks heap objects, so
+            // a string source contributed nothing and `{..."ab"}` was `{}`.
+            // Every other primitive (number/boolean/symbol) boxes to an object
+            // with no own enumerable properties, and null/undefined are ignored,
+            // so those correctly stay no-ops on the path below.
+            if let Some(s) = with_host(|h| h.as_str(&src)) {
+                for idx in 0..crate::utf16::len(&s) {
+                    if let Ok(ch) = get_property(&src, &idx.to_string()) {
+                        props.insert(idx.to_string(), ch);
+                    }
+                }
+                i += 3;
+                continue;
+            }
             // Object spread copies own *enumerable* properties only — never the
             // hidden `@@…` slots (copying `@@native` used to turn `{...buf}`
             // into something that still claimed to be a Buffer) and never a
@@ -6350,21 +6378,33 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             };
             Ok(Value::Float(r))
         }
-        // `normalize` is the identity here (no Unicode normalization tables),
-        // but the FORM argument is still validated: node throws for anything
-        // outside the four canonical names, and code that probes support with a
-        // try/catch was told every form was fine.
+        // `String.prototype.normalize` (22.1.3.15) — real UAX-15 normalization.
+        //
+        // This used to return the receiver unchanged and only validate the FORM
+        // argument, which made every one of the four forms a no-op: `"Å"` (NFC,
+        // one code point) and `"Å"` (NFD, two) stayed distinct under
+        // `.normalize()`, so the standard way to compare Unicode text for
+        // canonical equivalence silently answered `false`, and `NFKC` never
+        // folded a compatibility character (`"ﬁ"` stayed one code point instead
+        // of becoming `"fi"`). The tables come from `unicode-normalization`.
         "normalize" => {
+            use unicode_normalization::UnicodeNormalization;
             let form = match args.first() {
                 Some(v) if !matches!(v, Value::Undef) => with_host(|h| h.str_of(v)),
                 _ => "NFC".to_string(),
             };
-            if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
-                return Err(host::range_error(
-                    "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
-                ));
-            }
-            Ok(new_s(s.to_string()))
+            let out = match form.as_str() {
+                "NFC" => s.nfc().collect::<String>(),
+                "NFD" => s.nfd().collect::<String>(),
+                "NFKC" => s.nfkc().collect::<String>(),
+                "NFKD" => s.nfkd().collect::<String>(),
+                _ => {
+                    return Err(host::range_error(
+                        "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
+                    ))
+                }
+            };
+            Ok(new_s(out))
         }
         // ES2024 well-formedness (22.1.3.9 / 22.1.3.29). A `String` here is a
         // Rust `String`, whose `char` type EXCLUDES `U+D800..=U+DFFF`, so every
@@ -8005,6 +8045,18 @@ pub fn prototype_of(v: &Value) -> Value {
     // link — the instance-side half is `Buffer.prototype`'s `[[Prototype]]`.
     if matches!(with_host(|h| h.get(v).cloned()), Some(JsObj::Builtin(ref n)) if n == "Buffer") {
         return with_host(|h| h.alloc(JsObj::Builtin("Uint8Array".into())));
+    }
+    // Constructor-side inheritance for a `class B extends A` (ClassDefinition
+    // 15.7.14 step 6.d: the constructor's `[[Prototype]]` is the parent
+    // CONSTRUCTOR, not `Function.prototype`). Statics already resolved through
+    // `ClassVal.parent`, but the link itself was invisible, so
+    // `Object.getPrototypeOf(B) === A` read false and any library walking the
+    // constructor chain — rather than calling a static — saw a base class.
+    // A base class keeps the default answer below (`Function.prototype`).
+    if let Some(JsObj::Class(c)) = with_host(|h| h.get(v).cloned()) {
+        if let Some(parent) = c.parent {
+            return parent;
+        }
     }
     // `Object.create(null)` and friends really do have a null prototype.
     if with_host(|h| h.has_null_proto(v)) {
