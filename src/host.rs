@@ -3913,9 +3913,9 @@ fn group_array_elements(
     has_tail: bool,
 ) -> (Vec<String>, bool) {
     let separator_space = 2usize; // ", " between entries
-    // A `... N more items` tail is not an element: node drops it from the grid
-    // (`outputLength--`) so it neither widens a column nor occupies a cell, then
-    // re-appends it as its own final line.
+                                  // A `... N more items` tail is not an element: node drops it from the grid
+                                  // (`outputLength--`) so it neither widens a column nor occupies a cell, then
+                                  // re-appends it as its own final line.
     let output_length = output.len() - usize::from(has_tail);
     let data_len: Vec<usize> = output.iter().map(|o| o.chars().count()).collect();
     let mut total_length = 0usize;

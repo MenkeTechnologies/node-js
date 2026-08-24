@@ -375,6 +375,5 @@ mod tests {
         assert_ne!(build_id(), 0, "build_id must read the running binary");
         // Distinct sources still land on distinct keys.
         assert_ne!(key_for(src), key_for("console.log(2)\n"));
-
     }
 }

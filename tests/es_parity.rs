@@ -3256,7 +3256,7 @@ fn assignment_to_a_const_throws() {
         console.log(t(()=>{ const c = 1; c ||= 2; return c }));
     "#;
     let expect = "TypeError: Assignment to constant variable.";
-    assert_eq!(run(src), vec![expect; 9].join("\n"));
+    assert_eq!(run(src), [expect; 9].join("\n"));
 }
 
 /// The flip side, and the more important half: everything that is NOT an
