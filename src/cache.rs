@@ -9,7 +9,8 @@
 //! a zero-copy rkyv archive (`Shard`), validated on load; each *inner* entry blob
 //! is a bincode-encoded `CProg` (the compiled `fusevm::Chunk`s + func/try
 //! tables), because `fusevm::Chunk` is serde-owned, not `rkyv::Archive`. The key
-//! is a 64-bit hash of the source plus a schema version, so a source or format
+//! is a 64-bit hash of the source plus a schema version, the release version and
+//! an identity for the running BINARY, so a source, format, release or codegen
 //! change misses cleanly instead of loading stale bytecode.
 
 use crate::compiler::Program;
@@ -73,6 +74,13 @@ struct Entry {
     /// a different program's bytecode (which would silently produce wrong
     /// results — far worse than a cache miss).
     verify: u64,
+    /// The [`build_id`] that wrote this entry. Every key already mixes the build
+    /// id in, so an entry from a DIFFERENT build can never be hit again — it is
+    /// dead weight from the moment the binary is rebuilt. Recording it lets
+    /// `store` drop those entries instead of accumulating one full copy of the
+    /// shard per rebuild, which matters because `load_shard` reads and
+    /// deserializes the WHOLE file on every lookup.
+    build: u64,
     blob: Vec<u8>,
 }
 
@@ -84,10 +92,46 @@ struct CProg {
     tries: Vec<TryDef>,
 }
 
+/// The release this binary was built as, hashed into every cache key so a shard
+/// written by one release can never be read by another.
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// An identity for the BINARY doing the lookup — its own mtime, read once.
+///
+/// `SCHEMA` and `BUILD_VERSION` are both bumped BY HAND, and a codegen change
+/// that forgets either ships a binary that silently replays the previous
+/// build's bytecode for every script already run once. That failure is
+/// invisible: the right answer for the old program, no error, and the symptom
+/// is "my change did not take". Measured on this crate: with the key depending
+/// on `(SCHEMA, src)` alone, lowering `**` to a deliberately wrong opcode and
+/// rebuilding still printed the OLD result for a previously-cached script,
+/// while a byte-different script printed the new (wrong) one — the binary had
+/// changed and the cache had not noticed.
+///
+/// The mtime changes on every rebuild without anyone having to remember, and is
+/// stable for an installed binary, so it costs one `stat` per process and
+/// nothing else. `0` when the path or metadata is unreadable, which degrades to
+/// the previous behavior rather than failing the run.
+fn build_id() -> u64 {
+    use std::sync::OnceLock;
+    static ID: OnceLock<u64> = OnceLock::new();
+    *ID.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(|p| p.metadata())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    })
+}
+
 /// A stable content key for a source string (fast `FxHash`, used for lookup).
 pub fn key_for(src: &str) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     SCHEMA.hash(&mut h);
+    BUILD_VERSION.hash(&mut h);
+    build_id().hash(&mut h);
     src.hash(&mut h);
     h.finish()
 }
@@ -98,6 +142,8 @@ fn verify_for(src: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     let mut h = DefaultHasher::new();
     SCHEMA.hash(&mut h);
+    BUILD_VERSION.hash(&mut h);
+    build_id().hash(&mut h);
     src.len().hash(&mut h);
     src.hash(&mut h);
     h.finish()
@@ -146,7 +192,7 @@ pub fn load(src: &str) -> Option<Program> {
     let entry = shard
         .entries
         .iter()
-        .find(|e| e.key == key && e.verify == verify)?;
+        .find(|e| e.key == key && e.verify == verify && e.build == build_id())?;
     let cp: CProg = bincode::deserialize(&entry.blob).ok()?;
     Some(Program {
         main: cp.main,
@@ -165,8 +211,96 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
         tries: prog.tries.clone(),
     };
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
+    let build = build_id();
     let mut shard = load_shard();
-    shard.entries.retain(|e| e.key != key);
-    shard.entries.push(Entry { key, verify, blob });
+    // Drop this source's previous entry AND everything written by a build that
+    // is no longer running. The latter can never be hit again (the build id is
+    // part of every key), so without this the shard grows by a full copy of
+    // itself on each rebuild and every lookup pays to deserialize the lot.
+    shard.entries.retain(|e| e.key != key && e.build == build);
+    shard.entries.push(Entry {
+        key,
+        verify,
+        build,
+        blob,
+    });
     write_shard(&shard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both cache hashes must depend on the BUILD, not on `SCHEMA` alone.
+    ///
+    /// `SCHEMA` and `BUILD_VERSION` are bumped by hand, so the codegen change
+    /// that forgets one would otherwise read the previous build's bytecode out
+    /// of the shared shard and run the wrong program with no error. This was a
+    /// real, reproduced failure: with the key depending on `(SCHEMA, src)`
+    /// alone, lowering `**` to a wrong opcode and rebuilding still printed the
+    /// OLD answer for an already-cached script.
+    ///
+    /// Each hash is recomputed here with a component left out and required to
+    /// differ, so DELETING any one of the four `hash` lines in `key_for` /
+    /// `verify_for` fails this test rather than silently restoring the bug.
+    #[test]
+    fn cache_keys_depend_on_the_build_not_just_the_schema() {
+        use std::collections::hash_map::DefaultHasher;
+        let src = "console.log(1)\n";
+
+        // key_for without the version+build id.
+        let mut bare = rustc_hash::FxHasher::default();
+        SCHEMA.hash(&mut bare);
+        src.hash(&mut bare);
+        assert_ne!(
+            key_for(src),
+            bare.finish(),
+            "key_for must hash the build identity, not just SCHEMA"
+        );
+
+        // key_for with the version but WITHOUT the per-build id: this is what
+        // the fleet's version-only design hashes, and it is what leaves two dev
+        // builds of one version sharing a shard.
+        let mut version_only = rustc_hash::FxHasher::default();
+        SCHEMA.hash(&mut version_only);
+        BUILD_VERSION.hash(&mut version_only);
+        src.hash(&mut version_only);
+        assert_ne!(
+            key_for(src),
+            version_only.finish(),
+            "key_for must hash the per-build id, so two dev builds of one \
+             version cannot share cached bytecode"
+        );
+
+        // verify_for, same two omissions.
+        let mut bare = DefaultHasher::new();
+        SCHEMA.hash(&mut bare);
+        src.len().hash(&mut bare);
+        src.hash(&mut bare);
+        assert_ne!(
+            verify_for(src),
+            bare.finish(),
+            "verify_for must hash the build identity, not just SCHEMA"
+        );
+
+        let mut version_only = DefaultHasher::new();
+        SCHEMA.hash(&mut version_only);
+        BUILD_VERSION.hash(&mut version_only);
+        src.len().hash(&mut version_only);
+        src.hash(&mut version_only);
+        assert_ne!(
+            verify_for(src),
+            version_only.finish(),
+            "verify_for must hash the per-build id"
+        );
+
+        // The version that is hashed is THIS build's, so a release bump rotates
+        // the whole shard.
+        assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
+        // A `0` build id means the stat failed and the per-build guarantee is
+        // gone; under `cargo test` the binary is always readable.
+        assert_ne!(build_id(), 0, "build_id must read the running binary");
+        // Distinct sources still land on distinct keys.
+        assert_ne!(key_for(src), key_for("console.log(2)\n"));
+    }
 }
