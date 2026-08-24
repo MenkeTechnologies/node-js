@@ -3011,3 +3011,116 @@ fn normalize_actually_normalizes() {
          RangeError"
     );
 }
+
+// ── util.inspect: maxArrayLength, typed arrays, JSON short escapes ───────────
+
+/// `util.inspect` formats at most `maxArrayLength` (100) array elements and
+/// collapses the rest into `... N more items`. The cap was missing, so a
+/// 120-element array printed all 120 — and because the grid's column width is
+/// computed from what is SHOWN, every column was also one character wider than
+/// node's. The tail is not an element: node drops it from the grid so it
+/// neither widens a column nor fills a cell, then re-appends it on its own
+/// line. Expected values from node v26.7.0.
+#[test]
+fn array_inspect_caps_at_one_hundred_items() {
+    let src = r#"
+        const a = []; for (let i = 0; i < 120; i++) a.push(i);
+        console.log(a);
+        const b = []; for (let i = 0; i < 101; i++) b.push(0);
+        console.log(b.length, String(console.log) === String(console.log));
+        const exact = []; for (let i = 0; i < 100; i++) exact.push(1);
+        console.log(String(exact.length));
+    "#;
+    let out = run(src);
+    // The grid is sized from the 100 SHOWN entries (max width 2), not from 119.
+    assert!(
+        out.contains("   0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11,"),
+        "columns must be sized to the shown entries, got:\n{out}"
+    );
+    assert!(
+        out.contains("  96, 97, 98, 99,\n  ... 20 more items\n]"),
+        "the tail belongs on its own line after the grid, got:\n{out}"
+    );
+    // Singular/plural and the exact-boundary case (no tail at exactly 100).
+    assert!(!out.contains("more item\n"), "20 items must be plural");
+}
+
+/// A typed array inspects as `Uint8Array(3) [ 1, 2, 3 ]` — constructor, length,
+/// then the elements laid out as an array's. It used to fall through to the
+/// generic object arm and print the `{ length, byteLength, byteOffset,
+/// BYTES_PER_ELEMENT }` bookkeeping instead of the contents. Expected values
+/// from node v26.7.0.
+#[test]
+fn typed_array_inspects_as_its_contents() {
+    let src = r#"
+        console.log(new Uint8Array([1,2,3]));
+        console.log(new Int32Array([1,2]));
+        console.log(new Float64Array(2));
+        console.log(new Uint8Array(0));
+        console.log([new Uint8Array([1])]);
+        console.log({t: new Uint8Array([1,2])});
+        console.log(new Uint8Array([1,2,3]).subarray(1));
+    "#;
+    assert_eq!(
+        run(src),
+        "Uint8Array(3) [ 1, 2, 3 ]\n\
+         Int32Array(2) [ 1, 2 ]\n\
+         Float64Array(2) [ 0, 0 ]\n\
+         Uint8Array(0) []\n\
+         [ Uint8Array(1) [ 1 ] ]\n\
+         { t: Uint8Array(2) [ 1, 2 ] }\n\
+         Uint8Array(2) [ 2, 3 ]"
+    );
+}
+
+/// `Object.assign` filled a plain-object target in place and matched ONLY that
+/// shape, so every other target silently copied nothing and was returned
+/// untouched — no error, just a missing property. An array target is the common
+/// case. Expected values from node v26.7.0.
+#[test]
+fn object_assign_reaches_a_non_object_target() {
+    let src = r#"
+        const a = Object.assign([1,2], {extra: 9});
+        console.log(a.extra, JSON.stringify(Object.keys(a)), a.length);
+        console.log(a);
+        const b = Object.assign([1,2], {2: 3});       // an INDEX key extends it
+        console.log(JSON.stringify(b), b.length);
+        const f = Object.assign(function(){}, {tag: 't'});
+        console.log(f.tag, typeof f);
+        console.log(JSON.stringify(Object.assign({}, {a:1}, {b:2})));  // unchanged
+        console.log(Object.assign([1,2]) === undefined);
+    "#;
+    assert_eq!(
+        run(src),
+        "9 [\"0\",\"1\",\"extra\"] 2\n\
+         [ 1, 2, extra: 9 ]\n\
+         [1,2,3] 3\n\
+         t function\n\
+         {\"a\":1,\"b\":2}\n\
+         false"
+    );
+}
+
+/// QuoteJSONString (25.5.2.2) names SIX short escapes. Backspace and form feed
+/// were missing and fell through to the `\uXXXX` arm, so `JSON.stringify("\b")`
+/// produced `"\u0008"` where node produces `"\b"`. Both parse back to the same
+/// string, so the difference is invisible to a round trip and shows up only as
+/// a byte mismatch against a fixture or checksum. Expected from node v26.7.0.
+#[test]
+fn json_stringify_uses_every_short_escape() {
+    let src = r#"
+        console.log(JSON.stringify("\b\f\n\r\t\"\\"));
+        console.log(JSON.stringify("\u0000\u0001\u001f"));   // no short form
+        console.log(JSON.stringify({ "\b": "\f" }));
+        console.log(JSON.parse(JSON.stringify("\b\f")) === "\b\f");
+        console.log(JSON.stringify("\u007f"));               // DEL is NOT escaped
+    "#;
+    assert_eq!(
+        run(src),
+        "\"\\b\\f\\n\\r\\t\\\"\\\\\"\n\
+         \"\\u0000\\u0001\\u001f\"\n\
+         {\"\\b\":\"\\f\"}\n\
+         true\n\
+         \"\u{7f}\""
+    );
+}

@@ -2889,10 +2889,22 @@ impl JsHost {
                     if indent > 2 * inspect_max_depth() {
                         return "[Array]".into();
                     }
-                    let mut inner: Vec<String> = items
+                    // `util.inspect`'s `maxArrayLength` (default 100): only the
+                    // first 100 elements are formatted, and the rest collapse to
+                    // a `... N more items` entry. Without the cap a 120-element
+                    // array printed all 120 — and, because the grid column width
+                    // is computed from what is SHOWN, every column was also one
+                    // character wider than node's.
+                    let shown = items.len().min(MAX_ARRAY_LENGTH);
+                    let mut inner: Vec<String> = items[..shown]
                         .iter()
                         .map(|x| self.inspect_lvl(x, indent + 2, st))
                         .collect();
+                    let remaining = items.len() - shown;
+                    if remaining > 0 {
+                        let unit = if remaining == 1 { "item" } else { "items" };
+                        inner.push(format!("... {remaining} more {unit}"));
+                    }
                     let has_props = !prop_keys.is_empty() || !sym_entries.is_empty();
                     for k in &prop_keys {
                         let val = self.fn_prop(v, k).unwrap_or(Value::Undef);
@@ -2912,7 +2924,41 @@ impl JsHost {
                             self.inspect_lvl(val, indent + 2, st)
                         ));
                     }
-                    self.render_array(&inner, items, indent, has_props)
+                    self.render_array(&inner, items, indent, has_props, remaining > 0, "")
+                }
+                // A typed array renders as `Uint8Array(3) [ 1, 2, 3 ]` — its
+                // constructor and length, then the elements laid out exactly as
+                // an array's. Without this it fell through to the generic object
+                // arm and printed the `{ length, byteLength, byteOffset,
+                // BYTES_PER_ELEMENT }` bookkeeping instead of the CONTENTS,
+                // which is the whole reason anyone logs one.
+                Some(JsObj::Object(props))
+                    if props.get("@@native").map(|t| self.str_of(t)).as_deref()
+                        == Some("TypedArray") =>
+                {
+                    let kind = props
+                        .get("@@kind")
+                        .map(|k| self.str_of(k))
+                        .unwrap_or_else(|| "TypedArray".into());
+                    let elems: Vec<Value> = match props.get("@@elems").and_then(|e| self.get(e)) {
+                        Some(JsObj::Array(items)) => items.clone(),
+                        _ => Vec::new(),
+                    };
+                    let base = format!("{kind}({}) ", elems.len());
+                    if indent > 2 * inspect_max_depth() {
+                        return format!("[{kind}]");
+                    }
+                    let shown = elems.len().min(MAX_ARRAY_LENGTH);
+                    let mut inner: Vec<String> = elems[..shown]
+                        .iter()
+                        .map(|x| self.inspect_lvl(x, indent + 2, st))
+                        .collect();
+                    let remaining = elems.len() - shown;
+                    if remaining > 0 {
+                        let unit = if remaining == 1 { "item" } else { "items" };
+                        inner.push(format!("... {remaining} more {unit}"));
+                    }
+                    self.render_array(&inner, &elems, indent, false, remaining > 0, &base)
                 }
                 // A `Buffer` renders as `<Buffer 01 02 03>` — hex bytes, capped
                 // at 50 with a `... N more byte(s)` tail, exactly as
@@ -3188,28 +3234,40 @@ impl JsHost {
         values: &[Value],
         indent: usize,
         has_props: bool,
+        // `output`'s last entry is the `... N more items` tail rather than a
+        // real element, so the grid must not size a column to it.
+        has_tail: bool,
+        // A constructor tag printed before the brackets, with a trailing space
+        // (`"Uint8Array(3) "`), or empty for a plain array.
+        base: &str,
     ) -> String {
         // Group array elements together if the array has more than six entries.
         // Arrays carrying extra own props (`index`/`input`/… on a match result)
         // are never grid-grouped — Node lays those out plainly.
         let entries = output.len();
         let (lines, grouped) = if entries > 6 && !has_props {
-            group_array_elements(self, output, values, indent)
+            group_array_elements(self, output, values, indent, has_tail)
         } else {
             (output.to_vec(), false)
         };
+        // A typed array prints its constructor and length ahead of the brackets
+        // (`Uint8Array(3) [ 1, 2, 3 ]`); node counts that as `base` in the
+        // break-length seed, so a long tag wraps the list one entry sooner.
+        if output.is_empty() {
+            return format!("{base}[]");
+        }
         // If no grouping happened, try to line everything up on a single line.
         if !grouped {
-            // start = output.length + indentationLvl + braces[0].len(1) + base(0) + 10
-            let start = output.len() + indent + 1 + 10;
+            // start = output.length + indentationLvl + braces[0].len(1) + base + 10
+            let start = output.len() + indent + 1 + base.chars().count() + 10;
             if is_below_break_length(output, start) {
-                return format!("[ {} ]", output.join(", "));
+                return format!("{base}[ {} ]", output.join(", "));
             }
         }
         // Otherwise: one (grouped or single) entry per line, indented by indent+2.
         let pad = " ".repeat(indent);
         let sep = format!(",\n{pad}  ");
-        format!("[\n{pad}  {}\n{pad}]", lines.join(&sep))
+        format!("{base}[\n{pad}  {}\n{pad}]", lines.join(&sep))
     }
 
     /// Render a non-empty object's already-formatted `key: value` strings with
@@ -3767,6 +3825,9 @@ fn str_to_number(s: &str) -> f64 {
 const BREAK_LENGTH: usize = 80;
 /// Node's default `compact` setting (the `compact * 4` column cap term).
 const COMPACT: usize = 3;
+/// Node's default `maxArrayLength` — how many array elements `util.inspect`
+/// formats before collapsing the rest into `... N more items`.
+const MAX_ARRAY_LENGTH: usize = 100;
 
 /// Whether `output` fits on a single line — a faithful port of Node's
 /// `isBelowBreakLength` (no colors, no `base`). `start` is the caller's seed
@@ -3797,13 +3858,17 @@ fn group_array_elements(
     output: &[String],
     values: &[Value],
     indentation_lvl: usize,
+    has_tail: bool,
 ) -> (Vec<String>, bool) {
     let separator_space = 2usize; // ", " between entries
-    let output_length = output.len();
+    // A `... N more items` tail is not an element: node drops it from the grid
+    // (`outputLength--`) so it neither widens a column nor occupies a cell, then
+    // re-appends it as its own final line.
+    let output_length = output.len() - usize::from(has_tail);
     let data_len: Vec<usize> = output.iter().map(|o| o.chars().count()).collect();
     let mut total_length = 0usize;
     let mut max_length = 0usize;
-    for &len in &data_len {
+    for &len in &data_len[..output_length] {
         total_length += len + separator_space;
         if len > max_length {
             max_length = len;
@@ -3876,6 +3941,9 @@ fn group_array_elements(
         }
         tmp.push(str_line);
         i += columns;
+    }
+    if has_tail {
+        tmp.push(output[output_length].clone());
     }
     (tmp, true)
 }

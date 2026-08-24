@@ -4533,14 +4533,29 @@ fn object_assign(args: Vec<Value>) -> Result<Value, String> {
         // — symbol-keyed ones included (7.3.25).
         let entries = host::own_enum_entries_deep(src);
         let syms = with_host(|h| h.own_symbol_entries(src));
-        with_host(|h| {
+        // A plain object target is filled in place (one borrow, then a single
+        // re-canonicalization of the integer-index keys).
+        let filled = with_host(|h| {
             if let Some(JsObj::Object(p)) = h.get_mut(&target) {
-                for (k, v) in entries.into_iter().chain(syms) {
+                for (k, v) in entries.iter().cloned().chain(syms.iter().cloned()) {
                     p.insert(k, v);
                 }
                 host::canonicalize_own_keys(p);
+                return true;
             }
+            false
         });
+        // Any OTHER target — an array being the common one — goes through the
+        // ordinary Set path. The in-place branch above matched `JsObj::Object`
+        // only, so `Object.assign([1,2], {extra:9})` silently copied NOTHING and
+        // returned the untouched array: no error, just a missing property. The
+        // Set path is what an `arr.extra = 9` assignment already used, so index
+        // and non-index keys land where they do for a direct write.
+        if !filled {
+            for (k, v) in entries.into_iter().chain(syms) {
+                set_property(&target, &k, v)?;
+            }
+        }
     }
     Ok(target)
 }
@@ -4949,6 +4964,14 @@ fn json_quote(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
+            // QuoteJSONString (25.5.2.2) names SIX short escapes, not four.
+            // Backspace and form feed were missing, so they fell through to the
+            // `\uXXXX` arm below and `JSON.stringify("\b")` produced
+            // `""` where node produces `"\b"`. Both parse back to the same
+            // string, so the difference is invisible to a round trip and shows
+            // up only as a byte mismatch against a fixture or a checksum.
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             _ => out.push(c),
         }
