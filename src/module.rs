@@ -70,7 +70,7 @@ pub fn entry_dir() -> PathBuf {
 /// Install the CJS wrapper variables the ENTRY script sees.
 ///
 /// A `require`d module already receives `exports`/`require`/`module`/`__dirname`
-/// /`__filename` as wrapper parameters (see [`compile_wrapper`]); the entry
+/// /`__filename` as wrapper parameters (see `compile_wrapper`); the entry
 /// script used to receive none of them, so `typeof module` was `"undefined"`
 /// there and every UMD header took its browser branch. Node gives the entry
 /// script the same five names, with values that DEPEND ON THE ENTRY POINT:

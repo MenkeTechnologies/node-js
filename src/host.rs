@@ -4857,7 +4857,7 @@ fn init_fields(cv: &ClassVal, inst: &Value) -> Result<(), String> {
 /// Evaluate ONE instance-field initializer thunk and install the result on
 /// `inst`.
 ///
-/// Shared by the base-class path ([`init_fields`]) and the derived-class path
+/// Shared by the base-class path (`init_fields`) and the derived-class path
 /// that runs after `super(...)`; the two used to be separate loops, and only the
 /// first canonicalized an array-index key.
 ///
