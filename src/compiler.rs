@@ -1035,10 +1035,17 @@ impl Compiler {
                 self.compile_condition(b, t)?;
                 b.emit(Op::JumpIfTrue(top), 0);
             }
-            // `for (;;)` has no test to branch on, so its back edge stays
-            // unconditional — and so, necessarily, does its JIT eligibility.
+            // `for (;;)` has no test to branch on, so the back edge is a
+            // constant-true CONDITIONAL branch rather than an unconditional
+            // `Jump`. The distinction is not cosmetic: fusevm's trace compiler
+            // only ever installs a trace closed by `JumpIfTrue`/`JumpIfFalse`
+            // and silently declines an `Op::Jump` close, so `for (;;)` stayed
+            // interpreted while the identical `while (true)` — which already
+            // emitted `LoadTrue; JumpIfTrue` — reached native code. Measured on
+            // a debug build, 3M iterations of `s += i`: 4.26s against 0.02s.
             None => {
-                b.emit(Op::Jump(top), 0);
+                b.emit(Op::LoadTrue, 0);
+                b.emit(Op::JumpIfTrue(top), 0);
             }
         }
         let ctx = self.loops.pop().unwrap();

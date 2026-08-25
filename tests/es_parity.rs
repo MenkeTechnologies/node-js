@@ -4433,3 +4433,37 @@ fn a_failed_call_names_the_callee_as_the_source_wrote_it() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+#[test]
+fn an_untested_for_keeps_its_semantics() {
+    // `for (;;)` closes with a constant-true CONDITIONAL branch so the tracing
+    // JIT can compile it. This pins that the shape change is invisible: break,
+    // continue, labeled break/continue, return, a generator, a throw out of the
+    // loop, and try/finally all behave as before.
+    let src = r##"
+        let a=0; for(;;){ a++; if(a>3) break } console.log('a',a);
+        let b=0,c=0; for(;;){ b++; if(b>5) break; if(b%2) continue; c++ } console.log(b,c);
+        outer: for(;;){ for(;;){ break outer } } console.log('lbl ok');
+        let d=0; outer2: for(;;){ d++; if(d>2) break outer2; continue outer2 } console.log('d',d);
+        function f(){ for(;;){ return 'r' } } console.log(f());
+        function* g(){ let i=0; for(;;){ yield i++; if(i>2) return 'done' } }
+        console.log([...g()]);
+        let e=0; try { for(;;){ e++; if(e>2) throw new Error('x') } } catch(err){ console.log('caught',e) }
+        let h=0; for(;;){ try { h++; if(h>2) break } finally { if(h>2) console.log('fin') } } console.log('h',h);
+        let k=0; for(;;) { k++; if (k>1) break } console.log('k',k);
+    "##;
+    let expected = [
+        "a 4",
+        "6 2",
+        "lbl ok",
+        "d 3",
+        "r",
+        "[ 0, 1, 2 ]",
+        "caught 3",
+        "fin",
+        "h 3",
+        "k 2",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}

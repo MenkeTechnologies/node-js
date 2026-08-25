@@ -88,8 +88,9 @@ source ──▶ lexer ──▶ parser ──▶ compiler ──▶ fusevm::Chu
 - **Loops are lowered rotated** — the test emitted once as an entry guard and
   once at the bottom as a *conditional* backward branch, which is the shape
   fusevm's tracing JIT needs to close a trace. `for (;;)`, having no test to
-  branch on, keeps an unconditional back edge. `node --tiers` reports which
-  loops reached native code.
+  branch on, closes with a constant-true conditional branch for the same reason:
+  the trace compiler declines an unconditional `Jump` close. `node --tiers`
+  reports which loops reached native code.
 - **Arithmetic** lowers to native fusevm ops so the JIT can trace hot loops; a
   strict **numeric hook** supplies JS coercion for the non-numeric operand cases
   (`+` string concat, `==` matrix, `ToInt32` for bitwise ops). An object operand

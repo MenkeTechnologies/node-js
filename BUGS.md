@@ -1205,8 +1205,16 @@ cause visible: the same arithmetic ran 288x faster written that way.
 
 Both are now emitted ROTATED: the test once as an entry guard, once at the
 bottom as a conditional backward branch. `continue` targets the bottom copy
-(after the update clause, for a C-style `for`). `for (;;)` has no test to branch
-on and keeps its unconditional back edge — and, necessarily, its ineligibility.
+(after the update clause, for a C-style `for`).
+
+`for (;;)` has no test to branch on, and emitting the honest unconditional
+`Jump` left it interpreted: fusevm's trace compiler only ever installs a trace
+closed by `JumpIfTrue`/`JumpIfFalse` and silently declines a `Jump` close, so
+`for (;;)` stayed in the interpreter while the identical `while (true)` — whose
+condition already lowered to `LoadTrue; JumpIfTrue` — reached native code. It
+now closes with that same constant-true conditional branch. Measured on a debug
+build, user CPU, 3M iterations of `s += i`: **4.26 s to 0.01 s**, with `--tiers`
+going from `traced=false` to `traced=true`.
 
 Evaluation order and count are unchanged: a top-test loop runs the test `n + 1`
 times for `n` iterations, and so does this. Rotation costs one copy of the

@@ -371,11 +371,15 @@ mod tests {
         );
     }
 
-    /// `for (;;)` has no test to branch on, so its back edge stays an
-    /// unconditional `Jump` and the trace compiler still declines it. Pinned so
-    /// the rotation above is not mistaken for something it does for every loop.
+    /// `for (;;)` reaches a compiled trace too. It has no test to branch on, so
+    /// its back edge is a constant-true CONDITIONAL branch (`LoadTrue;
+    /// JumpIfTrue`) rather than an unconditional `Jump`: fusevm's trace compiler
+    /// only ever installs a trace closed by `JumpIfTrue`/`JumpIfFalse` and
+    /// silently declines a `Jump` close, so emitting the honest unconditional
+    /// edge left `for (;;)` interpreted while the identical `while (true)`
+    /// reached native code. This used to assert that gap.
     #[test]
-    fn an_untested_for_keeps_its_unconditional_back_edge() {
+    fn an_untested_for_reaches_a_compiled_trace() {
         const SRC: &str =
             "function f(n) {\n  let i = 0;\n  for (;;) { i += 1; if (i >= n) break; }\n  return i;\n}\nf(200000);\n";
         let report = report(SRC).expect("runs");
@@ -384,6 +388,7 @@ mod tests {
             .iter()
             .find(|c| !c.loops.is_empty())
             .unwrap_or_else(|| panic!("a chunk with a loop: {report}"));
-        assert!(!looped.loops[0].traced, "{report}");
+        assert!(looped.loops[0].traced, "{report}");
+        assert!(report.reaches_native(), "{report}");
     }
 }
