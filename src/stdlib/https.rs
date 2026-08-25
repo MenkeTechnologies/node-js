@@ -842,7 +842,7 @@ fn dispatch_request(reqid: u64) -> Result<(), String> {
     wire.extend_from_slice(&body);
 
     std::thread::spawn(move || {
-        let result = do_client_exchange(&host, port, &servername, config, &wire);
+        let result = exchange(&host, port, &servername, config, &wire);
         match result {
             Ok(raw) => {
                 let _ = io_tx.send(Box::new(move || deliver_response(reqid, raw)));
@@ -857,7 +857,7 @@ fn dispatch_request(reqid: u64) -> Result<(), String> {
 
 /// The blocking TLS round-trip: connect, handshake, write the request, read the
 /// full response to EOF. Returns the raw response bytes.
-fn do_client_exchange(
+pub(crate) fn exchange(
     host: &str,
     port: u16,
     servername: &str,

@@ -31,6 +31,7 @@ pub mod diagnostics_channel;
 pub mod dns;
 pub mod domain;
 pub mod events;
+pub mod fetch;
 pub mod fs;
 pub mod fs_promises;
 pub mod http;
@@ -167,6 +168,8 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "Buffer" => buffer::STATIC_METHODS,
         "buffer" => buffer::MODULE_METHODS,
         "Date" => date::STATIC_METHODS,
+        "Response" => fetch::RESPONSE_STATICS,
+        "AbortSignal" => fetch::ABORT_SIGNAL_STATICS,
         n if typedarray::is_ctor(n) => typedarray::STATIC_METHODS,
         "url" => url::MODULE_METHODS,
         "net" => net::MODULE_METHODS,
@@ -272,6 +275,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "buffer" if m == "Buffer" => Ok(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into())))),
         "buffer" => buffer::module_call(m, args)?,
         "Date" => date::static_call(m, args)?,
+        "Response" | "AbortSignal" => fetch::static_call(ns, m, args)?,
         n if typedarray::is_ctor(n) => typedarray::static_call(n, m, args)?,
         "url" if m == "URL" => Ok(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
         "url" => url::call(m, args)?,
@@ -458,6 +462,7 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "StringDecoder" => Some(string_decoder::construct(args)),
         "WeakRef" => Some(typedarray::construct_weakref(args)),
         "FinalizationRegistry" => Some(typedarray::construct_finalization_registry(args)),
+        n if fetch::is_class(n) => fetch::construct(n, args),
         "TextEncoder" => Some(typedarray::construct_text_encoder()),
         "TextDecoder" => Some(typedarray::construct_text_decoder(args)),
         n if typedarray::is_ctor(n) => Some(typedarray::construct(n, args)),
@@ -661,6 +666,7 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         "FinalizationRegistry" => &["register", "unregister"],
         "MIMEType" => util::MIME_TYPE_METHODS,
         "MIMEParams" => util::MIME_PARAMS_METHODS,
+        t if fetch::is_class(t) => fetch::methods_for(t),
         t if stream_web::is_class(t) => stream_web::methods_for(t),
         _ => &[],
     };
@@ -716,6 +722,7 @@ pub fn instance_call(
         "TextEncoder" => typedarray::text_encoder_call(recv, method, &args),
         "TextDecoder" => typedarray::text_decoder_call(recv, method, &args),
         "TypedArray" => typedarray::instance_call(recv, method, &args),
+        t if fetch::is_class(t) => fetch::instance_call(t, recv, method, &args),
         "Hash" => crypto::instance_call(recv, method, &args),
         "Hmac" => crypto::hmac_instance_call(recv, method, &args),
         "Interface" => readline::instance_call(recv, method, args),

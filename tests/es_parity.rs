@@ -3749,3 +3749,212 @@ fn private_brand_check_throws_on_a_foreign_receiver() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── fetch + generic Array.prototype ──────────────────────────────────────────
+
+#[test]
+fn fetch_round_trips_a_real_http_server() {
+    // `fetch` drives the same HTTP/1.1 exchange `http.request` does, on a
+    // background thread, and settles a Promise with a fully buffered `Response`.
+    // Served by node-js's own `http.createServer` so the test needs no network.
+    let src = r##"
+        const http = require('http');
+        const srv = http.createServer((req, res) => {
+          let body = '';
+          req.on('data', c => body += c);
+          req.on('end', () => {
+            if (req.url === '/json') {
+              res.writeHead(200, {'Content-Type': 'application/json', 'X-Dup': 'a'});
+              res.end(JSON.stringify({ok: true, method: req.method, body}));
+            } else if (req.url === '/404') {
+              res.writeHead(404, {'Content-Type': 'text/plain'});
+              res.end('nope');
+            } else {
+              res.writeHead(200, {'Content-Type': 'text/plain'});
+              res.end('hello ' + req.method);
+            }
+          });
+        });
+        srv.listen(0, async () => {
+          const port = srv.address().port;
+          const base = 'http://127.0.0.1:' + port;
+          const r1 = await fetch(base + '/');
+          console.log(r1.status, r1.ok, r1.statusText, await r1.text());
+          const r2 = await fetch(base + '/json');
+          console.log(r2.status, r2.headers.get('content-type'), JSON.stringify(await r2.json()));
+          const r3 = await fetch(base + '/404');
+          console.log(r3.status, r3.ok, await r3.text());
+          const r4 = await fetch(base + '/json', {method: 'POST', body: 'abc', headers: {'X-A': '1'}});
+          console.log(JSON.stringify(await r4.json()));
+          const r5 = await fetch(base + '/');
+          const buf = await r5.arrayBuffer();
+          console.log(buf.byteLength);
+          const r6 = await fetch(base + '/');
+          console.log(Array.from(await r6.bytes()).slice(0,5).join(','));
+          console.log(typeof r1.headers.get('nope'), r1.headers.has('content-type'));
+          srv.close();
+        });
+    "##;
+    let expected = [
+        "200 true OK hello GET",
+        "200 application/json {\"ok\":true,\"method\":\"GET\",\"body\":\"\"}",
+        "404 false nope",
+        "{\"ok\":true,\"method\":\"POST\",\"body\":\"abc\"}",
+        "9",
+        "104,101,108,108,111",
+        "object true",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn fetch_classes_match_the_whatwg_shapes() {
+    // `Headers` (case-insensitive, combined values, sorted iteration),
+    // `Response`/`Request` bodies, `Blob`, `FormData` and `AbortController`.
+    let src = r##"
+        (async () => {
+        const h = new Headers({'Content-Type': 'text/plain', 'X-A': '1'});
+        h.append('x-a', '2');
+        console.log(h.get('content-type'), h.get('X-A'), h.has('x-b'), h.get('x-b'));
+        h.set('x-a', '3'); console.log(h.get('x-a'));
+        h.delete('x-a'); console.log(h.has('x-a'));
+        console.log([...new Headers([['b','2'],['a','1']]).entries()]);
+        const r = new Response('hi', {status: 201, statusText: 'Created', headers: {'X-T':'v'}});
+        console.log(r.status, r.ok, r.statusText, r.headers.get('x-t'), await r.text());
+        const rj = Response.json({a:1});
+        console.log(rj.status, rj.headers.get('content-type'), await rj.text());
+        const req = new Request('http://x/y', {method:'post', headers:{'a':'b'}, body:'q'});
+        console.log(req.url, req.method, req.headers.get('a'), await req.text());
+        const b = new Blob(['ab', 'cd'], {type: 'text/plain'});
+        console.log(b.size, b.type, await b.text(), await b.slice(1,3).text());
+        const fd = new FormData();
+        fd.append('a','1'); fd.append('a','2'); fd.set('b','3');
+        console.log(fd.get('a'), fd.getAll('a'), fd.has('b'), [...fd.entries()]);
+        const ac = new AbortController();
+        console.log(ac.signal.aborted);
+        ac.signal.addEventListener('abort', () => console.log('aborted!'));
+        ac.abort();
+        console.log(ac.signal.aborted, ac.signal.reason.name);
+        try { ac.signal.throwIfAborted() } catch (e) { console.log('threw', e.name) }
+        const s = AbortSignal.abort('why');
+        console.log(s.aborted, s.reason);
+        console.log(typeof AbortSignal.timeout(5));
+        })();
+    "##;
+    let expected = [
+        "text/plain 1, 2 false null",
+        "3",
+        "false",
+        "[ [ 'a', '1' ], [ 'b', '2' ] ]",
+        "201 true Created v hi",
+        "200 application/json {\"a\":1}",
+        "http://x/y POST b q",
+        "4 text/plain abcd bc",
+        "1 [ '1', '2' ] true [ [ 'a', '1' ], [ 'a', '2' ], [ 'b', '3' ] ]",
+        "false",
+        "aborted!",
+        "true AbortError",
+        "threw AbortError",
+        "true why",
+        "object",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn fetch_failures_are_typeerror_with_a_cause() {
+    // Every transport failure is `TypeError: fetch failed` with the detail on
+    // `.cause`; an aborted signal rejects with the DOMException-shaped
+    // `AbortError` reason.
+    let src = r##"
+        const ac = new AbortController(); ac.abort();
+        const r = ac.signal.reason;
+        console.log(r.name, r.message, r instanceof Error, String(r));
+        (async () => {
+          try { await fetch('http://127.0.0.1:1/x') } catch (e) { console.log(e.constructor.name, e.message, typeof e.cause) }
+          try { await fetch('nope://x') } catch (e) { console.log(e.constructor.name, e.message) }
+          const c2 = new AbortController(); c2.abort();
+          try { await fetch('http://127.0.0.1:1/x', {signal: c2.signal}) } catch (e) { console.log(e.name, e.message) }
+        })();
+    "##;
+    let expected = [
+        "AbortError This operation was aborted true AbortError: This operation was aborted",
+        "TypeError fetch failed object",
+        "TypeError fetch failed",
+        "AbortError This operation was aborted",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn array_prototype_methods_are_generic_over_this() {
+    // 23.1.3: every `Array.prototype` method is defined over
+    // `LengthOfArrayLike(O)` and `Get(O, k)`, so it runs on an array-LIKE —
+    // which is what makes `Array.prototype.slice.call(arguments)` work. A
+    // missing index is a hole, a string receiver is dense, and a mutating method
+    // writes back.
+    let src = r##"
+        function f(){ return Array.prototype.slice.call(arguments) }
+        console.log(f(1,2,3));
+        const al = {0:'a', 2:'c', length:3};
+        console.log(Array.prototype.map.call(al, (x,i,o)=>[x,i,o===al]));
+        console.log(Array.prototype.forEach.call(al, (x,i)=>console.log('e',i,x)));
+        console.log(Object.keys(Array.prototype.slice.call(al)));
+        const m = {0:3,1:1,2:2,length:3};
+        console.log(Array.prototype.sort.call(m), m);
+        const pu = {length:0};
+        Array.prototype.push.call(pu, 'x', 'y'); console.log(pu.length, pu[0], pu[1]);
+        console.log(Array.prototype.reduce.call({0:1,1:2,length:2}, (a,b)=>a+b));
+        console.log(Array.prototype.concat.call([1], 2));
+        console.log(Array.prototype.join.call('abc', '-'));
+        console.log(Array.prototype.filter.call(al, ()=>true));
+        const arr2=[1,2,3]; console.log(arr2.slice.call([9,8], 1));
+        console.log([].map.call('abc', c=>c.toUpperCase()));
+        try { ({}).slice() } catch(e) { console.log(e.constructor.name) }
+        console.log(Array.prototype.indexOf.call({0:'z',length:1}, 'z'));
+    "##;
+    let expected = [
+        "[ 1, 2, 3 ]",
+        "[ [ 'a', 0, true ], <1 empty item>, [ 'c', 2, true ] ]",
+        "e 0 a",
+        "e 2 c",
+        "undefined",
+        "[ '0', '2' ]",
+        "{ '0': 1, '1': 2, '2': 3, length: 3 } { '0': 1, '1': 2, '2': 3, length: 3 }",
+        "2 x y",
+        "3",
+        "[ 1, 2 ]",
+        "a-b-c",
+        "[ 'a', 'c' ]",
+        "[ 8 ]",
+        "[ 'A', 'B', 'C' ]",
+        "TypeError",
+        "0",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn define_property_on_an_array_index_writes_the_element() {
+    // `Object.defineProperty(arr, i, {value})` wrote into a property map an
+    // Array does not have, so it was a silent no-op; defining past the end grows
+    // the array with holes.
+    let src = r##"
+        const a=[1,2,3];
+        Object.defineProperty(a, 1, {value: 9, writable:true, enumerable:true, configurable:true});
+        console.log(a, a.length);
+        const b=[1,2,3];
+        Object.defineProperty(b, 5, {value: 7, writable:true, enumerable:true, configurable:true});
+        console.log(b, b.length, Object.keys(b));
+    "##;
+    let expected = [
+        "[ 1, 9, 3 ] 3",
+        "[ 1, 2, 3, <2 empty items>, 7 ] 6 [ '0', '1', '2', '5' ]",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}

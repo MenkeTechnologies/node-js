@@ -1779,7 +1779,7 @@ impl JsHost {
         let mut out: Vec<String> = Vec::new();
         // The first index not yet accounted for by an entry.
         let mut index = 0usize;
-        for i in 0..items.len() {
+        for (i, it) in items.iter().enumerate() {
             if out.len() >= MAX_ARRAY_LENGTH {
                 break;
             }
@@ -1793,7 +1793,7 @@ impl JsHost {
                     break;
                 }
             }
-            out.push(self.inspect_lvl(&items[i], indent + 2, st));
+            out.push(self.inspect_lvl(it, indent + 2, st));
             index = i + 1;
         }
         let remaining = items.len() - index;
@@ -4931,7 +4931,26 @@ pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result
         }
         Some(JsObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args),
         Some(JsObj::Func(fv)) => run_user_func(&fv, args, this),
-        Some(JsObj::BoundMethod { recv, name }) => call_method(&recv, &name, args),
+        // A method read off an object is modelled as a thunk BOUND to it, but an
+        // explicit `.call`/`.apply` receiver still wins — `Function.prototype.call`
+        // rebinds `this`, and every `Array.prototype` method is generic over it, so
+        // `[].slice.call(arrayLike)` must run against the ARGUMENT. Dropping the
+        // override made that read back as the empty array the thunk was read off.
+        // A nullish override is ignored: it carries no receiver to dispatch on.
+        Some(JsObj::BoundMethod { recv, name }) => {
+            let target = match &this {
+                Some(t) if !matches!(t, Value::Undef) && !with_host(|h| h.is_null(t)) => t,
+                _ => &recv,
+            };
+            // A thunk read off an ARRAY carries an `Array.prototype` method, and
+            // those are generic over `this` — route the rebound call through
+            // `proto_method` so an array-LIKE receiver takes the generic path
+            // instead of being told the method does not exist.
+            if with_host(|h| h.kind_of(&recv)) == Some(ObjKind::Array) {
+                return crate::builtins::proto_method(target, &format!("Array:{name}"), args);
+            }
+            call_method(target, &name, args)
+        }
         Some(JsObj::BoundFunc {
             target,
             this: bthis,

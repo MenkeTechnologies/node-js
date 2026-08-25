@@ -1567,6 +1567,14 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
             _ => {}
         }
     }
+    // `Array.prototype.<m>.call(arrayLike)` — every `Array.prototype` method is
+    // GENERIC over `this` (23.1.3: each starts with `ToObject(this)` and
+    // `LengthOfArrayLike`), which is what makes
+    // `Array.prototype.slice.call(arguments)` the idiom it is. The receiver here
+    // is not an Array, so `call_method` would report the method missing.
+    if ctor == "Array" && with_host(|h| h.kind_of(recv)) != Some(ObjKind::Array) {
+        return array_generic(recv, method, args);
+    }
     // The general form of the two special cases above: a thunk taken off a native
     // constructor's real prototype, invoked with a receiver that IS an instance of
     // that constructor. Routing back through `call_method` would re-resolve this
@@ -3065,6 +3073,16 @@ const GLOBAL_FUNCS: &[&str] = &[
     "FinalizationRegistry",
     "TextEncoder",
     "TextDecoder",
+    // WHATWG Fetch globals (see `stdlib::fetch`).
+    "fetch",
+    "Headers",
+    "Request",
+    "Response",
+    "Blob",
+    "File",
+    "FormData",
+    "AbortController",
+    "AbortSignal",
     "queueMicrotask",
     "setTimeout",
     "setInterval",
@@ -3185,6 +3203,11 @@ const NS_METHODS: &[&str] = &[
     "Promise.any",
     "Promise.withResolvers",
     "Map.groupBy",
+    "Response.json",
+    "Response.error",
+    "Response.redirect",
+    "AbortSignal.abort",
+    "AbortSignal.timeout",
     "process.nextTick",
     "Error.captureStackTrace",
     "require.resolve",
@@ -3698,6 +3721,13 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "JSON.stringify" => json_stringify(args),
         "JSON.parse" => json_parse(args),
         "structuredClone" => Ok(deep_clone(&arg0(&args))),
+        "fetch" => crate::stdlib::fetch::fetch(&args),
+        // An `AbortSignal.timeout` deadline reached its macrotask: the thunk's
+        // suffix is the signal's heap index.
+        _ if name.starts_with("@@aborttimeout:") => {
+            let idx: u32 = name["@@aborttimeout:".len()..].parse().unwrap_or(0);
+            crate::stdlib::fetch::fire_timeout_abort(idx)
+        }
         "queueMicrotask" | "process.nextTick" => {
             let cb = arg0(&args);
             let rest = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
@@ -5770,6 +5800,86 @@ fn array_len(recv: &Value) -> usize {
 }
 
 fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    array_method_on(recv, recv, name, args)
+}
+
+/// The `Array.prototype` methods that WRITE to their receiver, and so need the
+/// generic path to copy the result back onto the array-like.
+const ARRAY_MUTATORS: &[&str] = &[
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "splice",
+    "sort",
+    "reverse",
+    "fill",
+    "copyWithin",
+];
+
+/// Run `Array.prototype.<method>` against an array-LIKE (`{0: 'a', length: 1}`,
+/// a DOM-ish collection, `arguments`).
+///
+/// 23.1.3 defines every one of these over `LengthOfArrayLike(O)` and `Get(O, k)`
+/// rather than over an Array's element vector, so the receiver only has to have
+/// a `length`. The elements are read out into a temporary Array, the ordinary
+/// implementation runs on that, and a MUTATING method writes the result back —
+/// which keeps one implementation of each method rather than a second, generic
+/// one that could drift from it.
+///
+/// An index the receiver does not own is a HOLE in the temporary, so the
+/// methods that skip holes skip it here too, exactly as `HasProperty` makes them.
+fn array_generic(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    let len = match get_property(recv, "length") {
+        Ok(v) => host::to_array_length(&v).unwrap_or(0),
+        Err(_) => 0,
+    };
+    // A STRING receiver owns every index of its length; `has_property` answers
+    // for objects and reports none of them, which made `[].map.call('abc', f)`
+    // an array of three holes.
+    let dense = with_host(|h| h.as_str(recv)).is_some();
+    let mut items = Vec::with_capacity(len);
+    let mut holes: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    for i in 0..len {
+        let k = i.to_string();
+        if dense || has_property(recv, &k)? {
+            items.push(get_property(recv, &k)?);
+        } else {
+            holes.insert(i);
+            items.push(Value::Undef);
+        }
+    }
+    let tmp = with_host(|h| {
+        let a = h.new_array(items);
+        h.install_holes(&a, holes);
+        a
+    });
+    let out = array_method_on(&tmp, recv, method, args)?;
+    if ARRAY_MUTATORS.contains(&method) {
+        let result = with_host(|h| match h.get(&tmp) {
+            Some(JsObj::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        });
+        for (i, v) in result.iter().enumerate() {
+            set_property(recv, &i.to_string(), v.clone())?;
+        }
+        set_property(recv, "length", Value::Float(result.len() as f64))?;
+    }
+    Ok(out)
+}
+
+/// `Array.prototype.<name>` on `recv`.
+///
+/// `this_value` is what a callback receives as its third argument and what a
+/// mutating method returns — the same object as `recv` for an ordinary array
+/// call, but the ORIGINAL array-like when `array_generic` runs a method against
+/// a temporary copy (`Array.prototype.slice.call(arguments)`).
+fn array_method_on(
+    recv: &Value,
+    this_value: &Value,
+    name: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match name {
         "push" => {
             // `push` returns the new length; take it from the same mutable
@@ -5942,7 +6052,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 h.remap_holes(recv, |i| Some(len - 1 - i));
             });
-            Ok(recv.clone())
+            Ok(this_value.clone())
         }
         "fill" => {
             // fill(value[, start[, end]]) — negative indices count from the end.
@@ -5969,7 +6079,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 // Every filled position now holds a real value.
                 h.remap_holes(recv, |i| (i < start || i >= end).then_some(i));
             });
-            Ok(recv.clone())
+            Ok(this_value.clone())
         }
         "copyWithin" => {
             // copyWithin(target, start[, end]) — copy a slice within the array.
@@ -6015,7 +6125,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 h.install_holes(recv, holes);
             });
-            Ok(recv.clone())
+            Ok(this_value.clone())
         }
         "at" => {
             let items = array_items(recv);
@@ -6044,7 +6154,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 out.push(host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?);
             }
@@ -6065,7 +6175,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 let r = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
                 match with_host(|h| h.get(&r).cloned()) {
@@ -6086,7 +6196,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 let keep = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
                 if with_host(|h| h.truthy(&keep)) {
@@ -6105,7 +6215,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
             }
@@ -6117,7 +6227,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             for (i, it) in items.iter().enumerate() {
                 let m = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
                 if with_host(|h| h.truthy(&m)) {
@@ -6132,7 +6242,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             for (i, it) in items.iter().enumerate() {
                 let m = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
                 if with_host(|h| h.truthy(&m)) {
@@ -6151,7 +6261,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 let m = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
                 if with_host(|h| h.truthy(&m)) {
@@ -6170,7 +6280,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 let m = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
                 if !with_host(|h| h.truthy(&m)) {
@@ -6208,7 +6318,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 acc = host::invoke(
                     &cb,
-                    vec![acc, it.clone(), Value::Float(i as f64), recv.clone()],
+                    vec![acc, it.clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
             }
@@ -6243,7 +6353,12 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 acc = host::invoke(
                     &cb,
-                    vec![acc, items[i].clone(), Value::Float(i as f64), recv.clone()],
+                    vec![
+                        acc,
+                        items[i].clone(),
+                        Value::Float(i as f64),
+                        this_value.clone(),
+                    ],
                     None,
                 )?;
             }
@@ -6255,7 +6370,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             for i in (0..items.len()).rev() {
                 let m = host::invoke(
                     &cb,
-                    vec![items[i].clone(), Value::Float(i as f64), recv.clone()],
+                    vec![items[i].clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
                 if with_host(|h| h.truthy(&m)) {
@@ -6270,7 +6385,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             for i in (0..items.len()).rev() {
                 let m = host::invoke(
                     &cb,
-                    vec![items[i].clone(), Value::Float(i as f64), recv.clone()],
+                    vec![items[i].clone(), Value::Float(i as f64), this_value.clone()],
                     None,
                 )?;
                 if with_host(|h| h.truthy(&m)) {
@@ -6300,7 +6415,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
                 h.install_holes(recv, (present..all.len()).collect());
             });
-            Ok(recv.clone())
+            Ok(this_value.clone())
         }
         // ES2023 change-by-copy: sort a fresh copy, leaving the receiver untouched.
         "toSorted" => {
@@ -8101,6 +8216,30 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
             Some(JsObj::Func(_)) | Some(JsObj::Class(_))
         ) {
             with_host(|h| h.set_fn_prop(obj, key, v));
+        } else if let (Some(ObjKind::Array), Ok(i)) =
+            (with_host(|h| h.kind_of(obj)), key.parse::<usize>())
+        {
+            // An array's index keys ARE its elements, and defining one past the
+            // end grows the array with holes in between (10.4.2.1). This whole
+            // branch used to be missing: `Object.defineProperty(arr, 1, {value})`
+            // wrote into the ordinary property map an array does not have, so it
+            // was a silent no-op.
+            with_host(|h| {
+                let old = match h.get(obj) {
+                    Some(JsObj::Array(items)) => items.len(),
+                    _ => 0,
+                };
+                if let Some(JsObj::Array(items)) = h.get_mut(obj) {
+                    if i >= old {
+                        items.resize(i + 1, Value::Undef);
+                    }
+                    items[i] = v;
+                }
+                if i > old {
+                    h.mark_hole_range(obj, old..i);
+                }
+                h.clear_hole(obj, i);
+            });
         } else {
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get_mut(obj) {
@@ -8286,7 +8425,7 @@ fn has_property_ordinary(obj: &Value, key: &str) -> bool {
 /// object clone to two properties pointing at the same clone, and a cycle clones
 /// to a cycle instead of recursing forever. `seen` maps each source heap index
 /// to its clone, which is what buys both.
-fn deep_clone(v: &Value) -> Value {
+pub(crate) fn deep_clone(v: &Value) -> Value {
     deep_clone_seen(v, &mut std::collections::HashMap::new())
 }
 

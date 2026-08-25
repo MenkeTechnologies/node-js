@@ -1088,7 +1088,7 @@ fn dispatch_request(reqid: u64) -> Result<(), String> {
     let mut wire = request_bytes.into_bytes();
     wire.extend_from_slice(&body);
 
-    std::thread::spawn(move || match do_client_exchange(&host, port, &wire) {
+    std::thread::spawn(move || match exchange(&host, port, &wire) {
         Ok(raw) => {
             let _ = io_tx.send(Box::new(move || deliver_response(reqid, raw)));
         }
@@ -1100,7 +1100,7 @@ fn dispatch_request(reqid: u64) -> Result<(), String> {
 }
 
 /// The blocking TCP round-trip: connect, write the request, read to EOF.
-fn do_client_exchange(host: &str, port: u16, request: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn exchange(host: &str, port: u16, request: &[u8]) -> Result<Vec<u8>, String> {
     let mut stream = TcpStream::connect((host, port))
         .map_err(|e| format!("Error: connect ECONNREFUSED {host}:{port}: {e}"))?;
     stream
@@ -1135,7 +1135,7 @@ fn deliver_response(reqid: u64, raw: Vec<u8>) -> Result<(), String> {
     let _ = with_host(|h| h.io_sender()).send(Box::new(|| Ok(())));
     let Some(entry) = entry else { return Ok(()) };
 
-    let (status, message, http_version, headers, body) = parse_response(&raw);
+    let (status, message, http_version, headers, body) = parse_raw_response(&raw);
 
     let headers_obj = with_host(|h| {
         let mut m = IndexMap::new();
@@ -1186,7 +1186,9 @@ fn deliver_error(reqid: u64, msg: String) -> Result<(), String> {
 
 /// Parse a raw HTTP/1.1 response into `(status, message, version, headers, body)`.
 /// Handles `Transfer-Encoding: chunked` and plain (Content-Length / to-EOF) bodies.
-fn parse_response(raw: &[u8]) -> (u16, String, String, Vec<(String, String)>, Vec<u8>) {
+pub(crate) fn parse_raw_response(
+    raw: &[u8],
+) -> (u16, String, String, Vec<(String, String)>, Vec<u8>) {
     let head_end = find_subslice(raw, b"\r\n\r\n").unwrap_or(raw.len());
     let head = String::from_utf8_lossy(&raw[..head_end]);
     let body_start = (head_end + 4).min(raw.len());

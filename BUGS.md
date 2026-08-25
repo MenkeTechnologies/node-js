@@ -93,34 +93,34 @@ timers, promises or sockets, so `executionAsyncId()` inside a `setTimeout`/
 `.then` callback reports the root context (1), not a per-callback id, and
 `createHook` callbacks still never fire.
 
-## Array HOLES are stored as `undefined`
+## Array holes: what is and is not modelled
 
-An array is a `Vec<Value>` with no representation for an ELIDED element, so a
-hole (`[1,,3]`, `new Array(5)`, a `delete arr[i]`, an index written past the
-end) becomes a stored `undefined`. The two are distinguishable in JS, and every
-place that distinguishes them diverges. Measured against node v26.7.0:
+An ELIDED array element (`[1,,3]`, `new Array(5)`, `delete arr[i]`, an index
+written past the end, a `length` grow) is tracked as a real hole, not as a
+stored `undefined`. The marker is deliberately NOT a `Value` variant: a sentinel
+would have to be mapped back to `undefined` at every element read, and one
+missed read would leak an un-nameable value into user code. Instead the elision
+set is a side table on the host keyed by heap index (`JsHost::array_holes`), and
+the element vector still holds an ordinary `Value::Undef` at a hole — so there
+is no sentinel that CAN leak, and a code path that has not been taught about
+holes degrades to the plain `undefined` reading rather than to something
+unrepresentable.
 
-| expression | node v26.7.0 | node-js |
-| --- | --- | --- |
-| `console.log([1,,3])` | `[ 1, <1 empty item>, 3 ]` | `[ 1, undefined, 3 ]` |
-| `console.log(new Array(5))` | `[ <5 empty items> ]` | five `undefined`s |
-| `1 in [1,,3]` | `false` | `true` |
-| `Object.keys([1,,3])` | `[ '0', '2' ]` | `[ '0', '1', '2' ]` |
-| `[1,,3].forEach(f)` | skips index 1 | calls `f(undefined, 1)` |
-| `[1,,3].filter(()=>true).length` | `2` | `3` |
+Modelled and verified against node v26.7.0: `in`, `Object.keys`/`values`/
+`entries`/`assign`/`getOwnPropertyNames`/`getOwnPropertyDescriptor`,
+`hasOwnProperty`, `propertyIsEnumerable`, `for…in`, object spread, `length`
+after a `delete`, `structuredClone`, the `<N empty items>` `util.inspect`
+rendering at every nesting depth, the `HasProperty`-spec'd iteration methods
+that SKIP a hole (`forEach`/`map`/`filter`/`some`/`every`/`reduce`/
+`reduceRight`/`flat`/`flatMap`/`indexOf`/`lastIndexOf`/`sort`) versus the
+`Get`-spec'd ones that see the `undefined` it reads back as (`for…of`, spread,
+`join`, `includes`, `find`, `Array.from`, `entries`), and hole tracking through
+`push`/`pop`/`shift`/`unshift`/`reverse`/`fill`/`copyWithin`/`splice`/`slice`/
+`concat`/`map` and the change-by-copy methods.
 
-What already AGREES, because it does not depend on the distinction: `.length`
-(3 either way), `JSON.stringify([1,,3])` (`[1,null,3]` — a hole and an
-`undefined` both serialize to `null`), `[...[1,,3]]` and `for…of` (both yield
-`undefined` for a hole per the spec), and `.map`, whose result node also reports
-as holed but which stringifies identically.
-
-Closing this needs a distinct in-heap sentinel for a hole plus a
-hole-to-`undefined` mapping at every element READ, and a skip in the iteration
-methods that skip holes. That is a wide change across the array surface, and a
-site that misses the mapping leaks the sentinel into user code — a worse failure
-than the current one, which is at least a consistent `undefined`. Left
-unimplemented deliberately rather than half-done.
+An array-LIKE receiver taken through `Array.prototype.<m>.call` is holed by the
+same rule: an index the object does not own is an elided element of the
+temporary the generic path builds (see `array_generic` in `src/builtins.rs`).
 
 ## Promise resolution, async iteration and unhandled rejections
 
