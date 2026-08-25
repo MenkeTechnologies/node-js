@@ -143,6 +143,10 @@ pub struct Compiler {
     /// makes here is `PutValue` on an unresolvable reference: strict code throws
     /// `ReferenceError` where sloppy code creates a global.
     strict: bool,
+    /// Callee SOURCE TEXT per call op of the chunk being emitted, handed to the
+    /// host when the chunk is built so a failed call can name the callee the way
+    /// the source wrote it. Saved and restored around every nested chunk.
+    call_sites: Vec<(usize, String)>,
     /// Locals of the chunk being emitted that live in fusevm frame slots rather
     /// than the host's scope chain — see [`crate::slots`]. Empty for a chunk the
     /// analysis refused, so `slot_of` answering `None` is the old path.
@@ -168,7 +172,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     c.hoist_funcs(&mut b, stmts)?;
     c.compile_stmts(&mut b, stmts)?;
     Ok(Program {
-        main: b.build(),
+        main: c.finish_chunk(b),
         functions: c.functions,
         tries: c.tries,
     })
@@ -195,7 +199,7 @@ pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String
         }
     }
     Ok(Program {
-        main: b.build(),
+        main: c.finish_chunk(b),
         functions: c.functions,
         tries: c.tries,
     })
@@ -218,6 +222,74 @@ fn has_use_strict(stmts: &[Stmt]) -> bool {
         }
     }
     false
+}
+
+/// The callee's source text, re-printed from its AST the way V8's `CallPrinter`
+/// does for the `TypeError` a failed call raises: `o.a.b`, `o[k]`, `"s".x`,
+/// `3.x`, `o?.a?.zz`. A string-literal computed access normalizes to dot form
+/// (`o['a']` prints `o.a`), which is what node reports.
+///
+/// `None` for any shape this does not print faithfully — the caller then keeps
+/// the bare method name it already used, so an unprinted shape is never given
+/// invented text.
+fn callee_text(e: &Expr) -> Option<String> {
+    Some(match e {
+        Expr::Ident(n) => n.clone(),
+        Expr::This => "this".into(),
+        Expr::Number(n) => crate::host::fmt_number(*n),
+        Expr::Str(s) => format!("\"{s}\""),
+        Expr::True => "true".into(),
+        Expr::False => "false".into(),
+        Expr::Null => "null".into(),
+        Expr::Undefined => "undefined".into(),
+        Expr::Array(items) if items.is_empty() => "[]".into(),
+        Expr::Object(props) if props.is_empty() => "{}".into(),
+        Expr::Member {
+            object,
+            property,
+            optional,
+        } => {
+            let dot = if *optional { "?." } else { "." };
+            format!("{}{dot}{property}", callee_text(object)?)
+        }
+        Expr::Index {
+            object,
+            index,
+            optional,
+        } => {
+            let obj = callee_text(object)?;
+            // A string-literal key that is a plain identifier prints as a dot
+            // access, exactly as node reports it.
+            if let Expr::Str(k) = &**index {
+                if is_identifier(k) {
+                    let dot = if *optional { "?." } else { "." };
+                    return Some(format!("{obj}{dot}{k}"));
+                }
+            }
+            let idx = callee_text(index)?;
+            let open = if *optional { "?.[" } else { "[" };
+            format!("{obj}{open}{idx}]")
+        }
+        // V8 prints a call in a callee position as `f(...)`, whatever its
+        // arguments were: `require('fs').nope()` reports `require(...).nope`.
+        Expr::Call { func, .. } => format!("{}(...)", callee_text(func)?),
+        Expr::Sequence(items) => {
+            let parts: Option<Vec<String>> = items.iter().map(callee_text).collect();
+            format!("({})", parts?.join(" , "))
+        }
+        _ => return None,
+    })
+}
+
+/// Whether `s` can be written after a `.` — the test that decides whether a
+/// string-literal computed access prints in dot form.
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 fn argc(n: usize) -> Result<u8, String> {
@@ -1288,6 +1360,7 @@ impl Compiler {
         let signals = std::mem::take(&mut self.chunk_signals);
         let depth = std::mem::take(&mut self.scope_depth);
         let iters = std::mem::take(&mut self.iter_depth);
+        let sites = std::mem::take(&mut self.call_sites);
         let r = (|| {
             self.hoist_funcs(&mut cb, stmts)?;
             self.compile_stmts(&mut cb, stmts)
@@ -1300,7 +1373,9 @@ impl Compiler {
         // loop in THIS chunk, so the flag propagates outward.
         self.chunk_signals |= signals;
         r?;
-        Ok(cb.build())
+        let chunk = self.finish_chunk(cb);
+        self.call_sites = sites;
+        Ok(chunk)
     }
 
     // ── functions ────────────────────────────────────────────────────────
@@ -1349,6 +1424,9 @@ impl Compiler {
         // ADDED by a body's own directive prologue — never dropped.
         let saved_strict = self.strict;
         self.strict = self.strict || has_use_strict(body);
+        // The body is a chunk of its own, so its call sites are keyed to ITS
+        // `op_hash`; the enclosing chunk's pending ones must not be swept in.
+        let saved_sites = std::mem::take(&mut self.call_sites);
         let r = (|| {
             // Function-body function hoisting.
             self.hoist_funcs(&mut fb, &prologue)?;
@@ -1368,13 +1446,14 @@ impl Compiler {
         let def = FuncDef {
             name: name.to_string(),
             params: param_slots,
-            chunk: fb.build(),
+            chunk: self.finish_chunk(fb),
             is_arrow: false,
             is_generator,
             is_async,
             is_method: false,
             self_name: false,
         };
+        self.call_sites = saved_sites;
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
     }
@@ -2580,6 +2659,25 @@ impl Compiler {
     /// Close every iterator this chunk has parked, with a value already on top
     /// of the stack that must survive: the iterators sit UNDER it, so each one
     /// is swapped up, closed, and its result dropped.
+    /// Build the chunk being emitted and hand the host its call-site table. Every
+    /// chunk goes through here so a site is registered exactly once, under the
+    /// `op_hash` `build()` computes.
+    fn finish_chunk(&mut self, b: ChunkBuilder) -> Chunk {
+        let sites = std::mem::take(&mut self.call_sites);
+        let chunk = b.build();
+        crate::host::register_call_sites(chunk.op_hash, sites);
+        chunk
+    }
+
+    /// Record the callee's source text for the call op just emitted at `at`, so
+    /// a `TypeError` raised there can name the callee the way V8 does. Nothing
+    /// is recorded for a shape `callee_text` declines to print.
+    fn note_call_site(&mut self, at: usize, callee: &Expr) {
+        if let Some(text) = callee_text(callee) {
+            self.call_sites.push((at, text));
+        }
+    }
+
     fn emit_close_iters_under_value(&self, b: &mut ChunkBuilder) {
         for _ in 0..self.iter_depth {
             b.emit(Op::Swap, 0); // [.., iter, val] -> [.., val, iter]
@@ -2844,7 +2942,8 @@ impl Compiler {
                     for a in args {
                         self.compile_expr(b, a)?;
                     }
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
+                    let at = b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
+                    self.note_call_site(at, func);
                 }
                 if let Some(j) = jshort {
                     let end = b.current_pos();
@@ -2878,7 +2977,8 @@ impl Compiler {
                     for a in args {
                         self.compile_expr(b, a)?;
                     }
-                    b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
+                    let at = b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
+                    self.note_call_site(at, func);
                 }
                 if let Some(j) = jshort {
                     let end = b.current_pos();
@@ -2901,7 +3001,8 @@ impl Compiler {
                     for a in args {
                         self.compile_expr(b, a)?;
                     }
-                    b.emit(Op::CallBuiltin(ops::CALL, argc(1 + args.len())?), 0);
+                    let at = b.emit(Op::CallBuiltin(ops::CALL, argc(1 + args.len())?), 0);
+                    self.note_call_site(at, func);
                 }
             }
             _ => {
@@ -2913,7 +3014,8 @@ impl Compiler {
                     for a in args {
                         self.compile_expr(b, a)?;
                     }
-                    b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
+                    let at = b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
+                    self.note_call_site(at, func);
                 }
             }
         }
@@ -2948,7 +3050,8 @@ impl Compiler {
         for a in args {
             self.compile_expr(b, a)?;
         }
-        b.emit(Op::CallBuiltin(ops::NEW, argc(1 + args.len())?), 0);
+        let at = b.emit(Op::CallBuiltin(ops::NEW, argc(1 + args.len())?), 0);
+        self.note_call_site(at, callee);
         Ok(())
     }
 }

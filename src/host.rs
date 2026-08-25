@@ -108,6 +108,86 @@ pub mod ops {
     pub const SETLOCAL_STRICT: u16 = 73; // [name, value] -> value; like SETLOCAL but an UNRESOLVABLE name throws ReferenceError instead of creating a global (strict-mode PutValue)
 }
 
+/// Per-call-site callee SOURCE TEXT, for the `TypeError` a failed call raises.
+///
+/// V8 reports the callee the way the source wrote it — `z.f is not a function`,
+/// not `f is not a function` — by re-printing the AST of the call it was
+/// evaluating. The text is therefore a static property of the SITE, so the
+/// compiler records it once per call op and nothing is carried at run time: the
+/// table is consulted only on the error path.
+///
+/// Keyed by the chunk's `op_hash` (which `ChunkBuilder::build` computes anyway)
+/// paired with the op index. `op_hash` covers the op vector but not the name
+/// pool, so two chunks that compile to the same ops with different names share a
+/// key; the consequence is confined to which receiver text an error message
+/// names, never to what a program does.
+mod call_sites {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SITES: RefCell<rustc_hash::FxHashMap<(u64, usize), String>> =
+            RefCell::new(rustc_hash::FxHashMap::default());
+    }
+
+    /// Record every call site of a freshly built chunk.
+    pub fn register(op_hash: u64, sites: Vec<(usize, String)>) {
+        if sites.is_empty() {
+            return;
+        }
+        SITES.with(|m| {
+            let mut m = m.borrow_mut();
+            for (ip, text) in sites {
+                m.insert((op_hash, ip), text);
+            }
+        });
+    }
+
+    /// The callee text recorded for the op at `ip` of the chunk `op_hash`.
+    pub fn text(op_hash: u64, ip: usize) -> Option<String> {
+        SITES.with(|m| m.borrow().get(&(op_hash, ip)).cloned())
+    }
+
+    pub fn clear() {
+        SITES.with(|m| m.borrow_mut().clear());
+    }
+}
+
+pub use call_sites::{clear as clear_call_sites, register as register_call_sites};
+
+/// Rewrite a `<subject> is not a function` / `is not a constructor` message with
+/// the SOURCE TEXT of the callee at the currently executing op, as V8 does.
+///
+/// `subject` is what the raising code named — the method name, or the callee's
+/// rendered value. The message's own subject must END WITH it, which is the
+/// guard that keeps an unrelated error raised deeper inside a native method from
+/// being relabelled with this call's text. (A native dispatcher may prefix its
+/// own receiver word, e.g. `map.get is not a function`, so the whole subject is
+/// replaced rather than trimmed by length.)
+///
+/// Returns the message unchanged when no site was recorded, so a shape the
+/// printer declines to print keeps the old wording rather than an invented one.
+pub fn name_call_site(vm: &fusevm::VM, subject: &str, msg: String) -> String {
+    for tail in [" is not a function", " is not a constructor"] {
+        let Some(head) = msg.strip_suffix(tail) else {
+            continue;
+        };
+        // The prefix is the error class (`TypeError: `); the rest is the subject.
+        let (prefix, found) = match head.rfind(": ") {
+            Some(i) => (&head[..i + 2], &head[i + 2..]),
+            None => ("", head),
+        };
+        if !found.ends_with(subject) {
+            return msg;
+        }
+        // `vm.ip` has already advanced past the op being executed.
+        let Some(text) = call_sites::text(vm.chunk.op_hash, vm.ip.saturating_sub(1)) else {
+            return msg;
+        };
+        return format!("{prefix}{text}{tail}");
+    }
+    msg
+}
+
 /// `SIG_UNWIND` scope tags: what the emitting site is nested in.
 pub mod unwind {
     /// No enclosing loop in this chunk — any pending signal propagates outward.

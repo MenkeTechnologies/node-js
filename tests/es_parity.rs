@@ -4384,3 +4384,52 @@ fn an_abrupt_return_closes_every_open_for_of_iterator() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── callee text in a failed call's TypeError ─────────────────────────────────
+
+#[test]
+fn a_failed_call_names_the_callee_as_the_source_wrote_it() {
+    // V8 reports the callee by re-printing its AST — `z.f is not a function`,
+    // not `f is not a function` — so the text is a static property of the call
+    // SITE and the compiler records it once per call op. A string-literal
+    // computed key normalizes to dot form (`o['a']` prints `o.a`), a call in a
+    // callee position prints as `f(...)`, and optional chaining is kept.
+    let src = r##"
+        const o={a:{b:{}}}, k='f', z={};
+        const t=(f)=>{try{f()}catch(e){console.log(e.message)}};
+        t(()=>z.f());
+        t(()=>o.a.b.c());
+        t(()=>o[k]());
+        t(()=>o['a']['zz']());
+        t(()=>o.a.b['x']());
+        t(()=>({}).x());
+        t(()=>[].x());
+        t(()=>"s".x());
+        t(()=>(3).x());
+        t(()=>Math.nope());
+        t(()=>JSON.nope());
+        t(()=>o?.a?.zz());
+        t(()=>{const q=1; q()});
+        t(()=>{let f; f()});
+        const arr=[1]; t(()=>arr.nope());
+    "##;
+    let expected = [
+        "z.f is not a function",
+        "o.a.b.c is not a function",
+        "o[k] is not a function",
+        "o.a.zz is not a function",
+        "o.a.b.x is not a function",
+        "{}.x is not a function",
+        "[].x is not a function",
+        "\"s\".x is not a function",
+        "3.x is not a function",
+        "Math.nope is not a function",
+        "JSON.nope is not a function",
+        "o?.a?.zz is not a function",
+        "q is not a function",
+        "f is not a function",
+        "arr.nope is not a function",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}

@@ -2884,6 +2884,15 @@ fn b_call(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_n(vm, argc as usize);
     let name = sval(&args.remove(0));
     let r = host::call_named(&name, args);
+    // A bare name that resolved to a non-callable reports the VALUE
+    // (`undefined is not a function`); node names the identifier. Resolving it
+    // again to learn what the message said costs nothing off the error path.
+    let r = r.map_err(|e| {
+        let shown = global_binding(&name)
+            .map(|v| with_host(|h| h.str_of(&v)))
+            .unwrap_or_default();
+        host::name_call_site(vm, &shown, e)
+    });
     finish(vm, r)
 }
 
@@ -2892,6 +2901,10 @@ fn b_call_method(vm: &mut VM, argc: u8) -> Value {
     let recv = args.remove(0);
     let name = sval(&args.remove(0));
     let r = host::call_method(&recv, &name, args);
+    // `z.f()` on a missing method is `z.f is not a function` in node, not
+    // `f is not a function`: V8 names the callee as the source wrote it. The
+    // text was recorded for this op at compile time.
+    let r = r.map_err(|e| host::name_call_site(vm, &name, e));
     finish(vm, r)
 }
 
@@ -2899,6 +2912,13 @@ fn b_call_value(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_n(vm, argc as usize);
     let callable = args.remove(0);
     let r = host::invoke(&callable, args, None);
+    // The callee here is an expression, not a name, so the message it produced
+    // describes the VALUE (`undefined is not a function`); node names the
+    // expression. Same site table, keyed on that rendering.
+    let r = r.map_err(|e| {
+        let shown = with_host(|h| h.str_of(&callable));
+        host::name_call_site(vm, &shown, e)
+    });
     finish(vm, r)
 }
 
@@ -2906,6 +2926,12 @@ fn b_new(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_n(vm, argc as usize);
     let ctor = args.remove(0);
     let r = host::construct(&ctor, args);
+    // `new (o.a.b.c)()` on a non-constructor names the expression, as a failed
+    // call does.
+    let r = r.map_err(|e| {
+        let shown = with_host(|h| h.str_of(&ctor));
+        host::name_call_site(vm, &shown, e)
+    });
     finish(vm, r)
 }
 
