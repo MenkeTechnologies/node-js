@@ -137,6 +137,12 @@ pub struct Compiler {
     /// `break`/`continue` that leaves such a loop must close and drop its iterator,
     /// otherwise the enclosing loop's `FORITER` would peek at the wrong one.
     iter_depth: usize,
+    /// Whether the code being emitted is in STRICT mode — a `'use strict'`
+    /// directive prologue on the program or an enclosing function body, or a
+    /// class body (which is strict unconditionally). The only difference it
+    /// makes here is `PutValue` on an unresolvable reference: strict code throws
+    /// `ReferenceError` where sloppy code creates a global.
+    strict: bool,
     /// Locals of the chunk being emitted that live in fusevm frame slots rather
     /// than the host's scope chain — see [`crate::slots`]. Empty for a chunk the
     /// analysis refused, so `slot_of` answering `None` is the old path.
@@ -154,6 +160,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
         } else {
             crate::slots::plan(&[], stmts, true)
         },
+        strict: has_use_strict(stmts),
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
@@ -173,6 +180,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
 pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     let mut c = Compiler {
         debug,
+        strict: has_use_strict(stmts),
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
@@ -191,6 +199,25 @@ pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String
         functions: c.functions,
         tries: c.tries,
     })
+}
+
+/// Does this statement list open with a `"use strict"` directive prologue?
+///
+/// A directive prologue is the run of leading statements that are nothing but a
+/// string literal, so `"use strict"` counts only while every statement before it
+/// is also one.
+fn has_use_strict(stmts: &[Stmt]) -> bool {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Expr(e) => match e {
+                Expr::Str(v) if v == "use strict" => return true,
+                Expr::Str(_) => continue,
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn argc(n: usize) -> Result<u8, String> {
@@ -558,7 +585,14 @@ impl Compiler {
                 }
                 self.name_const(b, n);
                 b.emit(Op::Swap, 0);
-                b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
+                // `PutValue` (6.2.5.6) on an unresolvable reference: strict code
+                // throws `ReferenceError`, sloppy code creates a global.
+                let op = if self.strict {
+                    ops::SETLOCAL_STRICT
+                } else {
+                    ops::SETLOCAL
+                };
+                b.emit(Op::CallBuiltin(op, 2), 0);
                 b.emit(Op::Pop, 0);
             }
             Expr::Member {
@@ -1272,6 +1306,10 @@ impl Compiler {
         let saved_depth = std::mem::take(&mut self.scope_depth);
         let saved_iters = std::mem::take(&mut self.iter_depth);
         let saved_agen = std::mem::replace(&mut self.in_async_generator, is_generator && is_async);
+        // Strictness is inherited by every nested function and can only be
+        // ADDED by a body's own directive prologue — never dropped.
+        let saved_strict = self.strict;
+        self.strict = self.strict || has_use_strict(body);
         let r = (|| {
             // Function-body function hoisting.
             self.hoist_funcs(&mut fb, &prologue)?;
@@ -1285,6 +1323,7 @@ impl Compiler {
         self.scope_depth = saved_depth;
         self.iter_depth = saved_iters;
         self.in_async_generator = saved_agen;
+        self.strict = saved_strict;
         self.slots = saved_slot_table;
         r?;
         let def = FuncDef {
@@ -1322,6 +1361,24 @@ impl Compiler {
     /// stack: `MKCLASS` (name, parent, ctor) then `DEF_MEMBER`/`DEF_FIELD` for
     /// each member (each keeps the class on the stack).
     fn compile_class(&mut self, b: &mut ChunkBuilder, node: &ClassNode) -> Result<(), String> {
+        // A class body is strict code unconditionally (10.2.4), directive or not.
+        let saved_strict = std::mem::replace(&mut self.strict, true);
+        let r = self.compile_class_body(b, node);
+        self.strict = saved_strict;
+        r
+    }
+
+    /// `#name` when this member's key is a literal private name, else `None`. A
+    /// private name is never computed, so a computed key is never one.
+    fn private_key(m: &ClassMember) -> Option<String> {
+        match &m.key {
+            Expr::Str(s) if !m.computed && s.starts_with('#') => Some(s.clone()),
+            Expr::Ident(s) if !m.computed && s.starts_with('#') => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    fn compile_class_body(&mut self, b: &mut ChunkBuilder, node: &ClassNode) -> Result<(), String> {
         let cname = node.name.clone().unwrap_or_default();
         // Push name, parent (or undefined), constructor (or undefined).
         self.name_const(b, &cname);
@@ -1382,6 +1439,24 @@ impl Compiler {
         for m in ordered {
             match m.kind {
                 MemberKind::Constructor => {}
+                // A PRIVATE static field declares a private element, so it
+                // cannot be an ordinary write: `C.#s = 5` through `SETATTR`
+                // trips the brand check that exists to reject exactly that write
+                // on an object that has not declared `#s`. `DEF_MEMBER` installs
+                // it directly, which is what a declaration is.
+                MemberKind::Field if m.is_static && Self::private_key(m).is_some() => {
+                    let key = Self::private_key(m).expect("guarded above");
+                    self.name_const(b, &key); // [class, name]
+                    b.emit(Op::LoadInt(member::STATIC_FIELD), 0);
+                    b.emit(Op::LoadTrue, 0); // is_static
+                    match &m.field_init {
+                        Some(e) => self.emit_keyed_value(b, &m.key, e, false, member::METHOD)?,
+                        None => {
+                            b.emit(Op::LoadUndef, 0);
+                        }
+                    }
+                    b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0); // -> [class]
+                }
                 MemberKind::Field if m.is_static => {
                     // A static field is evaluated once at class-definition time and
                     // set as an own property of the constructor: `[class]` stays on

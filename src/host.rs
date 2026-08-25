@@ -105,6 +105,7 @@ pub mod ops {
     pub const POW: u16 = 70; // [a, b] -> JS `a ** b` (NOT native `Op::Pow`: IEEE pow answers 1 for `(-1) ** Infinity` and `1 ** NaN`)
     pub const DECLARE_CONST: u16 = 71; // [name, value] -> value; like DECLARE but the binding is IMMUTABLE (`const`)
     pub const MARK_HOLE: u16 = 72; // [arr, index] -> arr; record an ELIDED array-literal element
+    pub const SETLOCAL_STRICT: u16 = 73; // [name, value] -> value; like SETLOCAL but an UNRESOLVABLE name throws ReferenceError instead of creating a global (strict-mode PutValue)
 }
 
 /// `SIG_UNWIND` scope tags: what the emitting site is nested in.
@@ -124,6 +125,12 @@ pub mod member {
     pub const METHOD: i64 = 0;
     pub const GET: i64 = 1;
     pub const SET: i64 = 2;
+    /// A static FIELD (`static x = 1`), which is a data property of the
+    /// constructor rather than a method. Only distinguished from `METHOD` for a
+    /// PRIVATE name, where the declaration must install the private element
+    /// without tripping the brand check an ordinary write to `#x` gets — and
+    /// where node's brand-check message words a field differently from a method.
+    pub const STATIC_FIELD: i64 = 3;
 }
 
 /// Bitwise/shift op tags carried by `ops::BINOP` (JS ToInt32/ToUint32 rules).
@@ -646,6 +653,13 @@ pub struct JsHost {
     /// Heap objects sealed against new properties by `Object.preventExtensions`,
     /// `Object.seal` or `Object.freeze`.
     non_extensible: HashSet<u32>,
+    /// Private names (`#m`) declared as a METHOD or accessor rather than as a
+    /// field, for the brand-check error text: node distinguishes `Receiver must
+    /// be an instance of class C` (a private method or accessor) from `Cannot
+    /// read private member #x …` (a private field). Which class is answered by
+    /// the running method's home class, not by this set, so two classes
+    /// declaring the same private method name stay exact.
+    private_methods: HashSet<String>,
     /// The ELIDED element positions of each array, by heap index. Absent (the
     /// overwhelmingly common case) means the array is dense.
     ///
@@ -931,6 +945,7 @@ impl JsHost {
             accessors: HashMap::new(),
             prop_attrs: HashMap::new(),
             non_extensible: HashSet::new(),
+            private_methods: HashSet::new(),
             array_holes: HashMap::new(),
             builtin_statics: HashMap::new(),
             object_proto: Value::Undef,
@@ -1579,6 +1594,46 @@ impl JsHost {
         self.alloc(JsObj::Array(items))
     }
 
+    /// Record that `name` was declared as a private method or accessor.
+    pub fn note_private_method(&mut self, name: &str) {
+        self.private_methods.insert(name.to_string());
+    }
+
+    /// Whether `name` was declared as a private method/accessor by some class,
+    /// as opposed to a private field.
+    pub fn is_private_method(&self, name: &str) -> bool {
+        self.private_methods.contains(name)
+    }
+
+    /// The name of the class whose body the running function belongs to. Only a
+    /// method of that class can even mention its private names, so this is the
+    /// class a failed brand check must name.
+    pub fn current_home_class_name(&self) -> Option<String> {
+        match self.get(&self.current_home_class()?) {
+            Some(JsObj::Class(c)) => Some(c.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether `recv` — or anything on its prototype chain — carries the private
+    /// name `key`. A private FIELD is an own property of the instance; a private
+    /// METHOD lives on the class prototype, one link up.
+    pub fn has_private(&self, recv: &Value, key: &str) -> bool {
+        let mut cur = Some(recv.clone());
+        while let Some(v) = cur {
+            let owns = match self.get(&v) {
+                Some(JsObj::Object(p)) => p.contains_key(key),
+                Some(JsObj::Class(c)) => c.statics.contains_key(key),
+                _ => false,
+            };
+            if owns || self.own_accessor(&v, key).is_some() || self.fn_prop(&v, key).is_some() {
+                return true;
+            }
+            cur = self.proto_of(&v);
+        }
+        false
+    }
+
     // ── array holes ──────────────────────────────────────────────────────
     //
     // Every read/write of an array's elision set goes through this block. See
@@ -1854,6 +1909,20 @@ impl JsHost {
     }
     pub fn read_global(&self, name: &str) -> Option<Value> {
         self.globals.get(name).cloned()
+    }
+
+    /// Whether `name` is bound anywhere on the scope chain or in the globals —
+    /// `read_name(..).is_some()` without cloning the value it finds. The
+    /// strict-mode assignment path asks this and nothing else.
+    pub fn has_name(&self, name: &str) -> bool {
+        let mut env = Some(self.cur_env());
+        while let Some(e) = env {
+            if e.borrow().vars.contains_key(name) {
+                return true;
+            }
+            env = e.borrow().parent.clone();
+        }
+        self.globals.contains_key(name)
     }
 
     /// Assign to an existing binding up the scope chain, else create a global
@@ -4626,6 +4695,12 @@ pub fn call_named(name: &str, args: Vec<Value>) -> Result<Value, String> {
 
 /// `recv.name(args)`.
 pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // `this.#m(…)` is a `[[PrivateGet]]` followed by a call, so the brand check
+    // comes first: an unbranded receiver throws here rather than reporting the
+    // method missing. Only a `#`-prefixed name pays the extra probe.
+    if name.starts_with('#') && !with_host(|h| h.has_private(recv, name)) {
+        return Err(crate::builtins::private_brand_message(name, false));
+    }
     // `proxy.m(…)` is 13.3.6 `EvaluateCall`: `Get(proxy, "m")` — through the
     // `get` trap — then a call with the PROXY as `this`. The `lookup_*` shortcuts
     // below all read a property map a proxy does not have.
@@ -5400,6 +5475,12 @@ pub fn define_member(class_val: &Value, name: &str, kind: i64, is_static: bool, 
             Some(JsObj::Class(c)) => c.name.clone(),
             _ => String::new(),
         };
+        // A private method/accessor: remember which class declared it, so a
+        // brand-check failure can name the class the way node does. A static
+        // FIELD is data, not a method, so it keeps the field wording.
+        if name.starts_with('#') && kind != member::STATIC_FIELD {
+            h.note_private_method(name);
+        }
         // Give the method its home class for `super.x()`.
         if let Some(JsObj::Func(f)) = h.get_mut(&func) {
             f.home_class = Some(cname);
@@ -5418,6 +5499,15 @@ pub fn define_member(class_val: &Value, name: &str, kind: i64, is_static: bool, 
             member::GET => h.set_accessor(&target, name, Some(func), None),
             member::SET => h.set_accessor(&target, name, None, Some(func)),
             _ => {
+                // A static field is enumerable (`Object.keys(C)` lists it) unlike
+                // a method, so it must not reach the `hide_prop` below.
+                if kind == member::STATIC_FIELD {
+                    if let Some(JsObj::Class(c)) = h.get_mut(class_val) {
+                        c.statics.insert(name.to_string(), func.clone());
+                    }
+                    h.set_fn_prop(class_val, name, func);
+                    return;
+                }
                 if is_static {
                     if let Some(JsObj::Class(c)) = h.get_mut(class_val) {
                         c.statics.insert(name.to_string(), func.clone());

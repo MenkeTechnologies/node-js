@@ -11,6 +11,7 @@ use indexmap::IndexMap;
 pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETLOCAL, b_getlocal);
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
+    vm.register_builtin(ops::SETLOCAL_STRICT, b_setlocal_strict);
     vm.register_builtin(ops::DECLARE, b_declare);
     vm.register_builtin(ops::DECLARE_CONST, b_declare_const);
     vm.register_builtin(ops::MARK_HOLE, b_mark_hole);
@@ -508,15 +509,70 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     }
 }
 
+/// The three global VALUE properties that are `{writable: false}` (19.1.1-19.1.3).
+/// Assigning to one is a silent no-op in sloppy code and a `TypeError` in strict
+/// code — and, either way, never rebinds the name.
+const READONLY_GLOBALS: [&str; 3] = ["undefined", "NaN", "Infinity"];
+
+fn readonly_global_error(name: &str) -> String {
+    host::type_error(&format!(
+        "Cannot assign to read only property '{name}' of object '#<Object>'"
+    ))
+}
+
 fn b_setlocal(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = sname(&vm.pop());
+    // Sloppy assignment to a non-writable global is DISCARDED, not applied:
+    // `undefined = 1` used to rebind the name and make every later `undefined`
+    // read back as `1`.
+    if READONLY_GLOBALS.contains(&name.as_str()) && !with_host(|h| h.has_name(&name)) {
+        return val;
+    }
     // An assignment to a `const` binding throws (8.5.2 SetMutableBinding on an
     // immutable binding). This used to succeed silently.
     if !with_host(|h| h.set_name(&name, val.clone())) {
         return abort(vm, host::type_error("Assignment to constant variable."));
     }
     val
+}
+
+/// Strict-mode `x = v` (6.2.5.6 `PutValue` with an unresolvable reference):
+/// where sloppy code silently creates a global, strict code throws
+/// `ReferenceError: x is not defined`.
+///
+/// A separate opcode rather than a runtime flag: strictness is a static property
+/// of the code, so the compiler already knows which of the two an assignment is
+/// and sloppy code — everything in a CommonJS module without the directive —
+/// keeps the exact instruction it had.
+fn b_setlocal_strict(vm: &mut VM, _: u8) -> Value {
+    let val = vm.pop();
+    let name = sname(&vm.pop());
+    if !binding_exists(&name) {
+        return abort(vm, host::ref_error(&name));
+    }
+    if READONLY_GLOBALS.contains(&name.as_str()) && !with_host(|h| h.has_name(&name)) {
+        return abort(vm, readonly_global_error(&name));
+    }
+    if !with_host(|h| h.set_name(&name, val.clone())) {
+        return abort(vm, host::type_error("Assignment to constant variable."));
+    }
+    val
+}
+
+/// Whether `name` resolves to anything — a scope binding, a global, or a lazily
+/// materialised builtin namespace. `global_binding` answers the same question
+/// but ALLOCATES the namespace object to do it, which an assignment then throws
+/// away.
+fn binding_exists(name: &str) -> bool {
+    if with_host(|h| h.has_name(name)) {
+        return true;
+    }
+    matches!(
+        name,
+        "undefined" | "NaN" | "Infinity" | "globalThis" | "global"
+    ) || is_namespace(name)
+        || is_known_builtin(name)
 }
 
 fn b_declare(vm: &mut VM, _: u8) -> Value {
@@ -623,7 +679,29 @@ pub(crate) fn proxy_proto_link(recv: &Value, name: &str) -> Option<Value> {
 }
 
 pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
+    // A `#`-prefixed key is a PRIVATE name. `[[PrivateGet]]` (7.3.31) throws
+    // when the receiver carries no such private element — it does NOT read back
+    // as `undefined`, which is what `C.prototype.method.call({})` used to do.
+    if name.starts_with('#') && !with_host(|h| h.has_private(recv, name)) {
+        return Err(private_brand_message(name, false));
+    }
     get_property_recv(recv, name, recv)
+}
+
+/// The `TypeError` a failed private brand check raises. Node words it two ways:
+/// a private METHOD or accessor names the class the receiver should have been an
+/// instance of, while a private FIELD names the member.
+pub fn private_brand_message(name: &str, writing: bool) -> String {
+    if with_host(|h| h.is_private_method(name)) {
+        if let Some(class) = with_host(|h| h.current_home_class_name()) {
+            return host::type_error(&format!("Receiver must be an instance of class {class}"));
+        }
+    }
+    let verb = if writing { "write" } else { "read" };
+    let prep = if writing { "to" } else { "from" };
+    host::type_error(&format!(
+        "Cannot {verb} private member {name} {prep} an object whose class did not declare it"
+    ))
 }
 
 /// `[[Get]](name, receiver)` — 10.1.8. `receiver` is the object the read STARTED
@@ -1696,6 +1774,12 @@ pub fn set_property_pub(recv: &Value, name: &str, val: Value) -> Result<(), Stri
 }
 
 fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
+    // `[[PrivateSet]]` (7.3.32) refuses a receiver that carries no such private
+    // element. The class's own field initializers install theirs directly
+    // (`host::init_one_field`), so a declaration never reaches this check.
+    if name.starts_with('#') && !with_host(|h| h.has_private(recv, name)) {
+        return Err(private_brand_message(name, true));
+    }
     // `[[Set]]` on a Proxy: the handler's `set` trap, or a forward to the target.
     if crate::proxy::set(recv, name, &val, recv)? {
         return Ok(());

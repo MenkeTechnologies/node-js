@@ -3660,3 +3660,92 @@ fn array_holes_render_as_empty_items() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── strict mode + private brand checks ───────────────────────────────────────
+
+#[test]
+fn strict_mode_assignment_to_an_undeclared_name_throws() {
+    // 6.2.5.6 PutValue on an UNRESOLVABLE reference: strict code throws
+    // ReferenceError where sloppy code creates a global. Strictness comes from a
+    // directive prologue and is inherited by every nested function; a class body
+    // is strict unconditionally.
+    let src = r##"
+        // sloppy at top level: implicit global still works
+        sloppy = 1; console.log(sloppy, globalThis.sloppy);
+        function f(){ 'use strict'; try { nope1 = 1 } catch(e){ console.log(e.constructor.name, e.message) } }
+        f();
+        function g(){ inner = 2; return inner } console.log(g());
+        class C { m(){ try { nope2 = 1 } catch(e){ return e.constructor.name + ' ' + e.message } } }
+        console.log(new C().m());
+        (function(){ 'use strict'; function h(){ try { nope3 = 1 } catch(e){ console.log(e.constructor.name) } } h(); })();
+        (function(){ 'use strict'; console = console; let x; x = 5; console.log('ok', x); })();
+        (function(){ 'use strict'; try { undefined = 1 } catch(e) { console.log('undef:', e.constructor.name) } })();
+        (function(){ 'use strict'; globalThis.made = 3; made = 4; console.log('made', made); })();
+        console.log(typeof (function(){ 'use strict'; return this })());
+    "##;
+    let expected = [
+        "1 1",
+        "ReferenceError nope1 is not defined",
+        "2",
+        "ReferenceError nope2 is not defined",
+        "ReferenceError",
+        "ok 5",
+        "undef: TypeError",
+        "made 4",
+        "undefined",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn readonly_globals_reject_assignment() {
+    // `undefined`/`NaN`/`Infinity` are non-writable global properties, so a
+    // sloppy assignment is DISCARDED rather than rebinding the name.
+    let src = r##"
+        undefined=1; console.log(undefined); NaN=2; console.log(NaN); Infinity=3; console.log(Infinity);
+    "##;
+    let expected = ["undefined", "NaN", "Infinity"].join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn private_brand_check_throws_on_a_foreign_receiver() {
+    // A private element read/written/called on an object whose class never
+    // declared it is a TypeError, not `undefined`. A private METHOD names the
+    // class (from the running method's home class, so two classes sharing a
+    // private name stay exact); a private FIELD names the member.
+    let src = r##"
+        class A { #v=1; static #sf=9; #pm(){return 2} get #g(){return 3} set #g(x){this.#gv=x} #gv=0;
+          read(){return [this.#v, this.#pm(), this.#g]} write(x){this.#g=x; return this.#gv}
+          static rs(){return A.#sf} static ws(v){A.#sf=v; return A.#sf} }
+        const a=new A();
+        console.log(a.read(), a.write(4), A.rs(), A.ws(11));
+        console.log(Object.keys(a), Object.getOwnPropertyNames(a), JSON.stringify(a));
+        console.log(Object.keys(A), Object.getOwnPropertyNames(A).filter(n=>!['length','name','prototype'].includes(n)));
+        class B extends A { #b=1; useb(){return this.#b} }
+        console.log(new B().useb(), new B().read());
+        const t=(f)=>{try{f()}catch(e){console.log(e.constructor.name+": "+e.message)}};
+        t(()=>A.prototype.read.call({}));
+        t(()=>A.prototype.write.call({},1));
+        t(()=>A.rs.call(null));
+        class D { #dup(){return 1} u(){return this.#dup()} }
+        class E { #dup(){return 2} u(){return this.#dup()} }
+        console.log(new D().u(), new E().u());
+        t(()=>D.prototype.u.call({}));
+        console.log(a instanceof A);
+    "##;
+    let expected = [
+        "[ 1, 2, 3 ] 4 9 11",
+        "[] [] {}",
+        "[] [ 'rs', 'ws' ]",
+        "1 [ 1, 2, 3 ]",
+        "TypeError: Cannot read private member #v from an object whose class did not declare it",
+        "TypeError: Receiver must be an instance of class A",
+        "1 2",
+        "TypeError: Receiver must be an instance of class D",
+        "true",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
