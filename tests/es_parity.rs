@@ -4114,3 +4114,273 @@ fn module_path_memoization_does_not_change_what_resolves() {
         .join("\n")
     );
 }
+
+// ── accessors, class statics, iterator closing, and the ES sweep ─────────────
+
+#[test]
+fn own_accessors_enumerate_and_render_where_declared() {
+    // An own accessor takes its slot in insertion order among the data
+    // properties (an object literal reserves it at compile time, so `{ get
+    // g(){}, d: 2 }` enumerates `g, d`), and `util.inspect` shows it as
+    // `[Getter]`/`[Setter]`/`[Getter/Setter]` rather than omitting it.
+    let src = r##"
+        console.log(Object.getOwnPropertyDescriptors({get g(){return 1}, d:2}));
+        const o = {a:1, get b(){return 2}, c:3, set b(v){}, get e(){return 5}};
+        console.log(Object.keys(o), JSON.stringify(o), o.b, o.e);
+        const k='cc';
+        const o2 = {x:1, get [k](){return 9}, y:2};
+        console.log(Object.keys(o2), o2.cc);
+        const o3 = {get a(){return 1}, set a(v){this._v=v}};
+        console.log(Object.keys(o3), Object.getOwnPropertyDescriptor(o3,'a').get !== undefined, Object.getOwnPropertyDescriptor(o3,'a').set !== undefined);
+        console.log({get z(){return 1}});
+        console.log(Object.entries({get p(){return 7}, q:8}));
+        console.log({...{get w(){return 3}, v:4}});
+    "##;
+    let expected = [
+        "{",
+        "  g: {",
+        "    get: [Function: get g],",
+        "    set: undefined,",
+        "    enumerable: true,",
+        "    configurable: true",
+        "  },",
+        "  d: { value: 2, writable: true, enumerable: true, configurable: true }",
+        "}",
+        "[ 'a', 'b', 'c', 'e' ] {\"a\":1,\"b\":2,\"c\":3,\"e\":5} 2 5",
+        "[ 'x', 'cc', 'y' ] 9",
+        "[ 'a' ] true true",
+        "{ z: [Getter] }",
+        "[ [ 'p', 7 ], [ 'q', 8 ] ]",
+        "{ w: 3, v: 4 }",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn non_enumerable_and_inherited_accessors_stay_hidden() {
+    // Only an own ENUMERABLE accessor renders; a non-enumerable one and a class
+    // prototype's getter do not.
+    let src = r##"
+        const o = {}; Object.defineProperty(o,'ng',{get(){return 1}});
+        console.log(o, Object.keys(o));
+        Object.defineProperty(o,'eg',{get(){return 1}, enumerable:true});
+        console.log(o);
+        class C { get p(){return 1} }
+        console.log(new C(), Object.keys(new C()));
+        const inst = new C(); Object.defineProperty(inst,'own',{get(){return 2},enumerable:true});
+        console.log(inst);
+        console.log({a:{get b(){return 1}}});
+        console.log([{get c(){return 1}}]);
+        console.log(JSON.stringify({get j(){return 5}, k:6}));
+        console.log(Object.assign({}, {get m(){return 7}}));
+        const s=Symbol('sy'); const o4={[s]:1, get n(){return 2}}; console.log(o4);
+        console.log(util_check());
+        function util_check(){ return require('util').inspect({get q(){return 1}}) }
+    "##;
+    let expected = [
+        "{} []",
+        "{ eg: [Getter] }",
+        "C {} []",
+        "C { own: [Getter] }",
+        "{ a: { b: [Getter] } }",
+        "[ { c: [Getter] } ]",
+        "{\"j\":5,\"k\":6}",
+        "{ m: 7 }",
+        "{ n: [Getter], Symbol(sy): 1 }",
+        "{ q: [Getter] }",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn class_statics_enumerate_in_class_evaluation_order() {
+    // ClassDefinitionEvaluation installs methods and accessors while evaluating
+    // the body and only then runs the static-field initializers, so
+    // `getOwnPropertyNames` lists a static getter before a static field declared
+    // ahead of it.
+    let src = r##"
+        class A { static s = 2; static get sv(){return 1} static m(){} }
+        console.log(Object.getOwnPropertyNames(A).filter(n=>!['length','name','prototype'].includes(n)));
+        const o = {}; Object.defineProperty(o,'g',{get(){return 1},enumerable:true,configurable:true}); o.d = 2;
+        console.log(Object.keys(o), Object.getOwnPropertyNames(o));
+        const o2 = {}; o2.d = 1; Object.defineProperty(o2,'g',{get(){return 1},enumerable:true,configurable:true}); o2.e = 3;
+        console.log(Object.keys(o2));
+        class B { static get g(){return 1} static f = 2 }
+        console.log(Object.getOwnPropertyNames(B).filter(n=>!['length','name','prototype'].includes(n)));
+    "##;
+    let expected = [
+        "[ 'sv', 'm', 's' ]",
+        "[ 'g', 'd' ] [ 'g', 'd' ]",
+        "[ 'd', 'g', 'e' ]",
+        "[ 'g', 'f' ]",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn generators_descriptors_weak_collections_and_error_cause() {
+    // yield* delegation, async generators and `for await`, try/finally
+    // overriding a return, labeled break, tagged templates and String.raw, error
+    // `cause`, property descriptors, and Map/Set semantics — a weak collection
+    // never shows its contents and `-0` is stored as `+0`.
+    let src = r##"
+        function* inner(){ yield 1; yield 2; return 'ir' }
+        function* outer(){ const r = yield* inner(); console.log('got', r); yield 3 }
+        const g = outer();
+        console.log(g.next(), g.next(), g.next(), g.next());
+        function* g4(){ try { yield 1 } catch(e) { yield 'c:'+e.message } }
+        const i4 = g4(); i4.next(); console.log(i4.throw(new Error('x')));
+        async function* ag(){ yield 1; yield await Promise.resolve(2); yield 3 }
+        (async () => {
+          const out = []; for await (const v of ag()) out.push(v); console.log('ag', out);
+          for await (const v of [Promise.resolve('a'), 'b']) console.log('fa', v);
+          const it = ag(); console.log(await it.next(), await it.return('r'));
+        })();
+        function f1(){ try { return 1 } finally { return 2 } }
+        console.log(f1());
+        function f3(){ lbl: { console.log('in'); break lbl; } return 'done' }
+        console.log(f3());
+        function tag(s, ...v){ return [s.raw.join('|'), s.join('|'), v.join(',')] }
+        console.log(tag`a${1}b\n${2}c`);
+        console.log(String.raw`x\ny${1+1}z`, String.raw({raw:['a','b','c']}, 1, 2));
+        const e1 = new Error('outer', { cause: new Error('inner') });
+        console.log(e1.message, e1.cause.message, 'cause' in e1, Object.keys(e1));
+        console.log(new TypeError('t', { cause: 42 }).cause, new Error('x').cause);
+        const o = {}; Object.defineProperty(o, 'a', {value:1});
+        console.log(Object.getOwnPropertyDescriptor(o,'a'), Object.keys(o), o.a);
+        const m = new Map([['a',1],[NaN,2]]); m.set(-0, 3);
+        console.log(m, m.get(NaN), m.get(0), m.size, [...m.keys()]);
+        const s = new Set([1,1,NaN,NaN,-0,0]); console.log(s, s.size, s.has(NaN));
+        const wm = new WeakMap(); const k = {}; wm.set(k, 1); console.log(wm.get(k), wm.has({}), wm);
+        const ws = new WeakSet(); ws.add(k); console.log(ws.has(k), ws);
+        console.log(new Map([[{a:1}, [1,2]]]), new Set([[1,2],{a:1}]));
+    "##;
+    let expected = [
+        "got ir",
+        "{ value: 1, done: false } { value: 2, done: false } { value: 3, done: false } { value: undefined, done: true }",
+        "{ value: 'c:x', done: false }",
+        "2",
+        "in",
+        "done",
+        "[ 'a|b\\\\n|c', 'a|b\\n|c', '1,2' ]",
+        "x\\ny2z a1b2c",
+        "outer inner true []",
+        "42 undefined",
+        "{ value: 1, writable: false, enumerable: false, configurable: false } [] 1",
+        "Map(3) { 'a' => 1, NaN => 2, 0 => 3 } 2 3 3 [ 'a', NaN, 0 ]",
+        "Set(3) { 1, NaN, 0 } 3 true",
+        "1 false WeakMap { <items unknown> }",
+        "true WeakSet { <items unknown> }",
+        "Map(1) { { a: 1 } => [ 1, 2 ] } Set(2) { [ 1, 2 ], { a: 1 } }",
+        "ag [ 1, 2, 3 ]",
+        "fa a",
+        "fa b",
+        "{ value: 1, done: false } { value: 'r', done: true }",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn class_fields_proxy_reflect_and_well_known_symbols() {
+    // Public/private/static class fields, static blocks, getters and setters;
+    // Proxy traps and Reflect; `Symbol.hasInstance`, `Symbol.toPrimitive`,
+    // `Symbol.toStringTag` and `Symbol.iterator`.
+    let src = r##"
+        // class fields, getters/setters, static blocks
+        class A { x = 1; static s = 2; #p = 3; static { A.fromBlock = 9 } get v(){return this.x} set v(n){this.x=n} static get sv(){return A.s} }
+        const a = new A(); a.v = 5;
+        console.log(a.x, A.s, A.fromBlock, a.v, A.sv, Object.keys(a), Object.getOwnPropertyNames(A).filter(n=>!['length','name','prototype'].includes(n)));
+        console.log(Object.getOwnPropertyDescriptor(A.prototype,'v'));
+        // Proxy / Reflect
+        const t = {a:1};
+        const p = new Proxy(t, { get:(o,k,r)=> k==='b'?42:Reflect.get(o,k,r), has:(o,k)=>k==='z'||k in o, ownKeys:o=>[...Reflect.ownKeys(o),'v'], getOwnPropertyDescriptor:(o,k)=>k==='v'?{value:7,enumerable:true,configurable:true}:Reflect.getOwnPropertyDescriptor(o,k), set:(o,k,v)=>Reflect.set(o,k,v), deleteProperty:(o,k)=>Reflect.deleteProperty(o,k) });
+        console.log(p.a, p.b, 'z' in p, Object.keys(p), JSON.stringify(p));
+        p.c = 3; console.log(t.c, delete p.c, t.c);
+        const { proxy, revoke } = Proxy.revocable({}, {}); revoke();
+        try { proxy.x } catch(e) { console.log(e.constructor.name) }
+        console.log(Reflect.ownKeys({a:1,[Symbol('s')]:2}).length, Reflect.has({a:1},'a'), Reflect.apply(Math.max,null,[1,2,3]));
+        // well-known symbols
+        class B { static [Symbol.hasInstance](x){ return x === 1 } }
+        console.log(1 instanceof B, 2 instanceof B);
+        const c = { [Symbol.toPrimitive](h){ return h==='number'?10:'str' } };
+        console.log(+c, `${c}`, c+'');
+        class D { get [Symbol.toStringTag](){ return 'Dee' } }
+        console.log(Object.prototype.toString.call(new D()), String(new D()));
+        const it = { *[Symbol.iterator](){ yield 1; yield 2 } };
+        console.log([...it]);
+    "##;
+    let expected = [
+        "5 2 9 5 2 [ 'x' ] [ 'sv', 's', 'fromBlock' ]",
+        "{",
+        "  get: [Function: get v],",
+        "  set: [Function: set v],",
+        "  enumerable: false,",
+        "  configurable: true",
+        "}",
+        "1 42 true [ 'a', 'v' ] {\"a\":1}",
+        "3 true undefined",
+        "TypeError",
+        "2 true 3",
+        "true false",
+        "10 str str",
+        "[object Dee] [object Dee]",
+        "[ 1, 2 ]",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn an_abrupt_return_closes_every_open_for_of_iterator() {
+    // 7.4.9 IteratorClose: a `return` out of a `for…of` closes the iterator,
+    // which is what runs a generator's pending `finally`. `break` and
+    // destructuring already did; a `return` walked away and left the generator
+    // suspended. Every iterator the chunk has parked is closed, innermost first,
+    // with the return value kept on the stack.
+    let src = r##"
+        function* inner(){ try { yield 1; yield 2 } finally { console.log('inner finally') } }
+        function f(){ for (const v of inner()) return 'ret'+v }
+        console.log(f());
+        function g(){ for (const v of inner()) break; return 'brk' }
+        console.log(g());
+        const [x] = inner(); console.log('destructure', x);
+        for (const v of inner()) { console.log('of', v); break }
+        function a(){ for (const v of inner()) { for (const w of inner()) return [v,w] } }
+        console.log(a());
+        function b(){ try { for (const v of inner()) return v } finally { console.log('outer fin') } }
+        console.log(b());
+        function c(){ for (const v of inner()) { if (v===1) continue; return v } return 'none' }
+        console.log(c());
+        function e(){ for (const v of [1,2,3]) return v }
+        console.log(e());
+        async function h(){ for (const v of inner()) return v }
+        h().then(v=>console.log('async', v));
+    "##;
+    let expected = [
+        "inner finally",
+        "ret1",
+        "inner finally",
+        "brk",
+        "inner finally",
+        "destructure 1",
+        "of 1",
+        "inner finally",
+        "inner finally",
+        "inner finally",
+        "[ 1, 1 ]",
+        "inner finally",
+        "outer fin",
+        "1",
+        "inner finally",
+        "2",
+        "1",
+        "inner finally",
+        "async 1",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}

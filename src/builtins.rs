@@ -2076,6 +2076,19 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
         if i + 2 >= flat.len() {
             break;
         }
+        // Tag 2: an ACCESSOR's position. An accessor lives in its own table, so
+        // the literal reserves its slot here with the `@@ord:` marker key that
+        // `own_enum_data_keys` resolves back — otherwise `{ get g(){}, d: 2 }`
+        // enumerated `d, g`, because `DEF_ACCESSOR` runs after `MKOBJ` and its
+        // marker landed at the end.
+        if matches!(flat[i], Value::Int(2)) {
+            let key = with_host(|h| h.str_of(&flat[i + 1]));
+            props
+                .entry(format!("{}{key}", host::ORD_MARKER))
+                .or_insert(Value::Undef);
+            i += 3;
+            continue;
+        }
         let spread = matches!(flat[i], Value::Int(1));
         if spread {
             let src = flat[i + 1].clone();
@@ -7763,6 +7776,17 @@ fn v8_exponent(x: f64) -> i32 {
 
 // ══ Map / Set / Symbol / generator methods ═══════════════════════════════════
 
+/// `Map.prototype.set` step 6 and `Set.prototype.add` step 4: a key of `-0` is
+/// STORED as `+0`. `map_key` already treats the two as one key (SameValueZero),
+/// but the value kept alongside it is what iteration and `console.log` report,
+/// and node shows `0` there — `new Map().set(-0, 1)` renders `Map(1) { 0 => 1 }`.
+fn normalize_zero_key(v: Value) -> Value {
+    match v {
+        Value::Float(f) if f == 0.0 && f.is_sign_negative() => Value::Float(0.0),
+        other => other,
+    }
+}
+
 fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "get" => {
@@ -7776,7 +7800,7 @@ fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
             }))
         }
         "set" => {
-            let kv = arg0(&args);
+            let kv = normalize_zero_key(arg0(&args));
             let vv = args.get(1).cloned().unwrap_or(Value::Undef);
             reject_non_object_weak_key(recv, &kv, "WeakMap")?;
             let key = with_host(|h| host::map_key(h, &kv));
@@ -7869,7 +7893,7 @@ fn reject_non_object_weak_key(recv: &Value, key: &Value, kind: &str) -> Result<(
 fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "add" => {
-            let vv = arg0(&args);
+            let vv = normalize_zero_key(arg0(&args));
             reject_non_object_weak_key(recv, &vv, "WeakSet")?;
             let key = with_host(|h| host::map_key(h, &vv));
             with_host(|h| {

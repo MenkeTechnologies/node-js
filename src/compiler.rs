@@ -406,6 +406,12 @@ impl Compiler {
                         b.emit(Op::LoadUndef, line);
                     }
                 }
+                // A `return` out of a `for…of` is an abrupt completion, and
+                // 7.4.9 `IteratorClose` runs the iterator's `return` for it —
+                // which is what makes a generator's `finally` run. `break` and
+                // `continue` already closed theirs; a `return` walked away and
+                // left the iterator suspended forever.
+                self.emit_close_iters_under_value(b);
                 b.emit(Op::CallBuiltin(ops::SIG_RETURN, 1), line);
             }
             StmtKind::Labeled { label, body } => self.compile_labeled(b, label, body)?,
@@ -2107,9 +2113,31 @@ impl Compiler {
     fn compile_object(&mut self, b: &mut ChunkBuilder, props: &[Prop]) -> Result<(), String> {
         // (tag, key, val) triples for the data/spread props; tag 1 = ...spread.
         // Accessors are installed afterward via DEF_ACCESSOR.
+        // An ACCESSOR keeps its slot in this list — with a tag of its own — so
+        // the object enumerates it where the source declared it. The pair
+        // `get`/`set` for one key contributes ONE slot.
+        let mut seen_accessor: Vec<String> = Vec::new();
         let data: Vec<&Prop> = props
             .iter()
-            .filter(|p| !matches!(p, Prop::Accessor { .. }))
+            .filter(|p| match p {
+                Prop::Accessor { key, computed, .. } => {
+                    // Only a literal key can be de-duplicated at compile time; a
+                    // computed one is settled by `b_mkobj`'s `or_insert`.
+                    let literal = match (key, computed) {
+                        (Expr::Str(s), false) => Some(s.clone()),
+                        _ => None,
+                    };
+                    match literal {
+                        Some(k) if seen_accessor.contains(&k) => false,
+                        Some(k) => {
+                            seen_accessor.push(k);
+                            true
+                        }
+                        None => true,
+                    }
+                }
+                _ => true,
+            })
             .collect();
         let has_spread = data.iter().any(|p| matches!(p, Prop::Spread(_)));
         // A spread-free literal with more triples than one CallBuiltin's u8 arg
@@ -2134,6 +2162,8 @@ impl Compiler {
                     b.emit(Op::Pop, 0); // [obj]
                 }
             }
+            // The incremental path's accessors keep their trailing order: a
+            // literal that large is a generated data table, and none carry one.
             return self.compile_object_accessors(b, props);
         }
         for p in &data {
@@ -2155,7 +2185,15 @@ impl Compiler {
                     self.compile_expr(b, src)?;
                     b.emit(Op::LoadUndef, 0);
                 }
-                Prop::Accessor { .. } => unreachable!(),
+                // Reserve the accessor's enumeration slot; `DEF_ACCESSOR` below
+                // installs the functions themselves.
+                Prop::Accessor { key, computed, .. } => {
+                    let _ = computed; // the key expression covers both forms
+                    b.emit(Op::LoadInt(2), 0);
+                    self.compile_expr(b, key)?;
+                    b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
+                    b.emit(Op::LoadUndef, 0);
+                }
             }
         }
         b.emit(Op::CallBuiltin(ops::MKOBJ, argc(data.len() * 3)?), 0); // [obj]
@@ -2539,6 +2577,17 @@ impl Compiler {
     /// iterators are parked on the VM stack, so they must be popped (running a
     /// generator's `finally` / the iterator protocol's `.return()`) or the outer
     /// `FORITER` would read the wrong stack slot.
+    /// Close every iterator this chunk has parked, with a value already on top
+    /// of the stack that must survive: the iterators sit UNDER it, so each one
+    /// is swapped up, closed, and its result dropped.
+    fn emit_close_iters_under_value(&self, b: &mut ChunkBuilder) {
+        for _ in 0..self.iter_depth {
+            b.emit(Op::Swap, 0); // [.., iter, val] -> [.., val, iter]
+            b.emit(Op::CallBuiltin(ops::ITER_CLOSE, 1), 0); // -> [.., val, result]
+            b.emit(Op::Pop, 0); // -> [.., val]
+        }
+    }
+
     fn emit_close_iters(&self, b: &mut ChunkBuilder, target: usize) {
         for _ in target..self.iter_depth {
             b.emit(Op::CallBuiltin(ops::ITER_CLOSE, 1), 0);

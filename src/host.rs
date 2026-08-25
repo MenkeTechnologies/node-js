@@ -1214,10 +1214,26 @@ impl JsHost {
             // `{ a: 1, get b() {}, c: 3 }` enumerates a, b, c — not a, c, b.
             // The marker is `@@`-prefixed, so it is invisible to every reader.
             let marker = format!("{ORD_MARKER}{key}");
-            if let Some(JsObj::Object(props)) = self.get_mut(owner) {
-                if !props.contains_key(key) && !props.contains_key(&marker) {
-                    props.insert(marker, Value::Undef);
+            match self.get_mut(owner) {
+                Some(JsObj::Object(props)) => {
+                    if !props.contains_key(key) && !props.contains_key(&marker) {
+                        props.insert(marker, Value::Undef);
+                    }
                 }
+                // A function or class keeps its own properties in the fn-prop
+                // side table, so its ordering marker belongs there. Without it a
+                // static accessor enumerated AFTER every static field and method
+                // regardless of where the class body declared it: node reports
+                // `class A { static s = 2; static get sv(){} static m(){} }` as
+                // `['sv', 'm', 's']` — the methods and accessors in source order
+                // first, then the fields — and this reported `['m', 's', 'sv']`.
+                Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => {
+                    let table = self.fn_props.entry(*i).or_default();
+                    if !table.contains_key(key) && !table.contains_key(&marker) {
+                        table.insert(marker, Value::Undef);
+                    }
+                }
+                _ => {}
             }
             let slot = self
                 .accessors
@@ -3370,16 +3386,37 @@ impl JsHost {
                     // Skip node-js's internal slots (`@@native`, `@@bytes`, …) and
                     // private class fields; a real symbol-keyed own property is a
                     // visible one and renders as `Symbol(desc): value`.
-                    let mut shown: Vec<(String, &Value)> = props
+                    // An own ACCESSOR has no value to print: node shows the
+                    // label `[Getter]` / `[Setter]` / `[Getter/Setter]` in its
+                    // place. It is found through the `@@ord:` marker the
+                    // property map holds for it, which is also what puts it in
+                    // declaration order among the data properties. Without this
+                    // an accessor rendered as nothing at all — `{ get z(){} }`
+                    // printed `{}`.
+                    let mut shown: Vec<(String, Result<&Value, &'static str>)> = props
                         .iter()
-                        .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
-                        .map(|(k, val)| (fmt_key(k), val))
+                        .filter_map(|(k, val)| match k.strip_prefix(ORD_MARKER) {
+                            Some(real) => {
+                                let attrs = self.prop_attrs(v, real);
+                                let label = match self.own_accessor(v, real)? {
+                                    (Some(_), Some(_)) => "[Getter/Setter]",
+                                    (Some(_), None) => "[Getter]",
+                                    (None, Some(_)) => "[Setter]",
+                                    (None, None) => return None,
+                                };
+                                attrs.enumerable.then(|| (fmt_key(real), Err(label)))
+                            }
+                            None if !k.starts_with("@@") && !k.starts_with('#') => {
+                                Some((fmt_key(k), Ok(val)))
+                            }
+                            None => None,
+                        })
                         .collect();
                     shown.extend(props.iter().filter_map(|(k, val)| {
                         let sym = self.symbol_of_key(k)?;
                         self.prop_attrs(v, k)
                             .enumerable
-                            .then(|| (self.inspect(&sym), val))
+                            .then(|| (self.inspect(&sym), Ok(val)))
                     }));
                     if shown.is_empty() {
                         return format!("{prefix}{{}}");
@@ -3398,7 +3435,10 @@ impl JsHost {
                     }
                     let inner: Vec<String> = shown
                         .iter()
-                        .map(|(k, val)| format!("{k}: {}", self.inspect_lvl(val, indent + 2, st)))
+                        .map(|(k, val)| match val {
+                            Ok(val) => format!("{k}: {}", self.inspect_lvl(val, indent + 2, st)),
+                            Err(label) => format!("{k}: {label}"),
+                        })
                         .collect();
                     self.render_object(&inner, &prefix, indent)
                 }
@@ -3431,6 +3471,11 @@ impl JsHost {
                 // died with `fatal runtime error: stack overflow`, which no
                 // `try`/`catch` can see. An empty one still prints in full at any
                 // depth, as `[]`/`{}` do.
+                // A WEAK collection never shows its contents: node prints
+                // `WeakMap { <items unknown> }` whether it holds anything or
+                // not, because the entries are not enumerable by design.
+                Some(JsObj::Map { weak: true, .. }) => "WeakMap { <items unknown> }".into(),
+                Some(JsObj::Set { weak: true, .. }) => "WeakSet { <items unknown> }".into(),
                 Some(JsObj::Map { entries, .. }) => {
                     if entries.is_empty() {
                         return "Map(0) {}".into();
@@ -4518,11 +4563,15 @@ impl JsHost {
                 let rest: Vec<String> = self
                     .fn_prop_keys(v)
                     .into_iter()
+                    // An accessor's ordering marker resolves back to its real
+                    // key, so a static getter enumerates where it was declared.
+                    .filter_map(|k| match k.strip_prefix(ORD_MARKER) {
+                        Some(real) => Some(real.to_string()),
+                        None if !k.starts_with("@@") && !k.starts_with('#') => Some(k),
+                        None => None,
+                    })
                     .filter(|k| {
-                        !k.starts_with("@@")
-                            && !k.starts_with('#')
-                            && !keys.contains(k)
-                            && (!enum_only || self.prop_attrs(v, k).enumerable)
+                        !keys.contains(k) && (!enum_only || self.prop_attrs(v, k).enumerable)
                     })
                     .collect();
                 keys.extend(rest);
