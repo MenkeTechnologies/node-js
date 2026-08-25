@@ -4584,10 +4584,25 @@ impl JsHost {
             // `"0".."len-1"` (the bytes live in the hidden `@@bytes` slot), never
             // the `length`/`byteLength` view metadata, which V8 keeps on the
             // prototype chain or as non-enumerable own slots.
+            // A `Buffer` and every other typed array are index-keyed exotics:
+            // their own enumerable keys are `"0".."len-1"` (the elements live in
+            // a hidden slot), never the `length`/`byteLength` view metadata,
+            // which V8 keeps on the prototype chain or as non-enumerable own
+            // slots. Only `Buffer` had this arm, so `Object.keys(u8)` was empty
+            // and `JSON.stringify(u8)` was `{}` where node gives
+            // `{"0":10,"1":9}` — `hasOwnProperty(0)` already answered true, so
+            // the two views of the same question disagreed.
             Some(JsObj::Object(props))
-                if props.get("@@native").map(|t| self.str_of(t)).as_deref() == Some("Buffer") =>
+                if matches!(
+                    props.get("@@native").map(|t| self.str_of(t)).as_deref(),
+                    Some("Buffer") | Some("TypedArray")
+                ) =>
             {
-                let n = match props.get("@@bytes").and_then(|b| self.get(b)) {
+                let field = match props.get("@@native").map(|t| self.str_of(t)).as_deref() {
+                    Some("Buffer") => "@@bytes",
+                    _ => "@@elems",
+                };
+                let n = match props.get(field).and_then(|b| self.get(b)) {
                     Some(JsObj::Array(items)) => items.len(),
                     _ => 0,
                 };
@@ -4673,35 +4688,38 @@ impl JsHost {
         self.own_enum_key_names(v)
             .into_iter()
             .map(|k| {
-                let val =
-                    match self.get(v) {
-                        // A Buffer's index keys read out of the hidden `@@bytes`
-                        // array; resolve inline rather than through
-                        // `buffer::byte_get`, which would re-borrow the host.
-                        Some(JsObj::Object(props)) => props.get(&k).cloned().unwrap_or_else(|| {
-                            match (
-                                props.get("@@bytes").and_then(|b| self.get(b)),
-                                k.parse::<usize>(),
-                            ) {
-                                (Some(JsObj::Array(items)), Ok(i)) => {
-                                    items.get(i).cloned().unwrap_or(Value::Undef)
-                                }
-                                _ => Value::Undef,
+                let val = match self.get(v) {
+                    // A Buffer's index keys read out of the hidden `@@bytes`
+                    // array; resolve inline rather than through
+                    // `buffer::byte_get`, which would re-borrow the host.
+                    Some(JsObj::Object(props)) => props.get(&k).cloned().unwrap_or_else(|| {
+                        // A Buffer's elements live in `@@bytes` and every
+                        // other typed array's in `@@elems`; both are index
+                        // keys with no entry in the property map.
+                        let backing = props
+                            .get("@@bytes")
+                            .or_else(|| props.get("@@elems"))
+                            .and_then(|b| self.get(b));
+                        match (backing, k.parse::<usize>()) {
+                            (Some(JsObj::Array(items)), Ok(i)) => {
+                                items.get(i).cloned().unwrap_or(Value::Undef)
                             }
-                        }),
-                        // An index reads the element; any other own key (`foo`,
-                        // a match result's `index`) lives in the side table.
-                        Some(JsObj::Array(items)) => k
-                            .parse::<usize>()
-                            .ok()
-                            .and_then(|i| items.get(i).cloned())
-                            .or_else(|| self.fn_prop(v, &k))
-                            .unwrap_or(Value::Undef),
-                        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => {
-                            self.fn_prop(v, &k).unwrap_or(Value::Undef)
+                            _ => Value::Undef,
                         }
-                        _ => Value::Undef,
-                    };
+                    }),
+                    // An index reads the element; any other own key (`foo`,
+                    // a match result's `index`) lives in the side table.
+                    Some(JsObj::Array(items)) => k
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| items.get(i).cloned())
+                        .or_else(|| self.fn_prop(v, &k))
+                        .unwrap_or(Value::Undef),
+                    Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => {
+                        self.fn_prop(v, &k).unwrap_or(Value::Undef)
+                    }
+                    _ => Value::Undef,
+                };
                 (k, val)
             })
             .collect()

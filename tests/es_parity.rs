@@ -4616,3 +4616,32 @@ fn typed_array_search_does_not_coerce_its_argument() {
     let expected = ["-1 1 false true -1", "true -1 true 2 2", "-1 false"].join("\n");
     assert_eq!(run(src), expected);
 }
+
+#[test]
+fn typed_array_index_keys_are_own_enumerable_properties() {
+    // A typed array is an index-keyed exotic: its own enumerable keys are its
+    // indices, so `Object.keys`, `JSON.stringify`, object spread and `for…in`
+    // all see them. Only `Buffer` had that arm, so every other view enumerated
+    // as empty while `hasOwnProperty(0)` already answered true.
+    let src = r##"
+        const b = Buffer.from([1,2,250]);
+        console.log(Object.keys(b), JSON.stringify(b), {...b});
+        console.log(b, b.length, b.toJSON());
+        console.log(JSON.stringify({b}), Object.entries(b).length);
+        const u = new Uint8Array([7,8]);
+        console.log(Object.keys(u), JSON.stringify(u), {...u}, Object.entries(u));
+        console.log(JSON.stringify(new Float64Array([1.5])), JSON.stringify(new BigInt64Array(0)));
+        for (const k in u) console.log('in', k);
+    "##;
+    let expected = [
+        "[ '0', '1', '2' ] {\"type\":\"Buffer\",\"data\":[1,2,250]} { '0': 1, '1': 2, '2': 250 }",
+        "<Buffer 01 02 fa> 3 { type: 'Buffer', data: [ 1, 2, 250 ] }",
+        "{\"b\":{\"type\":\"Buffer\",\"data\":[1,2,250]}} 3",
+        "[ '0', '1' ] {\"0\":7,\"1\":8} { '0': 7, '1': 8 } [ [ '0', 7 ], [ '1', 8 ] ]",
+        "{\"0\":1.5} {}",
+        "in 0",
+        "in 1",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
