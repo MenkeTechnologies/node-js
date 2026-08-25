@@ -154,6 +154,50 @@ mod call_sites {
 
 pub use call_sites::{clear as clear_call_sites, register as register_call_sites};
 
+/// How many `for…of` / `yield*` iterators are parked on the VM stack at each
+/// `yield` op, recorded by the compiler the same way callee text is.
+///
+/// A `.return()`/`.throw()` injected at a suspension point halts the generator's
+/// chunk outright, which jumps past the loop exits that would have closed those
+/// iterators — so the halt path has to close them itself, and this is how it
+/// knows how many are there and that they are the top of the stack.
+mod yield_sites {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static DEPTHS: RefCell<rustc_hash::FxHashMap<(u64, usize), usize>> =
+            RefCell::new(rustc_hash::FxHashMap::default());
+    }
+
+    pub fn register(op_hash: u64, sites: Vec<(usize, usize)>) {
+        if sites.is_empty() {
+            return;
+        }
+        DEPTHS.with(|m| {
+            let mut m = m.borrow_mut();
+            for (ip, depth) in sites {
+                m.insert((op_hash, ip), depth);
+            }
+        });
+    }
+
+    pub fn depth(op_hash: u64, ip: usize) -> usize {
+        DEPTHS.with(|m| m.borrow().get(&(op_hash, ip)).copied().unwrap_or(0))
+    }
+
+    pub fn clear() {
+        DEPTHS.with(|m| m.borrow_mut().clear());
+    }
+}
+
+pub use yield_sites::{clear as clear_yield_sites, register as register_yield_sites};
+
+/// The number of loop iterators parked on the stack at the op currently
+/// executing, for the abrupt-completion close in `b_yield`.
+pub fn parked_iters(vm: &fusevm::VM) -> usize {
+    yield_sites::depth(vm.chunk.op_hash, vm.ip.saturating_sub(1))
+}
+
 /// Rewrite a `<subject> is not a function` / `is not a constructor` message with
 /// the SOURCE TEXT of the callee at the currently executing op, as V8 does.
 ///

@@ -147,6 +147,10 @@ pub struct Compiler {
     /// host when the chunk is built so a failed call can name the callee the way
     /// the source wrote it. Saved and restored around every nested chunk.
     call_sites: Vec<(usize, String)>,
+    /// Parked-iterator depth per `yield` op of the chunk being emitted, so an
+    /// injected `.return()`/`.throw()` can close the `for…of` / `yield*`
+    /// iterators the halt would otherwise abandon.
+    yield_sites: Vec<(usize, usize)>,
     /// Locals of the chunk being emitted that live in fusevm frame slots rather
     /// than the host's scope chain — see [`crate::slots`]. Empty for a chunk the
     /// analysis refused, so `slot_of` answering `None` is the old path.
@@ -1368,6 +1372,7 @@ impl Compiler {
         let depth = std::mem::take(&mut self.scope_depth);
         let iters = std::mem::take(&mut self.iter_depth);
         let sites = std::mem::take(&mut self.call_sites);
+        let yields = std::mem::take(&mut self.yield_sites);
         let r = (|| {
             self.hoist_funcs(&mut cb, stmts)?;
             self.compile_stmts(&mut cb, stmts)
@@ -1382,6 +1387,7 @@ impl Compiler {
         r?;
         let chunk = self.finish_chunk(cb);
         self.call_sites = sites;
+        self.yield_sites = yields;
         Ok(chunk)
     }
 
@@ -1434,6 +1440,7 @@ impl Compiler {
         // The body is a chunk of its own, so its call sites are keyed to ITS
         // `op_hash`; the enclosing chunk's pending ones must not be swept in.
         let saved_sites = std::mem::take(&mut self.call_sites);
+        let saved_yields = std::mem::take(&mut self.yield_sites);
         let r = (|| {
             // Function-body function hoisting.
             self.hoist_funcs(&mut fb, &prologue)?;
@@ -1461,6 +1468,7 @@ impl Compiler {
             self_name: false,
         };
         self.call_sites = saved_sites;
+        self.yield_sites = saved_yields;
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
     }
@@ -1817,7 +1825,8 @@ impl Compiler {
             let jdone = b.emit(Op::JumpIfTrue(0), 0); // [aiter, step]
             self.name_const(b, "value");
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [aiter, value]
-            b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // [aiter, sent]
+            let at = b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // [aiter, sent]
+            self.yield_sites.push((at, self.iter_depth));
             b.emit(Op::Pop, 0); // [aiter]
             b.emit(Op::Jump(start), 0);
             let done = b.current_pos();
@@ -1839,6 +1848,11 @@ impl Compiler {
                 }
             }
             b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
+                                                         // The delegate is parked on the stack for the whole delegation, so
+                                                         // it counts as a live iterator: a `.return()`/`.throw()` injected
+                                                         // into the OUTER generator has to close it (7.4.9 IteratorClose),
+                                                         // which is what runs the delegate's pending `finally`.
+            self.iter_depth += 1;
             self.name_const(b, &sent_tmp);
             b.emit(Op::LoadUndef, 0);
             b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
@@ -1855,7 +1869,8 @@ impl Compiler {
             let jdone = b.emit(Op::JumpIfTrue(0), 0); // [iterator, step]
             self.name_const(b, "value");
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [iterator, value]
-            b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // [iterator, sent]
+            let at = b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // [iterator, sent]
+            self.yield_sites.push((at, self.iter_depth));
             self.name_const(b, &sent_tmp);
             b.emit(Op::Swap, 0);
             b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
@@ -1867,6 +1882,7 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [iterator, returnValue]
             b.emit(Op::Swap, 0);
             b.emit(Op::Pop, 0); // [returnValue]
+            self.iter_depth -= 1;
         } else {
             match arg {
                 Some(e) => self.compile_expr(b, e)?,
@@ -1875,7 +1891,8 @@ impl Compiler {
                 }
             }
             // YIELD suspends and leaves the value sent by `.next(x)` on the stack.
-            b.emit(Op::CallBuiltin(ops::YIELD, 1), 0);
+            let at = b.emit(Op::CallBuiltin(ops::YIELD, 1), 0);
+            self.yield_sites.push((at, self.iter_depth));
         }
         Ok(())
     }
@@ -2671,8 +2688,10 @@ impl Compiler {
     /// `op_hash` `build()` computes.
     fn finish_chunk(&mut self, b: ChunkBuilder) -> Chunk {
         let sites = std::mem::take(&mut self.call_sites);
+        let yields = std::mem::take(&mut self.yield_sites);
         let chunk = b.build();
         crate::host::register_call_sites(chunk.op_hash, sites);
+        crate::host::register_yield_sites(chunk.op_hash, yields);
         chunk
     }
 

@@ -87,27 +87,32 @@ pub fn install(vm: &mut VM) {
 /// `ITER_CLOSE`: close the iterator on the stack (a for-of `break`). A generator
 /// runs its pending `finally`; a user iterator object gets its `.return()` called
 /// if present; a plain materialized iterator just drops. Returns `undefined`.
-fn b_iter_close(vm: &mut VM, _: u8) -> Value {
-    let it = vm.pop();
-    if with_host(|h| h.is_generator_val(&it)) {
-        // Ignore the close outcome; a `finally` may print/yield but the loop is
-        // done. Preserve any error it raises (uncaught finally throw propagates).
-        if let Err(e) = host::gen_return(&it, Value::Undef) {
-            return abort(vm, e);
-        }
-        return Value::Undef;
+/// `IteratorClose` (7.4.9): resume a generator with a forced return so its
+/// pending `finally` runs, or invoke a user iterator's `.return()`. A value that
+/// is neither is left alone.
+pub(crate) fn close_iterator(it: &Value) -> Result<(), String> {
+    if with_host(|h| h.is_generator_val(it)) {
+        host::gen_return(it, Value::Undef)?;
+        return Ok(());
     }
-    // A user iterator object with a `.return()` method (iterator protocol close).
-    if matches!(with_host(|h| h.get(&it).cloned()), Some(JsObj::Object(_))) {
-        if let Some(f) = with_host(|h| host::lookup_chain(h, &it, "return")) {
+    if matches!(with_host(|h| h.get(it).cloned()), Some(JsObj::Object(_))) {
+        if let Some(f) = with_host(|h| host::lookup_chain(h, it, "return")) {
             if with_host(|h| host::is_callable(h, &f)) {
-                if let Err(e) = host::invoke(&f, Vec::new(), Some(it.clone())) {
-                    return abort(vm, e);
-                }
+                host::invoke(&f, Vec::new(), Some(it.clone()))?;
             }
         }
     }
-    Value::Undef
+    Ok(())
+}
+
+fn b_iter_close(vm: &mut VM, _: u8) -> Value {
+    let it = vm.pop();
+    // A `finally` may print or yield, but the loop is done either way; an error
+    // it raises still propagates.
+    match close_iterator(&it) {
+        Ok(()) => Value::Undef,
+        Err(e) => abort(vm, e),
+    }
 }
 
 /// `NUM_STEP`: the `++`/`--` core. Pops `old` and the step `tag` (`+1`/`-1`),
@@ -336,6 +341,33 @@ fn b_super_get(vm: &mut VM, _: u8) -> Value {
     }
 }
 
+/// Close every loop iterator parked on `vm`'s stack at the op now executing,
+/// innermost first. Called where a chunk is about to be halted abruptly, since
+/// the code that would ordinarily close them is being jumped over.
+///
+/// A close runs user code (a generator's `finally`), which can itself throw; the
+/// error is deliberately dropped, because it must not replace the completion
+/// that caused the unwind.
+fn close_parked_iters(vm: &mut VM) {
+    let n = host::parked_iters(vm);
+    if n == 0 {
+        return;
+    }
+    // The completion that caused the unwind is already pending on the host.
+    // Closing an iterator resumes ANOTHER generator, which settles its own
+    // signal/error state, so the pending one is saved across the close and put
+    // back — otherwise the outer `.return()` would be lost.
+    let saved = with_host(|h| (h.signal.take(), h.error.take()));
+    for _ in 0..n {
+        let it = vm.pop();
+        let _ = close_iterator(&it);
+    }
+    with_host(|h| {
+        h.signal = saved.0;
+        h.error = saved.1;
+    });
+}
+
 fn b_yield(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
     match host::gen_yield(v) {
@@ -344,11 +376,24 @@ fn b_yield(vm: &mut VM, _: u8) -> Value {
             // signal (or error); halt the chunk so the body unwinds through any
             // enclosing `try/finally`, exactly like a source `return`/`throw`.
             if with_host(|h| h.error.is_some() || h.signal.is_some()) {
+                // Halting jumps past the loop exits, so the `for…of` / `yield*`
+                // iterators parked on this chunk's stack would be abandoned
+                // still-suspended. They sit directly beneath the yielded value
+                // (innermost last), and the compiler recorded how many are
+                // there for this exact op.
+                close_parked_iters(vm);
                 vm.ip = vm.chunk.ops.len();
             }
             sent
         }
-        Err(e) => abort(vm, e),
+        // An injected `.throw()` comes back as an error rather than a signal,
+        // and abandons the parked iterators the same way. The thrown value is
+        // already on the host as `exc`; `close_parked_iters` puts back whatever
+        // it saves, so the close cannot swallow it.
+        Err(e) => {
+            close_parked_iters(vm);
+            abort(vm, e)
+        }
     }
 }
 

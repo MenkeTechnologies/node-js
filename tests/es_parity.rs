@@ -4701,3 +4701,59 @@ fn require_cache_is_the_live_module_cache() {
         .join("\n")
     );
 }
+
+#[test]
+fn an_injected_return_closes_the_parked_iterators() {
+    // A `.return()`/`.throw()` injected at a suspension point halts the
+    // generator's chunk, which jumps past the loop exits that would have closed
+    // its `for…of` / `yield*` iterators — so they were abandoned
+    // still-suspended and their `finally` never ran. The compiler records how
+    // many are parked at each `yield`, and the halt path closes them
+    // innermost-first, saving the pending completion across the close so it
+    // survives.
+    let src = r##"
+        function* inner(){ try { yield 1; yield 2 } finally { console.log('  inner finally') } }
+        console.log('A'); (function(){ for (const v of inner()) return v })();
+        console.log('B'); (function(){ for (const v of inner()) break })();
+        console.log('D'); { function* o(){ for (const v of inner()) yield v } const g=o(); g.next(); console.log(' ', g.return('r')); }
+        console.log('E'); { function* o(){ yield* inner() } const g=o(); g.next(); console.log(' ', g.return('r')); }
+        console.log('F'); { function* o(){ yield* inner() } const g=o(); g.next(); try{g.throw(new Error('t'))}catch(e){console.log('  caught', e.message)} }
+        console.log('G'); { function* m(){ yield* inner() } function* o(){ yield* m() } const g=o(); g.next(); console.log(' ', g.return('r')); }
+        console.log('H'); { const [x] = inner(); }
+        console.log('J two levels'); { function* o(){ for (const a of inner()) for (const b of inner()) yield [a,b] } const g=o(); g.next(); console.log(' ', g.return('z')); }
+        console.log('K delegate finishes'); { function* o(){ yield* inner(); yield 'after' } console.log(' ', [...o()]); }
+        console.log('L outer finally too'); { function* o(){ try { yield* inner() } finally { console.log('  outer finally') } } const g=o(); g.next(); g.return('r'); }
+    "##;
+    let expected = [
+        "A",
+        "  inner finally",
+        "B",
+        "  inner finally",
+        "D",
+        "  inner finally",
+        "  { value: 'r', done: true }",
+        "E",
+        "  inner finally",
+        "  { value: 'r', done: true }",
+        "F",
+        "  inner finally",
+        "  caught t",
+        "G",
+        "  inner finally",
+        "  { value: 'r', done: true }",
+        "H",
+        "  inner finally",
+        "J two levels",
+        "  inner finally",
+        "  inner finally",
+        "  { value: 'z', done: true }",
+        "K delegate finishes",
+        "  inner finally",
+        "  [ 1, 2, 'after' ]",
+        "L outer finally too",
+        "  inner finally",
+        "  outer finally",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
