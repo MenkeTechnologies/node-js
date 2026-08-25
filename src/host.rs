@@ -104,6 +104,7 @@ pub mod ops {
     pub const NAMED_EVAL: u16 = 69; // [key, kind, fn] -> fn; SetFunctionName for a COMPUTED key (kind picks the `get `/`set ` prefix)
     pub const POW: u16 = 70; // [a, b] -> JS `a ** b` (NOT native `Op::Pow`: IEEE pow answers 1 for `(-1) ** Infinity` and `1 ** NaN`)
     pub const DECLARE_CONST: u16 = 71; // [name, value] -> value; like DECLARE but the binding is IMMUTABLE (`const`)
+    pub const MARK_HOLE: u16 = 72; // [arr, index] -> arr; record an ELIDED array-literal element
 }
 
 /// `SIG_UNWIND` scope tags: what the emitting site is nested in.
@@ -645,6 +646,23 @@ pub struct JsHost {
     /// Heap objects sealed against new properties by `Object.preventExtensions`,
     /// `Object.seal` or `Object.freeze`.
     non_extensible: HashSet<u32>,
+    /// The ELIDED element positions of each array, by heap index. Absent (the
+    /// overwhelmingly common case) means the array is dense.
+    ///
+    /// A hole is deliberately NOT a `Value` variant. A sentinel value would have
+    /// to be mapped back to `undefined` at every element read in the runtime, and
+    /// a single missed read would leak an un-nameable value into user code — a
+    /// worse failure than storing `undefined` and losing the distinction. Keeping
+    /// the marker OUTSIDE the value domain makes that leak structurally
+    /// impossible: the element vector still holds a perfectly ordinary
+    /// `Value::Undef` at a hole, so any code path that has not been taught about
+    /// holes degrades to exactly the pre-existing behaviour (a visible
+    /// `undefined`) instead of producing something unrepresentable.
+    ///
+    /// Sized like the array it describes in the worst case (`new Array(n)` marks
+    /// every index), which is the same order as the `Vec<Value>` already paid for
+    /// that array — so it cannot turn a working allocation into an OOM.
+    array_holes: HashMap<u32, rustc_hash::FxHashSet<usize>>,
     /// User-assigned static properties on a builtin namespace/constructor, keyed
     /// by namespace name then property (`Error` → `prepareStackTrace`,
     /// `stackTraceLimit`). Each bare `Error` reference allocates a fresh
@@ -913,6 +931,7 @@ impl JsHost {
             accessors: HashMap::new(),
             prop_attrs: HashMap::new(),
             non_extensible: HashSet::new(),
+            array_holes: HashMap::new(),
             builtin_statics: HashMap::new(),
             object_proto: Value::Undef,
             proto_class: HashMap::new(),
@@ -1558,6 +1577,183 @@ impl JsHost {
     }
     pub fn new_array(&mut self, items: Vec<Value>) -> Value {
         self.alloc(JsObj::Array(items))
+    }
+
+    // ── array holes ──────────────────────────────────────────────────────
+    //
+    // Every read/write of an array's elision set goes through this block. See
+    // the `array_holes` field for why the marker lives here rather than in
+    // `Value`.
+
+    /// Whether element `i` of array `arr` is an elided element (a "hole"), as
+    /// opposed to a stored `undefined`. `false` for anything that is not an
+    /// array, and for every index of a dense one.
+    pub fn is_hole(&self, arr: &Value, i: usize) -> bool {
+        match (arr, ()) {
+            (Value::Obj(idx), ()) => self.array_holes.get(idx).is_some_and(|hs| hs.contains(&i)),
+            _ => false,
+        }
+    }
+
+    /// Whether `arr` has any elided element at all — one hash probe, and the
+    /// guard every hole-aware code path takes before doing anything slower.
+    pub fn has_holes(&self, arr: &Value) -> bool {
+        matches!(arr, Value::Obj(i) if self.array_holes.contains_key(i))
+    }
+
+    /// `arr`'s hole positions in ASCENDING order, or an empty vec if dense.
+    /// Sorted because every consumer (own-key enumeration, `util.inspect`
+    /// run-grouping) needs index order, and the backing set has none.
+    pub fn hole_indices(&self, arr: &Value) -> Vec<usize> {
+        let Value::Obj(i) = arr else {
+            return Vec::new();
+        };
+        let Some(hs) = self.array_holes.get(i) else {
+            return Vec::new();
+        };
+        let mut v: Vec<usize> = hs.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Record element `i` of `arr` as elided.
+    pub fn mark_hole(&mut self, arr: &Value, i: usize) {
+        if let Value::Obj(idx) = arr {
+            self.array_holes.entry(*idx).or_default().insert(i);
+        }
+    }
+
+    /// Record `range` of `arr` as elided (a `new Array(n)`, a `length` grow, or
+    /// the gap a write past the end opens).
+    pub fn mark_hole_range(&mut self, arr: &Value, range: std::ops::Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        if let Value::Obj(idx) = arr {
+            self.array_holes.entry(*idx).or_default().extend(range);
+        }
+    }
+
+    /// Element `i` now holds a real value: it is no longer a hole. Every write
+    /// to an array index calls this, which is what keeps a stale hole record
+    /// from outliving the elision it described.
+    pub fn clear_hole(&mut self, arr: &Value, i: usize) {
+        let Value::Obj(idx) = arr else { return };
+        let Some(hs) = self.array_holes.get_mut(idx) else {
+            return;
+        };
+        hs.remove(&i);
+        if hs.is_empty() {
+            self.array_holes.remove(idx);
+        }
+    }
+
+    /// `arr` is dense from here on (`fill` over the whole array, a fresh
+    /// dense assignment into an existing handle).
+    pub fn clear_holes(&mut self, arr: &Value) {
+        if let Value::Obj(idx) = arr {
+            self.array_holes.remove(idx);
+        }
+    }
+
+    /// Copy `src`'s elision set onto `dst`, optionally shifting each position by
+    /// `f`. Used by every method that derives a new array whose holes track the
+    /// source's (`slice`, `concat`, `map`).
+    pub fn copy_holes(&mut self, src: &Value, dst: &Value, f: impl Fn(usize) -> Option<usize>) {
+        if !self.has_holes(src) {
+            return;
+        }
+        let moved: rustc_hash::FxHashSet<usize> =
+            self.hole_indices(src).into_iter().filter_map(f).collect();
+        self.install_holes(dst, moved);
+    }
+
+    /// Rewrite `arr`'s own elision set in place: `f(i)` gives the position each
+    /// existing hole moves to, or `None` if the mutation removed it. This is the
+    /// one primitive behind every structural array mutation — `shift` is
+    /// `i.checked_sub(1)`, `unshift(k)` is `i + k`, `reverse` is `len-1-i`, and
+    /// `splice` is the general case.
+    pub fn remap_holes(&mut self, arr: &Value, f: impl Fn(usize) -> Option<usize>) {
+        if !self.has_holes(arr) {
+            return;
+        }
+        let moved: rustc_hash::FxHashSet<usize> =
+            self.hole_indices(arr).into_iter().filter_map(f).collect();
+        self.install_holes(arr, moved);
+    }
+
+    /// Replace `arr`'s elision set outright, dropping the record entirely when
+    /// the new set is empty so `has_holes` stays a single negative probe for the
+    /// dense case.
+    pub fn install_holes(&mut self, arr: &Value, holes: rustc_hash::FxHashSet<usize>) {
+        let Value::Obj(idx) = arr else { return };
+        if holes.is_empty() {
+            self.array_holes.remove(idx);
+        } else {
+            self.array_holes.insert(*idx, holes);
+        }
+    }
+
+    /// Forget any hole at or past `len` — what a `pop`, a `length` shrink or a
+    /// truncating `splice` leaves behind.
+    pub fn truncate_holes(&mut self, arr: &Value, len: usize) {
+        self.remap_holes(arr, |i| (i < len).then_some(i));
+    }
+
+    /// `util.inspect`'s `formatSpecialArray`: the element strings of a SPARSE
+    /// array, where each maximal run of elided positions collapses to a single
+    /// `<N empty items>` entry. Returns the entries and whether the last of them
+    /// is the `... N more items` tail (which the grid layout must not size a
+    /// column to).
+    ///
+    /// The `maxArrayLength` cap counts ENTRIES, not indices, so a run costs one
+    /// slot however long it is — matching node, where `[ ...Array(200) ]`-style
+    /// sparse arrays print a single `<200 empty items>`.
+    fn inspect_sparse(
+        &self,
+        v: &Value,
+        items: &[Value],
+        indent: usize,
+        st: &mut InspectCycles,
+    ) -> (Vec<String>, bool) {
+        let holes: rustc_hash::FxHashSet<usize> = self.hole_indices(v).into_iter().collect();
+        let empties = |n: usize| {
+            let unit = if n == 1 { "item" } else { "items" };
+            format!("<{n} empty {unit}>")
+        };
+        let mut out: Vec<String> = Vec::new();
+        // The first index not yet accounted for by an entry.
+        let mut index = 0usize;
+        for i in 0..items.len() {
+            if out.len() >= MAX_ARRAY_LENGTH {
+                break;
+            }
+            if holes.contains(&i) {
+                continue;
+            }
+            if i > index {
+                out.push(empties(i - index));
+                index = i;
+                if out.len() >= MAX_ARRAY_LENGTH {
+                    break;
+                }
+            }
+            out.push(self.inspect_lvl(&items[i], indent + 2, st));
+            index = i + 1;
+        }
+        let remaining = items.len() - index;
+        if remaining == 0 {
+            return (out, false);
+        }
+        if out.len() < MAX_ARRAY_LENGTH {
+            // Trailing holes are still `<N empty items>`, not a truncation.
+            out.push(empties(remaining));
+            (out, false)
+        } else {
+            let unit = if remaining == 1 { "item" } else { "items" };
+            out.push(format!("... {remaining} more {unit}"));
+            (out, true)
+        }
     }
     pub fn new_object(&mut self, mut props: IndexMap<String, Value>) -> Value {
         // Integer-index keys enumerate ascending-first regardless of the order
@@ -2947,16 +3143,24 @@ impl JsHost {
                     // array printed all 120 — and, because the grid column width
                     // is computed from what is SHOWN, every column was also one
                     // character wider than node's.
-                    let shown = items.len().min(MAX_ARRAY_LENGTH);
-                    let mut inner: Vec<String> = items[..shown]
-                        .iter()
-                        .map(|x| self.inspect_lvl(x, indent + 2, st))
-                        .collect();
-                    let remaining = items.len() - shown;
-                    if remaining > 0 {
-                        let unit = if remaining == 1 { "item" } else { "items" };
-                        inner.push(format!("... {remaining} more {unit}"));
-                    }
+                    // A SPARSE array takes node's `formatSpecialArray` path: an
+                    // elided run renders as `<N empty items>` rather than as the
+                    // `undefined` it reads back as.
+                    let (mut inner, has_tail) = if self.has_holes(v) {
+                        self.inspect_sparse(v, items, indent, st)
+                    } else {
+                        let shown = items.len().min(MAX_ARRAY_LENGTH);
+                        let mut inner: Vec<String> = items[..shown]
+                            .iter()
+                            .map(|x| self.inspect_lvl(x, indent + 2, st))
+                            .collect();
+                        let remaining = items.len() - shown;
+                        if remaining > 0 {
+                            let unit = if remaining == 1 { "item" } else { "items" };
+                            inner.push(format!("... {remaining} more {unit}"));
+                        }
+                        (inner, remaining > 0)
+                    };
                     let has_props = !prop_keys.is_empty() || !sym_entries.is_empty();
                     for k in &prop_keys {
                         let val = self.fn_prop(v, k).unwrap_or(Value::Undef);
@@ -2976,7 +3180,7 @@ impl JsHost {
                             self.inspect_lvl(val, indent + 2, st)
                         ));
                     }
-                    self.render_array(&inner, items, indent, has_props, remaining > 0, "")
+                    self.render_array(&inner, items, indent, has_props, has_tail, "")
                 }
                 // A typed array renders as `Uint8Array(3) [ 1, 2, 3 ]` — its
                 // constructor and length, then the elements laid out exactly as
@@ -4211,7 +4415,13 @@ impl JsHost {
             // `index`/`input`/`groups` and any user-assigned `arr.foo` are kept
             // in the fn-prop side table — so they are read back from there.
             Some(JsObj::Array(items)) => {
-                let mut keys: Vec<String> = (0..items.len()).map(|i| i.to_string()).collect();
+                // An ELIDED element is not an own property at all, so it
+                // contributes no key — the difference behind
+                // `Object.keys([1,,3])` being `['0','2']`.
+                let mut keys: Vec<String> = (0..items.len())
+                    .filter(|i| !self.is_hole(v, *i))
+                    .map(|i| i.to_string())
+                    .collect();
                 if !enum_only {
                     keys.push("length".into());
                 }

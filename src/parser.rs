@@ -1308,8 +1308,8 @@ impl Parser {
         let mut items = Vec::new();
         while !self.is_punct("]") {
             if self.is_punct(",") {
-                // Elision (hole) — represent as undefined.
-                items.push(Expr::Undefined);
+                // Elision: the element is a HOLE, not a stored `undefined`.
+                items.push(Expr::Hole);
                 self.advance();
                 continue;
             }

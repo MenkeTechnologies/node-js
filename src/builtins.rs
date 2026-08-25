@@ -13,6 +13,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
     vm.register_builtin(ops::DECLARE, b_declare);
     vm.register_builtin(ops::DECLARE_CONST, b_declare_const);
+    vm.register_builtin(ops::MARK_HOLE, b_mark_hole);
     vm.register_builtin(ops::DELNAME, b_delname);
     vm.register_builtin(ops::GETATTR, b_getattr);
     vm.register_builtin(ops::SETATTR, b_setattr);
@@ -1110,7 +1111,10 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             let has = with_host(|h| match h.get(recv) {
                 Some(JsObj::Object(p)) => p.contains_key(&k) || h.own_accessor(recv, &k).is_some(),
                 Some(JsObj::Array(items)) => {
-                    k == "length" || k.parse::<usize>().map(|i| i < items.len()).unwrap_or(false)
+                    k == "length"
+                        || k.parse::<usize>()
+                            .map(|i| i < items.len() && !h.is_hole(recv, i))
+                            .unwrap_or(false)
                 }
                 _ => false,
             });
@@ -1818,12 +1822,30 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         }
         Some(JsObj::Array(items)) => {
             if let Some(n) = new_len {
+                // Growing `length` appends HOLES (`a=[1]; a.length=3` still has
+                // just the one own key); shrinking drops any hole past the end.
+                let old = items.len();
                 items.resize(n, Value::Undef);
+                if n > old {
+                    h.mark_hole_range(recv, old..n);
+                } else {
+                    h.truncate_holes(recv, n);
+                }
             } else if let Ok(i) = name.parse::<usize>() {
-                if i >= items.len() {
+                // A write PAST the end leaves the skipped positions elided.
+                let old = items.len();
+                if i >= old {
                     items.resize(i + 1, Value::Undef);
                 }
                 items[i] = val;
+                if i > old {
+                    h.mark_hole_range(recv, old..i);
+                }
+                // …and the written index itself is no longer one. This is the
+                // single site that keeps a hole record from outliving the
+                // elision it describes: every array element write in the
+                // language reaches it.
+                h.clear_hole(recv, i);
             }
         }
         _ => {}
@@ -1882,7 +1904,10 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
             Some(JsObj::Array(items)) => {
                 if let Ok(i) = index {
                     if i < items.len() {
+                        // `delete a[i]` punches a HOLE: the length is unchanged
+                        // but the index stops being an own property.
                         items[i] = Value::Undef;
+                        h.mark_hole(recv, i);
                     }
                     return;
                 }
@@ -1932,6 +1957,21 @@ fn b_mkstr(vm: &mut VM, argc: u8) -> Value {
 fn b_mkarr(vm: &mut VM, argc: u8) -> Value {
     let items = pop_n(vm, argc as usize);
     with_host(|h| h.new_array(items))
+}
+
+/// `MARK_HOLE [arr, index]`: record `arr[index]` as an ELIDED element. Emitted
+/// only for an array literal that actually contains an elision, so a dense
+/// literal costs nothing. Returns `undefined`; the array stays on the stack
+/// underneath (the compiler `Dup`s it).
+fn b_mark_hole(vm: &mut VM, _: u8) -> Value {
+    let idx = vm.pop();
+    let arr = vm.pop();
+    let i = match idx {
+        Value::Int(i) if i >= 0 => i as usize,
+        _ => return Value::Undef,
+    };
+    with_host(|h| h.mark_hole(&arr, i));
+    Value::Undef
 }
 
 fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
@@ -2704,21 +2744,33 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
 fn b_build_args(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_n(vm, argc as usize);
     let mut out = Vec::new();
+    // Elided positions of an array literal (tag 2), recorded as the run-time
+    // index each lands on — which only this walk knows, because a preceding
+    // spread contributes an unknown number of elements. Call-argument lists,
+    // the other `BUILD_ARGS` caller, cannot contain an elision, so this stays
+    // empty for them.
+    let mut holes: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     let mut i = 0;
     while i + 1 < flat.len() {
-        let spread = matches!(flat[i], Value::Int(1));
         let val = flat[i + 1].clone();
-        if spread {
-            match host::iter_all(&val) {
+        match flat[i] {
+            Value::Int(1) => match host::iter_all(&val) {
                 Ok(items) => out.extend(items),
                 Err(e) => return abort(vm, e),
+            },
+            Value::Int(2) => {
+                holes.insert(out.len());
+                out.push(Value::Undef);
             }
-        } else {
-            out.push(val);
+            _ => out.push(val),
         }
         i += 2;
     }
-    with_host(|h| h.new_array(out))
+    with_host(|h| {
+        let arr = h.new_array(out);
+        h.install_holes(&arr, holes);
+        arr
+    })
 }
 
 // ── calls ──────────────────────────────────────────────────────────────────────
@@ -3785,7 +3837,13 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
             if args.len() == 1 {
                 if let Value::Float(_) | Value::Int(_) = args[0] {
                     let n = host::to_array_length(&args[0])?;
-                    return Ok(with_host(|h| h.new_array(vec![Value::Undef; n])));
+                    // Every element of `new Array(n)` is a HOLE, not a stored
+                    // `undefined`: `Object.keys(Array(3))` is `[]`.
+                    return Ok(with_host(|h| {
+                        let a = h.new_array(vec![Value::Undef; n]);
+                        h.mark_hole_range(&a, 0..n);
+                        a
+                    }));
                 }
             }
             Ok(with_host(|h| h.new_array(args)))
@@ -5605,6 +5663,19 @@ fn array_items(recv: &Value) -> Vec<Value> {
     })
 }
 
+/// The ELIDED positions of array `recv` as a membership set. A dense array —
+/// which is nearly every array — answers with an empty set after a single
+/// negative hash probe and allocates nothing.
+///
+/// The iteration methods split into two groups, and the split is not a matter of
+/// taste: the ones spec'd through `HasProperty` (`forEach`, `map`, `filter`,
+/// `some`, `every`, `reduce`, `indexOf`, `flat`, `sort`) SKIP a hole, while the
+/// ones spec'd through a bare `Get` (`for…of`, spread, `find`, `includes`,
+/// `join`, `entries`, `Array.from`) see the `undefined` a hole reads back as.
+fn hole_set(recv: &Value) -> rustc_hash::FxHashSet<usize> {
+    with_host(|h| h.hole_indices(recv)).into_iter().collect()
+}
+
 /// The element count, without copying the elements.
 fn array_len(recv: &Value) -> usize {
     peek(recv, |o| match o {
@@ -5630,14 +5701,20 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             Ok(Value::Float(len as f64))
         }
         "pop" => Ok(with_host(|h| {
-            if let Some(JsObj::Array(items)) = h.get_mut(recv) {
+            let popped = if let Some(JsObj::Array(items)) = h.get_mut(recv) {
                 items.pop().unwrap_or(Value::Undef)
             } else {
                 Value::Undef
-            }
+            };
+            let len = match h.get(recv) {
+                Some(JsObj::Array(items)) => items.len(),
+                _ => 0,
+            };
+            h.truncate_holes(recv, len);
+            popped
         })),
         "shift" => Ok(with_host(|h| {
-            if let Some(JsObj::Array(items)) = h.get_mut(recv) {
+            let shifted = if let Some(JsObj::Array(items)) = h.get_mut(recv) {
                 if items.is_empty() {
                     Value::Undef
                 } else {
@@ -5645,7 +5722,9 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 }
             } else {
                 Value::Undef
-            }
+            };
+            h.remap_holes(recv, |i| i.checked_sub(1));
+            shifted
         })),
         "unshift" => {
             with_host(|h| {
@@ -5654,6 +5733,8 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                         items.insert(i, a.clone());
                     }
                 }
+                let n = args.len();
+                h.remap_holes(recv, |i| Some(i + n));
             });
             Ok(Value::Float(array_len(recv) as f64))
         }
@@ -5694,16 +5775,31 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             host::join_stack_pop();
             Ok(with_host(|h| h.new_str(parts.join(","))))
         }
+        // `indexOf`/`lastIndexOf` are spec'd through `HasProperty`, so a hole is
+        // never a match: `[1,,3].indexOf(undefined)` is `-1`, while the
+        // `Get`-based `includes` reports `true` for the same array.
         "indexOf" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let target = arg0(&args);
-            let idx = with_host(|h| items.iter().position(|x| h.strict_eq(x, &target)));
+            let idx = with_host(|h| {
+                items
+                    .iter()
+                    .enumerate()
+                    .position(|(i, x)| !holes.contains(&i) && h.strict_eq(x, &target))
+            });
             Ok(Value::Float(idx.map(|i| i as f64).unwrap_or(-1.0)))
         }
         "lastIndexOf" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let target = arg0(&args);
-            let idx = with_host(|h| items.iter().rposition(|x| h.strict_eq(x, &target)));
+            let idx = with_host(|h| {
+                items
+                    .iter()
+                    .enumerate()
+                    .rposition(|(i, x)| !holes.contains(&i) && h.strict_eq(x, &target))
+            });
             Ok(Value::Float(idx.map(|i| i as f64).unwrap_or(-1.0)))
         }
         "includes" => {
@@ -5720,23 +5816,47 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         "slice" => {
             let items = array_items(recv);
             let (lo, hi) = slice_bounds(&args, items.len());
-            Ok(with_host(|h| h.new_array(items[lo..hi].to_vec())))
+            Ok(with_host(|h| {
+                let out = h.new_array(items[lo..hi].to_vec());
+                h.copy_holes(recv, &out, |i| (i >= lo && i < hi).then(|| i - lo));
+                out
+            }))
         }
         "concat" => {
             let mut out = array_items(recv);
+            // A hole in either the receiver or a spreadable argument stays a hole
+            // in the result, at its shifted position.
+            let mut holes = hole_set(recv);
+            let mut sources: Vec<(Value, usize)> = Vec::new();
             for a in &args {
                 match with_host(|h| h.get(a).cloned()) {
-                    Some(JsObj::Array(items)) => out.extend(items),
+                    Some(JsObj::Array(items)) => {
+                        sources.push((a.clone(), out.len()));
+                        out.extend(items);
+                    }
                     _ => out.push(a.clone()),
                 }
             }
-            Ok(with_host(|h| h.new_array(out)))
+            for (src, base) in sources {
+                holes.extend(
+                    with_host(|h| h.hole_indices(&src))
+                        .into_iter()
+                        .map(|i| i + base),
+                );
+            }
+            Ok(with_host(|h| {
+                let arr = h.new_array(out);
+                h.install_holes(&arr, holes);
+                arr
+            }))
         }
         "reverse" => {
+            let len = array_len(recv);
             with_host(|h| {
                 if let Some(JsObj::Array(items)) = h.get_mut(recv) {
                     items.reverse();
                 }
+                h.remap_holes(recv, |i| Some(len - 1 - i));
             });
             Ok(recv.clone())
         }
@@ -5762,6 +5882,8 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                         *it = val.clone();
                     }
                 }
+                // Every filled position now holds a real value.
+                h.remap_holes(recv, |i| (i < start || i >= end).then_some(i));
             });
             Ok(recv.clone())
         }
@@ -5783,6 +5905,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 len as usize
             };
             let slice: Vec<Value> = items[start..end.max(start)].to_vec();
+            let copied = slice.len();
+            // A copied position takes its SOURCE's hole-ness (10.4.2 copyWithin
+            // deletes the target when the source has no such property);
+            // everything outside the written range keeps its own.
+            let src_holes = hole_set(recv);
             with_host(|h| {
                 if let Some(JsObj::Array(a)) = h.get_mut(recv) {
                     for (k, v) in slice.into_iter().enumerate() {
@@ -5791,6 +5918,18 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                         }
                     }
                 }
+                let len = len as usize;
+                let mut holes: rustc_hash::FxHashSet<usize> = src_holes
+                    .iter()
+                    .copied()
+                    .filter(|i| *i < target || *i >= (target + copied).min(len))
+                    .collect();
+                for k in 0..copied {
+                    if target + k < len && src_holes.contains(&(start + k)) {
+                        holes.insert(target + k);
+                    }
+                }
+                h.install_holes(recv, holes);
             });
             Ok(recv.clone())
         }
@@ -5806,24 +5945,40 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 Value::Undef
             })
         }
+        // 23.1.3.21: the callback runs only where `HasProperty` holds, and the
+        // result array is created with the SAME holes — `[1,,3].map(f)` calls `f`
+        // twice and yields `[2, <1 empty item>, 6]`.
         "map" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let cb = arg0(&args);
             let mut out = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
+                if holes.contains(&i) {
+                    out.push(Value::Undef);
+                    continue;
+                }
                 out.push(host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), recv.clone()],
                     None,
                 )?);
             }
-            Ok(with_host(|h| h.new_array(out)))
+            Ok(with_host(|h| {
+                let arr = h.new_array(out);
+                h.install_holes(&arr, holes);
+                arr
+            }))
         }
         "flatMap" => {
             let items = array_items(recv);
             let cb = arg0(&args);
+            let holes = hole_set(recv);
             let mut out = Vec::new();
             for (i, it) in items.iter().enumerate() {
+                if holes.contains(&i) {
+                    continue;
+                }
                 let r = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), recv.clone()],
@@ -5838,9 +5993,13 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         }
         "filter" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let cb = arg0(&args);
             let mut out = Vec::new();
             for (i, it) in items.iter().enumerate() {
+                if holes.contains(&i) {
+                    continue;
+                }
                 let keep = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), recv.clone()],
@@ -5854,8 +6013,12 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         }
         "forEach" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let cb = arg0(&args);
             for (i, it) in items.iter().enumerate() {
+                if holes.contains(&i) {
+                    continue;
+                }
                 host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), recv.clone()],
@@ -5896,8 +6059,12 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         }
         "some" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let cb = arg0(&args);
             for (i, it) in items.iter().enumerate() {
+                if holes.contains(&i) {
+                    continue;
+                }
                 let m = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), recv.clone()],
@@ -5911,8 +6078,12 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         }
         "every" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let cb = arg0(&args);
             for (i, it) in items.iter().enumerate() {
+                if holes.contains(&i) {
+                    continue;
+                }
                 let m = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), recv.clone()],
@@ -5926,20 +6097,31 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         }
         "reduce" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let cb = arg0(&args);
             let mut acc;
             let mut start = 0;
             if args.len() >= 2 {
                 acc = args[1].clone();
-            } else if !items.is_empty() {
-                acc = items[0].clone();
-                start = 1;
             } else {
-                return Err(host::type_error(
-                    "Reduce of empty array with no initial value",
-                ));
+                // With no seed the accumulator is the first PRESENT element, so a
+                // leading run of holes is skipped rather than seeding `undefined`.
+                match (0..items.len()).find(|i| !holes.contains(i)) {
+                    Some(i) => {
+                        acc = items[i].clone();
+                        start = i + 1;
+                    }
+                    None => {
+                        return Err(host::type_error(
+                            "Reduce of empty array with no initial value",
+                        ))
+                    }
+                }
             }
             for (i, it) in items.iter().enumerate().skip(start) {
+                if holes.contains(&i) {
+                    continue;
+                }
                 acc = host::invoke(
                     &cb,
                     vec![acc, it.clone(), Value::Float(i as f64), recv.clone()],
@@ -5950,22 +6132,31 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         }
         "reduceRight" => {
             let items = array_items(recv);
+            let holes = hole_set(recv);
             let cb = arg0(&args);
             let n = items.len();
             let mut acc;
             let mut i = n; // one past the next index to process (walking down)
             if args.len() >= 2 {
                 acc = args[1].clone();
-            } else if n > 0 {
-                acc = items[n - 1].clone();
-                i = n - 1;
             } else {
-                return Err(host::type_error(
-                    "Reduce of empty array with no initial value",
-                ));
+                match (0..n).rev().find(|i| !holes.contains(i)) {
+                    Some(k) => {
+                        acc = items[k].clone();
+                        i = k;
+                    }
+                    None => {
+                        return Err(host::type_error(
+                            "Reduce of empty array with no initial value",
+                        ))
+                    }
+                }
             }
             while i > 0 {
                 i -= 1;
+                if holes.contains(&i) {
+                    continue;
+                }
                 acc = host::invoke(
                     &cb,
                     vec![acc, items[i].clone(), Value::Float(i as f64), recv.clone()],
@@ -6004,13 +6195,26 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
             }
             Ok(Value::Float(-1.0))
         }
+        // 23.1.3.30: `SortIndexedProperties` collects only the PRESENT elements,
+        // and the holes are re-created at the tail — `[3,,1].sort()` is
+        // `[1, 3, <1 empty item>]` with own keys `['0','1']`.
         "sort" => {
-            let mut items = array_items(recv);
+            let all = array_items(recv);
+            let holes = hole_set(recv);
+            let mut items: Vec<Value> = all
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !holes.contains(i))
+                .map(|(_, v)| v.clone())
+                .collect();
             sort_values(&mut items, args.first())?;
+            let present = items.len();
+            items.resize(all.len(), Value::Undef);
             with_host(|h| {
                 if let Some(JsObj::Array(a)) = h.get_mut(recv) {
                     *a = items;
                 }
+                h.install_holes(recv, (present..all.len()).collect());
             });
             Ok(recv.clone())
         }
@@ -6074,7 +6278,7 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
                 raw.trunc()
             };
             let mut out = Vec::new();
-            flatten_into(array_items(recv), depth, &mut out)?;
+            flatten_into(recv, depth, &mut out)?;
             Ok(with_host(|h| h.new_array(out)))
         }
         "keys" => {
@@ -6106,6 +6310,11 @@ fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Str
         // shares its cycle cut, which is the whole reason it must not call
         // `join_parts` directly: `ToString` of a nested array lands back here.
         "toString" => join_array(recv, ","),
+        // An Array inherits from `Object.prototype` too, so the methods it does
+        // not override resolve there. `[].hasOwnProperty` already read back as a
+        // function through the property path, but CALLING it landed here and
+        // threw `is not a function`.
+        _ if is_object_builtin_method(name) => object_builtin_method(recv, name, args),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
 }
@@ -6292,22 +6501,24 @@ fn merge(
 /// exceeded` on node v26.7.0. That is reproduced by checking the same native
 /// stack floor the VM does, so the answer is a catchable error rather than the
 /// `fatal runtime error: stack overflow` abort this used to produce.
-fn flatten_into(items: Vec<Value>, depth: f64, out: &mut Vec<Value>) -> Result<(), String> {
+/// `FlattenIntoArray` (23.1.3.13.1). Takes the source ARRAY rather than its
+/// elements because each level tests `HasProperty` before recursing, so a hole
+/// contributes nothing at any depth: `[1,,3].flat()` is the dense `[1, 3]`.
+fn flatten_into(src: &Value, depth: f64, out: &mut Vec<Value>) -> Result<(), String> {
     if host::stack_exhausted() {
         return Err(host::stack_overflow_error());
     }
-    for it in items {
-        let inner = if depth > 0.0 {
-            match with_host(|h| h.get(&it).cloned()) {
-                Some(JsObj::Array(inner)) => Some(inner),
-                _ => None,
-            }
+    let items = array_items(src);
+    let holes = hole_set(src);
+    for (i, it) in items.into_iter().enumerate() {
+        if holes.contains(&i) {
+            continue;
+        }
+        let nested = depth > 0.0 && with_host(|h| h.kind_of(&it)) == Some(ObjKind::Array);
+        if nested {
+            flatten_into(&it, depth - 1.0, out)?;
         } else {
-            None
-        };
-        match inner {
-            Some(inner) => flatten_into(inner, depth - 1.0, out)?,
-            None => out.push(it),
+            out.push(it);
         }
     }
     Ok(())
@@ -6329,6 +6540,10 @@ fn array_splice(recv: &Value, args: Vec<Value>) -> Result<Value, String> {
         len - start
     };
     let inserts: Vec<Value> = args.iter().skip(2).cloned().collect();
+    let inserted = inserts.len();
+    // The receiver's holes shift by (inserted - deleted) past the cut, and the
+    // ones inside the cut move into the RETURNED array at their offset there.
+    let holes = hole_set(recv);
     let removed = with_host(|h| {
         if let Some(JsObj::Array(items)) = h.get_mut(recv) {
             let removed: Vec<Value> = items.splice(start..start + delete, inserts).collect();
@@ -6337,7 +6552,33 @@ fn array_splice(recv: &Value, args: Vec<Value>) -> Result<Value, String> {
             Vec::new()
         }
     });
-    Ok(with_host(|h| h.new_array(removed)))
+    Ok(with_host(|h| {
+        h.install_holes(
+            recv,
+            holes
+                .iter()
+                .filter_map(|&i| {
+                    if i < start {
+                        Some(i)
+                    } else if i < start + delete {
+                        None
+                    } else {
+                        Some(i - delete + inserted)
+                    }
+                })
+                .collect(),
+        );
+        let out = h.new_array(removed);
+        h.install_holes(
+            &out,
+            holes
+                .iter()
+                .filter(|&&i| i >= start && i < start + delete)
+                .map(|&i| i - start)
+                .collect(),
+        );
+        out
+    }))
 }
 
 fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
@@ -7859,6 +8100,8 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
         // An array's index keys read the elements; `length` is the exotic own
         // property; anything else is an ordinary own key in the side table.
         Some(JsObj::Array(items)) => match key.parse::<usize>() {
+            // An ELIDED index owns no property at all, so it has no descriptor.
+            Ok(i) if h.is_hole(&obj, i) => None,
             Ok(i) => items.get(i).cloned(),
             Err(_) if key == "length" => Some(Value::Float(items.len() as f64)),
             Err(_) => h.fn_prop(&obj, &key),
@@ -7942,7 +8185,7 @@ fn has_property_ordinary(obj: &Value, key: &str) -> bool {
             key == "length"
                 || key
                     .parse::<usize>()
-                    .map(|i| i < items.len())
+                    .map(|i| i < items.len() && !h.is_hole(obj, i))
                     .unwrap_or(false)
                 // A non-index own property (`arr.foo`, `arr[sym]`) lives in the
                 // side table, and `in` must see it.
@@ -7982,6 +8225,9 @@ fn deep_clone_seen(v: &Value, seen: &mut std::collections::HashMap<u32, Value>) 
                 if let Some(JsObj::Array(a)) = h.get_mut(&out) {
                     *a = cloned;
                 }
+                // A sparse source clones to an equally sparse array: the clone
+                // walks own properties, so a hole is nothing to copy.
+                h.copy_holes(v, &out, Some);
             });
             out
         }

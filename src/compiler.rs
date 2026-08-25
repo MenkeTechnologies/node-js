@@ -598,8 +598,10 @@ impl Compiler {
         b.emit(Op::CallBuiltin(ops::UNPACK, 3), 0); // pushes items[0]..items[n-1], items[0] on top
         for it in items {
             match it {
-                Expr::Undefined => {
-                    b.emit(Op::Pop, 0); // hole
+                // An elided target position (`const [a, , b] = xs`) still
+                // consumes its unpacked value; nothing is bound to it.
+                Expr::Hole | Expr::Undefined => {
+                    b.emit(Op::Pop, 0);
                 }
                 Expr::Spread(inner) => self.compile_bind(b, inner, declare)?,
                 _ => self.compile_bind(b, it, declare)?,
@@ -1736,6 +1738,12 @@ impl Compiler {
             Expr::Undefined => {
                 b.emit(Op::LoadUndef, 0);
             }
+            // A hole only carries its extra meaning INSIDE an array literal
+            // (`compile_array` records it); evaluated anywhere else it is just
+            // the `undefined` an elided read produces.
+            Expr::Hole => {
+                b.emit(Op::LoadUndef, 0);
+            }
             Expr::Null => {
                 b.emit(Op::CallBuiltin(ops::LOAD_NULL, 0), 0);
             }
@@ -1926,12 +1934,19 @@ impl Compiler {
 
     fn compile_array(&mut self, b: &mut ChunkBuilder, items: &[Expr]) -> Result<(), String> {
         if items.iter().any(|e| matches!(e, Expr::Spread(_))) {
-            // (tag, value) pairs; tag 1 = spread.
+            // (tag, value) pairs; tag 1 = spread, tag 2 = elision. A spread
+            // makes every later element's index a RUN-TIME quantity, so the
+            // holes cannot be recorded from here — the tag carries the fact and
+            // `BUILD_ARGS` marks them as it walks.
             for it in items {
                 match it {
                     Expr::Spread(inner) => {
                         b.emit(Op::LoadInt(1), 0);
                         self.compile_expr(b, inner)?;
+                    }
+                    Expr::Hole => {
+                        b.emit(Op::LoadInt(2), 0);
+                        b.emit(Op::LoadUndef, 0);
                     }
                     _ => {
                         b.emit(Op::LoadInt(0), 0);
@@ -1945,6 +1960,7 @@ impl Compiler {
                 self.compile_expr(b, it)?;
             }
             b.emit(Op::CallBuiltin(ops::MKARR, argc(items.len())?), 0);
+            self.mark_literal_holes(b, items);
         } else {
             // A literal larger than one CallBuiltin's u8 arg count can hold (the
             // generated data tables in iconv-lite hit this): start from an empty
@@ -1958,8 +1974,26 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0); // -> [arr, val]
                 b.emit(Op::Pop, 0); // [arr]
             }
+            // After the writes: a `SETITEM` CLEARS the hole at the index it
+            // writes, so marking has to come last.
+            self.mark_literal_holes(b, items);
         }
         Ok(())
+    }
+
+    /// Emit a `MARK_HOLE` per elided position of a spread-free array literal,
+    /// with the finished array on top of the stack. Emits nothing at all for the
+    /// dense literals that are essentially every literal in real code.
+    fn mark_literal_holes(&mut self, b: &mut ChunkBuilder, items: &[Expr]) {
+        for (i, it) in items.iter().enumerate() {
+            if !matches!(it, Expr::Hole) {
+                continue;
+            }
+            b.emit(Op::Dup, 0); // [arr, arr]
+            b.emit(Op::LoadInt(i as i64), 0); // [arr, arr, i]
+            b.emit(Op::CallBuiltin(ops::MARK_HOLE, 2), 0); // [arr, undefined]
+            b.emit(Op::Pop, 0); // [arr]
+        }
     }
 
     fn compile_object(&mut self, b: &mut ChunkBuilder, props: &[Prop]) -> Result<(), String> {

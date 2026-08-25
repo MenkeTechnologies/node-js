@@ -99,6 +99,7 @@ pub fn expr_captures(e: &Expr) -> bool {
 
         Expr::Null
         | Expr::Undefined
+        | Expr::Hole
         | Expr::True
         | Expr::False
         | Expr::Number(_)

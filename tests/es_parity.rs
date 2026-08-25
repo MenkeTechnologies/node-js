@@ -3350,3 +3350,313 @@ fn regex_objects_stay_distinct_while_the_engine_is_shared() {
          [1,1,1]"
     );
 }
+
+// ── array holes (elided elements) ────────────────────────────────────────────
+//
+// A hole is NOT a stored `undefined`: it reads back as one, but it is not an
+// own property, and half the array methods are spec'd to skip it. The two facts
+// are what these tests pin, together with the `<N empty items>` rendering.
+
+#[test]
+fn array_holes_are_not_own_properties() {
+    // `[1,,3]` — an ELIDED element is not an own property, so it is absent
+    // from `in`, `Object.keys/values/entries`, `hasOwnProperty`, `for…in`,
+    // spread-into-object and `getOwnPropertyDescriptor`, while still READING
+    // back as `undefined`.
+    let src = r##"
+        const a = [1,,3];
+        console.log(1 in a, 0 in a, 2 in a);
+        console.log(JSON.stringify(Object.keys(a)));
+        console.log(JSON.stringify(Object.values(a)));
+        console.log(JSON.stringify(Object.entries(a)));
+        console.log(a.hasOwnProperty(1), a.hasOwnProperty(0), a.hasOwnProperty('length'));
+        console.log(a.length, JSON.stringify(a));
+        console.log(JSON.stringify(Object.getOwnPropertyNames(a)));
+        console.log(a.propertyIsEnumerable(1), a.propertyIsEnumerable(0));
+        const seen = []; for (const k in a) seen.push(k); console.log(JSON.stringify(seen));
+        console.log(JSON.stringify(Object.assign({}, a)));
+        console.log(JSON.stringify({...a}));
+        console.log(Object.getOwnPropertyDescriptor(a, 1));
+        console.log(JSON.stringify(Object.getOwnPropertyDescriptor(a, 0)));
+    "##;
+    let expected = [
+        "false true true",
+        "[\"0\",\"2\"]",
+        "[1,3]",
+        "[[\"0\",1],[\"2\",3]]",
+        "false true true",
+        "3 [1,null,3]",
+        "[\"0\",\"2\",\"length\"]",
+        "false true",
+        "[\"0\",\"2\"]",
+        "{\"0\":1,\"2\":3}",
+        "{\"0\":1,\"2\":3}",
+        "undefined",
+        "{\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true}",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn array_holes_survive_structural_mutation() {
+    // A hole tracks its element through every structural mutation —
+    // `push`/`pop`/`shift`/`unshift`, the change-by-copy methods, `copyWithin`,
+    // `fill`, a `length` grow, a write past the end — and `util.inspect`
+    // renders each maximal run as `<N empty items>`.
+    let src = r##"
+        const a=[1,,3];
+        console.log(a.at(1), a[1]);
+        console.log([1,,3,,5].toSorted());
+        console.log([1,,3].toReversed());
+        console.log([1,,3].with(0,9));
+        console.log([1,,3,4].toSpliced(1,1));
+        console.log([1,,3].copyWithin(0,1));
+        console.log([1,2,3,,5].fill(9,1,3));
+        console.log(Array(200));
+        console.log([1,...Array(3),5]);
+        const big=[]; big[150]=1; console.log(big);
+        console.log(Array.of(1,undefined,3));
+        console.log([1,,3].keys().next(), [...[1,,3].keys()]);
+        console.log([...[1,,3].entries()]);
+        console.log(JSON.stringify([1,,3], null, 0));
+        console.log([1,,3].lastIndexOf(undefined), [1,,3].indexOf(3));
+        console.log([1,,3].findLast(x=>true), [1,,3].findLastIndex(x=>x===undefined));
+        const f=[1,,3]; Object.freeze(f); console.log(Object.keys(f), f.length);
+        console.log(Array.isArray([1,,3]), [1,,3].constructor === Array);
+        let z=[1,,3]; z.push(4); console.log(z, Object.keys(z));
+        let y=[1,,3]; y.pop(); console.log(y, Object.keys(y), y.length);
+        let x=[,,3]; x.shift(); console.log(x, Object.keys(x));
+        let w=[1,,3]; w.unshift(0); console.log(w, Object.keys(w));
+        console.log(structuredClone([1,,3]));
+    "##;
+    let expected = [
+        "undefined undefined",
+        "[ 1, 3, 5, undefined, undefined ]",
+        "[ 3, undefined, 1 ]",
+        "[ 9, undefined, 3 ]",
+        "[ 1, 3, 4 ]",
+        "[ <1 empty item>, 3, 3 ]",
+        "[ 1, 9, 9, <1 empty item>, 5 ]",
+        "[ <200 empty items> ]",
+        "[ 1, undefined, undefined, undefined, 5 ]",
+        "[ <150 empty items>, 1 ]",
+        "[ 1, undefined, 3 ]",
+        "{ value: 0, done: false } [ 0, 1, 2 ]",
+        "[ [ 0, 1 ], [ 1, undefined ], [ 2, 3 ] ]",
+        "[1,null,3]",
+        "-1 2",
+        "3 1",
+        "[ '0', '2' ] 3",
+        "true true",
+        "[ 1, <1 empty item>, 3, 4 ] [ '0', '2', '3' ]",
+        "[ 1, <1 empty item> ] [ '0' ] 2",
+        "[ <1 empty item>, 3 ] [ '1' ]",
+        "[ 0, 1, <1 empty item>, 3 ] [ '0', '1', '3' ]",
+        "[ 1, <1 empty item>, 3 ]",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn array_hole_iteration_methods_skip_them() {
+    // The `HasProperty`-spec'd iteration methods
+    // (`forEach`/`map`/`filter`/`some`/`every`/`reduce`/`flat`/`sort`) SKIP a
+    // hole; the `Get`-spec'd ones (`for…of`, spread, `join`, `Array.from`,
+    // `includes`) see the `undefined` it reads back as.
+    let src = r##"
+        console.log(Array(3).every(x=>false), Array(3).some(x=>true));
+        console.log(Array(3).map((x,i)=>i));
+        console.log(Array.from({length:3}));
+        console.log(Array.from(Array(3), (x,i)=>i));
+        console.log([,,3].join('|'), [1,,].join('|'));
+        const [p,,q] = [1,2,3]; console.log(p,q);
+        const [r,s] = [1,,3]; console.log(r,s);
+        function f(...a){return a} console.log(f(...[1,,3]));
+        console.log(Math.max(...[1,,3]));
+        console.log([1,,3].toLocaleString());
+        console.log(Object.freeze([1,,3]));
+        console.log([].concat([1,,3], 4, [,5]));
+        console.log(new Set([1,,3]));
+        console.log(new Map([[1,2]]));
+        console.log([1,,3].flat(0));
+        console.log([[1,,3]].flat());
+        console.log(Array(3).fill().map((_,i)=>i));
+        console.log(Array(3).join('-'));
+        let a=Array(3); a[1]=7; console.log(a, Object.keys(a));
+        let b=[1,,3]; b[1]=7; console.log(b, Object.keys(b), 1 in b);
+        let c=[1,,3]; delete c[0]; console.log(c, Object.keys(c));
+        console.log([1,,3].reduce((p,q)=>p+q, 0));
+        console.log(Array(3).reduce((p,q)=>p+q, 0));
+        try { Array(3).reduce((p,q)=>p+q) } catch(e) { console.log(e.constructor.name, e.message) }
+        console.log(JSON.stringify({a:[1,,3]}));
+        console.log([1,,3].sort((x,y)=>0));
+        console.log([undefined,,1].sort());
+    "##;
+    let expected = [
+        "true false",
+        "[ <3 empty items> ]",
+        "[ undefined, undefined, undefined ]",
+        "[ 0, 1, 2 ]",
+        "||3 1|",
+        "1 3",
+        "1 undefined",
+        "[ 1, undefined, 3 ]",
+        "NaN",
+        "1,,3",
+        "[ 1, <1 empty item>, 3 ]",
+        "[ 1, <1 empty item>, 3, 4, <1 empty item>, 5 ]",
+        "Set(3) { 1, undefined, 3 }",
+        "Map(1) { 1 => 2 }",
+        "[ 1, 3 ]",
+        "[ 1, 3 ]",
+        "[ 0, 1, 2 ]",
+        "--",
+        "[ <1 empty item>, 7, <1 empty item> ] [ '1' ]",
+        "[ 1, 7, 3 ] [ '0', '1', '2' ] true",
+        "[ <2 empty items>, 3 ] [ '2' ]",
+        "4",
+        "0",
+        "TypeError Reduce of empty array with no initial value",
+        "{\"a\":[1,null,3]}",
+        "[ 1, 3, <1 empty item> ]",
+        "[ 1, undefined, <1 empty item> ]",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn array_holes_read_back_as_undefined() {
+    // The two groups side by side on one array, plus `delete` punching a hole,
+    // `Array(n)` being all holes, and `JSON.stringify` writing `null` for each.
+    let src = r##"
+        const a = [1,,3];
+        console.log(1 in a, 0 in a, 2 in a);
+        console.log(JSON.stringify(Object.keys(a)));
+        console.log(JSON.stringify(Object.values(a)));
+        console.log(JSON.stringify(Object.entries(a)));
+        console.log(a.hasOwnProperty(1), a.hasOwnProperty(0));
+        console.log(a.length);
+        let c=0; a.forEach(()=>c++); console.log('forEach', c);
+        console.log(JSON.stringify(a.map(x=>x*2)));
+        console.log(JSON.stringify(a.filter(()=>true)));
+        console.log(a.reduce((p,q)=>p+q));
+        console.log(JSON.stringify([...a]));
+        console.log(a.join('-'));
+        console.log(JSON.stringify(Array.from(a)));
+        console.log(JSON.stringify(a));
+        console.log(a.indexOf(undefined), a.includes(undefined));
+        const b = Array(3);
+        console.log(JSON.stringify(Object.keys(b)), b.length, JSON.stringify(b));
+        const d = [1,2,3]; delete d[1];
+        console.log(d.length, JSON.stringify(Object.keys(d)), 1 in d);
+        const e = [1,,];
+        console.log(e.length, JSON.stringify(Object.keys(e)));
+        console.log(JSON.stringify([3,,1].sort()));
+        console.log(JSON.stringify(Object.keys([3,,1].sort())));
+        console.log(JSON.stringify([1,,3].flat()));
+    "##;
+    let expected = [
+        "false true true",
+        "[\"0\",\"2\"]",
+        "[1,3]",
+        "[[\"0\",1],[\"2\",3]]",
+        "false true",
+        "3",
+        "forEach 2",
+        "[2,null,6]",
+        "[1,3]",
+        "4",
+        "[1,null,3]",
+        "1--3",
+        "[1,null,3]",
+        "[1,null,3]",
+        "-1 true",
+        "[] 3 [null,null,null]",
+        "3 [\"0\",\"2\"] false",
+        "2 [\"0\"]",
+        "[1,3,null]",
+        "[\"0\",\"1\"]",
+        "[1,3]",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn array_holes_render_as_empty_items() {
+    // `util.inspect` hole rendering: consecutive holes group into one `<N empty
+    // items>` entry, at every nesting level.
+    let src = r##"
+        console.log([1,,3]);
+        console.log(Array(3));
+        console.log([,,]);
+        console.log([1,,,,5]);
+        console.log([,1]);
+        console.log(new Array(5).fill(0));
+        const a=[1,2,3]; delete a[1]; console.log(a);
+        console.log([1,,3].map(x=>x*2));
+        console.log([3,,1].sort());
+        console.log([1,,3].slice(0,2));
+        console.log([1,,3].concat([4,,6]));
+        console.log([1,,3].reverse());
+        console.log([[1,,3]]);
+        console.log({x:[1,,3]});
+        const b=[1]; b.length=4; console.log(b, Object.keys(b));
+        const c=[]; c[3]='x'; console.log(c, Object.keys(c), c.length);
+        console.log([1,,3].splice(1,1));
+        const d=[1,,3,,5]; console.log(d.splice(1,2), d, Object.keys(d));
+        console.log([...[1,,3]]);
+        for (const x of [1,,3]) console.log('of', x);
+        console.log([1,,3].entries().next().value);
+        console.log(Array.from([1,,3]));
+        console.log([1,,3].find(x=>x===undefined));
+        console.log([1,,3].findIndex(x=>x===undefined));
+        console.log([1,,3].every(x=>x!==undefined));
+        console.log([1,,3].some(x=>x===undefined));
+        console.log([1,,3].flat(), [[1,,3],,4].flat());
+        console.log([1,,3].flatMap(x=>[x]));
+        console.log([1,,3].reduceRight((p,q)=>p+q));
+        console.log([1,,3].toString());
+        console.log(String([1,,3]));
+    "##;
+    let expected = [
+        "[ 1, <1 empty item>, 3 ]",
+        "[ <3 empty items> ]",
+        "[ <2 empty items> ]",
+        "[ 1, <3 empty items>, 5 ]",
+        "[ <1 empty item>, 1 ]",
+        "[ 0, 0, 0, 0, 0 ]",
+        "[ 1, <1 empty item>, 3 ]",
+        "[ 2, <1 empty item>, 6 ]",
+        "[ 1, 3, <1 empty item> ]",
+        "[ 1, <1 empty item> ]",
+        "[ 1, <1 empty item>, 3, 4, <1 empty item>, 6 ]",
+        "[ 3, <1 empty item>, 1 ]",
+        "[ [ 1, <1 empty item>, 3 ] ]",
+        "{ x: [ 1, <1 empty item>, 3 ] }",
+        "[ 1, <3 empty items> ] [ '0' ]",
+        "[ <3 empty items>, 'x' ] [ '3' ] 4",
+        "[ <1 empty item> ]",
+        "[ <1 empty item>, 3 ] [ 1, <1 empty item>, 5 ] [ '0', '2' ]",
+        "[ 1, undefined, 3 ]",
+        "of 1",
+        "of undefined",
+        "of 3",
+        "[ 0, 1 ]",
+        "[ 1, undefined, 3 ]",
+        "undefined",
+        "1",
+        "true",
+        "false",
+        "[ 1, 3 ] [ 1, 3, 4 ]",
+        "[ 1, 3 ]",
+        "4",
+        "1,,3",
+        "1,,3",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}

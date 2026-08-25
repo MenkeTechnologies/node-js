@@ -141,6 +141,10 @@ pub enum Expr {
     Class(Box<ClassNode>),
 
     Array(Vec<Expr>),
+    /// An elided array-literal element (`[1,,3]`) — a HOLE, which reads back as
+    /// `undefined` but is not an own property. Distinct from `Expr::Undefined`
+    /// so `compile_array` can record it and `destructure_array` can skip it.
+    Hole,
     Object(Vec<Prop>),
     /// `...expr` — a spread element (array/call).
     Spread(Box<Expr>),
