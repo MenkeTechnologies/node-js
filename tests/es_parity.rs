@@ -4757,3 +4757,163 @@ fn an_injected_return_closes_the_parked_iterators() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── web-platform globals ─────────────────────────────────────────────────────
+
+#[test]
+fn web_platform_globals_match_node() {
+    // URL/URLSearchParams, TextEncoder/TextDecoder, queueMicrotask ordering
+    // against promise reactions, AggregateError and Promise.any, and
+    // Object.groupBy/Map.groupBy.
+    let src = r##"
+        console.log('--- URL');
+        const u = new URL('https://a:b@h.io:8443/p/q?x=1&y=2#f');
+        console.log(u.href, u.protocol, u.host, u.hostname, u.port, u.pathname, u.search, u.hash, u.origin, u.username, u.password);
+        console.log(String(u), JSON.stringify(u), u.toJSON());
+        const sp = new URLSearchParams('a=1&b=2&a=3');
+        console.log(sp.get('a'), sp.getAll('a'), sp.has('b'), sp.toString());
+        sp.append('c','4'); sp.set('a','9'); sp.delete('b'); console.log(sp.toString(), sp.size);
+        console.log('iterable:', typeof sp[Symbol.iterator]);
+        console.log(new URL('/x','https://h.io/a/b').href, new URL('c','https://h.io/a/b').href);
+        console.log('--- TextEncoder/Decoder');
+        const te = new TextEncoder(); const bytes = te.encode('héllo');
+        console.log(te.encoding, bytes, bytes.length, new TextDecoder().decode(bytes));
+        console.log(new TextDecoder('utf-8').decode(new Uint8Array([226,130,172])));
+        console.log('--- queueMicrotask ordering');
+        Promise.resolve().then(()=>console.log('p1'));
+        queueMicrotask(()=>console.log('q1'));
+        Promise.resolve().then(()=>console.log('p2'));
+        queueMicrotask(()=>console.log('q2'));
+        console.log('sync');
+        console.log('--- AggregateError / Promise.any');
+        (async()=>{
+          try { await Promise.any([Promise.reject(new Error('a')), Promise.reject(new Error('b'))]) }
+          catch(e){ console.log(e.constructor.name, e.message, e.errors.map(x=>x.message)) }
+          console.log(await Promise.any([Promise.reject(new Error('a')), Promise.resolve('ok')]));
+          const ae = new AggregateError([new Error('x')], 'msg');
+          console.log(ae.name, ae.message, ae.errors.length, ae instanceof Error);
+        })();
+        console.log('--- Object.groupBy / Map.groupBy');
+        console.log(JSON.stringify(Object.groupBy([1,2,3,4], x=>x%2?'odd':'even')));
+        console.log([...Map.groupBy([1,2,3], x=>x>1)]);
+    "##;
+    let expected = [
+        "--- URL",
+        "https://a:b@h.io:8443/p/q?x=1&y=2#f https: h.io:8443 h.io 8443 /p/q ?x=1&y=2 #f https://h.io:8443 a b",
+        "https://a:b@h.io:8443/p/q?x=1&y=2#f \"https://a:b@h.io:8443/p/q?x=1&y=2#f\" https://a:b@h.io:8443/p/q?x=1&y=2#f",
+        "1 [ '1', '3' ] true a=1&b=2&a=3",
+        "a=9&c=4 2",
+        "iterable: function",
+        "https://h.io/x https://h.io/a/c",
+        "--- TextEncoder/Decoder",
+        "utf-8 Uint8Array(6) [ 104, 195, 169, 108, 108, 111 ] 6 héllo",
+        "€",
+        "--- queueMicrotask ordering",
+        "sync",
+        "--- AggregateError / Promise.any",
+        "--- Object.groupBy / Map.groupBy",
+        "{\"odd\":[1,3],\"even\":[2,4]}",
+        "[ [ false, [ 1 ] ], [ true, [ 2, 3 ] ] ]",
+        "p1",
+        "q1",
+        "p2",
+        "q2",
+        "AggregateError All promises were rejected [ 'a', 'b' ]",
+        "ok",
+        "AggregateError msg 1 true",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn native_objects_are_iterable_and_render_as_node_does() {
+    // A native-tagged object dispatches its methods through the stdlib table
+    // rather than a property map, so `Symbol.iterator` was invisible to the
+    // iteration protocol and `[...new URLSearchParams('a=1')]` threw. Also
+    // covers toLocaleString fallbacks, freeze with accessors, and
+    // structuredClone of Map/Set/Date/holes/cycles.
+    let src = r##"
+        const sp = new URLSearchParams('a=1&b=2');
+        console.log(sp, Object.keys(sp), JSON.stringify(sp), sp.size);
+        sp.append('c','3'); console.log(sp.size, [...sp]);
+        sp.delete('a'); console.log(sp.size, sp.toString());
+        console.log([...new URL('https://h.io/?x=1').searchParams], new URL('https://h.io/?x=1&y=2').searchParams.size);
+        console.log('--- iterate other natives');
+        console.log([...new Headers({a:'1',b:'2'})]);
+        const fd = new FormData(); fd.append('k','v'); console.log([...fd]);
+        console.log([...new Map([[1,2]])], [...new Set([1])], [...'ab'], [...new Uint8Array([1,2])]);
+        console.log([...new BigInt64Array([1n])]);
+        console.log('--- toLocaleString fallbacks');
+        console.log((1234.5678).toLocaleString(), (0).toLocaleString(), (-1234).toLocaleString());
+        console.log([1,'a',true].toLocaleString(), new Date(0).toLocaleString().length > 0);
+        console.log('--- freeze + accessors');
+        const o = { get g(){return 1}, d: 2 }; Object.freeze(o);
+        console.log(Object.isFrozen(o), Object.getOwnPropertyDescriptor(o,'g').configurable, o.g);
+        o.d = 9; console.log(o.d);
+        const f2 = Object.freeze({a:1}); try { 'use strict'; f2.a = 2 } catch(e) { console.log('frozen write', e.constructor.name) }
+        console.log('--- structuredClone extras');
+        console.log(structuredClone(new Map([[1,{a:2}]])), structuredClone(new Set([1,2])));
+        console.log(structuredClone(new Date(0)).getTime(), structuredClone([1,,3]));
+        const cyc = {}; cyc.self = cyc; console.log(structuredClone(cyc).self === structuredClone(cyc));
+        console.log('--- Array.fromAsync');
+        console.log(typeof Array.fromAsync);
+    "##;
+    let expected = [
+        "URLSearchParams { 'a' => '1', 'b' => '2' } [] {} 2",
+        "3 [ [ 'a', '1' ], [ 'b', '2' ], [ 'c', '3' ] ]",
+        "2 b=2&c=3",
+        "[ [ 'x', '1' ] ] 2",
+        "--- iterate other natives",
+        "[ [ 'a', '1' ], [ 'b', '2' ] ]",
+        "[ [ 'k', 'v' ] ]",
+        "[ [ 1, 2 ] ] [ 1 ] [ 'a', 'b' ] [ 1, 2 ]",
+        "[ 1n ]",
+        "--- toLocaleString fallbacks",
+        "1,234.568 0 -1,234",
+        "1,a,true true",
+        "--- freeze + accessors",
+        "true false 1",
+        "2",
+        "--- structuredClone extras",
+        "Map(1) { 1 => { a: 2 } } Set(2) { 1, 2 }",
+        "0 [ 1, <1 empty item>, 3 ]",
+        "false",
+        "--- Array.fromAsync",
+        "function",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn array_from_async_awaits_every_element() {
+    // `Array.fromAsync` over an async iterable, a sync iterable whose elements
+    // are promises, a bare async-generator iterator, an array-like, a string, a
+    // Set, empty, and a rejection.
+    let src = r##"
+        (async()=>{
+          console.log(await Array.fromAsync([1, Promise.resolve(2)]));
+          console.log(await Array.fromAsync([1,2], async x => x*2));
+          async function* g(){ yield 1; yield 2 }
+          console.log(await Array.fromAsync(g()));
+          console.log(await Array.fromAsync({length:2, 0:'a', 1:Promise.resolve('b')}));
+          console.log(await Array.fromAsync('ab'));
+          console.log(await Array.fromAsync(new Set([1,2])));
+          console.log(await Array.fromAsync([]), typeof Array.fromAsync([]).then);
+          try { await Array.fromAsync([Promise.reject(new Error('e'))]) } catch(e) { console.log('rejects', e.message) }
+        })();
+    "##;
+    let expected = [
+        "[ 1, 2 ]",
+        "[ 2, 4 ]",
+        "[ 1, 2 ]",
+        "[ 'a', 'b' ]",
+        "[ 'a', 'b' ]",
+        "[ 1, 2 ]",
+        "[] function",
+        "rejects e",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}

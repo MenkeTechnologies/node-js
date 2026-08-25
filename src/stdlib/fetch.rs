@@ -42,6 +42,7 @@ pub const HEADERS_METHODS: &[&str] = &[
     "keys",
     "values",
     "entries",
+    "@@iterator",
 ];
 pub const RESPONSE_METHODS: &[&str] = &[
     "text",
@@ -63,7 +64,17 @@ pub const REQUEST_METHODS: &[&str] = &[
 ];
 pub const BLOB_METHODS: &[&str] = &["text", "arrayBuffer", "bytes", "slice", "stream"];
 pub const FORM_DATA_METHODS: &[&str] = &[
-    "append", "delete", "get", "getAll", "has", "set", "forEach", "keys", "values", "entries",
+    "append",
+    "delete",
+    "get",
+    "getAll",
+    "has",
+    "set",
+    "forEach",
+    "keys",
+    "values",
+    "entries",
+    "@@iterator",
 ];
 pub const ABORT_CONTROLLER_METHODS: &[&str] = &["abort"];
 pub const ABORT_SIGNAL_METHODS: &[&str] =
@@ -325,12 +336,13 @@ pub fn headers_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value,
             }
             Ok(Value::Undef)
         }
-        "keys" | "values" | "entries" => {
+        "keys" | "values" | "entries" | "@@iterator" => {
             let items: Vec<Value> = sorted_combined(recv)
                 .into_iter()
                 .map(|(k, v)| match method {
                     "keys" => new_str(k),
                     "values" => new_str(v),
+                    // `entries` and the default iterator both yield pairs.
                     _ => {
                         let (kv, vv) = (new_str(k), new_str(v));
                         with_host(|h| h.new_array(vec![kv, vv]))
@@ -733,7 +745,7 @@ pub fn form_data_call(recv: &Value, method: &str, args: &[Value]) -> Result<Valu
             }
             Ok(Value::Undef)
         }
-        "keys" | "values" | "entries" => {
+        "keys" | "values" | "entries" | "@@iterator" => {
             let items: Vec<Value> = form_entries(recv)
                 .into_iter()
                 .map(|(k, v)| match method {

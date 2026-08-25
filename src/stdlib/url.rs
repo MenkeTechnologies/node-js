@@ -725,7 +725,13 @@ fn make_search_params(pairs: &[(String, String)]) -> Value {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("URLSearchParams"));
         m.insert("@@pairs".into(), arr);
-        h.new_object(m)
+        // `size` is a prototype getter in the spec; kept in sync as a hidden own
+        // property here, so it reads back without appearing in `Object.keys` or
+        // `console.log`. `set_pairs` maintains it.
+        m.insert("size".into(), Value::Float(pairs.len() as f64));
+        let obj = h.new_object(m);
+        h.hide_prop(&obj, "size");
+        obj
     })
 }
 
@@ -765,9 +771,12 @@ fn set_pairs(recv: &Value, pairs: &[(String, String)]) {
             })
             .collect();
         let arr = h.new_array(items);
+        let n = Value::Float(pairs.len() as f64);
         if let Some(JsObj::Object(p)) = h.get_mut(recv) {
             p.insert("@@pairs".into(), arr);
+            p.insert("size".into(), n);
         }
+        h.hide_prop(recv, "size");
     });
 }
 

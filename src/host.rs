@@ -3394,6 +3394,33 @@ impl JsHost {
                     }
                     self.render_array(&inner, items, indent, has_props, has_tail, "")
                 }
+                // `URLSearchParams` renders its pairs, not its slots:
+                // `URLSearchParams { 'a' => '1', 'b' => '2' }`. Keys repeat,
+                // which is why it is a pair list rather than a Map rendering.
+                Some(JsObj::Object(props))
+                    if props.get("@@native").map(|t| self.str_of(t)).as_deref()
+                        == Some("URLSearchParams") =>
+                {
+                    let pairs: Vec<Value> = match props.get("@@pairs").and_then(|a| self.get(a)) {
+                        Some(JsObj::Array(items)) => items.clone(),
+                        _ => Vec::new(),
+                    };
+                    if pairs.is_empty() {
+                        return "URLSearchParams {}".into();
+                    }
+                    let inner: Vec<String> = pairs
+                        .iter()
+                        .filter_map(|kv| match self.get(kv) {
+                            Some(JsObj::Array(p)) if p.len() == 2 => Some(format!(
+                                "{} => {}",
+                                self.inspect_lvl(&p[0], indent + 2, st),
+                                self.inspect_lvl(&p[1], indent + 2, st)
+                            )),
+                            _ => None,
+                        })
+                        .collect();
+                    self.render_object(&inner, "URLSearchParams ", indent)
+                }
                 // A typed array renders as `Uint8Array(3) [ 1, 2, 3 ]` — its
                 // constructor and length, then the elements laid out exactly as
                 // an array's. Without this it fell through to the generic object
@@ -3533,7 +3560,14 @@ impl JsHost {
                                 };
                                 attrs.enumerable.then(|| (fmt_key(real), Err(label)))
                             }
-                            None if !k.starts_with("@@") && !k.starts_with('#') => {
+                            // Only an ENUMERABLE own property is shown, as node
+                            // does: a native instance keeps bookkeeping (a
+                            // `URLSearchParams`'s `size`) as a hidden own slot,
+                            // and printing it would report a spec getter as data.
+                            None if !k.starts_with("@@")
+                                && !k.starts_with('#')
+                                && self.prop_attrs(v, k).enumerable =>
+                            {
                                 Some((fmt_key(k), Ok(val)))
                             }
                             None => None,
@@ -6401,11 +6435,13 @@ fn user_iterator_fn(v: &Value) -> Option<Value> {
     if !is_plain {
         return None;
     }
-    let f = with_host(|h| lookup_chain(h, v, "@@iterator"));
-    match f {
-        Some(f) if with_host(|h| is_callable(h, &f)) => Some(f),
-        _ => None,
-    }
+    // Full property resolution, not a stored-property lookup: a NATIVE-tagged
+    // object (`URLSearchParams`, `Headers`) dispatches its methods through the
+    // stdlib method table rather than a property map, so `lookup_chain` reported
+    // no `Symbol.iterator` for one even though reading it gave a function —
+    // `[...new URLSearchParams('a=1')]` threw `{} is not iterable`.
+    let f = crate::builtins::get_property(v, "@@iterator").ok()?;
+    with_host(|h| is_callable(h, &f)).then_some(f)
 }
 
 /// Drive an iterator object (one with a `.next()` returning `{value, done}`) to

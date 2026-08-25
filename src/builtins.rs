@@ -3282,6 +3282,7 @@ const NS_METHODS: &[&str] = &[
     "Object.groupBy",
     "Array.isArray",
     "Array.from",
+    "Array.fromAsync",
     "Array.of",
     "Number.isInteger",
     "Number.isNaN",
@@ -3606,6 +3607,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             )))
         }
         "Array.from" => array_from(args),
+        "Array.fromAsync" => array_from_async(args),
         "Object" => Ok(object_call(args)),
         "Object.keys" => object_keys(args, 0),
         "Object.values" => object_keys(args, 1),
@@ -4926,6 +4928,50 @@ fn map_group_by(args: Vec<Value>) -> Result<Value, String> {
         }
     }
     Ok(m)
+}
+
+/// `Array.fromAsync(items[, mapFn])` — a Promise for an array, awaiting each
+/// element and each `mapFn` result.
+///
+/// Written in JavaScript and compiled once, because the operation IS an async
+/// function: a Rust builtin runs outside any coroutine and has no way to await,
+/// so draining a promise from there would mean running the microtask queue by
+/// hand. Delegating to the engine's own `async`/`for await` keeps the
+/// suspension semantics — and the ordering they imply — exactly the language's.
+///
+/// The source may be an async iterable, a sync iterable, a bare iterator, or an
+/// array-like. Everything iterable goes through `for await`, which awaits a sync
+/// source's elements individually — that is what makes
+/// `Array.fromAsync([1, Promise.resolve(2)])` answer `[1, 2]`. A bare `.next` is
+/// accepted because an async generator object does not expose
+/// `Symbol.asyncIterator` on this frontend.
+fn array_from_async(args: Vec<Value>) -> Result<Value, String> {
+    thread_local! {
+        static IMPL: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    const SRC: &str = "(async function (items, mapFn, thisArg) {\n\
+        const out = []; let i = 0;\n\
+        const step = async (v) => { const a = await v; out.push(mapFn ? await mapFn.call(thisArg, a, i) : a); i++; };\n\
+        const iterable = items != null && (typeof items[Symbol.asyncIterator] === 'function'\n\
+            || typeof items[Symbol.iterator] === 'function' || typeof items.next === 'function');\n\
+        if (iterable) {\n\
+            for await (const v of items) { out.push(mapFn ? await mapFn.call(thisArg, v, i) : v); i++; }\n\
+            return out;\n\
+        }\n\
+        const len = items == null ? 0 : (Math.trunc(Number(items.length)) || 0);\n\
+        while (i < len) { await step(items[i]); }\n\
+        return out;\n\
+    })";
+    let f = IMPL.with(|c| c.borrow().clone());
+    let f = match f {
+        Some(f) => f,
+        None => {
+            let f = crate::eval_in_global_scope(SRC)?;
+            IMPL.with(|c| *c.borrow_mut() = Some(f.clone()));
+            f
+        }
+    };
+    host::invoke(&f, args, None)
 }
 
 fn array_from(args: Vec<Value>) -> Result<Value, String> {
