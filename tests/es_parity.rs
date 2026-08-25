@@ -4514,12 +4514,10 @@ fn require_main_is_the_entry_module() {
         .join("\n")
     );
 
-    // `node -e` and stdin run as a Script, not a module: no main.
-    for args in [vec!["-e", "console.log(typeof require.main)"]] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
-            .args(&args)
-            .output()
-            .expect("spawn node binary");
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "undefined");
-    }
+    // `node -e` runs as a Script, not a module: no main.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
+        .args(["-e", "console.log(typeof require.main)"])
+        .output()
+        .expect("spawn node binary");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "undefined");
 }

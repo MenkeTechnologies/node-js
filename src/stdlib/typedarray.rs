@@ -105,12 +105,118 @@ fn coerce(kind: &str, n: f64) -> f64 {
     }
 }
 
+/// Whether `kind` stores BigInt elements rather than Numbers. The two 64-bit
+/// views are the only ones: their elements do not fit an `f64` without loss, so
+/// the whole element pipeline carries `Value` rather than `f64`.
+pub fn is_bigint_kind(kind: &str) -> bool {
+    matches!(kind, "BigInt64Array" | "BigUint64Array")
+}
+
+/// Coerce a JS value into the element `kind` stores. The numeric kinds go
+/// through the `ToInt8`/`ToUint8Clamp`/… abstract ops as before; the 64-bit ones
+/// wrap through `ToBigInt64`/`ToBigUint64` and keep a BigInt.
+fn coerce_val(kind: &str, v: &Value) -> Result<Value, String> {
+    if !is_bigint_kind(kind) {
+        return Ok(Value::Float(coerce(kind, with_host(|h| h.to_number(v)))));
+    }
+    // 7.1.15/7.1.16: the operand must already BE a BigInt — a Number throws,
+    // which is what makes `new BigInt64Array(1)[0] = 1` a TypeError in node.
+    let big = with_host(|h| match h.get(v) {
+        Some(JsObj::BigInt(b)) => Some(b.clone()),
+        _ => None,
+    })
+    .ok_or_else(|| crate::host::type_error("Cannot convert a Number value to a BigInt"))?;
+    Ok(with_host(|h| h.new_bigint(wrap_bigint(kind, big))))
+}
+
+/// `ToBigInt64` / `ToBigUint64` — wrap modulo 2^64 into the signed or unsigned
+/// 64-bit range, which is what a 64-bit view stores.
+fn wrap_bigint(kind: &str, b: num_bigint::BigInt) -> num_bigint::BigInt {
+    use num_traits::cast::ToPrimitive;
+    let modulus = num_bigint::BigInt::from(1u128 << 64);
+    let mut m = b % &modulus;
+    if m.sign() == num_bigint::Sign::Minus {
+        m += &modulus;
+    }
+    // `m` is now in [0, 2^64); reinterpret it for the view's signedness.
+    let raw = m.to_u64().unwrap_or(0);
+    if kind == "BigInt64Array" {
+        num_bigint::BigInt::from(raw as i64)
+    } else {
+        num_bigint::BigInt::from(raw)
+    }
+}
+
+/// An element's BigInt, for ordering a 64-bit view. Zero for anything else,
+/// which the numeric kinds never ask for.
+fn bigint_of(v: &Value) -> num_bigint::BigInt {
+    with_host(|h| match h.get(v) {
+        Some(JsObj::BigInt(b)) => b.clone(),
+        _ => num_bigint::BigInt::from(0),
+    })
+}
+
+/// `indexOf`/`lastIndexOf`/`includes` element comparison. 23.2.3.x compare the
+/// search element with the STORED one and do not coerce it, so a string never
+/// matches a numeric element and a Number never matches a BigInt one.
+///
+/// `includes` differs from `indexOf` only in treating `NaN` as present
+/// (SameValueZero vs strict equality), which `nan_matches` selects: node reports
+/// `new Float64Array([NaN]).includes(NaN)` as true and `.indexOf(NaN)` as -1.
+fn same_element(stored: &Value, needle: &Value, nan_matches: bool) -> bool {
+    if nan_matches {
+        if let (Value::Float(a), Value::Float(b)) = (stored, needle) {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+        }
+    }
+    with_host(|h| h.strict_eq(stored, needle))
+}
+
+/// The zero element of `kind` — what a freshly allocated view is filled with.
+fn zero_of(kind: &str) -> Value {
+    if is_bigint_kind(kind) {
+        with_host(|h| h.new_bigint(num_bigint::BigInt::from(0)))
+    } else {
+        Value::Float(0.0)
+    }
+}
+
+/// An element as an `f64`, for the numeric-kind comparisons (`sort`'s default
+/// order, `indexOf`). A BigInt element answers its nearest `f64`, which is only
+/// ever used where the kind is numeric.
+fn num(v: &Value) -> f64 {
+    with_host(|h| h.to_number(v))
+}
+
+/// The element values of a typed array / Buffer as stored — `Value`, not `f64`,
+/// so a 64-bit view keeps its BigInts. `elems_of` is the numeric view of the
+/// same data and stays, because `Buffer` reads bytes through it.
+pub fn elem_values(v: &Value) -> Vec<Value> {
+    let Some(tag) = super::native_tag(v) else {
+        return Vec::new();
+    };
+    let field = match tag.as_str() {
+        "TypedArray" => "@@elems",
+        "Buffer" => "@@bytes",
+        _ => return Vec::new(),
+    };
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Object(p)) => match p.get(field).and_then(|a| h.get(a)) {
+            Some(JsObj::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    })
+}
+
 /// Build a typed array of `kind` from already-coerced element values.
-fn make(kind: &str, elems: Vec<f64>) -> Value {
+fn make(kind: &str, elems: Vec<Value>) -> Value {
     with_host(|h| {
         let bpe = bytes_per_element(kind);
         let len = elems.len();
-        let arr = h.new_array(elems.into_iter().map(Value::Float).collect());
+        let arr = h.new_array(elems);
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("TypedArray"));
         m.insert("@@kind".into(), h.new_str(kind));
@@ -160,24 +266,21 @@ pub fn construct(kind: &str, args: &[Value]) -> Result<Value, String> {
 /// Element vector for a typed-array construction from its first argument:
 /// a number → that many zeroed slots; an array/iterable/typed-array → its coerced
 /// values; otherwise → empty.
-fn build_elems(kind: &str, args: &[Value]) -> Result<Vec<f64>, String> {
+fn build_elems(kind: &str, args: &[Value]) -> Result<Vec<Value>, String> {
     match args.first() {
         None | Some(Value::Undef) => Ok(Vec::new()),
         Some(Value::Int(_)) | Some(Value::Float(_)) => {
             let n = super::arg_num(args, 0).max(0.0) as usize;
-            Ok(vec![0.0; n])
+            Ok(vec![zero_of(kind); n])
         }
         Some(v) => {
-            // Another typed array / Buffer → copy its elements.
-            if let Some(src) = elems_of(v) {
-                return Ok(src.iter().map(|x| coerce(kind, *x)).collect());
-            }
-            // A plain array or arraylike → coerce each entry.
-            let items = crate::host::iter_all(v).unwrap_or_default();
-            Ok(items
-                .iter()
-                .map(|x| coerce(kind, with_host(|h| h.to_number(x))))
-                .collect())
+            // Another typed array / Buffer → copy its elements; anything else
+            // iterable → coerce each entry.
+            let items = match super::native_tag(v).as_deref() {
+                Some("TypedArray") | Some("Buffer") => elem_values(v),
+                _ => crate::host::iter_all(v).unwrap_or_default(),
+            };
+            items.iter().map(|x| coerce_val(kind, x)).collect()
         }
     }
 }
@@ -185,12 +288,11 @@ fn build_elems(kind: &str, args: &[Value]) -> Result<Vec<f64>, String> {
 /// `Uint8Array.from(iterable[, mapFn])` / `Uint8Array.of(...items)`.
 pub fn static_call(kind: &str, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
-        "of" => Ok(make(
-            kind,
-            args.iter()
-                .map(|x| coerce(kind, with_host(|h| h.to_number(x))))
-                .collect(),
-        )),
+        "of" => args
+            .iter()
+            .map(|x| coerce_val(kind, x))
+            .collect::<Result<Vec<Value>, String>>()
+            .map(|e| make(kind, e)),
         "from" => from(kind, args),
         // `ArrayBuffer.isView(x)` — true for a typed array or a Buffer (which is
         // a Uint8Array view), false for the backing ArrayBuffer itself.
@@ -225,7 +327,7 @@ fn from(kind: &str, args: &[Value]) -> Result<Value, String> {
             Some(f) => crate::host::invoke(f, vec![it, Value::Float(i as f64)], None)?,
             None => it,
         };
-        out.push(coerce(kind, with_host(|h| h.to_number(&mapped))));
+        out.push(coerce_val(kind, &mapped)?);
     }
     Ok(make(kind, out))
 }
@@ -329,9 +431,9 @@ pub fn elem_set(recv: &Value, key: &str, val: &Value) -> bool {
 /// `Buffer`, every other typed array yields its own kind. Node picks the result
 /// type from the receiver's constructor, so `Buffer.from([1]).map(f)` is a
 /// Buffer and `new Int32Array([1]).map(f)` is an `Int32Array`.
-fn species(recv: &Value, kind: &str, elems: Vec<f64>) -> Value {
+fn species(recv: &Value, kind: &str, elems: Vec<Value>) -> Value {
     if super::native_tag(recv).as_deref() == Some("Buffer") {
-        let bytes: Vec<u8> = elems.iter().map(|x| *x as i64 as u8).collect();
+        let bytes: Vec<u8> = elems.iter().map(|x| num(x) as i64 as u8).collect();
         return super::buffer::from_bytes(&bytes);
     }
     make(kind, elems)
@@ -341,24 +443,31 @@ fn species(recv: &Value, kind: &str, elems: Vec<f64>) -> Value {
 /// the receiver (`fill`, `reverse`, `sort`, `copyWithin`). Writes through to
 /// whichever hidden array backs it — `@@elems` for a typed array, `@@bytes` for
 /// a `Buffer`.
-fn write_elems(recv: &Value, kind: &str, vals: &[f64]) {
+fn write_elems(recv: &Value, kind: &str, vals: &[Value]) -> Result<(), String> {
     let field = match super::native_tag(recv).as_deref() {
         Some("Buffer") => "@@bytes",
         _ => "@@elems",
     };
+    // Coerce OUTSIDE the host borrow: `coerce_val` re-enters the host to read a
+    // BigInt and to allocate the wrapped one.
+    let coerced: Vec<Value> = vals
+        .iter()
+        .map(|v| coerce_val(kind, v))
+        .collect::<Result<_, _>>()?;
     with_host(|h| {
         if let Some(JsObj::Object(p)) = h.get(recv) {
             if let Some(arr) = p.get(field).cloned() {
                 if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
-                    for (i, v) in vals.iter().enumerate() {
+                    for (i, v) in coerced.into_iter().enumerate() {
                         if i < items.len() {
-                            items[i] = Value::Float(coerce(kind, *v));
+                            items[i] = v;
                         }
                     }
                 }
             }
         }
     });
+    Ok(())
 }
 
 /// Resolve a relative index argument against `len` (negative counts from the
@@ -379,21 +488,25 @@ fn rel_index(args: &[Value], idx: usize, len: usize, default: usize) -> usize {
 /// Typed-array instance methods.
 pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     let kind = kind_of(recv);
-    let elems = elems_of(recv).unwrap_or_default();
+    // Elements travel as `Value`, not `f64`: a 64-bit view's are BigInts, and
+    // rounding them through a double is exactly the loss those views exist to
+    // avoid. The numeric kinds still hold `Value::Float`, so nothing about them
+    // changes.
+    let elems = elem_values(recv);
     // The callback-taking methods share one shape: invoke `cb(value, index,
     // receiver)` per element. They are inherited by `Buffer` too, which is why
     // they must live here rather than in either concrete type.
-    let call_cb = |i: usize, v: f64| -> Result<Value, String> {
+    let call_cb = |i: usize, v: &Value| -> Result<Value, String> {
         crate::host::invoke(
             &args.first().cloned().unwrap_or(Value::Undef),
-            vec![Value::Float(v), Value::Float(i as f64), recv.clone()],
+            vec![v.clone(), Value::Float(i as f64), recv.clone()],
             None,
         )
     };
     match method {
         "every" => {
             for (i, v) in elems.iter().enumerate() {
-                let r = call_cb(i, *v)?;
+                let r = call_cb(i, v)?;
                 if !with_host(|h| h.truthy(&r)) {
                     return Ok(Value::Bool(false));
                 }
@@ -402,7 +515,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
         "some" => {
             for (i, v) in elems.iter().enumerate() {
-                let r = call_cb(i, *v)?;
+                let r = call_cb(i, v)?;
                 if with_host(|h| h.truthy(&r)) {
                     return Ok(Value::Bool(true));
                 }
@@ -411,24 +524,24 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
         "forEach" => {
             for (i, v) in elems.iter().enumerate() {
-                call_cb(i, *v)?;
+                call_cb(i, v)?;
             }
             Ok(Value::Undef)
         }
         "map" => {
             let mut out = Vec::with_capacity(elems.len());
             for (i, v) in elems.iter().enumerate() {
-                let r = call_cb(i, *v)?;
-                out.push(coerce(&kind, with_host(|h| h.to_number(&r))));
+                let r = call_cb(i, v)?;
+                out.push(coerce_val(&kind, &r)?);
             }
             Ok(species(recv, &kind, out))
         }
         "filter" => {
             let mut out = Vec::new();
             for (i, v) in elems.iter().enumerate() {
-                let r = call_cb(i, *v)?;
+                let r = call_cb(i, v)?;
                 if with_host(|h| h.truthy(&r)) {
-                    out.push(*v);
+                    out.push(v.clone());
                 }
             }
             Ok(species(recv, &kind, out))
@@ -441,12 +554,12 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 (0..elems.len()).collect()
             };
             for i in idxs {
-                let r = call_cb(i, elems[i])?;
+                let r = call_cb(i, &elems[i])?;
                 if with_host(|h| h.truthy(&r)) {
                     return Ok(if method.ends_with("Index") {
                         Value::Float(i as f64)
                     } else {
-                        Value::Float(elems[i])
+                        elems[i].clone()
                     });
                 }
             }
@@ -469,7 +582,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 args[1].clone()
             } else {
                 match it.next() {
-                    Some(i) => Value::Float(elems[i]),
+                    Some(i) => elems[i].clone(),
                     None => {
                         return Err(crate::host::type_error(
                             "Reduce of empty array with no initial value",
@@ -480,12 +593,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             for i in it {
                 acc = crate::host::invoke(
                     &cb,
-                    vec![
-                        acc,
-                        Value::Float(elems[i]),
-                        Value::Float(i as f64),
-                        recv.clone(),
-                    ],
+                    vec![acc, elems[i].clone(), Value::Float(i as f64), recv.clone()],
                     None,
                 )?;
             }
@@ -494,7 +602,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         "reverse" => {
             let mut out = elems.clone();
             out.reverse();
-            write_elems(recv, &kind, &out);
+            write_elems(recv, &kind, &out)?;
             Ok(recv.clone())
         }
         "sort" => {
@@ -506,17 +614,29 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 // insertion sort this was, and a comparator returning NaN keeps
                 // the pair's order (23.2.4.1 step 3: NaN is +0) instead of
                 // swapping, which the `<= 0.0` break got wrong.
-                let mut vals: Vec<Value> = out.iter().map(|f| Value::Float(*f)).collect();
-                crate::builtins::sort_values(&mut vals, Some(&cmp))?;
-                out = vals.iter().map(|v| with_host(|h| h.to_number(v))).collect();
+                crate::builtins::sort_values(&mut out, Some(&cmp))?;
             } else {
                 // A typed array sorts NUMERICALLY by default, unlike `Array`
                 // which sorts by string. Verified against node v26.7.0:
                 // `new Uint8Array([10,9,1]).sort()` is `1,9,10` while
                 // `[10,9,1].sort()` is `1,10,9`.
-                out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                // A BigInt element cannot be ordered through an `f64` without
+                // collapsing values more than 2^53 apart, so the 64-bit views
+                // compare the integers themselves.
+                if is_bigint_kind(&kind) {
+                    let keys: Vec<num_bigint::BigInt> = out.iter().map(bigint_of).collect();
+                    let mut idx: Vec<usize> = (0..out.len()).collect();
+                    idx.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
+                    out = idx.into_iter().map(|i| out[i].clone()).collect();
+                } else {
+                    out.sort_by(|a, b| {
+                        num(a)
+                            .partial_cmp(&num(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
             }
-            write_elems(recv, &kind, &out);
+            write_elems(recv, &kind, &out)?;
             Ok(recv.clone())
         }
         "copyWithin" => {
@@ -524,14 +644,14 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let target = rel_index(args, 0, len, 0);
             let start = rel_index(args, 1, len, 0);
             let end = rel_index(args, 2, len, len);
-            let src: Vec<f64> = elems[start.min(end)..end.max(start)].to_vec();
+            let src: Vec<Value> = elems[start.min(end)..end.max(start)].to_vec();
             let mut out = elems.clone();
             for (k, v) in src.iter().enumerate() {
                 if target + k < len {
-                    out[target + k] = *v;
+                    out[target + k] = v.clone();
                 }
             }
-            write_elems(recv, &kind, &out);
+            write_elems(recv, &kind, &out)?;
             Ok(recv.clone())
         }
         "at" => {
@@ -540,14 +660,14 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             if i < 0.0 || i >= elems.len() as f64 {
                 return Ok(Value::Undef);
             }
-            Ok(Value::Float(elems[i as usize]))
+            Ok(elems[i as usize].clone())
         }
         "lastIndexOf" => {
-            let needle = super::arg_num(args, 0);
+            let needle = args.first().cloned().unwrap_or(Value::Undef);
             Ok(Value::Float(
                 elems
                     .iter()
-                    .rposition(|x| *x == needle)
+                    .rposition(|x| same_element(x, &needle, false))
                     .map(|p| p as f64)
                     .unwrap_or(-1.0),
             ))
@@ -555,11 +675,11 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         "keys" | "values" | "entries" => {
             let items: Vec<Value> = with_host(|h| match method {
                 "keys" => (0..elems.len()).map(|i| Value::Float(i as f64)).collect(),
-                "values" => elems.iter().map(|v| Value::Float(*v)).collect(),
+                "values" => elems.clone(),
                 _ => elems
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| h.new_array(vec![Value::Float(i as f64), Value::Float(*v)]))
+                    .map(|(i, v)| h.new_array(vec![Value::Float(i as f64), v.clone()]))
                     .collect(),
             });
             Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
@@ -570,8 +690,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             } else {
                 ",".into()
             };
-            let parts: Vec<String> =
-                with_host(|h| elems.iter().map(|n| h.str_of(&Value::Float(*n))).collect());
+            let parts: Vec<String> = with_host(|h| elems.iter().map(|n| h.str_of(n)).collect());
             Ok(with_host(|h| h.new_str(parts.join(&sep))))
         }
         "slice" | "subarray" => {
@@ -596,44 +715,45 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             Ok(make(&kind, elems[s.min(e)..e.max(s)].to_vec()))
         }
         "indexOf" => {
-            let needle = super::arg_num(args, 0);
+            let needle = args.first().cloned().unwrap_or(Value::Undef);
             Ok(Value::Float(
                 elems
                     .iter()
-                    .position(|x| *x == needle)
+                    .position(|x| same_element(x, &needle, false))
                     .map(|p| p as f64)
                     .unwrap_or(-1.0),
             ))
         }
         "includes" => {
-            let needle = super::arg_num(args, 0);
-            Ok(Value::Bool(elems.contains(&needle)))
+            let needle = args.first().cloned().unwrap_or(Value::Undef);
+            Ok(Value::Bool(
+                elems.iter().any(|x| same_element(x, &needle, true)),
+            ))
         }
         "fill" => {
-            let v = coerce(&kind, super::arg_num(args, 0));
+            let v = coerce_val(&kind, args.first().unwrap_or(&Value::Undef))?;
             Ok(make(&kind, vec![v; elems.len()]))
         }
         "set" => {
             // `ta.set(src[, offset])` — write `src`'s values in place.
-            let src = elems_of(&args.first().cloned().unwrap_or(Value::Undef))
-                .or_else(|| {
-                    Some(
-                        crate::host::iter_all(&args.first().cloned().unwrap_or(Value::Undef))
-                            .ok()?
-                            .iter()
-                            .map(|x| with_host(|h| h.to_number(x)))
-                            .collect(),
-                    )
-                })
-                .unwrap_or_default();
+            let arg = args.first().cloned().unwrap_or(Value::Undef);
+            let src = match super::native_tag(&arg).as_deref() {
+                Some("TypedArray") | Some("Buffer") => elem_values(&arg),
+                _ => crate::host::iter_all(&arg).unwrap_or_default(),
+            };
             let off = super::arg_num(args, 1).max(0.0) as usize;
+            // Coerced outside the host borrow: a 64-bit element allocates.
+            let src: Vec<Value> = src
+                .iter()
+                .map(|v| coerce_val(&kind, v))
+                .collect::<Result<_, _>>()?;
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get(recv) {
                     if let Some(arr) = p.get("@@elems").cloned() {
                         if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
-                            for (k, v) in src.iter().enumerate() {
+                            for (k, v) in src.into_iter().enumerate() {
                                 if off + k < items.len() {
-                                    items[off + k] = Value::Float(coerce(&kind, *v));
+                                    items[off + k] = v;
                                 }
                             }
                         }
@@ -815,7 +935,10 @@ pub fn text_encoder_call(_recv: &Value, method: &str, args: &[Value]) -> Result<
             let s = super::arg_str(args, 0);
             Ok(make(
                 "Uint8Array",
-                s.as_bytes().iter().map(|b| *b as f64).collect(),
+                s.as_bytes()
+                    .iter()
+                    .map(|b| Value::Float(*b as f64))
+                    .collect(),
             ))
         }
         _ => Err(crate::host::type_error(&format!(
