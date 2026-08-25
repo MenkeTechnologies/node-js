@@ -118,6 +118,17 @@ pub fn install_entry_globals(origin: &str) {
         h.set_global("__filename", origin_str);
         h.set_global("__dirname", dirname);
         h.set_global("module", module.clone());
+        // `require.main === module` in the entry script is the canonical
+        // "am I the program" test, and it read `undefined === <module>`
+        // because nothing ever set `main`. The ENTRY module is the value for
+        // every `require` in the process, not just this one, so it is recorded
+        // for the per-module closures too (`make_require` installs it).
+        // …but only when the program IS a module. `node -e` and a script on
+        // stdin run as a Script, not a CommonJS module, and node reports
+        // `require.main` as `undefined` for both.
+        if from_file {
+            h.set_builtin_static("require", "main", module.clone());
+        }
         h.set_global("exports", exports.clone());
         // Top-level `this`: the module's `exports` from a file (CommonJS
         // module), `globalThis` from `-e` and from stdin (a Script). See
@@ -457,7 +468,15 @@ fn eval_binding(src: &str) -> Result<Value, String> {
 fn make_require(dir: &Path) -> Result<Value, String> {
     let factory = factory()?;
     let dir_str = with_host(|h| h.new_str(dir.to_string_lossy().to_string()));
-    host::invoke(&factory, vec![dir_str], None)
+    let req = host::invoke(&factory, vec![dir_str], None)?;
+    // Every `require` in the process reports the same `main` — the ENTRY
+    // module — which is what `require.main === module` tests against.
+    if let Some(main) = with_host(|h| h.builtin_static("require", "main")) {
+        // `req` is a FUNCTION value, so its properties live in the fn-prop side
+        // table, not in an object property map.
+        with_host(|h| h.set_fn_prop(&req, "main", main));
+    }
+    Ok(req)
 }
 
 /// The one-time compiled `require`-closure factory. `require.resolve` /

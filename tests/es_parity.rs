@@ -4467,3 +4467,59 @@ fn an_untested_for_keeps_its_semantics() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── require.main ─────────────────────────────────────────────────────────────
+
+/// `require.main === module` is the canonical "am I the program" test, and it
+/// read `undefined === <module>` because nothing ever set `main`. Every
+/// `require` in the process reports the same value — the ENTRY module — and a
+/// program that is not a module at all (`node -e`, a script on stdin) reports
+/// `undefined`, as node does.
+#[test]
+fn require_main_is_the_entry_module() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("lib.js"),
+        "module.exports = { isMain: require.main === module, mainId: require.main && require.main.id };\n",
+    )
+    .expect("write lib.js");
+    let app = dir.path().join("app.js");
+    std::fs::write(
+        &app,
+        "console.log('entry isMain:', require.main === module);\n\
+         console.log('entry mainIsEntry:', require.main.filename === module.filename);\n\
+         const lib = require('./lib.js');\n\
+         console.log('lib isMain:', lib.isMain, 'sameMain:', lib.mainId === require.main.id);\n\
+         console.log(typeof require.main, typeof require.resolve);\n",
+    )
+    .expect("write app.js");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(&app)
+        .output()
+        .expect("spawn node binary");
+    assert!(
+        out.status.success(),
+        "program failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        [
+            "entry isMain: true",
+            "entry mainIsEntry: true",
+            "lib isMain: false sameMain: true",
+            "object function",
+        ]
+        .join("\n")
+    );
+
+    // `node -e` and stdin run as a Script, not a module: no main.
+    for args in [vec!["-e", "console.log(typeof require.main)"]] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
+            .args(&args)
+            .output()
+            .expect("spawn node binary");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "undefined");
+    }
+}
