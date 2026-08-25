@@ -85,6 +85,11 @@ source ──▶ lexer ──▶ parser ──▶ compiler ──▶ fusevm::Chu
   ones qualify. A name a nested function, a `try` block or a direct `eval` can
   reach stays a real binding, because those run as their own chunks and resolve
   through the environment.
+- **Loops are lowered rotated** — the test emitted once as an entry guard and
+  once at the bottom as a *conditional* backward branch, which is the shape
+  fusevm's tracing JIT needs to close a trace. `for (;;)`, having no test to
+  branch on, keeps an unconditional back edge. `node --tiers` reports which
+  loops reached native code.
 - **Arithmetic** lowers to native fusevm ops so the JIT can trace hot loops; a
   strict **numeric hook** supplies JS coercion for the non-numeric operand cases
   (`+` string concat, `==` matrix, `ToInt32` for bitwise ops). An object operand

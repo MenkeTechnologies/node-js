@@ -989,12 +989,12 @@ It was measured and it is SLOWER — `fib(27)` went 651 ms to 1086 ms and the
 counting loop 1895 ms to 2381 ms — so `VarMap` (`src/host.rs`) keeps the default
 hasher.
 
-What none of this touches: node-js runs these programs entirely in the fusevm
-interpreter. `node --tiers` reports `reaches native code false` for every loop
-above, because each JS-level operation lowers to a `CallBuiltin` and fusevm's
-block JIT declines any region containing one. That is the remaining 20-70x, and
-it is a lowering question (slot-resolved locals instead of name lookups), not a
-tuning one.
+What none of this touched at the time: every one of these programs ran entirely
+in the fusevm interpreter. That is settled for the counting loop by the loop
+ROTATION below (`node --tiers` now reports `reaches native code true` for it);
+the workloads whose bodies still hold a `CallBuiltin` — `Math.sqrt`, `Map.get`,
+a callback per element — remain interpreted, because fusevm's tiers decline any
+region containing one.
 
 ## FIXED — a whole VM, and a copy of the function's bytecode, per call
 
@@ -1160,19 +1160,55 @@ A 5M-iteration `s += i` loop is now, in full:
 
 with no `CallBuiltin` in the loop at all, where it used to hold six.
 
-**The JIT still does not compile it.** `node --tiers` now reports the loop
-`trace-eligible=true` (it was `false` — every `CallBuiltin` in the body
-disqualified it), which is the precondition for fusevm's trace tier. But the
-tracer never installs a trace: `traced=false`, `reaches native code false`, and a
-run adds nothing to fusevm's on-disk trace cache. Removing `NUM_STEP` on its own
-measured 1.03x, exactly what taking one host call out of a sixteen-op loop is
-worth — none of the 10-50x a compiled trace would be.
+**The JIT did not compile it, and the reason was the loop's SHAPE.** `node
+--tiers` reported the loop `trace-eligible=true` (it had been `false` — every
+`CallBuiltin` in the body disqualified it), which is the precondition for
+fusevm's trace tier. But the tracer never installed a trace: `traced=false`,
+`reaches native code false`. That is fixed below.
 
-So the remaining gap is on fusevm's side, not in this frontend's lowering: the
-loop presents ops the tier accepts, the strict-numeric slot gate is satisfied
-(both slots are `Value::Float`), the back-edge count is far past the threshold of
-50, and it still declines. That is where the next measurement belongs, and it is
-a fusevm question — `trace_lookup` / the recorder — not a node-js one.
+## FIXED — every `for` and `while` was lowered in a shape the tracing JIT refuses
+
+fusevm's tracing JIT only closes a trace on a CONDITIONAL backward branch.
+`compile_while` and `compile_for` emitted the test at the TOP and closed the
+loop with an unconditional `Jump` back to it, so the recorder recorded those
+loops and then declined them — `--tiers` said `trace-eligible=true traced=false`
+and `reaches native code false` for every one, and a hot loop stayed in the
+interpreter however hot it got. The one loop form that already ended in a
+conditional branch, `do { … } while ( … )`, traced fine, which is what made the
+cause visible: the same arithmetic ran 288x faster written that way.
+
+Both are now emitted ROTATED: the test once as an entry guard, once at the
+bottom as a conditional backward branch. `continue` targets the bottom copy
+(after the update clause, for a C-style `for`). `for (;;)` has no test to branch
+on and keeps its unconditional back edge — and, necessarily, its ineligibility.
+
+Evaluation order and count are unchanged: a top-test loop runs the test `n + 1`
+times for `n` iterations, and so does this. Rotation costs one copy of the
+condition's code and saves one jump per iteration.
+
+Measured on a debug build, user CPU, best of 5 with the two binaries
+interleaved so machine load cannot favour either:
+
+| workload | unrotated | rotated | |
+| --- | --- | --- | --- |
+| 5M `s += i` in a function | 8.42 s | 0.02 s | 421x |
+| `fib(27)` | 4.75 s | 4.66 s | 1.02x |
+| 1M `Math.sqrt` / divide | 5.49 s | 5.37 s | 1.02x |
+| 300k array map/filter/sum | 3.33 s | 3.48 s | 0.96x |
+| 200k `Map` set + get | 1.68 s | 1.62 s | 1.04x |
+| 500k property reads | 1.54 s | 1.59 s | 0.97x |
+| 5M `s += i & 7` | 9.94 s | 9.82 s | 1.01x |
+| 200k string appends | 3.00 s | 2.97 s | 1.01x |
+
+Only the first reaches native code; the rest are within measurement noise of
+each other, which is the expected result — rotation changes which loops the
+tracer can compile, not how the interpreter runs the ones it cannot.
+
+What still keeps the others interpreted is the `CallBuiltin` in their bodies.
+The nearest of them is the bitwise loop: JS `a & b` is
+`ToInt32(a) & ToInt32(b)`, which lowers to `CallBuiltin(BINOP)` even though
+fusevm has a native `Op::BitAnd`. Using the native op would need the ToInt32
+coercion proven away first, and that has not been done.
 
 ## FIXED — the process's own observables: exit status, exit events, raw stdout
 

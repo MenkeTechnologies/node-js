@@ -327,17 +327,23 @@ mod tests {
         );
     }
 
-    /// The tracing tier no longer refuses this loop for its *ops*: since
-    /// `i += 1` on a proven-Number slot lowers to a native add,
-    /// `is_trace_eligible` accepts the body. What still keeps the program off
-    /// native code is the loop's *shape* — the frontend closes a `while` with
-    /// an unconditional `Jump` back to the header, and fusevm's trace compiler
-    /// bails on that close (it compiles a `JumpIfTrue`/`JumpIfFalse` one, as
-    /// `a_rotated_slot_loop_reaches_a_compiled_trace` pins). Rotating the loop
-    /// is what would take this program to native code; shrinking the
-    /// `block-ineligible ops` list is no longer the blocker.
+    /// A counted loop written in the frontend's own syntax reaches a compiled
+    /// trace.
+    ///
+    /// This used to assert the opposite, and said why: the frontend closed a
+    /// `while` with an unconditional `Jump` back to a header test, and fusevm's
+    /// trace compiler bails on that close (it compiles a
+    /// `JumpIfTrue`/`JumpIfFalse` one, as
+    /// [`a_rotated_slot_loop_reaches_a_compiled_trace`] pins), so the hottest
+    /// shape a JavaScript program has stayed in the interpreter however hot it
+    /// got. `Compiler::compile_while`/`compile_for` now emit every `for` and
+    /// `while` ROTATED — the test duplicated as an entry guard and a conditional
+    /// backward branch — which is that shape.
+    ///
+    /// Keeping it as an assertion rather than deleting it is the point: rotate
+    /// the lowering back and this fails.
     #[test]
-    fn the_counted_loop_is_trace_eligible_but_its_close_is_not_traced() {
+    fn the_counted_loop_reaches_a_compiled_trace() {
         let report = report(PROGRAM).expect("runs");
         let looped = report
             .chunks
@@ -345,12 +351,11 @@ mod tests {
             .find(|c| !c.loops.is_empty())
             .unwrap_or_else(|| panic!("a chunk with a loop: {report}"));
         assert!(looped.loops[0].trace_eligible, "{report}");
-        assert!(!looped.loops[0].traced, "{report}");
-        assert!(!looped.ineligible.is_empty(), "{report}");
-        assert!(!report.reaches_native(), "{report}");
+        assert!(looped.loops[0].traced, "{report}");
+        assert!(report.reaches_native(), "{report}");
 
         // Name the reason rather than just the verdict: the close is the
-        // unconditional backward `Jump` the trace compiler refuses.
+        // CONDITIONAL backward branch the trace compiler accepts.
         let anchor = looped.loops[0].anchor;
         let chunks = program_chunks(&crate::compile(PROGRAM).expect("compiles"));
         let (_, chunk) = chunks
@@ -361,8 +366,24 @@ mod tests {
             .and_then(<[Op]>::last)
             .expect("the loop is closed");
         assert!(
-            matches!(close, Op::Jump(t) if *t == anchor),
-            "the loop closes with an unconditional Jump({anchor}), got {close:?}"
+            matches!(close, Op::JumpIfTrue(t) if *t == anchor),
+            "the loop closes with a conditional JumpIfTrue({anchor}), got {close:?}"
         );
+    }
+
+    /// `for (;;)` has no test to branch on, so its back edge stays an
+    /// unconditional `Jump` and the trace compiler still declines it. Pinned so
+    /// the rotation above is not mistaken for something it does for every loop.
+    #[test]
+    fn an_untested_for_keeps_its_unconditional_back_edge() {
+        const SRC: &str =
+            "function f(n) {\n  let i = 0;\n  for (;;) { i += 1; if (i >= n) break; }\n  return i;\n}\nf(200000);\n";
+        let report = report(SRC).expect("runs");
+        let looped = report
+            .chunks
+            .iter()
+            .find(|c| !c.loops.is_empty())
+            .unwrap_or_else(|| panic!("a chunk with a loop: {report}"));
+        assert!(!looped.loops[0].traced, "{report}");
     }
 }

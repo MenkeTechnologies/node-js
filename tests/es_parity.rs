@@ -3958,3 +3958,93 @@ fn define_property_on_an_array_index_writes_the_element() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── rotated loop lowering ────────────────────────────────────────────────────
+
+#[test]
+fn rotated_loops_keep_their_evaluation_order_and_count() {
+    // Loops are lowered ROTATED (the test as an entry guard plus a conditional
+    // backward branch at the bottom) so fusevm's tracing JIT can close a trace
+    // on them. This pins that the rotation is invisible: the test still runs n+1
+    // times, `continue` still re-tests, per-iteration `let` capture, labeled
+    // break/continue, try/finally, generators and `yield` in the condition all
+    // behave as before.
+    let src = r##"
+        // evaluation count of a side-effecting condition
+        let n = 0; let i = 0;
+        while ((n++, i < 3)) { i++; }
+        console.log('while tests:', n, 'i:', i);
+        let m = 0;
+        for (let k = 0; (m++, k < 3); k++) {}
+        console.log('for tests:', m);
+        // continue re-tests
+        let c = 0, t = 0;
+        while ((t++, c < 5)) { c++; if (c % 2) continue; }
+        console.log(c, t);
+        let c2 = 0, t2 = 0, seen = [];
+        for (let k = 0; (t2++, k < 5); k++) { if (k % 2) continue; seen.push(k); c2++; }
+        console.log(c2, t2, seen);
+        // zero iterations
+        let z = 0; while (false) { z++ } for (let k = 0; false; k++) { z++ } console.log('z', z);
+        // labeled break/continue
+        outer: for (let a = 0; a < 3; a++) { for (let b = 0; b < 3; b++) { if (b === 1) continue outer; if (a === 2) break outer; console.log('ab', a, b); } }
+        lbl: while (true) { let q = 0; while (true) { q++; if (q > 2) break lbl; } }
+        console.log('lbl done');
+        // per-iteration let capture
+        const fns = []; for (let k = 0; k < 3; k++) fns.push(() => k);
+        console.log(fns.map(f => f()));
+        const fns2 = []; for (var v = 0; v < 3; v++) fns2.push(() => v);
+        console.log(fns2.map(f => f()));
+        // try/finally inside a loop
+        let f1 = []; for (let k = 0; k < 3; k++) { try { if (k === 1) continue; f1.push(k) } finally { f1.push('f' + k) } }
+        console.log(f1);
+        function g() { for (let k = 0; k < 5; k++) { try { if (k === 2) return 'ret' + k } finally { } } return 'no' }
+        console.log(g());
+        // switch inside a loop
+        let sw = []; for (let k = 0; k < 4; k++) { switch (k) { case 1: sw.push('one'); break; case 2: continue; default: sw.push(k) } }
+        console.log(sw);
+        // for(;;) with break
+        let inf = 0; for (;;) { inf++; if (inf > 3) break } console.log('inf', inf);
+        // while with break in body
+        let w = 0; while (true) { w++; if (w === 4) break } console.log('w', w);
+        // nested while + do-while
+        let acc = []; let x = 0; while (x < 2) { let y = 0; do { acc.push([x,y]); y++ } while (y < 2); x++ } console.log(acc.length);
+        // condition mutating the loop variable
+        let mv = 0, cnt = 0; while (mv++ < 3) { cnt++ } console.log(mv, cnt);
+        // generator with a loop
+        function* gen() { let k = 0; while (k < 3) { yield k; k++ } }
+        console.log([...gen()]);
+        function* gen2() { for (let k = 0; k < 3; k++) yield k }
+        console.log([...gen2()]);
+        // yield in the condition
+        function* gen3() { let k = 0; while (yield k) { k++ } return k }
+        const it = gen3(); console.log(it.next().value, it.next(true).value, it.next(false));
+        // async loop
+        (async () => { let s = 0; for (let k = 0; k < 3; k++) { s += await Promise.resolve(k) } console.log('async', s) })();
+    "##;
+    let expected = [
+        "while tests: 4 i: 3",
+        "for tests: 4",
+        "5 6",
+        "3 6 [ 0, 2, 4 ]",
+        "z 0",
+        "ab 0 0",
+        "ab 1 0",
+        "lbl done",
+        "[ 0, 1, 2 ]",
+        "[ 3, 3, 3 ]",
+        "[ 0, 'f0', 'f1', 2, 'f2' ]",
+        "ret2",
+        "[ 0, 'one', 3 ]",
+        "inf 4",
+        "w 4",
+        "4",
+        "4 3",
+        "[ 0, 1, 2 ]",
+        "[ 0, 1, 2 ]",
+        "0 1 { value: 1, done: true }",
+        "async 3",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}

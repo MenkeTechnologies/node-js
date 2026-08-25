@@ -794,15 +794,33 @@ impl Compiler {
         }
     }
 
+    /// `while (test) body`, lowered ROTATED: the test is emitted once as an entry
+    /// guard and once at the bottom, so the loop closes with a CONDITIONAL
+    /// backward branch rather than an unconditional `Jump` back to a test at the
+    /// top.
+    ///
+    /// That shape is what fusevm's tracing JIT needs — it only closes a trace on
+    /// a conditional backward branch. Emitted the other way, `--tiers` reported
+    /// `trace-eligible=true traced=false` and `reaches native code false` for
+    /// every `for` and `while` this frontend produced, while the same arithmetic
+    /// written as `do { … } while (…)` — the one loop form that already ended in
+    /// a conditional branch — reported `traced=true`. Measured on a debug build:
+    /// `for (let i = 0; i < 3000000; i++) s += i` took 5.76s of user CPU
+    /// unrotated and 0.02s rotated.
+    ///
+    /// Evaluation order and count are unchanged: a top-test loop runs the test
+    /// `n + 1` times for `n` iterations, and so does this — one entry test, then
+    /// one after each pass. Rotation costs one copy of the condition's code and
+    /// saves one jump per iteration.
     fn compile_while(
         &mut self,
         b: &mut ChunkBuilder,
         test: &Expr,
         body: &Stmt,
     ) -> Result<(), String> {
-        let start = b.current_pos();
         self.compile_condition(b, test)?;
         let jfalse = b.emit(Op::JumpIfFalse(0), 0);
+        let top = b.current_pos();
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
@@ -813,10 +831,13 @@ impl Compiler {
             label: self.pending_label.take(),
         });
         self.compile_stmt(b, body)?;
-        b.emit(Op::Jump(start), 0);
+        // `continue` re-tests the condition, which is now the BOTTOM copy of it.
+        let cont_target = b.current_pos();
+        self.compile_condition(b, test)?;
+        b.emit(Op::JumpIfTrue(top), 0);
         let ctx = self.loops.pop().unwrap();
         for c in ctx.continues {
-            b.patch_jump(c, start);
+            b.patch_jump(c, cont_target);
         }
         let end = b.current_pos();
         b.patch_jump(jfalse, end);
@@ -901,7 +922,8 @@ impl Compiler {
         if copy_per_iteration {
             self.emit_copy_scope(b);
         }
-        let start = b.current_pos();
+        // Rotated, for the reason `compile_while` documents: the test as an entry
+        // guard plus a conditional backward branch at the bottom.
         let jfalse = match test {
             Some(t) => {
                 self.compile_condition(b, t)?;
@@ -909,6 +931,7 @@ impl Compiler {
             }
             None => None,
         };
+        let top = b.current_pos();
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
@@ -929,7 +952,17 @@ impl Compiler {
             self.compile_expr(b, u)?;
             b.emit(Op::Pop, 0);
         }
-        b.emit(Op::Jump(start), 0);
+        match test {
+            Some(t) => {
+                self.compile_condition(b, t)?;
+                b.emit(Op::JumpIfTrue(top), 0);
+            }
+            // `for (;;)` has no test to branch on, so its back edge stays
+            // unconditional — and so, necessarily, does its JIT eligibility.
+            None => {
+                b.emit(Op::Jump(top), 0);
+            }
+        }
         let ctx = self.loops.pop().unwrap();
         for c in ctx.continues {
             b.patch_jump(c, cont_target);
