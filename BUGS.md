@@ -1166,6 +1166,32 @@ with no `CallBuiltin` in the loop at all, where it used to hold six.
 fusevm's trace tier. But the tracer never installed a trace: `traced=false`,
 `reaches native code false`. That is fixed below.
 
+## FIXED — every `require` re-walked the filesystem, cached module or not
+
+`module::require` resolved its specifier on every call: a `node_modules` walk
+for a bare name, a set of extension probes for a relative one, then
+`std::fs::canonicalize`. Only AFTER all of that did it consult the module cache
+— so a program that requires the same specifier in a loop, or a dependency graph
+where twenty modules require the same helper, paid the full filesystem cost
+every time for a module that was already loaded.
+
+Resolution is now memoized per `(specifier, from_dir)`. Node keeps the same
+table (`Module._pathCache`) with the same consequence: a file that appears after
+a specifier has already resolved is not picked up by a later `require` of it.
+
+Measured on debug builds, wall clock, the baseline built from `git archive` of
+the parent commit into its own tree:
+
+| workload | before | after | |
+| --- | --- | --- | --- |
+| 12,000 cached `require`s (40 modules x 300) | 599-633 ms | 380-406 ms | 1.57x |
+| cold `require('express')` (200 files) | 475-590 ms | 460-534 ms | ~1.05x |
+
+The cold load is dominated by parsing and compiling ~3.4 MB of JavaScript, which
+this does not touch. Bytecode-caching those modules was tried in an earlier
+round and MEASURED SLOWER — deserializing 118 bincode blobs cost more than
+recompiling — and reverted; do not retry it without a new measurement.
+
 ## FIXED — every `for` and `while` was lowered in a shape the tracing JIT refuses
 
 fusevm's tracing JIT only closes a trace on a CONDITIONAL backward branch.
@@ -1186,23 +1212,28 @@ Evaluation order and count are unchanged: a top-test loop runs the test `n + 1`
 times for `n` iterations, and so does this. Rotation costs one copy of the
 condition's code and saves one jump per iteration.
 
-Measured on a debug build, user CPU, best of 5 with the two binaries
-interleaved so machine load cannot favour either:
+Measured on debug builds, user CPU, best of 7 with the two binaries interleaved
+so machine load cannot favour either. Both sides were built from
+`git archive` of the exact commits — the rotation commit and its parent —
+extracted to separate trees with their own target directories, rather than by
+reverting in place: a worktree that has been through a `git stash pop` on this
+box can report clean while the files differ from HEAD, so `git status` is not a
+usable baseline gate.
 
 | workload | unrotated | rotated | |
 | --- | --- | --- | --- |
-| 5M `s += i` in a function | 8.42 s | 0.02 s | 421x |
-| `fib(27)` | 4.75 s | 4.66 s | 1.02x |
-| 1M `Math.sqrt` / divide | 5.49 s | 5.37 s | 1.02x |
-| 300k array map/filter/sum | 3.33 s | 3.48 s | 0.96x |
-| 200k `Map` set + get | 1.68 s | 1.62 s | 1.04x |
-| 500k property reads | 1.54 s | 1.59 s | 0.97x |
-| 5M `s += i & 7` | 9.94 s | 9.82 s | 1.01x |
-| 200k string appends | 3.00 s | 2.97 s | 1.01x |
+| 5M `s += i` in a function | 7.89 s | 0.02 s | 394x |
+| `fib(27)` | 4.17 s | 4.08 s | 1.02x |
+| 1M `Math.sqrt` / divide | 4.99 s | 4.96 s | 1.01x |
+| 300k array map/filter/sum | 3.31 s | 2.86 s | 1.16x |
+| 200k `Map` set + get | 1.46 s | 1.50 s | 0.97x |
+| 500k property reads | 1.52 s | 1.44 s | 1.06x |
+| 5M `s += i & 7` | 9.79 s | 9.45 s | 1.04x |
+| 200k string appends | 2.87 s | 2.84 s | 1.01x |
 
-Only the first reaches native code; the rest are within measurement noise of
-each other, which is the expected result — rotation changes which loops the
-tracer can compile, not how the interpreter runs the ones it cannot.
+Only the first reaches native code; the rest sit within a few percent either
+way, which is the expected result — rotation changes which loops the tracer can
+compile, not how the interpreter runs the ones it cannot.
 
 What still keeps the others interpreted is the `CallBuiltin` in their bodies.
 The nearest of them is the bitwise loop: JS `a & b` is

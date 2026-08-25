@@ -37,6 +37,15 @@ thread_local! {
     /// is re-read on every hit, matching Node — `module.exports = X` reassignment
     /// is observed by later requires).
     static CACHE: RefCell<HashMap<PathBuf, Value>> = RefCell::new(HashMap::new());
+    /// Resolved `(specifier, from_dir)` to the CANONICAL absolute path it named,
+    /// so a repeated `require` of an already-loaded module costs one hash lookup
+    /// instead of walking `node_modules` and calling `canonicalize` again.
+    ///
+    /// Node keeps the same table (`Module._pathCache`) with the same
+    /// consequence: a file that appears after a specifier has already resolved
+    /// is not picked up by a later `require` of that specifier.
+    static PATH_CACHE: RefCell<HashMap<(String, PathBuf), PathBuf>> =
+        RefCell::new(HashMap::new());
     /// Base directory the ENTRY script's top-level `require` resolves against
     /// (the dir of `node app.js`, or cwd for `node -e`).
     static ENTRY_DIR: RefCell<PathBuf> = RefCell::new(std::env::current_dir().unwrap_or_default());
@@ -52,6 +61,7 @@ thread_local! {
 /// eval (which rebuilds the heap) never reuses a stale heap handle.
 pub fn reset() {
     CACHE.with(|c| c.borrow_mut().clear());
+    PATH_CACHE.with(|c| c.borrow_mut().clear());
     FACTORY.with(|f| *f.borrow_mut() = None);
     CALLSITE_FACTORY.with(|f| *f.borrow_mut() = None);
     ENTRY_DIR.with(|d| *d.borrow_mut() = std::env::current_dir().unwrap_or_default());
@@ -278,6 +288,15 @@ pub fn require(spec: &str, from_dir: &Path) -> Result<Value, String> {
     if let Some(ns) = crate::stdlib::resolve(spec) {
         return Ok(with_host(|h| h.alloc(JsObj::Builtin(ns.to_string()))));
     }
+    // Resolution is filesystem work — a `node_modules` walk, a set of extension
+    // probes, then `canonicalize` — and a program that requires the same
+    // specifier in a loop paid all of it on every call even though the module
+    // itself was already loaded and cached. The answer is memoized per
+    // `(specifier, from_dir)`.
+    let key = (spec.to_string(), from_dir.to_path_buf());
+    if let Some(hit) = PATH_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return load_file(&hit);
+    }
     let path = resolve(spec, from_dir).ok_or_else(|| {
         crate::host::plain_coded_error(
             "Error",
@@ -288,6 +307,7 @@ pub fn require(spec: &str, from_dir: &Path) -> Result<Value, String> {
     // A canonical absolute key so the same file required via different relative
     // specifiers shares one cache entry.
     let path = std::fs::canonicalize(&path).unwrap_or(path);
+    PATH_CACHE.with(|c| c.borrow_mut().insert(key, path.clone()));
     load_file(&path)
 }
 

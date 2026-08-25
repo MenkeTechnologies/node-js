@@ -4048,3 +4048,69 @@ fn rotated_loops_keep_their_evaluation_order_and_count() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── the module resolution cache ──────────────────────────────────────────────
+
+/// A repeated `require` of an already-loaded module resolves through a memoized
+/// `(specifier, from_dir)` table instead of walking the filesystem again. This
+/// pins that the memo cannot change what resolves: the same file reached by
+/// three different specifiers is still ONE module instance with one shared
+/// closure state, a re-require still returns the identical exports object, and a
+/// specifier that does not resolve still fails the same way the second time.
+///
+/// Expectations captured from node v26.7.0 (its `Module._pathCache` is the same
+/// memo, with the same consequence).
+#[test]
+fn module_path_memoization_does_not_change_what_resolves() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).expect("mkdir sub");
+    std::fs::write(
+        dir.path().join("a.js"),
+        "let n = 0;\nmodule.exports = { bump: () => ++n, get: () => n };\n",
+    )
+    .expect("write a.js");
+    std::fs::write(
+        sub.join("b.js"),
+        "const a1 = require('../a.js');\n\
+         const a2 = require('../a');\n\
+         const a3 = require(require('path').resolve(__dirname, '..', 'a.js'));\n\
+         a1.bump(); a2.bump(); a3.bump();\n\
+         module.exports = { same: a1 === a2 && a2 === a3, n: a1.get() };\n",
+    )
+    .expect("write b.js");
+    let main = dir.path().join("main.js");
+    std::fs::write(
+        &main,
+        "const b = require('./sub/b.js');\n\
+         console.log(b.same, b.n);\n\
+         const a = require('./a.js');\n\
+         console.log(a.get(), require('./a.js') === a, require('./a') === a);\n\
+         let t = 0; for (let i = 0; i < 500; i++) t += require('./a.js').get();\n\
+         console.log(t);\n\
+         try { require('./nope.js') } catch (e) { console.log(e.code) }\n\
+         try { require('./nope.js') } catch (e) { console.log(e.code) }\n",
+    )
+    .expect("write main.js");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(&main)
+        .output()
+        .expect("spawn node binary");
+    assert!(
+        out.status.success(),
+        "program failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        [
+            "true 3",
+            "3 true true",
+            "1500",
+            "MODULE_NOT_FOUND",
+            "MODULE_NOT_FOUND"
+        ]
+        .join("\n")
+    );
+}
