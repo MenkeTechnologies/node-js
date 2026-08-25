@@ -52,7 +52,8 @@ pub const PROTOTYPE_METHODS: &[&str] = &[
     "values",
 ];
 
-/// The nine element kinds plus `ArrayBuffer` (which carries only a byte length).
+/// The eleven element kinds plus `ArrayBuffer` (which carries only a byte
+/// length).
 pub fn is_ctor(name: &str) -> bool {
     ELEMENT_KINDS.contains(&name) || name == "ArrayBuffer"
 }
@@ -60,6 +61,11 @@ pub fn is_ctor(name: &str) -> bool {
 /// The element kinds, each of which gets its own real prototype object whose
 /// parent is the shared `%TypedArray%.prototype`. `Uint8Array` leads because
 /// `Buffer.prototype` chains onto it.
+///
+/// `BigInt64Array`/`BigUint64Array` are here too, and they are not
+/// interchangeable with the rest: their elements are BigInts, so a Number
+/// written into one is a `TypeError` and a `Number`-kind view will not accept
+/// one either (`coerce_val`).
 pub const ELEMENT_KINDS: &[&str] = &[
     "Uint8Array",
     "Int8Array",
@@ -70,6 +76,9 @@ pub const ELEMENT_KINDS: &[&str] = &[
     "Uint32Array",
     "Float32Array",
     "Float64Array",
+    // The 64-bit views store BigInt elements rather than Numbers.
+    "BigInt64Array",
+    "BigUint64Array",
 ];
 
 /// Bytes per element for a typed-array kind.
@@ -78,7 +87,7 @@ pub fn bytes_per_element(kind: &str) -> usize {
         "Int8Array" | "Uint8Array" | "Uint8ClampedArray" => 1,
         "Int16Array" | "Uint16Array" => 2,
         "Int32Array" | "Uint32Array" | "Float32Array" => 4,
-        "Float64Array" => 8,
+        "Float64Array" | "BigInt64Array" | "BigUint64Array" => 8,
         _ => 1,
     }
 }
@@ -406,25 +415,27 @@ pub fn elem_get(recv: &Value, key: &str) -> Option<Value> {
 }
 
 /// `ta[i] = v` write (coerced to the kind). Returns true if `i` is a valid index.
-pub fn elem_set(recv: &Value, key: &str, val: &Value) -> bool {
+pub fn elem_set(recv: &Value, key: &str, val: &Value) -> Result<bool, String> {
     let Ok(i) = key.parse::<usize>() else {
-        return false;
+        return Ok(false);
     };
     let kind = kind_of(recv);
-    let n = coerce(&kind, with_host(|h| h.to_number(val)));
-    with_host(|h| {
+    // Coerced through the element type, so writing a Number into a 64-bit view
+    // throws rather than storing an un-typed element.
+    let n = coerce_val(&kind, val)?;
+    Ok(with_host(|h| {
         if let Some(JsObj::Object(p)) = h.get(recv) {
             if let Some(arr) = p.get("@@elems").cloned() {
                 if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
                     if i < items.len() {
-                        items[i] = Value::Float(n);
+                        items[i] = n;
                         return true;
                     }
                 }
             }
         }
         false
-    })
+    }))
 }
 
 /// Build a result of the same "species" as `recv`: a `Buffer` receiver yields a

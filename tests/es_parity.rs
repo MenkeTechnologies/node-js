@@ -4521,3 +4521,98 @@ fn require_main_is_the_entry_module() {
         .expect("spawn node binary");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "undefined");
 }
+
+// ── 64-bit typed-array views ─────────────────────────────────────────────────
+
+#[test]
+fn bigint64_views_keep_full_64_bit_precision() {
+    // `BigInt64Array`/`BigUint64Array` store BigInt elements, so a value beyond
+    // 2^53 survives a round trip where an `f64` element would round it. Writing
+    // a Number into one is a TypeError, wrapping is modulo 2^64 into the view's
+    // signedness, and `sort` orders the integers rather than their nearest
+    // doubles.
+    let src = r##"
+        for (const K of [BigInt64Array, BigUint64Array]) {
+          const a = new K([1n, 2n, 3n]);
+          console.log(K.name, a, a.length, a.byteLength, a.BYTES_PER_ELEMENT);
+          console.log(' idx', a[0], typeof a[0], a.at(-1), a.indexOf(2n), a.includes(3n), a.includes(3));
+          console.log(' join', a.join('-'), a.toString(), [...a]);
+          console.log(' map', a.map(x=>x*2n));
+          console.log(' filter', a.filter(x=>x>1n));
+          console.log(' reduce', a.reduce((p,q)=>p+q, 0n));
+          console.log(' sort', new K([3n,1n,2n]).sort());
+          console.log(' reverse', new K([1n,2n,3n]).reverse());
+          console.log(' slice', a.slice(1), a.subarray(0,2));
+          console.log(' fill', new K(3).fill(7n), new K(2));
+          const b = new K(3); b.set([9n,8n],1); console.log(' set', b);
+          const c = new K(2); c[0] = 5n; console.log(' write', c);
+          console.log(' keys', [...a.keys()], [...a.entries()]);
+          console.log(' from/of', K.from([1n,2n]), K.of(4n,5n));
+          console.log(' every', a.every(x=>x>0n), a.some(x=>x>2n), a.find(x=>x>1n), a.findIndex(x=>x>1n));
+        }
+        console.log('wrap', new BigInt64Array([2n**63n]), new BigUint64Array([-1n]));
+        console.log('big', new BigInt64Array([2n**63n - 1n])[0], new BigUint64Array([2n**64n - 1n])[0]);
+        console.log('precision', new BigInt64Array([9007199254740993n])[0]);
+        try { const t = new BigInt64Array(1); t[0] = 1; } catch(e) { console.log('numwrite', e.constructor.name) }
+        try { new BigInt64Array([1]) } catch(e) { console.log('numctor', e.constructor.name) }
+        console.log('tag', Object.prototype.toString.call(new BigInt64Array(1)));
+        console.log('isview', ArrayBuffer.isView(new BigInt64Array(1)));
+    "##;
+    let expected = [
+        "BigInt64Array BigInt64Array(3) [ 1n, 2n, 3n ] 3 24 8",
+        " idx 1n bigint 3n 1 true false",
+        " join 1-2-3 1,2,3 [ 1n, 2n, 3n ]",
+        " map BigInt64Array(3) [ 2n, 4n, 6n ]",
+        " filter BigInt64Array(2) [ 2n, 3n ]",
+        " reduce 6n",
+        " sort BigInt64Array(3) [ 1n, 2n, 3n ]",
+        " reverse BigInt64Array(3) [ 3n, 2n, 1n ]",
+        " slice BigInt64Array(2) [ 2n, 3n ] BigInt64Array(2) [ 1n, 2n ]",
+        " fill BigInt64Array(3) [ 7n, 7n, 7n ] BigInt64Array(2) [ 0n, 0n ]",
+        " set BigInt64Array(3) [ 0n, 9n, 8n ]",
+        " write BigInt64Array(2) [ 5n, 0n ]",
+        " keys [ 0, 1, 2 ] [ [ 0, 1n ], [ 1, 2n ], [ 2, 3n ] ]",
+        " from/of BigInt64Array(2) [ 1n, 2n ] BigInt64Array(2) [ 4n, 5n ]",
+        " every true true 2n 1",
+        "BigUint64Array BigUint64Array(3) [ 1n, 2n, 3n ] 3 24 8",
+        " idx 1n bigint 3n 1 true false",
+        " join 1-2-3 1,2,3 [ 1n, 2n, 3n ]",
+        " map BigUint64Array(3) [ 2n, 4n, 6n ]",
+        " filter BigUint64Array(2) [ 2n, 3n ]",
+        " reduce 6n",
+        " sort BigUint64Array(3) [ 1n, 2n, 3n ]",
+        " reverse BigUint64Array(3) [ 3n, 2n, 1n ]",
+        " slice BigUint64Array(2) [ 2n, 3n ] BigUint64Array(2) [ 1n, 2n ]",
+        " fill BigUint64Array(3) [ 7n, 7n, 7n ] BigUint64Array(2) [ 0n, 0n ]",
+        " set BigUint64Array(3) [ 0n, 9n, 8n ]",
+        " write BigUint64Array(2) [ 5n, 0n ]",
+        " keys [ 0, 1, 2 ] [ [ 0, 1n ], [ 1, 2n ], [ 2, 3n ] ]",
+        " from/of BigUint64Array(2) [ 1n, 2n ] BigUint64Array(2) [ 4n, 5n ]",
+        " every true true 2n 1",
+        "wrap BigInt64Array(1) [ -9223372036854775808n ] BigUint64Array(1) [ 18446744073709551615n ]",
+        "big 9223372036854775807n 18446744073709551615n",
+        "precision 9007199254740993n",
+        "numwrite TypeError",
+        "numctor TypeError",
+        "tag [object BigInt64Array]",
+        "isview true",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+#[test]
+fn typed_array_search_does_not_coerce_its_argument() {
+    // 23.2.3.x compare the search element with the STORED one and do not coerce
+    // it, so a string never matches a numeric element; `includes` differs from
+    // `indexOf` only in using SameValueZero, which is the NaN case.
+    let src = r##"
+        const a = new Uint8Array([1,2,3]);
+        console.log(a.indexOf('2'), a.indexOf(2), a.includes('2'), a.includes(2), a.lastIndexOf('3'));
+        const f = new Float64Array([NaN, 1, -0]);
+        console.log(f.includes(NaN), f.indexOf(NaN), f.includes(0), f.indexOf(-0), f.indexOf(0));
+        console.log(new Uint8Array([1]).indexOf(null), new Uint8Array([0]).includes(null));
+    "##;
+    let expected = ["-1 1 false true -1", "true -1 true 2 2", "-1 false"].join("\n");
+    assert_eq!(run(src), expected);
+}

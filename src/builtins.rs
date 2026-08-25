@@ -1100,6 +1100,8 @@ fn is_builtin_ctor(name: &str) -> bool {
             | "Uint32Array"
             | "Float32Array"
             | "Float64Array"
+            | "BigInt64Array"
+            | "BigUint64Array"
             | "WeakRef"
             | "FinalizationRegistry"
             | "TextEncoder"
@@ -1878,7 +1880,7 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     // Typed-array element write (`ta[i] = v`): coerce + store into `@@elems`.
     if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
         let is_ta = crate::stdlib::native_tag(recv).as_deref() == Some("TypedArray");
-        if is_ta && crate::stdlib::typedarray::elem_set(recv, name, &val) {
+        if is_ta && crate::stdlib::typedarray::elem_set(recv, name, &val)? {
             return Ok(());
         }
         // `buf[i] = n` writes through to the Buffer's hidden byte array.
@@ -3108,6 +3110,8 @@ const GLOBAL_FUNCS: &[&str] = &[
     "Uint32Array",
     "Float32Array",
     "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
     "WeakRef",
     "FinalizationRegistry",
     "TextEncoder",
