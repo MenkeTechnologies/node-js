@@ -1166,6 +1166,43 @@ with no `CallBuiltin` in the loop at all, where it used to hold six.
 fusevm's trace tier. But the tracer never installed a trace: `traced=false`,
 `reaches native code false`. That is fixed below.
 
+## Which loops reach native code, and what stops the rest
+
+With the rotation and the `for (;;)` back edge below, loop SHAPE no longer
+keeps anything out of fusevm's tracing JIT. What is left is the op content of
+the body, and `--tiers` names the two cases distinctly — the distinction is
+worth reading before optimizing anything:
+
+- `traced=false` with `trace-eligible=true` was the SHAPE problem. No loop form
+  reports that any more.
+- `trace-eligible=false` is the OP problem: the body holds a `CallBuiltin`, and
+  fusevm's tiers decline any region containing one. Rotation is irrelevant to
+  it.
+
+Measured on this frontend (debug build, `--tiers`):
+
+| loop | reaches native code |
+| --- | --- |
+| `for (let i = 0; i < n; i++) s += i` | yes |
+| `while (i < n) { s += i; i++ }` | yes |
+| `do { s += i; i++ } while (i < n)` | yes |
+| `for (;;) { s += i; i++; if (…) break }` | yes |
+| `for (const v of a) s += v` | no — `trace-eligible=false` |
+| a body calling `Math.sqrt`, `Map.get`, `arr.push`, or reading `o.x` | no — `trace-eligible=false` |
+
+`for…of` is a structural case rather than a missing optimization: its step is
+`FORITER`, a host call that runs the iterator protocol, so the loop can never
+present a builtin-free body while the protocol is hosted. The others are the
+ordinary JS-specific lowerings (`CallBuiltin(BINOP)` for `&`, `GETATTR` for a
+property read); each would need its own proof that the JS coercion is
+unnecessary before it could become a native op.
+
+Two gates checked here and found NOT to apply, so they are not worth
+re-investigating on this frontend: a statement-position `if` inside a loop does
+not make it trace-ineligible (`--tiers` reports `traced=true` for a counted loop
+whose body is a bare `if`), and no loop form emits a stack-imbalancing
+`LoadUndef`.
+
 ## FIXED — every `require` re-walked the filesystem, cached module or not
 
 `module::require` resolved its specifier on every call: a `node_modules` walk
