@@ -1017,6 +1017,12 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
     })
 }
 
+/// The namespace name of the `require.cache` view. A `Builtin` rather than an
+/// object literal because the module cache is the single source of truth: a
+/// populated copy would answer reads correctly and silently ignore a `delete`,
+/// which is the operation the property exists for.
+pub const REQUIRE_CACHE: &str = "__cjs_cache";
+
 /// The builtin constructor name for a value with no own/inherited `constructor`
 /// property, so `x.constructor` (and thus `x.constructor.name`) matches Node for
 /// arrays, plain objects, Map/Set, promises, iterators, functions, and boxed
@@ -1381,6 +1387,17 @@ fn ensure_fn_prototype(recv: &Value) -> Value {
 /// A property on a builtin namespace object (`Math.PI`, `Number.MAX_SAFE_INTEGER`,
 /// `console.log`).
 pub fn namespace_property(ns: &str, name: &str) -> Value {
+    // `require.cache[id]` — a LIVE view of the module cache, not a copy, so a
+    // read sees whatever is loaded now and `delete` (see `delete_property`)
+    // actually invalidates.
+    if ns == REQUIRE_CACHE {
+        return crate::module::cache_get(name).unwrap_or(Value::Undef);
+    }
+    // The ENTRY script's `require` is this builtin rather than the per-module
+    // closure, so its `cache` has to be handed out here too.
+    if ns == "require" && name == "cache" {
+        return with_host(|h| h.alloc(JsObj::Builtin(REQUIRE_CACHE.to_string())));
+    }
     // Numeric constants.
     let konst = match (ns, name) {
         ("Math", "PI") => Some(std::f64::consts::PI),
@@ -1984,6 +2001,15 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
     // throw — the reason this reports a `Result` rather than a bare `bool`.
     if let Some(b) = crate::proxy::delete(recv, key)? {
         return Ok(b);
+    }
+    // `delete require.cache[id]` drops the module so the next `require` of that
+    // file runs it again — the whole point of exposing the cache.
+    if peek(recv, |o| match o {
+        JsObj::Builtin(ns) => Some(ns == REQUIRE_CACHE),
+        _ => None,
+    }) == Some(true)
+    {
+        return Ok(crate::module::cache_delete(key));
     }
     if !with_host(|h| h.prop_attrs(recv, key).configurable) {
         return Ok(false);
@@ -3140,6 +3166,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     // closures (see `module.rs`); never written by user code.
     "__cjs_require",
     "__cjs_resolve",
+    "__cjs_cache",
 ];
 
 const NS_METHODS: &[&str] = &[

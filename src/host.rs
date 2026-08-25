@@ -2999,6 +2999,9 @@ impl JsHost {
                 // objects (`Math`, `JSON`, `require('fs')`, …) which are "object".
                 Some(JsObj::Builtin(n)) => {
                     const NON_CALLABLE_NS: &[&str] = &[
+                        // The live `require.cache` view is a plain object to a
+                        // script, not something it can call.
+                        crate::builtins::REQUIRE_CACHE,
                         "Math",
                         "JSON",
                         "console",

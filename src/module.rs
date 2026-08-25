@@ -67,6 +67,28 @@ pub fn reset() {
     ENTRY_DIR.with(|d| *d.borrow_mut() = std::env::current_dir().unwrap_or_default());
 }
 
+/// The resolved filenames of every currently loaded module, in load order —
+/// the keys `require.cache` exposes.
+pub fn cache_keys() -> Vec<String> {
+    CACHE.with(|c| {
+        c.borrow()
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    })
+}
+
+/// The module object cached under the resolved filename `key`, if any.
+pub fn cache_get(key: &str) -> Option<Value> {
+    CACHE.with(|c| c.borrow().get(Path::new(key)).cloned())
+}
+
+/// Drop `key` from the module cache, so the next `require` of that file runs it
+/// again. This is what `delete require.cache[id]` must do to mean anything.
+pub fn cache_delete(key: &str) -> bool {
+    CACHE.with(|c| c.borrow_mut().remove(Path::new(key)).is_some())
+}
+
 /// Set the base directory the ENTRY script's `require` resolves against.
 pub fn set_entry_dir(dir: PathBuf) {
     ENTRY_DIR.with(|d| *d.borrow_mut() = dir);
@@ -488,7 +510,7 @@ fn factory() -> Result<Value, String> {
     let src = "(function (__cjs_dir) {\n\
         var req = function (spec) { return __cjs_require(spec, __cjs_dir); };\n\
         req.resolve = function (spec) { return __cjs_resolve(spec, __cjs_dir); };\n\
-        req.cache = {};\n\
+        req.cache = __cjs_cache;\n\
         req.main = undefined;\n\
         req.extensions = {};\n\
         return req;\n\

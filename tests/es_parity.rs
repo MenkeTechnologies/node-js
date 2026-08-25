@@ -4645,3 +4645,59 @@ fn typed_array_index_keys_are_own_enumerable_properties() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── require.cache ────────────────────────────────────────────────────────────
+
+/// `require.cache` is a LIVE view of the module cache, not a populated copy, so
+/// `delete require.cache[id]` actually invalidates and the next `require` runs
+/// the file again. It used to be an empty object literal: reads answered
+/// `undefined` and a delete silently did nothing.
+#[test]
+fn require_cache_is_the_live_module_cache() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("dep.js"),
+        "console.log('dep evaluated');\n\
+         module.exports = { n: (globalThis.__n = (globalThis.__n || 0) + 1) };\n",
+    )
+    .expect("write dep.js");
+    let main = dir.path().join("main.js");
+    std::fs::write(
+        &main,
+        "const a = require('./dep.js');\n\
+         const b = require('./dep.js');\n\
+         console.log('cached', a === b, a.n, b.n);\n\
+         const id = require.resolve('./dep.js');\n\
+         console.log('has', typeof require.cache[id] === 'object', Object.keys(require.cache).length > 0);\n\
+         console.log('exports match', require.cache[id].exports === a);\n\
+         delete require.cache[id];\n\
+         const c = require('./dep.js');\n\
+         console.log('after delete', c === a, c.n);\n\
+         console.log('missing', require.cache['/nope.js'], typeof require.cache);\n",
+    )
+    .expect("write main.js");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(&main)
+        .output()
+        .expect("spawn node binary");
+    assert!(
+        out.status.success(),
+        "program failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        [
+            "dep evaluated",
+            "cached true 1 1",
+            "has true true",
+            "exports match true",
+            // the delete forced a re-run, so the module body printed again
+            "dep evaluated",
+            "after delete false 2",
+            "missing undefined object",
+        ]
+        .join("\n")
+    );
+}

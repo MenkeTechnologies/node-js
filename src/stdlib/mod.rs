@@ -245,6 +245,10 @@ pub fn namespace_ctors(ns: &str) -> &'static [&'static str] {
 /// key-by-key (safer-buffer clones `buffer` and `Buffer`) ends up with exactly the
 /// working set rather than an empty object.
 pub fn namespace_keys(ns: &str) -> Vec<String> {
+    // The `require.cache` view enumerates the resolved filenames it holds.
+    if ns == crate::builtins::REQUIRE_CACHE {
+        return crate::module::cache_keys();
+    }
     let mut out: Vec<String> = namespace_ctors(ns).iter().map(|s| s.to_string()).collect();
     for m in namespace_methods(ns) {
         if !out.iter().any(|k| k == m) {
