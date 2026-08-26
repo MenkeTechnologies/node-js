@@ -6,7 +6,87 @@
 //! snapshot does not already cover.
 
 use std::io::Write;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a spawned `node` gets before it is treated as hung.
+///
+/// Every program here is a fraction of a second's work — the whole file runs in
+/// about two seconds — so a child still alive after this is not slow, it is
+/// stuck. Without a bound one hung child blocks `output()` forever and takes
+/// the CI job with it: the run of 2026-08-25 sat for six hours until GitHub
+/// cancelled it, which reports as "cancelled" and names no test. With the
+/// bound, the test that hung is the test that fails.
+const CHILD_BUDGET: Duration = Duration::from_secs(60);
+
+/// [`run_bounded`] in the shape the older call sites read: a `std::process::
+/// Output`, so `out.status.success()` and `out.stdout` keep working.
+fn run_bounded_out(path: &std::path::Path) -> std::process::Output {
+    let (ok, stdout, stderr) = run_bounded(path);
+    std::process::Output {
+        status: exit_status(ok),
+        stdout: stdout.into_bytes(),
+        stderr: stderr.into_bytes(),
+    }
+}
+
+/// An `ExitStatus` standing for success or failure. `ExitStatus` cannot be
+/// constructed portably, so this runs the platform's own true/false.
+fn exit_status(ok: bool) -> std::process::ExitStatus {
+    Command::new(if ok { "true" } else { "false" })
+        .status()
+        .expect("run true/false")
+}
+
+/// The exit status, stdout and stderr of the built `node` running `path`, or a
+/// panic naming the program if it outlives [`CHILD_BUDGET`].
+///
+/// Output goes to files rather than pipes: a pipe that fills while nothing
+/// reads it is its own deadlock, and polling `try_wait` is what makes the
+/// deadline enforceable.
+fn run_bounded(path: &std::path::Path) -> (bool, String, String) {
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("node");
+    let dir = std::env::temp_dir();
+    let (op, ep) = (
+        dir.join(format!("{stem}.{}.out", std::process::id())),
+        dir.join(format!("{stem}.{}.err", std::process::id())),
+    );
+    let (of, ef) = (
+        std::fs::File::create(&op).expect("stdout file"),
+        std::fs::File::create(&ep).expect("stderr file"),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(of))
+        .stderr(Stdio::from(ef))
+        .spawn()
+        .expect("spawn node binary");
+    let deadline = Instant::now() + CHILD_BUDGET;
+    let status = loop {
+        match child.try_wait().expect("wait for node binary") {
+            Some(st) => break st,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let out = std::fs::read_to_string(&op).unwrap_or_default();
+                let err = std::fs::read_to_string(&ep).unwrap_or_default();
+                let _ = std::fs::remove_file(&op);
+                let _ = std::fs::remove_file(&ep);
+                panic!(
+                    "node did not exit within {}s — killed.\n--- stdout ---\n{out}\n--- stderr ---\n{err}",
+                    CHILD_BUDGET.as_secs()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let out = std::fs::read_to_string(&op).unwrap_or_default();
+    let err = std::fs::read_to_string(&ep).unwrap_or_default();
+    let _ = std::fs::remove_file(&op);
+    let _ = std::fs::remove_file(&ep);
+    (status.success(), out, err)
+}
 
 /// Run `src` through the built `node` binary, returning trimmed stdout. Panics
 /// with stderr on a non-zero exit so a thrown error surfaces in the failure.
@@ -16,18 +96,11 @@ fn run(src: &str) -> String {
         .tempfile()
         .expect("temp file");
     f.write_all(src.as_bytes()).expect("write source");
-    let out = Command::new(env!("CARGO_BIN_EXE_node"))
-        .arg(f.path())
-        .output()
-        .expect("spawn node binary");
-    if !out.status.success() {
-        panic!(
-            "program failed:\n--- stderr ---\n{}\n--- stdout ---\n{}",
-            String::from_utf8_lossy(&out.stderr),
-            String::from_utf8_lossy(&out.stdout)
-        );
+    let (ok, stdout, stderr) = run_bounded(f.path());
+    if !ok {
+        panic!("program failed:\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}");
     }
-    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    stdout.trim_end().to_string()
 }
 
 // ── Array.prototype.flat(depth) ──────────────────────────────────────────────
@@ -434,16 +507,9 @@ fn run_failing(src: &str) -> String {
         .tempfile()
         .expect("temp file");
     f.write_all(src.as_bytes()).expect("write source");
-    let out = Command::new(env!("CARGO_BIN_EXE_node"))
-        .arg(f.path())
-        .output()
-        .expect("spawn node binary");
-    assert!(
-        !out.status.success(),
-        "expected a failure, got stdout:\n{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    String::from_utf8_lossy(&out.stderr).trim_end().to_string()
+    let (ok, stdout, stderr) = run_bounded(f.path());
+    assert!(!ok, "expected a failure, got stdout:\n{stdout}");
+    stderr.trim_end().to_string()
 }
 
 #[test]
@@ -750,19 +816,12 @@ fn unhandled_rejection_is_fatal() {
         .expect("temp file");
     f.write_all(b"console.log('before'); Promise.reject(new Error('boom'));")
         .expect("write source");
-    let out = Command::new(env!("CARGO_BIN_EXE_node"))
-        .arg(f.path())
-        .output()
-        .expect("spawn node binary");
+    let (ok, stdout, stderr) = run_bounded(f.path());
+    assert!(!ok, "an unhandled rejection must not exit 0");
+    assert_eq!(stdout.trim_end(), "before");
     assert!(
-        !out.status.success(),
-        "an unhandled rejection must not exit 0"
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "before");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("boom"),
-        "stderr should name the rejection: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("boom"),
+        "stderr should name the rejection: {stderr}"
     );
 }
 
@@ -1681,10 +1740,7 @@ fn a_script_file_entry_point_reports_its_resolved_path() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("entry.js");
     std::fs::write(&path, ENTRY_PROBE).expect("write script");
-    let out = Command::new(env!("CARGO_BIN_EXE_node"))
-        .arg(&path)
-        .output()
-        .expect("spawn node binary");
+    let out = run_bounded_out(&path);
     assert!(
         out.status.success(),
         "{}",
@@ -1766,10 +1822,7 @@ fn a_required_module_gets_the_full_module_object() {
          console.log(d.paths0 === __dirname + '/node_modules');",
     )
     .expect("write main");
-    let out = Command::new(env!("CARGO_BIN_EXE_node"))
-        .arg(&main)
-        .output()
-        .expect("spawn node binary");
+    let out = run_bounded_out(&main);
     assert!(
         out.status.success(),
         "{}",
@@ -4093,10 +4146,7 @@ fn module_path_memoization_does_not_change_what_resolves() {
     )
     .expect("write main.js");
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
-        .arg(&main)
-        .output()
-        .expect("spawn node binary");
+    let out = run_bounded_out(&main);
     assert!(
         out.status.success(),
         "program failed:\n{}",
@@ -4494,10 +4544,7 @@ fn require_main_is_the_entry_module() {
     )
     .expect("write app.js");
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
-        .arg(&app)
-        .output()
-        .expect("spawn node binary");
+    let out = run_bounded_out(&app);
     assert!(
         out.status.success(),
         "program failed:\n{}",
@@ -4677,10 +4724,7 @@ fn require_cache_is_the_live_module_cache() {
     )
     .expect("write main.js");
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_node"))
-        .arg(&main)
-        .output()
-        .expect("spawn node binary");
+    let out = run_bounded_out(&main);
     assert!(
         out.status.success(),
         "program failed:\n{}",

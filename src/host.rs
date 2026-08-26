@@ -125,7 +125,7 @@ mod call_sites {
     use std::cell::RefCell;
 
     thread_local! {
-        static SITES: RefCell<rustc_hash::FxHashMap<(u64, usize), String>> =
+        pub(super) static SITES: RefCell<rustc_hash::FxHashMap<(u64, usize), String>> =
             RefCell::new(rustc_hash::FxHashMap::default());
     }
 
@@ -165,7 +165,7 @@ mod yield_sites {
     use std::cell::RefCell;
 
     thread_local! {
-        static DEPTHS: RefCell<rustc_hash::FxHashMap<(u64, usize), usize>> =
+        pub(super) static DEPTHS: RefCell<rustc_hash::FxHashMap<(u64, usize), usize>> =
             RefCell::new(rustc_hash::FxHashMap::default());
     }
 
@@ -191,6 +191,46 @@ mod yield_sites {
 }
 
 pub use yield_sites::{clear as clear_yield_sites, register as register_yield_sites};
+
+/// Every call site and yield site registered so far, as the cache stores them:
+/// `(op_hash, ip)` keys with their recorded value.
+///
+/// The tables are built by the COMPILER (`finish_chunk`), so a run that loads a
+/// program from the bytecode cache never fills them — and everything that reads
+/// them silently degrades: a generator's parked `for…of`/`yield*` iterators are
+/// not closed on an injected `.return()`, so their `finally` never runs, and a
+/// `TypeError` loses the callee's source text. Storing them alongside the
+/// program is what makes a cache hit behave like a compile.
+pub type SiteTables = (Vec<((u64, usize), String)>, Vec<((u64, usize), usize)>);
+
+/// Snapshot both registries.
+pub fn site_tables() -> SiteTables {
+    let calls = call_sites::SITES.with(|m| {
+        m.borrow()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect::<Vec<_>>()
+    });
+    let yields =
+        yield_sites::DEPTHS.with(|m| m.borrow().iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>());
+    (calls, yields)
+}
+
+/// Put a snapshot back — what a cache hit does in place of compiling.
+pub fn restore_site_tables(t: &SiteTables) {
+    call_sites::SITES.with(|m| {
+        let mut m = m.borrow_mut();
+        for (k, v) in &t.0 {
+            m.insert(*k, v.clone());
+        }
+    });
+    yield_sites::DEPTHS.with(|m| {
+        let mut m = m.borrow_mut();
+        for (k, v) in &t.1 {
+            m.insert(*k, *v);
+        }
+    });
+}
 
 /// The number of loop iterators parked on the stack at the op currently
 /// executing, for the abrupt-completion close in `b_yield`.

@@ -56,7 +56,14 @@ use std::path::PathBuf;
 ///     slow bytecode, and a cache that kept replaying it would hide the whole
 ///     change from every script already run once. The bump is what makes the
 ///     speedup reach existing scripts.
-const SCHEMA: u64 = 9;
+/// v10: the entry carries the compiler's SIDE TABLES (call-site texts, yield-site
+///     iterator depths). They live in thread-local registries that only
+///     `finish_chunk` fills, so every cache hit ran without them: a generator's
+///     parked `for…of`/`yield*` iterators were not closed when a `.return()` or
+///     `.throw()` was injected, and their `finally` never ran — the same script
+///     printed one thing on its first run and another on its second. A v9 blob
+///     has no tables to restore, so it must not be replayed.
+const SCHEMA: u64 = 10;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -90,6 +97,11 @@ struct CProg {
     main: Chunk,
     functions: Vec<(String, FuncDef)>,
     tries: Vec<TryDef>,
+    /// The compiler's side tables — call-site texts and yield-site iterator
+    /// depths — which a cache hit would otherwise never build. See
+    /// [`crate::host::SiteTables`] for what silently degrades without them.
+    #[serde(default)]
+    sites: crate::host::SiteTables,
 }
 
 /// The release this binary was built as, hashed into every cache key so a shard
@@ -236,11 +248,54 @@ pub fn load(src: &str) -> Option<Program> {
             .map(|(_, b)| b.clone())
     })?;
     let cp: CProg = bincode::deserialize(&blob).ok()?;
-    Some(Program {
+    let mut prog = Program {
         main: cp.main,
         functions: cp.functions,
         tries: cp.tries,
-    })
+    };
+    // `Chunk::op_hash` is `#[serde(skip)]` in fusevm — it is a CACHE of the
+    // hash of ops+constants, computed by `ChunkBuilder::build`, so every chunk
+    // that comes back from a blob carries 0. Anything keyed by it then looks up
+    // the wrong entry: the compiler's side tables below, and fusevm's own JIT
+    // cache, which would see every cached chunk as the same key. Recomputing it
+    // with `build`'s own algorithm is what makes a loaded chunk indistinguishable
+    // from a compiled one.
+    rehash(&mut prog);
+    // A hit skips lex/parse/lower, and with it every `register_*` the compiler
+    // would have run — so the tables come back from the entry instead.
+    crate::host::restore_site_tables(&cp.sites);
+    Some(prog)
+}
+
+/// Recompute `op_hash` on every chunk of `prog`, exactly as
+/// `fusevm::ChunkBuilder::build` does: `DefaultHasher` over `ops` then
+/// `constants`.
+///
+/// The two must stay in step; a blob is only ever read back by the binary that
+/// wrote it (the cache key carries `BUILD_VERSION` and the binary's own mtime),
+/// so the hasher cannot change underneath an entry.
+fn rehash(prog: &mut Program) {
+    fn one(c: &mut Chunk) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        c.ops.hash(&mut h);
+        c.constants.hash(&mut h);
+        c.op_hash = h.finish();
+    }
+    one(&mut prog.main);
+    for (_, f) in &mut prog.functions {
+        one(&mut f.chunk);
+    }
+    for t in &mut prog.tries {
+        one(&mut t.block);
+        if let Some((_, h)) = &mut t.handler {
+            one(h);
+        }
+        if let Some(f) = &mut t.finalizer {
+            one(f);
+        }
+    }
 }
 
 /// Record `prog` (compiled from `src`) in the resident shard. Reaches disk at
@@ -250,6 +305,9 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
         main: prog.main.clone(),
         functions: prog.functions.clone(),
         tries: prog.tries.clone(),
+        // Taken after the compile that produced `prog`, so the entry carries
+        // what that compile registered.
+        sites: crate::host::site_tables(),
     };
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
     let key = key_for(src);
