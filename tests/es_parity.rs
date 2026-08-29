@@ -3870,28 +3870,50 @@ fn fetch_round_trips_a_real_http_server() {
 /// no output at all before the 60s budget. This exercises the same
 /// listen-on-an-ephemeral-port, accept, respond, close path through the older
 /// client, so the two together localise that hang to one half or the other.
+///
+/// Every step prints a marker BEFORE doing the next one, and both halves
+/// register `error` handlers that print rather than throw. `console.log`
+/// flushes on every call (`JsHost::write_out_bytes`), and the harness folds the
+/// child's stdout into its timeout panic, so a hang names the last stage that
+/// completed instead of producing the empty capture the plain version did.
 #[test]
 fn http_request_round_trips_without_fetch() {
     let src = r##"
         const http = require('http');
         const srv = http.createServer((req, res) => {
+          console.log('S3 server-handler', req.method, req.url);
           res.writeHead(200, {'Content-Type': 'text/plain'});
           res.end('hello ' + req.method + ' ' + req.url);
         });
+        srv.on('error', e => console.log('E-server', e && e.message));
+        console.log('S1 created');
         srv.listen(0, () => {
           const port = srv.address().port;
+          console.log('S2 listening', typeof port, port > 0);
           const req = http.request({host: '127.0.0.1', port, path: '/p', method: 'GET'}, res => {
+            console.log('S4 response', res.statusCode);
             let body = '';
             res.on('data', c => body += c);
             res.on('end', () => {
-              console.log(res.statusCode, body);
+              console.log('S5 end', body);
               srv.close();
             });
           });
+          req.on('error', e => console.log('E-client', e && e.message));
           req.end();
+          console.log('S2b request-sent');
         });
     "##;
-    assert_eq!(run(src), "200 hello GET /p");
+    let expected = [
+        "S1 created",
+        "S2 listening number true",
+        "S2b request-sent",
+        "S3 server-handler GET /p",
+        "S4 response 200",
+        "S5 end hello GET /p",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
 }
 
 #[test]
