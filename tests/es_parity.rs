@@ -47,9 +47,20 @@ fn exit_status(ok: bool) -> std::process::ExitStatus {
 fn run_bounded(path: &std::path::Path) -> (bool, String, String) {
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("node");
     let dir = std::env::temp_dir();
+    // The pid alone is not unique: `cargo test` runs these on threads of ONE
+    // process, and three tests here build a script called `main.js` in their
+    // own temp directory. All three landed on `main.js.<pid>.out`, so whoever
+    // finished first truncated the file the others were about to read and
+    // their assertions failed against an empty capture — 7 runs in 10 once the
+    // suite grew enough to overlap them. The counter makes the pair unique per
+    // call.
+    let seq = {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
     let (op, ep) = (
-        dir.join(format!("{stem}.{}.out", std::process::id())),
-        dir.join(format!("{stem}.{}.err", std::process::id())),
+        dir.join(format!("{stem}.{}.{seq}.out", std::process::id())),
+        dir.join(format!("{stem}.{}.{seq}.err", std::process::id())),
     );
     let (of, ef) = (
         std::fs::File::create(&op).expect("stdout file"),
