@@ -1099,7 +1099,18 @@ fn dispatch_request(reqid: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// The blocking TCP round-trip: connect, write the request, read to EOF.
+/// The blocking TCP round-trip: connect, write the request, read until the
+/// response message is COMPLETE — by its own framing when it has one, and only
+/// then to EOF.
+///
+/// Reading unconditionally to EOF made the client depend on the server hanging
+/// up. Against `http.createServer` it does not: the response carries
+/// `Content-Length` and `Connection: keep-alive`, and nothing closes the
+/// connection, so a request served by this runtime's own server deadlocked —
+/// the caller waiting for a FIN that the server, waiting for the caller, would
+/// never send. Node's client stops at the end of the message, and so does this
+/// one now; the EOF path survives only for a response with no framing at all
+/// (HTTP/1.0 style), which is the one case where EOF *is* the framing.
 pub(crate) fn exchange(host: &str, port: u16, request: &[u8]) -> Result<Vec<u8>, String> {
     let mut stream = TcpStream::connect((host, port))
         .map_err(|e| format!("Error: connect ECONNREFUSED {host}:{port}: {e}"))?;
@@ -1109,9 +1120,16 @@ pub(crate) fn exchange(host: &str, port: u16, request: &[u8]) -> Result<Vec<u8>,
     stream
         .flush()
         .map_err(|e| format!("Error: http flush: {e}"))?;
+    let head_request = request
+        .split(|b| *b == b' ')
+        .next()
+        .is_some_and(|m| m.eq_ignore_ascii_case(b"HEAD"));
     let mut raw = Vec::new();
     let mut buf = [0u8; 16384];
     loop {
+        if response_is_complete(&raw, head_request) {
+            break;
+        }
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
@@ -1125,6 +1143,80 @@ pub(crate) fn exchange(host: &str, port: u16, request: &[u8]) -> Result<Vec<u8>,
         }
     }
     Ok(raw)
+}
+
+/// Whether `raw` already holds a whole HTTP/1.1 response, per RFC 9112 §6.3.
+///
+/// `false` for anything unframed — a response with neither `Transfer-Encoding:
+/// chunked` nor `Content-Length`, where the end of the body IS the end of the
+/// connection — so the caller keeps reading to EOF exactly as it used to.
+pub(crate) fn response_is_complete(raw: &[u8], head_request: bool) -> bool {
+    let Some(head_end) = find_subslice(raw, b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]);
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1).and_then(|s| s.parse::<u16>().ok()))
+        .unwrap_or(0);
+    // A 1xx is an INTERIM response: the real one follows on the same
+    // connection, so the message is not finished and reading continues.
+    if (100..200).contains(&status) {
+        return false;
+    }
+    // These carry no body however they are framed (RFC 9112 §6.3, cases 1-2).
+    if head_request || status == 204 || status == 304 {
+        return true;
+    }
+    let mut chunked = false;
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let name = k.trim().to_ascii_lowercase();
+        let value = v.trim();
+        if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
+            chunked = true;
+        } else if name == "content-length" {
+            content_length = value.parse().ok();
+        }
+    }
+    let body = &raw[head_end + 4..];
+    // Chunked wins over Content-Length when both are present (RFC 9112 §6.3).
+    if chunked {
+        return chunked_body_is_terminated(body);
+    }
+    match content_length {
+        Some(n) => body.len() >= n,
+        None => false,
+    }
+}
+
+/// Whether a chunked body has reached its terminating zero-size chunk and the
+/// trailer section's closing CRLF.
+fn chunked_body_is_terminated(mut data: &[u8]) -> bool {
+    loop {
+        let Some(nl) = find_subslice(data, b"\r\n") else {
+            return false;
+        };
+        let size_line = String::from_utf8_lossy(&data[..nl]);
+        let Ok(size) = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+        else {
+            return false;
+        };
+        if size == 0 {
+            // Trailer section (possibly empty) ends at the next blank line.
+            return find_subslice(&data[nl + 2..], b"\r\n").is_some();
+        }
+        // chunk-data + its trailing CRLF.
+        let consumed = nl + 2 + size + 2;
+        if data.len() < consumed {
+            return false;
+        }
+        data = &data[consumed..];
+    }
 }
 
 /// Parse the raw response and emit `response` (with an `IncomingMessage`), then
@@ -1271,5 +1363,111 @@ fn status_text(code: u16) -> &'static str {
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "OK",
+    }
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::response_is_complete;
+
+    /// The shape `http.createServer` writes: `Content-Length` plus
+    /// `Connection: keep-alive`, and no FIN. Reading to EOF deadlocked here.
+    #[test]
+    fn a_keep_alive_content_length_response_is_complete_at_its_last_body_byte() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                     Content-Length: 12\r\nConnection: keep-alive\r\n\r\n";
+        let mut raw = head.to_vec();
+        assert!(!response_is_complete(&raw, false), "no body yet");
+        raw.extend_from_slice(b"hello GET /");
+        assert!(!response_is_complete(&raw, false), "11 of 12 bytes");
+        raw.push(b'p');
+        assert!(response_is_complete(&raw, false), "12 of 12 bytes");
+    }
+
+    #[test]
+    fn a_partial_header_block_is_never_complete() {
+        assert!(!response_is_complete(b"", false));
+        assert!(!response_is_complete(b"HTTP/1.1 200 OK\r\n", false));
+        assert!(!response_is_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n",
+            false
+        ));
+    }
+
+    /// No `Content-Length` and no `Transfer-Encoding`: the connection close IS
+    /// the framing, so the caller must keep reading to EOF.
+    #[test]
+    fn an_unframed_response_is_never_reported_complete() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nbody bytes";
+        assert!(!response_is_complete(raw, false));
+    }
+
+    #[test]
+    fn a_chunked_body_completes_only_at_its_zero_chunk() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        assert!(!response_is_complete(&raw, false));
+        raw.extend_from_slice(b"5\r\nhello\r\n");
+        assert!(
+            !response_is_complete(&raw, false),
+            "one chunk, no terminator"
+        );
+        raw.extend_from_slice(b"0\r\n");
+        assert!(
+            !response_is_complete(&raw, false),
+            "trailer CRLF still missing"
+        );
+        raw.extend_from_slice(b"\r\n");
+        assert!(response_is_complete(&raw, false));
+    }
+
+    /// A chunk size line may carry extensions, and `Transfer-Encoding` wins
+    /// over a `Content-Length` that arrives with it (RFC 9112 §6.3).
+    #[test]
+    fn chunk_extensions_parse_and_chunked_outranks_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    3;name=v\r\nabc\r\n0\r\n\r\n";
+        assert!(response_is_complete(raw, false));
+        let short =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc";
+        assert!(
+            !response_is_complete(short, false),
+            "Content-Length must not settle a chunked response"
+        );
+    }
+
+    /// 204 and 304 carry no body whatever the headers claim, and neither does
+    /// any response to a HEAD.
+    #[test]
+    fn bodiless_statuses_and_head_finish_at_the_header_block() {
+        assert!(response_is_complete(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 7\r\n\r\n",
+            false
+        ));
+        assert!(response_is_complete(
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 7\r\n\r\n",
+            false
+        ));
+        assert!(response_is_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n",
+            true
+        ));
+        assert!(
+            !response_is_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n", false),
+            "the same response to a GET still needs its body"
+        );
+    }
+
+    /// A 1xx is interim: the real response follows on the same connection.
+    #[test]
+    fn an_interim_response_does_not_end_the_read() {
+        assert!(!response_is_complete(
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            false
+        ));
+        assert!(!response_is_complete(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n",
+            false
+        ));
     }
 }
