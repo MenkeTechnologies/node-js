@@ -1,6 +1,6 @@
 [package]
 name = "node-js"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.80"
 description = "JavaScript as a fusevm frontend: a lexer/parser and compiler to fusevm::Chunk on a JsHost object heap, with no bespoke VM or JIT"
@@ -75,7 +75,7 @@ path = "src/bin/parity_fuzz.rs"
 # `jit-disk-cache` turns on fusevm's Cranelift JIT *and* its persistent on-disk
 # cache of compiled native code; `aot` enables the ahead-of-time object emitter.
 # `ffi` enables inline Rust FFI (`rust { ... }` blocks) — src/rust_ffi.rs.
-fusevm = { version = "0.25.0", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
+fusevm = { version = "0.26.0", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 clap = { version = "4.5", features = ["derive", "cargo"] }
 thiserror = "2.0"
