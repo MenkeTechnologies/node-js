@@ -4039,6 +4039,79 @@ fn a_keep_alive_connection_serves_a_second_request_on_the_same_socket() {
     assert_eq!(run(src), expected);
 }
 
+/// A self-signed localhost cert+key PEM pair, or `None` when `openssl` is not
+/// on PATH. Generated per run rather than committed: a checked-in certificate
+/// expires, and a test that starts failing on a date is the same
+/// pinned-to-when-it-was-recorded defect as one pinned to a machine.
+fn self_signed_pem() -> Option<(String, String)> {
+    let dir = tempfile::Builder::new()
+        .prefix("nodejs-tls")
+        .tempdir()
+        .ok()?;
+    let (key, cert) = (dir.path().join("key.pem"), dir.path().join("cert.pem"));
+    let out = Command::new("openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+        ])
+        .arg("-keyout")
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .args(["-subj", "/CN=localhost"])
+        .args(["-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some((
+        std::fs::read_to_string(&key).ok()?,
+        std::fs::read_to_string(&cert).ok()?,
+    ))
+}
+
+/// `tls.createServer` completes its handshake and carries a round trip.
+///
+/// The accept loop keeps the listener non-blocking so `close` can stop it, and
+/// on BSD the accepted socket inherits that flag. `accept_connection` handed
+/// it straight to `rustls`' `complete_io`, whose `WouldBlock` it read as a
+/// failed handshake and returned on — so on macOS EVERY TLS connection died
+/// mid-handshake and the peer got `tls handshake failed: unexpected end of
+/// file`. `http2`'s own accept path already carried the one-line fix and the
+/// comment explaining it; `tls` never got it.
+///
+/// Linux's accept does not inherit the flag, and this repo's CI is
+/// ubuntu-only, so this test passes there with or without the fix. It earns
+/// its place on a macOS working copy, where it fails without it.
+#[test]
+fn a_tls_server_completes_its_handshake_and_round_trips() {
+    let Some((key, cert)) = self_signed_pem() else {
+        eprintln!("skipping: openssl not on PATH");
+        return;
+    };
+    let src = format!(
+        r##"
+        const tls = require('tls');
+        const opts = {{ key: {key:?}, cert: {cert:?} }};
+        const srv = tls.createServer(opts, s => {{
+          console.log('server connection');
+          s.on('data', b => {{ console.log('server got', b.toString()); s.write('pong'); }});
+        }});
+        srv.listen(0, () => {{
+          const c = tls.connect(
+            {{port: srv.address().port, host: '127.0.0.1', rejectUnauthorized: false}},
+            () => c.write('ping'));
+          c.on('data', b => {{ console.log('client got', b.toString()); c.destroy(); srv.close(); }});
+          c.on('error', e => {{ console.log('client error', e && e.message); srv.close(); }});
+        }});
+    "##
+    );
+    let expected = ["server connection", "server got ping", "client got pong"].join("\n");
+    assert_eq!(run(&src), expected);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),

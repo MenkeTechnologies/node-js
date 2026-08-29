@@ -871,6 +871,12 @@ fn accept_connection(
     config: Arc<ServerConfig>,
     io_tx: Sender<IoTask>,
 ) {
+    // The socket is inherited non-blocking from the accept poll loop; put it in
+    // blocking mode so the TLS handshake below can't fail with WouldBlock. The
+    // `http2` server does the same for the same reason; without it every
+    // handshake aborted on BSD, where an accepted socket inherits the
+    // listener's O_NONBLOCK, and the peer saw `unexpected end of file`.
+    sock.set_nonblocking(false).ok();
     let mut conn = match ServerConnection::new(config) {
         Ok(c) => c,
         Err(_) => return,
