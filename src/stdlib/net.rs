@@ -822,8 +822,16 @@ fn on_connection(
     // Reader thread: raw bytes → posted IoTasks. Never touches the host.
     std::thread::spawn(move || reader_loop(read_stream, sock_id, tx));
 
-    // Emit `connection` + run the server's connection handling.
-    super::events::instance_call(&server, "emit", vec![with_host(|_h| socket.clone())])?;
+    // Emit `connection` + run the server's connection handling. `emit` takes
+    // the event NAME first: passing the socket alone made `arg_str(&args, 0)`
+    // stringify it into the name, so every accepted socket fired an event
+    // called `[object Object]` with no argument and `server.on('connection')`
+    // never ran.
+    super::events::instance_call(
+        &server,
+        "emit",
+        vec![with_host(|h| h.new_str("connection")), socket.clone()],
+    )?;
     let hook = NET.with(|s| {
         s.borrow()
             .servers

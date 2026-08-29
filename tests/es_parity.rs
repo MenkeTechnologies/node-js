@@ -3916,6 +3916,41 @@ fn http_request_round_trips_without_fetch() {
     assert_eq!(run(src), expected);
 }
 
+/// `server.on('connection')` fires for every accepted socket, with the socket
+/// as its argument.
+///
+/// `net.createServer()` with no listener argument is the shape where this is
+/// the ONLY way to reach the socket, and it was unreachable: `on_connection`
+/// called `emit` with the socket as the first argument, and `emit` reads its
+/// first argument as the event NAME — so each accept fired an event named by
+/// the socket's own stringification, carrying no argument, and any
+/// `'connection'` handler sat idle while the client connected and closed as if
+/// nothing were wrong.
+///
+/// The assertion stays on the accept itself. A first version had the client
+/// write and the server echo, and it hung for the full child budget in 1 run
+/// of 10: `connection` fired, the client closed, and the server's `data`
+/// never arrived. That is a second defect in `net`, not this one, and pinning
+/// it here would have shipped a test that fails one run in ten.
+#[test]
+fn a_server_connection_event_delivers_the_accepted_socket() {
+    let src = r##"
+        const net = require('net');
+        const srv = net.createServer();
+        srv.on('connection', s => {
+          console.log('connection', typeof s.write, typeof s.on, typeof s.end);
+          s.destroy();
+          srv.close();
+        });
+        srv.listen(0, () => {
+          const c = net.connect(srv.address().port, '127.0.0.1');
+          c.on('close', () => console.log('client closed'));
+        });
+    "##;
+    let expected = ["connection function function function", "client closed"].join("\n");
+    assert_eq!(run(src), expected);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
