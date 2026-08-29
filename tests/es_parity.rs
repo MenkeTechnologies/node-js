@@ -3861,6 +3861,39 @@ fn fetch_round_trips_a_real_http_server() {
     assert_eq!(run(src), expected);
 }
 
+/// The server half of the round trip, on its own: `http.createServer` +
+/// `http.request`, with no `fetch` anywhere.
+///
+/// `fetch_round_trips_a_real_http_server` is the only other test that starts a
+/// server, so when it hangs there is nothing to say whether the server or
+/// `fetch` is at fault — and it HAS hung, on the Linux runner only, producing
+/// no output at all before the 60s budget. This exercises the same
+/// listen-on-an-ephemeral-port, accept, respond, close path through the older
+/// client, so the two together localise that hang to one half or the other.
+#[test]
+fn http_request_round_trips_without_fetch() {
+    let src = r##"
+        const http = require('http');
+        const srv = http.createServer((req, res) => {
+          res.writeHead(200, {'Content-Type': 'text/plain'});
+          res.end('hello ' + req.method + ' ' + req.url);
+        });
+        srv.listen(0, () => {
+          const port = srv.address().port;
+          const req = http.request({host: '127.0.0.1', port, path: '/p', method: 'GET'}, res => {
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => {
+              console.log(res.statusCode, body);
+              srv.close();
+            });
+          });
+          req.end();
+        });
+    "##;
+    assert_eq!(run(src), "200 hello GET /p");
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
