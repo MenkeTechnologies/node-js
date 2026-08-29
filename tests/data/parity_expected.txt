@@ -54,6 +54,30 @@ total 12
 negative zero positive
 caught: failure
 done
+==== destructuring.js ====
+1 2 dflt { c: 3, d: 4 }
+10 99 [ 40, 50 ]
+found
+2 1
+computed
+[ 5, undefined, [] ] [ 1, 2, [ 3, 4 ] ]
+2 undefined undefined
+fallback 0 empty-is-falsy zero
+assigned
+7
+{ s: 1, t: 2 } [ 1, 2, 3 ]
+==== errors.js ====
+MyError boom 42 true true
+try,catch
+cleanup
+try
+string a string
+TypeError
+ReferenceError
+true
+m TypeError: t
+inner-finally
+inner
 ==== fib.js ====
 fib: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
 1 2 3
@@ -71,6 +95,41 @@ hello, world
 7 256 2.5 2
 template: WORLD has 5 letters
 42 number 101010 3.14
+==== json.js ====
+{"b":2,"a":1,"nested":{"list":[1,"two",null,true]}}
+{
+  "b": 2,
+  "a": 1,
+  "nested": {
+    "list": [
+      1,
+      "two",
+      null,
+      true
+    ]
+  }
+}
+{"a":1,"b":2}
+{"b":20,"a":10,"nested":{"list":[10,"two",null,true]}}
+[null,null,null]
+{}
+"he\"llo\n" null null
+1 [ 2, 3 ] v
+[ 2, 3, 4 ]
+SyntaxError
+"custom"
+==== numbers.js ====
+0.30000000000000004 0.30 1234.57
+1234.57 ff 11111111
+42 31 3.14
+42 0 NaN 0 1
+true false false
+9007199254740991 true
+9 1 7
+-2 -1 -1 -1
+-1 0 1024 1024
+3.5 1 -1 5
+Infinity -Infinity NaN true false
 ==== objects.js ====
 Ada { age: 36, roles: [ 'admin', 'dev' ] }
 [ 'name', 'age', 'roles', 'active' ] [ 36, [ 'admin', 'dev' ] ]
@@ -91,6 +150,19 @@ a#b#c#
 true 2 true 4
 [ 'bar', 'BAZ' ]
 true gi
+==== strings.js ====
+HELLO, WORLD hello, world 12
+World World Hello d
+4 8 true
+true false o
+pad | pad   |   pad |
+007 7--
+[ 'a', 'b', 'c' ] [ 'a', 'b', 'c' ] ababab
+Hello, there HeLLo, WorLd
+xyz 42 101010
+node has 3 letters: many
+-1 true true
+AB 66
 ==== wordcount.js ====
 the: 3
 fox: 2

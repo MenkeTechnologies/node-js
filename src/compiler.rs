@@ -110,6 +110,15 @@ struct LoopCtx {
 
 #[derive(Default)]
 pub struct Compiler {
+    /// Pending short-circuit jumps for the optional chain being lowered, one
+    /// frame per chain.
+    ///
+    /// `?.` short-circuits the WHOLE chain to its right, not just its own link:
+    /// `o.a?.b.c` is `undefined` when `o.a` is nullish, and never reads `.c`
+    /// off it. Each `?.` therefore parks its jump here and the chain's ROOT
+    /// patches every one of them to the end. An empty stack means no chain is
+    /// open, so a `?.` outside one patches itself as before.
+    opt_chain: Vec<Vec<usize>>,
     functions: Vec<(String, FuncDef)>,
     tries: Vec<TryDef>,
     loops: Vec<LoopCtx>,
@@ -160,6 +169,7 @@ pub struct Compiler {
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
 pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     let mut c = Compiler {
+        opt_chain: Vec::new(),
         debug,
         // Under `--dap` the debugger reads scopes by name out of the host, and a
         // slot has no name, so a debug run keeps every local a binding.
@@ -187,6 +197,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
 /// non-expression final statement leaves nothing (→ `undefined`).
 pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     let mut c = Compiler {
+        opt_chain: Vec::new(),
         debug,
         strict: has_use_strict(stmts),
         ..Default::default()
@@ -2028,6 +2039,13 @@ impl Compiler {
                 self.compile_bind(b, target, BindMode::Assign)?;
             }
             Expr::Update { op, prefix, target } => self.compile_update(b, *op, *prefix, target)?,
+            // A chain's ROOT opens the frame its `?.` links park their jumps
+            // in; nested links see it already open and add to it.
+            Expr::Call { .. } | Expr::Member { .. } | Expr::Index { .. }
+                if self.opt_chain.is_empty() && Self::spine_has_optional(e) =>
+            {
+                self.compile_chain_root(b, e)?
+            }
             Expr::Call {
                 func,
                 args,
@@ -2621,8 +2639,16 @@ impl Compiler {
             let jshort = self.emit_optional_guard(b);
             self.name_const(b, property);
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0);
-            let end = b.current_pos();
-            b.patch_jump(jshort, end);
+            // Inside a chain the jump belongs to the chain's end, not to this
+            // link's — otherwise the rest of the chain runs on the `undefined`
+            // the short-circuit just produced.
+            match self.opt_chain.last_mut() {
+                Some(frame) => frame.push(jshort),
+                None => {
+                    let end = b.current_pos();
+                    b.patch_jump(jshort, end);
+                }
+            }
         } else {
             self.name_const(b, property);
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0);
@@ -2640,12 +2666,17 @@ impl Compiler {
         self.compile_expr(b, object)?;
         if optional {
             let jshort = self.emit_optional_guard(b);
-            self.compile_expr(b, index)?;
+            self.compile_off_spine(b, index)?;
             b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0);
-            let end = b.current_pos();
-            b.patch_jump(jshort, end);
+            match self.opt_chain.last_mut() {
+                Some(frame) => frame.push(jshort),
+                None => {
+                    let end = b.current_pos();
+                    b.patch_jump(jshort, end);
+                }
+            }
         } else {
-            self.compile_expr(b, index)?;
+            self.compile_off_spine(b, index)?;
             b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0);
         }
         Ok(())
@@ -2821,6 +2852,47 @@ impl Compiler {
         }
     }
 
+    /// Whether `e` is a link in an optional chain that short-circuits — i.e.
+    /// walking the SPINE (a member's object, an index's object, a call's
+    /// callee) reaches a `?.`. An argument or a computed index is not on the
+    /// spine: `a?.b[c?.d]` is two chains, not one.
+    fn spine_has_optional(e: &Expr) -> bool {
+        match e {
+            Expr::Member {
+                object, optional, ..
+            } => *optional || Self::spine_has_optional(object),
+            Expr::Index {
+                object, optional, ..
+            } => *optional || Self::spine_has_optional(object),
+            Expr::Call { func, optional, .. } => *optional || Self::spine_has_optional(func),
+            _ => false,
+        }
+    }
+
+    /// Lower `e` as the ROOT of an optional chain: every `?.` inside its spine
+    /// parks a jump, and all of them land here, past the whole chain.
+    fn compile_chain_root(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
+        self.opt_chain.push(Vec::new());
+        let r = self.compile_expr(b, e);
+        let pending = self.opt_chain.pop().unwrap_or_default();
+        r?;
+        let end = b.current_pos();
+        for j in pending {
+            b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Lower `e` with the enclosing chain SUSPENDED, so a `?.` inside it forms
+    /// its own chain. Used for the parts that are not on the spine — call
+    /// arguments and a computed index.
+    fn compile_off_spine(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
+        let saved = std::mem::take(&mut self.opt_chain);
+        let r = self.compile_expr(b, e);
+        self.opt_chain = saved;
+        r
+    }
+
     fn emit_optional_guard(&mut self, b: &mut ChunkBuilder) -> usize {
         b.emit(Op::Dup, 0);
         b.emit(Op::CallBuiltin(ops::NULLISH, 1), 0);
@@ -2884,10 +2956,20 @@ impl Compiler {
                 args.len()
             };
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(3 + extra)?), 0);
-            let end = b.current_pos();
-            b.patch_jump(jend, end);
-            if let Some(j) = jobj {
-                b.patch_jump(j, end);
+            match self.opt_chain.last_mut() {
+                Some(frame) => {
+                    frame.push(jend);
+                    if let Some(j) = jobj {
+                        frame.push(j);
+                    }
+                }
+                None => {
+                    let end = b.current_pos();
+                    b.patch_jump(jend, end);
+                    if let Some(j) = jobj {
+                        b.patch_jump(j, end);
+                    }
+                }
             }
             return Ok(());
         }
@@ -2965,15 +3047,22 @@ impl Compiler {
                     self.compile_spread_args(b, args)?; // [recv, name, argsArray]
                     b.emit(Op::CallBuiltin(ops::APPLY_METHOD, 3), 0);
                 } else {
+                    // Arguments are not on the chain's spine: a `?.` inside one
+                    // is its own chain and must not jump past this call.
                     for a in args {
-                        self.compile_expr(b, a)?;
+                        self.compile_off_spine(b, a)?;
                     }
                     let at = b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
                     self.note_call_site(at, func);
                 }
                 if let Some(j) = jshort {
-                    let end = b.current_pos();
-                    b.patch_jump(j, end);
+                    match self.opt_chain.last_mut() {
+                        Some(frame) => frame.push(j),
+                        None => {
+                            let end = b.current_pos();
+                            b.patch_jump(j, end);
+                        }
+                    }
                 }
             }
             Expr::Index {
