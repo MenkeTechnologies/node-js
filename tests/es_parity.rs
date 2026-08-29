@@ -4112,6 +4112,80 @@ fn a_tls_server_completes_its_handshake_and_round_trips() {
     assert_eq!(run(&src), expected);
 }
 
+/// The three response framings a client has to tell apart, over one server:
+/// chunked, a bodiless 204, and a HEAD whose headers describe a body it must
+/// not send.
+///
+/// Each of these was a `response_is_complete` unit test and nothing more, so
+/// the branches were exercised against hand-written byte strings but never
+/// against bytes this runtime's own server produced. Doing that found two
+/// defects in the server half that no unit test could have:
+///
+///   - `Transfer-Encoding: chunked` was advertised and the body written RAW,
+///     so `res.write('one'); res.write('two')` went out as
+///     `…chunked\r\n\r\nonetwo`. A conforming client reads `onetwo` as a
+///     chunk-size line, fails to parse it as hex, and loses the body. Ours
+///     survived only by falling back to reading until EOF.
+///   - A HEAD response carried the full body, which RFC 9110 §9.3.2 forbids.
+///
+/// The assertions are on what the CLIENT ends up with, so they hold whatever
+/// framing the server picks, and `content-length` is checked on the HEAD to
+/// pin that the headers still describe the body a GET would return.
+#[test]
+fn chunked_bodiless_and_head_responses_all_arrive_correctly() {
+    let src = r##"
+        const http = require('http');
+        const srv = http.createServer((req, res) => {
+          if (req.url === '/chunked') {
+            res.writeHead(200, {'Content-Type': 'text/plain', 'Transfer-Encoding': 'chunked'});
+            res.write('one');
+            res.write('two');
+            res.end();
+          } else if (req.url === '/204') {
+            res.writeHead(204);
+            res.end();
+          } else {
+            res.writeHead(200, {'Content-Type': 'text/plain'});
+            res.end('body-here');
+          }
+        });
+        srv.listen(0, () => {
+          const port = srv.address().port;
+          const get = (path, method) => new Promise(resolve => {
+            const rq = http.request({host: '127.0.0.1', port, path, method: method || 'GET'}, res => {
+              let b = '';
+              res.on('data', c => b += c);
+              res.on('end', () => resolve({
+                code: res.statusCode,
+                body: b,
+                len: res.headers['content-length'],
+              }));
+            });
+            rq.end();
+          });
+          (async () => {
+            const c = await get('/chunked');
+            console.log('chunked', c.code, JSON.stringify(c.body));
+            const n = await get('/204');
+            console.log('204', n.code, JSON.stringify(n.body));
+            const h = await get('/plain', 'HEAD');
+            console.log('head', h.code, JSON.stringify(h.body), 'content-length=' + h.len);
+            const g = await get('/plain');
+            console.log('get', g.code, JSON.stringify(g.body));
+            srv.close();
+          })();
+        });
+    "##;
+    let expected = [
+        r#"chunked 200 "onetwo""#,
+        r#"204 204 """#,
+        r#"head 200 "" content-length=9"#,
+        r#"get 200 "body-here""#,
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),

@@ -189,6 +189,11 @@ struct HttpConn {
 struct ResState {
     /// Socket id to write the serialized response to.
     sock_id: u64,
+    /// The request was a HEAD, so the response carries headers and no body
+    /// (RFC 9110 §9.3.2). The headers stay exactly as a GET would produce
+    /// them — `Content-Length` still describes the body that GET *would*
+    /// return — only the bytes after the blank line are suppressed.
+    head: bool,
     /// Status code (`writeHead`/`res.statusCode`).
     status: u16,
     /// Optional custom status message.
@@ -391,7 +396,7 @@ pub fn feed(sock_id: u64, _socket: &Value, bytes: &[u8]) -> Result<(), String> {
         let Some(parsed) = parsed else { break };
 
         let req = build_incoming(&parsed);
-        let res = build_response(sock_id);
+        let res = build_response(sock_id, parsed.method.eq_ignore_ascii_case("HEAD"));
         if with_host(|h| crate::host::is_callable(h, &listener)) {
             invoke(&listener, vec![req.clone(), res], None)?;
         }
@@ -542,13 +547,14 @@ fn incoming_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, 
 
 // ── ServerResponse (res) ─────────────────────────────────────────────────────
 
-fn build_response(sock_id: u64) -> Value {
+fn build_response(sock_id: u64, head: bool) -> Value {
     let resid = next_resid();
     RESPONSES.with(|r| {
         r.borrow_mut().insert(
             resid,
             ResState {
                 sock_id,
+                head,
                 status: 200,
                 message: None,
                 headers: Vec::new(),
@@ -744,7 +750,31 @@ fn serialize_response(st: &mut ResState) -> Vec<u8> {
         out.extend_from_slice(b"Connection: keep-alive\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&st.body);
+    // `Transfer-Encoding: chunked` is a promise about the BODY's framing, not
+    // just a header. Writing the bytes raw under it sent, for a handler that
+    // set the header and wrote "one" then "two":
+    //
+    //     Transfer-Encoding: chunked\r\n\r\nonetwo
+    //
+    // which any conforming client reads as a chunk-size line of "onetwo" — not
+    // hex, so the body is lost. Our own client only survived it by falling back
+    // to reading until EOF. `res.write` buffers into one `body` rather than
+    // streaming, so the boundaries between writes are already gone by here;
+    // one chunk carrying the whole body is the honest encoding of what we have,
+    // and chunk boundaries carry no meaning to the receiver.
+    if st.head {
+        // Headers only. `Content-Length`/`Transfer-Encoding` above already
+        // describe the GET body, which is what a HEAD response must advertise.
+    } else if chunked {
+        if !st.body.is_empty() {
+            out.extend_from_slice(format!("{:x}\r\n", st.body.len()).as_bytes());
+            out.extend_from_slice(&st.body);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+    } else {
+        out.extend_from_slice(&st.body);
+    }
     out
 }
 
@@ -1368,7 +1398,7 @@ fn status_text(code: u16) -> &'static str {
 
 #[cfg(test)]
 mod framing_tests {
-    use super::response_is_complete;
+    use super::{response_is_complete, serialize_response, ResState};
 
     /// The shape `http.createServer` writes: `Content-Length` plus
     /// `Connection: keep-alive`, and no FIN. Reading to EOF deadlocked here.
@@ -1382,6 +1412,92 @@ mod framing_tests {
         assert!(!response_is_complete(&raw, false), "11 of 12 bytes");
         raw.push(b'p');
         assert!(response_is_complete(&raw, false), "12 of 12 bytes");
+    }
+
+    /// The encoder's own output must satisfy the decoder. `serialize_response`
+    /// frames a chunked body and `response_is_complete` decides when one has
+    /// arrived; if they disagree the client hangs waiting for a terminator the
+    /// server never wrote, which is what happened when the body went out raw
+    /// under a `Transfer-Encoding: chunked` header.
+    #[test]
+    fn a_chunked_response_this_server_wrote_is_complete_to_this_client() {
+        let mut st = ResState {
+            sock_id: 0,
+            head: false,
+            status: 200,
+            message: None,
+            headers: vec![("Transfer-Encoding".into(), "chunked".into())],
+            body: b"onetwo".to_vec(),
+        };
+        let wire = serialize_response(&mut st);
+        assert!(
+            wire.ends_with(b"\r\n\r\n6\r\nonetwo\r\n0\r\n\r\n"),
+            "unexpected framing: {}",
+            String::from_utf8_lossy(&wire)
+        );
+        assert!(response_is_complete(&wire, false));
+        // Every prefix short of the terminator must still read as incomplete,
+        // so the client keeps reading rather than truncating the body.
+        for cut in 1..wire.len() {
+            assert!(
+                !response_is_complete(&wire[..cut], false),
+                "a {cut}-byte prefix was reported complete"
+            );
+        }
+    }
+
+    /// An empty chunked body is still a terminator, not nothing.
+    #[test]
+    fn an_empty_chunked_response_is_just_the_zero_chunk() {
+        let mut st = ResState {
+            sock_id: 0,
+            head: false,
+            status: 200,
+            message: None,
+            headers: vec![("Transfer-Encoding".into(), "chunked".into())],
+            body: Vec::new(),
+        };
+        let wire = serialize_response(&mut st);
+        assert!(
+            wire.ends_with(b"\r\n\r\n0\r\n\r\n"),
+            "{}",
+            String::from_utf8_lossy(&wire)
+        );
+        assert!(response_is_complete(&wire, false));
+    }
+
+    /// A HEAD response keeps the headers a GET would send and drops the body.
+    #[test]
+    fn a_head_response_advertises_the_get_length_and_sends_no_body() {
+        let mk = |head: bool| {
+            let mut st = ResState {
+                sock_id: 0,
+                head,
+                status: 200,
+                message: None,
+                headers: vec![("Content-Type".into(), "text/plain".into())],
+                body: b"body-here".to_vec(),
+            };
+            serialize_response(&mut st)
+        };
+        let head = mk(true);
+        let get = mk(false);
+        let text = String::from_utf8_lossy(&head).into_owned();
+        assert!(text.contains("Content-Length: 9"), "{text}");
+        assert!(
+            text.ends_with("\r\n\r\n"),
+            "HEAD must stop at the blank line: {text}"
+        );
+        assert!(String::from_utf8_lossy(&get).ends_with("body-here"));
+        // Identical headers, differing only in the body that follows.
+        let split = |v: &[u8]| {
+            String::from_utf8_lossy(v)
+                .split("\r\n\r\n")
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(split(&head), split(&get));
     }
 
     #[test]
