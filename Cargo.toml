@@ -164,7 +164,7 @@ pkcs8 = { version = "0.10", features = ["pem", "alloc"] }
 spki = "0.7"
 sec1 = "0.7"
 x509-cert = "0.2"
-num-prime = "0.4"
+num-prime = "0.5"
 argon2 = "0.5"
 rand_core = { version = "0.6", features = ["getrandom"] }
 const-oid = "0.9"
