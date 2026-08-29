@@ -10,13 +10,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-test:
+  # Lint and doc gates are platform-independent, so they run once on Linux
+  # rather than twice.
+  lint:
     runs-on: ubuntu-latest
-    # The suite runs in about two minutes; anything approaching this is a hang,
-    # not slowness. Without a bound the job sat until GitHub's six-hour ceiling
-    # cancelled it — the run of 2026-08-25 went 21:39 to 03:42 and was killed
-    # with `es_parity` and a spawned `node` still alive, which reads as
-    # "cancelled" rather than as a failure and hides the real state.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +27,40 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  build-test:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # macOS is here because a whole class of defect is invisible without it.
+    # The `net`/`tls`/`http2` servers keep their LISTENER non-blocking so
+    # `close()` can stop the accept loop, and on BSD an accepted socket
+    # inherits that flag while on Linux it does not. Three bugs shipped behind
+    # that difference and none of them could fail an ubuntu-only run:
+    #
+    #   - `net`: the reader treated the inherited `WouldBlock` as fatal, so
+    #     every connection was closed after its first chunk (72f048eb54).
+    #   - `tls`: the handshake ran on the non-blocking socket and aborted, so
+    #     `tls.createServer` never completed a connection (442740e705).
+    #   - `http`: the client read to EOF and relied on the FIN that the first
+    #     bug produced, so it deadlocked where the server behaved correctly
+    #     (0a0b5cf5d7) — it hung on Linux ONLY, the mirror image of the others.
+    #
+    # The primary development machine is macOS aarch64; a suite that cannot
+    # fail there is not watching the platform the code is written on.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # The suite runs in about two minutes; anything approaching this is a hang,
+    # not slowness. Without a bound the job sat until GitHub's six-hour ceiling
+    # cancelled it — the run of 2026-08-25 went 21:39 to 03:42 and was killed
+    # with `es_parity` and a spawned `node` still alive, which reads as
+    # "cancelled" rather than as a failure and hides the real state.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
       - name: Build
         run: cargo build --verbose
       - name: Test
