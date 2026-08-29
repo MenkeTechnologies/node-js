@@ -797,6 +797,15 @@ fn on_connection(
     });
     let Some(server) = server else { return Ok(()) };
 
+    // The accept loop keeps the LISTENER non-blocking so `close` can stop it,
+    // and on BSD an accepted socket inherits that flag — on macOS the very
+    // first `read` on this connection returned `WouldBlock` (os error 35),
+    // which `reader_loop` used to treat as a fatal error, so every connection
+    // was torn down right after its first chunk. Linux's accept does not
+    // inherit it, which is why only macOS saw it. Put it back to blocking
+    // before anyone reads or writes.
+    let _ = stream.set_nonblocking(false);
+
     // Reader gets an independent handle; writes go through the original stream.
     let read_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -862,6 +871,18 @@ fn reader_loop(
             Ok(n) => {
                 let bytes = buf[..n].to_vec();
                 let _ = tx.send(Box::new(move || on_socket_data(sock_id, bytes)));
+            }
+            // Neither of these means the peer went away: `WouldBlock` says the
+            // socket is non-blocking and has nothing right now, `Interrupted`
+            // says a signal landed mid-call. Closing the connection on either
+            // one loses a live socket, so wait and read again. The sleep keeps
+            // a non-blocking socket from spinning, and matches the accept
+            // loop's poll interval.
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
             Err(_) => {
                 let _ = tx.send(Box::new(move || on_socket_close(sock_id)));

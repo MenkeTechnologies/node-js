@@ -3951,6 +3951,83 @@ fn a_server_connection_event_delivers_the_accepted_socket() {
     assert_eq!(run(src), expected);
 }
 
+/// A server connection survives past its first chunk, and a client `end()`
+/// reaches it as `end`.
+///
+/// The accept loop keeps the LISTENER non-blocking so `server.close()` can
+/// stop it. On BSD the accepted socket inherits that flag, so on macOS the
+/// second `read` of every connection returned `WouldBlock` — which
+/// `reader_loop` treated as a fatal error and closed the socket on. Every
+/// connection died right after its first chunk: `s.on('end')` never fired
+/// because there was no socket left to fire it, and the client saw a FIN
+/// 10ms after connecting that looked like a well-behaved server hanging up.
+/// Linux's accept does not inherit the flag, so CI never saw any of it.
+#[test]
+fn a_connection_outlives_its_first_chunk_and_sees_the_clients_end() {
+    let src = r##"
+        const net = require('net');
+        const srv = net.createServer();
+        srv.on('connection', s => {
+          s.on('data', b => { console.log('server got', b.toString()); s.write('pong'); });
+          s.on('end', () => { console.log('server saw end'); srv.close(); s.destroy(); });
+        });
+        srv.listen(0, () => {
+          const c = net.connect(srv.address().port, '127.0.0.1', () => c.write('ping'));
+          c.on('data', b => { console.log('client got', b.toString()); c.end(); });
+          c.on('close', () => console.log('client closed'));
+        });
+    "##;
+    let expected = [
+        "server got ping",
+        "client got pong",
+        "server saw end",
+        "client closed",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// Two requests over ONE socket. `serialize_response` advertises
+/// `Connection: keep-alive`, and until the reader stopped dying on
+/// `WouldBlock` that was a false claim on macOS: the server closed after the
+/// first request and a second one on the same connection got no reply.
+///
+/// The client is a raw `net` socket speaking HTTP by hand on purpose.
+/// `http.request` opens a fresh `TcpStream` per call (`http::exchange`
+/// connects every time, there is no agent pool), so a version of this written
+/// with two `http.request` calls passes with the bug still in place — it never
+/// reuses the connection it claims to be testing.
+#[test]
+fn a_keep_alive_connection_serves_a_second_request_on_the_same_socket() {
+    let src = r##"
+        const net = require('net');
+        const http = require('http');
+        const srv = http.createServer((req, res) => {
+          res.writeHead(200, {'Content-Type': 'text/plain'});
+          res.end('reply ' + req.url);
+        });
+        srv.listen(0, () => {
+          const c = net.connect(srv.address().port, '127.0.0.1', () => {
+            c.write('GET /one HTTP/1.1\r\nHost: x\r\n\r\n');
+          });
+          let buf = '', sent = 1;
+          c.on('data', d => {
+            buf += d.toString();
+            const i = buf.indexOf('\r\n\r\n');
+            if (i < 0) return;
+            const body = buf.slice(i + 4);
+            if (body.length < ('reply /one').length) return;
+            console.log('response ' + sent, body);
+            buf = '';
+            if (sent === 1) { sent = 2; c.write('GET /two HTTP/1.1\r\nHost: x\r\n\r\n'); }
+            else { c.destroy(); srv.close(); }
+          });
+        });
+    "##;
+    let expected = ["response 1 reply /one", "response 2 reply /two"].join("\n");
+    assert_eq!(run(src), expected);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
