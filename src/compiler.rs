@@ -183,6 +183,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     };
     let mut b = ChunkBuilder::new();
     // Hoist function declarations to the top (JS function hoisting).
+    c.hoist_vars(&mut b, stmts)?;
     c.hoist_funcs(&mut b, stmts)?;
     c.compile_stmts(&mut b, stmts)?;
     Ok(Program {
@@ -203,6 +204,7 @@ pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
+    c.hoist_vars(&mut b, stmts)?;
     c.hoist_funcs(&mut b, stmts)?;
     if let Some((last, rest)) = stmts.split_last() {
         c.compile_stmts(&mut b, rest)?;
@@ -370,6 +372,36 @@ impl Compiler {
         b.emit(Op::CallBuiltin(ops::MKFUNC, 1), 0);
     }
 
+    /// Emit the `var` hoisting for one function (or program) scope.
+    ///
+    /// A `var` binding exists from the moment its scope is entered, so
+    /// `f(){ x; var x = 1 }` reads `undefined` where a `let` would throw. The
+    /// walk therefore descends through every block, loop, `switch`, `try` and
+    /// label — `var` ignores block scope — but stops at a nested function, which
+    /// begins a scope of its own. Only the binding is created here; the
+    /// initialiser still runs where it is written.
+    ///
+    /// Emitted BEFORE [`Self::hoist_funcs`] so a function declaration overwrites
+    /// the `undefined` rather than the other way round, which is the order the
+    /// spec instantiates them in.
+    fn hoist_vars(&mut self, b: &mut ChunkBuilder, stmts: &[Stmt]) -> Result<(), String> {
+        let mut names = Vec::new();
+        for s in stmts {
+            collect_var_names(s, &mut names);
+        }
+        for n in names {
+            // A slotted local is its slot, which already reads `undefined`
+            // before its first write, so there is no binding to create.
+            if self.slot_of(&n).is_some() {
+                continue;
+            }
+            self.name_const(b, &n);
+            b.emit(Op::CallBuiltin(ops::HOIST_VAR, 1), 0);
+            b.emit(Op::Pop, 0);
+        }
+        Ok(())
+    }
+
     fn hoist_funcs(&mut self, b: &mut ChunkBuilder, stmts: &[Stmt]) -> Result<(), String> {
         for s in stmts {
             if let StmtKind::FuncDecl {
@@ -422,6 +454,12 @@ impl Compiler {
             StmtKind::Decl { kind, decls } => {
                 let mode = bind_mode(*kind);
                 for d in decls {
+                    // `var x;` with no initialiser names a binding that scope
+                    // entry already created, and must NOT reset it — in
+                    // `function f(a) { var a; }` the parameter stands.
+                    if d.init.is_none() && *kind == DeclKind::Var {
+                        continue;
+                    }
                     match &d.init {
                         Some(v) => {
                             self.compile_expr(b, v)?;
@@ -1453,7 +1491,11 @@ impl Compiler {
         let saved_sites = std::mem::take(&mut self.call_sites);
         let saved_yields = std::mem::take(&mut self.yield_sites);
         let r = (|| {
-            // Function-body function hoisting.
+            // Function-body hoisting: `var` bindings first, so a same-named
+            // function declaration below overwrites the `undefined` rather than
+            // being overwritten by it. Parameters are already bound, and
+            // `hoist_var_name` leaves an existing binding alone.
+            self.hoist_vars(&mut fb, body)?;
             self.hoist_funcs(&mut fb, &prologue)?;
             self.hoist_funcs(&mut fb, body)?;
             self.compile_stmts(&mut fb, &prologue)?;
@@ -3186,4 +3228,103 @@ fn default_stmt(name: &str, default: &Expr) -> Stmt {
         }))),
         alt: None,
     })
+}
+
+/// Every name a `var` binds inside one function scope, in source order.
+///
+/// Descends through block-scoped constructs, because `var` is not block-scoped,
+/// and stops at a nested `function` declaration, whose body is its own scope.
+/// Function *expressions* and arrows are inside `Expr`, which is not walked at
+/// all: a `var` can only be introduced by a statement.
+fn collect_var_names(s: &Stmt, out: &mut Vec<String>) {
+    match &s.kind {
+        StmtKind::Decl {
+            kind: DeclKind::Var,
+            decls,
+        } => {
+            for d in decls {
+                pattern_names(&d.target, out);
+            }
+        }
+        StmtKind::Block(body) => body.iter().for_each(|s| collect_var_names(s, out)),
+        StmtKind::If { cons, alt, .. } => {
+            collect_var_names(cons, out);
+            if let Some(a) = alt {
+                collect_var_names(a, out);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::Labeled { body, .. } => collect_var_names(body, out),
+        StmtKind::For { init, body, .. } => {
+            if let Some(i) = init {
+                collect_var_names(i, out);
+            }
+            collect_var_names(body, out);
+        }
+        StmtKind::ForOf {
+            decl_kind,
+            target,
+            body,
+            ..
+        }
+        | StmtKind::ForIn {
+            decl_kind,
+            target,
+            body,
+            ..
+        } => {
+            if *decl_kind == Some(DeclKind::Var) {
+                pattern_names(target, out);
+            }
+            collect_var_names(body, out);
+        }
+        StmtKind::Switch { cases, .. } => {
+            for c in cases {
+                c.body.iter().for_each(|s| collect_var_names(s, out));
+            }
+        }
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            block.iter().for_each(|s| collect_var_names(s, out));
+            if let Some((_, body)) = handler {
+                // The catch PARAMETER is block-scoped to the handler, so it is
+                // not collected; a `var` in the handler body still hoists.
+                body.iter().for_each(|s| collect_var_names(s, out));
+            }
+            if let Some(f) = finalizer {
+                f.iter().for_each(|s| collect_var_names(s, out));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The binding names a declaration target introduces, destructuring included.
+fn pattern_names(target: &Expr, out: &mut Vec<String>) {
+    match target {
+        Expr::Ident(n) => {
+            if !out.iter().any(|x| x == n) {
+                out.push(n.clone());
+            }
+        }
+        Expr::Array(items) => items.iter().for_each(|i| pattern_names(i, out)),
+        Expr::Object(props) => {
+            for p in props {
+                match p {
+                    Prop::KeyValue { value, .. } => pattern_names(value, out),
+                    Prop::Spread(e) => pattern_names(e, out),
+                    Prop::Accessor { .. } => {}
+                }
+            }
+        }
+        // `[a = 1]` / `{a: b = 1}` — the binding is the target, not the default.
+        Expr::Assign { target, .. } => pattern_names(target, out),
+        Expr::Spread(inner) => pattern_names(inner, out),
+        // A member target (`[obj.x] = …`) assigns a property, binding nothing.
+        _ => {}
+    }
 }

@@ -81,6 +81,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::POP_SCOPE, b_pop_scope);
     vm.register_builtin(ops::COPY_SCOPE, b_copy_scope);
     vm.register_builtin(ops::DECLARE_VAR, b_declare_var);
+    vm.register_builtin(ops::HOIST_VAR, b_hoist_var);
     vm.register_builtin(ops::NAMED_EVAL, b_named_eval);
 }
 
@@ -638,6 +639,13 @@ fn b_declare_const(vm: &mut VM, _: u8) -> Value {
 
 /// `var x = …` / a hoisted `function f(){}`: bind at function scope, skipping any
 /// open block scopes, so the name outlives the block it was written in.
+/// `var` hoisting: create the binding as `undefined` unless it already exists.
+fn b_hoist_var(vm: &mut VM, _: u8) -> Value {
+    let name = sname(&vm.pop());
+    with_host(|h| h.hoist_var_name(&name));
+    Value::Undef
+}
+
 fn b_declare_var(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = sname(&vm.pop());

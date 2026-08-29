@@ -119,7 +119,9 @@ Runnable `examples/*.js` ship with the crate.
 A working core, grown outward from the sibling frontends. Implemented end-to-end
 (see `examples/*.js` and `tests/parity.rs`):
 
-- `var` / `let` / `const`; block scoping; expression and block statements.
+- `var` / `let` / `const`; block scoping; `var` and function-declaration
+  hoisting (a `var` is bound from scope entry, so a read above its
+  declaration is `undefined`); expression and block statements.
 - Full operator surface: arithmetic (`+ - * / % **`), string `+`, comparison
   (`== != === !== < > <= >=`), logical (`&& || !`), nullish `??`, bitwise
   (`& | ^ ~ << >> >>>`), `typeof` / `void` / `delete` / `instanceof` / `in`,

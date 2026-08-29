@@ -106,6 +106,7 @@ pub mod ops {
     pub const DECLARE_CONST: u16 = 71; // [name, value] -> value; like DECLARE but the binding is IMMUTABLE (`const`)
     pub const MARK_HOLE: u16 = 72; // [arr, index] -> arr; record an ELIDED array-literal element
     pub const SETLOCAL_STRICT: u16 = 73; // [name, value] -> value; like SETLOCAL but an UNRESOLVABLE name throws ReferenceError instead of creating a global (strict-mode PutValue)
+    pub const HOIST_VAR: u16 = 74; // [name] -> create the `var` binding as undefined IF ABSENT (hoisting)
 }
 
 /// Per-call-site callee SOURCE TEXT, for the `TypeError` a failed call raises.
@@ -2179,6 +2180,27 @@ impl JsHost {
 
     /// Declare a `var` (or a hoisted function declaration): FUNCTION-scoped, so it
     /// skips every open block scope and lands in the activation's base env.
+    /// Create a hoisted `var` binding, initialised to `undefined`, only when the
+    /// name is not already bound in this activation.
+    ///
+    /// `var` bindings come into existence when the scope is entered, not where
+    /// the declaration is written — `f(){ x; var x = 1 }` reads `undefined`
+    /// rather than throwing. "If absent" is what keeps a parameter intact: in
+    /// `function f(a) { var a; }` the `var` names a binding that already exists
+    /// and must not be reset, which is also why a bare `var x;` emits nothing at
+    /// its own position.
+    pub fn hoist_var_name(&mut self, name: &str) {
+        if self.frame().is_module {
+            self.globals.entry(name.to_string()).or_insert(Value::Undef);
+            return;
+        }
+        let base = self.frame().base_env.clone();
+        let mut env = base.borrow_mut();
+        if !env.vars.contains_key(name) {
+            env.vars.insert(name.to_string(), Value::Undef);
+        }
+    }
+
     pub fn declare_var_name(&mut self, name: &str, val: Value) {
         if self.frame().is_module {
             self.globals.insert(name.to_string(), val);

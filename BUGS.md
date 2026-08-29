@@ -263,6 +263,56 @@ sloppy mode Node binds it to `globalThis` and boxes a primitive `this`
 Scoped to a CALL. The TOP-LEVEL `this` was `undefined` too and is now correct at
 all three entry points — see the FIXED section below.
 
+## The temporal dead zone is a missing binding, not a poisoned one
+
+A `let`/`const`/`class` binding is created where its declaration runs rather
+than where its block is entered, so the dead zone before it is indistinguishable
+from a name that was never declared. A plain read throws `ReferenceError` either
+way and so looks right, but the two observable halves are wrong:
+
+```js
+try { d; let d = 1 } catch (e) { e.message }
+// node:    Cannot access 'd' before initialization
+// node-js: d is not defined
+
+try { typeof d; let d = 1 } catch (e) { "threw" }
+// node:    threw          (typeof does NOT rescue a name in the dead zone)
+// node-js: no throw       (typeof reads it as an unbound name -> "undefined")
+```
+
+Both follow from the same absence. `typeof` is the sharper one: it is the only
+read JS allows of an unresolvable name, and the dead zone is the one case where
+it still throws, so treating "not there yet" and "never declared" alike gets it
+backwards. Closing this needs what `var` hoisting now does, but per BLOCK and
+with a poison rather than `undefined`: the lexical names of a block created on
+entry holding a marker, every name read checking for it, and the declaration
+overwriting it. The check lands on the by-name read path — which is the path
+`slots.rs` exists to keep hot code off, so the cost is bounded — but it is a
+representation change to every binding, and it is not free enough to fold into
+an unrelated fix.
+
+## FIXED — `var` bindings exist from scope entry, not from their declaration
+
+A `var` used to be created where its declaration ran, so every read above it
+threw instead of answering `undefined`, and a bare `var x;` overwrote a binding
+that already existed:
+
+```js
+function f() { console.log(x); var x = 1 }   // was: ReferenceError: x is not defined
+function g(a) { var a; return a }; g(5)      // was: undefined
+```
+
+Scope entry now creates them. `compiler::hoist_vars` walks the statements of one
+function scope — descending through blocks, loop heads, `switch`, `try`/`catch`/
+`finally` and labels, because none of those scopes a `var`, and stopping at a
+nested function, which starts a scope of its own — and emits `ops::HOIST_VAR`
+per name, destructuring targets included. The op creates the binding as
+`undefined` only when it is absent, which is what leaves a parameter standing,
+and a bare `var x;` now emits nothing at its own position. It runs before the
+function-declaration hoisting so a `function h(){}` overwrites a `var h`, the
+order the spec instantiates them in. A slotted local is skipped: its slot already
+reads `undefined` before its first write.
+
 ## FIXED — strings are indexed by UTF-16 code unit
 
 Strings used to be indexed by code POINT, so every index agreed with node

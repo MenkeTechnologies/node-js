@@ -95,6 +95,32 @@ hello, world
 7 256 2.5 2
 template: WORLD has 5 letters
 42 number 101010 3.14
+==== hoisting.js ====
+undefined undefined
+1
+[ undefined, 2 ]
+callable
+function
+5 undefined
+[ 'number', 1 ]
+[
+  [
+    'undefined',
+    'undefined',
+    'undefined',
+    'undefined',
+    'undefined',
+    'undefined'
+  ],
+  [ 1, 'a', 'sw', 't', 'c', 'fin' ]
+]
+[
+  [ 'undefined', 'undefined', 'undefined', 'undefined' ],
+  [ 'd1', 'dflt', 3, [ 4, 5 ] ]
+]
+3,3,3 0,1,2
+ReferenceError true
+undefined
 ==== json.js ====
 {"b":2,"a":1,"nested":{"list":[1,"two",null,true]}}
 {
