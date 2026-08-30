@@ -246,6 +246,21 @@ subclass 1 true
 ==== fib.js ====
 fib: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
 1 2 3
+==== filesystem.js ====
+none     Buffer<68656c6c6f>
+utf8     "hello" "hello"
+hex      "68656c6c6f" "68656c6c6f"
+base64   "aGVsbG8=" "hello"
+null-opt Buffer<68656c6c6f> "hello"
+wr-hex   "hello"
+wr-b64   "hi"
+ap-hex   "plain!"
+wr-buf   "hi"
+cb-hex   null "68656c6c6f"
+cb-b64   null "aGVsbG8="
+cb-buf   null true
+prom-hex "68656c6c6f"
+cleanup  false
 ==== generators.js ====
 range [ 2, 3, 4, 5, 6 ]
 fib [ 0, 1, 1, 2, 3, 5 ]

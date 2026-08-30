@@ -306,17 +306,40 @@ fn read_file_sync(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
     let enc = encoding_arg(args, 1);
     match std::fs::read(&path) {
+        // The encoding names the REPRESENTATION to return, not just "decode as
+        // text": `readFileSync(p, 'hex')` gives the hex digits of the file, and
+        // `'base64'` its base64. Every encoding used to come back as the raw
+        // UTF-8 text.
         Ok(bytes) => Ok(match enc {
-            Some(_) => with_host(|h| h.new_str(String::from_utf8_lossy(&bytes).into_owned())),
+            Some(e) => with_host(|h| h.new_str(super::buffer::encode_bytes(&bytes, &e))),
             None => super::buffer::from_bytes(&bytes),
         }),
         Err(e) => Err(err_str("readFileSync", &path, &e)),
     }
 }
 
+/// The bytes a `writeFileSync`/`appendFileSync` should put on disk.
+///
+/// When an encoding is given, the DATA STRING is in that encoding and has to be
+/// decoded first — `writeFileSync(p, '68656c6c6f', 'hex')` writes `hello`, five
+/// bytes, not the ten digits. The encoding argument was ignored, so the digits
+/// themselves were written. A Buffer argument carries its own bytes and is
+/// unaffected.
+fn encoded_bytes(args: &[Value]) -> Vec<u8> {
+    let v = args.get(1).cloned().unwrap_or(Value::Undef);
+    if native_tag(&v).as_deref() == Some("Buffer") {
+        return buf_bytes(&v);
+    }
+    let text = with_host(|h| h.str_of(&v));
+    match encoding_arg(args, 2) {
+        Some(e) => super::buffer::decode_str(&text, &e),
+        None => text.into_bytes(),
+    }
+}
+
 fn write_file_impl(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
-    let data = value_bytes(args.get(1).unwrap_or(&Value::Undef));
+    let data = encoded_bytes(args);
     match std::fs::write(&path, data) {
         Ok(_) => Ok(Value::Undef),
         Err(e) => Err(err_str("writeFile", &path, &e)),
@@ -325,7 +348,7 @@ fn write_file_impl(args: &[Value]) -> Result<Value, String> {
 
 fn append_file_impl(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
-    let data = value_bytes(args.get(1).unwrap_or(&Value::Undef));
+    let data = encoded_bytes(args);
     let r = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -350,8 +373,11 @@ fn read_file_async(args: &[Value]) -> Result<Value, String> {
     let (err, data) = match std::fs::read(&path) {
         Ok(bytes) => (
             with_host(|h| h.null()),
+            // Same representation rule as the sync read: the encoding names
+            // what to return, so `readFile(p, 'hex', cb)` hands the callback
+            // hex digits.
             match enc {
-                Some(_) => with_host(|h| h.new_str(String::from_utf8_lossy(&bytes).into_owned())),
+                Some(e) => with_host(|h| h.new_str(super::buffer::encode_bytes(&bytes, &e))),
                 None => super::buffer::from_bytes(&bytes),
             },
         ),
@@ -1781,12 +1807,27 @@ fn ok_or_errno(rc: libc::c_int, op: &str, path: &str) -> Result<Value, String> {
     }
 }
 
+/// The encoding an fs call was given, from either the string form
+/// (`readFileSync(p, 'hex')`) or the options-object form
+/// (`readFileSync(p, { encoding: 'hex' })`).
+///
+/// The object form used to be discarded — it was detected by its
+/// `"[object Object]"` stringification and treated as absent — so
+/// `{ encoding: 'utf8' }` returned a Buffer. `{ encoding: null }` really does
+/// mean "no encoding", and so returns `None`.
 fn encoding_arg(args: &[Value], i: usize) -> Option<String> {
     match args.get(i) {
         Some(Value::Undef) | None => None,
         Some(v) => {
+            if with_host(|h| matches!(h.get(v), Some(JsObj::Object(_)))) {
+                let e = crate::builtins::get_property(v, "encoding").ok()?;
+                if matches!(e, Value::Undef) || with_host(|h| h.is_null(&e)) {
+                    return None;
+                }
+                return Some(with_host(|h| h.str_of(&e)));
+            }
             let s = with_host(|h| h.str_of(v));
-            if s == "undefined" || s == "[object Object]" || s == "null" {
+            if s == "undefined" || s == "null" {
                 None
             } else {
                 Some(s)
