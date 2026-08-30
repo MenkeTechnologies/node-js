@@ -193,6 +193,8 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "util" => util::METHODS,
         "assert" | "assertStrict" => assert::METHODS,
         "crypto" => crypto::METHODS,
+        "webcrypto" => crypto::WEBCRYPTO_METHODS,
+        "SubtleCrypto" => crypto::SUBTLE_METHODS,
         "Buffer" => buffer::STATIC_METHODS,
         "buffer" => buffer::MODULE_METHODS,
         "Date" => date::STATIC_METHODS,
@@ -306,6 +308,10 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "assert" => assert::call(m, args)?,
         "assertStrict" => assert::strict_call(m, args)?,
         "crypto" => crypto::call(m, args)?,
+        // `webcrypto`'s two random helpers are the same implementations the
+        // node-flavoured `crypto` module exposes.
+        "webcrypto" => crypto::call(m, args)?,
+        "SubtleCrypto" => crypto::subtle_call(m, args)?,
         "Buffer" => buffer::static_call(m, args)?,
         "buffer" if m == "Buffer" => Ok(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into())))),
         "buffer" => buffer::module_call(m, args)?,
@@ -397,6 +403,15 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         // `undefined`.
         "fs" | "fs/promises" if name == "constants" => Some(constants::object(&constants::fs())),
         "crypto" if name == "constants" => Some(constants::object(&constants::crypto())),
+        // `crypto.webcrypto` is the WHATWG surface; `globalThis.crypto` is the
+        // same object. Only its two random helpers and `subtle.digest` are
+        // implemented — see `crypto::WEBCRYPTO_METHODS`.
+        "crypto" if name == "webcrypto" => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin("webcrypto".into()))))
+        }
+        "webcrypto" if name == "subtle" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("SubtleCrypto".into()))
+        })),
         // `EventEmitter.defaultMaxListeners` is a DATA property, so it belongs
         // here rather than among the static methods (which would make it read
         // as a function). It was absent: node reports 10.

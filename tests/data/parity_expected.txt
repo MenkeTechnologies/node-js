@@ -499,6 +499,19 @@ config   object object object
 flags    function number true false
 readline function object function object
 iface    function function function
+hash-ta  ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+hash-str ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+hash-buf ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+hash-bin 6e153708ea1302ccc480999bda6939c7aef6dd60531b7acfff00e81bde4986ab
+hmac-bin fedb07677f3c7c1fba4f5930bd47891bc3c4478040cecc235184de4b916f1d82
+hmac-key 200fd2f9dada90b91212225a6b5e5975512edffd02503bb98ea612ca904daa24
+hash-mix ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+webc     object true function function undefined
+random   36 4 true
+subtle   object function
+digest   ArrayBuffer 32 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+digest1  20 7037807198c22a7d2b0807371d763779a84fdfcf
+unknown  NotSupportedError Unrecognized algorithm name true
 ==== numbers.js ====
 0.30000000000000004 0.30 1234.57
 1234.57 ff 11111111

@@ -528,6 +528,20 @@ pub fn buffer_resize(ab: &Value, args: &[Value]) -> Result<Value, String> {
     Ok(Value::Undef)
 }
 
+/// Overwrite an `ArrayBuffer`'s bytes wholesale, for a producer that computed
+/// them outside the heap.
+pub fn write_buffer_bytes(ab: &Value, bytes: &[u8]) {
+    let Some(store) = store_of(ab) else { return };
+    with_host(|h| {
+        if let Some(JsObj::Array(items)) = h.get_mut(&store) {
+            *items = bytes.iter().map(|b| Value::Float(*b as f64)).collect();
+        }
+        if let Some(JsObj::Object(p)) = h.get_mut(ab) {
+            p.insert("byteLength".into(), Value::Float(bytes.len() as f64));
+        }
+    });
+}
+
 /// The heap array an `ArrayBuffer` keeps its bytes in, so another view can
 /// share it rather than copy.
 pub fn buffer_store(ab: &Value) -> Option<Value> {
@@ -728,8 +742,9 @@ pub fn new_array_buffer(n: usize) -> Value {
         m.insert("byteLength".into(), Value::Float(n as f64));
         let obj = h.new_object(m);
         h.hide_prop(&obj, "byteLength");
-        h.ensure_native_protos();
-        if let Some(p) = h.native_proto("ArrayBuffer") {
+        // `ensure_ctor_proto` builds the prototype WITH a `constructor` slot, so
+        // `ab.constructor.name` reports `ArrayBuffer` rather than `Object`.
+        if let Some(p) = h.ensure_ctor_proto("ArrayBuffer") {
             h.set_proto(&obj, p);
         }
         obj

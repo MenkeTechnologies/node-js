@@ -112,6 +112,49 @@ pub const METHODS: &[&str] = &[
     "getRandomValues",
 ];
 
+/// The `webcrypto` / `globalThis.crypto` members this runtime implements.
+///
+/// `subtle` carries `digest` ONLY. The rest of SubtleCrypto — `encrypt`,
+/// `generateKey`, `importKey`, the key-derivation and key-wrapping methods, and
+/// the `CryptoKey` type they exchange — is not implemented, and is absent rather
+/// than present-and-always-rejecting so that a `typeof subtle.encrypt` feature
+/// probe correctly takes its fallback path.
+pub const WEBCRYPTO_METHODS: &[&str] = &["getRandomValues", "randomUUID"];
+
+/// The implemented half of `crypto.subtle`.
+pub const SUBTLE_METHODS: &[&str] = &["digest"];
+
+/// `crypto.subtle.<method>`.
+pub fn subtle_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match method {
+        // `subtle.digest(algorithm, data)` resolves with an `ArrayBuffer`. The
+        // algorithm is named the WebCrypto way (`"SHA-256"`, or
+        // `{ name: "SHA-256" }`), which is node's `sha256` with the dash
+        // dropped.
+        "digest" => {
+            let spec = args.first().cloned().unwrap_or(Value::Undef);
+            let named = crate::builtins::get_property(&spec, "name").unwrap_or(Value::Undef);
+            let raw = match named {
+                Value::Undef => with_host(|h| h.str_of(&spec)),
+                n => with_host(|h| h.str_of(&n)),
+            };
+            let algo = raw.replace('-', "").to_ascii_lowercase();
+            if !supported(&algo) {
+                return Some(Err(crate::host::dom_error(
+                    "NotSupportedError",
+                    "Unrecognized algorithm name",
+                )));
+            }
+            let data = val_bytes_at(args, 1);
+            let out = digest(&algo, &data);
+            let buf = crate::stdlib::typedarray::new_array_buffer(out.len());
+            crate::stdlib::typedarray::write_buffer_bytes(&buf, &out);
+            Some(crate::builtins::promise_resolve_pub(buf))
+        }
+        _ => None,
+    }
+}
+
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "createHash" => {
@@ -592,7 +635,17 @@ fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Resu
             } else {
                 "utf8".into()
             };
-            let bytes = decode(&arg_str(args, 0), &enc);
+            // A byte-like VIEW contributes its bytes; only a string goes
+            // through the encoding. Every input used to be stringified first,
+            // so `hash.update(new TextEncoder().encode(s))` hashed
+            // `"[object Object]"`, and a Buffer only worked because
+            // stringifying it happened to yield its utf8 text — which is wrong
+            // the moment the bytes are not valid utf8.
+            let first = args.first().cloned().unwrap_or(Value::Undef);
+            let bytes = match super::buffer::bytes_like(&first) {
+                Some(b) => b,
+                None => decode(&arg_str(args, 0), &enc),
+            };
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get(recv).cloned() {
                     if let Some(arr) = p.get("@@data").cloned() {
@@ -708,14 +761,12 @@ fn key_bytes(v: Option<&Value>) -> Vec<u8> {
 /// A value's raw bytes: a Buffer/TypedArray's backing bytes, else its utf8
 /// string encoding. Used by pbkdf2/scrypt/hkdf/cipher/timingSafeEqual inputs.
 fn val_bytes(v: &Value) -> Vec<u8> {
-    if super::native_tag(v).as_deref() == Some("Buffer") {
-        return with_host(|h| match h.get(v) {
-            Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
-                Some(JsObj::Array(items)) => items.iter().map(|x| h.to_number(x) as u8).collect(),
-                _ => Vec::new(),
-            },
-            _ => Vec::new(),
-        });
+    // Any byte-like VIEW, not just a `Buffer`. Only the Buffer case was
+    // handled, so a `Uint8Array` — what `TextEncoder.encode` returns, and the
+    // form every WebCrypto call takes — fell through to `str_of` and hashed the
+    // string `"[object Object]"` instead of its bytes.
+    if let Some(bytes) = super::buffer::bytes_like(v) {
+        return bytes;
     }
     with_host(|h| h.str_of(v)).into_bytes()
 }
@@ -1627,12 +1678,15 @@ pub fn sign_verify_instance_call(
             } else {
                 "utf8".into()
             };
-            let bytes = if super::native_tag(args.first().unwrap_or(&Value::Undef)).as_deref()
-                == Some("Buffer")
-            {
-                val_bytes_at(args, 0)
-            } else {
-                decode(&arg_str(args, 0), &enc)
+            // Any byte-like VIEW is taken as bytes; only a STRING goes through
+            // the encoding. The Buffer case alone was handled, so
+            // `hash.update(new TextEncoder().encode(s))` — the standard way to
+            // hash bytes — stringified the view and hashed
+            // `"[object Object]"`.
+            let first = args.first().cloned().unwrap_or(Value::Undef);
+            let bytes = match super::buffer::bytes_like(&first) {
+                Some(b) => b,
+                None => decode(&arg_str(args, 0), &enc),
             };
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get(recv).cloned() {

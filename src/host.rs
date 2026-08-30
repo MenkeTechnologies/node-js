@@ -2674,6 +2674,17 @@ pub fn coded_error(class: &str, code: &str, msg: &str) -> String {
 /// The marker `plain_coded_error` hides a code behind, and `synth_error` strips.
 pub const CODE_MARK: &str = "\u{1}code:";
 
+/// Marks an error string as a `DOMException` carrying a WHATWG error NAME
+/// rather than one of the ECMAScript error classes. WebCrypto and the abort
+/// APIs reject with these, and the name (`NotSupportedError`) is not a class
+/// `synth_error` could otherwise recognise.
+pub const DOM_MARK: &str = "\u{1}dom:";
+
+/// A `DOMException` error string: `name` is the WHATWG error name.
+pub fn dom_error(name: &str, msg: &str) -> String {
+    format!("{DOM_MARK}{name}\u{1}{msg}")
+}
+
 /// A Node coded error raised from the *native* layer: `.code` is set, but the
 /// name is never bracketed, so `String(err)` is the plain `Name: message`.
 ///
@@ -3293,6 +3304,8 @@ impl JsHost {
                         "os",
                         "util",
                         "crypto",
+                        "webcrypto",
+                        "SubtleCrypto",
                         "querystring",
                         "events",
                         "timers",

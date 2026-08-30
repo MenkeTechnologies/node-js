@@ -539,6 +539,10 @@ pub(crate) fn global_binding(name: &str) -> Option<Value> {
         // `globalThis.x`. Both were false while each read minted a new object.
         // `global` is Node's alias for the same object.
         "globalThis" | "global" => return Some(with_host(|h| h.global_object())),
+        // The WHATWG `crypto` global IS `require('crypto').webcrypto`, not the
+        // node-flavoured module: `globalThis.crypto.randomUUID` exists while
+        // `globalThis.crypto.createHash` does not.
+        "crypto" => return Some(with_host(|h| h.alloc(JsObj::Builtin("webcrypto".into())))),
         _ => {}
     }
     if is_namespace(name) || is_known_builtin(name) {
@@ -3032,6 +3036,13 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
 /// the matching builtin error prototype so `instanceof`/`.constructor` work.
 pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
     h.ensure_error_protos();
+    // A `DOMException` marker: the WHATWG error NAME rides in the string, since
+    // it is not one of the ECMAScript error classes below.
+    if let Some(rest) = e.strip_prefix(host::DOM_MARK) {
+        if let Some((name, msg)) = rest.split_once('\u{1}') {
+            return dom_exception_with(h, name, msg);
+        }
+    }
     // A `Name [ERR_CODE]: message` head carries a Node error `code` next to the
     // error class, exactly as Node's internal errors render it in `.stack`.
     let (head, rest) = match e.split_once(": ") {
@@ -4842,6 +4853,13 @@ pub fn dom_exception(args: &[Value]) -> Value {
         None | Some(Value::Undef) => "Error".to_string(),
         Some(v) => with_host(|h| h.str_of(v)),
     };
+    with_host(|h| dom_exception_with(h, &name, &message))
+}
+
+/// `dom_exception` for a caller that already holds the host borrow.
+pub(crate) fn dom_exception_with(h: &mut host::JsHost, name: &str, message: &str) -> Value {
+    let name = name.to_string();
+    let message = message.to_string();
     let code = DOM_EXCEPTION_CODES
         .iter()
         .find(|(n, _)| *n == name)
@@ -4852,8 +4870,8 @@ pub fn dom_exception(args: &[Value]) -> Value {
     } else {
         format!("{name}: {message}")
     };
-    let e = with_host(|h| synth_error(h, &head));
-    with_host(|h| {
+    let e = synth_error(h, &head);
+    {
         let nv = h.new_str(name);
         let mv = h.new_str(message);
         let sv = h.new_str(head);
@@ -4872,7 +4890,7 @@ pub fn dom_exception(args: &[Value]) -> Value {
         if let Some(proto) = host::error_proto_of(h, "DOMException") {
             h.set_proto(&e, proto);
         }
-    });
+    }
     e
 }
 

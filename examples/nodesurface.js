@@ -66,3 +66,45 @@ console.log("readline", typeof rlp.createInterface, typeof require("readline").p
 const iface = rlp.createInterface({ input: process.stdin, output: process.stdout });
 console.log("iface   ", typeof iface.question, typeof iface.close, typeof iface.write);
 iface.close();
+
+// Hashing BINARY input. Every `update` argument was stringified first, so
+// `hash.update(new TextEncoder().encode(s))` hashed the text
+// `"[object Object]"`, and a Buffer only appeared to work because stringifying
+// it happened to yield its utf8 text — wrong the moment the bytes are not
+// valid utf8, which is exactly when hashing bytes matters.
+const crypto = require("crypto");
+const utf8 = new TextEncoder().encode("abc");
+console.log("hash-ta ", crypto.createHash("sha256").update(utf8).digest("hex"));
+console.log("hash-str", crypto.createHash("sha256").update("abc").digest("hex"));
+console.log("hash-buf", crypto.createHash("sha256").update(Buffer.from("abc")).digest("hex"));
+// Bytes that are not valid utf8 — the case stringifying silently corrupted.
+const rawBytes = Buffer.from([0xff, 0xfe, 0x00, 0x41]);
+console.log("hash-bin", crypto.createHash("sha256").update(rawBytes).digest("hex"));
+console.log("hmac-bin", crypto.createHmac("sha256", "k").update(rawBytes).digest("hex"));
+console.log("hmac-key", crypto.createHmac("sha256", Buffer.from([1, 2, 3])).update("abc").digest("hex"));
+// Mixed chunks accumulate in order regardless of each one's form.
+console.log("hash-mix", crypto.createHash("sha256").update("a").update(new Uint8Array([98]))
+  .update(Buffer.from("c")).digest("hex"));
+
+// The WHATWG crypto surface. `globalThis.crypto` IS `crypto.webcrypto`, which
+// is a different object from the node-flavoured module — it carries
+// `randomUUID` but no `createHash`.
+const wc = require("crypto").webcrypto;
+console.log("webc    ", typeof wc, globalThis.crypto === wc, typeof wc.randomUUID,
+  typeof wc.getRandomValues, typeof wc.createHash);
+console.log("random  ", wc.randomUUID().length, wc.getRandomValues(new Uint8Array(4)).length,
+  wc.randomUUID() !== wc.randomUUID());
+// Only `digest` of SubtleCrypto is implemented — the key-based half
+// (`encrypt`, `generateKey`, `importKey`, …) is not, so it is not pinned here.
+console.log("subtle  ", typeof wc.subtle, typeof wc.subtle.digest);
+(async () => {
+  const dg = await wc.subtle.digest("SHA-256", utf8);
+  console.log("digest  ", dg.constructor.name, dg.byteLength, Buffer.from(dg).toString("hex"));
+  const sha1 = await wc.subtle.digest({ name: "SHA-1" }, new Uint8Array([1, 2, 3]));
+  console.log("digest1 ", sha1.byteLength, Buffer.from(sha1).toString("hex"));
+  try {
+    await wc.subtle.digest("BOGUS", new Uint8Array(1));
+  } catch (e) {
+    console.log("unknown ", e.name, e.message, e instanceof DOMException);
+  }
+})();
