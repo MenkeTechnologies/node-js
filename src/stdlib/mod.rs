@@ -112,7 +112,12 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "process" => Some("process"),
         "net" => Some("net"),
         "http" => Some("http"),
-        "stream" => Some("stream"),
+        // `require('stream')` IS the `Stream` constructor — `stream.Stream ===
+        // stream`, and libraries still subclass it the ES5 way with
+        // `Stream.call(this)` + `Object.create(Stream.prototype)`. It used to
+        // resolve to a plain namespace, so `typeof` was `object`, `.prototype`
+        // was `undefined`, and that subclassing pattern threw.
+        "stream" => Some("Stream"),
         "tty" => Some("tty"),
         // The `events` module's export IS the EventEmitter constructor, so
         // `require('events')` yields the ctor namespace directly.
@@ -197,7 +202,7 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "url" => url::MODULE_METHODS,
         "net" => net::MODULE_METHODS,
         "http" => http::MODULE_METHODS,
-        "stream" => stream::METHODS,
+        "stream" | "Stream" => stream::METHODS,
         n if stream::is_class(n) => stream::STATIC_METHODS,
         "worker_threads" => worker_threads::METHODS,
         "zlib" => zlib::MODULE_METHODS,
@@ -244,6 +249,7 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
 pub fn namespace_ctors(ns: &str) -> &'static [&'static str] {
     match ns {
         "buffer" => &["Buffer", "Blob", "File"],
+        "stream" | "Stream" => stream::CLASSES,
         "url" => &["URL", "URLSearchParams"],
         "EventEmitter" => &["EventEmitter"],
         "async_hooks" => &["AsyncLocalStorage", "AsyncResource"],
@@ -310,7 +316,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "url" => url::call(m, args)?,
         "net" => net::call(m, args)?,
         "http" => http::call(m, args)?,
-        "stream" => stream::call(m, args)?,
+        "stream" | "Stream" => stream::call(m, args)?,
         "worker_threads" => worker_threads::call(m, args)?,
         "zlib" => zlib::call(m, args)?,
         "querystring" => querystring::call(m, args)?,
@@ -428,7 +434,12 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "assert" if name == "strict" => Some(with_host(|h| {
             h.alloc(JsObj::Builtin("assertStrict".into()))
         })),
-        "stream" => stream::constant(name),
+        // Every stream class's `.prototype` is the REAL prototype object the
+        // hierarchy hangs off, not a `Builtin("X.prototype")` handle — an ES5
+        // subclass reads it and passes it to `Object.create`, and
+        // `getPrototypeOf(Readable.prototype)` has to reach `Stream.prototype`.
+        n if stream::is_class(n) && name == "prototype" => with_host(|h| h.ensure_ctor_proto(n)),
+        "stream" | "Stream" => stream::constant(name),
         "http" => http::constant(name),
         "string_decoder" if name == "StringDecoder" => Some(with_host(|h| {
             h.alloc(JsObj::Builtin("StringDecoder".into()))
@@ -581,6 +592,22 @@ pub fn instance_has_method(tag: &str, name: &str) -> bool {
 /// real `.prototype` object from it. A predicate alone would have forced a
 /// second, hand-maintained list of the same names — the drift that put
 /// `listeners` on nine dispatchers and not on the three that run.
+/// The native class whose prototype `ctor`'s prototype inherits from, if any.
+///
+/// Only the stream hierarchy has one: node's is
+/// `Readable/Writable/Duplex/Transform/PassThrough → Stream → EventEmitter`,
+/// and every prototype used to hang straight off `Object.prototype` instead, so
+/// `new Readable() instanceof Stream` and `instanceof EventEmitter` both read
+/// false and an ES5 subclass built on `Object.create(Stream.prototype)`
+/// inherited nothing.
+pub fn native_parent(ctor: &str) -> Option<&'static str> {
+    match ctor {
+        "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" => Some("Stream"),
+        "Stream" => Some("EventEmitter"),
+        _ => None,
+    }
+}
+
 pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&'static str]) {
     // Shared EventEmitter surface for the emitter-backed instances. Read from
     // `events::METHODS` so what an instance ADVERTISES here can never drift from

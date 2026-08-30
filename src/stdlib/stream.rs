@@ -60,10 +60,16 @@ pub fn is_class(name: &str) -> bool {
 /// `namespace_property` → `stdlib::constant`.
 pub fn constant(name: &str) -> Option<Value> {
     if is_class(name) {
-        Some(with_host(|h| h.alloc(JsObj::Builtin(name.to_string()))))
-    } else {
-        None
+        return Some(with_host(|h| h.alloc(JsObj::Builtin(name.to_string()))));
     }
+
+    // `stream.promises` is the `stream/promises` module.
+    if name == "promises" {
+        return Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("stream/promises".to_string()))
+        }));
+    }
+    None
 }
 
 /// `new Readable()` / `Writable` / `Duplex` / `Transform` / `PassThrough` /

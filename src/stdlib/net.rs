@@ -97,7 +97,15 @@ pub fn new_emitter_object(tag: &str, mut extra: IndexMap<String, Value>) -> Valu
         for (k, v) in extra.drain(..) {
             m.insert(k, v);
         }
-        h.new_object(m)
+        let obj = h.new_object(m);
+        // Link the instance to its class's real prototype, so the chain — and
+        // with it `instanceof` — answers structurally instead of only through
+        // the native-tag special case. That is what makes `new Readable()
+        // instanceof Stream` and `instanceof EventEmitter` hold.
+        if let Some(proto) = h.ensure_ctor_proto(tag) {
+            h.set_proto(&obj, proto);
+        }
+        obj
     })
 }
 

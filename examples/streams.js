@@ -68,3 +68,42 @@ Readable.from([1, 2]).on("data", (x) => seen.push("arr:" + x)).on("end", () => {
     });
   });
 });
+
+// `require('stream')` IS the `Stream` constructor, not a namespace beside one.
+// It used to resolve to a plain namespace object, so `typeof` was `object`,
+// `stream.Stream === stream` was false, `.prototype` was `undefined`, and the
+// ES5 subclassing pattern libraries still ship threw outright.
+const S = require("stream");
+const EE = require("events");
+console.log("ctor    ", typeof S, S.Stream === S, S.name, typeof S.prototype);
+// The hierarchy is real: Readable → Stream → EventEmitter → Object. Every
+// prototype used to hang straight off Object.prototype, so `instanceof` only
+// worked through a native-tag special case one link deep.
+console.log("chain   ", Object.getPrototypeOf(S.Readable.prototype) === S.prototype,
+  Object.getPrototypeOf(S.prototype) === EE.prototype,
+  Object.getPrototypeOf(S.Writable.prototype) === S.prototype);
+const rd = new S.Readable({ read() {} });
+console.log("instance", rd instanceof S.Readable, rd instanceof S, rd instanceof EE,
+  Object.getPrototypeOf(rd) === S.Readable.prototype);
+console.log("classes ", ["Readable", "Writable", "Duplex", "Transform", "PassThrough", "Stream"]
+  .map((k) => typeof S[k]).join(","));
+console.log("members ", typeof S.promises, typeof S.pipeline, typeof S.finished,
+  ["Readable", "Writable", "Stream"].every((k) => Object.keys(S).includes(k)));
+// The ES5 pattern: borrow the constructor, then adopt its prototype.
+function Legacy() { S.call(this); }
+Legacy.prototype = Object.create(S.prototype);
+Legacy.prototype.constructor = Legacy;
+const legacy = new Legacy();
+console.log("es5     ", legacy instanceof S, legacy instanceof Legacy, typeof legacy.pipe, typeof legacy.on);
+
+// Two chain roots that were wrong for every object, not just streams:
+// `Object.prototype` reported ITSELF as its prototype — an endless chain to
+// anything walking one — and a builtin prototype namespace reported a handle
+// for its own constructor rather than `Object.prototype`.
+console.log("roots   ", Object.getPrototypeOf(Object.prototype),
+  Object.getPrototypeOf(Array.prototype) === Object.prototype,
+  Object.getPrototypeOf(Function.prototype) === Object.prototype);
+// A walk from any ordinary object now terminates.
+let node = Object.getPrototypeOf({}), hops = 0;
+while (node !== null && hops < 10) { node = Object.getPrototypeOf(node); hops++; }
+console.log("walk    ", hops, node);

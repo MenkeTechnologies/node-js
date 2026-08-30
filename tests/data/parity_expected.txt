@@ -655,6 +655,14 @@ sides-r   true undefined false
 sides-w   undefined true false
 sides-pt  true true
 after-end false
+ctor     function true Stream object
+chain    true true true
+instance true true true true
+classes  function,function,function,function,function,function
+members  object function function true
+es5      true true function function
+roots    null true true
+walk     1 null
 from      arr:1,arr:2,str:ab,set:s,gen:g1,gen:g2
 statics   function function function
 in-finish false

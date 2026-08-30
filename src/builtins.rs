@@ -1222,6 +1222,9 @@ fn is_builtin_ctor(name: &str) -> bool {
             | "Timeout"
             | "Immediate"
     ) || host::ERROR_NAMES.contains(&name)
+        // The stream base classes are constructors too, and `require('stream')`
+        // IS `Stream`, so `require('stream').name` has to answer.
+        || crate::stdlib::stream::is_class(name)
 }
 
 fn bound_method(recv: &Value, name: &str) -> Value {
@@ -10129,6 +10132,22 @@ pub fn prototype_of(v: &Value) -> Value {
     // `Object.create(null)` and friends really do have a null prototype.
     if with_host(|h| h.has_null_proto(v)) {
         return with_host(|h| h.null());
+    }
+    // `Object.prototype` is the CHAIN ROOT, so its own prototype is `null`. It
+    // reported itself, because the fallback below answers by constructor name
+    // and a plain object's is `Object` — an infinite chain to anything walking
+    // it.
+    if with_host(|h| h.strict_eq(v, &h.object_proto())) {
+        return with_host(|h| h.null());
+    }
+    // Every OTHER builtin prototype namespace (`Array.prototype`,
+    // `Function.prototype`, …) inherits from `Object.prototype`; the fallback
+    // would send it back to a namespace handle for its own constructor.
+    if matches!(
+        with_host(|h| h.get(v).cloned()),
+        Some(JsObj::Builtin(ref n)) if n.ends_with(".prototype")
+    ) {
+        return with_host(|h| h.object_proto());
     }
     if let Some(p) = with_host(|h| h.proto_of(v)) {
         return p;

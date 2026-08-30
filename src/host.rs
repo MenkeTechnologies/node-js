@@ -3295,7 +3295,6 @@ impl JsHost {
                         "crypto",
                         "querystring",
                         "events",
-                        "stream",
                         "timers",
                         "perf_hooks",
                         "async_hooks",
@@ -7541,9 +7540,19 @@ impl JsHost {
         if own.is_empty() && emitter.is_empty() {
             return None;
         }
-        let obj_proto = self.object_proto();
+        // A native class with a real PARENT hangs off that parent's prototype
+        // rather than straight off `Object.prototype`. The stream hierarchy is
+        // `Readable → Stream → EventEmitter`, which is what makes
+        // `new Readable() instanceof Stream` hold and what an ES5 subclass
+        // doing `Object.create(Stream.prototype)` inherits from.
+        let parent_proto = match crate::stdlib::native_parent(ctor) {
+            Some(p) => self
+                .ensure_ctor_proto(p)
+                .unwrap_or_else(|| self.object_proto()),
+            None => self.object_proto(),
+        };
         let proto = self.new_object(IndexMap::new());
-        self.set_proto(&proto, obj_proto);
+        self.set_proto(&proto, parent_proto);
         let ctor_val = self.alloc(JsObj::Builtin(ctor.to_string()));
         if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
             p.insert("constructor".into(), ctor_val);
