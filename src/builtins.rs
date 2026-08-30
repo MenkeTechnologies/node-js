@@ -8920,7 +8920,9 @@ pub fn error_string(h: &host::JsHost, v: &Value) -> String {
 /// halves. A promise returned by the callback was never awaited, so the
 /// ordinary async-cleanup shape
 ///
-///     work().finally(() => closeConnection()).then(next)
+/// ```text
+/// work().finally(() => closeConnection()).then(next)
+/// ```
 ///
 /// ran `next` before the connection had closed. And the chain settled three
 /// microtask ticks early, which is observable in ordering against any other

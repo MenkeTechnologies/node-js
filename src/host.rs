@@ -6384,7 +6384,9 @@ fn norm_num_bits(f: f64) -> u64 {
 /// fixed number of targets, so the spec pulls exactly that many and calls
 /// IteratorClose on whatever is left; draining instead made
 ///
-///     const [first] = infiniteGenerator();
+/// ```text
+/// const [first] = infiniteGenerator();
+/// ```
 ///
 /// run forever. It is also observable on any finite iterator, as the count of
 /// `next()` calls and whether `return()` ever ran.
