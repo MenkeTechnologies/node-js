@@ -703,3 +703,24 @@ brown: 1
 lazy: 1
 dog: 1
 max frequency: 3
+==== wrappers.js ====
+typeof   object object object
+valueOf  ab 3 false
+truthy   true true false t
+indices  2 a b undefined 0,1
+attrs    false false 0,1,length
+proto    true true true true
+typeofP  object object
+ctor     true true
+methods  b AB 1.50 ff
+reflect  true false true
+coerce   4 3 ab abc true true
+brand    [object String] [object Number] [object Boolean]
+iterate  a|b a|b
+json     ["ab",3,false] {"v":"x"}
+inspect  [String: 'ab'] [Number: 3] [Boolean: false] [String: 'ab'] { tag: 1 } [ [Number: 2] ]
+toObject object 1 1 true {} object
+newObj   object ab true
+boxthis  object,true,5 number,5
+thisArg  object
+extend   2 true true hi [object String]

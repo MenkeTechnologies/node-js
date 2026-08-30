@@ -3506,6 +3506,48 @@ impl JsHost {
     /// (`class C { get [Symbol.toStringTag]() { … } }`) would need a JS call,
     /// which cannot run under the host borrow `inspect` holds — such an object
     /// prints without the prefix.
+    /// `[String: 'ab']` / `[Number: 1]` / `[Boolean: false]` — how node renders
+    /// a primitive wrapper, distinguishing it from the bare primitive.
+    fn inspect_wrapper(&self, v: &Value, indent: usize, st: &mut InspectCycles) -> Option<String> {
+        let prim = match self.get(v) {
+            Some(JsObj::Object(p)) => p.get("@@primitive").cloned()?,
+            _ => return None,
+        };
+        let ctor = match &prim {
+            Value::Bool(_) => "Boolean",
+            Value::Int(_) | Value::Float(_) => "Number",
+            _ => "String",
+        };
+        let head = format!("[{ctor}: {}]", self.inspect_lvl(&prim, indent, st));
+        // Extra own properties still print, as `[String: 'ab'] { tag: 1 }`. The
+        // boxed characters are NOT extras — node hides the index properties of
+        // a String wrapper, showing only what was added to it.
+        let width = if ctor == "String" {
+            self.str_of(&prim).chars().count()
+        } else {
+            0
+        };
+        let extras: Vec<String> = match self.get(v) {
+            Some(JsObj::Object(p)) => p
+                .iter()
+                .filter(|(k, _)| {
+                    !k.starts_with("@@")
+                        && !k.starts_with('#')
+                        && self.prop_attrs(v, k).enumerable
+                        && !k.parse::<usize>().is_ok_and(|i| i < width)
+                })
+                .map(|(k, val)| {
+                    format!("{}: {}", fmt_key(k), self.inspect_lvl(val, indent + 2, st))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if extras.is_empty() {
+            return Some(head);
+        }
+        Some(self.render_object(&extras, &format!("{head} "), indent))
+    }
+
     fn inspect_tag(&self, v: &Value) -> Option<String> {
         let own = matches!(self.get(v), Some(JsObj::Object(p)) if p.contains_key("@@toStringTag"));
         if own && self.prop_attrs(v, "@@toStringTag").enumerable {
@@ -3563,6 +3605,9 @@ impl JsHost {
     /// The rendering itself, once `inspect_lvl` has established that `v` is not
     /// a back-edge into an object already on the stack.
     fn inspect_value(&self, v: &Value, indent: usize, st: &mut InspectCycles) -> String {
+        if let Some(s) = self.inspect_wrapper(v, indent, st) {
+            return s;
+        }
         match v {
             Value::Undef => "undefined".into(),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
@@ -5287,6 +5332,23 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
             }
             return crate::stdlib::instance_call(&tag, recv, name, args);
         }
+        // A primitive wrapper forwards to the primitive's method table, the
+        // same way a native instance forwards to its tag's. A user method on
+        // the wrapper or anywhere on its chain still wins first.
+        if let Some(prim) = crate::builtins::wrapped_primitive(recv) {
+            if let Some(f) = with_host(|h| lookup_chain(h, recv, name)) {
+                if with_host(|h| is_callable(h, &f)) {
+                    return invoke(&f, args, Some(recv.clone()));
+                }
+            }
+            // The reflective `Object.prototype` methods answer for the WRAPPER
+            // — `w.hasOwnProperty("0")` asks about the wrapper's own index
+            // properties, not about the string.
+            if crate::builtins::is_object_builtin_method(name) {
+                return crate::builtins::object_builtin_method(recv, name, args);
+            }
+            return call_method(&prim, name, args);
+        }
         if let Some((Some(getter), _)) = with_host(|h| lookup_accessor(h, recv, name)) {
             let f = invoke(&getter, Vec::new(), Some(recv.clone()))?;
             if with_host(|h| is_callable(h, &f)) {
@@ -5572,6 +5634,14 @@ pub fn run_user_func_nt(
         };
     if sloppy_this {
         this_val = Some(with_host(|h| h.global_object()));
+    } else if !fv.is_arrow && !with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict)) {
+        // The other half of OrdinaryCallBindThis: a SLOPPY function boxes a
+        // primitive `this` with `ToObject`, so `f.call(5)` sees a `Number`
+        // wrapper rather than the number. Only strict mode passes it through.
+        if let Some(t) = this_val.clone() {
+            let boxed = crate::builtins::to_object(&t);
+            this_val = Some(boxed);
+        }
     }
     // A generator function does not run its body on call — it returns a suspended
     // generator over the already-bound frame.
@@ -5983,7 +6053,16 @@ pub fn build_class(name: &str, parent: Value, ctor: Value) -> Value {
                 Some(JsObj::Class(pc)) => pc.proto.clone(),
                 Some(JsObj::Builtin(bn)) => {
                     h.ensure_error_protos();
+                    h.ensure_native_protos();
+                    // `class S extends String {}` links to the REAL
+                    // `String.prototype`, the same way an error subclass links
+                    // to its error prototype. Without it `S.prototype`'s
+                    // `[[Prototype]]` fell back to `Object.prototype`, so
+                    // `new S("hi") instanceof String` read false and
+                    // `String(new S("hi"))` reported `[object String]` instead
+                    // of `hi`.
                     error_proto_of(h, &bn)
+                        .or_else(|| h.native_proto(&bn))
                         .or_else(|| h.fn_prop(p, "prototype"))
                         .unwrap_or_else(|| h.object_proto())
                 }
@@ -6714,6 +6793,13 @@ pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
         }
         return Ok(out);
     }
+    // A String wrapper iterates its code POINTS, exactly as the primitive does
+    // (22.1.3.34) — `[...new String("ab")]` is `["a","b"]`, not a TypeError.
+    if let Some(prim) = crate::builtins::wrapped_primitive(v) {
+        if with_host(|h| matches!(h.get(&prim), Some(JsObj::Str(_)))) {
+            return iter_all(&prim);
+        }
+    }
     // Object with a user-defined Symbol.iterator: drive its iterator protocol.
     if let Some(iter_fn) = user_iterator_fn(v) {
         let iterator = invoke(&iter_fn, Vec::new(), Some(v.clone()))?;
@@ -7201,6 +7287,9 @@ impl JsHost {
     /// methods, so `Buffer.prototype.slice.call(buf, 1)` still dispatches the
     /// way it did when `Buffer.prototype` was a `Builtin` namespace.
     pub fn ensure_native_protos(&mut self) {
+        // The wrapper prototypes share this registry and this guard would skip
+        // them, so they are built through their own.
+        self.ensure_wrapper_protos();
         if self.native_protos.contains_key("Buffer") {
             return;
         }
@@ -7292,6 +7381,45 @@ impl JsHost {
             }
             self.native_protos.insert(ctor.to_string(), proto.clone());
             prev = Some(proto);
+        }
+    }
+
+    /// `String.prototype`, `Number.prototype` and `Boolean.prototype` as REAL
+    /// objects.
+    ///
+    /// A wrapper built by `new String("a")` needs a genuine `[[Prototype]]`
+    /// link: `Builtin("String.prototype")` is a thunk namespace that cannot
+    /// appear on a prototype chain, so `Object.getPrototypeOf(w) ===
+    /// String.prototype` and `w instanceof String` both read false while the
+    /// wrapper's methods still resolved through the string funnel. Registering
+    /// them here puts them on the same footing as `Buffer.prototype`.
+    pub fn ensure_wrapper_protos(&mut self) {
+        if self.native_protos.contains_key("String") {
+            return;
+        }
+        let obj_proto = self.object_proto();
+        for ctor in ["String", "Number", "Boolean", "Symbol", "BigInt"] {
+            let proto = self.new_object(IndexMap::new());
+            self.set_proto(&proto, obj_proto.clone());
+            let ctor_val = self.alloc(JsObj::Builtin(ctor.to_string()));
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert("constructor".into(), ctor_val);
+            }
+            self.hide_prop(&proto, "constructor");
+            // Only the three conversions need a thunk here: they are the ones
+            // `Object.prototype` also defines, so without a shadowing entry a
+            // wrapper would inherit the object forms and `String(new
+            // String("a"))` would report `[object Object]`. Every other method
+            // (`charAt`, `toFixed`, …) has no `Object.prototype` counterpart
+            // and reaches the primitive through `call_method`.
+            for m in ["toString", "valueOf", "toLocaleString"] {
+                let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
+                if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                    p.insert(m.to_string(), thunk);
+                }
+                self.hide_prop(&proto, m);
+            }
+            self.native_protos.insert(ctor.to_string(), proto);
         }
     }
 

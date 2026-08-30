@@ -1672,6 +1672,13 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         });
         return Ok(with_host(|h| h.new_str(s)));
     }
+    // A primitive wrapper's `toString`/`valueOf`/`toLocaleString`: unwrap and
+    // answer as the boxed primitive does. `Number.prototype.toString.call(5)`
+    // arrives with an already-primitive receiver and needs no unwrapping.
+    if matches!(ctor, "String" | "Number" | "Boolean") {
+        let prim = wrapped_primitive(recv).unwrap_or_else(|| recv.clone());
+        return host::call_method(&prim, method, args);
+    }
     if ctor == "Object" && method == "toString" {
         // Steps 16-17 of 20.1.3.6: a `Symbol.toStringTag` STRING on the receiver
         // (own or inherited, data property or getter) replaces the builtin brand,
@@ -1804,6 +1811,14 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             Some(JsObj::Null) => "Null".into(),
             Some(JsObj::Str(_)) => "String".into(),
             Some(JsObj::Array(_)) => "Array".into(),
+            // 20.1.3.6 steps 5-8 brand a wrapper by its internal slot, so
+            // `Object.prototype.toString.call(new Number(1))` is
+            // `[object Number]` rather than `[object Object]`.
+            Some(JsObj::Object(p)) if p.contains_key("@@primitive") => match p["@@primitive"] {
+                Value::Bool(_) => "Boolean".into(),
+                Value::Int(_) | Value::Float(_) => "Number".into(),
+                _ => "String".into(),
+            },
             // 20.1.3.6 step 3 brands by `IsArray`, which follows a Proxy to its
             // `[[ProxyTarget]]` — `Object.prototype.toString.call(new Proxy([],
             // {}))` is `'[object Array]'`. Everything else about a proxy brands
@@ -4500,14 +4515,101 @@ fn string_raw(args: &[Value]) -> Result<Value, String> {
 /// fresh object; objects pass through.
 fn object_call(args: Vec<Value>) -> Value {
     let a = arg0(&args);
-    if matches!(
-        with_host(|h| h.get(&a).cloned()),
-        Some(JsObj::Object(_)) | Some(JsObj::Array(_))
-    ) {
-        a
-    } else {
-        with_host(|h| h.new_object(IndexMap::new()))
+    // `Object(v)` is `ToObject(v)` (20.1.1.1): a primitive comes back BOXED,
+    // not replaced by an empty object. `Object(1).valueOf()` was `undefined`.
+    if matches!(a, Value::Undef) || with_host(|h| h.is_null(&a)) {
+        return with_host(|h| h.new_object(IndexMap::new()));
     }
+    to_object(&a)
+}
+
+/// The name of the wrapper a primitive boxes into, or `None` when the value is
+/// already an object.
+fn wrapper_ctor_of(v: &Value) -> Option<&'static str> {
+    match v {
+        Value::Int(_) | Value::Float(_) => Some("Number"),
+        Value::Bool(_) => Some("Boolean"),
+        Value::Obj(_) => match with_host(|h| h.get(v).cloned()) {
+            Some(JsObj::Str(_)) => Some("String"),
+            Some(JsObj::Symbol { .. }) => Some("Symbol"),
+            Some(JsObj::BigInt(_)) => Some("BigInt"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The primitive a wrapper object boxes (`new String("a")` → `"a"`), or `None`
+/// for every other value. The slot is a hidden `@@primitive` own property —
+/// the same `@@` marker convention the engine already uses for internal state,
+/// so it stays out of `Object.keys` and `JSON.stringify` on its own.
+pub fn wrapped_primitive(v: &Value) -> Option<Value> {
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Object(p)) => p.get("@@primitive").cloned(),
+        _ => None,
+    })
+}
+
+/// `ToObject(v)` (7.1.18) for a primitive: the wrapper object with the matching
+/// prototype and a `[[StringData]]`/`[[NumberData]]`/`[[BooleanData]]` slot.
+///
+/// A String wrapper also owns its index properties and `length`, which is what
+/// makes `w[0]`, `w.length` and `Object.keys(w)` answer; all of them are
+/// non-writable and non-configurable, as the exotic `String` object's are.
+pub fn to_object(v: &Value) -> Value {
+    let Some(ctor) = wrapper_ctor_of(v) else {
+        return v.clone();
+    };
+    with_host(|h| h.ensure_wrapper_protos());
+    let chars: Vec<String> = if ctor == "String" {
+        with_host(|h| h.str_of(v))
+            .chars()
+            .map(|c| c.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        for (i, c) in chars.iter().enumerate() {
+            let s = h.new_str(c.clone());
+            m.insert(i.to_string(), s);
+        }
+        let w = h.new_object(m);
+        if ctor == "String" {
+            for i in 0..chars.len() {
+                h.set_prop_attrs(
+                    &w,
+                    &i.to_string(),
+                    host::PropAttrs {
+                        writable: false,
+                        enumerable: true,
+                        configurable: false,
+                    },
+                );
+            }
+            let len = Value::Float(chars.len() as f64);
+            if let Some(JsObj::Object(p)) = h.get_mut(&w) {
+                p.insert("length".into(), len);
+            }
+            h.set_prop_attrs(
+                &w,
+                "length",
+                host::PropAttrs {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        if let Some(JsObj::Object(p)) = h.get_mut(&w) {
+            p.insert("@@primitive".into(), v.clone());
+        }
+        if let Some(proto) = h.native_proto(ctor) {
+            h.set_proto(&w, proto);
+        }
+        w
+    })
 }
 
 /// Construct via `new` for the builtin constructors.
@@ -4538,6 +4640,21 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
             Ok(with_host(|h| h.new_array(args)))
         }
         "Object" => Ok(object_call(args)),
+        // `new String(v)` / `new Number(v)` / `new Boolean(v)` — the wrapper
+        // form. These were not constructors at all, so every one threw.
+        "String" => Ok(to_object(&host::to_string_value(
+            &args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| with_host(|h| h.new_str(String::new()))),
+        )?)),
+        "Number" => Ok(to_object(&Value::Float(match args.first() {
+            Some(a) => host::to_number_value(a)?,
+            None => 0.0,
+        }))),
+        "Boolean" => Ok(to_object(&Value::Bool(with_host(|h| {
+            h.truthy(&arg0(&args))
+        })))),
         "Map" | "WeakMap" => {
             let weak = name == "WeakMap";
             let m = with_host(|h| {
@@ -5771,6 +5888,12 @@ fn json_str(
                     })
                     .collect();
                 Some(wrap(&parts, "[", "]", indent, depth))
+            }
+            Some(JsObj::Object(props)) if props.contains_key("@@primitive") => {
+                // 25.5.2.2 step 4: a String/Number/Boolean wrapper serializes as
+                // the primitive it boxes, not as the object holding it —
+                // `JSON.stringify(new Number(1))` is `1`, not `{}`.
+                json_str(h, &props["@@primitive"].clone(), indent, depth, keys)
             }
             Some(JsObj::Object(props)) => {
                 // A replacer array restricts (and orders) which keys are emitted.
@@ -9826,7 +9949,13 @@ pub fn prototype_of(v: &Value) -> Value {
         h.ensure_native_protos();
         match default_ctor_name(h, v) {
             Some("Object") => h.object_proto(),
-            Some(c) => h.alloc(JsObj::Builtin(format!("{c}.prototype"))),
+            // `String`/`Number`/`Boolean` own REAL prototype objects, so a
+            // primitive must report that object and not a fresh namespace
+            // thunk — otherwise `Object.getPrototypeOf(1) === Number.prototype`
+            // compares a thunk against the real object and reads false.
+            Some(c) => h
+                .native_proto(c)
+                .unwrap_or_else(|| h.alloc(JsObj::Builtin(format!("{c}.prototype")))),
             None => h.null(),
         }
     })
