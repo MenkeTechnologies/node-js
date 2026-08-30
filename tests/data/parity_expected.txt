@@ -126,6 +126,12 @@ toString  "T"
 sortDflt  "1,10,9"
 sparse    "[1,null,3]"
 holes-map 3
+noprim   TypeError TypeError TypeError
+noprim2  TypeError TypeError
+halfprim V V
+nullproto TypeError
+exotics  [object Map] [object Set] [object Promise]
+ordinary [object Object] 1,2 /a/g number
 ==== collections.js ====
 size 3
 get bob 75
@@ -341,6 +347,16 @@ xyz 42 101010
 node has 3 letters: many
 -1 true true
 AB 66
+sub-amp  a[b]c a[a]c a[c]c
+sub-dd   a$c a$1c
+sub-all  [a]b[a] a(a)b(aXb)c
+re-sub   a[b]c a<1>b x<1>
+cb-plain a4b
+cb-named x5
+cb-args  x["1","1",1,"x1",{"d":"1"}]
+cb-str   a3c
+nonglobal TypeError String.prototype.replaceAll called with a non-global RegExp argument
+global   bb ba
 ==== symbols.js ====
 iterator 1,2,3 1,2,3
 toPrim   42 str:string str:default

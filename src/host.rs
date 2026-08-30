@@ -6719,11 +6719,19 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
     } else {
         ["valueOf", "toString"]
     };
+    // Whether either candidate was actually CALLED. The `[object Tag]` fallback
+    // below is for exotics whose property funnel exposes no callable
+    // `toString`, not for an object whose own methods ran and returned
+    // non-primitives — that case is the spec's TypeError, and branding it
+    // instead meant `({ valueOf: () => ({}), toString: () => ({}) }) + 1`
+    // quietly produced `"[object Object]1"`.
+    let mut called_any = false;
     for m in order {
         let f = crate::builtins::get_property(v, m).unwrap_or(Value::Undef);
         if !with_host(|h| is_callable(h, &f)) {
             continue;
         }
+        called_any = true;
         // On a Proxy the resolved method is a thunk bound to the TARGET, so
         // invoking it directly would stringify the target — `String(new
         // Proxy(function f(){}, {}))` reported `f`'s source where V8 reports the
@@ -6743,7 +6751,7 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
     // TypeError is reachable only there. The exotics whose property funnel has
     // no `toString` entry of its own (`Map`, `Set`, `Promise`, …) land here and
     // get the same `[object Tag]` brand V8 gives them.
-    if !with_host(|h| h.has_null_proto(v)) {
+    if !called_any && !with_host(|h| h.has_null_proto(v)) {
         return crate::builtins::proto_method(v, "Object:toString", Vec::new());
     }
     Err(type_error("Cannot convert object to primitive value"))

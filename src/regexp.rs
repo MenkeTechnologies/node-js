@@ -709,6 +709,13 @@ pub fn str_replace_regex(
             }
             call_args.push(Value::Float(index_of_byte(s, m.start()).get() as f64));
             call_args.push(with_host(|h| h.new_str(s.to_string())));
+            // 22.1.3.19: when the pattern has named groups the callback takes a
+            // final `groups` argument. Omitting it left `arguments.length` at 4
+            // where node reports 5, and destructuring the groups out of the last
+            // parameter saw the subject string.
+            if let Some(groups) = named_groups_object(&re, &caps) {
+                call_args.push(groups);
+            }
             let r = host::invoke(repl, call_args, None)?;
             out.push_str(&with_host(|h| h.str_of(&r)));
         } else {
@@ -726,6 +733,29 @@ pub fn str_replace_regex(
 }
 
 /// Expand a replacement template's `$` patterns against a match.
+/// The `groups` object for a match — `OrdinaryObjectCreate(null)` carrying each
+/// named capture (22.2.7.2 step 30), or `None` when the pattern names none.
+fn named_groups_object(re: &Regex, caps: &Captures) -> Option<Value> {
+    let names: Vec<&str> = re.capture_names().flatten().collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut g: IndexMap<String, Value> = IndexMap::new();
+    for name in names {
+        let v = match caps.name(name) {
+            Some(m) => with_host(|h| h.new_str(m.as_str().to_string())),
+            None => Value::Undef,
+        };
+        g.insert(name.to_string(), v);
+    }
+    Some(with_host(|h| {
+        let obj = h.new_object(g);
+        let null = h.null();
+        h.set_proto(&obj, null);
+        obj
+    }))
+}
+
 fn expand_replacement(templ: &str, caps: &Captures, s: &str) -> String {
     let chars: Vec<char> = templ.chars().collect();
     let mut out = String::new();

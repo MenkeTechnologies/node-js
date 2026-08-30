@@ -7456,13 +7456,25 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             } else {
                 let from = with_host(|h| h.str_of(&pat));
                 let to = with_host(|h| h.str_of(&repl));
-                Ok(new_s(s.replacen(&from, &to, 1)))
+                Ok(new_s(replace_str_plain(s, &from, &to, false)))
             }
         }
         "replaceAll" => {
             let pat = arg0(&args);
             let repl = args.get(1).cloned().unwrap_or(Value::Undef);
             if is_regexp_arg(&pat) {
+                // 22.1.3.20 step 2: a non-global regexp is a TypeError here,
+                // because `replaceAll` cannot honour "all" without `g`. This
+                // used to replace only the first match and say nothing.
+                let global = with_host(|h| match h.get(&pat) {
+                    Some(JsObj::RegExp(r)) => r.global,
+                    _ => true,
+                });
+                if !global {
+                    return Err(host::type_error(
+                        "String.prototype.replaceAll called with a non-global RegExp argument",
+                    ));
+                }
                 crate::regexp::str_replace_regex(s, &pat, &repl, true)
             } else if with_host(|h| host::is_callable(h, &repl)) {
                 Ok(new_s(replace_str_fn(
@@ -7474,7 +7486,7 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             } else {
                 let from = with_host(|h| h.str_of(&pat));
                 let to = with_host(|h| h.str_of(&repl));
-                Ok(new_s(s.replace(&from, &to)))
+                Ok(new_s(replace_str_plain(s, &from, &to, true)))
             }
         }
         "split" => {
@@ -7513,6 +7525,84 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         }
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
+}
+
+/// GetSubstitution (22.1.3.19) for a STRING search value.
+///
+/// `String.prototype.replace`/`replaceAll` expand the same `$` patterns whether
+/// the pattern is a regexp or a plain string, but the string path here did a
+/// raw `str::replace` and passed the template through verbatim — so
+/// `'abc'.replace('b', '[$&]')` produced `a[$&]c` instead of `a[b]c`. The
+/// regexp path has always expanded them.
+///
+/// A string search captures nothing, so only `$$`, `$&`, `` $` `` and `$'`
+/// apply; `$1` and `$<name>` have no referent and stay literal, which is also
+/// what node does.
+fn substitute_plain(templ: &str, matched: &str, position: usize, subject: &str) -> String {
+    let chars: Vec<char> = templ.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            match chars[i + 1] {
+                '$' => {
+                    out.push('$');
+                    i += 2;
+                    continue;
+                }
+                '&' => {
+                    out.push_str(matched);
+                    i += 2;
+                    continue;
+                }
+                '`' => {
+                    out.push_str(&subject[..position]);
+                    i += 2;
+                    continue;
+                }
+                '\'' => {
+                    out.push_str(&subject[position + matched.len()..]);
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `replace`/`replaceAll` with a string pattern and a string replacement,
+/// expanding each match's `$` patterns against its own position.
+fn replace_str_plain(s: &str, from: &str, to: &str, all: bool) -> String {
+    if from.is_empty() && !all {
+        return format!("{}{s}", substitute_plain(to, "", 0, s));
+    }
+    let mut out = String::new();
+    let mut rest = 0usize;
+    while let Some(rel) = s[rest..].find(from) {
+        let at = rest + rel;
+        out.push_str(&s[rest..at]);
+        out.push_str(&substitute_plain(to, from, at, s));
+        rest = at + from.len();
+        if !all {
+            break;
+        }
+        // An empty pattern matches between every character; step one along so
+        // the scan terminates.
+        if from.is_empty() {
+            if rest >= s.len() {
+                break;
+            }
+            let step = s[rest..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&s[rest..rest + step]);
+            rest += step;
+        }
+    }
+    out.push_str(&s[rest..]);
+    out
 }
 
 fn new_s(s: String) -> Value {
