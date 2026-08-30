@@ -3002,6 +3002,21 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
             };
         }
     }
+    // A `Map`/`Set` dispatches its methods through the stdlib table rather than
+    // a property map, so the `lookup_chain` probe above cannot see its
+    // `Symbol.iterator` — and falling through to `iter_vec` snapshotted the
+    // whole collection, which is exactly what a LIVE iterator must not do.
+    // Arrays and strings keep the direct path; they have no live semantics to
+    // preserve and are the hot case.
+    if matches!(
+        with_host(|h| h.kind_of(&v)),
+        Some(ObjKind::Map) | Some(ObjKind::Set)
+    ) {
+        return match host::call_method(&v, "@@iterator", Vec::new()) {
+            Ok(it) => it,
+            Err(e) => abort(vm, e),
+        };
+    }
     match with_host(|h| h.iter_vec(&v)) {
         Ok(items) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })),
         Err(e) => abort(vm, e),
@@ -6289,6 +6304,106 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
 /// A copy of the whole backing store, for the methods that genuinely consume
 /// every element (`map`, `filter`, `join`, …). Never call it just to read
 /// `.len()` — use [`array_len`], or `push`/`unshift` become O(n) per call.
+/// A LIVE iterator over a `Map` or `Set`.
+///
+/// Node's collection iterators see the collection as it is at each step: an
+/// entry added during iteration IS visited, and one deleted before it is
+/// reached is NOT. Ours materialized every entry up front, so both were wrong —
+/// a loop that deletes as it goes still processed the entries it had removed.
+///
+/// The cursor is the last key yielded plus the index it was at. On each step
+/// the key is located again in the CURRENT order: if it is still there the next
+/// entry follows it, and if it was itself deleted the stored index now names
+/// the entry that shifted into its place. That reproduces node for the cases
+/// its own tests turn on — add-during, delete-ahead, delete-self,
+/// delete-behind, delete-the-rest and clear — without giving `Map` the
+/// tombstoned entry list node uses internally.
+fn collection_iterator(coll: &Value, kind: &str) -> Value {
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert(
+            "@@native".into(),
+            h.new_str("CollectionIterator".to_string()),
+        );
+        m.insert("@@coll".into(), coll.clone());
+        m.insert("@@kind".into(), h.new_str(kind.to_string()));
+        m.insert("@@started".into(), Value::Bool(false));
+        m.insert("@@lastIdx".into(), Value::Float(0.0));
+        h.new_object(m)
+    })
+}
+
+/// One step of a live collection iterator.
+pub(crate) fn collection_iterator_next(recv: &Value) -> Result<Value, String> {
+    let slot = |k: &str| {
+        with_host(|h| match h.get(recv) {
+            Some(JsObj::Object(p)) => p.get(k).cloned(),
+            _ => None,
+        })
+    };
+    let coll = slot("@@coll").unwrap_or(Value::Undef);
+    let kind = slot("@@kind")
+        .map(|v| with_host(|h| h.str_of(&v)))
+        .unwrap_or_default();
+    let started = slot("@@started").is_some_and(|v| with_host(|h| h.truthy(&v)));
+    let last_idx = slot("@@lastIdx")
+        .map(|v| with_host(|h| h.to_number(&v)) as usize)
+        .unwrap_or(0);
+    let last_key = slot("@@lastKey");
+
+    let next_idx = if !started {
+        0
+    } else {
+        match last_key
+            .as_ref()
+            .and_then(|k| with_host(|h| collection_index_of(h, &coll, k)))
+        {
+            // Still present: continue after it.
+            Some(i) => i + 1,
+            // Deleted since: whatever shifted into its slot is next.
+            None => last_idx,
+        }
+    };
+    let entry = with_host(|h| collection_entry_at(h, &coll, next_idx));
+    let Some((k, v)) = entry else {
+        return Ok(iter_result(Value::Undef, true));
+    };
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+            p.insert("@@started".into(), Value::Bool(true));
+            p.insert("@@lastIdx".into(), Value::Float(next_idx as f64));
+            p.insert("@@lastKey".into(), k.clone());
+        }
+    });
+    let out = match kind.as_str() {
+        "keys" => k,
+        "values" => v,
+        _ => with_host(|h| h.new_array(vec![k, v])),
+    };
+    Ok(iter_result(out, false))
+}
+
+/// The (key, value) at `idx` in a Map, or (value, value) in a Set.
+fn collection_entry_at(h: &host::JsHost, coll: &Value, idx: usize) -> Option<(Value, Value)> {
+    match h.get(coll) {
+        Some(JsObj::Map { entries, .. }) => entries.get_index(idx).map(|(_, kv)| kv.clone()),
+        Some(JsObj::Set { entries, .. }) => {
+            entries.get_index(idx).map(|(_, v)| (v.clone(), v.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Where `key` currently sits in the collection's order.
+fn collection_index_of(h: &host::JsHost, coll: &Value, key: &Value) -> Option<usize> {
+    let mk = host::map_key(h, key);
+    match h.get(coll) {
+        Some(JsObj::Map { entries, .. }) => entries.get_index_of(&mk),
+        Some(JsObj::Set { entries, .. }) => entries.get_index_of(&mk),
+        _ => None,
+    }
+}
+
 /// The `thisArg` an iteration method was given, if any.
 ///
 /// `[1].forEach(fn, thisArg)` binds `thisArg` as the callback's `this`, and so
@@ -8550,23 +8665,16 @@ fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
             }
             Ok(Value::Undef)
         }
-        "keys" | "values" | "entries" | "@@iterator" => {
-            let items: Vec<Value> = with_host(|h| {
-                let pairs: Vec<(Value, Value)> = match h.get(recv) {
-                    Some(JsObj::Map { entries, .. }) => entries.values().cloned().collect(),
-                    _ => Vec::new(),
-                };
-                pairs
-                    .into_iter()
-                    .map(|(k, v)| match name {
-                        "keys" => k,
-                        "values" => v,
-                        _ => h.new_array(vec![k, v]), // entries + @@iterator
-                    })
-                    .collect()
-            });
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
-        }
+        // LIVE, not a snapshot: an entry added during iteration is visited and
+        // one deleted before it is reached is not.
+        "keys" | "values" | "entries" | "@@iterator" => Ok(collection_iterator(
+            recv,
+            if name == "@@iterator" {
+                "entries"
+            } else {
+                name
+            },
+        )),
         _ => Err(host::type_error(&format!("map.{name} is not a function"))),
     }
 }
@@ -8642,22 +8750,15 @@ fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
             }
             Ok(Value::Undef)
         }
-        "keys" | "values" | "entries" | "@@iterator" => {
-            let items: Vec<Value> = with_host(|h| {
-                let vals: Vec<Value> = match h.get(recv) {
-                    Some(JsObj::Set { entries, .. }) => entries.values().cloned().collect(),
-                    _ => Vec::new(),
-                };
-                if name == "entries" {
-                    vals.into_iter()
-                        .map(|v| h.new_array(vec![v.clone(), v]))
-                        .collect()
-                } else {
-                    vals
-                }
-            });
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
-        }
+        // LIVE, as for `Map`. A Set's `keys` and `values` are the same thing.
+        "keys" | "values" | "entries" | "@@iterator" => Ok(collection_iterator(
+            recv,
+            if name == "entries" {
+                "entries"
+            } else {
+                "values"
+            },
+        )),
         _ => Err(host::type_error(&format!("set.{name} is not a function"))),
     }
 }

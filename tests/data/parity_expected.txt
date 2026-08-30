@@ -244,6 +244,23 @@ typeof symbol desc id
 interned true
 custom iterable [ 10, 20, 30 ]
 sum 60
+add      1,2,3,4
+del-next 1,3
+del-self 1,2,3
+del-back 1,2,3
+del-rest 1
+clear    1
+set-add  1,2,3,4
+set-del  1,2,3
+views    1,2 a,b 1:a,2:b
+spread   1:a,2:b 1,2
+destr    1=a
+nested   11,12,21,22
+partial  2
+done     true,undefined
+protocol function,true
+set-view x,y x,y x:x,y:y
+empty    0 0
 ==== control.js ====
 total 12
 negative zero positive
