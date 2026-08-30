@@ -3136,7 +3136,13 @@ fn call_key_of(v: &Value) -> String {
     if let Value::Str(s) = v {
         return (**s).clone();
     }
-    with_host(|h| h.str_of(v))
+    // `ToPropertyKey`, not `ToString`. A SYMBOL key has an internal `@@name`
+    // spelling that `str_of` does not produce — it renders
+    // `Symbol(Symbol.iterator)` — so `obj[Symbol.iterator]()` dispatched a
+    // method by that display text and reported it was not a function, for every
+    // object including a plain literal with a computed symbol method. Reading
+    // the same property without calling it worked, which is what hid this.
+    with_host(|h| h.property_key(v))
 }
 
 fn index_element_call(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {

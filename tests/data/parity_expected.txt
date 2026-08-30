@@ -76,6 +76,18 @@ overridden:cbfail
 kept:keep
 cleanup-done
 after:v
+==== asynciter.js ====
+literal  object
+builtins object object
+more     object object object
+custom   called
+other    idx str cat num
+forawait tick,tick,tick 3
+next     m false
+return   undefined true
+after    undefined true
+self     function true
+novalue  undefined
 ==== bigint.js ====
 10n -3n bigint
 255 ff 11111111

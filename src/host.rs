@@ -6606,11 +6606,14 @@ fn user_async_iterator_fn(v: &Value) -> Option<Value> {
     if !is_plain {
         return None;
     }
-    let f = with_host(|h| lookup_chain(h, v, "@@asyncIterator"));
-    match f {
-        Some(f) if with_host(|h| is_callable(h, &f)) => Some(f),
-        _ => None,
-    }
+    // Full property resolution, not a stored-property lookup — the same reason
+    // `user_iterator_fn` does it for the SYNC protocol. A NATIVE-tagged object
+    // dispatches its methods through the stdlib method table rather than a
+    // property map, so `lookup_chain` reported no `Symbol.asyncIterator` for one
+    // even though reading it gives a function: `for await (const v of
+    // timersPromises.setInterval(…))` said the iterator "is not iterable".
+    let f = crate::builtins::get_property(v, "@@asyncIterator").ok()?;
+    with_host(|h| is_callable(h, &f)).then_some(f)
 }
 
 /// One step of a `for await` loop: return a Promise that settles to a

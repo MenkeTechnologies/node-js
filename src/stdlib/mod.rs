@@ -555,6 +555,7 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
     const EMITTER: &[&str] = events::METHODS;
     let base: &[&str] = match tag {
         "Timeout" => timers::TIMEOUT_METHODS,
+        "IntervalIterator" => timers::INTERVAL_METHODS,
         "Immediate" => timers::IMMEDIATE_METHODS,
         "Server" => &["listen", "close", "address"],
         "Socket" => &[
@@ -729,6 +730,7 @@ pub fn instance_call(
     match tag {
         "Buffer" => buffer::instance_call(recv, method, &args),
         "Timeout" | "Immediate" => timers::instance_call(recv, method, &args),
+        "IntervalIterator" => timers::interval_call(recv, method, &args),
         "Date" => date::instance_call(recv, method, &args),
         "StringDecoder" => string_decoder::instance_call(recv, method, &args),
         "WeakRef" => typedarray::weakref_call(recv, method),

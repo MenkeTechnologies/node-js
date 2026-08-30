@@ -137,7 +137,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// dispatch methods through the parent `instance_call` table, not stored
 /// properties, so there is no way to expose it without editing `builtins.rs`/
 /// `host.rs` (out of scope here).
-pub const PROMISES_METHODS: &[&str] = &["setTimeout", "setImmediate"];
+pub const PROMISES_METHODS: &[&str] = &["setTimeout", "setImmediate", "setInterval"];
+
+/// The async-iterator surface `timers/promises.setInterval` returns.
+pub const INTERVAL_METHODS: &[&str] = &["next", "return", "@@asyncIterator"];
 
 /// Dispatch a `timers/promises.<method>` call.
 ///
@@ -156,8 +159,90 @@ pub fn promises_call(method: &str, args: &[Value]) -> Option<Result<Value, Strin
             let value = args.first().cloned().unwrap_or(Value::Undef);
             Some(Ok(schedule_promise("setImmediate", None, value)))
         }
+        // `setInterval(delay, value)` is an ASYNC ITERABLE, not a promise: it
+        // yields `value` every `delay` for as long as it is iterated. It was
+        // missing, so `for await (const v of setInterval(...))` had nothing to
+        // call.
+        "setInterval" => {
+            let delay = arg_num(args, 0);
+            let value = args.get(1).cloned().unwrap_or(Value::Undef);
+            Some(Ok(interval_iterator(delay, value)))
+        }
         _ => None,
     }
+}
+
+/// The object `timers/promises.setInterval` hands back: an async iterator that
+/// resolves one `{ value, done: false }` per `delay`, and reports `done` once
+/// `return()` has been called (which is what `break` inside `for await` does).
+fn interval_iterator(delay: f64, value: Value) -> Value {
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str("IntervalIterator"));
+        m.insert("@@delay".into(), Value::Float(delay));
+        m.insert("@@value".into(), value);
+        m.insert("@@stopped".into(), Value::Bool(false));
+        h.new_object(m)
+    })
+}
+
+pub fn interval_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
+    let slot = |k: &str| {
+        with_host(|h| match h.get(recv) {
+            Some(JsObj::Object(p)) => p.get(k).cloned(),
+            _ => None,
+        })
+    };
+    match method {
+        // An async iterable is its own iterator here, as node's is.
+        "@@asyncIterator" => Ok(recv.clone()),
+        "next" => {
+            let stopped = slot("@@stopped").is_some_and(|v| with_host(|h| h.truthy(&v)));
+            let value = slot("@@value").unwrap_or(Value::Undef);
+            if stopped {
+                let done = iter_result(Value::Undef, true);
+                return Ok(resolved_promise(done));
+            }
+            let delay = slot("@@delay")
+                .map(|v| with_host(|h| h.to_number(&v)))
+                .unwrap_or(0.0);
+            let result = iter_result(value, false);
+            Ok(schedule_promise("setTimeout", Some(delay), result))
+        }
+        "return" => {
+            with_host(|h| {
+                if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                    p.insert("@@stopped".into(), Value::Bool(true));
+                }
+            });
+            let done = iter_result(Value::Undef, true);
+            Ok(resolved_promise(done))
+        }
+        _ => Err(crate::host::type_error(&format!(
+            "intervalIterator.{method} is not a function"
+        ))),
+    }
+}
+
+/// `{ value, done }` — the iterator-result shape both arms return.
+fn iter_result(value: Value, done: bool) -> Value {
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("value".into(), value);
+        m.insert("done".into(), Value::Bool(done));
+        h.new_object(m)
+    })
+}
+
+/// A promise already fulfilled with `v`.
+fn resolved_promise(v: Value) -> Value {
+    let (promise, id) = with_host(|h| {
+        let p = h.new_promise();
+        let id = h.promise_id(&p).unwrap_or(0);
+        (p, id)
+    });
+    crate::host::resolve_promise_val(id, v);
+    promise
 }
 
 /// Allocate a pending Promise and schedule its resolution with `value` via the
