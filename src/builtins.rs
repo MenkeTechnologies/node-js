@@ -7452,8 +7452,6 @@ fn new_s(s: String) -> Value {
     with_host(|h| h.new_str(s))
 }
 
-/// `ToIntegerOrInfinity(n)` clamped into `0..=len` — the position argument of
-/// the `String.prototype` search methods. `NaN` (an absent argument) is `0`.
 /// Where a forward `indexOf`/`includes` search starts, given the optional
 /// `fromIndex` (23.1.3.17 steps 4-6, 23.1.3.16 steps 5-7). A negative value
 /// counts back from the end and clamps at 0; absent or `NaN` is 0. A start at
@@ -7505,6 +7503,8 @@ pub(crate) fn search_start_last(from: Option<f64>, len: usize) -> Option<usize> 
     }
 }
 
+/// `ToIntegerOrInfinity(n)` clamped into `0..=len` — the position argument of
+/// the `String.prototype` search methods. `NaN` (an absent argument) is `0`.
 fn clamp_pos(n: f64, len: usize) -> usize {
     if n.is_nan() || n <= 0.0 {
         0

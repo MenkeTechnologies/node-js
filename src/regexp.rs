@@ -575,38 +575,106 @@ pub fn str_search(s: &str, re_val: &Value) -> Result<Value, String> {
 
 /// `str.split(re[, limit])`: split on regex matches; captured groups are spliced
 /// into the output (JS semantics).
+/// `String.prototype.split(regexp[, limit])` — 22.2.6.14 `RegExp.prototype
+/// [@@split]`.
+///
+/// The previous shape of this was a `captures_iter` with one hand-rolled
+/// special case for a zero-width match at position 0, and it got every other
+/// empty-match position wrong: `'ab'.split(/(?:)/)` grew a trailing `""`,
+/// `''.split(/(?:)/)` answered `[""]` instead of `[]`, and `'ab'.split(/()/)`
+/// answered five elements instead of three.
+///
+/// The spec loop is what gets those right, and the single rule doing the work
+/// is `e == p`: a match ENDING where the previous piece began contributes
+/// nothing and only advances the scan. The final piece is always the tail from
+/// `p`, appended after the loop — which is why an empty match at the very end
+/// does not produce an extra `""` (the loop stops at `q == size` before ever
+/// matching there) while a real separator at the end does.
+///
+/// The scan is in UTF-16 code units, since that is what the spec indexes and
+/// what `.index`/`lastIndex` report elsewhere in this file. Where the spec
+/// advances `q` one position at a time until a match occurs AT `q`, this jumps
+/// straight to the next match at or after `q`: every position skipped is one
+/// the spec would have failed to match, so the two agree.
+///
+/// One divergence remains and is not fixable here: a lone surrogate cannot be
+/// represented in a Rust `String`, so a split position INSIDE an astral
+/// character does not exist to be split at. `'\u{1F600}a'.split(/(?:)/)` is
+/// `['\u{1F600}', 'a']` here and three elements in node, which splits the
+/// surrogate pair. `'\u{1F600}'.split('')` has always had the same limit; it
+/// is the string representation, not this algorithm.
 pub fn str_split_regex(s: &str, re_val: &Value, limit: Option<usize>) -> Result<Value, String> {
     let Some((re, _, _, _)) = regexp_snapshot(re_val) else {
         return Ok(with_host(|h| h.new_array(Vec::new())));
     };
+    let lim = limit.unwrap_or(usize::MAX);
+    if lim == 0 {
+        return Ok(with_host(|h| h.new_array(Vec::new())));
+    }
+    let size = utf16::len(s);
+    let units = |i: usize| byte_of_index(s, U16Index::new(i));
+
+    // An empty subject splits to nothing when the separator can match it, and
+    // to `[""]`... which is the subject itself, when it cannot.
+    if size == 0 {
+        let out = if matches!(re.find(s), Ok(Some(_))) {
+            Vec::new()
+        } else {
+            vec![with_host(|h| h.new_str(String::new()))]
+        };
+        return Ok(with_host(|h| h.new_array(out)));
+    }
+
     let mut out: Vec<Value> = Vec::new();
-    let mut last_end = 0usize;
-    for caps in re.captures_iter(s).flatten() {
-        let m = caps.get(0).unwrap();
-        // Zero-width match at the very start is skipped (matches JS closely).
-        if m.start() == m.end() && m.start() == last_end && last_end == 0 {
+    let mut p = 0usize; // start of the piece being accumulated
+    let mut q = 0usize; // scan position
+    while q < size {
+        let Some(caps) = re.captures_from_pos(s, units(q)).ok().flatten() else {
+            break;
+        };
+        let m = caps.get(0).expect("group 0 always participates");
+        let m_start = index_of_byte(s, m.start()).get();
+        // The spec scans `q` only while `q < size` and requires the match to be
+        // AT `q`, so a match starting at the very end is never reached. Jumping
+        // to the next match does reach it, and letting it through appended a
+        // spurious trailing `""` for every end-anchored zero-width separator —
+        // `/$/`, `/\b/`, a trailing lookbehind.
+        if m_start >= size {
+            break;
+        }
+        let e = index_of_byte(s, m.end()).get().min(size);
+        if e == p {
+            // Contributes no piece; step past this position and rescan.
+            //
+            // The step is off `q`, not off `m_start`, because the two can move
+            // backwards relative to each other: a unit index that falls INSIDE
+            // an astral character has no byte offset of its own, so the search
+            // starts at the character's first byte and reports a match before
+            // `q`. Stepping off `m_start` there left `q` pinned and the loop
+            // spun forever on `'\u{1F600}a'.split(/(?:)/)`.
+            q = m_start.max(q) + 1;
             continue;
         }
-        out.push(with_host(|h| h.new_str(s[last_end..m.start()].to_string())));
-        // Splice in captured groups (1..).
+        out.push(with_host(|h| {
+            h.new_str(utf16::Units::of(s).slice(p, m_start))
+        }));
+        if out.len() >= lim {
+            return Ok(with_host(|h| h.new_array(out)));
+        }
         for i in 1..caps.len() {
             out.push(match caps.get(i) {
                 Some(g) => with_host(|h| h.new_str(g.as_str().to_string())),
                 None => Value::Undef,
             });
-        }
-        last_end = m.end();
-        if let Some(l) = limit {
-            if out.len() >= l {
-                out.truncate(l);
+            if out.len() >= lim {
                 return Ok(with_host(|h| h.new_array(out)));
             }
         }
+        p = e;
+        q = p;
     }
-    out.push(with_host(|h| h.new_str(s[last_end..].to_string())));
-    if let Some(l) = limit {
-        out.truncate(l);
-    }
+    out.push(with_host(|h| h.new_str(utf16::Units::of(s).slice(p, size))));
+    out.truncate(lim);
     Ok(with_host(|h| h.new_array(out)))
 }
 

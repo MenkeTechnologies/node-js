@@ -281,6 +281,13 @@ abab xx
 \/ a\/b [/]
 /\// "\\n"
 (?:) true
+["a","b"] []
+["a","b"] ["","a","b"] ["a","b",""]
+["a","","b"] ["a","1","b"] ["a",null,"b"]
+["ab"] ["foo"," ","bar"] ["a1","b2"]
+["a","b",""] ["",""]
+["a","b"] ["a","1","b"] []
+["",""] ["a","","b"]
 ==== strings.js ====
 HELLO, WORLD hello, world 12
 World World Hello d
