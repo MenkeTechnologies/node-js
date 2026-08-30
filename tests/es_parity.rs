@@ -4324,6 +4324,90 @@ fn a_refused_connection_emits_an_error_rather_than_hanging() {
     assert_eq!(run(src), "error ECONNREFUSED true");
 }
 
+/// `server.close()` stops the listener accepting, so a later connect is
+/// refused rather than hanging or being served.
+///
+/// The accept loop polls a `stop` flag every 5ms and drops the `TcpListener`
+/// when it sees it, so there is a brief window after `close()` in which the
+/// kernel still completes handshakes on the not-yet-dropped socket. Measured
+/// here it is 0-20ms. Rather than sleep past it and hope, this RETRIES the
+/// connect until it is refused, with a bounded attempt count so a server that
+/// never stops accepting fails the assertion instead of hanging the suite.
+///
+/// (An earlier reading of this as nondeterministic — refused at 10/50/200ms
+/// but accepting at 100/400ms — was measurement error: `kill -9`ed processes
+/// from other probes were still holding reused ephemeral ports.)
+#[test]
+fn server_close_stops_the_listener_accepting() {
+    let src = r##"
+        const http = require('http');
+        const net = require('net');
+        const srv = http.createServer((req, res) => { res.writeHead(200); res.end('served'); });
+        srv.listen(0, () => {
+          const port = srv.address().port;
+          srv.close();
+          let tries = 0;
+          const attempt = () => {
+            if (++tries > 100) { console.log('still accepting after ' + (tries - 1) + ' tries'); return; }
+            const c = net.connect(port, '127.0.0.1');
+            c.on('error', () => console.log('refused', tries <= 100));
+            c.on('connect', () => { c.destroy(); setTimeout(attempt, 10); });
+          };
+          attempt();
+        });
+    "##;
+    assert_eq!(run(src), "refused true");
+}
+
+/// One round trip carrying every piece of metadata either side sets: the
+/// request's headers, url with query, method and `httpVersion` reaching the
+/// handler, and the reply's `res.statusCode = n` assignment and
+/// `res.setHeader` reaching the client.
+///
+/// The existing server tests all read the BODY and nothing else, so
+/// `writeHead`'s sibling paths — assigning `statusCode` after the fact, and
+/// `setHeader` rather than passing a header object — were never exercised, nor
+/// was any request header proven to survive the parse. `finish_response`
+/// reconciles a `statusCode` assignment with the status `writeHead` recorded,
+/// and only this asserts that reconciliation.
+#[test]
+fn request_metadata_and_response_status_and_headers_survive_the_round_trip() {
+    let src = r##"
+        const http = require('http');
+        const srv = http.createServer((req, res) => {
+          console.log('req', req.method, req.url, req.httpVersion);
+          console.log('hdr', req.headers['x-probe'], req.headers['content-type']);
+          res.statusCode = 201;
+          res.setHeader('X-Reply', 'yes');
+          res.end('done');
+        });
+        srv.on('listening', () => console.log('listening'));
+        srv.listen(0, () => {
+          const port = srv.address().port;
+          const rq = http.request({
+            host: '127.0.0.1', port, path: '/p?q=1', method: 'POST',
+            headers: {'X-Probe': 'abc', 'Content-Type': 'text/plain'},
+          }, res => {
+            let b = '';
+            res.on('data', c => b += c);
+            res.on('end', () => {
+              console.log('res', res.statusCode, res.headers['x-reply'], b);
+              srv.close();
+            });
+          });
+          rq.end('payload');
+        });
+    "##;
+    let expected = [
+        "listening",
+        "req POST /p?q=1 1.1",
+        "hdr abc text/plain",
+        "res 201 yes done",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
