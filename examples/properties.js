@@ -116,3 +116,51 @@ console.log('px-toString', new Proxy({ toString() { return 'TS'; } }, {}) + '');
 console.log('px-trap ', String(new Proxy({}, { get: (t, k) => (k === 'toString' ? () => 'TRAPPED' : t[k]) })));
 // The other proxy paths are unaffected.
 console.log('px-other', new Proxy([1, 2], {}).join('-'), new Proxy({ a: 1 }, {}).hasOwnProperty('a'), new Proxy(function (a) { return a * 2; }, {})(21));
+
+// A write the object REFUSES. With no own property the INHERITED one decides:
+// a non-writable data property up the chain blocks the write rather than being
+// shadowed, including one on a frozen prototype. Only own attributes were
+// consulted, so an own property got created that node refuses to create.
+const lockedBase = {};
+Object.defineProperty(lockedBase, "ro", { value: "base", writable: false, configurable: true });
+const heir = Object.create(lockedBase);
+heir.ro = "child";
+console.log("inh-ro  ", heir.ro, Object.prototype.hasOwnProperty.call(heir, "ro"));
+const frozenBase = Object.freeze({ f: 1 });
+const heir2 = Object.create(frozenBase);
+heir2.f = 2;
+console.log("inh-froz", heir2.f, Object.prototype.hasOwnProperty.call(heir2, "f"));
+// A WRITABLE inherited property is shadowed as usual, and an inherited SETTER
+// still runs — neither blocks.
+const openBase = { rw: "base" };
+const heir3 = Object.create(openBase);
+heir3.rw = "child";
+const withSetter = Object.create({ set s(v) { this.got = v; } });
+withSetter.s = "v";
+console.log("inh-rw  ", heir3.rw, Object.prototype.hasOwnProperty.call(heir3, "rw"), withSetter.got);
+
+// Refusing is SILENT in sloppy mode and a TypeError in strict code — the
+// ASSIGNMENT SITE decides, not the object. Every refusal used to be silent, so
+// `'use strict'` did not catch a write to a frozen object, which is most of the
+// reason to freeze one.
+const iced = Object.freeze({ a: 1 });
+const nonext = Object.preventExtensions({ c: 1 });
+const getterOnly = {};
+Object.defineProperty(getterOnly, "g", { get: () => 1 });
+const tryWrite = (f) => { try { f(); return "silent"; } catch (e) { return e.constructor.name; } };
+console.log("sloppy  ", tryWrite(() => { iced.a = 2; }), tryWrite(() => { iced.z = 2; }), tryWrite(() => { nonext.z = 2; }), tryWrite(() => { getterOnly.g = 2; }));
+(function () {
+  "use strict";
+  console.log("strict  ", tryWrite(() => { iced.a = 2; }), tryWrite(() => { iced.z = 2; }), tryWrite(() => { nonext.z = 2; }), tryWrite(() => { getterOnly.g = 2; }));
+  console.log("strict2 ", tryWrite(() => { heir.ro = "x"; }), tryWrite(() => { heir2.f = 3; }));
+  // A sealed property that is still WRITABLE assigns normally in either mode.
+  const sealed = Object.seal({ b: 1 });
+  console.log("sealed  ", tryWrite(() => { sealed.b = 2; }), sealed.b, tryWrite(() => { sealed.z = 1; }));
+  // And a setter that EXISTS runs rather than being refused — including a
+  // private one, where the refusal branch must not swallow a successful write.
+  const sink = {};
+  Object.defineProperty(sink, "v", { set(x) { this.got = x; }, get() { return "G"; } });
+  sink.v = "written";
+  class Priv { get #p() { return 3; } set #p(x) { this.seen = x; } write(x) { this.#p = x; return this.seen; } }
+  console.log("setters ", sink.got, sink.v, new Priv().write(4));
+})();

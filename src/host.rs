@@ -746,6 +746,10 @@ pub struct Frame {
     /// The object literal owning the running method — see
     /// `FuncVal::home_object`.
     pub home_object: Option<Value>,
+    /// Whether the code in this activation is strict. A write the object
+    /// refuses is a silent no-op in sloppy mode and a `TypeError` here, so the
+    /// ASSIGNMENT SITE decides — not the object being written to.
+    pub strict: bool,
     /// Source line the frame is currently executing (updated by the DAP line hook
     /// under `--dap`; stays 0 on ordinary runs).
     pub line: u32,
@@ -1115,6 +1119,7 @@ impl JsHost {
                 home_class: None,
                 home_static: false,
                 home_object: None,
+                strict: false,
                 line: 0,
                 owner: None,
                 is_module: true,
@@ -1604,6 +1609,35 @@ impl JsHost {
         if !self.prop_attrs(owner, key).writable {
             return false;
         }
+        // 10.1.9.2: with no OWN property, the inherited one decides. A
+        // non-writable data property up the chain blocks the write rather than
+        // being shadowed — including one on a frozen prototype. Only own
+        // attributes were consulted, so `Object.create(frozenBase).f = 2`
+        // quietly created an own property node refuses to create.
+        //
+        // An inherited ACCESSOR does not block: its setter runs, and the write
+        // path checks for one before reaching here.
+        let has_own = match self.get(owner) {
+            Some(JsObj::Object(p)) => p.contains_key(key),
+            _ => true,
+        };
+        if !has_own {
+            let mut cur = self.proto_of(owner);
+            while let Some(proto) = cur {
+                if self.own_accessor(&proto, key).is_some() {
+                    break;
+                }
+                let present =
+                    matches!(self.get(&proto), Some(JsObj::Object(p)) if p.contains_key(key));
+                if present {
+                    if !self.prop_attrs(&proto, key).writable {
+                        return false;
+                    }
+                    break;
+                }
+                cur = self.proto_of(&proto);
+            }
+        }
         if self.is_extensible(owner) {
             return true;
         }
@@ -1888,6 +1922,11 @@ impl JsHost {
     /// whether the method is static, and the home object of an object-literal
     /// method. An ARROW captures all three at creation, the way it captures
     /// `this` — `super` inside an arrow means the enclosing METHOD's `super`.
+    /// Whether the activation now running is strict code.
+    pub fn current_strict(&self) -> bool {
+        self.frame().strict
+    }
+
     pub fn current_home(&self) -> (Option<String>, bool, Option<Value>) {
         (
             self.current_home_class_name(),
@@ -3028,6 +3067,7 @@ pub fn run_chunk_in_global_scope(chunk: Chunk) -> Result<Value, String> {
             home_class: None,
             home_static: false,
             home_object: None,
+            strict: false,
             line: 0,
             owner: None,
             is_module: true,
@@ -5544,6 +5584,7 @@ pub fn run_user_func_nt(
             fv.home_class.clone(),
             fv.home_static,
             fv.home_object.clone(),
+            with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict)),
         );
         if is_async {
             if let Some(JsObj::Generator { id }) = with_host(|h| h.get(&gen).cloned()) {
@@ -5563,6 +5604,7 @@ pub fn run_user_func_nt(
             fv.home_class.clone(),
             fv.home_static,
             fv.home_object.clone(),
+            with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict)),
         );
         return Ok(run_async(gen));
     }
@@ -5570,6 +5612,9 @@ pub fn run_user_func_nt(
         .home_class
         .as_ref()
         .and_then(|n| with_host(|h| h.class_registry.get(n).cloned()));
+    // Resolved BEFORE the borrow below: reading the function table re-enters
+    // the host, and doing it inside the frame-push closure double-borrows.
+    let fn_strict = with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict));
     with_host(|h| {
         h.frames.push(Frame {
             base_env: env.clone(),
@@ -5579,6 +5624,7 @@ pub fn run_user_func_nt(
             home_class: home,
             home_static: fv.home_static,
             home_object: fv.home_object.clone(),
+            strict: fn_strict,
             line: 0,
             owner: Some(def_name),
             is_module: false,
@@ -6335,6 +6381,7 @@ fn make_generator(
     home_class: Option<String>,
     home_static: bool,
     home_object: Option<Value>,
+    strict: bool,
 ) -> Value {
     let home = home_class
         .as_ref()
@@ -6347,6 +6394,7 @@ fn make_generator(
         home_class: home,
         home_static,
         home_object,
+        strict,
         line: 0,
         owner: None,
         is_module: false,

@@ -512,6 +512,14 @@ px-valueOf 6
 px-toString TS
 px-trap  TRAPPED
 px-other 1-2 true 42
+inh-ro   base false
+inh-froz 1 false
+inh-rw   child true v
+sloppy   silent silent silent silent
+strict   TypeError TypeError TypeError TypeError
+strict2  TypeError TypeError
+sealed   silent 2 TypeError
+setters  written G 4
 ==== regexp.js ====
 true true false
 a b

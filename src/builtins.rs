@@ -1942,6 +1942,36 @@ pub fn set_property_pub(recv: &Value, name: &str, val: Value) -> Result<(), Stri
     set_property(recv, name, val)
 }
 
+/// The `TypeError` a refused write raises in strict code, worded as V8 does.
+///
+/// Adding a key to a non-extensible object reports differently from assigning
+/// to a read-only one, and the object is named by its brand — `#<Object>` for a
+/// plain object, `[object Array]` for an array.
+fn write_refused(recv: &Value, name: &str) -> String {
+    let extensible = with_host(|h| h.is_extensible(recv));
+    let has_own = with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) => p.contains_key(name),
+        Some(JsObj::Array(items)) => name
+            .parse::<usize>()
+            .map(|i| i < items.len())
+            .unwrap_or(false),
+        _ => true,
+    });
+    if !extensible && !has_own {
+        return host::type_error(&format!(
+            "Cannot add property {name}, object is not extensible"
+        ));
+    }
+    let brand = if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Array) {
+        "[object Array]".to_string()
+    } else {
+        "#<Object>".to_string()
+    };
+    host::type_error(&format!(
+        "Cannot assign to read only property '{name}' of object '{brand}'"
+    ))
+}
+
 fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     // `[[PrivateSet]]` (7.3.32) refuses a receiver that carries no such private
     // element. The class's own field initializers install theirs directly
@@ -2023,14 +2053,28 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     if let Some((getter, setter)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
         if let Some(setter) = setter {
             let _ = host::invoke(&setter, vec![val], Some(recv.clone()));
+            return Ok(());
         }
-        // A getter with no setter: the write is silently ignored.
+        // Only a getter: the write is refused — silent in sloppy mode, a
+        // TypeError in strict code. The `return` above matters, since a
+        // successful setter call must not fall into this.
         let _ = getter;
+        if with_host(|h| h.current_strict()) {
+            return Err(host::type_error(&format!(
+                "Cannot set property {name} of #<Object> which has only a getter"
+            )));
+        }
         return Ok(());
     }
-    // A non-writable own property, or a new key on a non-extensible object,
-    // silently discards the write (sloppy mode — the mode every script runs in).
+    // A non-writable property, or a new key on a non-extensible object, refuses
+    // the write. In SLOPPY mode that is silent; in strict code it is a
+    // TypeError, and the ASSIGNMENT SITE decides which — not the object. Every
+    // refusal used to be silent, so `'use strict'` did not catch a write to a
+    // frozen object, which is most of the reason to freeze one.
     if !with_host(|h| h.can_write_prop(recv, name)) {
+        if with_host(|h| h.current_strict()) {
+            return Err(write_refused(recv, name));
+        }
         return Ok(());
     }
     // Writing `name`/`prototype`/statics on a function value.
