@@ -2993,29 +2993,31 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
             Err(e) => abort(vm, e),
         };
     }
-    // An object with a user `Symbol.iterator`: call it to get the iterator object.
-    if let Some(iter_fn) = with_host(|h| host::lookup_chain(h, &v, "@@iterator")) {
-        if with_host(|h| host::is_callable(h, &iter_fn)) {
-            return match host::invoke(&iter_fn, Vec::new(), Some(v.clone())) {
-                Ok(it) => it,
-                Err(e) => abort(vm, e),
-            };
-        }
-    }
-    // A `Map`/`Set` dispatches its methods through the stdlib table rather than
-    // a property map, so the `lookup_chain` probe above cannot see its
-    // `Symbol.iterator` — and falling through to `iter_vec` snapshotted the
-    // whole collection, which is exactly what a LIVE iterator must not do.
-    // Arrays and strings keep the direct path; they have no live semantics to
-    // preserve and are the hot case.
-    if matches!(
+    // Arrays and strings take the direct path below: they have no iterator
+    // state to preserve and are the hot case, so they must not pay a property
+    // lookup and a call per loop.
+    let direct = matches!(
         with_host(|h| h.kind_of(&v)),
-        Some(ObjKind::Map) | Some(ObjKind::Set)
-    ) {
-        return match host::call_method(&v, "@@iterator", Vec::new()) {
-            Ok(it) => it,
-            Err(e) => abort(vm, e),
-        };
+        Some(ObjKind::Array) | Some(ObjKind::Str)
+    );
+    // Anything else with a `Symbol.iterator`: call it for the iterator object.
+    //
+    // Resolved as a full property READ, not a stored-property lookup. A
+    // NATIVE-tagged object (`URLSearchParams`, `Headers`, `Map`, `Set`)
+    // dispatches its methods through the stdlib table rather than a property
+    // map, so a `lookup_chain` probe found nothing and the loop fell through to
+    // materializing the value — which threw for `URLSearchParams` and
+    // snapshotted for `Map`. Spreading the same object already worked, because
+    // that path had been fixed and this one had not.
+    if !direct {
+        if let Ok(iter_fn) = get_property(&v, "@@iterator") {
+            if with_host(|h| host::is_callable(h, &iter_fn)) {
+                return match host::invoke(&iter_fn, Vec::new(), Some(v.clone())) {
+                    Ok(it) => it,
+                    Err(e) => abort(vm, e),
+                };
+            }
+        }
     }
     match with_host(|h| h.iter_vec(&v)) {
         Ok(items) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })),

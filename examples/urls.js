@@ -95,3 +95,28 @@ console.log("qs-array", qs.stringify({ a: [1, null, {}, "x"] }));
 // than about percent-escapes.
 console.log("qs-plus ", qs.unescape("a+b"), qs.unescape("a%2Bb"), JSON.stringify(qs.parse("a+b=c+d")));
 console.log("qs-round", JSON.stringify(qs.parse(qs.stringify({ a: "x y", b: "&=?" }))));
+
+// `for-of` over a NATIVE-tagged iterable. These dispatch their methods through
+// the stdlib table rather than a property map, and the loop probed
+// `Symbol.iterator` with a stored-property lookup — so it found nothing and
+// fell through to materializing the value, which THREW for `URLSearchParams`.
+// Spreading the same object already worked, because that path resolves the
+// property properly and this one did not.
+const params = new URLSearchParams("a=1&b=2");
+const walked = [];
+for (const [k, v] of params) walked.push(k + "=" + v);
+console.log("usp-forof", walked.join(","), [...params].length);
+const headers = new Headers([["x-one", "1"], ["x-two", "2"]]);
+const seenHeaders = [];
+for (const [k, v] of headers) seenHeaders.push(k + ":" + v);
+console.log("hdr-forof", seenHeaders.sort().join(","));
+// The iterators these expose directly work the same way.
+console.log("usp-views", [...params.keys()].join(","), [...params.values()].join(","), [...params.entries()].length);
+// And the paths that were already correct stay correct: arrays and strings
+// keep the direct route, and a generator is still its own iterator.
+const mixed = [];
+for (const c of "ab") mixed.push(c);
+for (const b of Buffer.from("hi")) mixed.push(b);
+for (const n of new Uint8Array([7])) mixed.push(n);
+for (const g of (function* () { yield "g"; })()) mixed.push(g);
+console.log("others  ", mixed.join(","));
