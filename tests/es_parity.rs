@@ -4408,6 +4408,74 @@ fn request_metadata_and_response_status_and_headers_survive_the_round_trip() {
     assert_eq!(run(src), expected);
 }
 
+/// The HTTPS server frames its responses the same way the HTTP one does:
+/// chunked bodies encoded, HEAD carrying headers only.
+///
+/// `https::serialize_response` is otherwise a copy of `http`'s, and it carried
+/// the SAME two defects fixed in 687765283d — computing `chunked` and then
+/// writing the body raw, and never suppressing the body for a HEAD. Over TLS
+/// the chunked one was worse than in plaintext: this server sends
+/// `Connection: close`, so the client reads to EOF and hands the raw bytes to
+/// the chunked decoder, which finds no valid chunk header and yields nothing.
+/// The body was lost outright, `""`, rather than mis-framed.
+///
+/// Fixing one copy and not the other is exactly how `net`/`tls`/`http2`
+/// diverged on the accept path (72f048eb54, 442740e705), so this pins the
+/// second copy rather than trusting the first one's test to speak for it.
+#[test]
+fn the_https_server_encodes_chunked_bodies_and_sends_no_body_for_head() {
+    let Some((key, cert)) = self_signed_pem() else {
+        eprintln!("skipping: openssl not on PATH");
+        return;
+    };
+    let src = format!(
+        r##"
+        const https = require('https');
+        const opts = {{ key: {key:?}, cert: {cert:?} }};
+        const srv = https.createServer(opts, (req, res) => {{
+          if (req.url === '/chunked') {{
+            res.writeHead(200, {{'Content-Type': 'text/plain', 'Transfer-Encoding': 'chunked'}});
+            res.write('one');
+            res.write('two');
+            res.end();
+          }} else {{
+            res.writeHead(200, {{'Content-Type': 'text/plain'}});
+            res.end('body-here');
+          }}
+        }});
+        srv.listen(0, () => {{
+          const port = srv.address().port;
+          const get = (path, method) => new Promise(resolve => {{
+            const rq = https.request(
+              {{host: '127.0.0.1', port, path, method: method || 'GET', rejectUnauthorized: false}},
+              res => {{
+                let b = '';
+                res.on('data', c => b += c);
+                res.on('end', () => resolve({{body: b, len: res.headers['content-length']}}));
+              }});
+            rq.end();
+          }});
+          (async () => {{
+            const c = await get('/chunked');
+            console.log('chunked', JSON.stringify(c.body));
+            const h = await get('/plain', 'HEAD');
+            console.log('head', JSON.stringify(h.body), 'content-length=' + h.len);
+            const g = await get('/plain');
+            console.log('get', JSON.stringify(g.body));
+            srv.close();
+          }})();
+        }});
+    "##
+    );
+    let expected = [
+        r#"chunked "onetwo""#,
+        r#"head "" content-length=9"#,
+        r#"get "body-here""#,
+    ]
+    .join("\n");
+    assert_eq!(run(&src), expected);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),

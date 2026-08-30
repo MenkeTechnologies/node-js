@@ -132,6 +132,9 @@ struct HttpsConn {
 
 struct ResState {
     sock_id: u64,
+    /// The request was a HEAD, so the response carries headers and no body
+    /// (RFC 9110 §9.3.2). Mirrors `http::ResState`.
+    head: bool,
     status: u16,
     message: Option<String>,
     headers: Vec<(String, String)>,
@@ -249,7 +252,7 @@ pub fn feed(sock_id: u64, _socket: &Value, bytes: &[u8]) -> Result<(), String> {
         let Some(parsed) = parsed else { break };
 
         let req = build_incoming(&parsed);
-        let res = build_response(sock_id);
+        let res = build_response(sock_id, parsed.method.eq_ignore_ascii_case("HEAD"));
         if with_host(|h| crate::host::is_callable(h, &listener)) {
             invoke(&listener, vec![req.clone(), res], None)?;
         }
@@ -350,13 +353,14 @@ fn build_incoming(req: &ParsedReq) -> Value {
     super::tls::new_emitter_object("IncomingMessage", extra)
 }
 
-fn build_response(sock_id: u64) -> Value {
+fn build_response(sock_id: u64, head: bool) -> Value {
     let resid = next_resid();
     RESPONSES.with(|r| {
         r.borrow_mut().insert(
             resid,
             ResState {
                 sock_id,
+                head,
                 status: 200,
                 message: None,
                 headers: Vec::new(),
@@ -528,7 +532,25 @@ fn serialize_response(st: &mut ResState) -> Vec<u8> {
         out.extend_from_slice(b"Connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&st.body);
+    // Same two rules as `http::serialize_response`, which this is otherwise a
+    // copy of. Both were missing here and both were worse over TLS: this server
+    // sends `Connection: close`, so a client reads to EOF and then hands the
+    // raw bytes to the chunked decoder, which finds no valid chunk header and
+    // yields NOTHING — a chunked body was lost entirely rather than merely
+    // mis-framed. HEAD likewise returned the full body, against RFC 9110
+    // §9.3.2.
+    if st.head {
+        // Headers only; `Content-Length` above still describes the GET body.
+    } else if chunked {
+        if !st.body.is_empty() {
+            out.extend_from_slice(format!("{:x}\r\n", st.body.len()).as_bytes());
+            out.extend_from_slice(&st.body);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+    } else {
+        out.extend_from_slice(&st.body);
+    }
     out
 }
 
