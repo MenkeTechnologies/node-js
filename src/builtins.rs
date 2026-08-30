@@ -1987,6 +1987,12 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         )
     {
         let text = with_host(|h| h.str_of(&val));
+        // Write THROUGH to the real environment as well. `process.env` is not a
+        // private map: node applies the change to the process, so a child
+        // spawned afterwards inherits it. Keeping it only in the JS object meant
+        // `process.env.NODE_ENV = 'production'` was invisible to every
+        // `spawnSync`/`execSync` that followed.
+        std::env::set_var(name, &text);
         let sv = with_host(|h| h.new_str(text));
         with_host(|h| {
             if let Some(JsObj::Object(p)) = h.get_mut(recv) {
@@ -2187,6 +2193,15 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
     }) == Some(true)
     {
         return Ok(crate::module::cache_delete(key));
+    }
+    // `delete process.env.X` unsets the variable in the PROCESS, not just in the
+    // JS view, so a child spawned afterwards no longer sees it.
+    if !key.starts_with("@@")
+        && with_host(
+            |h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key("@@envObject")),
+        )
+    {
+        std::env::remove_var(key);
     }
     if !with_host(|h| h.prop_attrs(recv, key).configurable) {
         return Ok(false);

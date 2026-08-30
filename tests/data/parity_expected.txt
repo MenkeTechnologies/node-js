@@ -472,9 +472,10 @@ global   bb ba
 cwd       /tmp /
 exec-cwd  /tmp
 env-set   [x]
-env-repl  [/usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:.]
-env-empty 3
-env-inherit has
+env-repl  []
+env-inherit [present]
+env-passed [given]
+env-delete [] undefined
 both      /tmp|zed
 exec-env  qq
 file-env  ww

@@ -12,14 +12,23 @@ console.log("exec-cwd ", cp.execSync("pwd", { cwd: "/tmp" }).toString().trim().r
 
 // `env` was ignored too — and it REPLACES the environment rather than adding
 // to it, so a variable the parent has is NOT visible to the child unless it is
-// passed. Both halves matter: the first line shows the value arriving, the
-// second that PATH did not come along with it.
+// passed.
+//
+// The replacement is shown with a marker this process sets rather than with
+// PATH: a shell started with an empty environment SUPPLIES a default PATH, and
+// that default differs between platforms, so printing it made this record fail
+// on Linux having been recorded on macOS.
 const sh = (script, opts) => cp.spawnSync("sh", ["-c", script], opts).stdout.toString().trim();
+process.env.PARENT_MARKER = "present";
 console.log("env-set  ", sh('echo "[$FOO]"', { env: { FOO: "x" } }));
-console.log("env-repl ", sh('echo "[$PATH]"', { env: { FOO: "x" } }));
-console.log("env-empty", sh("env | wc -l", { env: {} }).trim());
-// Without the option the child inherits, as before.
-console.log("env-inherit", sh('test -n "$PATH" && echo has'));
+console.log("env-repl ", sh('echo "[$PARENT_MARKER]"', { env: { FOO: "x" } }));
+// Writing to `process.env` applies to the PROCESS, so a child spawned
+// afterwards inherits it — it is not a private JS map.
+console.log("env-inherit", sh('echo "[$PARENT_MARKER]"'));
+console.log("env-passed", sh('echo "[$PARENT_MARKER]"', { env: { PARENT_MARKER: "given" } }));
+// And deleting it unsets the variable in the process too.
+delete process.env.PARENT_MARKER;
+console.log("env-delete", sh('echo "[$PARENT_MARKER]"'), String(process.env.PARENT_MARKER));
 console.log("both     ", sh("pwd; echo $Z", { cwd: "/tmp", env: { Z: "zed" } }).replace(/^\/private/, "").replace("\n", "|"));
 console.log("exec-env ", cp.execSync("echo $Q", { env: { Q: "qq" } }).toString().trim());
 console.log("file-env ", cp.execFileSync("sh", ["-c", "echo $W"], { env: { W: "ww" } }).toString().trim());
