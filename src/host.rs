@@ -6376,6 +6376,66 @@ fn norm_num_bits(f: f64) -> u64 {
 }
 
 /// Fully materialize any iterable into a vector of values.
+/// Pull at most `n` values, then close the iterator — 8.6.2
+/// IteratorBindingInitialization, which is what an array destructuring pattern
+/// without a `...rest` element performs.
+///
+/// The distinction from [`iter_all`] is not an optimization. A pattern names a
+/// fixed number of targets, so the spec pulls exactly that many and calls
+/// IteratorClose on whatever is left; draining instead made
+///
+///     const [first] = infiniteGenerator();
+///
+/// run forever. It is also observable on any finite iterator, as the count of
+/// `next()` calls and whether `return()` ever ran.
+///
+/// A `...rest` element genuinely consumes the remainder, so those patterns keep
+/// using `iter_all` and an unbounded source hangs there in node too.
+pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
+    // A Proxy iterates through its traps, which materialize eagerly; there is
+    // no step-wise form to bound, so this keeps the draining behaviour.
+    if let Some(items) = crate::proxy::iterate(v)? {
+        return Ok(items.into_iter().take(n).collect());
+    }
+    if with_host(|h| h.is_generator_val(v)) {
+        let mut out = Vec::new();
+        while out.len() < n {
+            match gen_resume(v, Value::Undef)? {
+                GenStep::Yield(x) => out.push(x),
+                _ => return Ok(out), // ran out on its own; nothing left to close
+            }
+        }
+        // Stopped early: `.return()` resumes it at the yield so `finally` runs.
+        let _ = gen_return(v, Value::Undef);
+        return Ok(out);
+    }
+    if let Some(iter_fn) = user_iterator_fn(v) {
+        let iterator = invoke(&iter_fn, Vec::new(), Some(v.clone()))?;
+        let mut out = Vec::new();
+        while out.len() < n {
+            let step = call_method(&iterator, "next", Vec::new())?;
+            // Read first: resolving the property re-enters the host, so doing
+            // it inside the `with_host` closure double-borrows and aborts.
+            let done = get_prop_chain(&step, "done")?;
+            if with_host(|h| h.truthy(&done)) {
+                return Ok(out);
+            }
+            out.push(get_prop_chain(&step, "value")?);
+        }
+        // IteratorClose: `return` is optional on the protocol, and a throw from
+        // it is swallowed here the way a normal (non-abrupt) completion does.
+        if let Ok(ret) = get_prop_chain(&iterator, "return") {
+            if with_host(|h| is_callable(h, &ret)) {
+                let _ = invoke(&ret, Vec::new(), Some(iterator.clone()));
+            }
+        }
+        return Ok(out);
+    }
+    // Arrays, strings, Map/Set: already materialized, and their built-in
+    // iterators carry no `return`, so there is nothing to close.
+    with_host(|h| h.iter_vec(v)).map(|items| items.into_iter().take(n).collect())
+}
+
 pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
     // A Proxy iterates through its traps (see `crate::proxy::iterate`); it has
     // no heap variant `iter_vec` could recognise.

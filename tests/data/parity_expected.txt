@@ -115,6 +115,11 @@ fallback 0 empty-is-falsy zero
 assigned
 7
 { s: 1, t: 2 } [ 1, 2, 3 ]
+take1    0 1,1
+hole     1 2,1
+rest     1 2,3
+cleanup 
+gen      a
 ==== dynamic.js ====
 direct   42
 literal  42

@@ -6195,3 +6195,31 @@ fn inspecting_an_error_shows_the_name_it_carries_now() {
     let heads: Vec<&str> = out.lines().filter(|l| !l.starts_with("    at ")).collect();
     assert_eq!(heads, ["Renamed: boom", "Renamed: again", "Error: x"]);
 }
+
+// ── Array destructuring closes the iterator instead of draining it ──────────
+
+#[test]
+fn a_pattern_over_an_endless_source_takes_what_it_names_and_stops() {
+    // The `examples/` record pins the pull counts, but it has to use a source
+    // that throws once over budget so a regression fails quickly. This is the
+    // case that motivated the fix and that a bounded source cannot express: a
+    // genuinely endless iterator, where draining does not merely pull too much
+    // but never returns at all. `const [first] = naturals()` is ordinary code.
+    //
+    // If the bounded pull regresses, this hangs rather than mismatching, which
+    // is why it lives here — `run` bounds the child and reports the timeout
+    // against this test by name.
+    let src = r#"
+        function* naturals() { let i = 0; while (true) yield i++; }
+        const [first, second] = naturals();
+        console.log(first, second);
+        const endless = { [Symbol.iterator]() { let i = 0; return { next: () => ({ value: i++, done: false }) }; } };
+        const [only] = endless;
+        console.log(only);
+        // A generator closed early still runs its `finally`.
+        function* guarded() { try { while (true) yield 'v'; } finally { console.log('closed'); } }
+        const [taken] = guarded();
+        console.log(taken);
+    "#;
+    assert_eq!(run(src), "0 1\n0\nclosed\nv");
+}

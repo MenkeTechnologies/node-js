@@ -2943,7 +2943,13 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
         _ => 0,
     };
     let iterable = vm.pop();
-    let items = match host::iter_all(&iterable) {
+    // Without a `...rest` element the pattern needs exactly `count` values and
+    // must then close the iterator; draining hung on an unbounded source.
+    let items = match if star < 0 {
+        host::iter_take(&iterable, count)
+    } else {
+        host::iter_all(&iterable)
+    } {
         Ok(v) => v,
         Err(e) => return abort(vm, e),
     };
