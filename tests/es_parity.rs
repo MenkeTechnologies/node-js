@@ -4794,6 +4794,44 @@ fn every_advertised_method_on_these_classes_is_dispatched() {
             "new (require('async_hooks').AsyncLocalStorage)()",
         ),
         ("Agent", "new (require('http').Agent)()"),
+        ("Buffer", "Buffer.from('ab')"),
+        ("Date", "new Date()"),
+        ("Readable", "new (require('stream').Readable)()"),
+        ("Writable", "new (require('stream').Writable)()"),
+        ("Duplex", "new (require('stream').Duplex)()"),
+        ("Transform", "new (require('stream').Transform)()"),
+        ("PassThrough", "new (require('stream').PassThrough)()"),
+        // Console's methods legitimately WRITE, so it gets a discarding sink
+        // rather than process.stdout — pointed at stdout it printed traces,
+        // assertion text and a clear-screen escape into the captured output
+        // and broke the assertion on noise that was not a failure.
+        (
+            "Console",
+            "new (require('console').Console)(new (require('stream').Writable)({ write(c, e, cb) { cb(); } }))",
+        ),
+        ("MIMEType", "new (require('util').MIMEType)('text/plain')"),
+        ("BlockList", "new (require('net').BlockList)()"),
+        ("Sign", "require('crypto').createSign('sha256')"),
+        ("Verify", "require('crypto').createVerify('sha256')"),
+        ("KeyObject", "require('crypto').createSecretKey(Buffer.alloc(32))"),
+        ("ECDH", "require('crypto').createECDH('prime256v1')"),
+        ("DiffieHellman", "require('crypto').createDiffieHellman(64)"),
+        ("Histogram", "require('perf_hooks').createHistogram()"),
+        (
+            "PerformanceObserver",
+            "new (require('perf_hooks').PerformanceObserver)(() => {})",
+        ),
+        ("Serializer", "new (require('v8').Serializer)()"),
+        ("Deserializer", "new (require('v8').Deserializer)(Buffer.alloc(8))"),
+        ("Domain", "require('domain').create()"),
+        (
+            "Cipheriv",
+            "require('crypto').createCipheriv('aes-256-cbc', Buffer.alloc(32), Buffer.alloc(16))",
+        ),
+        (
+            "Decipheriv",
+            "require('crypto').createDecipheriv('aes-256-cbc', Buffer.alloc(32), Buffer.alloc(16))",
+        ),
     ];
 
     let mut checks = String::new();
@@ -4835,11 +4873,103 @@ fn every_advertised_method_on_these_classes_is_dispatched() {
           }}
         }}
         {checks}
-        console.log(bad.length === 0 ? 'all dispatched' : bad.join(','));
+        // `process.stdout.write`, not `console.log`: this test calls Console's
+        // own `group()`, and group depth is a process-global indent rather than
+        // a per-instance one, so a later `console.log` came out shifted by two
+        // spaces and the assertion failed on whitespace. Writing directly is
+        // independent of whatever console state the checks left behind.
+        process.stdout.write((bad.length === 0 ? 'all dispatched' : bad.join(',')) + '\n');
         process.exit(0);
     "##
     );
     assert_eq!(run(&src), "all dispatched");
+}
+
+/// `histogram.reset()` empties the histogram and leaves it reusable.
+///
+/// It used to abort the whole process: the `reset` arm called `hidden()` —
+/// which takes the host — from INSIDE a `with_host` closure, borrowing the
+/// same RefCell twice. That is a Rust panic, not a throw, so it could not be
+/// caught from JS and no `try` around it helped; the runtime simply died.
+///
+/// Found by the advertised-surface guard above once it was extended past the
+/// first ten classes, which is the argument for driving these from the real
+/// method lists: nothing here was written because anyone suspected
+/// `perf_hooks`.
+///
+/// The empty `min` is `i64::MAX`, Node's sentinel for a histogram with no
+/// recorded values; every number below was compared against real `node`.
+#[test]
+fn a_histogram_resets_to_empty_and_records_again() {
+    let src = r##"
+        const h = require('perf_hooks').createHistogram();
+        h.record(5); h.record(10); h.record(15);
+        console.log('before', h.count, h.min, h.max);
+        h.reset();
+        console.log('after', h.count, h.min, h.max);
+        h.record(7);
+        console.log('reuse', h.count, h.min, h.max);
+    "##;
+    let expected = [
+        "before 3 5 15",
+        "after 0 9223372036854776000 0",
+        "reuse 1 7 7",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// `recv[expr](...)` keeps its receiver, exactly as `recv.name(...)` does.
+///
+/// 13.3.6 EvaluateCall gives both forms the same `this`. The computed path read
+/// the function with GETITEM, DROPPED the receiver, and called the value with
+/// no `this` — the compiler comment called it "approximated". It was not a
+/// corner: it silently produced WRONG ANSWERS on ordinary objects, and crashed
+/// on class instances.
+///
+///     o.f()      // 42
+///     o['f']()   // undefined   <- was, no error
+///     c['m']()   // TypeError: Cannot read properties of undefined
+///
+/// Every line below was compared against real `node`. Found by the
+/// advertised-surface guard, which calls methods as `obj[name]()` and so
+/// reported 37 working Buffer methods as undispatched — the guard was right
+/// that something was broken, just not about what.
+#[test]
+fn a_computed_method_call_binds_this_like_a_static_one() {
+    let src = r##"
+        const o = {x: 42, f() { return this && this.x; }};
+        console.log('obj', o.f(), o['f'](), o[String.fromCharCode(102)]());
+
+        class C { constructor() { this.v = 7; } m() { return this.v; } }
+        const c = new C();
+        console.log('class', c.m(), c['m']());
+
+        // A native whose methods need `this`: 37 Buffer methods were unreachable
+        // through the computed form.
+        const b = Buffer.from('ab');
+        console.log('buffer', b.toString(), b['toString'](), b['slice'](0, 1).toString());
+
+        // Builtins reached the same way.
+        console.log('array', JSON.stringify([3, 1, 2]['sort']()));
+
+        // Spread goes through APPLY_METHOD and must bind the same receiver.
+        console.log('spread', o['f'](...[]), [1, 2]['concat'](...[[3]]).join(','));
+
+        // A numeric key still calls the element, with the array as `this`.
+        const arr = [function () { return this.length; }];
+        console.log('numeric', arr[0]());
+    "##;
+    let expected = [
+        "obj 42 42 42",
+        "class 7 7",
+        "buffer ab ab a",
+        "array [1,2,3]",
+        "spread 42 1,2,3",
+        "numeric 1",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
 }
 
 #[test]

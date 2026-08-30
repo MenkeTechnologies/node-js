@@ -3120,21 +3120,29 @@ impl Compiler {
                 } else {
                     None
                 };
-                b.emit(Op::Dup, 0); // [recv, recv]
-                self.compile_expr(b, index)?; // [recv, recv, idx]
-                b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0); // [recv, fn]
-                b.emit(Op::Swap, 0); // [fn, recv]... but APPLY needs callable then this
-                                     // Fall back: call the function value with `this`=recv via CALL_VALUE
-                                     // (this-binding for computed method calls is approximated).
-                b.emit(Op::Pop, 0); // drop recv; keep fn on stack: [fn]
+                // 13.3.6 EvaluateCall: the receiver of `recv[expr](...)` is
+                // `recv`, exactly as for `recv.name(...)`. This used to read the
+                // function with GETITEM, DROP the receiver, and call the value
+                // with no `this` — the comment called it "approximated", and it
+                // silently produced wrong answers rather than errors:
+                //
+                //     const o = {x: 42, f() { return this.x }};
+                //     o.f()      // 42
+                //     o['f']()   // undefined      <- was
+                //     c['m']()   // TypeError      <- on a class instance
+                //
+                // CALL_METHOD/APPLY_METHOD take the name off the STACK, so a
+                // computed key dispatches through the same path a static one
+                // does and keeps the receiver.
+                self.compile_expr(b, index)?; // [recv, name]
                 if has_spread {
-                    self.compile_spread_args(b, args)?;
-                    b.emit(Op::CallBuiltin(ops::APPLY, 2), 0);
+                    self.compile_spread_args(b, args)?; // [recv, name, argsArray]
+                    b.emit(Op::CallBuiltin(ops::APPLY_METHOD, 3), 0);
                 } else {
                     for a in args {
-                        self.compile_expr(b, a)?;
+                        self.compile_off_spine(b, a)?;
                     }
-                    let at = b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
+                    let at = b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
                     self.note_call_site(at, func);
                 }
                 if let Some(j) = jshort {

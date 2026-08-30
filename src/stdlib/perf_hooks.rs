@@ -412,13 +412,19 @@ pub fn histogram_instance_call(
             Ok(Value::Undef)
         }
         "reset" => {
-            with_host(|h| {
-                if let Some(vals) = hidden(recv, "@@vals") {
+            // `hidden` takes the host itself, so reading it INSIDE `with_host`
+            // borrowed the same RefCell twice and aborted the process with
+            // "RefCell already borrowed" — not a catchable JS error, the whole
+            // runtime died on `histogram.reset()`. Read the handle first, then
+            // borrow to mutate.
+            let vals = hidden(recv, "@@vals");
+            if let Some(vals) = vals {
+                with_host(|h| {
                     if let Some(JsObj::Array(items)) = h.get_mut(&vals) {
                         items.clear();
                     }
-                }
-            });
+                });
+            }
             update_stats(recv);
             Ok(Value::Undef)
         }

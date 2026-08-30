@@ -2977,10 +2977,38 @@ fn b_call(vm: &mut VM, argc: u8) -> Value {
     finish(vm, r)
 }
 
+/// `recv[0](…)` — a computed call whose key is an ARRAY INDEX rather than a
+/// method name. `call_method` resolves by name and bottoms out in
+/// `call_type_method`, which knows `sort`/`slice` and not `"0"`, so an element
+/// that happens to be a function reported "is not a function". Read the element
+/// and invoke it with `recv` as `this`, which is the receiver 13.3.6 gives it.
+/// A computed call's key is a property key, so it goes through ToPropertyKey:
+/// `arr[0](…)` looks up `"0"`. `sval` only unwraps an existing `Value::Str` and
+/// answers "" for a number, which turned `arr[0]()` into a call to the method
+/// named "" — so the key is stringified here instead.
+fn call_key_of(v: &Value) -> String {
+    if let Value::Str(s) = v {
+        return (**s).clone();
+    }
+    with_host(|h| h.str_of(v))
+}
+
+fn index_element_call(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let f = get_property(recv, name).ok()?;
+    with_host(|h| host::is_callable(h, &f))
+        .then(|| host::invoke(&f, args.to_vec(), Some(recv.clone())))
+}
+
 fn b_call_method(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_n(vm, argc as usize);
     let recv = args.remove(0);
-    let name = sval(&args.remove(0));
+    let name = call_key_of(&args.remove(0));
+    if let Some(r) = index_element_call(&recv, &name, &args) {
+        return finish(vm, r);
+    }
     let r = host::call_method(&recv, &name, args);
     // `z.f()` on a missing method is `z.f is not a function` in node, not
     // `f is not a function`: V8 names the callee as the source wrote it. The
@@ -3026,9 +3054,12 @@ fn b_apply(vm: &mut VM, _: u8) -> Value {
 
 fn b_apply_method(vm: &mut VM, _: u8) -> Value {
     let args_arr = vm.pop();
-    let name = sval(&vm.pop());
+    let name = call_key_of(&vm.pop());
     let recv = vm.pop();
     let args = host::iter_all(&args_arr).unwrap_or_default();
+    if let Some(r) = index_element_call(&recv, &name, &args) {
+        return finish(vm, r);
+    }
     let r = host::call_method(&recv, &name, args);
     finish(vm, r)
 }
