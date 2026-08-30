@@ -66,6 +66,21 @@ fallback 0 empty-is-falsy zero
 assigned
 7
 { s: 1, t: 2 } [ 1, 2, 3 ]
+==== dynamic.js ====
+direct   42
+literal  42
+variable 42
+computed 42
+args     45 45
+class    7 7 14
+array    [1,2,3] 123
+string   ABC 2
+buffer   hi h
+index    2 second second
+spread   49 9
+explicit 1 2 3
+optional undefined 42
+detached function 42
 ==== errors.js ====
 MyError boom 42 true true
 try,catch

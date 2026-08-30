@@ -3015,8 +3015,67 @@ impl Compiler {
             }
             return Ok(());
         }
-        // Plain callee (`f?.()`, `obj[k]?.()`): evaluate it, guard, then call with
-        // no receiver — matching the non-optional path for the same callee shape.
+        // `recv[expr]?.(…)` — the optional-call form of a COMPUTED member. Same
+        // receiver rule as `recv.name?.(…)` above; only the key differs, being
+        // known at run time rather than compile time. This used to fall through
+        // to the plain-callee path below and lose `this`, so `o['self']?.()`
+        // threw where `o.self?.()` worked.
+        if let Expr::Index {
+            object,
+            index,
+            optional: obj_optional,
+        } = func
+        {
+            self.compile_expr(b, object)?; // [recv]
+            let jobj = if *obj_optional {
+                Some(self.emit_optional_guard(b))
+            } else {
+                None
+            };
+            b.emit(Op::Dup, 0); // [recv, recv]
+            self.compile_expr(b, index)?; // [recv, recv, key]
+            b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0); // [recv, fn]
+            b.emit(Op::Dup, 0);
+            b.emit(Op::CallBuiltin(ops::NULLISH, 1), 0);
+            let jlive = b.emit(Op::JumpIfFalse(0), 0);
+            b.emit(Op::Pop, 0);
+            b.emit(Op::Pop, 0);
+            b.emit(Op::LoadUndef, 0);
+            let jend = b.emit(Op::Jump(0), 0);
+            let live = b.current_pos();
+            b.patch_jump(jlive, live);
+            let via = if has_spread { "apply" } else { "call" };
+            self.name_const(b, via); // [recv, fn, via]
+            b.emit(Op::Rot, 0); // [fn, via, recv]
+            let extra = if has_spread {
+                self.compile_spread_args(b, args)?;
+                1
+            } else {
+                for a in args {
+                    self.compile_expr(b, a)?;
+                }
+                args.len()
+            };
+            b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(3 + extra)?), 0);
+            match self.opt_chain.last_mut() {
+                Some(frame) => {
+                    frame.push(jend);
+                    if let Some(j) = jobj {
+                        frame.push(j);
+                    }
+                }
+                None => {
+                    let end = b.current_pos();
+                    b.patch_jump(jend, end);
+                    if let Some(j) = jobj {
+                        b.patch_jump(j, end);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // Plain callee (`f?.()`): evaluate it, guard, then call with no
+        // receiver — a bare expression has none to keep.
         self.compile_expr(b, func)?;
         let jend = self.emit_optional_guard(b);
         if has_spread {
