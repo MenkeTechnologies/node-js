@@ -4186,6 +4186,144 @@ fn chunked_bodiless_and_head_responses_all_arrive_correctly() {
     assert_eq!(run(src), expected);
 }
 
+/// A body far larger than the reader's 8 KiB buffer, in both directions:
+/// 50 000 bytes needs about seven reads each way, and the halves must be
+/// reassembled in order on both ends.
+///
+/// What this does NOT cover, measured rather than assumed: it is not a
+/// regression test for the O_NONBLOCK reader bug (72f048eb54). Reverting that
+/// fix — either half or both together — leaves this test passing, because a
+/// body already sitting in the kernel buffer makes every read return data and
+/// `WouldBlock` never arrives. That bug needs a connection that goes IDLE
+/// between messages, which is what
+/// `a_connection_outlives_its_first_chunk_and_sees_the_clients_end` builds and
+/// why that one fails without the fix.
+#[test]
+fn a_body_far_larger_than_the_read_buffer_survives_both_directions() {
+    let src = r##"
+        const http = require('http');
+        const BIG = 'x'.repeat(50000);
+        const srv = http.createServer((req, res) => {
+          let body = '';
+          req.on('data', c => body += c);
+          req.on('end', () => {
+            console.log('server', body.length, body === BIG);
+            res.writeHead(200, {'Content-Type': 'text/plain'});
+            res.end(BIG);
+          });
+        });
+        srv.listen(0, () => {
+          const port = srv.address().port;
+          const rq = http.request(
+            {host: '127.0.0.1', port, path: '/', method: 'POST',
+             headers: {'Content-Length': String(BIG.length)}},
+            res => {
+              let b = '';
+              res.on('data', c => b += c);
+              res.on('end', () => {
+                console.log('client', b.length, b === BIG);
+                srv.close();
+              });
+            });
+          rq.write(BIG);
+          rq.end();
+        });
+    "##;
+    let expected = ["server 50000 true", "client 50000 true"].join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// Two requests in ONE write: the pipelining loop in `http::feed`, which
+/// parses and dispatches every complete request currently buffered rather than
+/// assuming one read is one request.
+///
+/// Driven over a raw `net` socket on purpose — `http.request` opens a fresh
+/// connection per call, so it cannot put two requests on the wire together and
+/// would never reach this path.
+#[test]
+fn two_pipelined_requests_in_one_write_are_both_answered_in_order() {
+    let src = r##"
+        const http = require('http');
+        const net = require('net');
+        const srv = http.createServer((req, res) => {
+          res.writeHead(200, {'Content-Type': 'text/plain'});
+          res.end('r:' + req.url);
+        });
+        srv.listen(0, () => {
+          const c = net.connect(srv.address().port, '127.0.0.1', () => {
+            c.write('GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n');
+          });
+          let buf = '';
+          c.on('data', d => {
+            buf += d.toString();
+            if ((buf.match(/HTTP\/1\.1 200/g) || []).length < 2) return;
+            const bodies = buf.split('\r\n\r\n').filter(p => p.startsWith('r:')).map(p => p.slice(0, 4));
+            console.log('responses 2', bodies.join(','));
+            c.destroy();
+            srv.close();
+          });
+        });
+    "##;
+    assert_eq!(run(src), "responses 2 r:/a,r:/b");
+}
+
+/// Eight requests in flight at once, each on its own connection, all answered
+/// with their own path.
+///
+/// Every other server test here uses one connection at a time, so the accept
+/// loop has never been asked to hand several sockets to the main thread while
+/// earlier ones are still being served. A reply landing on the wrong socket, or
+/// one connection starving the others, shows up as a mismatch rather than a
+/// hang. `Promise.all` preserves input order regardless of completion order, so
+/// the assertion does not depend on which finishes first.
+#[test]
+fn eight_concurrent_connections_each_get_their_own_reply() {
+    let src = r##"
+        const http = require('http');
+        const srv = http.createServer((req, res) => {
+          res.writeHead(200, {'Content-Type': 'text/plain'});
+          res.end('reply' + req.url);
+        });
+        srv.listen(0, () => {
+          const port = srv.address().port;
+          const get = p => new Promise(resolve => {
+            const rq = http.request({host: '127.0.0.1', port, path: p}, res => {
+              let b = '';
+              res.on('data', c => b += c);
+              res.on('end', () => resolve(b));
+            });
+            rq.end();
+          });
+          const paths = ['/1','/2','/3','/4','/5','/6','/7','/8'];
+          Promise.all(paths.map(get)).then(rs => {
+            console.log(rs.length, rs.join(','));
+            srv.close();
+          });
+        });
+    "##;
+    let expected = "8 reply/1,reply/2,reply/3,reply/4,reply/5,reply/6,reply/7,reply/8";
+    assert_eq!(run(src), expected);
+}
+
+/// A refused connection reaches JS as an `error` event carrying
+/// `ECONNREFUSED`, and does not hang.
+///
+/// Port 1 is privileged and unbound, so the connect fails immediately. The
+/// failure path is its own code (`on_connect_error`, which builds the Error and
+/// releases the handle) and nothing else here exercises it — a connect that
+/// silently never settles would leave the event loop alive with no way out,
+/// which is the shape of the hang fixed in 0a0b5cf5d7.
+#[test]
+fn a_refused_connection_emits_an_error_rather_than_hanging() {
+    let src = r##"
+        const net = require('net');
+        const c = net.connect(1, '127.0.0.1');
+        c.on('error', e => console.log('error', e.code, typeof e.message === 'string'));
+        c.on('connect', () => console.log('UNEXPECTED connect'));
+    "##;
+    assert_eq!(run(src), "error ECONNREFUSED true");
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
