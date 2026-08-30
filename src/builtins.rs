@@ -2100,7 +2100,26 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     // and does so outside the host borrow because `ToNumber` may run a user
     // `valueOf`. An invalid length throws instead of being silently coerced to 0.
     let new_len = if name == "length" && with_host(|h| h.kind_of(recv)) == Some(ObjKind::Array) {
-        Some(host::to_array_length(&val)?)
+        let want = host::to_array_length(&val)?;
+        // 10.4.2.4 steps 15-17: shrinking deletes from the END downwards and
+        // STOPS at the first element that cannot be deleted, leaving the length
+        // just past it. Truncating regardless discarded a non-configurable
+        // element and reported a length node would not have accepted.
+        let floor = with_host(|h| {
+            let old = match h.get(recv) {
+                Some(JsObj::Array(items)) => items.len(),
+                _ => 0,
+            };
+            let mut stop = want;
+            for i in (want..old).rev() {
+                if !h.prop_attrs(recv, &i.to_string()).configurable {
+                    stop = i + 1;
+                    break;
+                }
+            }
+            stop
+        });
+        Some(floor.max(want))
     } else {
         None
     };
@@ -5411,8 +5430,17 @@ fn json_walk_children(
     path.push(v.clone());
     let out = (|| match obj {
         Some(JsObj::Array(items)) => {
+            // Read the elements through the accessor-aware funnel: an index
+            // with a getter must be SERIALIZED as what the getter returns, and
+            // the backing vector still holds the stale slot.
+            let mut resolved = items;
+            // An index with a getter must be SERIALIZED as what the getter
+            // returns, and it also forces a rebuild below: keeping the original
+            // array would hand the serializer back the stale backing vector.
+            let had_accessor = resolve_index_accessors(v, &mut resolved);
+            let items = resolved;
             let mut out = Vec::with_capacity(items.len());
-            let mut changed = false;
+            let mut changed = had_accessor;
             for (i, it) in items.iter().enumerate() {
                 let nv = apply_to_json(v, &i.to_string(), it, path, rep)?;
                 changed |= !with_host(|h| h.strict_eq(&nv, it));
@@ -6220,11 +6248,47 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
 /// A copy of the whole backing store, for the methods that genuinely consume
 /// every element (`map`, `filter`, `join`, …). Never call it just to read
 /// `.len()` — use [`array_len`], or `push`/`unshift` become O(n) per call.
+/// The elements of an array, with any INDEX ACCESSOR resolved.
+///
+/// `Object.defineProperty(arr, 1, { get })` stores the getter in the accessor
+/// table, and an array's elements live in a backing vector — so every method
+/// reading that vector directly (`join`, `map`, `indexOf`, …) saw the stale
+/// slot and never called the getter, while a plain `arr[1]` read did.
+///
+/// An array with no accessors pays one lookup returning an empty list, so the
+/// ordinary case is unchanged. The getters are invoked OUTSIDE the host borrow,
+/// since calling one re-enters.
 fn array_items(recv: &Value) -> Vec<Value> {
-    with_host(|h| match h.get(recv) {
+    let mut items = with_host(|h| match h.get(recv) {
         Some(JsObj::Array(items)) => items.clone(),
         _ => Vec::new(),
-    })
+    });
+    resolve_index_accessors(recv, &mut items);
+    items
+}
+
+/// Replace each slot that has an own accessor with what its getter returns.
+pub(crate) fn resolve_index_accessors_pub(recv: &Value, items: &mut [Value]) {
+    resolve_index_accessors(recv, items);
+}
+
+/// Returns whether any slot was replaced, which the JSON walk needs: it keeps
+/// the ORIGINAL array when nothing changed, and the original still holds the
+/// stale slots.
+fn resolve_index_accessors(recv: &Value, items: &mut [Value]) -> bool {
+    let indices: Vec<usize> = with_host(|h| h.own_accessor_keys(recv))
+        .into_iter()
+        .filter_map(|k| k.parse::<usize>().ok())
+        .filter(|i| *i < items.len())
+        .collect();
+    let mut replaced = false;
+    for i in indices {
+        if let Ok(v) = get_property(recv, &i.to_string()) {
+            items[i] = v;
+            replaced = true;
+        }
+    }
+    replaced
 }
 
 /// The ELIDED positions of array `recv` as a membership set. A dense array —

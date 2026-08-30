@@ -60,3 +60,37 @@ console.log("sparse  ", JSON.stringify([3, , 1].sort()), JSON.stringify([3, unde
 console.log("typed   ", new Int32Array([3, 1, 2]).sort().join(","), new Int32Array([3, 1, 2]).sort((a, b) => b - a).join(","));
 // A throwing comparator propagates rather than being swallowed.
 try { [1, 2, 3].sort(() => { throw new Error("cmp"); }); } catch (e) { console.log("throws  ", e.message); }
+
+// An accessor defined on an array INDEX. The getter was honoured by a direct
+// `arr[1]` read and by nothing else: an array's elements live in a backing
+// vector, and every method reading that vector saw the stale slot, so `join`,
+// `map`, spread and `JSON.stringify` all reported the original value while
+// `arr[1]` reported the getter's. The array disagreed with itself.
+const withGetter = [1, 2, 3];
+Object.defineProperty(withGetter, 1, { get() { return "G"; }, configurable: true });
+console.log("direct  ", withGetter[1], withGetter.length);
+console.log("methods ", withGetter.join("-"), withGetter.map((x) => x).join(","), String(withGetter));
+console.log("iterate ", [...withGetter].join(","), Array.from(withGetter).join(","));
+console.log("json    ", JSON.stringify(withGetter));
+console.log("search  ", withGetter.indexOf("G"), withGetter.includes("G"), withGetter.filter((x) => x === "G").length);
+// A getter counts reads, so this also shows it is called rather than cached.
+let reads = 0;
+const counted = [0, 0];
+Object.defineProperty(counted, 0, { get() { reads++; return reads; }, configurable: true });
+const readA = counted.join("");
+const readB = counted.join("");
+console.log("invoked ", readA !== readB, reads > 1);
+
+// Shrinking `length` deletes from the END downwards and STOPS at the first
+// element that cannot be deleted (10.4.2.4), leaving the length just past it.
+// Truncating regardless discarded a non-configurable element.
+const pinnedElem = [1, 2, 3];
+Object.defineProperty(pinnedElem, 1, { value: 9, writable: false, configurable: false });
+pinnedElem.length = 0;
+console.log("shrink  ", pinnedElem.join(","), pinnedElem.length);
+// With nothing pinned it truncates all the way, and growing still adds holes.
+const ordinary = [1, 2, 3];
+ordinary.length = 1;
+const grown = [1];
+grown.length = 3;
+console.log("plain   ", ordinary.join(","), ordinary.length, grown.length, JSON.stringify(grown));

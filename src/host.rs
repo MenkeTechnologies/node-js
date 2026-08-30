@@ -6602,7 +6602,14 @@ pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
         let iterator = invoke(&iter_fn, Vec::new(), Some(v.clone()))?;
         return drain_iterator(&iterator);
     }
-    with_host(|h| h.iter_vec(v))
+    // An array's index ACCESSORS are not in its backing vector, so iterating one
+    // (spread, `for-of`, `Array.from`) has to resolve them the way the
+    // `Array.prototype` methods do.
+    let mut items = with_host(|h| h.iter_vec(v))?;
+    if with_host(|h| matches!(h.get(v), Some(JsObj::Array(_)))) {
+        crate::builtins::resolve_index_accessors_pub(v, &mut items);
+    }
+    Ok(items)
 }
 
 // ── async iteration (`for await (… of …)`) ───────────────────────────────────
