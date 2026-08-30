@@ -458,6 +458,29 @@ raw-shape true true
 request   PUT|sent|true|true|true|sent
 status    200 OK
 closed    yes
+==== inspection.js ====
+d1       "{ a: 1 }"
+d3       "{ a: { b: { c: 1 } } }"
+d4-null  "{\n  a: { b: { c: { d: 1 } } }\n}"
+d5-null  "{\n  a: {\n    b: { c: { d: { e: 1 } } }\n  }\n}"
+d4-dflt  "{ a: { b: { c: [Object] } } }"
+d4-at3   "{\n  a: { b: { c: { d: 1 } } }\n}"
+d4-at1   "{ a: { b: [Object] } }"
+arrays   "[\n  [ [ [ 1 ] ] ]\n]"
+mixed    "{\n  a: [ 1, 2, { b: { c: 1 } } ]\n}"
+c1       "{\n  a: {\n    b: {\n      c: { d: 1 }\n    }\n  }\n}"
+c5       "{ a: { b: { c: { d: 1 } } } }"
+c1-flat  "{\n  a: { b: 1 }\n}"
+false    "[\n  1,\n  2\n]"
+false-o  "{\n  x: 1,\n  y: 2\n}"
+false-n  "{\n  a: {\n    b: 1\n  },\n  c: [\n    1,\n    2\n  ]\n}"
+false-e  "[]{}"
+bl-10    "{\n  aaa: 1,\n  bbb: 2,\n  ccc: 3\n}"
+bl-200   "{ aaa: 1, bbb: 2, ccc: 3 }"
+bl-1     "{\n  a: 1,\n  b: 2\n}"
+bl-grid  "[\n  0, 1, 2, 3,\n  4, 5, 6, 7\n]"
+combo    "[\n  1,\n  2\n]"
+console  { a: { b: { c: [Object] } } } [ 1, 2, 3 ] { x: { y: { z: [Object] } } }
 ==== json.js ====
 {"b":2,"a":1,"nested":{"list":[1,"two",null,true]}}
 {

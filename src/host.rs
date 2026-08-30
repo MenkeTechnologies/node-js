@@ -3558,7 +3558,7 @@ impl JsHost {
         if extras.is_empty() {
             return Some(head);
         }
-        Some(self.render_object(&extras, &format!("{head} "), indent))
+        Some(self.render_object(&extras, &format!("{head} "), indent, st))
     }
 
     /// The `key: value` parts for own properties a script attached to an exotic
@@ -3630,6 +3630,15 @@ impl JsHost {
             return format!("[Circular *{}]", st.mark(self, v));
         }
         st.seen.push(v.clone());
+        // Node ASSIGNS `ctx.currentDepth = recurseTimes` on entry to each value
+        // it expands — not a running maximum — so after the children have been
+        // rendered it holds the depth of the last chain below this group, which
+        // is what `reduceToSingleString` compares. A value the depth limit
+        // stubs out as `[Object]` is never expanded and must not count, or an
+        // object whose deepest level was elided would break where node joins.
+        if indent as i64 <= inspect_indent_limit() {
+            st.deepest = indent;
+        }
         let body = self.inspect_value(v, indent, st);
         st.seen.pop();
         match st.id_of(self, v) {
@@ -3733,7 +3742,17 @@ impl JsHost {
                             self.inspect_lvl(val, indent + 2, st)
                         ));
                     }
-                    self.render_array(&inner, items, indent, has_props, has_tail, "")
+                    self.render_array(
+                        &inner,
+                        items,
+                        indent,
+                        ArrayLayout {
+                            has_props,
+                            has_tail,
+                            base: "",
+                        },
+                        st,
+                    )
                 }
                 // `URLSearchParams` renders its pairs, not its slots:
                 // `URLSearchParams { 'a' => '1', 'b' => '2' }`. Keys repeat,
@@ -3760,7 +3779,7 @@ impl JsHost {
                             _ => None,
                         })
                         .collect();
-                    self.render_object(&inner, "URLSearchParams ", indent)
+                    self.render_object(&inner, "URLSearchParams ", indent, st)
                 }
                 // A typed array renders as `Uint8Array(3) [ 1, 2, 3 ]` — its
                 // constructor and length, then the elements laid out exactly as
@@ -3794,7 +3813,17 @@ impl JsHost {
                         let unit = if remaining == 1 { "item" } else { "items" };
                         inner.push(format!("... {remaining} more {unit}"));
                     }
-                    self.render_array(&inner, &vals, indent, false, remaining > 0, &base)
+                    self.render_array(
+                        &inner,
+                        &vals,
+                        indent,
+                        ArrayLayout {
+                            has_props: false,
+                            has_tail: remaining > 0,
+                            base: &base,
+                        },
+                        st,
+                    )
                 }
                 // An `ArrayBuffer` renders its CONTENTS, which is the only way
                 // to see them — it exposes no indices of its own:
@@ -3821,7 +3850,7 @@ impl JsHost {
                             .unwrap_or(0.0);
                         parts.insert(1, format!("maxByteLength: {}", fmt_number(max)));
                     }
-                    self.render_object(&parts, "ArrayBuffer ", indent)
+                    self.render_object(&parts, "ArrayBuffer ", indent, st)
                 }
                 // A `Buffer` renders as `<Buffer 01 02 03>` — hex bytes, capped
                 // at 50 with a `... N more byte(s)` tail, exactly as
@@ -3981,7 +4010,7 @@ impl JsHost {
                             Err(label) => format!("{k}: {label}"),
                         })
                         .collect();
-                    self.render_object(&inner, &prefix, indent)
+                    self.render_object(&inner, &prefix, indent, st)
                 }
                 Some(JsObj::Symbol { desc, .. }) => match desc {
                     Some(d) => format!("Symbol({d})"),
@@ -4135,7 +4164,7 @@ impl JsHost {
         if inner.is_empty() {
             return base;
         }
-        self.render_object(&inner, &format!("{base} "), indent)
+        self.render_object(&inner, &format!("{base} "), indent, st)
     }
 
     /// Render a non-empty array's already-formatted element strings, applying
@@ -4148,14 +4177,14 @@ impl JsHost {
         output: &[String],
         values: &[Value],
         indent: usize,
-        has_props: bool,
-        // `output`'s last entry is the `... N more items` tail rather than a
-        // real element, so the grid must not size a column to it.
-        has_tail: bool,
-        // A constructor tag printed before the brackets, with a trailing space
-        // (`"Uint8Array(3) "`), or empty for a plain array.
-        base: &str,
+        opts: ArrayLayout<'_>,
+        st: &InspectCycles,
     ) -> String {
+        let ArrayLayout {
+            has_props,
+            has_tail,
+            base,
+        } = opts;
         // Group array elements together if the array has more than six entries.
         // Arrays carrying extra own props (`index`/`input`/… on a match result)
         // are never grid-grouped — Node lays those out plainly.
@@ -4175,7 +4204,7 @@ impl JsHost {
         if !grouped {
             // start = output.length + indentationLvl + braces[0].len(1) + base + 10
             let start = output.len() + indent + 1 + base.chars().count() + 10;
-            if is_below_break_length(output, start) {
+            if self.may_compact(indent, st) && is_below_break_length(output, start) {
                 return format!("{base}[ {} ]", output.join(", "));
             }
         }
@@ -4189,16 +4218,37 @@ impl JsHost {
     /// Node's `util.inspect` layout: a single line when it fits `breakLength`,
     /// else one property per line indented by `indent + 2`. `prefix` is the
     /// constructor/`[Object: null prototype]` tag (with trailing space) or empty.
-    /// Mirrors `render_array`'s break decision. (Node's `compact` depth gate is a
-    /// no-op at `console.log`'s default depth of 2, so only length matters here.)
-    fn render_object(&self, output: &[String], prefix: &str, indent: usize) -> String {
+    /// Mirrors `render_array`'s break decision, including the `compact` depth
+    /// gate.
+    /// Whether a group at `indent` may be joined onto one line.
+    ///
+    /// Node's `reduceToSingleString`: only while the subtree below this group is
+    /// SHALLOWER than `compact` (default 3). `compact: false` is held as 0, so
+    /// nothing qualifies and every group breaks.
+    fn may_compact(&self, indent: usize, st: &InspectCycles) -> bool {
+        let compact = inspect_compact();
+        if compact < 1 {
+            return false;
+        }
+        // Levels, not columns: the indent advances by two per level.
+        let depth_below = (st.deepest.saturating_sub(indent)) / 2;
+        (depth_below as i64) < compact
+    }
+
+    fn render_object(
+        &self,
+        output: &[String],
+        prefix: &str,
+        indent: usize,
+        st: &InspectCycles,
+    ) -> String {
         // start = output.length + indentationLvl + braces[0].len + base(0) + 10.
         // For a tagged object Node folds the tag into `braces[0]` (e.g.
         // `"Point {"`, `"[Object: null prototype] {"`), so its length is the
         // prefix (which carries the trailing space) plus the `{`.
         let braces0 = prefix.chars().count() + 1;
         let start = output.len() + indent + braces0 + 10;
-        if is_below_break_length(output, start) {
+        if self.may_compact(indent, st) && is_below_break_length(output, start) {
             return format!("{prefix}{{ {} }}", output.join(", "));
         }
         let pad = " ".repeat(indent);
@@ -4649,10 +4699,28 @@ fn js_mod(a: f64, b: f64) -> f64 {
 /// twice is a back-edge), and `refs` records every object a back-edge pointed
 /// at, in first-encountered order — its position + 1 is the `*N` id Node prints
 /// in `[Circular *N]` / `<ref *N>`.
+/// How an array-shaped group is laid out, beyond its entries themselves.
+#[derive(Clone, Copy)]
+struct ArrayLayout<'a> {
+    /// Extra own properties follow the elements, which suppresses grid grouping.
+    has_props: bool,
+    /// `output`'s last entry is the `... N more items` tail rather than a real
+    /// element, so the grid must not size a column to it.
+    has_tail: bool,
+    /// A constructor tag printed before the brackets, with a trailing space
+    /// (`"Uint8Array(3) "`), or empty for a plain array.
+    base: &'a str,
+}
+
 #[derive(Default)]
 struct InspectCycles {
     seen: Vec<Value>,
     refs: Vec<Value>,
+    /// The indent level of the value most recently EXPANDED — node's
+    /// `ctx.currentDepth`. `reduceToSingleString` puts a group on one line only
+    /// while `currentDepth - thisDepth < compact`, so without it a deeply
+    /// nested object printed on one line where node breaks the outer levels.
+    deepest: usize,
 }
 
 impl InspectCycles {
@@ -4682,6 +4750,30 @@ thread_local! {
     /// "already past the limit" — everything collapses to `[Object]` at the top
     /// level. Held as `usize` it read as an enormous depth and expanded fully.
     static INSPECT_MAX_DEPTH: std::cell::Cell<i64> = const { std::cell::Cell::new(2) };
+
+    /// `util.inspect`'s `compact` option. Node's default is the NUMBER 3: a
+    /// group is put on one line only when the subtree below it is shallower
+    /// than this. `compact: false` is held as 0, which no subtree depth is
+    /// below, so every group breaks — which is exactly what node does.
+    static INSPECT_COMPACT: std::cell::Cell<i64> = const { std::cell::Cell::new(3) };
+
+    /// `util.inspect`'s `breakLength`. Node's default is 128, but `util.inspect`
+    /// itself passes 80.
+    static INSPECT_BREAK_LENGTH: std::cell::Cell<usize> = const { std::cell::Cell::new(80) };
+}
+
+/// Set the `util.inspect` `compact` option for the next render (0 for `false`).
+pub fn set_inspect_compact(c: i64) {
+    INSPECT_COMPACT.with(|x| x.set(c));
+}
+
+/// Set the `util.inspect` `breakLength` for the next render.
+pub fn set_inspect_break_length(n: usize) {
+    INSPECT_BREAK_LENGTH.with(|x| x.set(n));
+}
+
+fn inspect_compact() -> i64 {
+    INSPECT_COMPACT.with(|x| x.get())
 }
 
 /// Set the `util.inspect` depth for the next render (restore to 2 after).
@@ -4748,7 +4840,9 @@ fn str_to_number(s: &str) -> f64 {
 }
 
 /// `util.inspect` break length (the width past which entries wrap). Node's default.
-const BREAK_LENGTH: usize = 80;
+fn break_length() -> usize {
+    INSPECT_BREAK_LENGTH.with(|x| x.get())
+}
 /// Node's default `compact` setting (the `compact * 4` column cap term).
 const COMPACT: usize = 3;
 /// Node's default `maxArrayLength` — how many array elements `util.inspect`
@@ -4759,8 +4853,9 @@ const MAX_ARRAY_LENGTH: usize = 100;
 /// `isBelowBreakLength` (no colors, no `base`). `start` is the caller's seed
 /// length (braces + indentation + slack).
 fn is_below_break_length(output: &[String], start: usize) -> bool {
+    let limit = break_length();
     let mut total = output.len() + start;
-    if total + output.len() > BREAK_LENGTH {
+    if total + output.len() > limit {
         return false;
     }
     for o in output {
@@ -4768,7 +4863,7 @@ fn is_below_break_length(output: &[String], start: usize) -> bool {
             return false;
         }
         total += o.chars().count();
-        if total > BREAK_LENGTH {
+        if total > limit {
             return false;
         }
     }
@@ -4802,7 +4897,7 @@ fn group_array_elements(
     }
     let actual_max = max_length + separator_space;
     // Only group when ≥3 entries fit across AND the entries aren't wildly uneven.
-    if !(actual_max * 3 + indentation_lvl < BREAK_LENGTH
+    if !(actual_max * 3 + indentation_lvl < break_length()
         && (total_length as f64 / actual_max as f64 > 5.0 || max_length <= 6))
     {
         return (output.to_vec(), false);
@@ -4814,7 +4909,7 @@ fn group_array_elements(
     let columns = [
         ((approx_char_heights * biased_max * output_length as f64).sqrt() / biased_max).round()
             as i64,
-        ((BREAK_LENGTH - indentation_lvl) as f64 / actual_max as f64).floor() as i64,
+        ((break_length() - indentation_lvl) as f64 / actual_max as f64).floor() as i64,
         (COMPACT * 4) as i64,
         15,
     ]

@@ -90,11 +90,39 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 None => 2,
             };
             crate::host::set_inspect_max_depth(depth);
+            // `compact` (default 3) decides how deep a subtree may be and still
+            // print on one line; `false` means never. `breakLength` (80 here) is
+            // the column budget for that line.
+            let opts = args.get(1).cloned().unwrap_or(Value::Undef);
+            let read = |k: &str| crate::builtins::get_property(&opts, k).unwrap_or(Value::Undef);
+            let compact = match read("compact") {
+                Value::Undef => 3,
+                Value::Bool(false) => 0,
+                // `compact: true` is node's legacy "always join" mode; no depth
+                // gate applies, which a very large number expresses exactly.
+                Value::Bool(true) => i64::MAX,
+                v => with_host(|h| h.to_number(&v)).max(0.0) as i64,
+            };
+            let break_length = match read("breakLength") {
+                Value::Undef => 80,
+                v => {
+                    let n = with_host(|h| h.to_number(&v));
+                    if n.is_finite() {
+                        n.max(0.0) as usize
+                    } else {
+                        usize::MAX
+                    }
+                }
+            };
+            crate::host::set_inspect_compact(compact);
+            crate::host::set_inspect_break_length(break_length);
             let out = with_host(|h| {
                 let s = h.inspect(&args.first().cloned().unwrap_or(Value::Undef));
                 h.new_str(s)
             });
             crate::host::set_inspect_max_depth(2);
+            crate::host::set_inspect_compact(3);
+            crate::host::set_inspect_break_length(80);
             Ok(out)
         }
         // `deprecate(fn, msg)`: return a callable that behaves like `fn`. The
