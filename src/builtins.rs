@@ -3986,7 +3986,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.fromEntries" => object_from_entries(args),
         // `[[GetPrototypeOf]]`: a Proxy answers from its trap (which may throw),
         // so the proxy form cannot share `prototype_of`'s infallible signature.
+        // `Object.getPrototypeOf` coerces a primitive to its wrapper and
+        // answers; `Reflect.getPrototypeOf` requires an object (28.1.8).
         "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => {
+            if name == "Reflect.getPrototypeOf" {
+                reflect_require_object(&arg0(&args), "getPrototypeOf")?;
+            }
             let v = arg0(&args);
             match crate::proxy::get_prototype_of(&v)? {
                 Some(p) => Ok(p),
@@ -4076,6 +4081,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // non-enumerable included, strings first and then the SYMBOLS.
         "Reflect.ownKeys" => {
             let v = arg0(&args);
+            reflect_require_object(&v, "ownKeys")?;
             let names = object_keys(args, 3)?;
             let syms = proxy_or_own_symbol_keys(&v)?;
             if syms.is_empty() {
@@ -4086,12 +4092,16 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(with_host(|h| h.new_array(all)))
         }
         "Reflect.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
+        // `Reflect.defineProperty` REPORTS success as a boolean where
+        // `Object.defineProperty` throws (28.1.3). It was propagating the
+        // throw, so the whole point of the reflective form was lost.
         "Reflect.defineProperty" => {
-            object_define_property(args)?;
-            Ok(Value::Bool(true))
+            reflect_require_object(&arg0(&args), "defineProperty")?;
+            Ok(Value::Bool(object_define_property(args).is_ok()))
         }
         "Reflect.deleteProperty" => {
             let obj = arg0(&args);
+            reflect_require_object(&obj, "deleteProperty")?;
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
             Ok(Value::Bool(delete_property(&obj, &k)?))
         }
@@ -4128,14 +4138,20 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 .unwrap_or_default();
             host::invoke(&f, list, this.filter(|t| !with_host(|h| h.is_nullish(t))))
         }
+        // `Reflect.construct(target, args, newTarget)` — the optional third
+        // argument decides which constructor's `prototype` the instance gets
+        // (28.1.2). It was ignored, so the result always inherited from
+        // `target` and `instanceof newTarget` was false.
         "Reflect.construct" => {
             let f = arg0(&args);
             let list = with_host(|h| h.iter_vec(&args.get(1).cloned().unwrap_or(Value::Undef)))
                 .unwrap_or_default();
-            host::construct(&f, list)
+            let new_target = args.get(2).cloned().unwrap_or_else(|| f.clone());
+            host::construct_nt(&f, list, new_target)
         }
         "Reflect.has" => {
             let obj = arg0(&args);
+            reflect_require_object(&obj, "has")?;
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
             Ok(Value::Bool(has_property(&obj, &k)?))
         }
@@ -4143,15 +4159,26 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // what a getter sees as `this` (28.1.6). Defaults to the target.
         "Reflect.get" => {
             let obj = arg0(&args);
+            reflect_require_object(&obj, "get")?;
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
             let receiver = args.get(2).cloned().unwrap_or_else(|| obj.clone());
             get_property_recv(&obj, &k, &receiver)
         }
+        // `Reflect.set(target, key, value, receiver)` — the optional fourth
+        // argument is what a setter sees as `this`, and where a DATA property
+        // lands (28.1.13). It was ignored: the setter ran against the target
+        // and the property was written there.
         "Reflect.set" => {
             let obj = arg0(&args);
+            reflect_require_object(&obj, "set")?;
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
             let v = args.get(2).cloned().unwrap_or(Value::Undef);
-            let _ = set_property(&obj, &k, v);
+            let receiver = args.get(3).cloned().unwrap_or_else(|| obj.clone());
+            if let Some((_, Some(setter))) = with_host(|h| host::lookup_accessor(h, &obj, &k)) {
+                let _ = host::invoke(&setter, vec![v], Some(receiver));
+                return Ok(Value::Bool(true));
+            }
+            let _ = set_property(&receiver, &k, v);
             Ok(Value::Bool(true))
         }
         "JSON.stringify" => json_stringify(args),
@@ -9023,6 +9050,18 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
     Ok(obj)
 }
 
+/// Every `Reflect` method requires an OBJECT target and reports a `TypeError`
+/// for anything else (28.1). A primitive was being accepted and silently
+/// producing nothing.
+fn reflect_require_object(v: &Value, method: &str) -> Result<(), String> {
+    if with_host(|h| is_object_like(h, v)) {
+        return Ok(());
+    }
+    Err(host::type_error(&format!(
+        "Reflect.{method} called on non-object"
+    )))
+}
+
 /// Whether `v` is an Object in the language sense — anything `typeof` calls
 /// `"object"` (bar `null`) or `"function"`. Used by the argument checks that
 /// distinguish "an object" from a primitive.
@@ -9214,6 +9253,14 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) -> Result<(), String> 
         }
     }
 
+    // 10.1.6.3 step 2: a NEW property cannot be added to a non-extensible
+    // object. Only an existing property's attributes were being validated, so
+    // `defineProperty(Object.freeze({}), 'z', …)` silently added one.
+    if cur.is_none() && !with_host(|h| h.is_extensible(obj)) {
+        return Err(host::type_error(&format!(
+            "Cannot define property {key}, object is not extensible"
+        )));
+    }
     if let Some(c) = &cur {
         if !c.configurable {
             let rejected = req.configurable == Some(true)

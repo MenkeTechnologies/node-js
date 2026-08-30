@@ -520,6 +520,19 @@ strict   TypeError TypeError TypeError TypeError
 strict2  TypeError TypeError
 sealed   silent 2 TypeError
 setters  written G 4
+==== reflection.js ====
+set-data 1 9
+set-accs undefined 5
+set-dflt 5 7
+get-recv R
+newTarget 1 true false
+nt-self  3 true true
+define   true false
+extens   false TypeError
+nonobj   TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError
+object   true
+others   true 0,1,length T1
+protos   null true
 ==== regexp.js ====
 true true false
 a b
