@@ -80,6 +80,13 @@ instanceof Shape true
 instanceof Object true
 static [ 'circle', 'rect', 'square' ]
 ctor name Square
+inst-super derived+base-instance
+stat-super derived+base-static
+stat-getter base-tag
+explicit   explicit+base-static true
+arity      3 3 2
+arity2     1 0
+chained    1 bound arity3
 ==== classfeatures.js ====
 private  1|privMethod|privGetter
 statics  1 static-block true false

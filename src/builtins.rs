@@ -2359,6 +2359,7 @@ fn b_mkfunc(vm: &mut VM, _: u8) -> Value {
             this,
             is_arrow,
             home_class: None,
+            home_static: false,
         }));
         if let Some(n) = self_name {
             env.borrow_mut().vars.insert(n, f.clone());

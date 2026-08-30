@@ -376,6 +376,11 @@ pub struct FuncVal {
     /// The owning class name for a method (drives `super` resolution). `None` for
     /// plain functions/arrows.
     pub home_class: Option<String>,
+    /// Whether that method is a STATIC one. `super.x` resolves against a
+    /// different object in each case — the parent constructor for a static
+    /// method, the parent's prototype for an instance method — and the class
+    /// name alone cannot tell them apart, since both carry the same one.
+    pub home_static: bool,
 }
 
 /// A heap object.
@@ -726,6 +731,8 @@ pub struct Frame {
     /// The class value owning the running method (drives `super`); `None` outside
     /// a class method/constructor.
     pub home_class: Option<Value>,
+    /// Whether the running method is a static one — see `FuncVal::home_static`.
+    pub home_static: bool,
     /// Source line the frame is currently executing (updated by the DAP line hook
     /// under `--dap`; stays 0 on ordinary runs).
     pub line: u32,
@@ -1093,6 +1100,7 @@ impl JsHost {
                 this_obj: None,
                 new_target: None,
                 home_class: None,
+                home_static: false,
                 line: 0,
                 owner: None,
                 is_module: true,
@@ -2450,14 +2458,27 @@ impl JsHost {
             Some(p) => p,
             None => return SuperRef::Data(Value::Undef),
         };
-        let parent_proto = match self.get(&parent) {
-            Some(JsObj::Class(pc)) => pc.proto.clone(),
-            _ => self.fn_prop(&parent, "prototype").unwrap_or(Value::Undef),
+        // A STATIC method's home object is the constructor, so `super.x` reads
+        // off the parent CONSTRUCTOR; an instance method's is the prototype
+        // object, so it reads off the parent's prototype. Always taking the
+        // prototype meant `static s() { return super.s(); }` found nothing and
+        // then tried to call it.
+        let target = if self.frame().home_static {
+            parent.clone()
+        } else {
+            match self.get(&parent) {
+                Some(JsObj::Class(pc)) => pc.proto.clone(),
+                _ => self.fn_prop(&parent, "prototype").unwrap_or(Value::Undef),
+            }
         };
-        if let Some((Some(getter), _)) = lookup_accessor(self, &parent_proto, name) {
+        if let Some((Some(getter), _)) = lookup_accessor(self, &target, name) {
             return SuperRef::Getter(getter);
         }
-        SuperRef::Data(lookup_chain(self, &parent_proto, name).unwrap_or(Value::Undef))
+        if let Some(v) = lookup_chain(self, &target, name) {
+            return SuperRef::Data(v);
+        }
+        // A static method lives in the fn-prop side table, not the property map.
+        SuperRef::Data(self.fn_prop(&target, name).unwrap_or(Value::Undef))
     }
 
     // ── signals / errors ─────────────────────────────────────────────────
@@ -2941,6 +2962,7 @@ pub fn run_chunk_in_global_scope(chunk: Chunk) -> Result<Value, String> {
             this_obj: None,
             new_target: None,
             home_class: None,
+            home_static: false,
             line: 0,
             owner: None,
             is_module: true,
@@ -5391,7 +5413,7 @@ pub fn run_user_func_nt(
     // generator over the already-bound frame.
     if is_generator {
         let chunk = with_host(|h| h.funcs[fv.def_id].chunk.clone());
-        let gen = make_generator(chunk, env, this_val, fv.home_class.clone());
+        let gen = make_generator(chunk, env, this_val, fv.home_class.clone(), fv.home_static);
         if is_async {
             if let Some(JsObj::Generator { id }) = with_host(|h| h.get(&gen).cloned()) {
                 with_host(|h| h.generators[id as usize].async_gen = true);
@@ -5403,7 +5425,7 @@ pub fn run_user_func_nt(
     // synchronously up to the first `await`, then continues via microtasks.
     if is_async {
         let chunk = with_host(|h| h.funcs[fv.def_id].chunk.clone());
-        let gen = make_generator(chunk, env, this_val, fv.home_class.clone());
+        let gen = make_generator(chunk, env, this_val, fv.home_class.clone(), fv.home_static);
         return Ok(run_async(gen));
     }
     let home = fv
@@ -5417,6 +5439,7 @@ pub fn run_user_func_nt(
             this_obj: this_val,
             new_target,
             home_class: home,
+            home_static: fv.home_static,
             line: 0,
             owner: Some(def_name),
             is_module: false,
@@ -5836,9 +5859,11 @@ pub fn define_member(class_val: &Value, name: &str, kind: i64, is_static: bool, 
         if name.starts_with('#') && kind != member::STATIC_FIELD {
             h.note_private_method(name);
         }
-        // Give the method its home class for `super.x()`.
+        // Give the method its home class for `super.x()`, and record whether it
+        // is static — `super` resolves against a different object either way.
         if let Some(JsObj::Func(f)) = h.get_mut(&func) {
             f.home_class = Some(cname);
+            f.home_static = is_static;
         }
         // Static members live on the constructor (fn-props / static accessors);
         // instance members on the prototype.
@@ -6169,6 +6194,7 @@ fn make_generator(
     env: Env,
     this_val: Option<Value>,
     home_class: Option<String>,
+    home_static: bool,
 ) -> Value {
     let home = home_class
         .as_ref()
@@ -6179,6 +6205,7 @@ fn make_generator(
         this_obj: this_val,
         new_target: None,
         home_class: home,
+        home_static,
         line: 0,
         owner: None,
         is_module: false,
@@ -7170,6 +7197,14 @@ impl JsHost {
     /// A function's `.length`: the count of leading params before the first one
     /// with a default or the rest element.
     pub fn func_arity(&self, v: &Value) -> usize {
+        // 20.2.3.2: a bound function's `length` is the target's, less the
+        // arguments already bound, floored at 0. Reporting 0 for every bound
+        // function breaks arity dispatch — express picks error-handling
+        // middleware with `fn.length === 4`, so a bound handler was never
+        // recognised as one.
+        if let Some(JsObj::BoundFunc { target, args, .. }) = self.get(v) {
+            return self.func_arity(&target.clone()).saturating_sub(args.len());
+        }
         let def_id = match self.get(v) {
             Some(JsObj::Func(f)) => Some(f.def_id),
             Some(JsObj::Class(c)) => match c.ctor.as_ref().and_then(|cf| self.get(cf)) {

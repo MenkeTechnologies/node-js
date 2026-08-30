@@ -58,3 +58,34 @@ console.log("instanceof Shape", sq instanceof Shape);
 console.log("instanceof Object", sq instanceof Object);
 console.log("static", Shape.kinds());
 console.log("ctor name", sq.constructor.name);
+
+// `super` in a STATIC method resolves against the parent CONSTRUCTOR, not the
+// parent's prototype — the two home objects differ, and the class name alone
+// cannot tell a static method from an instance one since both carry the same
+// one. Always taking the prototype meant a static `super.x()` found nothing and
+// then threw trying to call it.
+class SBase {
+  greet() { return "base-instance"; }
+  static make() { return "base-static"; }
+  static get tag() { return "base-tag"; }
+}
+class SDerived extends SBase {
+  greet() { return "derived+" + super.greet(); }
+  static make() { return "derived+" + super.make(); }
+  static readTag() { return super.tag; }
+}
+console.log("inst-super", new SDerived().greet());
+console.log("stat-super", SDerived.make());
+console.log("stat-getter", SDerived.readTag());
+// Reaching the parent explicitly always worked and must keep working.
+class SExplicit extends SBase { static make() { return "explicit+" + SBase.make(); } }
+console.log("explicit  ", SExplicit.make(), Object.getPrototypeOf(SDerived) === SBase);
+
+// A bound function's `length` is the target's less the arguments already bound
+// (20.2.3.2), floored at 0. Every bound function used to report 0, which breaks
+// arity dispatch — express selects error-handling middleware with
+// `fn.length === 4`, so a bound handler was never recognised as one.
+function arity3(a, b, c) {}
+console.log("arity     ", arity3.length, arity3.bind(null).length, arity3.bind(null, 1).length);
+console.log("arity2    ", arity3.bind(null, 1, 2).length, arity3.bind(null, 1, 2, 3, 4).length);
+console.log("chained   ", arity3.bind(null, 1).bind(null, 2).length, arity3.bind(null).name);
