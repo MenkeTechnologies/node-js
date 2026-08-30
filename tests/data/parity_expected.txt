@@ -317,6 +317,14 @@ function
 3,3,3 0,1,2
 ReferenceError true
 undefined
+==== httpserver.js ====
+message   201 Created Custom m
+writeHead 202 Head Message w
+raw-case  true v
+raw-shape true true
+request   PUT|sent|true|true|true|sent
+status    200 OK
+closed    yes
 ==== json.js ====
 {"b":2,"a":1,"nested":{"list":[1,"two",null,true]}}
 {

@@ -434,6 +434,10 @@ struct ParsedReq {
     http_version: String,
     /// Lowercased header name → value (last wins, like Node for simple headers).
     headers: Vec<(String, String)>,
+    /// The same headers in WIRE order and case, for `rawHeaders`. The lowered
+    /// map cannot express either, so a caller needing the original casing or a
+    /// repeated header has nothing to read without it.
+    raw_headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -455,6 +459,7 @@ fn parse_request(buf: &[u8]) -> Option<(ParsedReq, usize)> {
     let http_version = version.strip_prefix("HTTP/").unwrap_or("1.1").to_string();
 
     let mut headers: Vec<(String, String)> = Vec::new();
+    let mut raw_headers: Vec<(String, String)> = Vec::new();
     let mut content_length = 0usize;
     for line in lines {
         if line.is_empty() {
@@ -466,6 +471,7 @@ fn parse_request(buf: &[u8]) -> Option<(ParsedReq, usize)> {
             if name == "content-length" {
                 content_length = value.parse().unwrap_or(0);
             }
+            raw_headers.push((k.trim().to_string(), value.clone()));
             headers.push((name, value));
         }
     }
@@ -481,6 +487,7 @@ fn parse_request(buf: &[u8]) -> Option<(ParsedReq, usize)> {
             url,
             http_version,
             headers,
+            raw_headers,
             body,
         },
         body_start + content_length,
@@ -492,6 +499,18 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 // ── IncomingMessage (req) ────────────────────────────────────────────────────
+
+/// `rawHeaders`: the flat name/value list in WIRE order and case. The `headers`
+/// object is lower-cased and one-value-per-name, so it can express neither.
+fn flat_headers(pairs: &[(String, String)]) -> Value {
+    with_host(|h| {
+        let flat: Vec<Value> = pairs
+            .iter()
+            .flat_map(|(k, v)| [h.new_str(k.clone()), h.new_str(v.clone())])
+            .collect();
+        h.new_array(flat)
+    })
+}
 
 fn build_incoming(req: &ParsedReq) -> Value {
     let headers_obj = with_host(|h| {
@@ -512,6 +531,7 @@ fn build_incoming(req: &ParsedReq) -> Value {
         with_host(|h| h.new_str(req.http_version.clone())),
     );
     extra.insert("headers".into(), headers_obj);
+    extra.insert("rawHeaders".into(), flat_headers(&req.raw_headers));
     super::net::new_emitter_object("IncomingMessage", extra)
 }
 
@@ -767,15 +787,26 @@ fn response_call(res: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
 
 /// Serialize and write the response, then emit `finish`.
 fn finish_response(res: &Value, resid: u64) -> Result<(), String> {
-    // Reconcile status with a possible `res.statusCode = n` assignment.
-    let js_status = with_host(|h| match h.get(res) {
-        Some(JsObj::Object(p)) => p.get("statusCode").map(|v| h.to_number(v) as u16),
-        _ => None,
+    // Reconcile status with a possible `res.statusCode = n` assignment, and the
+    // reason phrase with `res.statusMessage = '…'`. Only the code was being
+    // read back, so a custom message set that way was dropped and the default
+    // phrase for the code went out instead.
+    let (js_status, js_message) = with_host(|h| match h.get(res) {
+        Some(JsObj::Object(p)) => (
+            p.get("statusCode").map(|v| h.to_number(v) as u16),
+            p.get("statusMessage")
+                .filter(|v| !matches!(v, Value::Undef))
+                .map(|v| h.str_of(v)),
+        ),
+        _ => (None, None),
     });
     let st = RESPONSES.with(|r| r.borrow_mut().remove(&resid));
     let Some(mut st) = st else { return Ok(()) };
     if let Some(s) = js_status {
         st.status = s;
+    }
+    if let Some(m) = js_message {
+        st.message = Some(m);
     }
     let payload = serialize_response(&mut st);
     super::net::socket_write_id(st.sock_id, &payload);
@@ -1315,7 +1346,14 @@ fn deliver_response(reqid: u64, raw: Vec<u8>) -> Result<(), String> {
     let _ = with_host(|h| h.io_sender()).send(Box::new(|| Ok(())));
     let Some(entry) = entry else { return Ok(()) };
 
-    let (status, message, http_version, headers, body) = parse_raw_response(&raw);
+    let ParsedRes {
+        status,
+        message,
+        http_version,
+        headers,
+        raw_headers: raw_header_pairs,
+        body,
+    } = parse_raw_response(&raw);
 
     let headers_obj = with_host(|h| {
         let mut m = IndexMap::new();
@@ -1324,7 +1362,13 @@ fn deliver_response(reqid: u64, raw: Vec<u8>) -> Result<(), String> {
         }
         h.new_object(m)
     });
+    // `rawHeaders` is the flat name/value list in WIRE order and case, which
+    // `headers` (lower-cased and de-duplicated into an object) cannot express.
+    // It was absent entirely, so a caller needing the original casing or a
+    // repeated header had nothing to read.
+    let raw_headers = flat_headers(&raw_header_pairs);
     let mut extra = IndexMap::new();
+    extra.insert("rawHeaders".into(), raw_headers);
     extra.insert("statusCode".into(), Value::Float(status as f64));
     extra.insert("statusMessage".into(), with_host(|h| h.new_str(message)));
     extra.insert("httpVersion".into(), with_host(|h| h.new_str(http_version)));
@@ -1366,9 +1410,19 @@ fn deliver_error(reqid: u64, msg: String) -> Result<(), String> {
 
 /// Parse a raw HTTP/1.1 response into `(status, message, version, headers, body)`.
 /// Handles `Transfer-Encoding: chunked` and plain (Content-Length / to-EOF) bodies.
-pub(crate) fn parse_raw_response(
-    raw: &[u8],
-) -> (u16, String, String, Vec<(String, String)>, Vec<u8>) {
+/// One parsed HTTP response.
+pub(crate) struct ParsedRes {
+    pub status: u16,
+    pub message: String,
+    pub http_version: String,
+    /// Lower-cased name → value, for the `headers` object.
+    pub headers: Vec<(String, String)>,
+    /// The same headers in wire order and case, for `rawHeaders`.
+    pub raw_headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+pub(crate) fn parse_raw_response(raw: &[u8]) -> ParsedRes {
     let head_end = find_subslice(raw, b"\r\n\r\n").unwrap_or(raw.len());
     let head = String::from_utf8_lossy(&raw[..head_end]);
     let body_start = (head_end + 4).min(raw.len());
@@ -1385,6 +1439,7 @@ pub(crate) fn parse_raw_response(
     let message = sp.next().unwrap_or("").to_string();
 
     let mut headers: Vec<(String, String)> = Vec::new();
+    let mut raw_headers: Vec<(String, String)> = Vec::new();
     let mut chunked = false;
     for line in lines {
         if line.is_empty() {
@@ -1396,6 +1451,7 @@ pub(crate) fn parse_raw_response(
             if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
                 chunked = true;
             }
+            raw_headers.push((k.trim().to_string(), value.clone()));
             headers.push((name, value));
         }
     }
@@ -1405,7 +1461,14 @@ pub(crate) fn parse_raw_response(
     } else {
         raw_body.to_vec()
     };
-    (status, message, version, headers, body)
+    ParsedRes {
+        status,
+        message,
+        http_version: version,
+        headers,
+        raw_headers,
+        body,
+    }
 }
 
 /// Decode an HTTP/1.1 chunked body (best-effort; stops at the terminating

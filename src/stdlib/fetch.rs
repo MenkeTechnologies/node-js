@@ -991,8 +991,9 @@ pub fn fetch(args: &[Value]) -> Result<Value, String> {
             with_host(|h| h.decr_handle());
             match raw {
                 Ok(raw) => {
-                    let (status, message, _v, headers, body) =
-                        crate::stdlib::http::parse_raw_response(&raw);
+                    let parsed = crate::stdlib::http::parse_raw_response(&raw);
+                    let (status, message, headers, body) =
+                        (parsed.status, parsed.message, parsed.headers, parsed.body);
                     let resp = build_response(status, &message, &headers, &body, &url_for_response);
                     crate::host::resolve_promise_val(id, resp);
                 }
