@@ -31,3 +31,32 @@ console.log("holes   ", gappy.indexOf(undefined), gappy.includes(undefined, 1), 
 // Typed arrays carry the same three methods and had the same defect.
 const typed = new Uint8Array([1, 2, 3, 2, 1]);
 console.log("typed   ", typed.indexOf(2, 2), typed.lastIndexOf(2, 2), typed.includes(2, 4));
+
+// `sort` with CONSISTENT comparators, which is the only case the spec pins:
+// 23.1.3.30 leaves the order implementation-defined when the comparator is
+// inconsistent, so a constant `() => 1` is deliberately not asserted here —
+// node and this engine genuinely differ there and neither is wrong.
+let sortSeed = 12345;
+const nextRandom = () => (sortSeed = (sortSeed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+const sample = (n) => Array.from({ length: n }, () => Math.floor(nextRandom() * 50));
+for (const n of [0, 1, 2, 3, 5, 33, 257]) {
+  const data = sample(n);
+  console.log("sort" + String(n).padEnd(4),
+    data.slice().sort((a, b) => a - b).join(","),
+    data.slice().sort().join(","));
+}
+// Stability: many ties, compared by the ORIGINAL index so a reordering of
+// equal elements shows up.
+const tied = sample(60).map((v, i) => ({ key: v % 4, i }));
+console.log("stable  ", tied.sort((a, b) => a.key - b.key).map((o) => o.i).join(","));
+// Sorting is in place and returns the same array; `toSorted` is neither.
+const inPlace = [2, 1];
+const returned = inPlace.sort();
+const copied = [2, 1];
+const fresh = copied.toSorted();
+console.log("inplace ", returned === inPlace, inPlace.join(","), fresh === copied, copied.join(","), fresh.join(","));
+// Holes and undefined both sort to the end, undefined ahead of the holes.
+console.log("sparse  ", JSON.stringify([3, , 1].sort()), JSON.stringify([3, undefined, 1].sort()));
+console.log("typed   ", new Int32Array([3, 1, 2]).sort().join(","), new Int32Array([3, 1, 2]).sort((a, b) => b - a).join(","));
+// A throwing comparator propagates rather than being swallowed.
+try { [1, 2, 3].sort(() => { throw new Error("cmp"); }); } catch (e) { console.log("throws  ", e.message); }

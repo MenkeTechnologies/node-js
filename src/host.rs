@@ -1423,6 +1423,33 @@ impl JsHost {
         }
     }
     /// The accessor `(get, set)` for `key` directly on `owner` (no chain walk).
+    /// Drop an own accessor property entirely, marker and all.
+    ///
+    /// `delete obj.accessorProp` used to clear only the property map, and an
+    /// accessor does not live there — so the delete reported success while the
+    /// getter kept answering and `in` kept reporting the key.
+    pub fn remove_accessor(&mut self, owner: &Value, key: &str) {
+        if let Value::Obj(i) = owner {
+            if let Some(m) = self.accessors.get_mut(i) {
+                m.shift_remove(key);
+            }
+        }
+        let marker = format!("{ORD_MARKER}{key}");
+        match self.get_mut(owner) {
+            Some(JsObj::Object(props)) => {
+                props.shift_remove(&marker);
+            }
+            Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => {
+                if let Value::Obj(i) = owner {
+                    if let Some(t) = self.fn_props.get_mut(i) {
+                        t.shift_remove(&marker);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Turn an own accessor property into a data property carrying `value`,
     /// keeping its place in the own-key order.
     ///

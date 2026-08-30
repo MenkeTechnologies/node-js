@@ -2206,6 +2206,13 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
     if !with_host(|h| h.prop_attrs(recv, key).configurable) {
         return Ok(false);
     }
+    // An accessor lives in its own table, not the property map, so removing it
+    // has to be explicit — otherwise `delete` reported success while the getter
+    // kept answering and `in` kept reporting the key.
+    if with_host(|h| h.own_accessor(recv, key).is_some()) {
+        with_host(|h| h.remove_accessor(recv, key));
+        return Ok(true);
+    }
     with_host(|h| {
         let index = key.parse::<usize>();
         match h.get_mut(recv) {

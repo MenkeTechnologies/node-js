@@ -109,3 +109,33 @@ console.log('lookup  ', typeof legacy.__lookupGetter__('g'), typeof legacy.__loo
 const heir = Object.create(legacy);
 console.log('inherit ', typeof heir.__lookupGetter__('g'), Object.prototype.hasOwnProperty.call(heir, 'g'));
 console.log('missing ', legacy.__lookupGetter__('nope'), typeof {}.__defineGetter__);
+
+// `delete obj.accessorProp` reported success and removed nothing. An accessor
+// lives in its own table rather than the property map, and the delete cleared
+// only the map — so the getter kept answering and `in` kept reporting the key.
+const removable = { a: 1, get b() { return 2; }, c: 3 };
+console.log("del-pre ", Object.keys(removable).join(","), removable.b);
+console.log("del-ok  ", delete removable.b, "b" in removable, String(removable.b));
+console.log("del-post", Object.keys(removable).join(","), JSON.stringify(removable));
+// A getter that deletes itself mid-read: the second read finds nothing.
+const once = { get value() { delete once.value; return "first"; } };
+console.log("selfdel ", once.value, String(once.value), "value" in once);
+// Both spellings and Reflect take the same path.
+const viaComputed = { get g() { return 1; } };
+const viaReflect = { get g() { return 1; } };
+console.log("spellings", delete viaComputed["g"], Reflect.deleteProperty(viaReflect, "g"), "g" in viaComputed, "g" in viaReflect);
+// A non-configurable accessor resists, as a non-configurable data property does.
+const pinned = {};
+Object.defineProperty(pinned, "k", { get: () => 1, configurable: false });
+console.log("nonconf ", delete pinned.k, "k" in pinned, pinned.k);
+// After removal the name is free for an ordinary assignment.
+const reused = { get x() { return "accessor"; } };
+delete reused.x;
+reused.x = "plain";
+console.log("readd   ", reused.x, JSON.stringify(reused));
+// Deleting an own accessor uncovers one inherited from the prototype.
+const base = { get p() { return "base"; } };
+const derived = Object.create(base);
+Object.defineProperty(derived, "p", { get: () => "own", configurable: true });
+delete derived.p;
+console.log("shadow  ", derived.p, Object.prototype.hasOwnProperty.call(derived, "p"));
