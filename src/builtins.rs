@@ -5635,14 +5635,26 @@ fn json_parse(args: Vec<Value>) -> Result<Value, String> {
         .filter(|r| with_host(|h| host::is_callable(h, r)))
         .cloned()
     {
-        return json_revive("", v, &reviver);
+        // The top-level holder is a fresh `{ "": value }` wrapper, as the spec
+        // constructs before the walk.
+        let root = with_host(|h| {
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert(String::new(), v.clone());
+            h.new_object(m)
+        });
+        return json_revive("", v, &reviver, &root);
     }
     Ok(v)
 }
 
 /// `JSON.parse` reviver walk: recurse into children first, then call
 /// `reviver(key, value)`; a returned `undefined` drops the property.
-fn json_revive(key: &str, val: Value, reviver: &Value) -> Result<Value, String> {
+///
+/// The reviver runs with the HOLDER as `this` (25.5.1.1
+/// InternalizeJSONProperty) — the object or array the key lives in, and at the
+/// top level a wrapper `{ "": value }`. It was being called with no receiver,
+/// so `this` was undefined and a reviver could not reach its siblings.
+fn json_revive(key: &str, val: Value, reviver: &Value, holder: &Value) -> Result<Value, String> {
     match with_host(|h| h.get(&val).cloned()) {
         Some(JsObj::Array(items)) => {
             for i in 0..items.len() {
@@ -5650,7 +5662,7 @@ fn json_revive(key: &str, val: Value, reviver: &Value) -> Result<Value, String> 
                     Some(JsObj::Array(it)) => it[i].clone(),
                     _ => Value::Undef,
                 });
-                let nv = json_revive(&i.to_string(), elem, reviver)?;
+                let nv = json_revive(&i.to_string(), elem, reviver, &val)?;
                 with_host(|h| {
                     if let Some(JsObj::Array(it)) = h.get_mut(&val) {
                         it[i] = nv;
@@ -5669,7 +5681,7 @@ fn json_revive(key: &str, val: Value, reviver: &Value) -> Result<Value, String> 
                     Some(JsObj::Object(p)) => p.get(&k).cloned().unwrap_or(Value::Undef),
                     _ => Value::Undef,
                 });
-                let nv = json_revive(&k, elem, reviver)?;
+                let nv = json_revive(&k, elem, reviver, &val)?;
                 with_host(|h| {
                     if let Some(JsObj::Object(p)) = h.get_mut(&val) {
                         if matches!(nv, Value::Undef) {
@@ -5684,7 +5696,7 @@ fn json_revive(key: &str, val: Value, reviver: &Value) -> Result<Value, String> 
         _ => {}
     }
     let kv = with_host(|h| h.new_str(key.to_string()));
-    host::invoke(reviver, vec![kv, val], None)
+    host::invoke(reviver, vec![kv, val], Some(holder.clone()))
 }
 
 struct JsonParser {

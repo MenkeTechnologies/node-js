@@ -364,6 +364,12 @@ closed    yes
 [ 2, 3, 4 ]
 SyntaxError
 "custom"
+sibling  {"a":1,"b":3}
+nested   {"o":{"x":1,"y":3}}
+array    arr
+root     ""|object|1
+order    b,a,c,
+dropped  {"b":2}
 ==== numbers.js ====
 0.30000000000000004 0.30 1234.57
 1234.57 ff 11111111
@@ -457,6 +463,12 @@ abab xx
 ["a","b",""] ["",""]
 ["a","b"] ["a","1","b"] []
 ["",""] ["a","","b"]
+repl-idx xxx 0
+match-idx ["a","a","a"] 0
+kept     3 2
+reuse    xxx true 1
+matchAll TypeError String.prototype.matchAll called with a non-global RegExp argument
+global   2
 ==== streams.js ====
 transform A,B,C
 filter    keep,last

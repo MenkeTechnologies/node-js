@@ -528,6 +528,10 @@ pub fn str_match(s: &str, re_val: &Value) -> Result<Value, String> {
         set_last_index(re_val, U16Index::ZERO);
         return regexp_exec_from_zero(&re, s);
     }
+    // 22.2.6.9 step 6.a: a global match sets `lastIndex` to 0 before it starts,
+    // so it always collects from the beginning and leaves it there. It was
+    // being left wherever the caller had put it.
+    set_last_index(re_val, U16Index::ZERO);
     let matches: Vec<Value> = re
         .find_iter(s)
         .filter_map(|m| m.ok())
@@ -551,9 +555,17 @@ fn regexp_exec_from_zero(re: &Regex, s: &str) -> Result<Value, String> {
 /// `str.matchAll(re)`: an iterator over every match array (requires the `g` flag
 /// in Node, but we accept a non-global regex too and still iterate all matches).
 pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
-    let Some((re, _, _, _)) = regexp_snapshot(re_val) else {
+    let Some((re, global, _, _)) = regexp_snapshot(re_val) else {
         return Ok(with_host(|h| h.new_array(Vec::new())));
     };
+    // 22.1.3.14 step 5.c: a non-global regexp is a TypeError, because
+    // `matchAll` cannot produce every match without `g` — the same rule
+    // `replaceAll` enforces. This used to return just the first match.
+    if !global {
+        return Err(host::type_error(
+            "String.prototype.matchAll called with a non-global RegExp argument",
+        ));
+    }
     let mut items = Vec::new();
     for caps in re.captures_iter(s).flatten() {
         items.push(build_match_array(&re, &caps, s));
@@ -729,6 +741,13 @@ pub fn str_replace_regex(
         }
     }
     out.push_str(&s[last..]);
+    // 22.2.6.11 step 8: a GLOBAL regexp has its `lastIndex` set to 0 by the
+    // replace, so the next use starts from the beginning. It was left wherever
+    // the caller had put it, which made a shared `/…/g` skip the front of the
+    // string on its next `test`/`exec`.
+    if global {
+        set_last_index(re_val, U16Index::ZERO);
+    }
     Ok(with_host(|h| h.new_str(out)))
 }
 

@@ -62,3 +62,31 @@ console.log(JSON.stringify("a,b,".split(/,/)), JSON.stringify(",".split(/,/)));
 console.log(JSON.stringify("abc".split(/(?:)/, 2)), JSON.stringify("a1b2c".split(/(\d)/, 3)), JSON.stringify("abc".split(/b/, 0)));
 // Splitting on the whole subject leaves the two empty sides.
 console.log(JSON.stringify("abc".split(/abc/)), JSON.stringify("aXXb".split(/X/)));
+
+// A global regexp carries `lastIndex` as mutable state, and the methods that
+// consume the WHOLE string reset it. `replace` and `match` were leaving it
+// wherever the caller had put it, so a shared `/…/g` skipped the front of the
+// string on its next use — the classic reason a regexp "stops matching".
+const shared = /a/g;
+shared.lastIndex = 3;
+console.log("repl-idx", "aaa".replace(shared, "x"), shared.lastIndex);
+const scan = /a/g;
+scan.lastIndex = 2;
+console.log("match-idx", JSON.stringify("aaa".match(scan)), scan.lastIndex);
+// A NON-global replace leaves it alone, and `matchAll` leaves its own alone.
+const once = /a/;
+once.lastIndex = 3;
+"aaa".replace(once, "x");
+const all = /a/g;
+all.lastIndex = 2;
+[..."aaa".matchAll(all)];
+console.log("kept    ", once.lastIndex, all.lastIndex);
+// Which is what makes a shared global regexp usable twice in a row.
+const reused = /a/g;
+console.log("reuse   ", "aaa".replace(reused, "x"), reused.test("aaa"), reused.lastIndex);
+
+// `matchAll` cannot produce every match without `g`, so a non-global regexp is
+// a TypeError (22.1.3.14) — the same rule `replaceAll` enforces. It used to
+// return just the first match.
+try { [..."ab".matchAll(/a/)]; } catch (e) { console.log("matchAll", e.constructor.name, e.message); }
+console.log("global  ", [..."aa".matchAll(/a/g)].length);
