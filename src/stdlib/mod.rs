@@ -470,7 +470,7 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "TextEncoder" => Some(typedarray::construct_text_encoder()),
         "TextDecoder" => Some(typedarray::construct_text_decoder(args)),
         n if typedarray::is_ctor(n) => Some(typedarray::construct(n, args)),
-        n if stream::is_class(n) => Some(Ok(stream::construct(n))),
+        n if stream::is_class(n) => Some(Ok(stream::construct(n, args))),
         "AsyncLocalStorage" | "AsyncResource" => async_hooks::construct(name, args),
         "Script" => Some(vm::construct(args)),
         "URLSearchParams" => Some(url::construct_search_params(args)),

@@ -2435,7 +2435,12 @@ pub fn construct_x509(args: &[Value]) -> Result<Value, String> {
 /// `X509Certificate` instance dispatch (`toString`, `toLegacyObject`).
 pub fn x509_instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
     match method {
-        "toString" => Ok(with_host(|h| h.new_str(obj_str(recv, "@@pem")))),
+        // Same nested-borrow hazard as `events::getEventListeners`: `obj_str`
+        // takes the host, so reading it inside `with_host` aborts the process.
+        "toString" => {
+            let pem = obj_str(recv, "@@pem");
+            Ok(with_host(|h| h.new_str(pem)))
+        }
         _ => Err(crate::host::type_error(&format!(
             "x509Certificate.{method} is not a function"
         ))),

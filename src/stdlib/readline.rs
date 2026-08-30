@@ -192,12 +192,12 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         }
         "write" => {
             let data = with_host(|h| args.first().map(|v| h.str_of(v)).unwrap_or_default());
-            write_stdout(&data);
+            write_output(recv, &data);
             Ok(Value::Undef)
         }
         "prompt" => {
             let p = read_hidden(recv, "@@prompt");
-            write_stdout(&p);
+            write_output(recv, &p);
             Ok(Value::Undef)
         }
         "setPrompt" => {
@@ -210,7 +210,13 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             });
             Ok(Value::Undef)
         }
-        "getPrompt" => Ok(with_host(|h| h.new_str(read_hidden(recv, "@@prompt")))),
+        // `read_hidden` takes the host, so reading it INSIDE `with_host` borrowed
+        // the same RefCell twice and aborted the process — a Rust panic, not a
+        // throw, so no JS `try` could catch it. Read first, then borrow.
+        "getPrompt" => {
+            let prompt = read_hidden(recv, "@@prompt");
+            Ok(with_host(|h| h.new_str(prompt)))
+        }
         // Listener registration: stored under `@@listeners[event]` so it is not
         // lost and chaining returns `this`. node-js does NOT asynchronously emit
         // `'line'`/`'close'` (no background stdin reader) — use `question` for
@@ -284,6 +290,25 @@ fn write_stdout(s: &str) {
     let mut out = io::stdout();
     let _ = out.write_all(s.as_bytes());
     let _ = out.flush();
+}
+
+/// Write to the interface's configured `output` stream, falling back to stdout
+/// when it has none.
+///
+/// `createInterface({input, output})` records `@@output` and Node writes
+/// `prompt()` and `write()` THROUGH it — the option exists so a caller can
+/// capture or redirect that text. Both went straight to `io::stdout()` here, so
+/// an interface given its own output printed to the process's stdout anyway and
+/// the supplied stream never saw a byte.
+fn write_output(recv: &Value, s: &str) {
+    let out = opt_prop(recv, "@@output").unwrap_or(Value::Undef);
+    if matches!(out, Value::Obj(_)) {
+        let payload = with_host(|h| h.new_str(s.to_string()));
+        if crate::host::call_method(&out, "write", vec![payload]).is_ok() {
+            return;
+        }
+    }
+    write_stdout(s);
 }
 
 /// An own property of `v` if `v` is a plain object, else `None`.

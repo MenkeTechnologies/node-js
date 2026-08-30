@@ -68,12 +68,56 @@ pub fn constant(name: &str) -> Option<Value> {
 
 /// `new Readable()` / `Writable` / `Duplex` / `Transform` / `PassThrough` /
 /// `Stream`.
-pub fn construct(name: &str) -> Value {
+pub fn construct(name: &str, args: &[Value]) -> Value {
     // A `push`ed-data queue lives on the object as an array for `read`.
     let mut extra = IndexMap::new();
     let queue = with_host(|h| h.new_array(Vec::new()));
     extra.insert("@@queue".into(), queue);
+    // `new Writable({ write(chunk, enc, cb) {…} })` supplies the implementation
+    // the stream is supposed to run — that option is the whole point of
+    // constructing one directly, and it was DISCARDED: `construct` took only the
+    // class name, so a custom sink silently swallowed every chunk. Keep the
+    // callbacks the write path uses.
+    if let Some(opts) = args.first() {
+        for (opt, key) in [("write", "@@writeImpl"), ("final", "@@finalImpl")] {
+            if let Some(f) = opt_callable(opts, opt) {
+                extra.insert(key.into(), f);
+            }
+        }
+    }
     super::net::new_emitter_object(name, extra)
+}
+
+/// An own property of `v` that is callable, else `None`.
+fn opt_callable(v: &Value, key: &str) -> Option<Value> {
+    let f = with_host(|h| match h.get(v) {
+        Some(JsObj::Object(m)) => m.get(key).cloned(),
+        _ => None,
+    })?;
+    with_host(|h| crate::host::is_callable(h, &f)).then_some(f)
+}
+
+/// Run the `write(chunk, encoding, callback)` implementation the constructor was
+/// given, if any. The callback is required by the contract, so a no-op function
+/// is supplied when the implementation asks for one.
+fn run_write_impl(recv: &Value, chunk: &Value) -> Result<(), String> {
+    let Some(f) = hidden_prop(recv, "@@writeImpl") else {
+        return Ok(());
+    };
+    let enc = with_host(|h| h.new_str("utf8".to_string()));
+    // `_write` is handed a `callback` it is contractually required to call.
+    // Nothing here waits on backpressure, so it only has to BE callable —
+    // a `write(c, e, cb) { …; cb(); }` implementation throws without it.
+    let cb = with_host(|h| h.alloc(JsObj::Builtin("@@streamWriteCallback".into())));
+    crate::host::invoke(&f, vec![chunk.clone(), enc, cb], None)?;
+    Ok(())
+}
+
+fn hidden_prop(recv: &Value, key: &str) -> Option<Value> {
+    with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(m)) => m.get(key).cloned(),
+        _ => None,
+    })
 }
 
 /// Module free-function dispatch (`stream.finished`, `stream.isReadable`, …).
@@ -338,11 +382,13 @@ pub fn instance_call(
     match method {
         "write" => {
             let chunk = args.first().cloned().unwrap_or(Value::Undef);
+            run_write_impl(recv, &chunk)?;
             emit_event(recv, "data", vec![chunk])?;
             Ok(Value::Bool(true))
         }
         "end" => {
             if let Some(chunk) = args.first().filter(|v| !matches!(v, Value::Undef)) {
+                run_write_impl(recv, chunk)?;
                 emit_event(recv, "data", vec![chunk.clone()])?;
             }
             emit_event(recv, "finish", vec![])?;

@@ -331,9 +331,14 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         "listenerCount" => Ok(Value::Float(
             listeners(&emitter, &arg_str(args, 1)).len() as f64
         )),
-        "getEventListeners" => Ok(with_host(|h| {
-            h.new_array(listeners(&emitter, &arg_str(args, 1)))
-        })),
+        // `listeners` takes the host, so calling it INSIDE `with_host` borrowed
+        // the same RefCell twice and aborted the process with "RefCell already
+        // borrowed" — a Rust panic, not a throw, so no JS `try` caught it.
+        // Collect first, then borrow to build the array.
+        "getEventListeners" => {
+            let found = listeners(&emitter, &arg_str(args, 1));
+            Ok(with_host(|h| h.new_array(found)))
+        }
         // No per-emitter cap is tracked; report Node's default and accept sets.
         "getMaxListeners" => Ok(Value::Float(10.0)),
         "setMaxListeners" => Ok(Value::Undef),

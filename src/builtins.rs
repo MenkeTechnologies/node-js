@@ -3884,6 +3884,11 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             let idx: u32 = name["@@aborttimeout:".len()..].parse().unwrap_or(0);
             crate::stdlib::fetch::fire_timeout_abort(idx)
         }
+        // The `callback` handed to a `new Writable({ write(chunk, enc, cb) })`
+        // implementation. Nothing here waits on backpressure, so it only has to
+        // BE callable — an implementation that ends with `cb()`, which the
+        // stream contract requires, would otherwise throw.
+        "@@streamWriteCallback" => Ok(Value::Undef),
         "queueMicrotask" | "process.nextTick" => {
             let cb = arg0(&args);
             let rest = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();

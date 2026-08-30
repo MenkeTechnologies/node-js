@@ -4832,6 +4832,30 @@ fn every_advertised_method_on_these_classes_is_dispatched() {
             "Decipheriv",
             "require('crypto').createDecipheriv('aes-256-cbc', Buffer.alloc(32), Buffer.alloc(16))",
         ),
+        ("AsyncResource", "new (require('async_hooks').AsyncResource)('x')"),
+        ("AsyncHook", "require('async_hooks').createHook({})"),
+        ("Channel", "require('diagnostics_channel').channel('c')"),
+        ("TracingChannel", "require('diagnostics_channel').tracingChannel('t')"),
+        ("Script", "new (require('vm').Script)('1')"),
+        ("MIMEParams", "new (require('util').MIMEType)('text/plain;a=b').params"),
+        ("FinalizationRegistry", "new FinalizationRegistry(() => {})"),
+        ("Dirent", "require('fs').readdirSync('.', {withFileTypes: true})[0]"),
+        // `prompt()` WRITES, so the interface gets a discarding output rather
+        // than the real stdout, which otherwise put "> " into the capture.
+        (
+            "Interface",
+            "require('readline').createInterface({input: process.stdin, \
+              output: new (require('stream').Writable)({ write(c, e, cb) { cb(); } })})",
+        ),
+        ("WriteStream", "process.stdout"),
+        // ReadStream is deliberately absent: `process.stdin` is not tagged as
+        // one, so it reported every ReadStream method missing — a wrong subject
+        // rather than a runtime gap, and there is no cheap way to build the
+        // tagged instance here.
+        ("Tracing", "require('trace_events').createTracing({categories: ['node']})"),
+        ("Domain", "require('domain').create()"),
+        ("Immediate", "setImmediate(() => {})"),
+        ("Timeout", "setTimeout(() => {}, 100000)"),
     ];
 
     let mut checks = String::new();
@@ -4970,6 +4994,75 @@ fn a_computed_method_call_binds_this_like_a_static_one() {
     ]
     .join("\n");
     assert_eq!(run(src), expected);
+}
+
+/// A custom `Writable` runs the `write` implementation it was constructed
+/// with, and `readline` sends its prompt through the `output` it was given.
+///
+/// `stream::construct` took only the class NAME and discarded the constructor
+/// arguments, so `new Writable({ write(chunk, enc, cb) {…} })` — which is the
+/// entire reason to construct one directly — silently swallowed every chunk.
+/// Separately, `readline`'s `prompt()` and `write()` went straight to
+/// `io::stdout()` and ignored the `output` stream recorded as `@@output`, so an
+/// interface built to capture its text printed to the process instead.
+///
+/// The two appear together because the second is only observable once the
+/// first works: capturing the prompt needs a Writable that actually runs.
+/// Every value below matches real `node`.
+///
+/// `rl.write()` is deliberately NOT asserted: real node does not put it in the
+/// output sink and this runtime does, so pinning either would be pinning a
+/// divergence. Only `prompt()`, where the two agree, is checked.
+#[test]
+fn a_custom_writable_runs_its_write_and_readline_honours_its_output() {
+    let src = r##"
+        const { Writable } = require('stream');
+
+        const seen = [];
+        const w = new Writable({ write(chunk, enc, cb) { seen.push(String(chunk)); cb(); } });
+        w.write('hello');
+        w.end('bye');
+        console.log('writable', JSON.stringify(seen));
+
+        const prompted = [];
+        const out = new Writable({ write(chunk, enc, cb) { prompted.push(String(chunk)); cb(); } });
+        const rl = require('readline').createInterface({input: process.stdin, output: out});
+        rl.prompt();
+        console.log('readline', JSON.stringify(prompted));
+
+        // `getPrompt` used to abort the process: it read a hidden property with a
+        // helper that takes the host from INSIDE a `with_host` borrow, which is a
+        // Rust double-borrow panic rather than a throw.
+        console.log('getPrompt', JSON.stringify(rl.getPrompt()));
+    "##;
+    let expected = [
+        r#"writable ["hello","bye"]"#,
+        r#"readline ["> "]"#,
+        r#"getPrompt "> ""#,
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// `events.getEventListeners` returns the listeners rather than aborting.
+///
+/// It built its result array with `with_host` while calling `listeners()`,
+/// which takes the host itself — the same double borrow that killed
+/// `histogram.reset()` and `readline.getPrompt()`. All three were found by
+/// grepping for the shape once the first one turned up, not one at a time.
+#[test]
+fn get_event_listeners_returns_the_registered_listeners() {
+    let src = r##"
+        const events = require('events');
+        const ee = new events.EventEmitter();
+        const a = () => {};
+        ee.on('x', a);
+        ee.on('x', () => {});
+        const l = events.getEventListeners(ee, 'x');
+        console.log(Array.isArray(l), l.length, l[0] === a);
+        console.log(events.getEventListeners(ee, 'nope').length);
+    "##;
+    assert_eq!(run(src), "true 2 true\n0");
 }
 
 #[test]
