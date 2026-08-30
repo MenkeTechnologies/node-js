@@ -48,3 +48,19 @@ console.log("base64  ", btoa("abc"), atob("YWJj"), btoa(""), atob(btoa("Hello, W
 console.log("padding ", btoa("a"), btoa("ab"), btoa("abc"));
 console.log("bytes   ", btoa("\x00\x01\xff"), Array.from(atob("AAH/")).map((c) => c.charCodeAt(0)).join(","));
 console.log("same    ", btoa("abc") === require("buffer").btoa("abc"), typeof globalThis.atob);
+
+// `typeof` on a builtin module namespace. A namespace is modelled as a callable
+// unless it is on an explicit non-callable list, and every sub-path module plus
+// a dozen later-added ones were missing from it — so `typeof require('tls')`
+// answered "function". Measured by taking `typeof` of every builtin module.
+const mods = ["path", "path/posix", "path/win32", "fs", "fs/promises", "os", "util",
+  "stream/promises", "stream/consumers", "stream/web", "timers", "timers/promises",
+  "dns", "dns/promises", "https", "http2", "tls", "dgram", "cluster",
+  "worker_threads", "readline", "repl", "vm", "domain", "trace_events", "inspector"];
+console.log("ns-object", mods.every((m) => typeof require(m) === "object"), mods.length);
+// `assert` is genuinely callable — it was on that list and should not have been.
+console.log("ns-assert", typeof require("assert"), typeof require("assert/strict"));
+require("assert")(true);
+console.log("ns-call  ", "assert(true) passed", typeof require("assert").strictEqual);
+// The cross-links keep working and keep their own flavor.
+console.log("ns-flavor", require("path").win32.sep, require("path").posix.sep, require("path").win32.join("a", "b"));

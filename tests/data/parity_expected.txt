@@ -396,6 +396,10 @@ base64   YWJj abc  Hello, World!
 padding  YQ== YWI= YWJj
 bytes    AAH/ 0,1,255
 same     true function
+ns-object true 26
+ns-assert function function
+ns-call   assert(true) passed function
+ns-flavor \ / a\b
 ==== wordcount.js ====
 the: 3
 fox: 2

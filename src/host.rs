@@ -3203,10 +3203,35 @@ impl JsHost {
                         "url",
                         "zlib",
                         "string_decoder",
-                        "assert",
                         "http",
                         "net",
                         "buffer",
+                        // The sub-path and later-added modules were all absent,
+                        // so `typeof require('tls')` and every one of these
+                        // reported "function". Measured against node v26.8.1 by
+                        // taking `typeof` of every builtin module. `path/posix`
+                        // is not listed because it resolves to the `path`
+                        // namespace, which already is.
+                        "path/win32",
+                        "fs/promises",
+                        "stream/promises",
+                        "stream/consumers",
+                        "stream/web",
+                        "timers/promises",
+                        "dns/promises",
+                        "https",
+                        "http2",
+                        "tls",
+                        "dgram",
+                        "cluster",
+                        "worker_threads",
+                        "readline",
+                        "repl",
+                        "vm",
+                        "domain",
+                        "trace_events",
+                        "wasi",
+                        "inspector",
                     ];
                     if NON_CALLABLE_NS.contains(&n.as_str()) {
                         "object"
