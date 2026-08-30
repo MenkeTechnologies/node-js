@@ -6275,11 +6275,14 @@ fn array_method_on(
             let items = array_items(recv);
             let holes = hole_set(recv);
             let target = arg0(&args);
+            let start = search_start(arg_num(&args, 1), items.len());
             let idx = with_host(|h| {
                 items
                     .iter()
                     .enumerate()
-                    .position(|(i, x)| !holes.contains(&i) && h.strict_eq(x, &target))
+                    .skip(start)
+                    .find(|(i, x)| !holes.contains(i) && h.strict_eq(x, &target))
+                    .map(|(i, _)| i)
             });
             Ok(Value::Float(idx.map(|i| i as f64).unwrap_or(-1.0)))
         }
@@ -6287,12 +6290,18 @@ fn array_method_on(
             let items = array_items(recv);
             let holes = hole_set(recv);
             let target = arg0(&args);
-            let idx = with_host(|h| {
-                items
-                    .iter()
-                    .enumerate()
-                    .rposition(|(i, x)| !holes.contains(&i) && h.strict_eq(x, &target))
-            });
+            let from = (args.len() > 1).then(|| arg_num(&args, 1));
+            let idx = match search_start_last(from, items.len()) {
+                None => None,
+                Some(start) => with_host(|h| {
+                    items[..=start]
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(i, x)| !holes.contains(i) && h.strict_eq(x, &target))
+                        .map(|(i, _)| i)
+                }),
+            };
             Ok(Value::Float(idx.map(|i| i as f64).unwrap_or(-1.0)))
         }
         "includes" => {
@@ -6300,8 +6309,9 @@ fn array_method_on(
             let items = array_items(recv);
             let target = arg0(&args);
             let tnan = matches!(target, Value::Float(f) if f.is_nan());
+            let start = search_start(arg_num(&args, 1), items.len());
             Ok(Value::Bool(with_host(|h| {
-                items.iter().any(|x| {
+                items.iter().skip(start).any(|x| {
                     (tnan && matches!(x, Value::Float(f) if f.is_nan())) || h.strict_eq(x, &target)
                 })
             })))
@@ -7444,6 +7454,57 @@ fn new_s(s: String) -> Value {
 
 /// `ToIntegerOrInfinity(n)` clamped into `0..=len` — the position argument of
 /// the `String.prototype` search methods. `NaN` (an absent argument) is `0`.
+/// Where a forward `indexOf`/`includes` search starts, given the optional
+/// `fromIndex` (23.1.3.17 steps 4-6, 23.1.3.16 steps 5-7). A negative value
+/// counts back from the end and clamps at 0; absent or `NaN` is 0. A start at
+/// or past the end finds nothing, which callers report as `-1` / `false`.
+pub(crate) fn search_start(n: f64, len: usize) -> usize {
+    if n.is_nan() {
+        return 0;
+    }
+    let n = n.trunc();
+    if n >= 0.0 {
+        if n >= len as f64 {
+            len
+        } else {
+            n as usize
+        }
+    } else {
+        let from_end = len as f64 + n;
+        if from_end <= 0.0 {
+            0
+        } else {
+            from_end as usize
+        }
+    }
+}
+
+/// The INCLUSIVE index a backward `lastIndexOf` starts at (23.1.3.20 steps
+/// 4-6), or `None` when `fromIndex` places it before the array. Absent means
+/// the last element — which is why this takes an `Option` rather than reading
+/// `NaN` as "absent" the way the forward form can: an explicit `NaN` is
+/// `ToIntegerOrInfinity`'d to 0 and searches only index 0.
+pub(crate) fn search_start_last(from: Option<f64>, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let n = match from {
+        None => return Some(len - 1),
+        Some(v) if v.is_nan() => 0.0,
+        Some(v) => v.trunc(),
+    };
+    if n >= 0.0 {
+        Some(if n >= len as f64 { len - 1 } else { n as usize })
+    } else {
+        let k = len as f64 + n;
+        if k < 0.0 {
+            None
+        } else {
+            Some(k as usize)
+        }
+    }
+}
+
 fn clamp_pos(n: f64, len: usize) -> usize {
     if n.is_nan() || n <= 0.0 {
         0

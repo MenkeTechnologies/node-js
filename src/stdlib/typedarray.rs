@@ -675,13 +675,13 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
         "lastIndexOf" => {
             let needle = args.first().cloned().unwrap_or(Value::Undef);
-            Ok(Value::Float(
-                elems
+            let from = (args.len() > 1).then(|| super::arg_num(args, 1));
+            let found = crate::builtins::search_start_last(from, elems.len()).and_then(|start| {
+                elems[..=start]
                     .iter()
                     .rposition(|x| same_element(x, &needle, false))
-                    .map(|p| p as f64)
-                    .unwrap_or(-1.0),
-            ))
+            });
+            Ok(Value::Float(found.map(|p| p as f64).unwrap_or(-1.0)))
         }
         "keys" | "values" | "entries" => {
             let items: Vec<Value> = with_host(|h| match method {
@@ -727,18 +727,24 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
         "indexOf" => {
             let needle = args.first().cloned().unwrap_or(Value::Undef);
+            let start = crate::builtins::search_start(super::arg_num(args, 1), elems.len());
             Ok(Value::Float(
                 elems
                     .iter()
+                    .skip(start)
                     .position(|x| same_element(x, &needle, false))
-                    .map(|p| p as f64)
+                    .map(|p| (p + start) as f64)
                     .unwrap_or(-1.0),
             ))
         }
         "includes" => {
             let needle = args.first().cloned().unwrap_or(Value::Undef);
+            let start = crate::builtins::search_start(super::arg_num(args, 1), elems.len());
             Ok(Value::Bool(
-                elems.iter().any(|x| same_element(x, &needle, true)),
+                elems
+                    .iter()
+                    .skip(start)
+                    .any(|x| same_element(x, &needle, true)),
             ))
         }
         "fill" => {
