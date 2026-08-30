@@ -90,3 +90,27 @@ console.log("reuse   ", "aaa".replace(reused, "x"), reused.test("aaa"), reused.l
 // return just the first match.
 try { [..."ab".matchAll(/a/)]; } catch (e) { console.log("matchAll", e.constructor.name, e.message); }
 console.log("global  ", [..."aa".matchAll(/a/g)].length);
+
+// The `d` flag (match indices, 22.2.7.8 MakeMatchIndicesIndexPairArray). The
+// flag itself parsed — `flags` and `hasIndices` both read correctly — but no
+// match ever carried `.indices`, so the whole point of it was missing.
+const show = (m) => JSON.stringify(m && m.indices);
+console.log("flags   ", /a/d.flags, /a/d.hasIndices, /a/.hasIndices, String(/a/dg), new RegExp("a", "dgimsuy").flags);
+console.log("basic   ", show(/b/d.exec("abc")), show(/(a)(b)/d.exec("xab")));
+// A group that did not participate reports `undefined`, not a pair.
+console.log("optional", show(/(a)?(b)/d.exec("b")));
+// Named groups mirror into `indices.groups`, which is null-prototype like
+// `groups` itself.
+const dated = /(?<y>\d{4})-(?<mo>\d{2})/d.exec("on 2024-05");
+console.log("named   ", show(dated), JSON.stringify(dated.indices.groups),
+  Object.getPrototypeOf(dated.indices.groups));
+// Offsets are UTF-16 indices, the same units `.index` uses.
+console.log("units   ", show(/b/d.exec("ab")), /b/d.exec("ab").index);
+// Without the flag there are no indices at all.
+console.log("absent  ", String(/(a)/.exec("a").indices));
+// Every entry point that produces a match array carries them.
+console.log("paths   ", show("xay".match(/a/d)),
+  [...("aa".matchAll(/a/dg))].map(show).join(" "));
+const sticky = /a/dy;
+sticky.lastIndex = 1;
+console.log("sticky  ", show(sticky.exec("ba")));

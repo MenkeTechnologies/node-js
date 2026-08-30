@@ -720,6 +720,14 @@ kept     3 2
 reuse    xxx true 1
 matchAll TypeError String.prototype.matchAll called with a non-global RegExp argument
 global   2
+flags    d true false /a/dg dgimsuy
+basic    [[1,2]] [[1,3],[1,2],[2,3]]
+optional [[0,1],null,[0,1]]
+named    [[3,10],[3,7],[8,10]] {"y":[3,7],"mo":[8,10]} null
+units    [[1,2]] 1
+absent   undefined
+paths    [[1,2]] [[0,1]] [[1,2]]
+sticky   [[1,2]]
 ==== streams.js ====
 transform A,B,C
 filter    keep,last

@@ -380,6 +380,14 @@ fn regexp_snapshot(recv: &Value) -> Option<(Rc<Regex>, bool, bool, U16Index)> {
     })
 }
 
+/// Whether the regexp carries the `d` flag, so its matches report `.indices`.
+fn has_indices(recv: &Value) -> bool {
+    with_host(|h| match h.get(recv) {
+        Some(JsObj::RegExp(r)) => r.flags.contains('d'),
+        _ => false,
+    })
+}
+
 fn set_last_index(recv: &Value, idx: U16Index) {
     with_host(|h| {
         if let Some(JsObj::RegExp(r)) = h.get_mut(recv) {
@@ -468,12 +476,13 @@ pub fn regexp_exec(recv: &Value, s: &str) -> Result<Value, String> {
     if global || sticky {
         set_last_index(recv, index_of_byte(s, whole.end()));
     }
-    Ok(build_match_array(&re, &caps, s))
+    Ok(build_match_array(&re, &caps, s, has_indices(recv)))
 }
 
 /// Build the JS match-result array from a `Captures`, attaching `.index`,
-/// `.input`, and (named-group) `.groups`.
-fn build_match_array(re: &Regex, caps: &Captures, s: &str) -> Value {
+/// `.input`, and (named-group) `.groups` — plus `.indices` when the regexp
+/// carried the `d` flag (22.2.7.2 step 34, `MakeMatchIndicesIndexPairArray`).
+fn build_match_array(re: &Regex, caps: &Captures, s: &str, indices: bool) -> Value {
     let mut items: Vec<Value> = Vec::with_capacity(caps.len());
     for i in 0..caps.len() {
         items.push(match caps.get(i) {
@@ -492,6 +501,9 @@ fn build_match_array(re: &Regex, caps: &Captures, s: &str) -> Value {
     });
     // Named groups → a `.groups` object (or `undefined` if the regex has none).
     let names: Vec<&str> = re.capture_names().flatten().collect();
+    if indices {
+        attach_indices(caps, s, &arr, &names);
+    }
     if names.is_empty() {
         with_host(|h| h.set_fn_prop(&arr, "groups", Value::Undef));
     } else {
@@ -515,6 +527,45 @@ fn build_match_array(re: &Regex, caps: &Captures, s: &str) -> Value {
     arr
 }
 
+/// `MakeMatchIndicesIndexPairArray` (22.2.7.8): a `[start, end]` pair per
+/// capture — `null` for one that did not participate — with a null-prototype
+/// `.groups` mirroring the named groups. Offsets are UTF-16 indices, the same
+/// units `.index` uses.
+fn attach_indices(caps: &Captures, s: &str, arr: &Value, names: &[&str]) {
+    let pair = |m: Option<fancy_regex::Match>| match m {
+        Some(m) => {
+            let (a, b) = (index_of_byte(s, m.start()), index_of_byte(s, m.end()));
+            with_host(|h| {
+                h.new_array(vec![
+                    Value::Float(a.get() as f64),
+                    Value::Float(b.get() as f64),
+                ])
+            })
+        }
+        None => Value::Undef,
+    };
+    let mut pairs: Vec<Value> = Vec::with_capacity(caps.len());
+    for i in 0..caps.len() {
+        pairs.push(pair(caps.get(i)));
+    }
+    let idx_arr = with_host(|h| h.new_array(pairs));
+    if names.is_empty() {
+        with_host(|h| h.set_fn_prop(&idx_arr, "groups", Value::Undef));
+    } else {
+        let mut g: IndexMap<String, Value> = IndexMap::new();
+        for name in names {
+            g.insert((*name).to_string(), pair(caps.name(name)));
+        }
+        with_host(|h| {
+            let obj = h.new_object(g);
+            let null = h.null();
+            h.set_proto(&obj, null);
+            h.set_fn_prop(&idx_arr, "groups", obj);
+        });
+    }
+    with_host(|h| h.set_fn_prop(arr, "indices", idx_arr));
+}
+
 // ── String.prototype regex methods (called from builtins::string_method) ──────
 
 /// `str.match(re)`: without `g`, same as `exec` (array or null); with `g`, an
@@ -526,7 +577,7 @@ pub fn str_match(s: &str, re_val: &Value) -> Result<Value, String> {
     if !global {
         // Non-global match ignores lastIndex and searches from the start.
         set_last_index(re_val, U16Index::ZERO);
-        return regexp_exec_from_zero(&re, s);
+        return regexp_exec_from_zero(&re, s, has_indices(re_val));
     }
     // 22.2.6.9 step 6.a: a global match sets `lastIndex` to 0 before it starts,
     // so it always collects from the beginning and leaves it there. It was
@@ -545,9 +596,9 @@ pub fn str_match(s: &str, re_val: &Value) -> Result<Value, String> {
 }
 
 /// Non-global exec searching from offset 0 (for `str.match` without `g`).
-fn regexp_exec_from_zero(re: &Regex, s: &str) -> Result<Value, String> {
+fn regexp_exec_from_zero(re: &Regex, s: &str, indices: bool) -> Result<Value, String> {
     match re.captures(s).ok().flatten() {
-        Some(caps) => Ok(build_match_array(re, &caps, s)),
+        Some(caps) => Ok(build_match_array(re, &caps, s, indices)),
         None => Ok(with_host(|h| h.null())),
     }
 }
@@ -558,6 +609,7 @@ pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
     let Some((re, global, _, _)) = regexp_snapshot(re_val) else {
         return Ok(with_host(|h| h.new_array(Vec::new())));
     };
+    let indices = has_indices(re_val);
     // 22.1.3.14 step 5.c: a non-global regexp is a TypeError, because
     // `matchAll` cannot produce every match without `g` — the same rule
     // `replaceAll` enforces. This used to return just the first match.
@@ -568,7 +620,7 @@ pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
     }
     let mut items = Vec::new();
     for caps in re.captures_iter(s).flatten() {
-        items.push(build_match_array(&re, &caps, s));
+        items.push(build_match_array(&re, &caps, s, indices));
     }
     // Return a live iterator so `for-of`/spread/`Array.from` all work.
     Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
