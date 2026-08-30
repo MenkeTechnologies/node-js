@@ -533,6 +533,22 @@ nonobj   TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError
 object   true
 others   true 0,1,length T1
 protos   null true
+get      TypeError allowed
+set      TypeError
+has      TypeError
+delete   TypeError
+gopd     TypeError
+ownKeys  TypeError TypeError
+nonext   TypeError TypeError
+proto    TypeError
+defineP  TypeError
+honest   get:k:true,set:j:2,has:k,ownKeys 2
+callable 42 1
+forward  set:a,defineProperty:a 1 1
+receiver true 0 9 true
+setter   5 false
+refused  false 1 false
+no-setter false false
 ==== regexp.js ====
 true true false
 a b

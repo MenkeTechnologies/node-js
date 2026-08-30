@@ -112,10 +112,35 @@ fn call(t: &Value, handler: &Value, args: Vec<Value>) -> Result<Value, String> {
 // ── the thirteen traps ───────────────────────────────────────────────────────
 
 /// `[[Get]]`. `Ok(None)` → not a proxy; the caller proceeds normally.
+// ── trap invariants (10.5) ──────────────────────────────────────────────────
+//
+// A proxy may lie about most things, but not about a property the TARGET has
+// pinned. None of these checks existed: a trap could report a different value
+// for a non-configurable non-writable property, hide one from `in` or
+// `ownKeys`, claim a frozen object was extensible, or report a prototype an
+// unextensible target does not have. Every one is what a membrane or a
+// hardened-JS shim relies on to know a frozen thing stays frozen.
+fn invariant(msg: &str) -> String {
+    host::type_error(msg)
+}
+
 pub fn get(v: &Value, key: &str, receiver: &Value) -> Result<Option<Value>, String> {
     if let Some((t, target, handler)) = trap(v, "get")? {
         let k = key_value(key);
-        return call(&t, &handler, vec![target, k, receiver.clone()]).map(Some);
+        let got = call(&t, &handler, vec![target.clone(), k, receiver.clone()])?;
+        // A non-configurable non-writable data property must be reported as it
+        // is on the target.
+        if let Some((val, writable, configurable, is_accessor)) =
+            crate::builtins::own_prop_facts(&target, key)
+        {
+            if !configurable && !is_accessor && !writable && !with_host(|h| h.strict_eq(&got, &val))
+            {
+                return Err(invariant(&format!(
+                    "'get' on proxy: property '{key}' is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value"
+                )));
+            }
+        }
+        return Ok(Some(got));
     }
     match no_trap(v, "get")? {
         Some(target) => crate::builtins::get_property_recv(&target, key, receiver).map(Some),
@@ -127,7 +152,22 @@ pub fn get(v: &Value, key: &str, receiver: &Value) -> Result<Option<Value>, Stri
 pub fn set(v: &Value, key: &str, val: &Value, receiver: &Value) -> Result<bool, String> {
     if let Some((t, target, handler)) = trap(v, "set")? {
         let k = key_value(key);
-        call(&t, &handler, vec![target, k, val.clone(), receiver.clone()])?;
+        call(
+            &t,
+            &handler,
+            vec![target.clone(), k, val.clone(), receiver.clone()],
+        )?;
+        // Reporting success for a write the target pins is a lie.
+        if let Some((cur, writable, configurable, is_accessor)) =
+            crate::builtins::own_prop_facts(&target, key)
+        {
+            if !configurable && !is_accessor && !writable && !with_host(|h| h.strict_eq(val, &cur))
+            {
+                return Err(invariant(&format!(
+                    "'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
+                )));
+            }
+        }
         return Ok(true);
     }
     match no_trap(v, "set")? {
@@ -143,8 +183,20 @@ pub fn set(v: &Value, key: &str, val: &Value, receiver: &Value) -> Result<bool, 
 pub fn has(v: &Value, key: &str) -> Result<Option<bool>, String> {
     if let Some((t, target, handler)) = trap(v, "has")? {
         let k = key_value(key);
-        let r = call(&t, &handler, vec![target, k])?;
-        return Ok(Some(with_host(|h| h.truthy(&r))));
+        let r = call(&t, &handler, vec![target.clone(), k])?;
+        let reported = with_host(|h| h.truthy(&r));
+        // A non-configurable property, or any property of a non-extensible
+        // target, cannot be hidden from `in`.
+        if !reported {
+            if let Some((_, _, configurable, _)) = crate::builtins::own_prop_facts(&target, key) {
+                if !configurable || !with_host(|h| h.is_extensible(&target)) {
+                    return Err(invariant(&format!(
+                        "'has' on proxy: trap returned falsish for property '{key}' which exists in the proxy target as non-configurable"
+                    )));
+                }
+            }
+        }
+        return Ok(Some(reported));
     }
     match no_trap(v, "has")? {
         Some(target) => crate::builtins::has_property(&target, key).map(Some),
@@ -156,8 +208,19 @@ pub fn has(v: &Value, key: &str) -> Result<Option<bool>, String> {
 pub fn delete(v: &Value, key: &str) -> Result<Option<bool>, String> {
     if let Some((t, target, handler)) = trap(v, "deleteProperty")? {
         let k = key_value(key);
-        let r = call(&t, &handler, vec![target, k])?;
-        return Ok(Some(with_host(|h| h.truthy(&r))));
+        let r = call(&t, &handler, vec![target.clone(), k])?;
+        let reported = with_host(|h| h.truthy(&r));
+        // A non-configurable property cannot be reported as deleted.
+        if reported {
+            if let Some((_, _, configurable, _)) = crate::builtins::own_prop_facts(&target, key) {
+                if !configurable {
+                    return Err(invariant(&format!(
+                        "'deleteProperty' on proxy: trap returned truish for property '{key}' which is non-configurable in the proxy target"
+                    )));
+                }
+            }
+        }
+        return Ok(Some(reported));
     }
     match no_trap(v, "deleteProperty")? {
         Some(target) => crate::builtins::delete_property(&target, key).map(Some),
@@ -169,11 +232,58 @@ pub fn delete(v: &Value, key: &str) -> Result<Option<bool>, String> {
 /// `@@sym:<id>` — the form the rest of the runtime indexes by).
 pub fn own_keys(v: &Value) -> Result<Option<Vec<String>>, String> {
     if let Some((t, target, handler)) = trap(v, "ownKeys")? {
-        let r = call(&t, &handler, vec![target])?;
+        let r = call(&t, &handler, vec![target.clone()])?;
         let items = with_host(|h| h.iter_vec(&r))?;
         let mut out = Vec::with_capacity(items.len());
         for k in items {
             out.push(host::to_property_key(&k)?);
+        }
+        // The list must contain no duplicates …
+        let mut seen: Vec<&String> = Vec::with_capacity(out.len());
+        for k in &out {
+            if seen.contains(&k) {
+                return Err(invariant(&format!(
+                    "'ownKeys' on proxy: trap returned duplicate entries for property '{k}'"
+                )));
+            }
+            seen.push(k);
+        }
+        // … must include every non-configurable own key of the target …
+        let target_keys = with_host(|h| {
+            let mut ks = h.own_key_names(&target, false);
+            ks.extend(
+                h.own_symbol_keys(&target)
+                    .iter()
+                    .map(|sym| h.property_key(sym))
+                    .collect::<Vec<_>>(),
+            );
+            ks
+        });
+        for k in &target_keys {
+            let pinned =
+                crate::builtins::own_prop_facts(&target, k).is_some_and(|(_, _, conf, _)| !conf);
+            if pinned && !out.contains(k) {
+                return Err(invariant(&format!(
+                    "'ownKeys' on proxy: trap result did not include '{k}'"
+                )));
+            }
+        }
+        // … and, for a NON-EXTENSIBLE target, must be exactly its own keys.
+        if !with_host(|h| h.is_extensible(&target)) {
+            for k in &target_keys {
+                if !out.contains(k) {
+                    return Err(invariant(&format!(
+                        "'ownKeys' on proxy: trap result did not include '{k}'"
+                    )));
+                }
+            }
+            for k in &out {
+                if !target_keys.contains(k) {
+                    return Err(invariant(
+                        "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible",
+                    ));
+                }
+            }
         }
         return Ok(Some(out));
     }
@@ -196,7 +306,18 @@ pub fn own_keys(v: &Value) -> Result<Option<Vec<String>>, String> {
 pub fn get_own_descriptor(v: &Value, key: &str) -> Result<Option<Value>, String> {
     if let Some((t, target, handler)) = trap(v, "getOwnPropertyDescriptor")? {
         let k = key_value(key);
-        return call(&t, &handler, vec![target, k]).map(Some);
+        let d = call(&t, &handler, vec![target.clone(), k])?;
+        // A non-configurable property cannot be reported as absent.
+        if matches!(d, Value::Undef) {
+            if let Some((_, _, configurable, _)) = crate::builtins::own_prop_facts(&target, key) {
+                if !configurable {
+                    return Err(invariant(&format!(
+                        "'getOwnPropertyDescriptor' on proxy: trap returned undefined for property '{key}' which is non-configurable in the proxy target"
+                    )));
+                }
+            }
+        }
+        return Ok(Some(d));
     }
     match no_trap(v, "getOwnPropertyDescriptor")? {
         Some(target) => {
@@ -211,7 +332,15 @@ pub fn get_own_descriptor(v: &Value, key: &str) -> Result<Option<Value>, String>
 pub fn define_property(v: &Value, key: &str, desc: &Value) -> Result<bool, String> {
     if let Some((t, target, handler)) = trap(v, "defineProperty")? {
         let k = key_value(key);
-        call(&t, &handler, vec![target, k, desc.clone()])?;
+        call(&t, &handler, vec![target.clone(), k, desc.clone()])?;
+        // A new property cannot be added to a non-extensible target.
+        if crate::builtins::own_prop_facts(&target, key).is_none()
+            && !with_host(|h| h.is_extensible(&target))
+        {
+            return Err(invariant(&format!(
+                "'defineProperty' on proxy: trap returned truish for adding property '{key}' to the non-extensible proxy target"
+            )));
+        }
         return Ok(true);
     }
     match no_trap(v, "defineProperty")? {
@@ -227,7 +356,18 @@ pub fn define_property(v: &Value, key: &str, desc: &Value) -> Result<bool, Strin
 /// `[[GetPrototypeOf]]`.
 pub fn get_prototype_of(v: &Value) -> Result<Option<Value>, String> {
     if let Some((t, target, handler)) = trap(v, "getPrototypeOf")? {
-        return call(&t, &handler, vec![target]).map(Some);
+        let reported = call(&t, &handler, vec![target.clone()])?;
+        // A non-extensible target's prototype is fixed, so it must be reported
+        // as it is.
+        if !with_host(|h| h.is_extensible(&target)) {
+            let actual = crate::builtins::prototype_of(&target);
+            if !with_host(|h| h.strict_eq(&reported, &actual)) {
+                return Err(invariant(
+                    "'getPrototypeOf' on proxy: proxy target is non-extensible but the trap did not return its actual prototype",
+                ));
+            }
+        }
+        return Ok(Some(reported));
     }
     match no_trap(v, "getPrototypeOf")? {
         Some(target) => Ok(Some(crate::builtins::prototype_of(&target))),
@@ -253,8 +393,16 @@ pub fn set_prototype_of(v: &Value, proto: &Value) -> Result<bool, String> {
 /// `[[IsExtensible]]`.
 pub fn is_extensible(v: &Value) -> Result<Option<bool>, String> {
     if let Some((t, target, handler)) = trap(v, "isExtensible")? {
-        let r = call(&t, &handler, vec![target])?;
-        return Ok(Some(with_host(|h| h.truthy(&r))));
+        // Extensibility cannot be misreported: the answer must match the
+        // target's, so a frozen target cannot be passed off as open.
+        let reported = call(&t, &handler, vec![target.clone()])?;
+        let reported = with_host(|h| h.truthy(&reported));
+        if reported != with_host(|h| h.is_extensible(&target)) {
+            return Err(invariant(
+                "'isExtensible' on proxy: trap result does not reflect extensibility of proxy target",
+            ));
+        }
+        return Ok(Some(reported));
     }
     match no_trap(v, "isExtensible")? {
         Some(target) => Ok(Some(with_host(|h| h.is_extensible(&target)))),

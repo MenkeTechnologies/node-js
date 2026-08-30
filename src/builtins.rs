@@ -1942,6 +1942,92 @@ pub fn set_property_pub(recv: &Value, name: &str, val: Value) -> Result<(), Stri
     set_property(recv, name, val)
 }
 
+/// An object's OWN property as `(value, writable, configurable, is_accessor)`,
+/// or `None` when it has none. Reads through a Proxy's
+/// `getOwnPropertyDescriptor` trap, so it answers for any object.
+pub fn own_prop_facts(obj: &Value, key: &str) -> Option<(Value, bool, bool, bool)> {
+    let k = with_host(|h| h.new_str(key.to_string()));
+    let d = own_descriptor_pub(obj, k).ok()?;
+    if matches!(d, Value::Undef) {
+        return None;
+    }
+    let field = |n: &str| get_property(&d, n).unwrap_or(Value::Undef);
+    // Each read is hoisted out of the `with_host` borrow: `get_property` takes
+    // the host itself, so reading inside the closure double-borrows.
+    let value = field("value");
+    let writable = field("writable");
+    let configurable = field("configurable");
+    let truthy = |v: &Value| with_host(|h| h.truthy(v));
+    let is_accessor = with_host(|h| host::lookup_chain(h, &d, "get").is_some());
+    Some((value, truthy(&writable), truthy(&configurable), is_accessor))
+}
+
+/// `OrdinarySetWithOwnDescriptor` (10.1.9.2) with a receiver distinct from the
+/// object the lookup started on — what `Reflect.set(t, k, v, receiver)` and a
+/// proxy `set` trap forwarding to it both need.
+///
+/// The distinction that matters: an accessor found on `target`'s chain RUNS,
+/// with `receiver` as `this`; a data property does not write to `target` at all
+/// but is CREATED on `receiver` through its `[[DefineOwnProperty]]`. Routing
+/// that second case back through `[[Set]]` made a proxy receiver re-enter its
+/// own `set` trap forever — the trap body `Reflect.set(t, k, v, recv)` is the
+/// documented way to forward a write, so the recursion hit every faithful
+/// handler.
+pub fn set_with_receiver(
+    target: &Value,
+    key: &str,
+    val: Value,
+    receiver: &Value,
+) -> Result<bool, String> {
+    // A proxy target answers through its own trap, which re-enters here with
+    // whatever receiver the handler passes on.
+    if crate::proxy::parts(target).is_some() {
+        return crate::proxy::set(target, key, &val, receiver);
+    }
+    // An accessor anywhere on the target's chain wins, and sees `receiver`.
+    if let Some((_, setter)) = with_host(|h| host::lookup_accessor(h, target, key)) {
+        return match setter {
+            Some(s) => {
+                host::invoke(&s, vec![val], Some(receiver.clone()))?;
+                Ok(true)
+            }
+            // A getter with no setter refuses the write rather than shadowing it.
+            None => Ok(false),
+        };
+    }
+    if !with_host(|h| h.can_write_prop(target, key)) {
+        return Ok(false);
+    }
+    // Steps 3.b-3.d: only an object can receive the property, and its OWN
+    // property decides — an accessor or a read-only slot refuses, and every
+    // other case defines a plain data property.
+    if !matches!(receiver, Value::Obj(_)) {
+        return Ok(false);
+    }
+    if let Some((_, writable, _, is_accessor)) = own_prop_facts(receiver, key) {
+        if is_accessor || !writable {
+            return Ok(false);
+        }
+    }
+    // Steps 3.d.iii and 3.e both DEFINE, they do not assign: a setter inherited
+    // by the receiver must not run, and a proxy receiver must reach its
+    // `defineProperty` trap rather than its `set` trap.
+    let desc = with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert("value".into(), val);
+        m.insert("writable".into(), Value::Bool(true));
+        m.insert("enumerable".into(), Value::Bool(true));
+        m.insert("configurable".into(), Value::Bool(true));
+        h.new_object(m)
+    });
+    if crate::proxy::parts(receiver).is_some() {
+        return crate::proxy::define_property(receiver, key, &desc);
+    }
+    let k = with_host(|h| h.new_str(key.to_string()));
+    define_property_pub(receiver, k, desc)?;
+    Ok(true)
+}
+
 /// The `TypeError` a refused write raises in strict code, worded as V8 does.
 ///
 /// Adding a key to a non-extensible object reports differently from assigning
@@ -4174,12 +4260,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
             let v = args.get(2).cloned().unwrap_or(Value::Undef);
             let receiver = args.get(3).cloned().unwrap_or_else(|| obj.clone());
-            if let Some((_, Some(setter))) = with_host(|h| host::lookup_accessor(h, &obj, &k)) {
-                let _ = host::invoke(&setter, vec![v], Some(receiver));
-                return Ok(Value::Bool(true));
-            }
-            let _ = set_property(&receiver, &k, v);
-            Ok(Value::Bool(true))
+            Ok(Value::Bool(set_with_receiver(&obj, &k, v, &receiver)?))
         }
         "JSON.stringify" => json_stringify(args),
         "JSON.parse" => json_parse(args),
