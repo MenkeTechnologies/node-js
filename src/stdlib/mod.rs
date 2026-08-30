@@ -179,6 +179,7 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "net" => net::MODULE_METHODS,
         "http" => http::MODULE_METHODS,
         "stream" => stream::METHODS,
+        n if stream::is_class(n) => stream::STATIC_METHODS,
         "worker_threads" => worker_threads::METHODS,
         "zlib" => zlib::MODULE_METHODS,
         "querystring" => querystring::METHODS,
@@ -299,6 +300,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
             h.alloc(JsObj::Builtin("EventEmitter".into()))
         })),
         "EventEmitter" => events::static_call(m, args)?,
+        n if stream::is_class(n) => stream::static_call(n, m, args)?,
         "console" => console::call(m, args)?,
         "child_process" => child_process::call(m, args)?,
         "dns" => dns::call(m, args)?,

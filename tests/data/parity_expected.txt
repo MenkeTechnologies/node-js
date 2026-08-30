@@ -433,6 +433,18 @@ abab xx
 ["a","b",""] ["",""]
 ["a","b"] ["a","1","b"] []
 ["",""] ["a","","b"]
+==== streams.js ====
+transform A,B,C
+filter    keep,last
+writable  w:1,w:2
+sides-r   true undefined false
+sides-w   undefined true false
+sides-pt  true true
+after-end false
+from      arr:1,arr:2,str:ab,set:s,gen:g1,gen:g2
+statics   function function function
+in-finish false
+ended     false
 ==== strings.js ====
 HELLO, WORLD hello, world 12
 World World Hello d

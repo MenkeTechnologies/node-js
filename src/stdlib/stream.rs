@@ -79,12 +79,35 @@ pub fn construct(name: &str, args: &[Value]) -> Value {
     // class name, so a custom sink silently swallowed every chunk. Keep the
     // callbacks the write path uses.
     if let Some(opts) = args.first() {
-        for (opt, key) in [("write", "@@writeImpl"), ("final", "@@finalImpl")] {
+        // `new Transform({ transform(chunk, enc, cb) {…} })` supplies the
+        // conversion the stream exists to perform. It was discarded like the
+        // `write` option once was, so a Transform passed every chunk through
+        // UNCHANGED and still looked like it worked.
+        for (opt, key) in [
+            ("write", "@@writeImpl"),
+            ("final", "@@finalImpl"),
+            ("transform", "@@transformImpl"),
+            ("flush", "@@flushImpl"),
+        ] {
             if let Some(f) = opt_callable(opts, opt) {
                 extra.insert(key.into(), f);
             }
         }
     }
+    // `readable`/`writable`/`destroyed` are live PROPERTIES on a node stream and
+    // read back as `undefined` here — the internal `@@ended`/`@@finished`/
+    // `@@destroyed` flags existed but nothing exposed them. `emit_event` keeps
+    // them in step as the lifecycle events fire.
+    // Only the side that APPLIES gets a property: node leaves `writable`
+    // undefined on a plain Readable rather than reporting false, and a library
+    // distinguishing a duplex from a one-way stream tests exactly that.
+    if matches!(name, "Readable" | "Duplex" | "Transform" | "PassThrough") {
+        extra.insert("readable".into(), Value::Bool(true));
+    }
+    if matches!(name, "Writable" | "Duplex" | "Transform" | "PassThrough") {
+        extra.insert("writable".into(), Value::Bool(true));
+    }
+    extra.insert("destroyed".into(), Value::Bool(false));
     super::net::new_emitter_object(name, extra)
 }
 
@@ -118,6 +141,115 @@ fn hidden_prop(recv: &Value, key: &str) -> Option<Value> {
         Some(JsObj::Object(m)) => m.get(key).cloned(),
         _ => None,
     })
+}
+
+/// Take one written chunk: hand it to whichever implementation the constructor
+/// was given, and emit what comes out.
+///
+/// A `transform` implementation decides the output itself — it calls back with
+/// the converted chunk — so the raw one must NOT also be emitted. A `write`
+/// implementation is a sink and emits the chunk unchanged.
+fn accept_chunk(recv: &Value, chunk: &Value) -> Result<(), String> {
+    if let Some(f) = hidden_prop(recv, "@@transformImpl") {
+        let enc = with_host(|h| h.new_str("utf8".to_string()));
+        let cb = match recv {
+            Value::Obj(i) => with_host(|h| h.alloc(JsObj::Builtin(format!("@@transformCb:{i}")))),
+            _ => Value::Undef,
+        };
+        crate::host::invoke(&f, vec![chunk.clone(), enc, cb], None)?;
+        return Ok(());
+    }
+    run_write_impl(recv, chunk)?;
+    emit_event(recv, "data", vec![chunk.clone()])?;
+    Ok(())
+}
+
+/// The callback a `transform` implementation invokes: `cb(err, chunk)`. A
+/// nullish chunk contributes nothing, matching `push(null)`-style suppression.
+pub fn transform_callback(recv: &Value, args: &[Value]) -> Result<(), String> {
+    if let Some(err) = args.first().filter(|e| !with_host(|h| h.is_nullish(e))) {
+        emit_event(recv, "error", vec![err.clone()])?;
+        return Ok(());
+    }
+    if let Some(out) = args.get(1).filter(|c| !with_host(|h| h.is_nullish(c))) {
+        emit_event(recv, "data", vec![out.clone()])?;
+    }
+    Ok(())
+}
+
+/// Statics on the stream CONSTRUCTORS (`Readable.from`, not `stream.from`).
+pub const STATIC_METHODS: &[&str] = &["from", "isDisturbed"];
+
+/// `Readable.from(iterable)` / `Duplex.from(iterable)`.
+///
+/// The whole point of it is that a caller attaches its `data` listener AFTER
+/// the call returns, so the items cannot be emitted while building the stream —
+/// this model emits `data` synchronously from `push`, and pushing here would
+/// fire every chunk into a stream nobody is listening to yet. The items are
+/// queued and drained from a microtask instead, which is the same "next tick"
+/// ordering node gives.
+pub fn static_call(cls: &str, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    Some(match method {
+        "from" => Ok(from_iterable(cls, args)),
+        "isDisturbed" => Ok(Value::Bool(
+            hidden_prop(
+                &args.first().cloned().unwrap_or(Value::Undef),
+                "@@disturbed",
+            )
+            .is_some_and(|v| with_host(|h| h.truthy(&v))),
+        )),
+        _ => return None,
+    })
+}
+
+fn from_iterable(cls: &str, args: &[Value]) -> Value {
+    let src = args.first().cloned().unwrap_or(Value::Undef);
+    // A string (or Buffer) is ONE chunk, not one per character — node yields
+    // `'ab'` whole from `Readable.from('ab')`, and iterating it would turn every
+    // string source into a stream of single characters.
+    let whole = with_host(|h| h.as_str(&src).is_some())
+        || super::native_tag(&src).as_deref() == Some("Buffer");
+    let items = if whole {
+        vec![src.clone()]
+    } else {
+        crate::host::iter_all(&src).unwrap_or_default()
+    };
+    let stream = construct(
+        if cls == "Duplex" {
+            "Duplex"
+        } else {
+            "Readable"
+        },
+        &[],
+    );
+    if let Some(q) = queue_of(&stream) {
+        with_host(|h| {
+            if let Some(JsObj::Array(dst)) = h.get_mut(&q) {
+                dst.extend(items);
+            }
+        });
+    }
+    if let Value::Obj(i) = stream {
+        let thunk = with_host(|h| h.alloc(JsObj::Builtin(format!("@@streamFlush:{i}"))));
+        with_host(|h| h.queue_micro(thunk, Vec::new()));
+    }
+    stream
+}
+
+/// Drain a `Readable.from` queue: one `data` per item, then `end`.
+pub fn flush_from(recv: &Value) -> Result<(), String> {
+    let items = match queue_of(recv) {
+        Some(q) => with_host(|h| match h.get_mut(&q) {
+            Some(JsObj::Array(v)) => std::mem::take(v),
+            _ => Vec::new(),
+        }),
+        None => Vec::new(),
+    };
+    for item in items {
+        emit_event(recv, "data", vec![item])?;
+    }
+    emit_event(recv, "end", Vec::new())?;
+    Ok(())
 }
 
 /// Module free-function dispatch (`stream.finished`, `stream.isReadable`, …).
@@ -180,6 +312,16 @@ fn flag(recv: &Value, key: &str) -> bool {
         Some(JsObj::Object(p)) => p.get(key).map(|v| h.truthy(v)).unwrap_or(false),
         _ => false,
     })
+}
+
+/// Mark one side of a stream closed — but only if that side existed. A plain
+/// Readable has no `writable` property at all and must not gain one.
+fn clear_side(recv: &Value, key: &str) {
+    let present =
+        with_host(|h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key(key)));
+    if present {
+        set_flag(recv, key, Value::Bool(false));
+    }
 }
 
 fn set_flag(recv: &Value, key: &str, v: Value) {
@@ -253,11 +395,25 @@ fn take_finished(recv: &Value) -> Vec<Value> {
 fn emit_event(recv: &Value, name: &str, extra: Vec<Value>) -> Result<Value, String> {
     let mut a = vec![with_host(|h| h.new_str(name))];
     a.extend(extra.iter().cloned());
-    let r = super::events::instance_call(recv, "emit", a)?;
+    // The state change lands BEFORE the listeners run: by the time `end` fires,
+    // node already reports `readable === false`, and a handler that checks is
+    // asking about the stream it is being told about. Setting the flags after
+    // the emit showed handlers the previous state.
     match name {
-        "end" => set_flag(recv, "@@ended", Value::Bool(true)),
-        "finish" => set_flag(recv, "@@finished", Value::Bool(true)),
-        "close" => set_flag(recv, "@@destroyed", Value::Bool(true)),
+        "end" => {
+            set_flag(recv, "@@ended", Value::Bool(true));
+            clear_side(recv, "readable");
+        }
+        "finish" => {
+            set_flag(recv, "@@finished", Value::Bool(true));
+            clear_side(recv, "writable");
+        }
+        "close" => {
+            set_flag(recv, "@@destroyed", Value::Bool(true));
+            set_flag(recv, "destroyed", Value::Bool(true));
+            clear_side(recv, "readable");
+            clear_side(recv, "writable");
+        }
         "error" => set_flag(
             recv,
             "@@errored",
@@ -265,6 +421,7 @@ fn emit_event(recv: &Value, name: &str, extra: Vec<Value>) -> Result<Value, Stri
         ),
         _ => {}
     }
+    let r = super::events::instance_call(recv, "emit", a)?;
     if matches!(name, "end" | "finish" | "close" | "error") {
         let cbs = take_finished(recv);
         let arg = if name == "error" {
@@ -382,14 +539,12 @@ pub fn instance_call(
     match method {
         "write" => {
             let chunk = args.first().cloned().unwrap_or(Value::Undef);
-            run_write_impl(recv, &chunk)?;
-            emit_event(recv, "data", vec![chunk])?;
+            accept_chunk(recv, &chunk)?;
             Ok(Value::Bool(true))
         }
         "end" => {
             if let Some(chunk) = args.first().filter(|v| !matches!(v, Value::Undef)) {
-                run_write_impl(recv, chunk)?;
-                emit_event(recv, "data", vec![chunk.clone()])?;
+                accept_chunk(recv, chunk)?;
             }
             emit_event(recv, "finish", vec![])?;
             emit_event(recv, "end", vec![])?;

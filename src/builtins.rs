@@ -4012,6 +4012,18 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "JSON.stringify" => json_stringify(args),
         "JSON.parse" => json_parse(args),
         "structuredClone" => Ok(deep_clone(&arg0(&args))),
+        // The deferred drain a `Readable.from` schedules; the suffix is the
+        // stream's heap index.
+        _ if name.starts_with("@@transformCb:") => {
+            let idx: u32 = name["@@transformCb:".len()..].parse().unwrap_or(0);
+            crate::stdlib::stream::transform_callback(&Value::Obj(idx), &args)?;
+            Ok(Value::Undef)
+        }
+        _ if name.starts_with("@@streamFlush:") => {
+            let idx: u32 = name["@@streamFlush:".len()..].parse().unwrap_or(0);
+            crate::stdlib::stream::flush_from(&Value::Obj(idx))?;
+            Ok(Value::Undef)
+        }
         // Same implementation the `buffer` module exposes; only the binding was
         // missing.
         "btoa" | "atob" => crate::stdlib::buffer::module_call(name, &args)
