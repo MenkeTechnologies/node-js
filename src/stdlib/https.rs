@@ -256,8 +256,23 @@ pub fn feed(sock_id: u64, _socket: &Value, bytes: &[u8]) -> Result<(), String> {
         if with_host(|h| crate::host::is_callable(h, &listener)) {
             invoke(&listener, vec![req.clone(), res], None)?;
         }
+        // A listener that called `req.setEncoding(enc)` gets a decoded string
+        // chunk instead of a Buffer, matching Node's Readable — and matching
+        // `http::feed`, which has done this all along. Without it
+        // `setEncoding` was accepted over TLS and then ignored: the same
+        // handler saw a string over http and a Buffer over https.
         if !parsed.body.is_empty() {
-            let chunk = super::buffer::from_bytes(&parsed.body);
+            let encoding = with_host(|h| match h.get(&req) {
+                Some(JsObj::Object(p)) => p.get("@@encoding").map(|v| h.str_of(v)),
+                _ => None,
+            });
+            let chunk = match encoding {
+                Some(enc) => with_host(|h| {
+                    let s = super::buffer::encode_bytes(&parsed.body, &enc);
+                    h.new_str(s)
+                }),
+                None => super::buffer::from_bytes(&parsed.body),
+            };
             super::events::instance_call(
                 &req,
                 "emit",

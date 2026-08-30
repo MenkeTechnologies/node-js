@@ -4586,6 +4586,66 @@ threading.Event().wait(180)
     assert_eq!(got, r#"got 200 "hello""#);
 }
 
+/// The same handler, run over `http` and over `https`, must see the same
+/// thing. `req.setEncoding('utf8')` gives a decoded string chunk; it did so
+/// over plaintext and was silently ignored over TLS, where the handler got a
+/// Buffer.
+///
+/// Written as ONE handler used twice on purpose. Every other test here covers
+/// a single protocol, which is why three divergences between two near-copies
+/// of the same module reached this far: the framing bugs (54dd0d09b6), the
+/// read-to-EOF hang (af1597f886), and this. A test that runs both and compares
+/// fails on the next one without anybody having to think to look.
+#[test]
+fn setencoding_gives_a_string_over_https_exactly_as_it_does_over_http() {
+    let Some((key, cert)) = self_signed_pem() else {
+        eprintln!("skipping: openssl not on PATH");
+        return;
+    };
+    let src = format!(
+        r##"
+        const http = require('http');
+        const https = require('https');
+        const opts = {{ key: {key:?}, cert: {cert:?} }};
+
+        // One handler, both servers.
+        function handler(tag) {{
+          return (req, res) => {{
+            req.setEncoding('utf8');
+            const seen = [];
+            req.on('data', c => seen.push(typeof c));
+            req.on('end', () => {{
+              console.log(tag, JSON.stringify(seen));
+              res.writeHead(200, {{'Content-Type': 'text/plain'}});
+              res.end('ok');
+            }});
+          }};
+        }}
+
+        const post = (mod, port, extra) => new Promise(resolve => {{
+          const rq = mod.request(
+            Object.assign({{host: '127.0.0.1', port, method: 'POST', path: '/',
+                           headers: {{'Content-Length': '5'}}}}, extra),
+            res => {{ res.on('data', () => {{}}); res.on('end', resolve); }});
+          rq.end('hello');
+        }});
+
+        const hs = http.createServer(handler('http'));
+        hs.listen(0, async () => {{
+          await post(http, hs.address().port, {{}});
+          hs.close();
+          const ss = https.createServer(opts, handler('https'));
+          ss.listen(0, async () => {{
+            await post(https, ss.address().port, {{rejectUnauthorized: false}});
+            ss.close();
+          }});
+        }});
+    "##
+    );
+    let expected = [r#"http ["string"]"#, r#"https ["string"]"#].join("\n");
+    assert_eq!(run(&src), expected);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
