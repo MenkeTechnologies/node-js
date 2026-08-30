@@ -483,8 +483,13 @@ fn assertion_error(msg: &str) -> String {
     crate::host::coded_error("AssertionError", "ERR_ASSERTION", msg)
 }
 
+/// `assert.strictEqual` compares with `Object.is`, not `===`.
+///
+/// That is the whole difference for two values: `NaN` equals itself, and `+0`
+/// does not equal `-0`. Using `===` had both backwards — `strictEqual(NaN, NaN)`
+/// failed and `strictEqual(0, -0)` passed.
 fn strict(a: &Value, b: &Value) -> bool {
-    with_host(|h| h.strict_eq(a, b))
+    crate::builtins::same_value(a, b)
 }
 
 fn loose_eq(a: &Value, b: &Value) -> bool {
@@ -502,11 +507,61 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
 
 /// Structural equality. `strict` compares leaves with `===`, otherwise `==`.
 pub fn deep_equal(a: &Value, b: &Value, strict_mode: bool) -> bool {
+    deep_equal_seen(a, b, strict_mode, &mut Vec::new())
+}
+
+/// `deep_equal` carrying the pairs currently being compared.
+///
+/// Without it a self-referential structure recursed until the stack overflowed
+/// and the process aborted — `const x = {}; x.self = x;` compared against
+/// another of the same shape, which is exactly what a test asserting on a
+/// linked structure does. A pair already on the stack is treated as equal: if
+/// anything else about the two differs, some other comparison finds it.
+fn deep_equal_seen(
+    a: &Value,
+    b: &Value,
+    strict_mode: bool,
+    seen: &mut Vec<(Value, Value)>,
+) -> bool {
+    if seen.iter().any(|(x, y)| x == a && y == b) {
+        return true;
+    }
+    // `deepStrictEqual` requires the two to share a [[Prototype]]. That single
+    // check is what separates `Object.create(null)` from `{}`, an instance of
+    // one class from an instance of another, and a `Uint8Array` from an
+    // `Int8Array` — none of which were being distinguished.
+    if strict_mode {
+        let both_objects = with_host(|h| h.get(a).is_some() && h.get(b).is_some());
+        if both_objects
+            && with_host(|h| {
+                // A null-prototype object is tracked separately rather than by
+                // `proto_of` returning None — which a plain object does too, its
+                // `Object.prototype` being implicit. Comparing only `proto_of`
+                // therefore called `Object.create(null)` and `{}` alike.
+                h.proto_of(a) != h.proto_of(b) || h.has_null_proto(a) != h.has_null_proto(b)
+            })
+        {
+            return false;
+        }
+    }
     let kinds = with_host(|h| {
         let av = h.get(a).map(kind);
         let bv = h.get(b).map(kind);
         (av, bv)
     });
+    seen.push((a.clone(), b.clone()));
+    let result = deep_equal_body(a, b, strict_mode, seen, kinds);
+    seen.pop();
+    result
+}
+
+fn deep_equal_body(
+    a: &Value,
+    b: &Value,
+    strict_mode: bool,
+    seen: &mut Vec<(Value, Value)>,
+    kinds: (Option<Kind>, Option<Kind>),
+) -> bool {
     match kinds {
         (Some(Kind::Array), Some(Kind::Array)) => {
             let (ia, ib) = with_host(|h| (array_of(h, a), array_of(h, b)));
@@ -514,7 +569,7 @@ pub fn deep_equal(a: &Value, b: &Value, strict_mode: bool) -> bool {
                 && ia
                     .iter()
                     .zip(ib.iter())
-                    .all(|(x, y)| deep_equal(x, y, strict_mode))
+                    .all(|(x, y)| deep_equal_seen(x, y, strict_mode, seen))
         }
         (Some(Kind::Object), Some(Kind::Object)) => {
             let (ea, eb) = with_host(|h| (object_of(h, a), object_of(h, b)));
@@ -524,7 +579,7 @@ pub fn deep_equal(a: &Value, b: &Value, strict_mode: bool) -> bool {
             ea.iter().all(|(k, va)| {
                 eb.iter()
                     .find(|(k2, _)| k2 == k)
-                    .is_some_and(|(_, vb)| deep_equal(va, vb, strict_mode))
+                    .is_some_and(|(_, vb)| deep_equal_seen(va, vb, strict_mode, seen))
             })
         }
         _ => {

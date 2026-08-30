@@ -8844,7 +8844,7 @@ fn existing_property(obj: &Value, key: &str) -> Option<Existing> {
 /// SameValue (7.2.11) — `===` except that `NaN` equals itself and `+0` and
 /// `-0` are distinct. 10.1.6.3 compares a redefined value against the current
 /// one with this, not with strict equality.
-fn same_value(a: &Value, b: &Value) -> bool {
+pub(crate) fn same_value(a: &Value, b: &Value) -> bool {
     let num = |v: &Value| match v {
         Value::Int(n) => Some(*n as f64),
         Value::Float(f) => Some(*f),

@@ -36,6 +36,22 @@ inf      -1 0 4
 frac     1 3
 holes    -1 true 4
 typed    3 1 false
+==== assertions.js ====
+nan      pass throw:ERR_ASSERTION
+zero     throw:ERR_ASSERTION pass
+ordinary pass throw:ERR_ASSERTION
+proto    throw:ERR_ASSERTION
+classes  throw:ERR_ASSERTION pass
+typed    throw:ERR_ASSERTION pass
+deep-nan pass throw:ERR_ASSERTION
+cycle    pass
+mutual   pass
+cycle-ne throw:ERR_ASSERTION
+strictns throw:ERR_ASSERTION pass
+strictdp throw:ERR_ASSERTION throw:ERR_ASSERTION
+loose    pass pass
+shapes   pass throw:ERR_ASSERTION pass
+more     pass pass function
 ==== async.js ====
 start
 end

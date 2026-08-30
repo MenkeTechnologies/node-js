@@ -110,7 +110,11 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "path/win32" => Some("path/win32"),
         // `sys` is the long-deprecated alias for `util`.
         "sys" => Some("util"),
-        "assert/strict" => Some("assert"),
+        // `require('assert/strict')` IS the strict namespace, so its `equal`
+        // and `deepEqual` are the strict comparisons. Pointing it at the plain
+        // `assert` made `require('assert/strict').equal(1, '1')` pass. The
+        // strict namespace already existed for `assert.strict.*`.
+        "assert/strict" => Some("assertStrict"),
         "child_process" => Some("child_process"),
         "dns" => Some("dns"),
         "punycode" => Some("punycode"),
