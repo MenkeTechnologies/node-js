@@ -2317,6 +2317,7 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
     let mut props: IndexMap<String, Value> = IndexMap::new();
     // A literal `__proto__: x` key sets the object's prototype (not an own prop).
     let mut proto_override: Option<Value> = None;
+    let mut method_keys: Vec<String> = Vec::new();
     let mut i = 0;
     while i + 2 < flat.len() || (i + 2 == flat.len() && flat.len() % 3 == 0 && i < flat.len()) {
         if i + 2 >= flat.len() {
@@ -2332,6 +2333,15 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
             props
                 .entry(format!("{}{key}", host::ORD_MARKER))
                 .or_insert(Value::Undef);
+            i += 3;
+            continue;
+        }
+        // Tag 3: a METHOD DEFINITION — an ordinary property whose key is also
+        // recorded so the literal can become its `[[HomeObject]]` below.
+        if matches!(flat[i], Value::Int(3)) {
+            let key = with_host(|h| h.str_of(&flat[i + 1]));
+            method_keys.push(key.clone());
+            props.insert(key, flat[i + 2].clone());
             i += 3;
             continue;
         }
@@ -2385,6 +2395,23 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
                 h.set_proto(&o, p);
             }
         }
+        // A method DEFINED here takes the literal as its `[[HomeObject]]`, which
+        // is what `super` inside it resolves through. The home object is fixed
+        // at definition, so a method that merely arrives as a value
+        // (`{ m: other.m }`) keeps the one it was defined with — stamping every
+        // method-valued property instead rebound the original and changed what
+        // IT resolved.
+        for key in &method_keys {
+            let m = match h.get(&o) {
+                Some(JsObj::Object(p)) => p.get(key).cloned(),
+                _ => None,
+            };
+            if let Some(m) = m {
+                if let Some(JsObj::Func(f)) = h.get_mut(&m) {
+                    f.home_object = Some(o.clone());
+                }
+            }
+        }
         o
     })
 }
@@ -2405,6 +2432,15 @@ fn b_mkfunc(vm: &mut VM, _: u8) -> Value {
     with_host(|h| {
         let mut env = h.current_env_capture();
         let this = h.current_this();
+        // An arrow has no `super` of its own: it uses the enclosing METHOD's,
+        // exactly as it uses the enclosing `this`. Nothing was captured, so
+        // `super.m()` inside an arrow reported the method missing — in a class
+        // method as well as an object literal.
+        let (home_class, home_static, home_object) = if is_arrow {
+            h.current_home()
+        } else {
+            (None, false, None)
+        };
         // A named function expression closes over an extra scope holding its own
         // name, so the body can recurse through it (`function f(){ … f() … }`)
         // independently of whatever the outer binding is later set to.
@@ -2416,8 +2452,9 @@ fn b_mkfunc(vm: &mut VM, _: u8) -> Value {
             env: Some(env.clone()),
             this,
             is_arrow,
-            home_class: None,
-            home_static: false,
+            home_class,
+            home_static,
+            home_object,
         }));
         if let Some(n) = self_name {
             env.borrow_mut().vars.insert(n, f.clone());

@@ -2454,7 +2454,20 @@ impl Compiler {
                     value,
                     computed,
                 } => {
-                    b.emit(Op::LoadInt(0), 0);
+                    // Tag 3 marks a METHOD DEFINITION, so `MKOBJ` can give it
+                    // the literal as its `[[HomeObject]]`. It has to be decided
+                    // HERE: a method assigned from elsewhere (`{ m: other.m }`)
+                    // is an ordinary value whose home object was fixed where it
+                    // was defined, and the runtime cannot tell the two apart
+                    // from the value alone.
+                    let defines_method = matches!(
+                        value,
+                        Expr::Function {
+                            is_method: true,
+                            ..
+                        }
+                    );
+                    b.emit(Op::LoadInt(if defines_method { 3 } else { 0 }), 0);
                     // Key coerces to a property key (Symbol-aware: a Symbol maps to
                     // its internal `@@…` key rather than a `String()` coercion).
                     self.compile_expr(b, key)?;

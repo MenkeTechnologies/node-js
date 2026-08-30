@@ -381,6 +381,11 @@ pub struct FuncVal {
     /// method, the parent's prototype for an instance method — and the class
     /// name alone cannot tell them apart, since both carry the same one.
     pub home_static: bool,
+    /// The object literal a shorthand method was defined in, for `super` inside
+    /// it. A class method resolves `super` through `home_class` instead; this
+    /// is the `[[HomeObject]]` an ordinary `{ m() { super.x } }` needs, and
+    /// without it there was nothing to resolve against.
+    pub home_object: Option<Value>,
 }
 
 /// A heap object.
@@ -733,6 +738,9 @@ pub struct Frame {
     pub home_class: Option<Value>,
     /// Whether the running method is a static one — see `FuncVal::home_static`.
     pub home_static: bool,
+    /// The object literal owning the running method — see
+    /// `FuncVal::home_object`.
+    pub home_object: Option<Value>,
     /// Source line the frame is currently executing (updated by the DAP line hook
     /// under `--dap`; stays 0 on ordinary runs).
     pub line: u32,
@@ -1101,6 +1109,7 @@ impl JsHost {
                 new_target: None,
                 home_class: None,
                 home_static: false,
+                home_object: None,
                 line: 0,
                 owner: None,
                 is_module: true,
@@ -1870,6 +1879,18 @@ impl JsHost {
     /// The name of the class whose body the running function belongs to. Only a
     /// method of that class can even mention its private names, so this is the
     /// class a failed brand check must name.
+    /// The `super` binding of the frame now running: the owning class name,
+    /// whether the method is static, and the home object of an object-literal
+    /// method. An ARROW captures all three at creation, the way it captures
+    /// `this` — `super` inside an arrow means the enclosing METHOD's `super`.
+    pub fn current_home(&self) -> (Option<String>, bool, Option<Value>) {
+        (
+            self.current_home_class_name(),
+            self.frame().home_static,
+            self.frame().home_object.clone(),
+        )
+    }
+
     pub fn current_home_class_name(&self) -> Option<String> {
         match self.get(&self.current_home_class()?) {
             Some(JsObj::Class(c)) => Some(c.name.clone()),
@@ -2476,6 +2497,17 @@ impl JsHost {
     /// Resolve `super.name` to either the parent-prototype getter (to be invoked
     /// by the caller, outside any host borrow) or a directly-usable value.
     pub fn super_resolve(&self, name: &str) -> SuperRef {
+        // A shorthand method in an OBJECT LITERAL resolves `super` through its
+        // home object's prototype; only a class method has a home CLASS. With
+        // nothing tracked for the literal case, `{ m() { super.x() } }` had no
+        // parent to look in and reported the method missing.
+        if let Some(home) = self.frame().home_object.clone() {
+            let target = self.proto_of(&home).unwrap_or(Value::Undef);
+            if let Some((Some(getter), _)) = lookup_accessor(self, &target, name) {
+                return SuperRef::Getter(getter);
+            }
+            return SuperRef::Data(lookup_chain(self, &target, name).unwrap_or(Value::Undef));
+        }
         let parent = match self
             .current_home_class()
             .and_then(|cv| match self.get(&cv) {
@@ -2990,6 +3022,7 @@ pub fn run_chunk_in_global_scope(chunk: Chunk) -> Result<Value, String> {
             new_target: None,
             home_class: None,
             home_static: false,
+            home_object: None,
             line: 0,
             owner: None,
             is_module: true,
@@ -5485,7 +5518,14 @@ pub fn run_user_func_nt(
     // generator over the already-bound frame.
     if is_generator {
         let chunk = with_host(|h| h.funcs[fv.def_id].chunk.clone());
-        let gen = make_generator(chunk, env, this_val, fv.home_class.clone(), fv.home_static);
+        let gen = make_generator(
+            chunk,
+            env,
+            this_val,
+            fv.home_class.clone(),
+            fv.home_static,
+            fv.home_object.clone(),
+        );
         if is_async {
             if let Some(JsObj::Generator { id }) = with_host(|h| h.get(&gen).cloned()) {
                 with_host(|h| h.generators[id as usize].async_gen = true);
@@ -5497,7 +5537,14 @@ pub fn run_user_func_nt(
     // synchronously up to the first `await`, then continues via microtasks.
     if is_async {
         let chunk = with_host(|h| h.funcs[fv.def_id].chunk.clone());
-        let gen = make_generator(chunk, env, this_val, fv.home_class.clone(), fv.home_static);
+        let gen = make_generator(
+            chunk,
+            env,
+            this_val,
+            fv.home_class.clone(),
+            fv.home_static,
+            fv.home_object.clone(),
+        );
         return Ok(run_async(gen));
     }
     let home = fv
@@ -5512,6 +5559,7 @@ pub fn run_user_func_nt(
             new_target,
             home_class: home,
             home_static: fv.home_static,
+            home_object: fv.home_object.clone(),
             line: 0,
             owner: Some(def_name),
             is_module: false,
@@ -6267,6 +6315,7 @@ fn make_generator(
     this_val: Option<Value>,
     home_class: Option<String>,
     home_static: bool,
+    home_object: Option<Value>,
 ) -> Value {
     let home = home_class
         .as_ref()
@@ -6278,6 +6327,7 @@ fn make_generator(
         new_target: None,
         home_class: home,
         home_static,
+        home_object,
         line: 0,
         owner: None,
         is_module: false,

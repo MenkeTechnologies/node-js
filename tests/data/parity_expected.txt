@@ -175,6 +175,16 @@ computed child+base var+base
 read     base-label base
 static   child+base-make base-tag
 agree    base|base
+literal  own+base base base
+lit-read bl bt base
+setproto base
+plainfn  function
+arrow    C+AB AB AB
+arrow2   AG CS+AS
+litarrow base 0
+this     ThisCheck
+home-def A A A
+home-asn A A
 ==== classfeatures.js ====
 private  1|privMethod|privGetter
 statics  1 static-block true false

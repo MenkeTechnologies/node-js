@@ -115,3 +115,61 @@ console.log("read    ", child.readLabel(), child.withArgs());
 console.log("static  ", SuperChild.make(), SuperChild.readTag());
 // The dotted form must keep working, and the two must agree.
 console.log("agree   ", child.bothForms());
+
+// `super` in an OBJECT LITERAL method. Only a home CLASS was tracked, so a
+// shorthand method in a literal had no parent to resolve against and reported
+// the method missing. The literal is its method's [[HomeObject]], and `super`
+// reads through that object's prototype — which is why reassigning the
+// prototype afterwards changes what `super` finds.
+const litBase = { greet() { return "base"; }, get label() { return "bl"; }, tag: "bt" };
+const literal = {
+  __proto__: litBase,
+  greet() { return "own+" + super.greet(); },
+  computed() { return super["greet"](); },
+  readGetter() { return super.label; },
+  readData() { return super.tag; },
+  *gen() { yield super.greet(); },
+  ["dyn" + "amic"]() { return super.greet(); },
+};
+console.log("literal ", literal.greet(), literal.computed(), literal.dynamic());
+console.log("lit-read", literal.readGetter(), literal.readData(), [...literal.gen()].join(","));
+const assigned = { m() { return super.greet(); } };
+Object.setPrototypeOf(assigned, litBase);
+console.log("setproto", assigned.m());
+// Only a METHOD DEFINITION gets a home object; a plain function-valued
+// property is an ordinary property and cannot use `super` at all.
+const plainProp = { __proto__: litBase, m: function () { return typeof this.greet; } };
+console.log("plainfn ", plainProp.m());
+
+// An ARROW has no `super` of its own and uses the enclosing METHOD's, exactly
+// as it uses the enclosing `this`. Nothing was captured, so `super` inside an
+// arrow failed — in a CLASS method as well as a literal.
+class ArrowBase { m() { return "AB"; } static s() { return "AS"; } get g() { return "AG"; } }
+class ArrowChild extends ArrowBase {
+  m() { const f = () => super.m(); return "C+" + f(); }
+  deep() { const f = () => () => super.m(); return f()(); }
+  callback() { return [1].map(() => super.m())[0]; }
+  getter() { const f = () => super.g; return f(); }
+  static s() { const f = () => super.s(); return "CS+" + f(); }
+}
+console.log("arrow   ", new ArrowChild().m(), new ArrowChild().deep(), new ArrowChild().callback());
+console.log("arrow2  ", new ArrowChild().getter(), ArrowChild.s());
+const litArrow = { __proto__: litBase, m() { const f = () => super.greet(); return f(); } };
+console.log("litarrow", litArrow.m(), [1].map(() => 0)[0]);
+// `this` inside such an arrow is still the instance, and a non-arrow function
+// inside a method does NOT inherit `super`.
+class ThisCheck extends ArrowBase { m() { const f = () => this.constructor.name; return f(); } }
+console.log("this    ", new ThisCheck().m());
+// [[HomeObject]] is fixed where the method is DEFINED. A method that merely
+// arrives as a value keeps the home it was defined with — so copying one into
+// another literal must not rebind it, nor change what the original resolves.
+// Stamping every method-VALUED property, rather than every method DEFINITION,
+// got this wrong in both directions at once.
+const homeA = { m() { return "A"; } };
+const homeB = { m() { return "B"; } };
+const definedInA = { __proto__: homeA, m() { return super.m(); } };
+const copiedIntoB = { __proto__: homeB, m: definedInA.m };
+console.log("home-def", definedInA.m(), copiedIntoB.m(), definedInA.m());
+const assignedLater = { __proto__: homeB };
+assignedLater.m = definedInA.m;
+console.log("home-asn", assignedLater.m(), definedInA.m());
