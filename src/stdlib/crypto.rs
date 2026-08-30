@@ -2271,14 +2271,7 @@ fn get_random_values(v: Option<&Value>) -> Result<Value, String> {
     if kind.starts_with("Float") {
         return Err("Error: The provided ArrayBufferView is of type 'Float', which is not an integer array type".into());
     }
-    let len = with_host(|h| {
-        if let Some(JsObj::Object(p)) = h.get(&ta) {
-            if let Some(JsObj::Array(it)) = p.get("@@elems").and_then(|v| h.get(v)) {
-                return it.len();
-            }
-        }
-        0
-    });
+    let len = crate::stdlib::typedarray::index_len(&ta).unwrap_or(0);
     let bpe = match kind.as_str() {
         "Int16Array" | "Uint16Array" => 2,
         "Int32Array" | "Uint32Array" => 4,
@@ -2295,17 +2288,11 @@ fn get_random_values(v: Option<&Value>) -> Result<Value, String> {
             Value::Float(ta_coerce(&kind, acc))
         })
         .collect();
-    with_host(|h| {
-        let arr = match h.get(&ta) {
-            Some(JsObj::Object(p)) => p.get("@@elems").cloned(),
-            _ => None,
-        };
-        if let Some(a) = arr {
-            if let Some(JsObj::Array(items)) = h.get_mut(&a) {
-                *items = elems;
-            }
-        }
-    });
+    // Written through the view, so the bytes land in the backing ArrayBuffer
+    // and every other view over it sees them.
+    for (i, e) in elems.iter().enumerate() {
+        crate::stdlib::typedarray::elem_set(&ta, &i.to_string(), e)?;
+    }
     Ok(ta)
 }
 

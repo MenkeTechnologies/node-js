@@ -2,7 +2,8 @@
 //! `ArrayBuffer`, `WeakRef`, and `TextEncoder`/`TextDecoder`.
 //!
 //! A typed array is a plain object tagged `@@native = "TypedArray"` carrying its
-//! kind (`@@kind`), its elements as a hidden `@@elems` array of numbers, and the
+//! kind (`@@kind`), a window (`@@buffer`/`byteOffset`/`length`) onto the bytes
+//! its `ArrayBuffer` owns, and the
 //! enumerable `length`/`byteLength`/`BYTES_PER_ELEMENT` data properties JS code
 //! reads directly. Element indexing (`ta[i]` get/set) is special-cased in
 //! `builtins::get_property`/`set_property` via `elem_get`/`elem_set` here, which
@@ -52,10 +53,9 @@ pub const PROTOTYPE_METHODS: &[&str] = &[
     "values",
 ];
 
-/// The eleven element kinds plus `ArrayBuffer` (which carries only a byte
-/// length).
+/// The eleven element kinds plus the two buffer types.
 pub fn is_ctor(name: &str) -> bool {
-    ELEMENT_KINDS.contains(&name) || name == "ArrayBuffer"
+    ELEMENT_KINDS.contains(&name) || matches!(name, "ArrayBuffer" | "DataView")
 }
 
 /// The element kinds, each of which gets its own real prototype object whose
@@ -206,13 +206,22 @@ pub fn elem_values(v: &Value) -> Vec<Value> {
     let Some(tag) = super::native_tag(v) else {
         return Vec::new();
     };
-    let field = match tag.as_str() {
-        "TypedArray" => "@@elems",
-        "Buffer" => "@@bytes",
-        _ => return Vec::new(),
-    };
+    if tag == "TypedArray" {
+        let kind = kind_of(v);
+        let bpe = bytes_per_element(&kind);
+        return (0..view_len(v))
+            .map(|i| {
+                view_bytes(v, i * bpe, bpe)
+                    .map(|b| decode(&kind, &b))
+                    .unwrap_or(Value::Undef)
+            })
+            .collect();
+    }
+    if tag != "Buffer" {
+        return Vec::new();
+    }
     with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => match p.get(field).and_then(|a| h.get(a)) {
+        Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|a| h.get(a)) {
             Some(JsObj::Array(items)) => items.clone(),
             _ => Vec::new(),
         },
@@ -222,21 +231,34 @@ pub fn elem_values(v: &Value) -> Vec<Value> {
 
 /// Build a typed array of `kind` from already-coerced element values.
 fn make(kind: &str, elems: Vec<Value>) -> Value {
+    let bpe = bytes_per_element(kind);
+    let len = elems.len();
+    let buf = new_array_buffer(len * bpe);
+    let view = make_view(kind, &buf, 0, len);
+    for (i, e) in elems.iter().enumerate() {
+        write_view_bytes(&view, i * bpe, &encode(kind, e));
+    }
+    view
+}
+
+/// A typed array of `kind` over `buf`, `len` elements from `byte_off`.
+fn make_view(kind: &str, buf: &Value, byte_off: usize, len: usize) -> Value {
     with_host(|h| {
         let bpe = bytes_per_element(kind);
-        let len = elems.len();
-        let arr = h.new_array(elems);
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("TypedArray"));
         m.insert("@@kind".into(), h.new_str(kind));
-        m.insert("@@elems".into(), arr);
+        m.insert("@@buffer".into(), buf.clone());
+        // `ta.buffer` is a non-enumerable accessor in node; a hidden own slot
+        // reads identically and keeps it out of `Object.keys` and `inspect`.
+        m.insert("buffer".into(), buf.clone());
         m.insert("length".into(), Value::Float(len as f64));
         m.insert("byteLength".into(), Value::Float((len * bpe) as f64));
         // Every view reports where it starts in its backing store. A `Buffer`
         // already carried this; a typed array did not, so `u8.byteOffset` read
         // `undefined` where a Buffer read 0. Nothing here can produce a
         // non-zero offset yet — see the note on `.buffer` below.
-        m.insert("byteOffset".into(), Value::Float(0.0));
+        m.insert("byteOffset".into(), Value::Float(byte_off as f64));
         m.insert("BYTES_PER_ELEMENT".into(), Value::Float(bpe as f64));
         let obj = h.new_object(m);
         // Link the instance to the real `Uint8Array.prototype` object so its
@@ -249,7 +271,13 @@ fn make(kind: &str, elems: Vec<Value>) -> Value {
             h.set_proto(&obj, p);
         }
         // View metadata is real but non-enumerable, as it is for a Buffer.
-        for k in ["length", "byteLength", "byteOffset", "BYTES_PER_ELEMENT"] {
+        for k in [
+            "buffer",
+            "length",
+            "byteLength",
+            "byteOffset",
+            "BYTES_PER_ELEMENT",
+        ] {
             h.hide_prop(&obj, k);
         }
         obj
@@ -261,15 +289,304 @@ fn make(kind: &str, elems: Vec<Value>) -> Value {
 pub fn construct(kind: &str, args: &[Value]) -> Result<Value, String> {
     if kind == "ArrayBuffer" {
         let n = super::arg_num(args, 0).max(0.0) as usize;
-        return Ok(with_host(|h| {
-            let mut m = IndexMap::new();
-            m.insert("@@native".into(), h.new_str("ArrayBuffer"));
-            m.insert("byteLength".into(), Value::Float(n as f64));
-            h.new_object(m)
-        }));
+        let ab = new_array_buffer(n);
+        // `new ArrayBuffer(n, { maxByteLength })` is a RESIZABLE buffer, which
+        // reports `resizable` and `maxByteLength` and accepts `resize`.
+        if let Some(opts) = args.get(1) {
+            let max = crate::builtins::get_property(opts, "maxByteLength").unwrap_or(Value::Undef);
+            if !matches!(max, Value::Undef) {
+                let m = with_host(|h| h.to_number(&max)).max(0.0) as usize;
+                with_host(|h| {
+                    if let Some(JsObj::Object(p)) = h.get_mut(&ab) {
+                        p.insert("@@maxByteLength".into(), Value::Float(m as f64));
+                        p.insert("maxByteLength".into(), Value::Float(m as f64));
+                        p.insert("resizable".into(), Value::Bool(true));
+                    }
+                    h.hide_prop(&ab, "maxByteLength");
+                    h.hide_prop(&ab, "resizable");
+                });
+            }
+        }
+        return Ok(ab);
+    }
+    // `new Uint8Array(buffer[, byteOffset[, length]])` — a VIEW onto an existing
+    // buffer rather than a fresh copy. This is the form that makes two views
+    // alias, and it did not exist: the argument fell through to the iterable
+    // branch and produced an empty array.
+    if let Some(first) = args.first() {
+        if super::native_tag(first).as_deref() == Some("ArrayBuffer") {
+            let bpe = bytes_per_element(kind);
+            let total = buffer_byte_length(first);
+            let off = super::arg_num(args, 1).max(0.0) as usize;
+            if off > total || off % bpe != 0 {
+                return Err(crate::host::range_error(
+                    "start offset of Uint8Array should be a multiple of element size",
+                ));
+            }
+            let len = match args.get(2) {
+                Some(Value::Undef) | None => (total - off) / bpe,
+                Some(_) => super::arg_num(args, 2).max(0.0) as usize,
+            };
+            if off + len * bpe > total {
+                return Err(crate::host::range_error("Invalid typed array length"));
+            }
+            return Ok(make_view(kind, first, off, len));
+        }
     }
     let elems = build_elems(kind, args)?;
     Ok(make(kind, elems))
+}
+
+/// The methods a `DataView` instance exposes.
+pub const DATAVIEW_METHODS: &[&str] = &[
+    "getInt8",
+    "getUint8",
+    "getInt16",
+    "getUint16",
+    "getInt32",
+    "getUint32",
+    "getFloat32",
+    "getFloat64",
+    "getBigInt64",
+    "getBigUint64",
+    "setInt8",
+    "setUint8",
+    "setInt16",
+    "setUint16",
+    "setInt32",
+    "setUint32",
+    "setFloat32",
+    "setFloat64",
+    "setBigInt64",
+    "setBigUint64",
+];
+
+/// `new DataView(buffer[, byteOffset[, byteLength]])`.
+pub fn construct_dataview(args: &[Value]) -> Result<Value, String> {
+    let buf = args.first().cloned().unwrap_or(Value::Undef);
+    if super::native_tag(&buf).as_deref() != Some("ArrayBuffer") {
+        return Err(crate::host::type_error(
+            "First argument to DataView constructor must be an ArrayBuffer",
+        ));
+    }
+    let total = buffer_byte_length(&buf);
+    let off = super::arg_num(args, 1).max(0.0) as usize;
+    if off > total {
+        return Err(crate::host::range_error(
+            "Start offset is outside the bounds of the buffer",
+        ));
+    }
+    let len = match args.get(2) {
+        Some(Value::Undef) | None => total - off,
+        Some(_) => super::arg_num(args, 2).max(0.0) as usize,
+    };
+    if off + len > total {
+        return Err(crate::host::range_error("Invalid DataView length"));
+    }
+    Ok(with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str("DataView"));
+        m.insert("@@buffer".into(), buf.clone());
+        m.insert("buffer".into(), buf.clone());
+        m.insert("byteOffset".into(), Value::Float(off as f64));
+        m.insert("byteLength".into(), Value::Float(len as f64));
+        let obj = h.new_object(m);
+        for k in ["buffer", "byteOffset", "byteLength"] {
+            h.hide_prop(&obj, k);
+        }
+        h.ensure_native_protos();
+        if let Some(p) = h.ensure_ctor_proto("DataView") {
+            h.set_proto(&obj, p);
+        }
+        obj
+    }))
+}
+
+/// `dv.getUint16(off[, littleEndian])` and its siblings. A `DataView` defaults
+/// to BIG-endian, unlike a typed array, which is the whole reason it exists.
+pub fn dataview_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    let Some(spec) = method.get(3..) else {
+        return Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        )));
+    };
+    let width = match spec {
+        "Int8" | "Uint8" => 1,
+        "Int16" | "Uint16" => 2,
+        "Int32" | "Uint32" | "Float32" => 4,
+        "Float64" | "BigInt64" | "BigUint64" => 8,
+        _ => {
+            return Err(crate::host::type_error(&format!(
+                "{method} is not a function"
+            )))
+        }
+    };
+    let is_get = method.starts_with("get");
+    let at = super::arg_num(args, 0).max(0.0) as usize;
+    let span = with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) => p.get("byteLength").map(|l| h.to_number(l)).unwrap_or(0.0),
+        _ => 0.0,
+    }) as usize;
+    if at + width > span {
+        return Err(crate::host::range_error(
+            "Offset is outside the bounds of the DataView",
+        ));
+    }
+    // The endianness flag is the LAST argument, and it is the second for a
+    // getter but the third for a setter.
+    let le = with_host(|h| {
+        h.truthy(
+            args.get(if is_get { 1 } else { 2 })
+                .unwrap_or(&Value::Undef),
+        )
+    });
+    if is_get {
+        let mut b = view_bytes(recv, at, width).unwrap_or_else(|| vec![0; width]);
+        if !le {
+            b.reverse();
+        }
+        return Ok(match spec {
+            "Int8" => Value::Float(b[0] as i8 as f64),
+            "Uint8" => Value::Float(b[0] as f64),
+            "Int16" => Value::Float(i16::from_le_bytes([b[0], b[1]]) as f64),
+            "Uint16" => Value::Float(u16::from_le_bytes([b[0], b[1]]) as f64),
+            "Int32" => Value::Float(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+            "Uint32" => Value::Float(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+            "Float32" => Value::Float(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+            "Float64" => Value::Float(f64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))),
+            "BigInt64" => {
+                let raw = i64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]));
+                with_host(|h| h.new_bigint(num_bigint::BigInt::from(raw)))
+            }
+            _ => {
+                let raw = u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]));
+                with_host(|h| h.new_bigint(num_bigint::BigInt::from(raw)))
+            }
+        });
+    }
+    let val = args.get(1).cloned().unwrap_or(Value::Undef);
+    let mut b = match spec {
+        "BigInt64" | "BigUint64" => {
+            use num_traits::cast::ToPrimitive;
+            let big = with_host(|h| match h.get(&val) {
+                Some(JsObj::BigInt(x)) => Some(x.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| crate::host::type_error("Cannot convert a Number value to a BigInt"))?;
+            let raw = if spec == "BigInt64" {
+                big.to_i64().unwrap_or(0) as u64
+            } else {
+                big.to_u64().unwrap_or(0)
+            };
+            raw.to_le_bytes().to_vec()
+        }
+        _ => {
+            let n = with_host(|h| h.to_number(&val));
+            match spec {
+                "Int8" | "Uint8" => vec![n as i64 as u8],
+                "Int16" | "Uint16" => (n as i64 as u16).to_le_bytes().to_vec(),
+                "Int32" | "Uint32" => (n as i64 as u32).to_le_bytes().to_vec(),
+                "Float32" => (n as f32).to_le_bytes().to_vec(),
+                _ => n.to_le_bytes().to_vec(),
+            }
+        }
+    };
+    if !le {
+        b.reverse();
+    }
+    write_view_bytes(recv, at, &b);
+    Ok(Value::Undef)
+}
+
+/// `ab.resize(n)` on a resizable buffer — grows with zeros or truncates,
+/// in place, so every view over it sees the new size.
+pub fn buffer_resize(ab: &Value, args: &[Value]) -> Result<Value, String> {
+    let max = with_host(|h| match h.get(ab) {
+        Some(JsObj::Object(p)) => p.get("@@maxByteLength").map(|m| h.to_number(m) as usize),
+        _ => None,
+    })
+    .ok_or_else(|| {
+        crate::host::type_error(
+            "ArrayBuffer.prototype.resize called on a non-resizable ArrayBuffer",
+        )
+    })?;
+    let n = super::arg_num(args, 0).max(0.0) as usize;
+    if n > max {
+        return Err(crate::host::range_error("Invalid array buffer length"));
+    }
+    let store = store_of(ab);
+    with_host(|h| {
+        if let Some(a) = store {
+            if let Some(JsObj::Array(items)) = h.get_mut(&a) {
+                items.resize(n, Value::Float(0.0));
+            }
+        }
+        if let Some(JsObj::Object(p)) = h.get_mut(ab) {
+            p.insert("byteLength".into(), Value::Float(n as f64));
+        }
+    });
+    Ok(Value::Undef)
+}
+
+/// The heap array an `ArrayBuffer` keeps its bytes in, so another view can
+/// share it rather than copy.
+pub fn buffer_store(ab: &Value) -> Option<Value> {
+    store_of(ab)
+}
+
+/// A COPY of an `ArrayBuffer`'s bytes, for the callers that only read.
+pub fn buffer_bytes_snapshot(ab: &Value) -> Option<Vec<u8>> {
+    let store = store_of(ab)?;
+    with_host(|h| match h.get(&store) {
+        Some(JsObj::Array(items)) => {
+            Some(items.iter().map(|x| h.to_number(x) as i64 as u8).collect())
+        }
+        _ => None,
+    })
+}
+
+/// An `ArrayBuffer`'s byte length, from its own store.
+pub fn buffer_byte_length(ab: &Value) -> usize {
+    with_host(|h| match h.get(ab) {
+        Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|a| h.get(a)) {
+            Some(JsObj::Array(items)) => items.len(),
+            _ => 0,
+        },
+        _ => 0,
+    })
+}
+
+/// `ArrayBuffer.prototype.slice(begin[, end])` — a COPY of the byte range, as a
+/// new buffer. Writes to it are not seen by views over the original.
+pub fn buffer_slice(ab: &Value, args: &[Value]) -> Value {
+    let total = buffer_byte_length(ab) as i64;
+    let idx = |v: Option<&Value>, dflt: i64| -> usize {
+        let n = match v {
+            None | Some(Value::Undef) => dflt,
+            Some(x) => with_host(|h| h.to_number(x)) as i64,
+        };
+        (if n < 0 { total + n } else { n }).clamp(0, total) as usize
+    };
+    let start = idx(args.first(), 0);
+    let end = idx(args.get(1), total).max(start);
+    let out = new_array_buffer(end - start);
+    let src = with_host(|h| match h.get(ab) {
+        Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|a| h.get(a)) {
+            Some(JsObj::Array(items)) => items[start..end].to_vec(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    });
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get(&out) {
+            if let Some(arr) = p.get("@@bytes").cloned() {
+                if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
+                    *items = src;
+                }
+            }
+        }
+    });
+    out
 }
 
 /// Element vector for a typed-array construction from its first argument:
@@ -344,22 +661,15 @@ fn from(kind: &str, args: &[Value]) -> Result<Value, String> {
 /// The element values of a typed array / Buffer (`None` for anything else).
 pub fn elems_of(v: &Value) -> Option<Vec<f64>> {
     let tag = super::native_tag(v)?;
-    let field = match tag.as_str() {
-        "TypedArray" => "@@elems",
-        "Buffer" => "@@bytes",
-        _ => return None,
-    };
-    with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => match p.get(field).and_then(|a| h.get(a)) {
-            Some(JsObj::Array(items)) => Some(items.iter().map(|x| h.to_number(x)).collect()),
-            _ => None,
-        },
-        _ => None,
-    })
+    if !matches!(tag.as_str(), "TypedArray" | "Buffer") {
+        return None;
+    }
+    let vals = elem_values(v);
+    Some(with_host(|h| vals.iter().map(|x| h.to_number(x)).collect()))
 }
 
 /// The number of elements `v` exposes as integer-index own properties, for a
-/// typed array (`@@elems`) or a `Buffer` (`@@bytes`); `None` for anything else.
+/// typed array (its view length) or a `Buffer` (`@@bytes`); `None` otherwise.
 ///
 /// Both index-membership questions — `obj.hasOwnProperty(i)` and `i in obj` —
 /// must answer from this one place. They used to disagree: `hasOwnProperty`
@@ -367,18 +677,17 @@ pub fn elems_of(v: &Value) -> Option<Vec<f64>> {
 /// a Buffer and wrong for every other typed array, while the `in` operator knew
 /// about neither and reported false for every valid index of both.
 pub fn index_len(v: &Value) -> Option<usize> {
-    let field = match super::native_tag(v)?.as_str() {
-        "TypedArray" => "@@elems",
-        "Buffer" => "@@bytes",
-        _ => return None,
-    };
-    with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => match p.get(field).and_then(|a| h.get(a)) {
-            Some(JsObj::Array(items)) => Some(items.len()),
+    match super::native_tag(v)?.as_str() {
+        "TypedArray" => Some(view_len(v)),
+        "Buffer" => with_host(|h| match h.get(v) {
+            Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|a| h.get(a)) {
+                Some(JsObj::Array(items)) => Some(items.len()),
+                _ => None,
+            },
             _ => None,
-        },
+        }),
         _ => None,
-    })
+    }
 }
 
 /// Whether `key` is an in-range integer index of the typed array / Buffer `v`.
@@ -399,19 +708,279 @@ pub fn kind_of(recv: &Value) -> String {
     })
 }
 
+// ── backing store ────────────────────────────────────────────────────────────
+//
+// Every view — typed array or `DataView` — reads and writes THROUGH an
+// `ArrayBuffer`, which owns the only copy of the bytes as a hidden `@@bytes`
+// heap array. That is what makes two views over one buffer see each other's
+// writes: `new Uint32Array(ab)[0]` reflects a byte written through
+// `new Uint8Array(ab)`. Before this an `ArrayBuffer` carried nothing but a
+// `byteLength` and each view owned a private element vector, so nothing was
+// ever shared and `DataView` did not exist at all.
+
+/// Allocate an `ArrayBuffer` of `n` zeroed bytes.
+pub fn new_array_buffer(n: usize) -> Value {
+    with_host(|h| {
+        let arr = h.new_array(vec![Value::Float(0.0); n]);
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str("ArrayBuffer"));
+        m.insert("@@bytes".into(), arr);
+        m.insert("byteLength".into(), Value::Float(n as f64));
+        let obj = h.new_object(m);
+        h.hide_prop(&obj, "byteLength");
+        h.ensure_native_protos();
+        if let Some(p) = h.native_proto("ArrayBuffer") {
+            h.set_proto(&obj, p);
+        }
+        obj
+    })
+}
+
+/// The heap array holding an `ArrayBuffer`'s bytes.
+fn store_of(ab: &Value) -> Option<Value> {
+    with_host(|h| match h.get(ab) {
+        Some(JsObj::Object(p)) => p.get("@@bytes").cloned(),
+        _ => None,
+    })
+}
+
+/// A view's `(buffer, byteOffset)`.
+fn view_base(v: &Value) -> Option<(Value, usize)> {
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Object(p)) => {
+            let buf = p.get("@@buffer").cloned()?;
+            let off = p.get("byteOffset").map(|o| h.to_number(o)).unwrap_or(0.0);
+            Some((buf, off.max(0.0) as usize))
+        }
+        _ => None,
+    })
+}
+
+/// `n` bytes of `v`'s buffer starting at its `byteOffset + at`.
+pub fn view_bytes(v: &Value, at: usize, n: usize) -> Option<Vec<u8>> {
+    let (buf, off) = view_base(v)?;
+    let store = store_of(&buf)?;
+    with_host(|h| match h.get(&store) {
+        Some(JsObj::Array(items)) => {
+            let start = off + at;
+            if start + n > items.len() {
+                return None;
+            }
+            Some(
+                items[start..start + n]
+                    .iter()
+                    .map(|x| h.to_number(x) as i64 as u8)
+                    .collect(),
+            )
+        }
+        _ => None,
+    })
+}
+
+/// Write `bytes` into `v`'s buffer at its `byteOffset + at`. False when the
+/// range does not fit.
+pub fn write_view_bytes(v: &Value, at: usize, bytes: &[u8]) -> bool {
+    let Some((buf, off)) = view_base(v) else {
+        return false;
+    };
+    let Some(store) = store_of(&buf) else {
+        return false;
+    };
+    with_host(|h| match h.get_mut(&store) {
+        Some(JsObj::Array(items)) => {
+            let start = off + at;
+            if start + bytes.len() > items.len() {
+                return false;
+            }
+            for (i, b) in bytes.iter().enumerate() {
+                items[start + i] = Value::Float(*b as f64);
+            }
+            true
+        }
+        _ => false,
+    })
+}
+
+/// Decode one element of `kind` from its `bytes` (native byte order, which on
+/// every architecture this runs on is little-endian).
+fn decode(kind: &str, b: &[u8]) -> Value {
+    match kind {
+        "Int8Array" => Value::Float(b[0] as i8 as f64),
+        "Uint8Array" | "Uint8ClampedArray" => Value::Float(b[0] as f64),
+        "Int16Array" => Value::Float(i16::from_le_bytes([b[0], b[1]]) as f64),
+        "Uint16Array" => Value::Float(u16::from_le_bytes([b[0], b[1]]) as f64),
+        "Int32Array" => Value::Float(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        "Uint32Array" => Value::Float(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        "Float32Array" => Value::Float(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        "BigInt64Array" => {
+            let raw = i64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]));
+            with_host(|h| h.new_bigint(num_bigint::BigInt::from(raw)))
+        }
+        "BigUint64Array" => {
+            let raw = u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]));
+            with_host(|h| h.new_bigint(num_bigint::BigInt::from(raw)))
+        }
+        _ => Value::Float(f64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))),
+    }
+}
+
+/// Encode one already-coerced element of `kind` into its bytes.
+fn encode(kind: &str, v: &Value) -> Vec<u8> {
+    if is_bigint_kind(kind) {
+        use num_traits::cast::ToPrimitive;
+        let b = bigint_of(v);
+        let raw = if kind == "BigInt64Array" {
+            b.to_i64().unwrap_or(0) as u64
+        } else {
+            b.to_u64().unwrap_or(0)
+        };
+        return raw.to_le_bytes().to_vec();
+    }
+    let n = num(v);
+    match kind {
+        "Int8Array" => vec![n as i64 as i8 as u8],
+        "Uint8Array" | "Uint8ClampedArray" => vec![n as i64 as u8],
+        "Int16Array" => (n as i64 as i16).to_le_bytes().to_vec(),
+        "Uint16Array" => (n as i64 as u16).to_le_bytes().to_vec(),
+        "Int32Array" => (n as i64 as i32).to_le_bytes().to_vec(),
+        "Uint32Array" => (n as i64 as u32).to_le_bytes().to_vec(),
+        "Float32Array" => (n as f32).to_le_bytes().to_vec(),
+        _ => n.to_le_bytes().to_vec(),
+    }
+}
+
+/// The elements of a typed-array view, decoded with a host borrow ALREADY
+/// held. `host` reads views from inside `&self` methods (inspect, key
+/// enumeration, iteration) where re-entering through `with_host` would panic on
+/// the outstanding borrow.
+pub fn elems_with_host(h: &crate::host::JsHost, v: &Value) -> Vec<Value> {
+    if let Some(JsObj::Object(p)) = h.get(v) {
+        if let Some(arr) = p.get("@@bytes") {
+            return match h.get(arr) {
+                Some(JsObj::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            };
+        }
+    }
+    let Some((kind, raws)) = raw_elems(h, v) else {
+        return Vec::new();
+    };
+    // A 64-bit element is a BigInt, which needs an allocation this borrow
+    // cannot make; `elems_mut_host` is the reader for callers that can.
+    if is_bigint_kind(&kind) {
+        return vec![Value::Undef; raws.len()];
+    }
+    raws.iter().map(|b| decode(&kind, b)).collect()
+}
+
+/// The raw bytes of every element of a view, with the host borrow already held.
+/// The shared half of the three readers below.
+fn raw_elems(h: &crate::host::JsHost, v: &Value) -> Option<(String, Vec<Vec<u8>>)> {
+    let JsObj::Object(p) = h.get(v)? else {
+        return None;
+    };
+    let kind = p
+        .get("@@kind")
+        .map(|k| h.str_of(k))
+        .unwrap_or_else(|| "Uint8Array".into());
+    let bpe = bytes_per_element(&kind);
+    let len = p.get("length").map(|l| h.to_number(l)).unwrap_or(0.0) as usize;
+    let off = p.get("byteOffset").map(|o| h.to_number(o)).unwrap_or(0.0) as usize;
+    let store = match p.get("@@buffer").and_then(|b| h.get(b)) {
+        Some(JsObj::Object(bp)) => bp.get("@@bytes").and_then(|a| h.get(a)),
+        _ => None,
+    };
+    let JsObj::Array(bytes) = store? else {
+        return None;
+    };
+    let out = (0..len)
+        .map(|i| {
+            let start = off + i * bpe;
+            if start + bpe > bytes.len() {
+                return vec![0u8; bpe];
+            }
+            bytes[start..start + bpe]
+                .iter()
+                .map(|x| h.to_number(x) as i64 as u8)
+                .collect()
+        })
+        .collect();
+    Some((kind, out))
+}
+
+/// The elements of a view with a MUTABLE host borrow held, so the two 64-bit
+/// kinds can allocate their BigInts. This is the complete reader; the `&self`
+/// one below cannot allocate and so answers `undefined` for those two kinds.
+pub fn elems_mut_host(h: &mut crate::host::JsHost, v: &Value) -> Vec<Value> {
+    if let Some(JsObj::Object(p)) = h.get(v) {
+        if let Some(arr) = p.get("@@bytes").cloned() {
+            return match h.get(&arr) {
+                Some(JsObj::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            };
+        }
+    }
+    let Some((kind, raws)) = raw_elems(h, v) else {
+        return Vec::new();
+    };
+    raws.iter()
+        .map(|b| {
+            if !is_bigint_kind(&kind) {
+                return decode(&kind, b);
+            }
+            let raw = u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]));
+            h.new_bigint(if kind == "BigInt64Array" {
+                num_bigint::BigInt::from(raw as i64)
+            } else {
+                num_bigint::BigInt::from(raw)
+            })
+        })
+        .collect()
+}
+
+/// Every element rendered for display, for `util.inspect` — which holds a
+/// shared borrow and so cannot allocate the BigInt a 64-bit element would need
+/// as a `Value`. Elements are always primitives, so a string loses nothing.
+pub fn elems_display(h: &crate::host::JsHost, v: &Value) -> Vec<String> {
+    let Some((kind, raws)) = raw_elems(h, v) else {
+        return Vec::new();
+    };
+    raws.iter()
+        .map(|b| {
+            if !is_bigint_kind(&kind) {
+                return h.inspect(&decode(&kind, b));
+            }
+            let raw = u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]));
+            if kind == "BigInt64Array" {
+                format!("{}n", raw as i64)
+            } else {
+                format!("{raw}n")
+            }
+        })
+        .collect()
+}
+
+/// The element count a view exposes, from its own `length` slot.
+fn view_len(v: &Value) -> usize {
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Object(p)) => p.get("length").map(|l| h.to_number(l)).unwrap_or(0.0) as usize,
+        _ => 0,
+    })
+}
+
 // ── element indexing (called from builtins::get_property/set_property) ────────
 
 /// `ta[i]` read: the element at char/index `i`, or `None` if `i` is out of range
 /// or not an integer index.
 pub fn elem_get(recv: &Value, key: &str) -> Option<Value> {
     let i: usize = key.parse().ok()?;
-    with_host(|h| match h.get(recv) {
-        Some(JsObj::Object(p)) => match p.get("@@elems").and_then(|a| h.get(a)) {
-            Some(JsObj::Array(items)) => items.get(i).cloned(),
-            _ => None,
-        },
-        _ => None,
-    })
+    if i >= view_len(recv) {
+        return None;
+    }
+    let kind = kind_of(recv);
+    let bpe = bytes_per_element(&kind);
+    let bytes = view_bytes(recv, i * bpe, bpe)?;
+    Some(decode(&kind, &bytes))
 }
 
 /// `ta[i] = v` write (coerced to the kind). Returns true if `i` is a valid index.
@@ -423,19 +992,11 @@ pub fn elem_set(recv: &Value, key: &str, val: &Value) -> Result<bool, String> {
     // Coerced through the element type, so writing a Number into a 64-bit view
     // throws rather than storing an un-typed element.
     let n = coerce_val(&kind, val)?;
-    Ok(with_host(|h| {
-        if let Some(JsObj::Object(p)) = h.get(recv) {
-            if let Some(arr) = p.get("@@elems").cloned() {
-                if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
-                    if i < items.len() {
-                        items[i] = n;
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }))
+    if i >= view_len(recv) {
+        return Ok(false);
+    }
+    let bpe = bytes_per_element(&kind);
+    Ok(write_view_bytes(recv, i * bpe, &encode(&kind, &n)))
 }
 
 /// Build a result of the same "species" as `recv`: a `Buffer` receiver yields a
@@ -452,13 +1013,21 @@ fn species(recv: &Value, kind: &str, elems: Vec<Value>) -> Value {
 
 /// Overwrite `recv`'s elements in place, for the methods that mutate and return
 /// the receiver (`fill`, `reverse`, `sort`, `copyWithin`). Writes through to
-/// whichever hidden array backs it — `@@elems` for a typed array, `@@bytes` for
+/// whichever store backs it — the `ArrayBuffer` for a typed array, `@@bytes` for
 /// a `Buffer`.
 fn write_elems(recv: &Value, kind: &str, vals: &[Value]) -> Result<(), String> {
-    let field = match super::native_tag(recv).as_deref() {
-        Some("Buffer") => "@@bytes",
-        _ => "@@elems",
-    };
+    if super::native_tag(recv).as_deref() == Some("TypedArray") {
+        let bpe = bytes_per_element(kind);
+        let coerced: Vec<Value> = vals
+            .iter()
+            .map(|v| coerce_val(kind, v))
+            .collect::<Result<_, _>>()?;
+        for (i, v) in coerced.iter().enumerate() {
+            write_view_bytes(recv, i * bpe, &encode(kind, v));
+        }
+        return Ok(());
+    }
+    let field = "@@bytes";
     // Coerce OUTSIDE the host borrow: `coerce_val` re-enters the host to read a
     // BigInt and to allocate the wrapped one.
     let coerced: Vec<Value> = vals
@@ -726,7 +1295,16 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             } else {
                 norm(super::arg_num(args, 1))
             };
-            Ok(make(&kind, elems[s.min(e)..e.max(s)].to_vec()))
+            let (lo, hi) = (s.min(e), e.max(s));
+            // 23.2.3.30: `subarray` is a VIEW over the same buffer — writes
+            // through it are seen by the original. `slice` copies (23.2.3.27).
+            if method == "subarray" && super::native_tag(recv).as_deref() == Some("TypedArray") {
+                if let Some((buf, off)) = view_base(recv) {
+                    let bpe = bytes_per_element(&kind);
+                    return Ok(make_view(&kind, &buf, off + lo * bpe, hi - lo));
+                }
+            }
+            Ok(species(recv, &kind, elems[lo..hi].to_vec()))
         }
         "indexOf" => {
             let needle = args.first().cloned().unwrap_or(Value::Undef);
@@ -767,19 +1345,13 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 .iter()
                 .map(|v| coerce_val(&kind, v))
                 .collect::<Result<_, _>>()?;
-            with_host(|h| {
-                if let Some(JsObj::Object(p)) = h.get(recv) {
-                    if let Some(arr) = p.get("@@elems").cloned() {
-                        if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
-                            for (k, v) in src.into_iter().enumerate() {
-                                if off + k < items.len() {
-                                    items[off + k] = v;
-                                }
-                            }
-                        }
-                    }
+            let bpe = bytes_per_element(&kind);
+            let len = view_len(recv);
+            for (k, v) in src.into_iter().enumerate() {
+                if off + k < len {
+                    write_view_bytes(recv, (off + k) * bpe, &encode(&kind, &v));
                 }
-            });
+            }
             Ok(Value::Undef)
         }
         _ => Err(crate::host::type_error(&format!(

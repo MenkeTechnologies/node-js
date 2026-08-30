@@ -207,15 +207,22 @@ fn rejected(err: Value) -> Value {
     p
 }
 
-/// Raw bytes of a chunk: a Buffer's `@@bytes`, a TypedArray's `@@elems`, else its
+/// Raw bytes of a chunk: a Buffer's `@@bytes`, a TypedArray's view, else its
 /// UTF-8 string form.
 fn chunk_bytes(v: &Value) -> Vec<u8> {
     let via_field = with_host(|h| match h.get(v) {
         Some(JsObj::Object(p)) => {
             let field = if p.contains_key("@@bytes") {
                 Some("@@bytes")
-            } else if p.contains_key("@@elems") {
-                Some("@@elems")
+            } else if p.contains_key("@@buffer") {
+                // A typed array's bytes live in its ArrayBuffer, decoded
+                // through the view rather than read out of a private vector.
+                return Some(
+                    crate::stdlib::typedarray::elems_with_host(h, v)
+                        .iter()
+                        .map(|x| h.to_number(x) as u8)
+                        .collect::<Vec<u8>>(),
+                );
             } else {
                 None
             };

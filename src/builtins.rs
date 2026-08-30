@@ -1192,6 +1192,7 @@ fn is_builtin_ctor(name: &str) -> bool {
             | "RegExp"
             | "Date"
             | "ArrayBuffer"
+            | "DataView"
             | "Uint8Array"
             | "Int8Array"
             | "Uint8ClampedArray"
@@ -3588,6 +3589,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "RegExp",
     "Date",
     "ArrayBuffer",
+    "DataView",
     "Uint8Array",
     "Int8Array",
     "Uint8ClampedArray",

@@ -53,8 +53,13 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
 fn bytes_of(v: &Value) -> Vec<u8> {
     with_host(|h| match h.get(v) {
         Some(JsObj::Object(p)) => {
-            let field = p.get("@@bytes").or_else(|| p.get("@@elems"));
-            match field.and_then(|a| h.get(a)) {
+            if p.contains_key("@@buffer") {
+                return crate::stdlib::typedarray::elems_with_host(h, v)
+                    .iter()
+                    .map(|x| h.to_number(x) as u8)
+                    .collect();
+            }
+            match p.get("@@bytes").and_then(|a| h.get(a)) {
                 Some(JsObj::Array(items)) => items.iter().map(|x| h.to_number(x) as u8).collect(),
                 _ => Vec::new(),
             }

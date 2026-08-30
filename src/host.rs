@@ -3740,25 +3740,52 @@ impl JsHost {
                         .get("@@kind")
                         .map(|k| self.str_of(k))
                         .unwrap_or_else(|| "TypedArray".into());
-                    let elems: Vec<Value> = match props.get("@@elems").and_then(|e| self.get(e)) {
-                        Some(JsObj::Array(items)) => items.clone(),
-                        _ => Vec::new(),
-                    };
+                    // Rendered as STRINGS: a 64-bit view's elements are BigInts,
+                    // which this shared borrow cannot allocate as values.
+                    let elems = crate::stdlib::typedarray::elems_display(self, v);
+                    // The grid layout sizes its columns from the VALUES; a
+                    // 64-bit view's come back as `undefined` (no allocation is
+                    // possible here), which only affects column padding.
+                    let vals = crate::stdlib::typedarray::elems_with_host(self, v);
                     let base = format!("{kind}({}) ", elems.len());
                     if indent as i64 > inspect_indent_limit() {
                         return format!("[{kind}]");
                     }
                     let shown = elems.len().min(MAX_ARRAY_LENGTH);
-                    let mut inner: Vec<String> = elems[..shown]
-                        .iter()
-                        .map(|x| self.inspect_lvl(x, indent + 2, st))
-                        .collect();
+                    let mut inner: Vec<String> = elems[..shown].to_vec();
                     let remaining = elems.len() - shown;
                     if remaining > 0 {
                         let unit = if remaining == 1 { "item" } else { "items" };
                         inner.push(format!("... {remaining} more {unit}"));
                     }
-                    self.render_array(&inner, &elems, indent, false, remaining > 0, &base)
+                    self.render_array(&inner, &vals, indent, false, remaining > 0, &base)
+                }
+                // An `ArrayBuffer` renders its CONTENTS, which is the only way
+                // to see them — it exposes no indices of its own:
+                // `ArrayBuffer { [Uint8Contents]: <00 01>, [byteLength]: 2 }`.
+                Some(JsObj::Object(props))
+                    if props.get("@@native").map(|t| self.str_of(t)).as_deref()
+                        == Some("ArrayBuffer") =>
+                {
+                    let bytes: Vec<u8> = match props.get("@@bytes").and_then(|b| self.get(b)) {
+                        Some(JsObj::Array(items)) => {
+                            items.iter().map(|x| self.to_number(x) as u8).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    let mut parts = vec![
+                        format!("[Uint8Contents]: <{}>", hex.join(" ")),
+                        format!("[byteLength]: {}", bytes.len()),
+                    ];
+                    if props.contains_key("@@maxByteLength") {
+                        let max = props
+                            .get("@@maxByteLength")
+                            .map(|m| self.to_number(m))
+                            .unwrap_or(0.0);
+                        parts.insert(1, format!("maxByteLength: {}", fmt_number(max)));
+                    }
+                    self.render_object(&parts, "ArrayBuffer ", indent)
                 }
                 // A `Buffer` renders as `<Buffer 01 02 03>` — hex bytes, capped
                 // at 50 with a `... N more byte(s)` tail, exactly as
@@ -4896,21 +4923,9 @@ impl JsHost {
             // "object is not iterable", which is the same invariant holding at
             // one of its two sites.
             Some(JsObj::Object(props))
-                if props.contains_key("@@bytes") || props.contains_key("@@elems") =>
+                if props.contains_key("@@bytes") || props.contains_key("@@buffer") =>
             {
-                let field = if props.contains_key("@@bytes") {
-                    "@@bytes"
-                } else {
-                    "@@elems"
-                };
-                match props
-                    .get(field)
-                    .cloned()
-                    .and_then(|b| self.get(&b).cloned())
-                {
-                    Some(JsObj::Array(items)) => Ok(items),
-                    _ => Ok(Vec::new()),
-                }
+                Ok(crate::stdlib::typedarray::elems_mut_host(self, v))
             }
             // V8 names the VALUE, not its type: `[...5]` is `5 is not iterable`,
             // `[...{}]` is `{} is not iterable`. Reporting `typeof` instead
@@ -4995,13 +5010,14 @@ impl JsHost {
                     Some("Buffer") | Some("TypedArray")
                 ) =>
             {
-                let field = match props.get("@@native").map(|t| self.str_of(t)).as_deref() {
-                    Some("Buffer") => "@@bytes",
-                    _ => "@@elems",
-                };
-                let n = match props.get(field).and_then(|b| self.get(b)) {
+                // A Buffer counts its byte store; every other view reports the
+                // element count of its window onto the ArrayBuffer.
+                let n = match props.get("@@bytes").and_then(|b| self.get(b)) {
                     Some(JsObj::Array(items)) => items.len(),
-                    _ => 0,
+                    _ => props
+                        .get("length")
+                        .map(|l| self.to_number(l))
+                        .unwrap_or(0.0) as usize,
                 };
                 (0..n).map(|i| i.to_string()).collect()
             }
@@ -5093,14 +5109,11 @@ impl JsHost {
                         // A Buffer's elements live in `@@bytes` and every
                         // other typed array's in `@@elems`; both are index
                         // keys with no entry in the property map.
-                        let backing = props
-                            .get("@@bytes")
-                            .or_else(|| props.get("@@elems"))
-                            .and_then(|b| self.get(b));
-                        match (backing, k.parse::<usize>()) {
-                            (Some(JsObj::Array(items)), Ok(i)) => {
-                                items.get(i).cloned().unwrap_or(Value::Undef)
-                            }
+                        match k.parse::<usize>() {
+                            Ok(i) => crate::stdlib::typedarray::elems_with_host(self, v)
+                                .get(i)
+                                .cloned()
+                                .unwrap_or(Value::Undef),
                             _ => Value::Undef,
                         }
                     }),

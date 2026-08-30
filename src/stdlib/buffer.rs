@@ -323,6 +323,41 @@ pub fn blob_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, St
     }
 }
 
+/// A Buffer that is a WINDOW onto an existing `ArrayBuffer`'s store, sharing
+/// its bytes rather than copying them.
+pub fn share_array_buffer(ab: &Value, off: usize, len: usize) -> Value {
+    let store = crate::stdlib::typedarray::buffer_store(ab);
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str("Buffer"));
+        m.insert(
+            "@@bytes".into(),
+            store.unwrap_or_else(|| h.new_array(Vec::new())),
+        );
+        m.insert("@@buffer".into(), ab.clone());
+        m.insert("buffer".into(), ab.clone());
+        m.insert("length".into(), Value::Float(len as f64));
+        m.insert("byteLength".into(), Value::Float(len as f64));
+        m.insert("byteOffset".into(), Value::Float(off as f64));
+        m.insert("BYTES_PER_ELEMENT".into(), Value::Float(1.0));
+        let obj = h.new_object(m);
+        h.ensure_native_protos();
+        if let Some(p) = h.native_proto("Buffer") {
+            h.set_proto(&obj, p);
+        }
+        for k in [
+            "buffer",
+            "length",
+            "byteLength",
+            "byteOffset",
+            "BYTES_PER_ELEMENT",
+        ] {
+            h.hide_prop(&obj, k);
+        }
+        obj
+    })
+}
+
 /// Build a Buffer value from raw bytes.
 pub fn from_bytes(bytes: &[u8]) -> Value {
     with_host(|h| {
@@ -353,10 +388,38 @@ pub fn from_bytes(bytes: &[u8]) -> Value {
     })
 }
 
+/// A Buffer's window onto its byte store as `(byteOffset, length)`.
+///
+/// A Buffer built from its own bytes spans the whole store, so this is
+/// `(0, len)` and every accessor behaves as it did. One built over an
+/// `ArrayBuffer` SHARES that buffer's array and may start partway into it, which
+/// is what makes `Buffer.from(ab, 2, 2)` alias rather than copy.
+fn window(recv: &Value) -> (usize, usize) {
+    with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) => {
+            let off = p.get("byteOffset").map(|o| h.to_number(o)).unwrap_or(0.0) as usize;
+            let store = match p.get("@@bytes").and_then(|v| h.get(v)) {
+                Some(JsObj::Array(items)) => items.len(),
+                _ => 0,
+            };
+            let len = p
+                .get("length")
+                .map(|l| h.to_number(l) as usize)
+                .unwrap_or(store);
+            (off.min(store), len.min(store.saturating_sub(off)))
+        }
+        _ => (0, 0),
+    })
+}
+
 fn bytes_of(recv: &Value) -> Vec<u8> {
+    let (off, len) = window(recv);
     with_host(|h| match h.get(recv) {
         Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|v| h.get(v)) {
-            Some(JsObj::Array(items)) => items.iter().map(|v| h.to_number(v) as u8).collect(),
+            Some(JsObj::Array(items)) => items[off..off + len]
+                .iter()
+                .map(|v| h.to_number(v) as u8)
+                .collect(),
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -386,8 +449,12 @@ pub fn byte_get(recv: &Value, index: &str) -> Value {
         Some(a) => a,
         None => return Value::Undef,
     };
+    let (off, len) = window(recv);
+    if i >= len {
+        return Value::Undef;
+    }
     with_host(|h| match h.get(&arr) {
-        Some(JsObj::Array(items)) => match items.get(i) {
+        Some(JsObj::Array(items)) => match items.get(off + i) {
             Some(v) => Value::Float(h.to_number(v)),
             None => Value::Undef,
         },
@@ -413,10 +480,16 @@ pub fn byte_set(recv: &Value, index: &str, val: &Value) -> bool {
         None => return false,
     };
     let b = with_host(|h| h.to_number(val)) as i64 as u8;
+    // Indexed through the Buffer's WINDOW, so one sharing an ArrayBuffer writes
+    // where its own view starts rather than at the store's origin.
+    let (off, len) = window(recv);
+    if i >= len {
+        return true;
+    }
     with_host(|h| {
         if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
             // Out of range writes are dropped, not appended.
-            if let Some(slot) = items.get_mut(i) {
+            if let Some(slot) = items.get_mut(off + i) {
                 *slot = Value::Float(b as f64);
             }
         }
@@ -535,15 +608,10 @@ pub fn bytes_like(v: &Value) -> Option<Vec<u8>> {
     if let Some(elems) = crate::stdlib::typedarray::elems_of(v) {
         return Some(elems.iter().map(|x| *x as i64 as u8).collect());
     }
-    // An `ArrayBuffer` carries only a byte length in this model, so it reads as
-    // that many zero bytes. Node would share the memory; nothing here can
-    // observe the difference until typed arrays get a real backing store.
+    // An `ArrayBuffer` is handled by `from`, which SHARES its store rather than
+    // copying — reaching here would produce a detached copy.
     if super::native_tag(v).as_deref() == Some("ArrayBuffer") {
-        let n = with_host(|h| match h.get(v) {
-            Some(JsObj::Object(p)) => p.get("byteLength").map(|b| h.to_number(b) as usize),
-            _ => None,
-        });
-        return n.map(|n| vec![0u8; n]);
+        return Some(crate::stdlib::typedarray::buffer_bytes_snapshot(v).unwrap_or_default());
     }
     // A plain JS array of byte values.
     with_host(|h| match h.get(v) {
@@ -571,7 +639,19 @@ fn view_byte_length(v: &Value) -> Option<f64> {
 
 fn from(args: &[Value]) -> Result<Value, String> {
     let v = args.first().cloned().unwrap_or(Value::Undef);
-    // Any byte-like source (array of bytes, Buffer, typed array, ArrayBuffer).
+    // `Buffer.from(arrayBuffer[, byteOffset[, length]])` SHARES the buffer's
+    // memory — a write through the Buffer is visible through every other view.
+    // It used to copy zero bytes, because an ArrayBuffer had no store at all.
+    if super::native_tag(&v).as_deref() == Some("ArrayBuffer") {
+        let total = crate::stdlib::typedarray::buffer_byte_length(&v);
+        let off = (super::arg_num(args, 1).max(0.0) as usize).min(total);
+        let len = match args.get(2) {
+            Some(Value::Undef) | None => total - off,
+            Some(_) => (super::arg_num(args, 2).max(0.0) as usize).min(total - off),
+        };
+        return Ok(share_array_buffer(&v, off, len));
+    }
+    // Any byte-like source (array of bytes, Buffer, typed array).
     if let Some(bytes) = bytes_like(&v) {
         return Ok(from_bytes(&bytes));
     }
@@ -1138,6 +1218,7 @@ fn range_error_out_of_bounds() -> String {
 }
 
 fn set_bytes(recv: &Value, new: &[u8]) {
+    let (off, _) = window(recv);
     with_host(|h| {
         let arr = match h.get(recv) {
             Some(JsObj::Object(p)) => p.get("@@bytes").cloned(),
@@ -1145,7 +1226,13 @@ fn set_bytes(recv: &Value, new: &[u8]) {
         };
         if let Some(a) = arr {
             if let Some(JsObj::Array(items)) = h.get_mut(&a) {
-                *items = new.iter().map(|b| Value::Float(*b as f64)).collect();
+                // Only the window is rewritten, so a Buffer sharing an
+                // ArrayBuffer never clobbers bytes outside its own view.
+                for (i, b) in new.iter().enumerate() {
+                    if off + i < items.len() {
+                        items[off + i] = Value::Float(*b as f64);
+                    }
+                }
             }
         }
     });

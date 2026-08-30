@@ -125,6 +125,28 @@ true true false true
 1n 7n 4n -6n 256n
 TypeError: Cannot mix BigInt and other types, use explicit conversions
 42n 255n 1n
+==== binary.js ====
+shared   513 2 true true
+back     4 3 2 1
+offset   2 4 2 4
+aliased  9 9
+bounds   RangeError RangeError ok
+subarray 1,99,3,4 99,3 2,77 true
+dataview 4660 13330 18 52
+float    1.5 8 0
+bigint   -2n 18446744073709551614n
+dvbounds RangeError RangeError TypeError
+dvwindow 0,171,205,0
+abslice  2 1 6
+isView   true true false false
+bufshare 7,0,8,0 4 2 2
+kinds    -1 -2 -3 1.5 1.5 255
+bigkinds -1n 1n
+resize   true 8 2
+grown    6 6 RangeError
+brand    [object ArrayBuffer] [object DataView] [object Uint8Array] true
+inspect  ArrayBuffer { [Uint8Contents]: <00 00 00>, [byteLength]: 3 } Uint8Array(2) [ 1, 2 ] Int32Array(1) [ 5 ] BigInt64Array(1) [ 7n ]
+iterate  1|2|3 0,1 4|5 {"0":1,"1":2}
 ==== buffers.js ====
 Int8      80=-128 ff=-1 7f=127
 UInt8     00=0 ff=255

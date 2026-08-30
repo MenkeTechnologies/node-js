@@ -479,6 +479,7 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         n if fetch::is_class(n) => fetch::construct(n, args),
         "TextEncoder" => Some(typedarray::construct_text_encoder()),
         "TextDecoder" => Some(typedarray::construct_text_decoder(args)),
+        "DataView" => Some(typedarray::construct_dataview(args)),
         n if typedarray::is_ctor(n) => Some(typedarray::construct(n, args)),
         n if stream::is_class(n) => Some(Ok(stream::construct(n, args))),
         "AsyncLocalStorage" | "AsyncResource" => async_hooks::construct(name, args),
@@ -587,6 +588,8 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         ],
         "IncomingMessage" => &["pause", "resume", "setEncoding", "destroy"],
         "Buffer" => buffer::INSTANCE_METHODS,
+        "DataView" => typedarray::DATAVIEW_METHODS,
+        "ArrayBuffer" => &["slice", "resize"],
         "Date" => date::INSTANCE_METHODS,
         "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" => &[
             "read",
@@ -746,6 +749,11 @@ pub fn instance_call(
         "TextEncoder" => typedarray::text_encoder_call(recv, method, &args),
         "TextDecoder" => typedarray::text_decoder_call(recv, method, &args),
         "TypedArray" => typedarray::instance_call(recv, method, &args),
+        "DataView" => typedarray::dataview_call(recv, method, &args),
+        // An `ArrayBuffer`'s only instance method is `slice`, which copies the
+        // byte range into a fresh buffer.
+        "ArrayBuffer" if method == "slice" => Ok(typedarray::buffer_slice(recv, &args)),
+        "ArrayBuffer" if method == "resize" => typedarray::buffer_resize(recv, &args),
         t if fetch::is_class(t) => fetch::instance_call(t, recv, method, &args),
         "Hash" => crypto::instance_call(recv, method, &args),
         "Hmac" => crypto::hmac_instance_call(recv, method, &args),
