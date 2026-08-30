@@ -4341,6 +4341,13 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
     }
 }
 
+/// Build an `Error` object carrying `msg`, for stdlib callers that need to
+/// throw a value with extra own properties on it.
+pub(crate) fn make_error_pub(name: &str, msg: &str) -> Value {
+    let m = with_host(|h| h.new_str(msg.to_string()));
+    make_error(name, &[m])
+}
+
 fn make_error(name: &str, args: &[Value]) -> Value {
     // `new AggregateError(errors, message)` takes the causes FIRST; every other
     // error constructor takes the message first.

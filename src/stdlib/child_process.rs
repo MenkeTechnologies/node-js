@@ -98,11 +98,73 @@ struct Run {
     pid: u32,
 }
 
+/// The options a *Sync call passes through to the child.
+#[derive(Default)]
+struct SpawnOpts {
+    input: Option<Vec<u8>>,
+    /// `env` REPLACES the environment rather than extending it, as in node.
+    env: Option<Vec<(String, String)>>,
+    cwd: Option<String>,
+}
+
+/// Read `input`, `env` and `cwd` out of the options argument.
+///
+/// `env` and `cwd` were being ignored entirely: the child inherited this
+/// process's environment and working directory, so `spawnSync(cmd, args,
+/// { cwd })` silently ran somewhere else and `{ env }` silently saw the wrong
+/// variables.
+fn spawn_opts(args: &[Value], idx: usize) -> SpawnOpts {
+    let Some(opts) = args.get(idx) else {
+        return SpawnOpts::default();
+    };
+    let read = |k: &str| crate::builtins::get_property(opts, k).ok();
+    let input = match read("input") {
+        Some(Value::Undef) | None => None,
+        Some(v) => Some(super::arg_str(&[v], 0).into_bytes()),
+    };
+    let cwd = match read("cwd") {
+        Some(Value::Undef) | None => None,
+        Some(v) => Some(with_host(|h| h.str_of(&v))),
+    };
+    let env = match read("env") {
+        Some(v) if with_host(|h| matches!(h.get(&v), Some(JsObj::Object(_)))) => {
+            let keys = with_host(|h| match h.get(&v) {
+                Some(JsObj::Object(m)) => m
+                    .keys()
+                    .filter(|k| !k.starts_with("@@"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            });
+            Some(
+                keys.into_iter()
+                    .filter_map(|k| {
+                        let val = crate::builtins::get_property(&v, &k).ok()?;
+                        Some((k, with_host(|h| h.str_of(&val))))
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
+    SpawnOpts { input, env, cwd }
+}
+
 /// Spawn `program` with `args`, capture both pipes, optionally feed `input` to
 /// stdin, and wait for exit.
-fn run(program: &str, args: &[String], input: Option<&[u8]>) -> std::io::Result<Run> {
+fn run(program: &str, args: &[String], opts: &SpawnOpts) -> std::io::Result<Run> {
+    let input = opts.input.as_deref();
     let mut cmd = Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = &opts.cwd {
+        cmd.current_dir(dir);
+    }
+    if let Some(vars) = &opts.env {
+        cmd.env_clear();
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+    }
     cmd.stdin(if input.is_some() {
         Stdio::piped()
     } else {
@@ -126,14 +188,50 @@ fn run(program: &str, args: &[String], input: Option<&[u8]>) -> std::io::Result<
     })
 }
 
-/// The `opts.input` (stdin) bytes for a *Sync call, if provided.
-fn opts_input(args: &[Value], idx: usize) -> Option<Vec<u8>> {
-    let opts = args.get(idx)?;
-    match crate::builtins::get_property(opts, "input") {
-        Ok(Value::Undef) => None,
-        Ok(v) => Some(super::arg_str(&[v], 0).into_bytes()),
-        Err(_) => None,
+/// `execSync`/`execFileSync` send the child's stderr on to the PARENT's stderr
+/// as well as capturing it — that is their documented default stdio, and it is
+/// how a build script's diagnostics reach the terminal. `spawnSync` does not,
+/// and must not. Nothing was echoing it, so those diagnostics vanished.
+fn echo_stderr(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
     }
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    with_host(|h| h.write_out(&text, true));
+}
+
+/// The error a failing `execSync` throws.
+///
+/// Node throws a real Error carrying `status`, `signal`, `pid`, `stdout` and
+/// `stderr`, and the standard shape of a caller is to read `e.status` or
+/// `e.stderr`. This used to throw a bare message string, so every one of those
+/// read back as undefined and the exit code was unrecoverable.
+fn command_failed(cmd: &str, r: &Run, enc: Option<&str>) -> String {
+    let tail = String::from_utf8_lossy(&r.stderr).into_owned();
+    let msg = format!("Command failed: {cmd}\n{tail}");
+    // Build the pipe values before the allocating `with_host` below; each takes
+    // its own borrow.
+    let stdout = output_value(&r.stdout, enc);
+    let stderr = output_value(&r.stderr, enc);
+    // Each of these takes its own host borrow, so none may be built inside
+    // another's `with_host` closure.
+    let e = crate::builtins::make_error_pub("Error", &msg);
+    let null = with_host(|h| h.null());
+    let status = r
+        .status
+        .map(|c| Value::Float(c as f64))
+        .unwrap_or_else(|| null.clone());
+    for (k, v) in [
+        ("status", status),
+        ("signal", null),
+        ("pid", Value::Float(r.pid as f64)),
+        ("stdout", stdout),
+        ("stderr", stderr),
+    ] {
+        let _ = crate::builtins::set_property_pub(&e, k, v);
+    }
+    with_host(|h| h.exc = Some(e));
+    format!("Error: {msg}")
 }
 
 /// `execSync(command[, options])` — run `sh -c <command>`, return stdout, and
@@ -141,15 +239,11 @@ fn opts_input(args: &[Value], idx: usize) -> Option<Vec<u8>> {
 fn exec_sync(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     let enc = opts_encoding(args, 1);
-    let r = run(
-        "sh",
-        &["-c".to_string(), cmd.clone()],
-        opts_input(args, 1).as_deref(),
-    )
-    .map_err(|e| format!("Error: {e}"))?;
+    let r = run("sh", &["-c".to_string(), cmd.clone()], &spawn_opts(args, 1))
+        .map_err(|e| format!("Error: {e}"))?;
+    echo_stderr(&r.stderr);
     if r.status != Some(0) {
-        let tail = String::from_utf8_lossy(&r.stderr);
-        return Err(format!("Error: Command failed: {cmd}\n{tail}"));
+        return Err(command_failed(&cmd, &r, enc.as_deref()));
     }
     Ok(output_value(&r.stdout, enc.as_deref()))
 }
@@ -160,7 +254,7 @@ fn spawn_sync(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     let cmd_args = arg_array(args, 1);
     let enc = opts_encoding(args, 2);
-    match run(&cmd, &cmd_args, opts_input(args, 2).as_deref()) {
+    match run(&cmd, &cmd_args, &spawn_opts(args, 2)) {
         Ok(r) => {
             // Build the stdout/stderr values FIRST (each allocates via its own
             // `with_host`); inserting them inside the outer `with_host` below would
@@ -205,8 +299,9 @@ fn exec_file_sync(args: &[Value]) -> Result<Value, String> {
     let file = arg_str(args, 0);
     let cmd_args = arg_array(args, 1);
     let enc = opts_encoding(args, 2);
-    let r = run(&file, &cmd_args, opts_input(args, 2).as_deref())
+    let r = run(&file, &cmd_args, &spawn_opts(args, 2))
         .map_err(|e| format!("Error: spawn {file} {e}"))?;
+    echo_stderr(&r.stderr);
     if r.status != Some(0) {
         let tail = String::from_utf8_lossy(&r.stderr);
         return Err(format!("Error: Command failed: {file}\n{tail}"));
@@ -223,7 +318,8 @@ fn exec(args: &[Value]) -> Result<Value, String> {
     let Some(cb) = args.last().cloned() else {
         return Ok(Value::Undef);
     };
-    let (err, out, errout) = match run("sh", &["-c".to_string(), cmd.clone()], None) {
+    let (err, out, errout) = match run("sh", &["-c".to_string(), cmd.clone()], &spawn_opts(args, 1))
+    {
         Ok(r) => {
             let stdout = String::from_utf8_lossy(&r.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&r.stderr).into_owned();
@@ -255,7 +351,7 @@ fn exec(args: &[Value]) -> Result<Value, String> {
 fn spawn(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     let cmd_args = arg_array(args, 1);
-    match run(&cmd, &cmd_args, None) {
+    match run(&cmd, &cmd_args, &spawn_opts(args, 2)) {
         Ok(r) => {
             // Allocate the Buffers / null before building the map (`from_bytes` and
             // `null` borrow the host — nesting inside another `with_host` panics).
@@ -295,7 +391,7 @@ fn exec_file(args: &[Value]) -> Result<Value, String> {
         .find(|v| with_host(|h| crate::host::is_callable(h, v)))
         .cloned();
 
-    match run(&file, &cmd_args, None) {
+    match run(&file, &cmd_args, &spawn_opts(args, 2)) {
         Ok(r) => {
             let stdout_buf = super::buffer::from_bytes(&r.stdout);
             let stderr_buf = super::buffer::from_bytes(&r.stderr);

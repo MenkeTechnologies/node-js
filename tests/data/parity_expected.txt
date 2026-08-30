@@ -468,6 +468,20 @@ cb-args  x["1","1",1,"x1",{"d":"1"}]
 cb-str   a3c
 nonglobal TypeError String.prototype.replaceAll called with a non-global RegExp argument
 global   bb ba
+==== subprocess.js ====
+cwd       /tmp /
+exec-cwd  /tmp
+env-set   [x]
+env-repl  [/usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:.]
+env-empty 3
+env-inherit has
+both      /tmp|zed
+exec-env  qq
+file-env  ww
+throw     true|9||number|out
+throw-enc 4,string
+status    3 0
+input     piped
 ==== symbols.js ====
 iterator 1,2,3 1,2,3
 toPrim   42 str:string str:default
