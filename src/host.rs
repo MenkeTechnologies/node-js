@@ -3501,7 +3501,7 @@ impl JsHost {
                     }
                     // Node's default inspect depth is 2 (root = depth 0); deeper
                     // nesting collapses to `[Array]`. indent grows by 2 per level.
-                    if indent > 2 * inspect_max_depth() {
+                    if indent as i64 > inspect_indent_limit() {
                         return "[Array]".into();
                     }
                     // `util.inspect`'s `maxArrayLength` (default 100): only the
@@ -3595,7 +3595,7 @@ impl JsHost {
                         _ => Vec::new(),
                     };
                     let base = format!("{kind}({}) ", elems.len());
-                    if indent > 2 * inspect_max_depth() {
+                    if indent as i64 > inspect_indent_limit() {
                         return format!("[{kind}]");
                     }
                     let shown = elems.len().min(MAX_ARRAY_LENGTH);
@@ -3739,7 +3739,7 @@ impl JsHost {
                     }
                     // Depth limit (Node default 2): deeper objects collapse to
                     // `[Object]` (or `[ClassName]` for a named instance).
-                    if indent > 2 * inspect_max_depth() {
+                    if indent as i64 > inspect_indent_limit() {
                         return if self.has_null_proto(v) {
                             // Already bracketed (`[Object: null prototype]`).
                             prefix.trim_end().to_string()
@@ -3796,7 +3796,7 @@ impl JsHost {
                     if entries.is_empty() {
                         return "Map(0) {}".into();
                     }
-                    if indent > 2 * inspect_max_depth() {
+                    if indent as i64 > inspect_indent_limit() {
                         return "[Map]".into();
                     }
                     let inner: Vec<String> = entries
@@ -3815,7 +3815,7 @@ impl JsHost {
                     if entries.is_empty() {
                         return "Set(0) {}".into();
                     }
-                    if indent > 2 * inspect_max_depth() {
+                    if indent as i64 > inspect_indent_limit() {
                         return "[Set]".into();
                     }
                     let inner: Vec<String> = entries
@@ -4449,14 +4449,25 @@ thread_local! {
     /// The active `util.inspect` `depth` (nesting levels shown before collapsing
     /// to `[Object]`/`[Array]`). Node's default is 2; `util.inspect(v,{depth:N})`
     /// overrides it for one call, `console.log`/`util.format` use the default.
-    static INSPECT_MAX_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
+    /// Signed, because `util.inspect(v, { depth: -1 })` is legal and means
+    /// "already past the limit" — everything collapses to `[Object]` at the top
+    /// level. Held as `usize` it read as an enormous depth and expanded fully.
+    static INSPECT_MAX_DEPTH: std::cell::Cell<i64> = const { std::cell::Cell::new(2) };
 }
 
 /// Set the `util.inspect` depth for the next render (restore to 2 after).
-pub fn set_inspect_max_depth(d: usize) {
+pub fn set_inspect_max_depth(d: i64) {
     INSPECT_MAX_DEPTH.with(|c| c.set(d));
 }
-fn inspect_max_depth() -> usize {
+/// Twice the configured depth, which is what the inspect walk compares its
+/// indent against. Saturating, because `util.inspect(x, { depth: null })` and
+/// `{ depth: Infinity }` both set the depth to `usize::MAX`, and doubling that
+/// overflowed and panicked the process — an abort no script could catch.
+fn inspect_indent_limit() -> i64 {
+    inspect_max_depth().saturating_mul(2)
+}
+
+fn inspect_max_depth() -> i64 {
     INSPECT_MAX_DEPTH.with(|c| c.get())
 }
 

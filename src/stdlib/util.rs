@@ -72,13 +72,17 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             let depth = match args.get(1) {
                 Some(opts) => match crate::builtins::get_property(opts, "depth") {
                     Ok(Value::Undef) => 2,
-                    Ok(v) if with_host(|h| h.is_null(&v)) => usize::MAX,
+                    Ok(v) if with_host(|h| h.is_null(&v)) => i64::MAX,
                     Ok(v) => {
                         let n = with_host(|h| h.to_number(&v));
-                        if n.is_finite() && n >= 0.0 {
-                            n as usize
-                        } else {
-                            usize::MAX
+                        // A NEGATIVE depth is legal and means "already past the
+                        // limit"; only `null` and a non-finite depth mean
+                        // unlimited. Treating anything below zero as unlimited
+                        // made `{ depth: -1 }` print the whole object.
+                        match n {
+                            _ if n.is_nan() || n == f64::INFINITY => i64::MAX,
+                            _ if n == f64::NEG_INFINITY => i64::MIN,
+                            _ => n.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64,
                         }
                     }
                     Err(_) => 2,

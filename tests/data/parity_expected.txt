@@ -326,6 +326,14 @@ Ada { age: 36, roles: [ 'admin', 'dev' ] }
 [ 'name', 'age', 'roles', 'active' ] [ 36, [ 'admin', 'dev' ] ]
 {"name":"Ada","age":36,"roles":["admin","dev"],"active":true}
 1 [ 2, 3 ]
+depth-def  { a: { b: { c: [Object] } } }
+depth-0    { a: [Object] }
+depth-1    { a: { b: [Object] } }
+depth-null { a: { b: { c: { d: { e: 1 } } } } }
+depth-inf  { a: { b: { c: { d: { e: 1 } } } } }
+depth-neg  [Object] [Object]
+depth-ninf [Object] [Array]
+depth-frac { a: { b: [Object] } } { a: { b: { c: [Object] } } }
 ==== properties.js ====
 order    1,2,b,a,01
 reflect  6
