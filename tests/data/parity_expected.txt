@@ -45,6 +45,45 @@ instanceof Shape true
 instanceof Object true
 static [ 'circle', 'rect', 'square' ]
 ctor name Square
+==== classfeatures.js ====
+private  1|privMethod|privGetter
+statics  1 static-block true false
+gen      a b
+inner-finally
+genRet   {"value":"early","done":true}
+genThrow caught:boom
+asyncGen 1,2
+==== coercion.js ====
+arr+arr   ""
+arr+obj   "[object Object]"
+obj+arr   "[object Object]"
+1+"2"     "12"
+"3"*"4"   12
+true+true 2
+null+1    1
+undef+1   NaN
+[]==false true
+"0"==false true
+null==undef true
+null>=0   true
+NaN==NaN  false
+typeof-fn "function"
+typeof-null "object"
+typeof-sym "symbol"
+0.1+0.2   0.30000000000000004
+-0===0    true
+Object.is false
+1/-0      -Infinity
+2**53+1   9007199254740992
+parseInt  8
+Number("") 0
++" 12 "   12
+[1,2]=="1,2" true
+valueOf   7
+toString  "T"
+sortDflt  "1,10,9"
+sparse    "[1,null,3]"
+holes-map 3
 ==== collections.js ====
 size 3
 get bob 75
@@ -186,6 +225,20 @@ Ada { age: 36, roles: [ 'admin', 'dev' ] }
 [ 'name', 'age', 'roles', 'active' ] [ 36, [ 'admin', 'dev' ] ]
 {"name":"Ada","age":36,"roles":["admin","dev"],"active":true}
 1 [ 2, 3 ]
+==== properties.js ====
+order    1,2,b,a,01
+reflect  6
+freeze   1 99 true false
+seal     2 undefined true false
+length   1,2 2
+sparse   6 [1,2,null,null,null,"x"] false
+defArr   1,two,3 3
+nonwrit  1
+prevent  undefined false false
+descrs   G 1 function
+nogetter 0
+getter   1
+proxykeys ownKeys,gopd,gopd
 ==== regexp.js ====
 true true false
 a b
