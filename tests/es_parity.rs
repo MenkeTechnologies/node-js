@@ -4757,6 +4757,91 @@ fn the_response_header_accessors_report_what_was_set_and_removed() {
     assert_eq!(run(src), expected);
 }
 
+/// Every method these classes ADVERTISE is actually dispatched.
+///
+/// `stdlib::instance_method_lists` is what `typeof obj.x === 'function'`
+/// answers from, and each module's `*_call` is what actually runs. When they
+/// drift the failure is nastier than a plain missing method: feature detection
+/// says the method is there and the call throws "is not a function" anyway.
+/// That had happened to four ServerResponse methods (cc77f2fe43).
+///
+/// The method names come from `instance_method_lists` itself, not a copy, so a
+/// name added to a list without a dispatcher arm fails here on the next run.
+/// The constructors below are hand-written because there is no generic way to
+/// build these — that is the part that genuinely needs a person, and it is also
+/// the part least likely to drift.
+///
+/// Only errors matching "is not a function" count. Calling with no arguments
+/// legitimately throws elsewhere (a missing required argument, a socket that is
+/// not connected), and those are not what this is looking for.
+#[test]
+fn every_advertised_method_on_these_classes_is_dispatched() {
+    // tag -> a JS expression evaluating to an instance of it.
+    let subjects: &[(&str, &str)] = &[
+        ("Server", "require('net').createServer()"),
+        ("Socket", "new (require('net').Socket)()"),
+        ("URL", "new URL('http://example.com/a?b=1')"),
+        ("URLSearchParams", "new URLSearchParams('a=1&b=2')"),
+        (
+            "StringDecoder",
+            "new (require('string_decoder').StringDecoder)('utf8')",
+        ),
+        ("Hash", "require('crypto').createHash('sha256')"),
+        ("Hmac", "require('crypto').createHmac('sha256', 'k')"),
+        ("Blob", "new Blob(['ab'])"),
+        (
+            "AsyncLocalStorage",
+            "new (require('async_hooks').AsyncLocalStorage)()",
+        ),
+        ("Agent", "new (require('http').Agent)()"),
+    ];
+
+    let mut checks = String::new();
+    for (tag, ctor) in subjects {
+        let (base, emitter) = nodejs::stdlib::instance_method_lists(tag);
+        let names: Vec<String> = base
+            .iter()
+            .chain(emitter.iter())
+            .map(|n| format!("'{n}'"))
+            .collect();
+        checks.push_str(&format!(
+            "check({tag:?}, () => ({ctor}), [{}]);\n",
+            names.join(", ")
+        ));
+    }
+
+    let src = format!(
+        r##"
+        const bad = [];
+        function check(tag, make, names) {{
+          for (const n of names) {{
+            // A FRESH instance per method: calling them in sequence on one
+            // object lets an earlier call change state and make a later one
+            // fail for an unrelated reason (`close()` then `emit()`).
+            let obj;
+            try {{ obj = make(); }} catch (e) {{ bad.push(tag + ':construct'); return; }}
+            if (typeof obj[n] !== 'function') {{ bad.push(tag + '.' + n + ':absent'); continue; }}
+            try {{ obj[n](); }} catch (e) {{
+              // Only an error naming THIS METHOD means the dispatcher has no
+              // arm for it — "res.flushHeaders is not a function". Calling with
+              // no arguments also throws "undefined is not a function" from
+              // methods that require a callback (forEach, AsyncLocalStorage.run),
+              // and that is about the argument, not the method.
+              const msg = String(e && e.message);
+              if (msg.indexOf(n + ' is not a function') !== -1) {{
+                bad.push(tag + '.' + n + ':notdispatched');
+              }}
+            }}
+          }}
+        }}
+        {checks}
+        console.log(bad.length === 0 ? 'all dispatched' : bad.join(','));
+        process.exit(0);
+    "##
+    );
+    assert_eq!(run(&src), "all dispatched");
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
