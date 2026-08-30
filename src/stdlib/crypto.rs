@@ -642,7 +642,7 @@ fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Resu
             // stringifying it happened to yield its utf8 text — which is wrong
             // the moment the bytes are not valid utf8.
             let first = args.first().cloned().unwrap_or(Value::Undef);
-            let bytes = match super::buffer::bytes_like(&first) {
+            let bytes = match super::buffer::view_bytes(&first) {
                 Some(b) => b,
                 None => decode(&arg_str(args, 0), &enc),
             };
@@ -765,7 +765,7 @@ fn val_bytes(v: &Value) -> Vec<u8> {
     // handled, so a `Uint8Array` — what `TextEncoder.encode` returns, and the
     // form every WebCrypto call takes — fell through to `str_of` and hashed the
     // string `"[object Object]"` instead of its bytes.
-    if let Some(bytes) = super::buffer::bytes_like(v) {
+    if let Some(bytes) = super::buffer::view_bytes(v) {
         return bytes;
     }
     with_host(|h| h.str_of(v)).into_bytes()
@@ -1684,7 +1684,7 @@ pub fn sign_verify_instance_call(
             // hash bytes — stringified the view and hashed
             // `"[object Object]"`.
             let first = args.first().cloned().unwrap_or(Value::Undef);
-            let bytes = match super::buffer::bytes_like(&first) {
+            let bytes = match super::buffer::view_bytes(&first) {
                 Some(b) => b,
                 None => decode(&arg_str(args, 0), &enc),
             };

@@ -66,3 +66,48 @@ const small = Buffer.alloc(4);
 const attempt = (f) => { try { return String(f()); } catch (e) { return e.constructor.name; } };
 console.log("bounds  ", attempt(() => small.writeUInt32BE(1, 2)), attempt(() => small.readUInt32BE(1)), attempt(() => small.readBigUInt64BE(0)));
 console.log("inrange ", attempt(() => { small.writeUInt32BE(1, 0); return small.toString("hex"); }));
+
+// BINARY input across the stdlib. Only a `Buffer` argument was read as bytes;
+// a TypedArray or DataView was stringified first, so `writeFileSync`,
+// `gzipSync` and `hash.update` all wrote the text "[object Object]". A Buffer
+// only appeared to work because stringifying one yields its utf8 text — wrong
+// the moment the bytes are not valid utf8, which is when binary I/O matters.
+const fs = require("fs"), zlib = require("zlib"), crypto = require("crypto");
+const os = require("os"), path = require("path");
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nodejs-bin-"));
+const bytes = [0xff, 0xfe, 0x00, 0x41, 0x80];
+const buf = Buffer.from(bytes), ta = new Uint8Array(bytes);
+const ab = new ArrayBuffer(5);
+new Uint8Array(ab).set(bytes);
+const dv = new DataView(ab);
+const wrote = (name, data) => {
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, data);
+  return fs.readFileSync(p).toString("hex");
+};
+console.log("fs      ", wrote("a", buf), wrote("b", ta), wrote("c", dv));
+console.log("fs-win  ", wrote("d", new Uint8Array(ab, 1, 3)));
+console.log("zlib    ", zlib.gunzipSync(zlib.gzipSync(buf)).toString("hex"),
+  zlib.gunzipSync(zlib.gzipSync(ta)).toString("hex"),
+  zlib.inflateSync(zlib.deflateSync(dv)).toString("hex"));
+const h = (d) => crypto.createHash("sha256").update(d).digest("hex");
+console.log("hash    ", h(buf) === h(ta), h(buf) === h(dv), h(buf).slice(0, 16));
+console.log("hmac    ", crypto.createHmac("sha256", buf).update(ta).digest("hex").slice(0, 16));
+// A window into a buffer contributes only its own bytes.
+console.log("window  ", h(new DataView(ab, 1, 3)) === h(Buffer.from([0xfe, 0x00, 0x41])));
+// Mixed chunk forms accumulate in order.
+console.log("chunks  ", crypto.createHash("sha256").update("a").update(new Uint8Array([98]))
+  .update(Buffer.from("c")).digest("hex") === h(Buffer.from("abc")));
+
+// `Buffer.from` took anything at all and stringified what it did not recognise:
+// `Buffer.from(5)` produced the digit "5" and `Buffer.from(null)` the four
+// bytes of "null". Node accepts a string, a byte source, an Array or an
+// ARRAY-LIKE object, and rejects the rest.
+const tryFrom = (f) => { try { return f(); } catch (e) { return e.constructor.name + "/" + e.code; } };
+console.log("from-ok ", [...Buffer.from([1, 2, 3])].join(","), Buffer.from("ab").toString(),
+  [...Buffer.from(ta)].length, Buffer.from(new DataView(new ArrayBuffer(3))).length);
+console.log("from-alk", [...Buffer.from({ length: 2 })].join(","),
+  [...Buffer.from({ length: 2, 0: 65, 1: 66 })].join(","));
+console.log("from-bad", tryFrom(() => Buffer.from(5)), tryFrom(() => Buffer.from(null)),
+  tryFrom(() => Buffer.from({})), tryFrom(() => Buffer.from(true)));
+fs.rmSync(dir, { recursive: true, force: true });

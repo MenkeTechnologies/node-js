@@ -175,6 +175,16 @@ varoff   131844 262914 72623859790382856n
 chained  4 010203ff0000
 bounds   RangeError RangeError RangeError
 inrange  00000001
+fs       fffe004180 fffe004180 fffe004180
+fs-win   fe0041
+zlib     fffe004180 fffe004180 fffe004180
+hash     true true 65e8170ee25b6536
+hmac     4c1b94ad9dfc4977
+window   true
+chunks   true
+from-ok  1,2,3 ab 5 0
+from-alk 0,0 65,66
+from-bad TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE
 ==== classes.js ====
 rectangle with area 12
 perimeter 14

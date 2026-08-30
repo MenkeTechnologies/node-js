@@ -327,8 +327,11 @@ fn read_file_sync(args: &[Value]) -> Result<Value, String> {
 /// unaffected.
 fn encoded_bytes(args: &[Value]) -> Vec<u8> {
     let v = args.get(1).cloned().unwrap_or(Value::Undef);
-    if native_tag(&v).as_deref() == Some("Buffer") {
-        return buf_bytes(&v);
+    // Any byte VIEW writes its bytes; only a string goes through the encoding.
+    // The Buffer case alone was handled, so `writeFileSync(p, new Uint8Array(…))`
+    // wrote the text `[object Object]`.
+    if let Some(bytes) = super::buffer::view_bytes(&v) {
+        return bytes;
     }
     let text = with_host(|h| h.str_of(&v));
     match encoding_arg(args, 2) {
@@ -805,11 +808,12 @@ fn read_impl(args: &[Value]) -> Result<usize, String> {
 fn write_impl(args: &[Value]) -> Result<usize, String> {
     let fd = arg_num(args, 0) as i32;
     let src = args.get(1).cloned().unwrap_or(Value::Undef);
-    let is_buffer = native_tag(&src).as_deref() == Some("Buffer");
+    // The positional form differs for a byte VIEW and a string, so the two are
+    // distinguished by what the argument IS, not by whether it is a Buffer.
+    let view = super::buffer::view_bytes(&src);
     // Buffer form: write(fd, buffer, offset, length, position)
     // String form: write(fd, string, position, encoding)
-    let (data, position) = if is_buffer {
-        let all = buf_bytes(&src);
+    let (data, position) = if let Some(all) = view {
         let offset = num_or(args, 2, 0.0) as usize;
         let length = num_or(args, 3, (all.len().saturating_sub(offset)) as f64) as usize;
         let end = (offset + length).min(all.len());
@@ -1650,12 +1654,11 @@ fn set_prop(recv: &Value, key: &str, val: Value) {
     });
 }
 
-/// Raw bytes of a Buffer arg, or the utf-8 bytes of anything else.
+/// Raw bytes of a byte-view arg, or the utf-8 bytes of anything else.
 fn value_bytes(v: &Value) -> Vec<u8> {
-    if native_tag(v).as_deref() == Some("Buffer") {
-        buf_bytes(v)
-    } else {
-        with_host(|h| h.str_of(v)).into_bytes()
+    match super::buffer::view_bytes(v) {
+        Some(b) => b,
+        None => with_host(|h| h.str_of(v)).into_bytes(),
     }
 }
 

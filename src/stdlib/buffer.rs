@@ -603,6 +603,33 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
 ///
 /// Element values are truncated to a byte each, which is what Node does:
 /// `Buffer.from(new Int32Array([1, 2, 300]))` is `<Buffer 01 02 2c>`.
+/// The bytes of a byte VIEW — a `Buffer`, any typed array, a `DataView` or an
+/// `ArrayBuffer` — and nothing else.
+///
+/// Narrower than `bytes_like`, which also accepts a plain JS array of byte
+/// values. The APIs that take "a Buffer, TypedArray, DataView or string" want
+/// exactly this set: an array argument is a TypeError in node, so widening to
+/// it would trade one divergence for another.
+pub fn view_bytes(v: &Value) -> Option<Vec<u8>> {
+    match super::native_tag(v).as_deref() {
+        // A `DataView` exposes no elements, so its bytes come straight from the
+        // window it holds onto its buffer. It is deliberately absent from
+        // `bytes_like`: `Buffer.from(dataView)` is EMPTY in node, because
+        // `Buffer.from` wants something array-like and a DataView has no
+        // `length`.
+        Some("DataView") => {
+            let n = with_host(|h| match h.get(v) {
+                Some(JsObj::Object(p)) => p.get("byteLength").map(|l| h.to_number(l) as usize),
+                _ => None,
+            })
+            .unwrap_or(0);
+            crate::stdlib::typedarray::view_bytes(v, 0, n)
+        }
+        Some("Buffer") | Some("TypedArray") | Some("ArrayBuffer") => bytes_like(v),
+        _ => None,
+    }
+}
+
 pub fn bytes_like(v: &Value) -> Option<Vec<u8>> {
     // A Buffer or a typed array of any kind: its ELEMENTS, truncated.
     if let Some(elems) = crate::stdlib::typedarray::elems_of(v) {
@@ -655,13 +682,75 @@ fn from(args: &[Value]) -> Result<Value, String> {
     if let Some(bytes) = bytes_like(&v) {
         return Ok(from_bytes(&bytes));
     }
-    // String with an optional encoding.
-    let enc = if args.len() > 1 {
-        arg_str(args, 1)
-    } else {
-        "utf8".into()
-    };
-    Ok(from_bytes(&decode_str(&arg_str(args, 0), &enc)))
+    // A string, with an optional encoding.
+    if with_host(|h| h.as_str(&v)).is_some() || matches!(v, Value::Str(_)) {
+        let enc = if args.len() > 1 {
+            arg_str(args, 1)
+        } else {
+            "utf8".into()
+        };
+        return Ok(from_bytes(&decode_str(&arg_str(args, 0), &enc)));
+    }
+    // A `DataView` yields an EMPTY buffer: `Buffer.from` wants something
+    // array-like, and a DataView carries `byteLength` but no `length`.
+    if super::native_tag(&v).as_deref() == Some("DataView") {
+        return Ok(from_bytes(&[]));
+    }
+    // An ARRAY-LIKE object — anything with a numeric `length` — contributes its
+    // index properties, each coerced to a byte. `Buffer.from({length: 2})` is
+    // two zero bytes in node.
+    if matches!(v, Value::Obj(_)) {
+        let len = crate::builtins::get_property(&v, "length").unwrap_or(Value::Undef);
+        if !matches!(len, Value::Undef) {
+            let n = with_host(|h| h.to_number(&len));
+            if n.is_finite() && n >= 0.0 {
+                let n = n as usize;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let e =
+                        crate::builtins::get_property(&v, &i.to_string()).unwrap_or(Value::Undef);
+                    let b = with_host(|h| h.to_number(&e));
+                    out.push(if b.is_finite() { b as i64 as u8 } else { 0 });
+                }
+                return Ok(from_bytes(&out));
+            }
+        }
+    }
+    // Anything else is a TypeError, not a stringification: `Buffer.from(5)`
+    // used to produce the single byte `0x35` (the digit "5") and
+    // `Buffer.from(null)` the four bytes of `"null"`.
+    Err(crate::host::plain_coded_error(
+        "TypeError",
+        "ERR_INVALID_ARG_TYPE",
+        &format!(
+            "The first argument must be of type string or an instance of \
+Buffer, ArrayBuffer, or Array or an Array-like Object. Received {}",
+            received_label(&v)
+        ),
+    ))
+}
+
+/// How node names a rejected `Buffer.from` argument: `null`, `type number (5)`,
+/// or `an instance of Object`.
+fn received_label(v: &Value) -> String {
+    if matches!(v, Value::Undef) {
+        return "undefined".into();
+    }
+    if with_host(|h| h.is_null(v)) {
+        return "null".into();
+    }
+    let ty = with_host(|h| h.type_of(v));
+    if ty == "object" || ty == "function" {
+        let ctor = with_host(|h| h.ctor_name(v));
+        let ctor = if ctor.is_empty() {
+            "Object".into()
+        } else {
+            ctor
+        };
+        return format!("an instance of {ctor}");
+    }
+    let shown = with_host(|h| h.inspect(v));
+    format!("type {ty} ({shown})")
 }
 
 fn concat(args: &[Value]) -> Result<Value, String> {

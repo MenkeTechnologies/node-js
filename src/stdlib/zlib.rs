@@ -19,7 +19,7 @@
 //! have here, so those return an honest "not supported" error rather than a
 //! silently-wrong result.
 
-use crate::host::{with_host, JsObj};
+use crate::host::with_host;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
 use flate2::Compression;
@@ -159,13 +159,13 @@ fn oneshot(op: &str, input: &[u8]) -> Result<Vec<u8>, String> {
 /// its string coercion (node accepts a Buffer, TypedArray, DataView, or string).
 fn input_bytes(args: &[Value]) -> Vec<u8> {
     let v = args.first().cloned().unwrap_or(Value::Undef);
-    with_host(|h| match h.get(&v) {
-        Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
-            Some(JsObj::Array(items)) => items.iter().map(|x| h.to_number(x) as u8).collect(),
-            _ => h.str_of(&v).into_bytes(),
-        },
-        _ => h.str_of(&v).into_bytes(),
-    })
+    // Only a Buffer's own `@@bytes` was read, so a TypedArray or DataView —
+    // both of which this comment already promised to accept — was stringified
+    // and compressed as the text `[object Object]`.
+    match super::buffer::view_bytes(&v) {
+        Some(b) => b,
+        None => with_host(|h| h.str_of(&v)).into_bytes(),
+    }
 }
 
 /// Map an I/O error (a malformed compressed stream, etc.) to a node-style message.
