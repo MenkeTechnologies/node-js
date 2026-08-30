@@ -1035,10 +1035,11 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             }
         }
         Some(ObjKind::Generator) => {
-            if is_generator_method(name) {
+            // Every iterator carries the `Iterator.prototype` helpers.
+            if is_generator_method(name) || crate::stdlib::iterator::is_helper(name) {
                 bound_method(recv, name)
             } else {
-                Value::Undef
+                with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef)
             }
         }
         Some(ObjKind::Promise) => {
@@ -1049,7 +1050,9 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             }
         }
         Some(ObjKind::Iter) => {
-            if matches!(name, "next" | "return" | "@@iterator") {
+            if matches!(name, "next" | "return" | "@@iterator")
+                || crate::stdlib::iterator::is_helper(name)
+            {
                 bound_method(recv, name)
             } else {
                 with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef)
@@ -1851,6 +1854,12 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             Some(JsObj::Null) => "Null".into(),
             Some(JsObj::Str(_)) => "String".into(),
             Some(JsObj::Array(_)) => "Array".into(),
+            // A lazy iterator helper brands as node does.
+            Some(JsObj::Object(p))
+                if p.get("@@native").map(|t| h.str_of(t)).as_deref() == Some("IteratorHelper") =>
+            {
+                "Iterator Helper".into()
+            }
             // A `DOMException` brands by its class, not as a plain `Error`.
             Some(JsObj::Object(p)) if p.contains_key("@@domName") => "DOMException".into(),
             // 20.1.3.6 steps 5-8 brand a wrapper by its internal slot, so
@@ -3641,6 +3650,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "URIError",
     "AggregateError",
     "DOMException",
+    "Iterator",
     "BigInt",
     "RegExp",
     "Date",
@@ -6723,8 +6733,14 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
         }
         Some(ObjKind::Map) => map_method(recv, name, args),
         Some(ObjKind::Set) => set_method(recv, name, args),
+        Some(ObjKind::Generator) if crate::stdlib::iterator::is_helper(name) => {
+            crate::stdlib::iterator::call(recv, name, &args)
+        }
         Some(ObjKind::Generator) => generator_method(recv, name, args),
         Some(ObjKind::Promise) => promise_method(recv, name, args),
+        Some(ObjKind::Iter) if crate::stdlib::iterator::is_helper(name) => {
+            crate::stdlib::iterator::call(recv, name, &args)
+        }
         Some(ObjKind::Iter) => iter_method(recv, name, args),
         Some(ObjKind::Symbol) => symbol_method(recv, name, args),
         Some(ObjKind::BigInt) => {

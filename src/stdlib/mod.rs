@@ -38,6 +38,7 @@ pub mod fs_promises;
 pub mod http;
 pub mod http2;
 pub mod https;
+pub mod iterator;
 pub mod net;
 pub mod node_module;
 pub mod os;
@@ -200,6 +201,7 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "Date" => date::STATIC_METHODS,
         "Response" => fetch::RESPONSE_STATICS,
         "AbortSignal" => fetch::ABORT_SIGNAL_STATICS,
+        "Iterator" => iterator::STATIC_METHODS,
         n if typedarray::is_ctor(n) => typedarray::STATIC_METHODS,
         "url" => url::MODULE_METHODS,
         "net" => net::MODULE_METHODS,
@@ -317,6 +319,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "buffer" => buffer::module_call(m, args)?,
         "Date" => date::static_call(m, args)?,
         "Response" | "AbortSignal" => fetch::static_call(ns, m, args)?,
+        "Iterator" => iterator::static_call(m, args)?,
         n if typedarray::is_ctor(n) => typedarray::static_call(n, m, args)?,
         "url" if m == "URL" => Ok(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
         "url" => url::call(m, args)?,
@@ -632,6 +635,7 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         "Timeout" => timers::TIMEOUT_METHODS,
         "IntervalIterator" => timers::INTERVAL_METHODS,
         "CollectionIterator" => &["next", "@@iterator"],
+        "IteratorHelper" => iterator::METHODS,
         "Immediate" => timers::IMMEDIATE_METHODS,
         "Server" => &["listen", "close", "address"],
         "Socket" => &[
@@ -812,8 +816,21 @@ pub fn instance_call(
         "CollectionIterator" => match method {
             "next" => crate::builtins::collection_iterator_next(recv),
             "@@iterator" => Ok(recv.clone()),
+            m if iterator::is_helper(m) => iterator::call(recv, m, &args),
             _ => Err(crate::host::type_error(&format!(
                 "mapIterator.{method} is not a function"
+            ))),
+        },
+        "IteratorHelper" => match method {
+            "next" => iterator::helper_next(recv),
+            "@@iterator" => Ok(recv.clone()),
+            // Abandoning a helper marks it exhausted AND closes its source, so
+            // a later `next` is a done step and the generator underneath runs
+            // its `finally`.
+            "return" => Ok(iterator::helper_return(recv)),
+            m if iterator::is_helper(m) => iterator::call(recv, m, &args),
+            _ => Err(crate::host::type_error(&format!(
+                "{method} is not a function"
             ))),
         },
         "Date" => date::instance_call(recv, method, &args),

@@ -6414,8 +6414,9 @@ fn walk_target_prototype(ctor: &Value) -> Option<Value> {
 /// A number/string/boolean is named WITH its value (`number 1 is not a
 /// function`, `string "s" is not a function`); every other type is named by type
 /// alone (`object is not a function`, `symbol is not a function`).
-fn not_a_function_message(v: &Value) -> String {
+pub fn not_a_function_message(v: &Value) -> String {
     with_host(|h| match v {
+        Value::Undef => "undefined is not a function".into(),
         Value::Bool(b) => format!("boolean {b} is not a function"),
         Value::Int(_) | Value::Float(_) => format!("number {} is not a function", h.str_of(v)),
         Value::Str(s) => format!("string \"{s}\" is not a function"),

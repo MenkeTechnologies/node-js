@@ -481,6 +481,33 @@ bl-1     "{\n  a: 1,\n  b: 2\n}"
 bl-grid  "[\n  0, 1, 2, 3,\n  4, 5, 6, 7\n]"
 combo    "[\n  1,\n  2\n]"
 console  { a: { b: { c: [Object] } } } [ 1, 2, 3 ] { x: { y: { z: [Object] } } }
+==== iterhelpers.js ====
+global   function function function
+lazy     1,2 3,4 2,4,6,8 2,4
+flatMap  1,-1,2,-2,3,-3,4,-4
+chain    3,9
+reduce   10 20
+search   true false true false 3 undefined
+forEach  1,2,3,4
+endless  0,3,6,9 5,6
+pulls    1,2,3 3
+builtins 2,3,4 0,2,4 heo 2,3 a,1
+entries  [10,21]
+iterable 2,4,6,8 1,2 10,20 true
+brand    [object Iterator Helper] true
+from     1,2
+from-obj 0,1
+closed   1
+drained  1 ||
+returned 2 {"done":true}
+spent    {"done":true}
+neg      RangeError: -1 must be positive
+nan      RangeError: NaN must be positive
+nofn     TypeError: undefined is not a function
+notfn    TypeError: number 5 is not a function
+empty    0,0
+noseed   TypeError: Reduce of a done iterator with no initial value
+seed     7
 ==== json.js ====
 {"b":2,"a":1,"nested":{"list":[1,"two",null,true]}}
 {
