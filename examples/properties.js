@@ -99,3 +99,20 @@ console.log('fresh   ', JSON.stringify(Object.getOwnPropertyDescriptor(fresh, 'n
 const trunc = [1, 2, 3];
 Object.defineProperty(trunc, 'length', { value: 1 });
 console.log('length  ', trunc.join(','), trunc.length);
+
+// Stringifying a proxy used to overflow the stack and abort the process.
+// `Get(proxy, 'toString')` yields a thunk already bound to the TARGET, and the
+// call path was invoking it with the PROXY as `this` — which the bound-method
+// arm prefers over the thunk's own receiver, so it called straight back in.
+// These three generics resolve by the target's kind, so the thunk is invoked
+// with no receiver override.
+console.log('px-str  ', String(new Proxy({}, {})), String(new Proxy([1, 2], {})));
+console.log('px-concat', new Proxy({}, {}) + '', new Proxy([1, 2], {}) + '');
+console.log('px-nested', String(new Proxy(new Proxy({}, {}), {})));
+// The target's own valueOf/toString still drive the conversion.
+console.log('px-valueOf', new Proxy({ valueOf() { return 5; } }, {}) + 1);
+console.log('px-toString', new Proxy({ toString() { return 'TS'; } }, {}) + '');
+// A `get` trap still intercepts the lookup ahead of all of that.
+console.log('px-trap ', String(new Proxy({}, { get: (t, k) => (k === 'toString' ? () => 'TRAPPED' : t[k]) })));
+// The other proxy paths are unaffected.
+console.log('px-other', new Proxy([1, 2], {}).join('-'), new Proxy({ a: 1 }, {}).hasOwnProperty('a'), new Proxy(function (a) { return a * 2; }, {})(21));

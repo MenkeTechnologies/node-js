@@ -306,6 +306,13 @@ omitted  shown 42
 desc     {"value":42,"writable":true,"enumerable":false,"configurable":true}
 fresh    {"value":3,"writable":false,"enumerable":false,"configurable":false}
 length   1 1
+px-str   [object Object] 1,2
+px-concat [object Object] 1,2
+px-nested [object Object]
+px-valueOf 6
+px-toString TS
+px-trap  TRAPPED
+px-other 1-2 true 42
 ==== regexp.js ====
 true true false
 a b

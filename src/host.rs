@@ -5091,6 +5091,15 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
             ) {
                 return crate::builtins::object_builtin_method(recv, name, args);
             }
+            // The three above resolve by the TARGET's kind, and the thunk is
+            // already bound to the target — so it must be invoked WITHOUT a
+            // receiver override. Passing the proxy as `this` made the
+            // `BoundMethod` arm of `invoke` prefer it over its own receiver and
+            // call straight back into this branch, so `String(new Proxy({}, {}))`
+            // recursed until the stack overflowed and the process aborted.
+            if matches!(name, "toString" | "valueOf" | "toLocaleString") {
+                return invoke(&f, args, None);
+            }
         }
         return invoke(&f, args, Some(recv.clone()));
     }
