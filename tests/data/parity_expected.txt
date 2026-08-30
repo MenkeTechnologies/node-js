@@ -374,6 +374,28 @@ keys     plain 1 v
 proxy    get:a set:b has:a del:b ownKeys
 applyTrp 11
 reflect  true a,b
+==== urls.js ====
+encode   /a%20b ?c=d%20e #f%20g
+href     https://a.b/a%20b?c=d%20e#f%20g
+roundtrip true
+path     /x%22%3C%3E%5E%60%7B%7Dy
+path-ok  /x|!$&'()*+,;:@~-_.y
+query    ?x%22%27%3C%3E^`{}y
+hash     #x%22'%3C%3E%60{}y
+user     x%20%3C%3E%3B%3D%40%5B%5D%5E%60%7B%7C%7Dy
+utf8     https://a.b/%C3%A9%F0%9F%98%80?%C3%A9#%C3%A9
+escaped  /a%20b /a%zz
+strip    /xyz!
+case     https://example.com/
+port     e.com e.com e.com:8080
+slash    /x/y ?x\y
+relative https://e.com/a/x https://e.com/z
+dots     /a/c
+params   2 1,3
+base64   YWJj abc  Hello, World!
+padding  YQ== YWI= YWJj
+bytes    AAH/ 0,1,255
+same     true function
 ==== wordcount.js ====
 the: 3
 fox: 2

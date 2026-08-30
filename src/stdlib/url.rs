@@ -67,9 +67,42 @@ impl Parts {
     }
 }
 
+/// Whether `scheme` is one of the WHATWG "special" schemes, whose parsing
+/// normalizes backslashes and drops a default port.
+fn special_port(scheme: &str) -> Option<&'static str> {
+    match scheme {
+        "http" | "ws" => Some("80"),
+        "https" | "wss" => Some("443"),
+        "ftp" => Some("21"),
+        _ => None,
+    }
+}
+
 /// Parse an absolute URL. Returns `None` if there is no `scheme://`.
 fn parse_absolute(input: &str) -> Option<Parts> {
+    // The URL parser REMOVES every tab and newline from the input before doing
+    // anything else, rather than treating them as content. They were surviving
+    // into the components and then being percent-encoded.
+    let stripped: String;
+    let input = if input.contains(['\t', '\n', '\r']) {
+        stripped = input.replace(['\t', '\n', '\r'], "");
+        stripped.as_str()
+    } else {
+        input
+    };
     let (scheme, rest) = input.split_once("://")?;
+    // For a special scheme a backslash is a path separator, not a character —
+    // in the AUTHORITY too, where it terminates the userinfo. It is NOT one in
+    // the query or fragment, where node keeps it literal, so the rewrite stops
+    // at whichever of `?`/`#` comes first.
+    let backslashed: String;
+    let rest = if special_port(&scheme.to_ascii_lowercase()).is_some() && rest.contains('\\') {
+        let cut = rest.find(['?', '#']).unwrap_or(rest.len());
+        backslashed = format!("{}{}", rest[..cut].replace('\\', "/"), &rest[cut..]);
+        backslashed.as_str()
+    } else {
+        rest
+    };
     if scheme.is_empty()
         || !scheme
             .chars()
@@ -111,10 +144,19 @@ fn parse_absolute(input: &str) -> Option<Parts> {
         }
         None => String::new(),
     };
+    // A scheme is case-insensitive and reported lower-case.
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = special_port(&scheme);
     let pathname = if tail.is_empty() {
         "/".to_string()
     } else {
         normalize_path(tail)
+    };
+    // The scheme's default port is not part of the serialization.
+    let port = if default_port == Some(port.as_str()) {
+        String::new()
+    } else {
+        port
     };
 
     Some(Parts {
@@ -228,7 +270,63 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
     Ok(build(&parts))
 }
 
+/// Percent-encode `s` for one URL component, per the WHATWG percent-encode sets.
+///
+/// None of this was happening: `new URL('https://a.b/a b?c=d e').href` came back
+/// with the spaces intact, which is not a valid URL and does not round-trip.
+///
+/// The sets below were derived by feeding every ASCII character through node
+/// v26.8.1 in each position rather than transcribed, since the spec's sets and
+/// what a parser actually emits differ around the component delimiters. Every
+/// C0 control, `%7F`, and every non-ASCII byte is encoded in all four; a byte
+/// already part of a valid `%XX` escape is left alone so re-parsing a URL does
+/// not double-encode it.
+fn percent_encode(s: &str, extra: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // An existing escape passes through untouched.
+        if b == b'%' && i + 2 < bytes.len() + 1 {
+            let hex = bytes.get(i + 1..i + 3);
+            if hex.is_some_and(|h| h.iter().all(|c| c.is_ascii_hexdigit())) {
+                out.push('%');
+                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 2] as char);
+                i += 3;
+                continue;
+            }
+        }
+        if b < 0x20 || b == 0x7f || b >= 0x80 || extra.as_bytes().contains(&b) {
+            out.push_str(&format!("%{b:02X}"));
+        } else {
+            out.push(b as char);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The four component encode sets, as measured against node.
+const PATH_SET: &str = " \"<>^`{}";
+const QUERY_SET: &str = " \"'<>";
+const FRAGMENT_SET: &str = " \"<>`";
+const USERINFO_SET: &str = " \";<=>@[]^`{|}";
+
 fn build(p: &Parts) -> Value {
+    // Percent-encode each component and lower-case the host once, here, so
+    // `href()` and every individual property report the same normalized text.
+    let p = &Parts {
+        protocol: p.protocol.clone(),
+        username: percent_encode(&p.username, USERINFO_SET),
+        password: percent_encode(&p.password, USERINFO_SET),
+        hostname: p.hostname.to_lowercase(),
+        port: p.port.clone(),
+        pathname: percent_encode(&p.pathname, PATH_SET),
+        search: percent_encode(&p.search, QUERY_SET),
+        hash: percent_encode(&p.hash, FRAGMENT_SET),
+    };
     // Build the `URLSearchParams` snapshot BEFORE the allocating `with_host` below
     // (never nest `with_host`); it is stored as the `searchParams` data property so
     // `url.searchParams.get(...)` reads it directly. It is a static snapshot of the

@@ -3358,6 +3358,10 @@ const GLOBAL_FUNCS: &[&str] = &[
     "clearInterval",
     "clearImmediate",
     "structuredClone",
+    // Base64 helpers. They existed only as `require('buffer').btoa`, but node
+    // exposes both as globals, so `btoa('abc')` was a ReferenceError.
+    "btoa",
+    "atob",
     "Proxy",
     "require",
     // CommonJS loader dispatch targets referenced by per-module `require`
@@ -3991,6 +3995,10 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "JSON.stringify" => json_stringify(args),
         "JSON.parse" => json_parse(args),
         "structuredClone" => Ok(deep_clone(&arg0(&args))),
+        // Same implementation the `buffer` module exposes; only the binding was
+        // missing.
+        "btoa" | "atob" => crate::stdlib::buffer::module_call(name, &args)
+            .unwrap_or_else(|| Err(host::type_error(&format!("{name} is not a function")))),
         "fetch" => crate::stdlib::fetch::fetch(&args),
         // An `AbortSignal.timeout` deadline reached its macrotask: the thunk's
         // suffix is the signal's heap index.
