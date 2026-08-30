@@ -701,6 +701,64 @@ fn response_call(res: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
             finish_response(res, resid)?;
             Ok(res.clone())
         }
+        // Advertised in `stdlib::instance_methods` for ServerResponse and
+        // implemented in `https::response_call`, but missing here — so
+        // `res.flushHeaders()` threw "is not a function" over plaintext while
+        // working over TLS. A no-op is the honest implementation either way:
+        // `write` buffers into `ResState.body` and nothing reaches the socket
+        // until `end`, so there is no partial header block to flush.
+        // Advertised in `stdlib::instance_methods` for ServerResponse but never
+        // implemented in either module, so all three threw "is not a function"
+        // on both protocols despite feature-detection saying they exist.
+        // Node lowercases the names it reports, so these do too, while
+        // `setHeader` keeps the caller's spelling on the wire.
+        "hasHeader" => {
+            let k = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
+            let found = RESPONSES.with(|r| {
+                r.borrow()
+                    .get(&resid)
+                    .is_some_and(|st| st.headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&k)))
+            });
+            Ok(Value::Bool(found))
+        }
+        "getHeaderNames" => {
+            let names = RESPONSES.with(|r| {
+                r.borrow()
+                    .get(&resid)
+                    .map(|st| {
+                        st.headers
+                            .iter()
+                            .map(|(k, _)| k.to_ascii_lowercase())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
+            Ok(with_host(|h| {
+                let items = names.into_iter().map(|n| h.new_str(n)).collect::<Vec<_>>();
+                h.new_array(items)
+            }))
+        }
+        "getHeaders" => {
+            let pairs = RESPONSES.with(|r| {
+                r.borrow()
+                    .get(&resid)
+                    .map(|st| {
+                        st.headers
+                            .iter()
+                            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
+            Ok(with_host(|h| {
+                let mut m = IndexMap::new();
+                for (k, v) in pairs {
+                    m.insert(k, h.new_str(v));
+                }
+                h.new_object(m)
+            }))
+        }
+        "flushHeaders" => Ok(Value::Undef),
         _ => Err(crate::host::type_error(&format!(
             "res.{method} is not a function"
         ))),

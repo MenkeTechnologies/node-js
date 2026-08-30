@@ -4646,6 +4646,117 @@ fn setencoding_gives_a_string_over_https_exactly_as_it_does_over_http() {
     assert_eq!(run(&src), expected);
 }
 
+/// Every method `ServerResponse` advertises is callable, over both protocols.
+///
+/// `stdlib::instance_methods` lists the names, and each module's
+/// `response_call` implements them — two places that can drift apart. They had:
+/// `flushHeaders` was advertised for every ServerResponse and implemented only
+/// in `https::response_call`, so `res.flushHeaders()` worked over TLS and threw
+/// "res.flushHeaders is not a function" over plaintext. Advertised-but-absent
+/// is the worst shape of this, because feature-detection (`typeof res.x ===
+/// 'function'`) says yes and the call still throws.
+///
+/// Driving the list itself rather than a hand-written copy means a method added
+/// to the advertised set without an implementation fails here immediately.
+#[test]
+fn every_advertised_server_response_method_is_callable_on_both_protocols() {
+    let Some((key, cert)) = self_signed_pem() else {
+        eprintln!("skipping: openssl not on PATH");
+        return;
+    };
+    let src = format!(
+        r##"
+        const http = require('http');
+        const https = require('https');
+        const opts = {{ key: {key:?}, cert: {cert:?} }};
+
+        // Called with arguments that are valid for every one of them.
+        const CALLS = [
+          ['setHeader', ['X-A', '1']],
+          ['getHeader', ['X-A']],
+          ['getHeaderNames', []],
+          ['getHeaders', []],
+          ['hasHeader', ['X-A']],
+          ['removeHeader', ['X-A']],
+          ['flushHeaders', []],
+        ];
+
+        function handler(tag) {{
+          return (req, res) => {{
+            const bad = [];
+            for (const [name, args] of CALLS) {{
+              if (typeof res[name] !== 'function') {{ bad.push(name + ':absent'); continue; }}
+              try {{ res[name].apply(res, args); }} catch (e) {{ bad.push(name + ':threw'); }}
+            }}
+            console.log(tag, bad.length === 0 ? 'all callable' : bad.join(','));
+            res.writeHead(200, {{'Content-Type': 'text/plain'}});
+            res.end('ok');
+          }};
+        }}
+
+        const get = (mod, port, extra) => new Promise(resolve => {{
+          const rq = mod.request(
+            Object.assign({{host: '127.0.0.1', port, path: '/'}}, extra),
+            res => {{ res.on('data', () => {{}}); res.on('end', resolve); }});
+          rq.end();
+        }});
+
+        const hs = http.createServer(handler('http'));
+        hs.listen(0, async () => {{
+          await get(http, hs.address().port, {{}});
+          hs.close();
+          const ss = https.createServer(opts, handler('https'));
+          ss.listen(0, async () => {{
+            await get(https, ss.address().port, {{rejectUnauthorized: false}});
+            ss.close();
+          }});
+        }});
+    "##
+    );
+    let expected = ["http all callable", "https all callable"].join("\n");
+    assert_eq!(run(&src), expected);
+}
+
+/// `hasHeader` / `getHeaderNames` / `getHeaders` report what `setHeader` and
+/// `removeHeader` did, with the lowercased names Node reports.
+///
+/// The callable-surface test above proves they do not throw; this one proves
+/// they are right. Every line was compared against real `node` on the same
+/// script and matches byte for byte, including that the reported names are
+/// lowercased while `setHeader` keeps the caller's spelling for the wire.
+#[test]
+fn the_response_header_accessors_report_what_was_set_and_removed() {
+    let src = r##"
+        const http = require('http');
+        const srv = http.createServer((req, res) => {
+          res.setHeader('X-One', '1');
+          res.setHeader('Content-Type', 'text/plain');
+          console.log('has', res.hasHeader('X-ONE'), res.hasHeader('X-Two'));
+          console.log('names', JSON.stringify(res.getHeaderNames()));
+          console.log('headers', JSON.stringify(res.getHeaders()));
+          res.removeHeader('X-One');
+          console.log('removed', JSON.stringify(res.getHeaderNames()), res.hasHeader('x-one'));
+          res.writeHead(200, {'Content-Type': 'text/plain'});
+          res.end('ok');
+        });
+        srv.listen(0, () => {
+          const rq = http.request({host: '127.0.0.1', port: srv.address().port, path: '/'}, res => {
+            res.on('data', () => {});
+            res.on('end', () => srv.close());
+          });
+          rq.end();
+        });
+    "##;
+    let expected = [
+        "has true false",
+        r#"names ["x-one","content-type"]"#,
+        r#"headers {"x-one":"1","content-type":"text/plain"}"#,
+        r#"removed ["content-type"] false"#,
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
