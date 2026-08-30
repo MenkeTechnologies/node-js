@@ -899,12 +899,27 @@ pub(crate) fn exchange(
     stream
         .flush()
         .map_err(|e| format!("Error: https flush: {e}"))?;
+    let head_request = request
+        .split(|b| *b == b' ')
+        .next()
+        .is_some_and(|m| m.eq_ignore_ascii_case(b"HEAD"));
     let mut raw = Vec::new();
-    // Read to EOF; a clean TLS close-notify surfaces as `Ok(0)`. A peer that drops
-    // the TCP connection without close-notify yields an UnexpectedEof, which for a
-    // `Connection: close` response we treat as end-of-body.
+    // Stop when the response is COMPLETE by its own framing, exactly as
+    // `http::exchange` does — see the note there. Reading to EOF worked only
+    // because THIS crate's server answers `Connection: close`; against a
+    // keep-alive server, which is every real one, the read never returned and
+    // `https.request` hung forever. Verified against a TLS server that sends
+    // `Content-Length` and holds the connection open: it hung, and now it does
+    // not.
+    //
+    // EOF still ends the read, for a response with no framing at all: a clean
+    // TLS close-notify surfaces as `Ok(0)`, and a peer that drops the TCP
+    // connection without one yields `UnexpectedEof`.
     let mut buf = [0u8; 16384];
     loop {
+        if super::http::response_is_complete(&raw, head_request) {
+            break;
+        }
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),

@@ -4476,6 +4476,116 @@ fn the_https_server_encodes_chunked_bodies_and_sends_no_body_for_head() {
     assert_eq!(run(&src), expected);
 }
 
+/// `https.request` finishes against a server that keeps the connection open.
+///
+/// `https::exchange` read to EOF, the same defect `http::exchange` had before
+/// 0a0b5cf5d7, and it stayed hidden for the same reason in reverse: this
+/// crate's own HTTPS server answers `Connection: close`, so every existing test
+/// got its EOF and passed. Against a keep-alive server — which is every real
+/// one — the read never returned and the call hung forever.
+///
+/// So the server here is NOT ours. It is a few lines of Python holding the
+/// connection open after a `Content-Length` reply, which is the only way to
+/// reproduce what our own server can never do.
+///
+/// It holds for 180s ON PURPOSE — longer than the harness's 60s child budget.
+/// An earlier version held 30s, and a client that reads to EOF simply waited
+/// the server out and passed in 32s instead of 11s, so the test could not fail
+/// on the very bug it exists for. Confirmed with the hold extended: the fix
+/// answers in ~140ms, and without it the child is killed at the budget.
+#[test]
+fn the_https_client_finishes_against_a_keep_alive_server() {
+    let Some((key, cert)) = self_signed_pem() else {
+        eprintln!("skipping: openssl not on PATH");
+        return;
+    };
+    if Command::new("python3")
+        .arg("-c")
+        .arg("import ssl")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: python3 with ssl not available");
+        return;
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("nodejs-ka")
+        .tempdir()
+        .expect("temp dir");
+    let (kp, cp) = (dir.path().join("key.pem"), dir.path().join("cert.pem"));
+    std::fs::write(&kp, key).expect("write key");
+    std::fs::write(&cp, cert).expect("write cert");
+    let server_py = dir.path().join("ka.py");
+    std::fs::write(
+        &server_py,
+        r#"
+import ssl, socket, threading, sys
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', 0)); srv.listen(5)
+print(srv.getsockname()[1], flush=True)
+def serve():
+    while True:
+        try: c, _ = srv.accept()
+        except OSError: return
+        try:
+            s = ctx.wrap_socket(c, server_side=True)
+            s.recv(65535)
+            body = b'hello'
+            s.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s' % (len(body), body))
+            threading.Event().wait(180)  # hold it open past the child budget
+        except Exception: pass
+threading.Thread(target=serve, daemon=True).start()
+threading.Event().wait(180)
+"#,
+    )
+    .expect("write server");
+
+    let mut child = Command::new("python3")
+        .arg(&server_py)
+        .arg(&cp)
+        .arg(&kp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tls server");
+    let port = {
+        use std::io::BufRead;
+        let out = child.stdout.take().expect("stdout");
+        let mut line = String::new();
+        std::io::BufReader::new(out)
+            .read_line(&mut line)
+            .expect("read port");
+        line.trim().to_string()
+    };
+    assert!(!port.is_empty(), "server printed no port");
+
+    let src = format!(
+        r##"
+        const https = require('https');
+        const rq = https.request(
+          {{host: '127.0.0.1', port: {port}, path: '/', rejectUnauthorized: false}},
+          res => {{
+            let b = '';
+            res.on('data', c => b += c);
+            res.on('end', () => console.log('got', res.statusCode, JSON.stringify(b)));
+          }});
+        rq.on('error', e => console.log('error', e && e.message));
+        rq.end();
+    "##
+    );
+    let got = run(&src);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(got, r#"got 200 "hello""#);
+}
+
 #[test]
 fn fetch_classes_match_the_whatwg_shapes() {
     // `Headers` (case-insensitive, combined values, sorted iteration),
