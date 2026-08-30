@@ -65,6 +65,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             Ok(with_host(|h| h.new_str(s)))
         }
         "inspect" => {
+            if let Some(v) = args.first() {
+                crate::builtins::materialize_stack(v);
+            }
             // Honor an options `{ depth: N | null }` (default 2; null = unlimited).
             let depth = match args.get(1) {
                 Some(opts) => match crate::builtins::get_property(opts, "depth") {
@@ -214,6 +217,13 @@ fn coerce_via(parser: &str, arg: &Value) -> f64 {
 /// `util.format(fmt, ...args)` — printf-style substitution (`%s %d %i %f %j %o %O
 /// %c %%`) with any leftover arguments appended space-separated.
 pub fn format(args: &[Value]) -> String {
+    // Node's inspect reads `err.stack`, and that read is what FORMATS the header
+    // and freezes it. Doing it here, before the inspect borrow, keeps
+    // `console.log(err)` showing the error's current `name` — the inspect walk
+    // itself runs under an immutable host borrow and cannot re-format anything.
+    for a in args {
+        crate::builtins::materialize_stack(a);
+    }
     if args.is_empty() {
         return String::new();
     }

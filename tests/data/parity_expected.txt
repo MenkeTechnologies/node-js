@@ -142,6 +142,12 @@ true
 m TypeError: t
 inner-finally
 inner
+Renamed: boom
+Late: changed
+ProtoNamed: boom
+Error: boom Error: boom
+CUSTOM
+0 {} true
 ==== fib.js ====
 fib: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
 1 2 3
@@ -254,6 +260,12 @@ a#b#c#
 true 2 true 4
 [ 'bar', 'BAZ' ]
 true gi
+foo foo
+42 42
+abab xx
+\/ a\/b [/]
+/\// "\\n"
+(?:) true
 ==== strings.js ====
 HELLO, WORLD hello, world 12
 World World Hello d

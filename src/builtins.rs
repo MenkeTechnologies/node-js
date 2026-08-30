@@ -762,6 +762,45 @@ pub fn private_brand_message(name: &str, writing: bool) -> String {
 /// read was forwarded down a prototype chain, which is why `Reflect.get(t, k, r)`
 /// and a Proxy `get` trap's third argument both need it. Every ordinary read
 /// passes `recv` itself.
+/// Re-format an error's `.stack` header on its first read, the way V8 does.
+///
+/// The constructor could only stamp the name it was called with, so a subclass
+/// that sets `this.name` after `super()` — or any `e.name = …` / `e.message = …`
+/// before the first read — left a stale header. Node re-reads both properties at
+/// format time, including one inherited from the prototype (`E.prototype.name`).
+///
+/// It is formatted ONCE: node caches the string, so renaming AFTER a read does
+/// not change what later reads return. `@@stackRaw` is the not-yet-formatted
+/// marker and is dropped here; an explicit `e.stack = …` drops it too, so an
+/// assignment is never clobbered by a later read.
+pub fn materialize_stack(recv: &Value) {
+    let Some(frames) = with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) => p.get("@@stackRaw").cloned(),
+        _ => None,
+    }) else {
+        return;
+    };
+    with_host(|h| {
+        let frames = h.str_of(&frames);
+        let name = host::lookup_chain(h, recv, "name")
+            .map(|v| h.str_of(&v))
+            .unwrap_or_else(|| "Error".to_string());
+        let message = host::lookup_chain(h, recv, "message")
+            .map(|v| h.str_of(&v))
+            .unwrap_or_default();
+        let header = if message.is_empty() {
+            name
+        } else {
+            format!("{name}: {message}")
+        };
+        let sv = h.new_str(format!("{header}{frames}"));
+        if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+            p.insert("stack".into(), sv);
+            p.shift_remove("@@stackRaw");
+        }
+    });
+}
+
 pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<Value, String> {
     // `[[Get]]` on a Proxy: the handler's `get` trap, or a forward to the
     // target. Checked before anything else so no ordinary-object shortcut can
@@ -774,6 +813,9 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             "Cannot read properties of {} (reading '{name}')",
             with_host(|h| h.str_of(recv))
         )));
+    }
+    if name == "stack" {
+        materialize_stack(recv);
     }
     // A read off `globalThis` for a name the object does not own falls back to
     // the same lazy global binding the bare identifier gets. Without it the
@@ -1888,6 +1930,15 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             }
             return Ok(());
         }
+    }
+    // Assigning `e.stack` wins permanently: drop the not-yet-formatted marker so
+    // no later read re-derives a header over the top of the assigned value.
+    if name == "stack" {
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                p.shift_remove("@@stackRaw");
+            }
+        });
     }
     // A non-writable own property, or a new key on a non-extensible object,
     // silently discards the write (sloppy mode — the mode every script runs in).
@@ -4205,6 +4256,16 @@ fn make_error(name: &str, args: &[Value]) -> Value {
         }
         // `.stack` is engine-specific; a simple `Name: message` header line
         // suffices for parity (the fuzzer never prints raw stacks).
+        //
+        // V8 formats that header LAZILY, on the first read, from whatever `name`
+        // and `message` the error carries at that moment — which is why the
+        // near-universal
+        //
+        //     class MyErr extends Error { constructor(m) { super(m); this.name = 'MyErr'; } }
+        //
+        // reports `MyErr: boom` and not the `Error: boom` this built eagerly,
+        // inside `super()`, before the subclass had renamed anything. `@@stackRaw`
+        // carries the frames so the read can redo it; see `materialize_stack`.
         let frames = h.stack_frames();
         let stack = match &msg {
             Some(m) if !m.is_empty() => format!("{name}: {m}{frames}"),
@@ -4212,6 +4273,8 @@ fn make_error(name: &str, args: &[Value]) -> Value {
         };
         let sv = h.new_str(stack);
         props.insert("stack".into(), sv);
+        let raw = h.new_str(frames);
+        props.insert("@@stackRaw".into(), raw);
         if let Some(errs) = errors {
             // Materialize the iterable into the own `errors` array property.
             let items = h.iter_vec(&errs).unwrap_or_default();
@@ -4234,7 +4297,7 @@ fn make_error(name: &str, args: &[Value]) -> Value {
         // Every own slot an error constructor installs is non-enumerable in V8,
         // which is why `Object.keys(err)` is `[]` and `JSON.stringify(err)` is
         // `{}` — properties a *script* later assigns stay enumerable.
-        for k in ["message", "stack", "errors", "cause"] {
+        for k in ["message", "stack", "errors", "cause", "@@stackRaw"] {
             h.hide_prop(&e, k);
         }
         e

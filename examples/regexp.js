@@ -1,6 +1,6 @@
-// Regular expressions: the Rust-regex-supported subset (char classes,
-// quantifiers, anchors, groups, alternation, \d\w\s, flags g/i/m). node-js
-// rejects backreferences/lookaround rather than mis-executing them.
+// Regular expressions: char classes, quantifiers, anchors, groups,
+// alternation, \d\w\s, the g/i/m flags, and the lookaround and backreference
+// forms — all six of which run here and agree with node.
 
 // test / exec.
 console.log(/\d+/.test("abc123"), /^foo/.test("foobar"), /z/.test("abc"));
@@ -30,3 +30,18 @@ console.log("Foo\nbar\nBAZ".match(/^b\w+/gim));
 
 // Constructing via new RegExp.
 console.log(new RegExp("\\d{3}").test("ab123"), new RegExp("x", "gi").flags);
+
+// Lookaround and backreferences.
+console.log("foo1".match(/foo(?=\d)/)[0], "fooX".match(/foo(?!\d)/)[0]);
+console.log("a$42".match(/(?<=\$)\d+/)[0], "a42".match(/(?<!\$)\d+/)[0]);
+console.log("abab".match(/(ab)\1/)[0], "xx".match(/(?<c>x)\k<c>/)[0]);
+
+// `source` is escaped (22.2.6.13 EscapeRegExpPattern) so that `/` + source +
+// `/` re-parses as a literal matching the same thing. A `/` left unescaped
+// closed the literal early — `String(new RegExp("/"))` read back as `///`,
+// which is not parseable — and a literal newline, which cannot appear in a
+// literal at all, came through raw instead of as the two characters `\n`. A
+// `/` inside a character class needs no escape and gets none.
+console.log(new RegExp("/").source, new RegExp("a/b").source, new RegExp("[/]").source);
+console.log(String(new RegExp("/")), JSON.stringify(new RegExp("\n").source));
+console.log(new RegExp("").source, new RegExp(new RegExp("a/b").source).test("a/b"));

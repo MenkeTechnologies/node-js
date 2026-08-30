@@ -52,6 +52,53 @@ fn remap_surrogate(cp: u32) -> u32 {
 
 /// Build a `RegExp` value from a JS `pattern` + `flags`, or a `SyntaxError` if the
 /// pattern uses an unsupported construct or is otherwise invalid.
+/// 22.2.6.13.1 EscapeRegExpPattern — the text `source` reports, escaped so that
+/// `/` + source + `/` is a parseable regular-expression literal that matches the
+/// same thing.
+///
+/// Two characters need it and neither was handled: an unescaped `/` ended the
+/// literal early, so `String(new RegExp('/'))` produced `///`, and a literal
+/// line terminator cannot appear in a literal at all, so `new RegExp('\n')`
+/// reported a raw newline where node reports the two characters `\n`.
+///
+/// A `/` inside a character class does NOT need escaping and node does not add
+/// one (`new RegExp('[/]').source` is `[/]`), so the scan tracks class depth.
+/// An already-escaped `\/` is left alone rather than doubled.
+fn escape_regexp_pattern(pattern: &str) -> String {
+    if pattern.is_empty() {
+        return "(?:)".to_string();
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut in_class = false;
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // A backslash escapes whatever follows; both travel through as-is.
+            '\\' => {
+                out.push(c);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '[' if !in_class => {
+                in_class = true;
+                out.push(c);
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(c);
+            }
+            '/' if !in_class => out.push_str("\\/"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     // Validate flags (Node throws on an unknown/repeated flag).
     let mut seen = String::new();
@@ -98,11 +145,7 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     // per-object mutable state), but the engine inside it is not.
     let obj = RegExpObj {
         re,
-        source: if pattern.is_empty() {
-            "(?:)".to_string()
-        } else {
-            pattern.to_string()
-        },
+        source: escape_regexp_pattern(pattern),
         flags: flags.to_string(),
         global,
         ignore_case,

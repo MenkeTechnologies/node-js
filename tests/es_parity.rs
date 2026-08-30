@@ -6165,3 +6165,33 @@ fn array_from_async_awaits_every_element() {
     .join("\n");
     assert_eq!(run(src), expected);
 }
+
+// ── Error.prototype.stack: lazy header, via the inspect path ────────────────
+
+#[test]
+fn inspecting_an_error_shows_the_name_it_carries_now() {
+    // `console.log(err)` renders an error as its `.stack`, and reading `.stack`
+    // is what formats the header. The formatting runs under an immutable host
+    // borrow, so it cannot re-derive anything itself — the value has to be
+    // materialized before the inspect walk starts. When it was not, every
+    // `console.log` of a renamed error subclass printed `Error:`, even though
+    // reading `err.stack` directly on the same object printed the real name.
+    //
+    // Only the header line is asserted: the frames below it are engine-specific
+    // and deliberately not pinned, which is also why this cannot live in the
+    // byte-exact `examples/` corpus.
+    let src = r#"
+        class Renamed extends Error { constructor(m) { super(m); this.name = 'Renamed'; } }
+        console.log(new Renamed('boom'));
+        console.log(require('util').inspect(new Renamed('again')).split('\n')[0]);
+        // Inspecting formats-and-freezes exactly as a direct read does: the
+        // rename below lands after the header is already settled.
+        const settled = new Error('x');
+        require('util').inspect(settled);
+        settled.name = 'TooLate';
+        console.log(settled.stack.split('\n')[0]);
+    "#;
+    let out = run(src);
+    let heads: Vec<&str> = out.lines().filter(|l| !l.starts_with("    at ")).collect();
+    assert_eq!(heads, ["Renamed: boom", "Renamed: again", "Error: x"]);
+}
