@@ -47,6 +47,17 @@ fn is_keyword(s: &str) -> bool {
     KEYWORDS.contains(&s)
 }
 
+/// The private names one class body declares and the ones its code refers to.
+#[derive(Default)]
+struct PrivateScope {
+    declared: Vec<String>,
+    used: Vec<String>,
+}
+
+fn private_not_declared(name: &str) -> String {
+    format!("SyntaxError: Private field '{name}' must be declared in an enclosing class")
+}
+
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -59,6 +70,12 @@ struct Parser {
     /// the `in` as the loop separator, not a binary expression. Cleared inside
     /// any parenthesised/bracketed sub-expression, where `in` is legal again.
     no_in: bool,
+    /// One frame per enclosing class body, each holding the private names that
+    /// body DECLARES and the ones its code USES. A private name is only in
+    /// scope inside a class that declares it, so an undeclared use is an EARLY
+    /// error (`SyntaxError`) rather than a runtime `TypeError` if the read ever
+    /// happens — a typo in a dead branch used to ship silently.
+    class_scopes: Vec<PrivateScope>,
 }
 
 /// Parse a complete JS program into a statement list. Inline `rust { ... }` FFI
@@ -72,6 +89,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         in_generator: false,
         in_async: false,
         no_in: false,
+        class_scopes: Vec::new(),
     };
     let mut out = Vec::new();
     while !p.at_eof() {
@@ -340,7 +358,43 @@ impl Parser {
     /// Parse a `class` (the `class` keyword is current). `_decl` distinguishes a
     /// declaration (name required in strict mode, but we accept optional) from an
     /// expression.
+    /// 15.7.1: a private name must be declared by an enclosing class body.
+    /// Outside one, `this.#x` is a SyntaxError at parse time — it used to parse
+    /// and then throw a `TypeError` only if the read ever ran, so a typo in a
+    /// dead branch shipped silently.
+    fn check_private_in_scope(&mut self, property: &str) -> Result<(), String> {
+        if !property.starts_with('#') {
+            return Ok(());
+        }
+        match self.class_scopes.last_mut() {
+            // Recorded, not resolved: the declaration may still be ahead of the
+            // use in the same body, so the check runs when the body closes.
+            Some(scope) => scope.used.push(property.to_string()),
+            None => return Err(private_not_declared(property)),
+        }
+        Ok(())
+    }
+
     fn parse_class(&mut self, _decl: bool) -> Result<ClassNode, String> {
+        self.class_scopes.push(PrivateScope::default());
+        let out = self.parse_class_inner();
+        let scope = self.class_scopes.pop().unwrap_or_default();
+        let out = out?;
+        for name in &scope.used {
+            if scope.declared.contains(name) {
+                continue;
+            }
+            // A nested class may reference a name an OUTER class declares, so an
+            // unresolved use is handed outwards rather than rejected here.
+            match self.class_scopes.last_mut() {
+                Some(outer) => outer.used.push(name.clone()),
+                None => return Err(private_not_declared(name)),
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_class_inner(&mut self) -> Result<ClassNode, String> {
         self.advance(); // class
         let name = if let Tok::Ident(n) = self.tok() {
             if !is_keyword(n) && n != "extends" {
@@ -366,7 +420,15 @@ impl Parser {
             if self.eat_punct(";") {
                 continue; // stray semicolons between members
             }
-            members.push(self.parse_class_member()?);
+            let member = self.parse_class_member()?;
+            if let Expr::Str(k) = &member.key {
+                if k.starts_with('#') {
+                    if let Some(scope) = self.class_scopes.last_mut() {
+                        scope.declared.push(k.clone());
+                    }
+                }
+            }
+            members.push(member);
         }
         self.expect_punct("}")?;
         Ok(ClassNode {
@@ -1057,6 +1119,7 @@ impl Parser {
         loop {
             if self.eat_punct(".") {
                 let property = self.ident_name()?;
+                self.check_private_in_scope(&property)?;
                 e = Expr::Member {
                     object: Box::new(e),
                     property,
@@ -1144,6 +1207,7 @@ impl Parser {
         loop {
             if self.eat_punct(".") {
                 let property = self.ident_name()?;
+                self.check_private_in_scope(&property)?;
                 e = Expr::Member {
                     object: Box::new(e),
                     property,
@@ -1590,6 +1654,7 @@ fn parse_expr_source(src: &str) -> Result<Expr, String> {
         in_generator: false,
         in_async: false,
         no_in: false,
+        class_scopes: Vec::new(),
     };
     let e = p.parse_expr()?;
     Ok(e)

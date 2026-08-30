@@ -26,3 +26,55 @@ console.log("depth-neg ", util.inspect(deep, { depth: -1 }), util.inspect(deep, 
 console.log("depth-ninf", util.inspect(deep, { depth: -Infinity }), util.inspect([1, [2]], { depth: -1 }));
 // Truncated toward zero, and the override lasts for the one call only.
 console.log("depth-frac", util.inspect(deep, { depth: 1.9 }), util.inspect(deep));
+
+// A Map/Set/Promise/RegExp/generator is an ordinary object that ALSO has
+// internal slots, so it can carry own properties like anything else. Its heap
+// representation held only those slots, so every such write vanished: `m.x = 5`
+// left `m.x` undefined, and `Object.keys`, spread, `Object.assign`,
+// `JSON.stringify` and `util.inspect` all reported nothing.
+const m = new Map([["k", 1]]);
+m.x = 5;
+console.log("map     ", m.x, Object.keys(m).join(","), m.size, JSON.stringify({ ...m }));
+const st = new Set([1]);
+st.tag = "t";
+console.log("set     ", st.tag, Object.getOwnPropertyNames(st).join(","), st.size, st.has(1));
+const pr = Promise.resolve(1);
+pr.p = 2;
+const re = /a/g;
+re.r = 3;
+console.log("others  ", pr.p, re.r, Object.keys(re).join(","), re.source, re.flags);
+// A RegExp's own `lastIndex` is still its match cursor, not a stored property.
+re.lastIndex = 4;
+console.log("cursor  ", re.lastIndex, Object.keys(re).join(","));
+// defineProperty, hasOwn and JSON all see the same own properties.
+Object.defineProperty(m, "d", { value: 3, enumerable: true });
+console.log("define  ", m.d, Object.hasOwn(m, "d"), Object.hasOwn(m, "nope"),
+  JSON.stringify(Object.assign({}, m)));
+console.log("json    ", JSON.stringify(m), JSON.stringify(st));
+// inspect shows the entries AND the attached properties.
+console.log("inspect ", m, st, new Map(), new Set());
+delete m.x;
+console.log("delete  ", m.x, Object.keys(m).join(","));
+
+// An EventEmitter keys a symbol event by the symbol itself, so `eventNames()`
+// hands back something `off` accepts. It used to render the symbol as
+// `"Symbol(desc)"`, collapsing it with a string event of that name and making
+// every symbol listener unremovable by its symbol.
+const EE = require("events");
+const em = new EE();
+const evt = Symbol("evt");
+let seen = 0;
+const fn = (n) => { seen += n; };
+em.on(evt, fn);
+em.on("plain", () => {});
+const names = em.eventNames();
+console.log("events  ", names.length, typeof names[0], typeof names[1], names[1] === evt);
+em.emit(evt, 7);
+console.log("emit    ", seen, em.listenerCount(evt), em.listeners(evt).length);
+em.off(evt, fn);
+em.emit(evt, 7);
+console.log("off     ", seen, em.listenerCount(evt), em.eventNames().length);
+// A string event of the symbol's DESCRIPTION is a different event entirely.
+em.on("Symbol(evt)", () => { seen += 100; });
+em.emit(evt, 1);
+console.log("distinct", seen, em.eventNames().length);

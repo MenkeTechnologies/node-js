@@ -3548,6 +3548,29 @@ impl JsHost {
         Some(self.render_object(&extras, &format!("{head} "), indent))
     }
 
+    /// The `key: value` parts for own properties a script attached to an exotic
+    /// whose contents are internal slots — `new Map([['k',1]])` with `m.x = 5`
+    /// prints `Map(1) { 'k' => 1, x: 5 }`.
+    fn side_table_parts(&self, v: &Value, indent: usize, st: &mut InspectCycles) -> Vec<String> {
+        self.fn_prop_keys(v)
+            .into_iter()
+            .filter(|k| {
+                !k.starts_with("@@")
+                    && !k.starts_with('#')
+                    && !is_symbol_key(k)
+                    && self.prop_attrs(v, k).enumerable
+            })
+            .map(|k| {
+                let val = self.fn_prop(v, &k).unwrap_or(Value::Undef);
+                format!(
+                    "{}: {}",
+                    fmt_key(&k),
+                    self.inspect_lvl(&val, indent + 2, st)
+                )
+            })
+            .collect()
+    }
+
     fn inspect_tag(&self, v: &Value) -> Option<String> {
         let own = matches!(self.get(v), Some(JsObj::Object(p)) if p.contains_key("@@toStringTag"));
         if own && self.prop_attrs(v, "@@toStringTag").enumerable {
@@ -3970,13 +3993,14 @@ impl JsHost {
                 Some(JsObj::Map { weak: true, .. }) => "WeakMap { <items unknown> }".into(),
                 Some(JsObj::Set { weak: true, .. }) => "WeakSet { <items unknown> }".into(),
                 Some(JsObj::Map { entries, .. }) => {
-                    if entries.is_empty() {
+                    let extra = self.side_table_parts(v, indent, st);
+                    if entries.is_empty() && extra.is_empty() {
                         return "Map(0) {}".into();
                     }
                     if indent as i64 > inspect_indent_limit() {
                         return "[Map]".into();
                     }
-                    let inner: Vec<String> = entries
+                    let mut inner: Vec<String> = entries
                         .values()
                         .map(|(k, val)| {
                             // Sequenced, not nested in one `format!`: both arms
@@ -3986,19 +4010,22 @@ impl JsHost {
                             format!("{ks} => {vs}")
                         })
                         .collect();
+                    inner.extend(extra);
                     format!("Map({}) {{ {} }}", entries.len(), inner.join(", "))
                 }
                 Some(JsObj::Set { entries, .. }) => {
-                    if entries.is_empty() {
+                    let extra = self.side_table_parts(v, indent, st);
+                    if entries.is_empty() && extra.is_empty() {
                         return "Set(0) {}".into();
                     }
                     if indent as i64 > inspect_indent_limit() {
                         return "[Set]".into();
                     }
-                    let inner: Vec<String> = entries
+                    let mut inner: Vec<String> = entries
                         .values()
                         .map(|v| self.inspect_lvl(v, indent + 2, st))
                         .collect();
+                    inner.extend(extra);
                     format!("Set({}) {{ {} }}", entries.len(), inner.join(", "))
                 }
                 Some(JsObj::Generator { .. }) => "Object [Generator] {}".into(),
@@ -5089,6 +5116,18 @@ impl JsHost {
             // members node-js implements, so a package that copies a namespace
             // key-by-key gets the working set instead of an empty object.
             Some(JsObj::Builtin(ns)) => crate::stdlib::namespace_keys(&ns.clone()),
+            // A `Map`/`Set`/`Promise`/`RegExp`/generator holds only its internal
+            // slots, so what a script assigned lives in the side table — and is
+            // just as much an own property as an object's.
+            Some(_) => self
+                .fn_prop_keys(v)
+                .into_iter()
+                .filter(|k| {
+                    !k.starts_with("@@")
+                        && !k.starts_with('#')
+                        && (!enum_only || self.prop_attrs(v, k).enumerable)
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -5117,6 +5156,18 @@ impl JsHost {
                             _ => Value::Undef,
                         }
                     }),
+                    // A Map/Set/Promise/RegExp/generator keeps every own
+                    // property in the side table.
+                    Some(
+                        JsObj::Map { .. }
+                        | JsObj::Set { .. }
+                        | JsObj::Promise { .. }
+                        | JsObj::RegExp(_)
+                        | JsObj::Generator { .. }
+                        | JsObj::Symbol { .. }
+                        | JsObj::BigInt(_)
+                        | JsObj::Iter { .. },
+                    ) => self.fn_prop(v, &k).unwrap_or(Value::Undef),
                     // An index reads the element; any other own key (`foo`,
                     // a match result's `index`) lives in the side table.
                     Some(JsObj::Array(items)) => k

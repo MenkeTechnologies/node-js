@@ -991,7 +991,7 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                     if crate::regexp::is_regexp_method(name) {
                         bound_method(recv, name)
                     } else {
-                        Value::Undef
+                        with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef)
                     }
                 }),
                 None => Value::Undef,
@@ -1009,7 +1009,7 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                 "size" if !weak => Value::Float(len as f64),
                 "@@iterator" => bound_method(recv, name),
                 _ if is_map_method(name) => bound_method(recv, name),
-                _ => Value::Undef,
+                _ => with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef),
             }
         }
         Some(ObjKind::Set) => {
@@ -1022,7 +1022,7 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                 "size" if !weak => Value::Float(len as f64),
                 "@@iterator" => bound_method(recv, name),
                 _ if is_set_method(name) => bound_method(recv, name),
-                _ => Value::Undef,
+                _ => with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef),
             }
         }
         Some(ObjKind::Generator) => {
@@ -1036,14 +1036,14 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             if matches!(name, "then" | "catch" | "finally") {
                 bound_method(recv, name)
             } else {
-                Value::Undef
+                with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef)
             }
         }
         Some(ObjKind::Iter) => {
             if matches!(name, "next" | "return" | "@@iterator") {
                 bound_method(recv, name)
             } else {
-                Value::Undef
+                with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef)
             }
         }
         Some(ObjKind::Array) => {
@@ -1336,6 +1336,9 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             // Shared with the `in` operator so the two cannot drift apart.
             if let Some(hit) = crate::stdlib::typedarray::has_index(recv, &k) {
                 return Ok(Value::Bool(hit));
+            }
+            if uses_side_table(recv) {
+                return Ok(Value::Bool(with_host(|h| h.fn_prop(recv, &k).is_some())));
             }
             let has = with_host(|h| match h.get(recv) {
                 Some(JsObj::Object(p)) => p.contains_key(&k) || h.own_accessor(recv, &k).is_some(),
@@ -2233,6 +2236,13 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         if crate::stdlib::buffer::byte_set(recv, name, &val) {
             return Ok(());
         }
+    }
+    // Any own property on an exotic with no property map of its own. This sits
+    // BELOW the exotic-specific writes above, so a RegExp's `lastIndex` still
+    // moves its match cursor rather than being shadowed by a side-table entry.
+    if uses_side_table(recv) {
+        with_host(|h| h.set_fn_prop(recv, name, val));
+        return Ok(());
     }
     // An arbitrary own prop on an array (e.g. exec-result `.index`/`.input`).
     if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Array)
@@ -4515,6 +4525,27 @@ fn string_raw(args: &[Value]) -> Result<Value, String> {
 
 /// `Object(x)`: box/pass-through — for our model, non-object args just return a
 /// fresh object; objects pass through.
+/// Whether `v`'s own properties live in the fn-prop SIDE TABLE rather than in a
+/// property map. A `Map`/`Set`/`Promise`/`RegExp`/generator/symbol/bigint is an
+/// ordinary object that also has internal slots, so it can carry own properties
+/// like anything else — but its heap variant holds only those slots, so a write
+/// had nowhere to go and vanished: `m.x = 5` left `m.x` undefined.
+pub fn uses_side_table(v: &Value) -> bool {
+    matches!(
+        with_host(|h| h.kind_of(v)),
+        Some(
+            ObjKind::Map
+                | ObjKind::Set
+                | ObjKind::Promise
+                | ObjKind::RegExp
+                | ObjKind::Generator
+                | ObjKind::Symbol
+                | ObjKind::BigInt
+                | ObjKind::Iter
+        )
+    )
+}
+
 fn object_call(args: Vec<Value>) -> Value {
     let a = arg0(&args);
     // `Object(v)` is `ToObject(v)` (20.1.1.1): a primitive comes back BOXED,
@@ -5869,8 +5900,22 @@ fn json_str(
         Value::Obj(_) => match h.get(v) {
             Some(JsObj::Str(s)) => Some(json_quote(s)),
             Some(JsObj::Null) => Some("null".into()),
-            // Map/Set have no enumerable own string keys → serialize as `{}`.
-            Some(JsObj::Map { .. }) | Some(JsObj::Set { .. }) => Some("{}".into()),
+            // A Map/Set has no ENTRIES to serialize (they are internal slots),
+            // but any own property a script attached is serialized like an
+            // ordinary object's: `JSON.stringify(Object.assign(new Map(), {a:1}))`
+            // is `{"a":1}`.
+            Some(JsObj::Map { .. }) | Some(JsObj::Set { .. }) | Some(JsObj::RegExp(_)) => {
+                let parts: Vec<String> = h
+                    .own_enum_entries(v)
+                    .into_iter()
+                    .filter(|(k, _)| !k.starts_with("@@") && !host::is_symbol_key(k))
+                    .filter_map(|(k, val)| {
+                        json_str(h, &val, indent, depth + 1, keys)
+                            .map(|s| format!("{}{sep}{s}", json_quote(&k)))
+                    })
+                    .collect();
+                Some(wrap(&parts, "{", "}", indent, depth))
+            }
             // Functions and symbols are omitted (undefined) as values.
             Some(JsObj::Func(_))
             | Some(JsObj::Builtin(_))
@@ -9545,7 +9590,8 @@ fn write_data_slot(obj: &Value, key: &str, v: Value) {
     if matches!(
         with_host(|h| h.get(obj).cloned()),
         Some(JsObj::Func(_)) | Some(JsObj::Class(_))
-    ) {
+    ) || uses_side_table(obj)
+    {
         with_host(|h| h.set_fn_prop(obj, key, v));
         return;
     }

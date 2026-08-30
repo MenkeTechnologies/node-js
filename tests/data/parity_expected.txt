@@ -342,6 +342,14 @@ ok       accepted
 ok       accepted
 ok       accepted
 errshape true 7 object object
+bare     SyntaxError: Private field '#x' must be declared in an enclosing class
+in-fn    SyntaxError: Private field '#y' must be declared in an enclosing class
+in-class SyntaxError: Private field '#z' must be declared in an enclosing class
+obj      SyntaxError: Private field '#w' must be declared in an enclosing class
+hoisted  parsed
+nested   parsed
+kinds    parsed parsed
+unrelated SyntaxError: Private field '#a' must be declared in an enclosing class
 ==== errors.js ====
 MyError boom 42 true true
 try,catch
@@ -494,6 +502,18 @@ depth-inf  { a: { b: { c: { d: { e: 1 } } } } }
 depth-neg  [Object] [Object]
 depth-ninf [Object] [Array]
 depth-frac { a: { b: [Object] } } { a: { b: { c: [Object] } } }
+map      5 x 1 {"x":5}
+set      t tag 1 true
+others   2 3 r a g
+cursor   4 r
+define   3 true false {"x":5,"d":3}
+json     {"x":5,"d":3} {"tag":"t"}
+inspect  Map(1) { 'k' => 1, x: 5, d: 3 } Set(1) { 1, tag: 't' } Map(0) {} Set(0) {}
+delete   undefined d
+events   2 string symbol true
+emit     7 1 1
+off      7 0 1
+distinct 7 2
 ==== processenv.js ====
 num      5 string 51
 coerced  true undefined null

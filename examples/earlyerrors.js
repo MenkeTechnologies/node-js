@@ -64,3 +64,23 @@ try {
 } catch (e) {
   console.log("errshape", e instanceof Error, e.status, typeof e.stderr, typeof e.stdout);
 }
+
+// 15.7.1: a private name must be declared by an enclosing class body. An
+// undeclared one is a SyntaxError at PARSE time — it used to parse fine and
+// throw a TypeError only if the read ever ran, so a typo in a branch that never
+// executed shipped silently.
+const syn = (src) => { try { eval(src); return "parsed"; } catch (e) { return e.constructor.name + ": " + e.message; } };
+console.log("bare    ", syn("this.#x"));
+console.log("in-fn   ", syn("function f() { return this.#y; }"));
+console.log("in-class", syn("class C { m() { return this.#z; } }"));
+console.log("obj     ", syn("const o = {}; o.#w"));
+// A declaration BELOW the use in the same body is still in scope.
+console.log("hoisted ", syn("class C { m() { return this.#later; } #later = 1; }"));
+// A nested class may reference a name an OUTER class declares.
+console.log("nested  ", syn("class B { #v = 1; f() { const s = this; return class { g() { return s.#v; } }; } }"));
+// A private method, a private static and a brand check all count.
+console.log("kinds   ", syn("class D { #m() {} static #s = 1; run() { return this.#m(); } }"),
+  syn("class E { #b = 1; static has(o) { return #b in o; } }"));
+// The undeclared name is named in the message, and the innermost class does not
+// silently satisfy a use of a name only an unrelated class declares.
+console.log("unrelated", syn("class F { #a = 1; } class G { m() { return this.#a; } }"));

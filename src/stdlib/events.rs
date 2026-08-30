@@ -42,6 +42,16 @@ pub const METHODS: &[&str] = &[
     "getMaxListeners",
 ];
 
+/// The internal key an event name registers under.
+///
+/// `ToPropertyKey`, not `String(name)`: a SYMBOL event name is a distinct key
+/// (`@@sym:<id>`), so `on(sym, f)` and `on("Symbol(desc)", f)` are different
+/// events and `eventNames()` can hand the symbol itself back. Rendering it
+/// collapsed the two and made every symbol listener unremovable by its symbol.
+fn event_key(args: &[Value]) -> String {
+    with_host(|h| h.property_key(args.first().unwrap_or(&Value::Undef)))
+}
+
 pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     match method {
         // Both the event-name coercion and the listener lookup re-enter the host,
@@ -51,7 +61,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         // `rawListeners` returns the once-WRAPPERS in node; once-listeners are
         // stored unwrapped here, so the two views coincide.
         "listeners" | "rawListeners" => {
-            let items = listeners(recv, &arg_str(&args, 0));
+            let items = listeners(recv, &event_key(&args));
             Ok(with_host(|h| h.new_array(items)))
         }
         // The cap is not enforced (nothing here warns on listener count), but it
@@ -80,7 +90,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         "on" | "addListener" | "prependListener" | "once" | "prependOnceListener" => {
             let once = matches!(method, "once" | "prependOnceListener");
             let prepend = method.starts_with("prepend");
-            let name = arg_str(&args, 0);
+            let name = event_key(&args);
             let f = args.get(1).cloned().unwrap_or(Value::Undef);
             // `newListener` fires BEFORE the listener is added, so a handler for
             // it sees the emitter without the new listener and can add its own
@@ -100,11 +110,11 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         }
         "emit" => emit(
             recv,
-            &arg_str(&args, 0),
+            &event_key(&args),
             &args.get(1..).map(|s| s.to_vec()).unwrap_or_default(),
         ),
         "removeListener" | "off" => {
-            let name = arg_str(&args, 0);
+            let name = event_key(&args);
             let f = args.get(1).cloned();
             let had = f
                 .as_ref()
@@ -122,20 +132,30 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             let name = if args.is_empty() {
                 None
             } else {
-                Some(arg_str(&args, 0))
+                Some(event_key(&args))
             };
             remove_all(recv, name.as_deref());
             Ok(recv.clone())
         }
-        "listenerCount" => Ok(Value::Float(
-            listeners(recv, &arg_str(&args, 0)).len() as f64
-        )),
+        "listenerCount" => Ok(Value::Float(listeners(recv, &event_key(&args)).len() as f64)),
+        // A SYMBOL event name comes back as the symbol itself, not as its
+        // `Symbol(desc)` rendering — `emitter.on(sym, f)` then `eventNames()`
+        // has to hand back something `emitter.off(name, f)` accepts. Strings
+        // come first, then symbols, which is the own-key order node reports.
         "eventNames" => Ok(with_host(|h| {
             let mut keys: Vec<String> = Vec::new();
             if let Some(JsObj::Object(p)) = named_map(h, recv, "@@on").and_then(|v| h.get(&v)) {
                 keys.extend(p.keys().cloned());
             }
-            let names: Vec<Value> = keys.into_iter().map(|k| h.new_str(k)).collect();
+            let (syms, strs): (Vec<String>, Vec<String>) = keys
+                .into_iter()
+                .partition(|k| crate::host::is_symbol_key(k));
+            let mut names: Vec<Value> = strs.into_iter().map(|k| h.new_str(k)).collect();
+            names.extend(
+                syms.iter()
+                    .filter_map(|k| h.symbol_of_key(k))
+                    .collect::<Vec<Value>>(),
+            );
             h.new_array(names)
         })),
         _ => Err(crate::host::type_error(&format!(
