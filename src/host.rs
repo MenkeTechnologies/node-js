@@ -332,6 +332,11 @@ pub struct FuncDef {
     /// True for an `async` function/method/arrow: calling it drives a coroutine
     /// and returns a Promise; `await` inside suspends via the same yielder.
     pub is_async: bool,
+    /// True when the function body (or the enclosing program) is strict. A
+    /// SLOPPY function called with no receiver gets the GLOBAL object as
+    /// `this`; a strict one keeps `undefined` (10.2.1.2 OrdinaryCallBindThis).
+    #[serde(default)]
+    pub strict: bool,
     /// True for a MethodDefinition (`{ m(){} }`, a class method/accessor). A
     /// non-generator method is not a constructor, so it owns no `prototype`.
     #[serde(default)]
@@ -5513,7 +5518,21 @@ pub fn run_user_func_nt(
     // prologue (compiled ahead of the user statements).
     bind_params(&env, &params, args, is_arrow_def);
     // Arrow functions capture `this` lexically; regular functions receive it.
-    let this_val = if fv.is_arrow { fv.this.clone() } else { this };
+    let mut this_val = if fv.is_arrow { fv.this.clone() } else { this };
+    // 10.2.1.2 OrdinaryCallBindThis: in SLOPPY mode an absent or nullish `this`
+    // becomes the global object. Only a strict function keeps `undefined`, and
+    // an arrow has no `this` of its own to substitute. Leaving it undefined
+    // meant a plain `f()`, a detached method, a callback and `f.call(null)` all
+    // saw `undefined` where node sees `globalThis`.
+    let sloppy_this = !fv.is_arrow
+        && !with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict))
+        && match &this_val {
+            None => true,
+            Some(v) => matches!(v, Value::Undef) || with_host(|h| h.is_null(v)),
+        };
+    if sloppy_this {
+        this_val = Some(with_host(|h| h.global_object()));
+    }
     // A generator function does not run its body on call — it returns a suspended
     // generator over the already-bound frame.
     if is_generator {

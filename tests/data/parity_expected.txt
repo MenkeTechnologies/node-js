@@ -589,6 +589,21 @@ keys     plain 1 v
 proxy    get:a set:b has:a del:b ownKeys
 applyTrp 11
 reflect  true a,b
+==== thisbinding.js ====
+forEach  T
+array    T 1
+search   true true 1 0
+last     1 0 T
+from     T
+colls    T,T,T
+typed    9
+args     a,1,1,x,x,1
+plain    global global global
+detached global
+callback global global
+receiver object object
+strict   undefined
+arrow    object
 ==== urls.js ====
 encode   /a%20b ?c=d%20e #f%20g
 href     https://a.b/a%20b?c=d%20e#f%20g

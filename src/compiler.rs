@@ -1604,6 +1604,9 @@ impl Compiler {
         // ADDED by a body's own directive prologue — never dropped.
         let saved_strict = self.strict;
         self.strict = self.strict || has_use_strict(body);
+        // Captured before the restore below, since the FuncDef is built after
+        // `self.strict` has been put back to the enclosing value.
+        let body_strict = self.strict;
         // The body is a chunk of its own, so its call sites are keyed to ITS
         // `op_hash`; the enclosing chunk's pending ones must not be swept in.
         let saved_sites = std::mem::take(&mut self.call_sites);
@@ -1637,6 +1640,7 @@ impl Compiler {
             is_async,
             is_method: false,
             self_name: false,
+            strict: body_strict,
         };
         self.call_sites = saved_sites;
         self.yield_sites = saved_yields;

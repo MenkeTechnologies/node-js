@@ -5318,7 +5318,11 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
     if let Some(cb) = args.get(1).cloned() {
         let mut out = Vec::with_capacity(items.len());
         for (i, it) in items.into_iter().enumerate() {
-            out.push(host::invoke(&cb, vec![it, Value::Float(i as f64)], None)?);
+            out.push(host::invoke(
+                &cb,
+                vec![it, Value::Float(i as f64)],
+                this_arg(&args, 2),
+            )?);
         }
         return Ok(with_host(|h| h.new_array(out)));
     }
@@ -6285,6 +6289,20 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
 /// A copy of the whole backing store, for the methods that genuinely consume
 /// every element (`map`, `filter`, `join`, …). Never call it just to read
 /// `.len()` — use [`array_len`], or `push`/`unshift` become O(n) per call.
+/// The `thisArg` an iteration method was given, if any.
+///
+/// `[1].forEach(fn, thisArg)` binds `thisArg` as the callback's `this`, and so
+/// do `map`/`filter`/`some`/`every`/`find`/`findIndex`/`findLast`/
+/// `findLastIndex`/`flatMap`, `Map`/`Set`/TypedArray `forEach`, and
+/// `Array.from`'s map function. Every one of them was invoking the callback
+/// with no receiver, so `this` inside it was undefined and the argument did
+/// nothing.
+fn this_arg(args: &[Value], idx: usize) -> Option<Value> {
+    args.get(idx)
+        .filter(|v| !matches!(v, Value::Undef))
+        .cloned()
+}
+
 /// The elements of an array, with any INDEX ACCESSOR resolved.
 ///
 /// `Object.defineProperty(arr, 1, { get })` stores the getter in the accessor
@@ -6716,7 +6734,7 @@ fn array_method_on(
                 out.push(host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?);
             }
             Ok(with_host(|h| {
@@ -6737,7 +6755,7 @@ fn array_method_on(
                 let r = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
                 match with_host(|h| h.get(&r).cloned()) {
                     Some(JsObj::Array(inner)) => out.extend(inner),
@@ -6758,7 +6776,7 @@ fn array_method_on(
                 let keep = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
                 if with_host(|h| h.truthy(&keep)) {
                     out.push(it.clone());
@@ -6777,7 +6795,7 @@ fn array_method_on(
                 host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
             }
             Ok(Value::Undef)
@@ -6789,7 +6807,7 @@ fn array_method_on(
                 let m = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(it.clone());
@@ -6804,7 +6822,7 @@ fn array_method_on(
                 let m = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(Value::Float(i as f64));
@@ -6823,7 +6841,7 @@ fn array_method_on(
                 let m = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(Value::Bool(true));
@@ -6842,7 +6860,7 @@ fn array_method_on(
                 let m = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
                 if !with_host(|h| h.truthy(&m)) {
                     return Ok(Value::Bool(false));
@@ -6880,7 +6898,7 @@ fn array_method_on(
                 acc = host::invoke(
                     &cb,
                     vec![acc, it.clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
             }
             Ok(acc)
@@ -6932,7 +6950,7 @@ fn array_method_on(
                 let m = host::invoke(
                     &cb,
                     vec![items[i].clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(items[i].clone());
@@ -6947,7 +6965,7 @@ fn array_method_on(
                 let m = host::invoke(
                     &cb,
                     vec![items[i].clone(), Value::Float(i as f64), this_value.clone()],
-                    None,
+                    this_arg(&args, 1),
                 )?;
                 if with_host(|h| h.truthy(&m)) {
                     return Ok(Value::Float(i as f64));
@@ -8528,7 +8546,7 @@ fn map_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
                 _ => Vec::new(),
             });
             for (k, v) in pairs {
-                host::invoke(&cb, vec![v, k, recv.clone()], None)?;
+                host::invoke(&cb, vec![v, k, recv.clone()], this_arg(&args, 1))?;
             }
             Ok(Value::Undef)
         }
@@ -8620,7 +8638,7 @@ fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
                 _ => Vec::new(),
             });
             for v in vals {
-                host::invoke(&cb, vec![v.clone(), v, recv.clone()], None)?;
+                host::invoke(&cb, vec![v.clone(), v, recv.clone()], this_arg(&args, 1))?;
             }
             Ok(Value::Undef)
         }

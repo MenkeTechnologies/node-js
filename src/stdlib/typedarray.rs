@@ -507,11 +507,14 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
     // The callback-taking methods share one shape: invoke `cb(value, index,
     // receiver)` per element. They are inherited by `Buffer` too, which is why
     // they must live here rather than in either concrete type.
+    // `forEach(fn, thisArg)` and its siblings bind `thisArg` as the callback's
+    // `this`; it was being dropped, so `this` inside the callback was undefined.
+    let this_arg = args.get(1).filter(|v| !matches!(v, Value::Undef)).cloned();
     let call_cb = |i: usize, v: &Value| -> Result<Value, String> {
         crate::host::invoke(
             &args.first().cloned().unwrap_or(Value::Undef),
             vec![v.clone(), Value::Float(i as f64), recv.clone()],
-            None,
+            this_arg.clone(),
         )
     };
     match method {
