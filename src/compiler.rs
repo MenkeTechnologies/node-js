@@ -2705,6 +2705,14 @@ impl Compiler {
         index: &Expr,
         optional: bool,
     ) -> Result<(), String> {
+        // `super[expr]` READ — the computed twin of `super.prop`, which
+        // `compile_member` handles. Without it `super` compiled as a value and
+        // the read went against `undefined`.
+        if matches!(object, Expr::Super) {
+            self.compile_expr(b, index)?;
+            b.emit(Op::CallBuiltin(ops::SUPER_GET, 1), 0);
+            return Ok(());
+        }
         self.compile_expr(b, object)?;
         if optional {
             let jshort = self.emit_optional_guard(b);
@@ -3165,6 +3173,21 @@ impl Compiler {
                         }
                     }
                 }
+            }
+            // `super[expr](args)` — the computed twin of `super.m(args)` above.
+            // The dotted form was handled and this was not, so it fell through
+            // to the ordinary computed-call path, which compiled `super` as a
+            // value and dispatched on that.
+            Expr::Index { object, index, .. } if matches!(**object, Expr::Super) => {
+                self.compile_expr(b, index)?; // [name]
+                b.emit(Op::CallBuiltin(ops::SUPER_GET, 1), 0); // [method]
+                self.name_const(b, "call"); // [method, "call"]
+                b.emit(Op::CallBuiltin(ops::THIS, 0), 0); // [method, "call", this]
+                for a in args {
+                    self.compile_expr(b, a)?;
+                }
+                b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(3 + args.len())?), 0);
+                return Ok(());
             }
             Expr::Index {
                 object,

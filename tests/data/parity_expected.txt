@@ -143,6 +143,10 @@ explicit   explicit+base-static true
 arity      3 3 2
 arity2     1 0
 chained    1 bound arity3
+computed child+base var+base
+read     base-label base
+static   child+base-make base-tag
+agree    base|base
 ==== classfeatures.js ====
 private  1|privMethod|privGetter
 statics  1 static-block true false

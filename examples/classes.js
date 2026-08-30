@@ -89,3 +89,29 @@ function arity3(a, b, c) {}
 console.log("arity     ", arity3.length, arity3.bind(null).length, arity3.bind(null, 1).length);
 console.log("arity2    ", arity3.bind(null, 1, 2).length, arity3.bind(null, 1, 2, 3, 4).length);
 console.log("chained   ", arity3.bind(null, 1).bind(null, 2).length, arity3.bind(null).name);
+
+// `super[expr]` — the COMPUTED twin of `super.m`. Only the dotted form was
+// compiled; the computed one fell through to the ordinary path, which compiled
+// `super` as a value and then read or called against `undefined`. Both the
+// call and the plain read were affected, on instance and static methods alike.
+class SuperBase {
+  greet() { return "base"; }
+  get label() { return "base-label"; }
+  static make() { return "base-make"; }
+  static get tag() { return "base-tag"; }
+}
+class SuperChild extends SuperBase {
+  greet() { return "child+" + super["greet"](); }
+  viaVariable() { const key = "greet"; return "var+" + super[key](); }
+  readLabel() { return super["label"]; }
+  withArgs() { return super["greet"](1, 2); }
+  bothForms() { return [super["greet"](), super.greet()].join("|"); }
+  static make() { return "child+" + super["make"](); }
+  static readTag() { return super["tag"]; }
+}
+const child = new SuperChild();
+console.log("computed", child.greet(), child.viaVariable());
+console.log("read    ", child.readLabel(), child.withArgs());
+console.log("static  ", SuperChild.make(), SuperChild.readTag());
+// The dotted form must keep working, and the two must agree.
+console.log("agree   ", child.bothForms());
