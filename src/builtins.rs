@@ -1978,6 +1978,23 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             return Ok(());
         }
     }
+    // Every environment value is a STRING. `process.env.PORT = 8080` stores
+    // "8080", so `process.env.PORT + 1` concatenates the way it does in a real
+    // process; storing the number made it add instead.
+    if !name.starts_with("@@")
+        && with_host(
+            |h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key("@@envObject")),
+        )
+    {
+        let text = with_host(|h| h.str_of(&val));
+        let sv = with_host(|h| h.new_str(text));
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                p.insert(name.to_string(), sv);
+            }
+        });
+        return Ok(());
+    }
     // Assigning `e.stack` wins permanently: drop the not-yet-formatted marker so
     // no later read re-derives a header over the top of the assigned value.
     if name == "stack" {

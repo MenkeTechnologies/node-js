@@ -334,6 +334,17 @@ depth-inf  { a: { b: { c: { d: { e: 1 } } } } }
 depth-neg  [Object] [Object]
 depth-ninf [Object] [Array]
 depth-frac { a: { b: [Object] } } { a: { b: { c: [Object] } } }
+==== processenv.js ====
+num      5 string 51
+coerced  true undefined null
+types    string string string
+objects  [object Object] 1,2 string
+delete   undefined false true
+keys     true false
+tty      undefined undefined number
+release  object node true
+shapes   true object number string
+fns      function function function function
 ==== properties.js ====
 order    1,2,b,a,01
 reflect  6

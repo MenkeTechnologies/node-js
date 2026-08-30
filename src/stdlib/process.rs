@@ -214,6 +214,20 @@ fn memo(name: &str, make: impl FnOnce() -> Value) -> Value {
 pub fn constant(name: &str) -> Option<Value> {
     Some(match name {
         "env" => memo("env", env_object),
+        // `process.release` carried nothing, so the common
+        // `process.release.name === 'node'` probe threw on `undefined.name`.
+        // Only `name` is reported: it is consistent with the node version this
+        // already claims through `process.version`, whereas the `sourceUrl` and
+        // `headersUrl` node also carries would point at a release tarball that
+        // does not exist for this engine.
+        "release" => memo("release", || {
+            with_host(|h| {
+                let mut m = IndexMap::new();
+                let name = h.new_str("node");
+                m.insert("name".into(), name);
+                h.new_object(m)
+            })
+        }),
         "argv" => memo("argv", argv),
         "argv0" => with_host(|h| h.new_str(exec_path())),
         "execPath" => with_host(|h| h.new_str(exec_path())),
@@ -600,6 +614,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 fn env_object() -> Value {
     with_host(|h| {
         let mut m = IndexMap::new();
+        // A marker the property-write path recognises, so an assignment into
+        // `process.env` coerces to a string the way a real environment does.
+        // Nothing dispatches on it; it is hidden from enumeration like any
+        // `@@` key.
+        m.insert("@@envObject".into(), Value::Bool(true));
         for (k, v) in std::env::vars() {
             m.insert(k, h.new_str(v));
         }
@@ -689,7 +708,14 @@ fn std_stream(fd: i32) -> Value {
         m.insert("fd".into(), Value::Float(fd as f64));
         // SAFETY: isatty is a pure query on the fd number.
         let is_tty = unsafe { libc::isatty(fd) == 1 };
-        m.insert("isTTY".into(), Value::Bool(is_tty));
+        // Node defines `isTTY` only when the fd IS a terminal; off a pipe the
+        // property is absent, not `false`. Defining it either way made
+        // `typeof process.stdout.isTTY` report "boolean" where node says
+        // "undefined", which is exactly the check a library uses to decide
+        // whether to emit colour.
+        if is_tty {
+            m.insert("isTTY".into(), Value::Bool(true));
+        }
         m.insert("writable".into(), Value::Bool(fd != 0));
         m.insert("readable".into(), Value::Bool(fd == 0));
         // A tty stream exposes its terminal dimensions (real ioctl reading).
