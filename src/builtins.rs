@@ -4753,6 +4753,18 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
                 h.new_array(out)
             }));
         }
+        // `Object.keys` (mode 0) must run `ownKeys` and `getOwnPropertyDescriptor`
+        // and STOP — 7.3.23 never performs `[[Get]]` when only keys are wanted.
+        // Going through `own_enum_entries` fired the `get` trap once per key, so
+        // the observable trap sequence carried a trailing `get` node does not
+        // emit, and a trap with side effects ran when it should not have.
+        if mode == 0 {
+            let keys = crate::proxy::own_enum_string_keys(&v)?;
+            return Ok(with_host(|h| {
+                let out: Vec<Value> = keys.into_iter().map(|k| h.new_str(k)).collect();
+                h.new_array(out)
+            }));
+        }
         let entries = crate::proxy::own_enum_entries(&v)?;
         return Ok(with_host(|h| {
             let out: Vec<Value> = entries
@@ -4849,10 +4861,23 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
         }
         Vec::new()
     });
-    let entries = if mode == 3 {
-        entries
-    } else {
-        host::own_enum_entries_deep(&v)
+    // `Object.keys` (mode 0) wants NAMES. `own_enum_entries_deep` returns
+    // key/value pairs, so asking it for them ran every enumerable getter —
+    // 20.1.2.17 -> 7.3.23 EnumerableOwnProperties only needs `[[GetOwnProperty]]`
+    // for the enumerable flag, never `[[Get]]`, and a getter can throw or have
+    // side effects:
+    //
+    //     let n = 0; const o = { get g() { n++; return 1 } };
+    //     Object.keys(o); n   // was 1, node says 0
+    //
+    // `values`/`entries` (modes 1 and 2) do read, and still do.
+    let entries = match mode {
+        3 => entries,
+        0 => with_host(|h| h.own_enum_key_names(&v))
+            .into_iter()
+            .map(|k| (k, Value::Undef))
+            .collect(),
+        _ => host::own_enum_entries_deep(&v),
     };
     Ok(with_host(|h| {
         let out: Vec<Value> = entries

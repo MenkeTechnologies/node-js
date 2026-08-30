@@ -39,11 +39,10 @@ class Sub extends Base {
 }
 const s = new Sub();
 s.x = 9;
-// `Sub.kind` is deliberately absent: a static ACCESSOR is not inherited through
-// `extends` here (node reads 'base', this reads undefined), while static methods
-// and fields are. Asserting either spelling would pin a divergence, so only the
-// declaring class is read.
-console.log('class   ', s.x, s.doubled, Base.kind);
+// `Sub.kind` reads through `extends`: a static ACCESSOR is inherited the same
+// way a static method is. It was not, until the read learned to walk the class
+// parent chain for accessors as it already did for methods and fields.
+console.log('class   ', s.x, s.doubled, Base.kind, Sub.kind);
 
 // The accessor lives on the prototype, not the instance.
 console.log('where   ', Object.getOwnPropertyNames(s).join(','),

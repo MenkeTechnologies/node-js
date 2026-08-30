@@ -6739,6 +6739,29 @@ pub fn lookup_accessor(
         }
         cur = h.proto_of(&p);
     }
+    // A STATIC accessor declared by an ancestor class. A subclass reaches its
+    // parent's statics through `ClassVal.parent`, not the `protos` map the walk
+    // above reads — classes are not linked there, so that walk ended at once.
+    // Static methods and fields already inherited because `class_static` does
+    // this same parent walk for `fn_prop`; only accessors had no equivalent:
+    //
+    //     class Base { static get kind() { return 'base' } }
+    //     class Sub extends Base {}
+    //     Sub.plain()  // worked, a fn_prop
+    //     Sub.kind     // undefined; node reads 'base'
+    //
+    // The caller invokes the getter with the class it was READ off as `this`,
+    // so a getter reading `this.x` sees the subclass, per 10.2.4.
+    let mut cls = recv.clone();
+    while let Some(JsObj::Class(c)) = h.get(&cls) {
+        let Some(parent) = c.parent.clone() else {
+            break;
+        };
+        if let Some(a) = h.own_accessor(&parent, key) {
+            return Some(a);
+        }
+        cls = parent;
+    }
     None
 }
 

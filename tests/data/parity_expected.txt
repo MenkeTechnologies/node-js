@@ -4,7 +4,7 @@ computed 20 20
 defined  8 twice {"twice":8}
 descr    4 true false false
 accessor function
-class    10 20 base
+class    10 20 base base
 where    _x function
 chain    proto true
 shadow   own proto
@@ -214,6 +214,16 @@ xyz 42 101010
 node has 3 letters: many
 -1 true true
 AB 66
+==== symbols.js ====
+iterator 1,2,3 1,2,3
+toPrim   42 str:string str:default
+hasInst  true false
+tag      [object Custom]
+symbols  Symbol(d) d k true
+keys     plain 1 v
+proxy    get:a set:b has:a del:b ownKeys
+applyTrp 11
+reflect  true a,b
 ==== wordcount.js ====
 the: 3
 fox: 2
