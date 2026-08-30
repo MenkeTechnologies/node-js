@@ -166,6 +166,123 @@ pub struct Compiler {
     slots: crate::slots::Plan,
 }
 
+// ── early errors: duplicate lexical declarations ─────────────────────────────
+
+/// Reject a duplicate lexical declaration before anything runs, as node does.
+///
+/// `let a = 1; let a = 2;` is a SyntaxError at PARSE time in node, and this
+/// engine ran it — the second declaration simply won. That is the gap that lets
+/// a genuine double-declaration bug through silently, and it bit three test
+/// files in this repo whose collisions node rejected and this accepted.
+///
+/// Deliberately narrow, since a false positive REJECTS a program that works:
+/// only the three collisions the spec is unambiguous about are reported —
+/// two lexical declarations of one name in the same statement list, a lexical
+/// name that a `var` in the same subtree hoists onto, and a lexical name
+/// colliding with a function declaration beside it. Repeated `var`s, and the
+/// same name in nested scopes, stay legal.
+pub fn check_early_errors(stmts: &[Stmt]) -> Result<(), String> {
+    let mut lexical: Vec<String> = Vec::new();
+    let mut functions: Vec<String> = Vec::new();
+    for st in stmts {
+        match &st.kind {
+            StmtKind::Decl { kind, decls } if !matches!(kind, DeclKind::Var) => {
+                for d in decls {
+                    let mut names = Vec::new();
+                    pattern_names(&d.target, &mut names);
+                    for n in names {
+                        if lexical.contains(&n) {
+                            return Err(already_declared(&n));
+                        }
+                        lexical.push(n);
+                    }
+                }
+            }
+            StmtKind::ClassDecl(c) => {
+                if let Some(n) = &c.name {
+                    if lexical.contains(n) {
+                        return Err(already_declared(n));
+                    }
+                    lexical.push(n.clone());
+                }
+            }
+            StmtKind::FuncDecl { name, .. } => functions.push(name.clone()),
+            _ => {}
+        }
+    }
+    // A function declaration and a lexical binding of the same name cannot
+    // share a scope, whichever order they appear in.
+    for f in &functions {
+        if lexical.contains(f) {
+            return Err(already_declared(f));
+        }
+    }
+    // A `var` anywhere below hoists PAST any block between it and its function
+    // scope, so it collides with a lexical name declared here.
+    let mut vars: Vec<String> = Vec::new();
+    for st in stmts {
+        collect_var_names(st, &mut vars);
+    }
+    for n in &lexical {
+        if vars.contains(n) {
+            return Err(already_declared(n));
+        }
+    }
+    // Each nested statement list is its own scope.
+    for st in stmts {
+        check_nested(&st.kind)?;
+    }
+    Ok(())
+}
+
+fn already_declared(name: &str) -> String {
+    format!("SyntaxError: Identifier '{name}' has already been declared")
+}
+
+/// Recurse into the statement lists that form their own scopes. A function
+/// BODY is checked when that function is compiled, so the walk does not
+/// descend into one here.
+fn check_nested(k: &StmtKind) -> Result<(), String> {
+    let one = |s: &Stmt| check_nested(&s.kind);
+    match k {
+        StmtKind::Block(b) => check_early_errors(b),
+        StmtKind::If { cons, alt, .. } => {
+            one(cons)?;
+            match alt {
+                Some(a) => one(a),
+                None => Ok(()),
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::Labeled { body, .. }
+        | StmtKind::ForOf { body, .. }
+        | StmtKind::ForIn { body, .. } => one(body),
+        StmtKind::For { body, .. } => one(body),
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            check_early_errors(block)?;
+            if let Some((_, h)) = handler {
+                check_early_errors(h)?;
+            }
+            match finalizer {
+                Some(f) => check_early_errors(f),
+                None => Ok(()),
+            }
+        }
+        StmtKind::Switch { cases, .. } => {
+            // Every case shares ONE block scope, so their statements are
+            // checked together rather than case by case.
+            let all: Vec<Stmt> = cases.iter().flat_map(|c| c.body.clone()).collect();
+            check_early_errors(&all)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
 pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     let mut c = Compiler {
@@ -181,6 +298,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
         strict: has_use_strict(stmts),
         ..Default::default()
     };
+    check_early_errors(stmts)?;
     let mut b = ChunkBuilder::new();
     // Hoist function declarations to the top (JS function hoisting).
     c.hoist_vars(&mut b, stmts)?;

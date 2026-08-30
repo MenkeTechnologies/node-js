@@ -189,11 +189,22 @@ fn run(program: &str, args: &[String], opts: &SpawnOpts) -> std::io::Result<Run>
 }
 
 /// `execSync`/`execFileSync` send the child's stderr on to the PARENT's stderr
-/// as well as capturing it — that is their documented default stdio, and it is
+/// as well as capturing it — that is their documented DEFAULT stdio, and it is
 /// how a build script's diagnostics reach the terminal. `spawnSync` does not,
-/// and must not. Nothing was echoing it, so those diagnostics vanished.
-fn echo_stderr(bytes: &[u8]) {
+/// and must not.
+///
+/// "Default" is the operative word: node echoes only when the caller left
+/// `stdio` unspecified. Echoing regardless meant a caller that had asked for
+/// the pipes explicitly still saw the child's stderr on its own.
+fn echo_stderr(args: &[Value], opts_idx: usize, bytes: &[u8]) {
     if bytes.is_empty() {
+        return;
+    }
+    let explicit_stdio = args
+        .get(opts_idx)
+        .and_then(|o| crate::builtins::get_property(o, "stdio").ok())
+        .is_some_and(|v| !matches!(v, Value::Undef));
+    if explicit_stdio {
         return;
     }
     let text = String::from_utf8_lossy(bytes).into_owned();
@@ -241,7 +252,7 @@ fn exec_sync(args: &[Value]) -> Result<Value, String> {
     let enc = opts_encoding(args, 1);
     let r = run("sh", &["-c".to_string(), cmd.clone()], &spawn_opts(args, 1))
         .map_err(|e| format!("Error: {e}"))?;
-    echo_stderr(&r.stderr);
+    echo_stderr(args, 1, &r.stderr);
     if r.status != Some(0) {
         return Err(command_failed(&cmd, &r, enc.as_deref()));
     }
@@ -301,10 +312,12 @@ fn exec_file_sync(args: &[Value]) -> Result<Value, String> {
     let enc = opts_encoding(args, 2);
     let r = run(&file, &cmd_args, &spawn_opts(args, 2))
         .map_err(|e| format!("Error: spawn {file} {e}"))?;
-    echo_stderr(&r.stderr);
+    echo_stderr(args, 2, &r.stderr);
     if r.status != Some(0) {
-        let tail = String::from_utf8_lossy(&r.stderr);
-        return Err(format!("Error: Command failed: {file}\n{tail}"));
+        // Same rich error `execSync` throws: a caller reads `e.status` and
+        // `e.stderr` here exactly as it does there, and this path was still
+        // handing back a bare message string.
+        return Err(command_failed(&file, &r, enc.as_deref()));
     }
     Ok(output_value(&r.stdout, enc.as_deref()))
 }

@@ -271,6 +271,28 @@ spread   49 9
 explicit 1 2 3
 optional undefined 42
 detached function 42
+==== earlyerrors.js ====
+dup      Identifier 'a' has already been declared
+dup      Identifier 'b' has already been declared
+dup      Identifier 'G' has already been declared
+dup      Identifier 'k' has already been declared
+dup      Identifier 'j' has already been declared
+var      Identifier 'c' has already been declared
+var      Identifier 'e' has already been declared
+var      Identifier 'f' has already been declared
+func     Identifier 'g' has already been declared
+func     Identifier 'h' has already been declared
+switch   Identifier 'i' has already been declared
+ok       accepted
+ok       accepted
+ok       accepted
+ok       accepted
+ok       accepted
+ok       accepted
+ok       accepted
+ok       accepted
+ok       accepted
+errshape true 7 object object
 ==== errors.js ====
 MyError boom 42 true true
 try,catch
