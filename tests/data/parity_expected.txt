@@ -35,6 +35,19 @@ allSettled [ 'fulfilled', 'rejected' ]
 caught: boom
 compute result 7
 timeout
+F
+a1
+a2
+nullcb:p
+undefcb:q
+syncthrow:sync
+a3
+F-then
+a4
+overridden:cbfail
+kept:keep
+cleanup-done
+after:v
 ==== bigint.js ====
 10n -3n bigint
 255 ff 11111111

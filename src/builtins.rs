@@ -3989,18 +3989,28 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             Ok(crate::proxy::revoke(i))
         }
         _ if name.starts_with("@@finpass:") => {
-            // finally(cb) on fulfill: run cb, then pass the value through.
-            let i: u32 = name[10..].parse().unwrap_or(0);
-            let cb = Value::Obj(i);
-            host::invoke(&cb, Vec::new(), None)?;
-            Ok(arg0(&args))
+            // finally(cb) on fulfill: run cb, await whatever it returned, then
+            // pass the original value through.
+            let i: u32 = name["@@finpass:".len()..].parse().unwrap_or(0);
+            let result = host::invoke(&Value::Obj(i), Vec::new(), None)?;
+            Ok(finally_chain(result, arg0(&args), false))
         }
         _ if name.starts_with("@@finthrow:") => {
-            // finally(cb) on reject: run cb, then re-throw the reason.
-            let i: u32 = name[11..].parse().unwrap_or(0);
-            let cb = Value::Obj(i);
-            host::invoke(&cb, Vec::new(), None)?;
-            let reason = arg0(&args);
+            // finally(cb) on reject: same, then re-throw the original reason.
+            let i: u32 = name["@@finthrow:".len()..].parse().unwrap_or(0);
+            let result = host::invoke(&Value::Obj(i), Vec::new(), None)?;
+            Ok(finally_chain(result, arg0(&args), true))
+        }
+        // The two thunks `finally_chain` hangs off that awaited promise. Each
+        // carries the value it must reinstate in a one-slot cell, since a
+        // builtin is identified only by its name and cannot close over one.
+        _ if name.starts_with("@@finret:") => {
+            let i: u32 = name["@@finret:".len()..].parse().unwrap_or(0);
+            get_property(&Value::Obj(i), "0")
+        }
+        _ if name.starts_with("@@finrethrow:") => {
+            let i: u32 = name["@@finrethrow:".len()..].parse().unwrap_or(0);
+            let reason = get_property(&Value::Obj(i), "0")?;
             with_host(|h| h.exc = Some(reason.clone()));
             Err(with_host(|h| error_string(h, &reason)))
         }
@@ -8903,6 +8913,46 @@ pub fn error_string(h: &host::JsHost, v: &Value) -> String {
     h.str_of(v)
 }
 
+/// 27.2.5.3 `thenFinally`/`catchFinally`: `PromiseResolve(result).then(() =>
+/// value)`, or `() => { throw reason }` on the reject path.
+///
+/// Returning the carried value directly — what this used to do — skipped both
+/// halves. A promise returned by the callback was never awaited, so the
+/// ordinary async-cleanup shape
+///
+///     work().finally(() => closeConnection()).then(next)
+///
+/// ran `next` before the connection had closed. And the chain settled three
+/// microtask ticks early, which is observable in ordering against any other
+/// chain, not just against a timer.
+///
+/// A rejection from the callback's own promise wins over the carried value, so
+/// no reject handler is attached here: it propagates on its own.
+fn finally_chain(result: Value, carried: Value, rethrow: bool) -> Value {
+    // PromiseResolve (27.2.4.7) returns an argument that is already a promise
+    // UNCHANGED. Wrapping it anyway costs the extra tick that resolving with a
+    // thenable takes to adopt it, which showed up as a callback returning a
+    // rejected promise settling one tick late against every other chain.
+    let p = match with_host(|h| h.promise_id(&result)) {
+        Some(_) => result,
+        None => {
+            let fresh = with_host(|h| h.new_promise());
+            if let Some(pid) = with_host(|h| h.promise_id(&fresh)) {
+                host::resolve_promise_val(pid, result);
+            }
+            fresh
+        }
+    };
+    let cell = with_host(|h| h.new_array(vec![carried]));
+    let idx = match cell {
+        Value::Obj(i) => i,
+        _ => 0,
+    };
+    let tag = if rethrow { "finrethrow" } else { "finret" };
+    let thunk = make_builtin(format!("@@{tag}:{idx}"));
+    host::promise_then(&p, thunk, Value::Undef)
+}
+
 fn make_builtin(name: String) -> Value {
     with_host(|h| h.alloc(JsObj::Builtin(name)))
 }
@@ -9116,6 +9166,13 @@ fn promise_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, S
         )),
         "finally" => {
             let cb = arg0(&args);
+            // 27.2.5.3 step 3: a non-callable `onFinally` is handed to `then`
+            // as BOTH handlers, and `then` ignores a non-callable one — so the
+            // value or reason simply passes through. Building the thunks
+            // regardless meant `p.finally(null)` tried to call `null`.
+            if !with_host(|h| host::is_callable(h, &cb)) {
+                return Ok(host::promise_then(recv, cb.clone(), cb));
+            }
             let i = match cb {
                 Value::Obj(i) => i,
                 _ => 0,
