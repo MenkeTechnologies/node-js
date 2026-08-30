@@ -1,3 +1,13 @@
+==== accessors.js ====
+literal  10 10
+computed 20 20
+defined  8 twice {"twice":8}
+descr    4 true false false
+accessor function
+class    10 20 base
+where    _x function
+chain    proto true
+shadow   own proto
 ==== arrays.js ====
 [ 25, 9, 1, 81 ]
 28
