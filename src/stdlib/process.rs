@@ -211,6 +211,80 @@ fn memo(name: &str, make: impl FnOnce() -> Value) -> Value {
     v
 }
 
+/// `process.features` — what this runtime can do.
+fn features() -> Value {
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        for (k, v) in [
+            ("inspector", false),
+            ("debug", false),
+            ("uv", false),
+            ("ipv6", true),
+            ("tls_alpn", false),
+            ("tls_sni", false),
+            ("tls_ocsp", false),
+            ("tls", true),
+            ("openssl_is_boringssl", false),
+            ("cached_builtins", true),
+            ("require_module", true),
+            ("quic", false),
+        ] {
+            m.insert(k.to_string(), Value::Bool(v));
+        }
+        // A string, not a boolean, in node too: it names the TypeScript mode.
+        let ts = h.new_str("none");
+        m.insert("typescript".into(), ts);
+        h.new_object(m)
+    })
+}
+
+/// `process.config`.
+fn config() -> Value {
+    with_host(|h| {
+        let mut vars = IndexMap::new();
+        let arch = h.new_str(super::os::arch());
+        let plat = h.new_str(super::os::platform());
+        vars.insert("host_arch".to_string(), arch.clone());
+        vars.insert("target_arch".to_string(), arch);
+        vars.insert("node_shared".to_string(), Value::Bool(false));
+        vars.insert("node_use_openssl".to_string(), Value::Bool(false));
+        vars.insert("v8_enable_i18n_support".to_string(), Value::Bool(false));
+        vars.insert("node_platform".to_string(), plat);
+        let variables = h.new_object(vars);
+        let defaults = h.new_object(IndexMap::new());
+        let mut m = IndexMap::new();
+        m.insert("target_defaults".to_string(), defaults);
+        m.insert("variables".to_string(), variables);
+        h.new_object(m)
+    })
+}
+
+/// The `NODE_OPTIONS` flags this runtime accepts, as a `Set`.
+fn allowed_flags() -> Value {
+    let flags = [
+        "--enable-source-maps",
+        "--max-old-space-size",
+        "--no-warnings",
+        "--preserve-symlinks",
+        "--stack-trace-limit",
+        "--throw-deprecation",
+        "--trace-warnings",
+        "--unhandled-rejections",
+        "--zero-fill-buffers",
+    ];
+    let vals: Vec<Value> = flags.iter().map(|f| with_host(|h| h.new_str(*f))).collect();
+    let set = with_host(|h| {
+        h.alloc(crate::host::JsObj::Set {
+            entries: indexmap::IndexMap::new(),
+            weak: false,
+        })
+    });
+    for v in vals {
+        let _ = crate::host::call_method(&set, "add", vec![v]);
+    }
+    set
+}
+
 pub fn constant(name: &str) -> Option<Value> {
     Some(match name {
         "env" => memo("env", env_object),
@@ -241,6 +315,20 @@ pub fn constant(name: &str) -> Option<Value> {
         // `if (semver.lt(process.version, ...))` gate takes the conservative path.
         "version" => with_host(|h| h.new_str("v26.5.0")),
         "versions" => memo("versions", versions),
+        // A capability map tooling probes before reaching for an optional API.
+        // It reports what THIS runtime supports, not what node's own build
+        // does — claiming a feature that is not here would defeat the point of
+        // the probe. It was absent entirely, so `process.features.X` threw on
+        // `undefined`.
+        "features" => memo("features", features),
+        // Node's shape is `{ target_defaults, variables }`; the contents
+        // describe the build. Only what is true of this build is reported —
+        // there is no configure step to echo.
+        "config" => memo("config", config),
+        // The flags this runtime accepts in `NODE_OPTIONS`, as the Set-like
+        // node exposes. `process.allowedNodeEnvironmentFlags.has(f)` used to
+        // throw: the value was undefined.
+        "allowedNodeEnvironmentFlags" => memo("allowedNodeEnvironmentFlags", allowed_flags),
         "stdout" => memo("stdout", || std_stream(1)),
         "stderr" => memo("stderr", || std_stream(2)),
         "stdin" => memo("stdin", || std_stream(0)),

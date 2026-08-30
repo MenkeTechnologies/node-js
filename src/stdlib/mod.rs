@@ -24,6 +24,7 @@ pub mod buffer;
 pub mod child_process;
 pub mod cluster;
 pub mod console;
+pub mod constants;
 pub mod crypto;
 pub mod date;
 pub mod dgram;
@@ -81,6 +82,23 @@ pub fn is_unimplemented(ns: &str) -> bool {
 
 /// Canonical namespace name a `require(spec)` resolves to (after stripping an
 /// optional `node:` prefix), or `None` for an unsupported module.
+/// Core modules whose export is a plain DATA value rather than a namespace of
+/// methods. `require('constants')` is the only one: every member is a number,
+/// so it is built as a real object instead of a `Builtin` handle, whose members
+/// are dispatchable methods by construction.
+pub fn data_module(spec: &str) -> Option<Value> {
+    match spec.strip_prefix("node:").unwrap_or(spec) {
+        "constants" => Some(constants::object(&constants::flat())),
+        _ => None,
+    }
+}
+
+/// Whether `spec` names a core module of any kind — a method namespace or a
+/// data module. This is what `require.resolve` answers with the bare specifier.
+pub fn is_core(spec: &str) -> bool {
+    resolve(spec).is_some() || matches!(spec.strip_prefix("node:").unwrap_or(spec), "constants")
+}
+
 pub fn resolve(spec: &str) -> Option<&'static str> {
     match spec.strip_prefix("node:").unwrap_or(spec) {
         "fs" => Some("fs"),
@@ -126,6 +144,7 @@ pub fn resolve(spec: &str) -> Option<&'static str> {
         "diagnostics_channel" => Some("diagnostics_channel"),
         "v8" => Some("v8"),
         "readline" => Some("readline"),
+        "readline/promises" => Some("readline/promises"),
         "vm" => Some("vm"),
         "fs/promises" => Some("fs/promises"),
         "dgram" => Some("dgram"),
@@ -200,6 +219,7 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "diagnostics_channel" => diagnostics_channel::METHODS,
         "v8" => v8::METHODS,
         "readline" => readline::METHODS,
+        "readline/promises" => readline::PROMISES_METHODS,
         "vm" => vm::METHODS,
         "fs/promises" => fs_promises::METHODS,
         "dgram" => dgram::MODULE_METHODS,
@@ -314,6 +334,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "diagnostics_channel" => diagnostics_channel::call(m, args)?,
         "v8" => v8::call(m, args)?,
         "readline" => readline::call(m, args)?,
+        "readline/promises" => readline::promises_call(m, args)?,
         "vm" => vm::call(m, args)?,
         "fs/promises" => fs_promises::call(m, args)?,
         "dgram" => dgram::call(m, args)?,
@@ -364,6 +385,12 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "path" => path::constant(path::Flavor::Posix, name),
         "path/win32" => path::constant(path::Flavor::Win32, name),
         "os" => os::constant(name),
+        // `fs.constants` and `crypto.constants` were absent, so
+        // `fs.constants.O_RDONLY` and `crypto.constants.RSA_PKCS1_PADDING` —
+        // which libraries pass straight through to `open` and to RSA — read as
+        // `undefined`.
+        "fs" | "fs/promises" if name == "constants" => Some(constants::object(&constants::fs())),
+        "crypto" if name == "constants" => Some(constants::object(&constants::crypto())),
         // `EventEmitter.defaultMaxListeners` is a DATA property, so it belongs
         // here rather than among the static methods (which would make it read
         // as a function). It was absent: node reports 10.
@@ -384,7 +411,12 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "net" => net::constant(name),
         "tty" => tty::constant(name),
         "repl" => repl::constant(name),
-        "readline" => readline::constant(name),
+        // `readline.promises` is the same module reached as a property, so the
+        // cross-link is checked before the shared constant table.
+        "readline" if name == "promises" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("readline/promises".into()))
+        })),
+        "readline" | "readline/promises" => readline::constant(name),
         "diagnostics_channel" => diagnostics_channel::constant(name),
         "v8" => v8::constant(name),
         "console" if name == "Console" => {

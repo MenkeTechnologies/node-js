@@ -60,9 +60,13 @@ pub const INTERFACE_METHODS: &[&str] = &[
     "removeAllListeners",
 ];
 
+/// The `readline/promises` surface: the same module, whose `createInterface`
+/// builds an Interface with a promise-returning `question`.
+pub const PROMISES_METHODS: &[&str] = &["createInterface"];
+
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
-        "createInterface" => Ok(create_interface(args)),
+        "createInterface" => Ok(create_interface(args, false)),
         // Cursor / line control: emit the ANSI sequence to stdout. Node passes the
         // target stream as the first arg; node-js writes to the real stdout (the
         // usual `process.stdout` target). Each returns `true` (write accepted).
@@ -127,7 +131,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// `createInterface`, producing the same `@@native = "Interface"` object.
 /// Requires the parent to route `"Interface"` construction into this fn.
 pub fn construct(args: &[Value]) -> Result<Value, String> {
-    Ok(create_interface(args))
+    Ok(create_interface(args, false))
 }
 
 /// A non-function member of the `readline` namespace (reachable via
@@ -141,7 +145,15 @@ pub fn constant(name: &str) -> Option<Value> {
 }
 
 /// `readline.createInterface(options | input[, output])` → an Interface object.
-fn create_interface(args: &[Value]) -> Value {
+/// `require('readline/promises').<method>`.
+pub fn promises_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match method {
+        "createInterface" => Some(Ok(create_interface(args, true))),
+        _ => None,
+    }
+}
+
+fn create_interface(args: &[Value], promises: bool) -> Value {
     // Options object form `{ input, output }` vs positional `(input, output)`.
     let (input, output) = match args.first() {
         Some(o) if opt_prop(o, "input").is_some() => (
@@ -162,6 +174,10 @@ fn create_interface(args: &[Value]) -> Value {
         m.insert("@@output".into(), output);
         m.insert("@@prompt".into(), prompt);
         m.insert("@@listeners".into(), listeners);
+        if promises {
+            let flag = h.new_str("1");
+            m.insert("@@promises".into(), flag);
+        }
         h.new_object(m)
     })
 }
@@ -175,6 +191,13 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             let query = with_host(|h| args.first().map(|v| h.str_of(v)).unwrap_or_default());
             write_stdout(&query);
             let line = read_line();
+            // `require('readline/promises')` builds an Interface whose
+            // `question` RESOLVES with the line instead of taking a callback.
+            // The two forms are the same read; only the handoff differs.
+            if read_hidden(recv, "@@promises") == "1" {
+                let line_val = with_host(|h| h.new_str(line));
+                return crate::builtins::promise_resolve_pub(line_val);
+            }
             // The callback is the last callable argument (Node: `question(q, cb)`
             // or `question(q, options, cb)`).
             // The `.find` predicate receives `&&Value`; deref once so `is_callable`

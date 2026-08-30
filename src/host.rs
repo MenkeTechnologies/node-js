@@ -3331,6 +3331,7 @@ impl JsHost {
                         "cluster",
                         "worker_threads",
                         "readline",
+                        "readline/promises",
                         "repl",
                         "vm",
                         "domain",
@@ -3842,9 +3843,21 @@ impl JsHost {
                 // a script added beyond those follows in braces, as V8 renders
                 // it: `Error: x\n    at … { code: 'C' }`.
                 Some(JsObj::Object(_)) if self.error_to_string(v).is_some() => {
-                    let stack = lookup_chain(self, v, "stack")
+                    let mut stack = lookup_chain(self, v, "stack")
                         .map(|s| self.str_of(&s))
                         .unwrap_or_else(|| self.error_to_string(v).unwrap_or_default());
+                    // A `DOMException` prints its CLASS and then its name —
+                    // `DOMException [AbortError]: m` — where a plain error
+                    // prints only its stack head.
+                    if let Some(JsObj::Object(p)) = self.get(v) {
+                        if let Some(n) = p.get("@@domName") {
+                            let name = self.str_of(n);
+                            stack = format!(
+                                "DOMException [{name}]{}",
+                                stack.strip_prefix(&name).unwrap_or(&stack)
+                            );
+                        }
+                    }
                     let extra: Vec<String> = self
                         .own_enum_key_names(v)
                         .into_iter()
@@ -7333,6 +7346,11 @@ pub const ERROR_NAMES: &[&str] = &[
     // the `Error` branch with the WHOLE head kept as the message, so `e.name`
     // was `Error` and `e.message` carried a prefix node keeps out of it.
     "AssertionError",
+    // The WHATWG error class `AbortSignal.reason` carries. Unlike the others its
+    // `name` comes from the SECOND constructor argument rather than from the
+    // class, so its prototype keeps the base default and each instance stamps
+    // its own name into an internal slot.
+    "DOMException",
 ];
 
 impl JsHost {

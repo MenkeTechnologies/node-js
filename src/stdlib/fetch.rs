@@ -793,16 +793,9 @@ pub fn construct_abort_controller(_args: &[Value]) -> Result<Value, String> {
 /// `synth_error` only knows the ECMAScript error classes, so the name, the
 /// constructor label and the `stack` head are stamped on afterwards.
 fn dom_exception(name: &str, message: &str) -> Value {
-    let e = with_host(|h| crate::builtins::synth_error(h, &format!("Error: {message}")));
-    with_host(|h| {
-        let n = h.new_str(name.to_string());
-        let stack = h.new_str(format!("{name}: {message}"));
-        if let Some(JsObj::Object(p)) = h.get_mut(&e) {
-            p.insert("name".into(), n);
-            p.insert("stack".into(), stack);
-        }
-    });
-    e
+    let msg = with_host(|h| h.new_str(message.to_string()));
+    let nm = with_host(|h| h.new_str(name.to_string()));
+    crate::builtins::dom_exception(&[msg, nm])
 }
 
 /// Fire an `AbortSignal.timeout` deadline: abort the signal at heap index `idx`

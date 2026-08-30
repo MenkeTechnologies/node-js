@@ -318,6 +318,9 @@ pub fn resolve(spec: &str, from_dir: &Path) -> Option<PathBuf> {
 pub fn require(spec: &str, from_dir: &Path) -> Result<Value, String> {
     // Core module: the native namespace value, never a file (mirrors the legacy
     // `require` path — `require('events')` yields the EventEmitter ctor, etc.).
+    if let Some(v) = crate::stdlib::data_module(spec) {
+        return Ok(v);
+    }
     if let Some(ns) = crate::stdlib::resolve(spec) {
         return Ok(with_host(|h| h.alloc(JsObj::Builtin(ns.to_string()))));
     }

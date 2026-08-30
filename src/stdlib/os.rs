@@ -37,50 +37,27 @@ pub fn constant(name: &str) -> Option<Value> {
         "EOL" => Some(with_host(|h| h.new_str("\n"))),
         "devNull" => Some(with_host(|h| h.new_str("/dev/null"))),
         // os.constants.signals (POSIX signal numbers) + priority levels.
-        "constants" => Some(with_host(|h| {
-            let mut signals = indexmap::IndexMap::new();
-            for (k, v) in [
-                ("SIGHUP", 1),
-                ("SIGINT", 2),
-                ("SIGQUIT", 3),
-                ("SIGILL", 4),
-                ("SIGTRAP", 5),
-                ("SIGABRT", 6),
-                ("SIGBUS", 10),
-                ("SIGFPE", 8),
-                ("SIGKILL", 9),
-                ("SIGUSR1", 30),
-                ("SIGSEGV", 11),
-                ("SIGUSR2", 31),
-                ("SIGPIPE", 13),
-                ("SIGALRM", 14),
-                ("SIGTERM", 15),
-                ("SIGCHLD", 20),
-                ("SIGCONT", 19),
-                ("SIGSTOP", 17),
-                ("SIGTSTP", 18),
-                ("SIGWINCH", 28),
-            ] {
-                signals.insert(k.to_string(), Value::Float(v as f64));
-            }
-            let sig = h.new_object(signals);
-            let mut priority = indexmap::IndexMap::new();
-            for (k, v) in [
-                ("PRIORITY_LOW", 19),
-                ("PRIORITY_BELOW_NORMAL", 10),
-                ("PRIORITY_NORMAL", 0),
-                ("PRIORITY_ABOVE_NORMAL", -7),
-                ("PRIORITY_HIGH", -14),
-                ("PRIORITY_HIGHEST", -20),
-            ] {
-                priority.insert(k.to_string(), Value::Float(v as f64));
-            }
-            let prio = h.new_object(priority);
-            let mut m = indexmap::IndexMap::new();
-            m.insert("signals".to_string(), sig);
-            m.insert("priority".to_string(), prio);
-            h.new_object(m)
-        })),
+        // Every number comes from `libc`, so it is the one THIS platform uses:
+        // the signal table was a hardcoded list of macOS values, which made
+        // `SIGUSR1` 30 (Linux uses 10) and `SIGSTOP` 17 (Linux uses 19) on
+        // every Linux host. `errno` and `dlopen` were missing entirely.
+        "constants" => {
+            // Each sub-table allocates, so it is built BEFORE the borrow below
+            // rather than inside it.
+            let sig = super::constants::object(&super::constants::signals());
+            let prio = super::constants::object(&super::constants::priority());
+            let errno = super::constants::object(&super::constants::errno());
+            let dlopen = super::constants::object(&super::constants::dlopen());
+            Some(with_host(|h| {
+                let mut m = indexmap::IndexMap::new();
+                m.insert("UV_UDP_REUSEADDR".to_string(), Value::Float(4.0));
+                m.insert("dlopen".to_string(), dlopen);
+                m.insert("errno".to_string(), errno);
+                m.insert("signals".to_string(), sig);
+                m.insert("priority".to_string(), prio);
+                h.new_object(m)
+            }))
+        }
         _ => None,
     }
 }

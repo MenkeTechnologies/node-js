@@ -817,6 +817,11 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
     if name == "stack" {
         materialize_stack(recv);
     }
+    // A `DOMException`'s `name`/`message`/`code` are prototype accessors over
+    // internal slots, so they resolve here rather than out of a property map.
+    if let Some(v) = dom_exception_slot(recv, name) {
+        return Ok(v);
+    }
     // A read off `globalThis` for a name the object does not own falls back to
     // the same lazy global binding the bare identifier gets. Without it the
     // global object was an empty bag: `globalThis.process`, `.console`, `.Math`
@@ -1544,6 +1549,16 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     if ns == "require" && name == "cache" {
         return with_host(|h| h.alloc(JsObj::Builtin(REQUIRE_CACHE.to_string())));
     }
+    // The legacy numeric codes `DOMException` carries as statics
+    // (`DOMException.ABORT_ERR` is 20), named by uppercasing the error name.
+    if ns == "DOMException" {
+        if let Some((_, code)) = DOM_EXCEPTION_CODES
+            .iter()
+            .find(|(n, _)| legacy_code_name(n) == name)
+        {
+            return Value::Float(*code);
+        }
+    }
     // Numeric constants.
     let konst = match (ns, name) {
         ("Math", "PI") => Some(std::f64::consts::PI),
@@ -1659,6 +1674,20 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     // `Error.prototype.toString` (20.5.3.4): `name`, `message`, or `name:
     // message`, read off the chain so a subclass's `this.name = 'E'` is honored.
     if ctor == "Error" && method == "toString" {
+        // A `DOMException` keeps its `name`/`message` in internal slots, so the
+        // chain read below would find the class name on the prototype instead.
+        if let Some(n) = dom_exception_slot(recv, "name") {
+            let name = with_host(|h| h.str_of(&n));
+            let msg = dom_exception_slot(recv, "message")
+                .map(|m| with_host(|h| h.str_of(&m)))
+                .unwrap_or_default();
+            let s = if msg.is_empty() {
+                name
+            } else {
+                format!("{name}: {msg}")
+            };
+            return Ok(with_host(|h| h.new_str(s)));
+        }
         let s = with_host(|h| h.error_to_string(recv)).unwrap_or_else(|| {
             with_host(|h| {
                 let name = host::lookup_chain(h, recv, "name")
@@ -1815,6 +1844,8 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             Some(JsObj::Null) => "Null".into(),
             Some(JsObj::Str(_)) => "String".into(),
             Some(JsObj::Array(_)) => "Array".into(),
+            // A `DOMException` brands by its class, not as a plain `Error`.
+            Some(JsObj::Object(p)) if p.contains_key("@@domName") => "DOMException".into(),
             // 20.1.3.6 steps 5-8 brand a wrapper by its internal slot, so
             // `Object.prototype.toString.call(new Number(1))` is
             // `[object Number]` rather than `[object Object]`.
@@ -3595,6 +3626,7 @@ const GLOBAL_FUNCS: &[&str] = &[
     "EvalError",
     "URIError",
     "AggregateError",
+    "DOMException",
     "BigInt",
     "RegExp",
     "Date",
@@ -3859,7 +3891,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
     // `require.resolve(spec)` at the ENTRY level: resolve from the entry dir.
     if name == "require.resolve" {
         let spec = with_host(|h| h.str_of(&arg0(&args)));
-        if crate::stdlib::resolve(&spec).is_some() {
+        if crate::stdlib::is_core(&spec) {
             return Ok(with_host(|h| h.new_str(spec)));
         }
         return match crate::module::resolve(&spec, &crate::module::entry_dir()) {
@@ -3876,7 +3908,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
     if name == "__cjs_resolve" {
         let spec = with_host(|h| h.str_of(&arg0(&args)));
         let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
-        if crate::stdlib::resolve(&spec).is_some() {
+        if crate::stdlib::is_core(&spec) {
             return Ok(with_host(|h| h.new_str(spec)));
         }
         return match crate::module::resolve(&spec, std::path::Path::new(&from)) {
@@ -4739,9 +4771,121 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
         "RegExp" => regexp_ctor(&args),
         "BigInt" => Err(host::type_error("BigInt is not a constructor")),
         "Error" => Ok(make_error(name, &args)),
+        // `new DOMException(message, name)` — the name is an ARGUMENT, and the
+        // legacy numeric `code` follows from it.
+        "DOMException" => Ok(dom_exception(&args)),
         n if host::ERROR_NAMES.contains(&n) => Ok(make_error(name, &args)),
         _ => Err(host::type_error(&format!("{name} is not a constructor"))),
     }
+}
+
+/// The legacy numeric `DOMException.code` a WHATWG error name maps to. A name
+/// outside the table — including the default `"Error"` — reports 0.
+pub const DOM_EXCEPTION_CODES: &[(&str, f64)] = &[
+    ("IndexSizeError", 1.0),
+    ("DOMStringSizeError", 2.0),
+    ("HierarchyRequestError", 3.0),
+    ("WrongDocumentError", 4.0),
+    ("InvalidCharacterError", 5.0),
+    ("NoDataAllowedError", 6.0),
+    ("NoModificationAllowedError", 7.0),
+    ("NotFoundError", 8.0),
+    ("NotSupportedError", 9.0),
+    ("InUseAttributeError", 10.0),
+    ("InvalidStateError", 11.0),
+    ("SyntaxError", 12.0),
+    ("InvalidModificationError", 13.0),
+    ("NamespaceError", 14.0),
+    ("InvalidAccessError", 15.0),
+    ("ValidationError", 16.0),
+    ("TypeMismatchError", 17.0),
+    ("SecurityError", 18.0),
+    ("NetworkError", 19.0),
+    ("AbortError", 20.0),
+    ("URLMismatchError", 21.0),
+    ("QuotaExceededError", 22.0),
+    ("TimeoutError", 23.0),
+    ("InvalidNodeTypeError", 24.0),
+    ("DataCloneError", 25.0),
+];
+
+/// The static name a `DOMException` code is exposed under: the error name minus
+/// its `Error` suffix, upper-snake-cased, plus `_ERR` — `AbortError` becomes
+/// `ABORT_ERR`, `IndexSizeError` becomes `INDEX_SIZE_ERR`.
+fn legacy_code_name(error_name: &str) -> String {
+    let stem = error_name.strip_suffix("Error").unwrap_or(error_name);
+    let mut out = String::new();
+    for (i, c) in stem.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_uppercase());
+    }
+    out.push_str("_ERR");
+    out
+}
+
+/// `new DOMException(message, name)`.
+///
+/// The class node's `AbortSignal.reason` rejects with. Its `name` is the second
+/// ARGUMENT (defaulting to `"Error"`), not the class name, and its `code` is the
+/// legacy number that name maps to.
+pub fn dom_exception(args: &[Value]) -> Value {
+    let message = match args.first() {
+        None | Some(Value::Undef) => String::new(),
+        Some(v) => with_host(|h| h.str_of(v)),
+    };
+    let name = match args.get(1) {
+        None | Some(Value::Undef) => "Error".to_string(),
+        Some(v) => with_host(|h| h.str_of(v)),
+    };
+    let code = DOM_EXCEPTION_CODES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+        .unwrap_or(0.0);
+    let head = if message.is_empty() {
+        name.clone()
+    } else {
+        format!("{name}: {message}")
+    };
+    let e = with_host(|h| synth_error(h, &head));
+    with_host(|h| {
+        let nv = h.new_str(name);
+        let mv = h.new_str(message);
+        let sv = h.new_str(head);
+        if let Some(JsObj::Object(p)) = h.get_mut(&e) {
+            // `name`, `message` and `code` are PROTOTYPE accessors over internal
+            // slots in node, so `stack` is the instance's only own property.
+            // Storing them as own keys would show up in
+            // `Object.getOwnPropertyNames`, which reports just `['stack']`.
+            p.shift_remove("message");
+            p.insert("@@domName".into(), nv);
+            p.insert("@@domMessage".into(), mv);
+            p.insert("@@domCode".into(), Value::Float(code));
+            p.insert("stack".into(), sv);
+        }
+        h.ensure_error_protos();
+        if let Some(proto) = host::error_proto_of(h, "DOMException") {
+            h.set_proto(&e, proto);
+        }
+    });
+    e
+}
+
+/// A `DOMException`'s `name`/`message`/`code`, which live in internal slots
+/// rather than as own properties. `None` for anything else.
+pub fn dom_exception_slot(recv: &Value, name: &str) -> Option<Value> {
+    let slot = match name {
+        "name" => "@@domName",
+        "message" => "@@domMessage",
+        "code" => "@@domCode",
+        _ => return None,
+    };
+    with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) if p.contains_key("@@domName") => p.get(slot).cloned(),
+        _ => None,
+    })
 }
 
 /// Build an `Error` object carrying `msg`, for stdlib callers that need to
@@ -10022,6 +10166,12 @@ fn new_promise(executor: Value) -> Result<Value, String> {
         host::reject_promise_val(id, ev);
     }
     Ok(p)
+}
+
+/// `Promise.resolve(v)` for stdlib callers that need to hand back an
+/// already-settled promise.
+pub fn promise_resolve_pub(v: Value) -> Result<Value, String> {
+    promise_resolve(v)
 }
 
 fn promise_resolve(v: Value) -> Result<Value, String> {
