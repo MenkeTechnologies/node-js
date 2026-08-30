@@ -64,3 +64,34 @@ require("assert")(true);
 console.log("ns-call  ", "assert(true) passed", typeof require("assert").strictEqual);
 // The cross-links keep working and keep their own flavor.
 console.log("ns-flavor", require("path").win32.sep, require("path").posix.sep, require("path").win32.join("a", "b"));
+
+// `querystring`. Five behaviours were wrong, two of them security-relevant.
+const qs = require("querystring");
+
+// `parse` returns a NULL-prototype object, so a `__proto__` or `constructor`
+// key in the input is an ordinary own property rather than a reference to
+// something inherited. It was inheriting Object.prototype.
+const hostile = qs.parse("__proto__=polluted&constructor=x");
+console.log("qs-proto", Object.getPrototypeOf(qs.parse("a=1")) === null, Object.keys(hostile).join(","));
+console.log("qs-safe ", hostile.__proto__, {}.polluted);
+
+// `maxKeys` (default 1000, 0 means unlimited) caps how many distinct keys are
+// kept. It was ignored, so a hostile query string could allocate without bound.
+const many = Array.from({ length: 1200 }, (_, i) => "k" + i + "=1").join("&");
+console.log("qs-maxk ", Object.keys(qs.parse(many)).length,
+  Object.keys(qs.parse("a=1&b=2&c=3", "&", "=", { maxKeys: 2 })).length,
+  Object.keys(qs.parse("a=1&b=2&c=3", "&", "=", { maxKeys: 0 })).length);
+
+// Only a string, number, bigint or boolean serializes; null, undefined, an
+// object and a symbol all become the EMPTY string. Running everything through
+// String() emitted the text "null" and "[object Object]", both of which parse
+// back as real data.
+console.log("qs-types", qs.stringify({ s: "x", n: 1, b: true, g: 10n, nul: null, und: undefined, o: {}, y: Symbol("s") }));
+// The same rule applies element-by-element inside an array value.
+console.log("qs-array", qs.stringify({ a: [1, null, {}, "x"] }));
+
+// `unescape` is percent-decoding only — a `+` stays a `+`. Only `parse` reads
+// it as a space, that being a form-encoding rule about the pair syntax rather
+// than about percent-escapes.
+console.log("qs-plus ", qs.unescape("a+b"), qs.unescape("a%2Bb"), JSON.stringify(qs.parse("a+b=c+d")));
+console.log("qs-round", JSON.stringify(qs.parse(qs.stringify({ a: "x y", b: "&=?" }))));

@@ -450,6 +450,13 @@ ns-object true 26
 ns-assert function function
 ns-call   assert(true) passed function
 ns-flavor \ / a\b
+qs-proto true __proto__,constructor
+qs-safe  polluted undefined
+qs-maxk  1000 2 3
+qs-types s=x&n=1&b=true&g=10&nul=&und=&o=&y=
+qs-array a=1&a=&a=&a=x
+qs-plus  a+b a+b {"a b":"c d"}
+qs-round {"a":"x y","b":"&=?"}
 ==== wordcount.js ====
 the: 3
 fox: 2
