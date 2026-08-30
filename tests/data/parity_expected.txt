@@ -8,6 +8,18 @@ class    10 20 base base
 where    _x function
 chain    proto true
 shadow   own proto
+pre      a,b,c getter
+post     a,b,c 9
+kind     configurable,enumerable,value,writable
+data->acc now-accessor
+flagsonly still 0
+clone    1 P written
+direct   Q sent
+getonly  R
+legacy   got set-through-legacy g,stored
+lookup   function function
+inherit  function false
+missing  undefined function
 ==== arrays.js ====
 [ 25, 9, 1, 81 ]
 28
@@ -273,6 +285,14 @@ descrs   G 1 function
 nogetter 0
 getter   1
 proxykeys ownKeys,gopd,gopd
+redefine TypeError
+toacc    TypeError
+samevalue NO THROW
+ncwrit   2 NO THROW
+omitted  shown 42
+desc     {"value":42,"writable":true,"enumerable":false,"configurable":true}
+fresh    {"value":3,"writable":false,"enumerable":false,"configurable":false}
+length   1 1
 ==== regexp.js ====
 true true false
 a b

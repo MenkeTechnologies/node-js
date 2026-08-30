@@ -64,3 +64,38 @@ const px = new Proxy({ a: 1, b: 2 }, {
 });
 Object.keys(px);
 console.log('proxykeys', traps.join(','));
+
+// ValidateAndApplyPropertyDescriptor (10.1.6.3). None of this validation
+// existed — every defineProperty was applied unconditionally.
+const nc = {};
+Object.defineProperty(nc, 'k', { value: 1 });
+const attempt = (f) => { try { f(); return 'NO THROW'; } catch (e) { return e.constructor.name; } };
+console.log('redefine', attempt(() => Object.defineProperty(nc, 'k', { value: 2 })));
+console.log('toacc   ', attempt(() => Object.defineProperty(nc, 'k', { get() { return 3; } })));
+// Redefining with the SAME value is allowed even when non-configurable.
+console.log('samevalue', attempt(() => Object.defineProperty(nc, 'k', { value: 1 })));
+// Non-configurable but writable may still change value, and may be made
+// non-writable — the one-way door.
+const nw2 = {};
+Object.defineProperty(nw2, 'w', { value: 1, writable: true });
+Object.defineProperty(nw2, 'w', { value: 2 });
+console.log('ncwrit  ', nw2.w, attempt(() => Object.defineProperty(nw2, 'w', { writable: false })));
+
+// An OMITTED field leaves the existing attribute alone; it does not reset it to
+// false. This is the everyday pattern that made the bug matter: marking a
+// property non-enumerable also stripped writable and configurable from it.
+const keep = { hidden: 1, shown: 2 };
+Object.defineProperty(keep, 'hidden', { enumerable: false });
+keep.hidden = 42;
+console.log('omitted ', Object.keys(keep).join(','), keep.hidden);
+console.log('desc    ', JSON.stringify(Object.getOwnPropertyDescriptor(keep, 'hidden')));
+// A brand-new property still defaults every absent field to false.
+const fresh = {};
+Object.defineProperty(fresh, 'n', { value: 3 });
+console.log('fresh   ', JSON.stringify(Object.getOwnPropertyDescriptor(fresh, 'n')));
+
+// An array's `length` is the exotic own property whose write resizes it; going
+// through the ordinary path stored a shadowing key and left the elements alone.
+const trunc = [1, 2, 3];
+Object.defineProperty(trunc, 'length', { value: 1 });
+console.log('length  ', trunc.join(','), trunc.length);

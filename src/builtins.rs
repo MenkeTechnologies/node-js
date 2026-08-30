@@ -1238,6 +1238,10 @@ fn is_object_method(name: &str) -> bool {
             | "toLocaleString"
             | "valueOf"
             | "constructor"
+            | "__defineGetter__"
+            | "__defineSetter__"
+            | "__lookupGetter__"
+            | "__lookupSetter__"
     )
 }
 
@@ -1251,6 +1255,10 @@ pub const OBJECT_PROTO_METHODS: &[&str] = &[
     "toString",
     "toLocaleString",
     "valueOf",
+    "__defineGetter__",
+    "__defineSetter__",
+    "__lookupGetter__",
+    "__lookupSetter__",
 ];
 
 pub fn is_object_builtin_method(name: &str) -> bool {
@@ -1262,12 +1270,51 @@ pub fn is_object_builtin_method(name: &str) -> bool {
             | "toString"
             | "toLocaleString"
             | "valueOf"
+            | "__defineGetter__"
+            | "__defineSetter__"
+            | "__lookupGetter__"
+            | "__lookupSetter__"
     )
 }
 
 /// Dispatch an `Object.prototype` builtin method on an object/instance.
 pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
+        // Annex B B.2.2.2-B.2.2.5. Legacy, but still present in node and still
+        // reached by pre-`defineProperty` libraries; all four were missing, so
+        // `o.__defineGetter__` threw "is not a function".
+        "__defineGetter__" | "__defineSetter__" => {
+            let getter = name == "__defineGetter__";
+            let f = args.get(1).cloned().unwrap_or(Value::Undef);
+            if !with_host(|h| host::is_callable(h, &f)) {
+                return Err(host::type_error(&format!(
+                    "Object.prototype.{name}: Expecting function"
+                )));
+            }
+            let key = with_host(|h| h.property_key(&arg0(&args)));
+            let desc = with_host(|h| {
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert(if getter { "get" } else { "set" }.into(), f);
+                m.insert("enumerable".into(), Value::Bool(true));
+                m.insert("configurable".into(), Value::Bool(true));
+                h.new_object(m)
+            });
+            apply_descriptor(recv, &key, &desc)?;
+            Ok(Value::Undef)
+        }
+        "__lookupGetter__" | "__lookupSetter__" => {
+            let want_get = name == "__lookupGetter__";
+            let key = with_host(|h| h.property_key(&arg0(&args)));
+            // Walks the prototype chain, unlike `getOwnPropertyDescriptor`.
+            let found = with_host(|h| host::lookup_accessor(h, recv, &key));
+            Ok(match found {
+                Some((g, st)) => {
+                    let side = if want_get { g } else { st };
+                    side.unwrap_or(Value::Undef)
+                }
+                None => Value::Undef,
+            })
+        }
         "hasOwnProperty" => {
             let k = with_host(|h| h.property_key(&arg0(&args)));
             // A builtin namespace/prototype receiver (`Map.prototype`) reports
@@ -1940,18 +1987,27 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             }
         });
     }
+    // An inherited/own setter accessor intercepts the write. This is checked
+    // BEFORE the writable test because 10.1.9.2 branches on the descriptor
+    // kind first: `writable` is a data-property attribute and means nothing on
+    // an accessor, where the setter alone decides. Testing it first meant an
+    // accessor defined through `Object.defineProperty` — which leaves
+    // `writable` false, having no such field — silently swallowed every write
+    // instead of calling its setter, so the standard clone idiom
+    // `Object.create(proto, Object.getOwnPropertyDescriptors(src))` produced an
+    // object whose setters did nothing. An accessor from an object literal
+    // carries all-true attributes, which is why only the former broke.
+    if let Some((getter, setter)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
+        if let Some(setter) = setter {
+            let _ = host::invoke(&setter, vec![val], Some(recv.clone()));
+        }
+        // A getter with no setter: the write is silently ignored.
+        let _ = getter;
+        return Ok(());
+    }
     // A non-writable own property, or a new key on a non-extensible object,
     // silently discards the write (sloppy mode — the mode every script runs in).
     if !with_host(|h| h.can_write_prop(recv, name)) {
-        return Ok(());
-    }
-    // An inherited/own setter accessor intercepts the write.
-    if let Some((_, Some(setter))) = with_host(|h| host::lookup_accessor(h, recv, name)) {
-        let _ = host::invoke(&setter, vec![val], Some(recv.clone()));
-        return Ok(());
-    }
-    // A set-only-elsewhere getter (accessor with no setter): ignore the write.
-    if let Some((Some(_), None)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
         return Ok(());
     }
     // Writing `name`/`prototype`/statics on a function value.
@@ -8451,7 +8507,7 @@ fn object_create(args: Vec<Value>) -> Result<Value, String> {
             _ => Vec::new(),
         });
         for (k, d) in entries {
-            apply_descriptor(&obj, &k, &d);
+            apply_descriptor(&obj, &k, &d)?;
         }
     }
     Ok(obj)
@@ -8522,7 +8578,7 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
         )));
     }
     let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
-    apply_descriptor(&obj, &key, &desc);
+    apply_descriptor(&obj, &key, &desc)?;
     Ok(obj)
 }
 
@@ -8569,67 +8625,266 @@ fn reject_bad_prototype(proto: &Value) -> Result<(), String> {
 /// data property is invisible to `Object.keys` unless the caller opts in. That
 /// asymmetry against plain assignment is the whole reason the attribute table
 /// exists.
-fn apply_descriptor(obj: &Value, key: &str, desc: &Value) {
-    let (value, get, set, attrs) = with_host(|h| match h.get(desc) {
-        Some(JsObj::Object(p)) => {
-            let flag = |n: &str| p.get(n).map(|v| h.truthy(v)).unwrap_or(false);
-            (
-                p.get("value").cloned(),
-                p.get("get").cloned(),
-                p.get("set").cloned(),
-                host::PropAttrs {
-                    writable: flag("writable"),
-                    enumerable: flag("enumerable"),
-                    configurable: flag("configurable"),
-                },
-            )
-        }
-        _ => (None, None, None, host::PropAttrs::default()),
-    });
-    with_host(|h| h.set_prop_attrs(obj, key, attrs));
-    if get.is_some() || set.is_some() {
-        with_host(|h| h.set_accessor(obj, key, get, set));
-    } else if let Some(v) = value {
-        // A function/class receiver stores its own props in the fn-prop side table
-        // (express `mixin(app, proto)` defines methods onto the `app` *function*).
-        if matches!(
-            with_host(|h| h.get(obj).cloned()),
-            Some(JsObj::Func(_)) | Some(JsObj::Class(_))
-        ) {
-            with_host(|h| h.set_fn_prop(obj, key, v));
-        } else if let (Some(ObjKind::Array), Ok(i)) =
-            (with_host(|h| h.kind_of(obj)), key.parse::<usize>())
-        {
-            // An array's index keys ARE its elements, and defining one past the
-            // end grows the array with holes in between (10.4.2.1). This whole
-            // branch used to be missing: `Object.defineProperty(arr, 1, {value})`
-            // wrote into the ordinary property map an array does not have, so it
-            // was a silent no-op.
+/// The requested fields of a property descriptor — 10.1.6.2
+/// `ToPropertyDescriptor`. Each is `None` when the descriptor omits it, which
+/// is the distinction the merge below turns on: an omitted field LEAVES an
+/// existing attribute alone rather than resetting it.
+struct Requested {
+    value: Option<Value>,
+    get: Option<Option<Value>>,
+    set: Option<Option<Value>>,
+    writable: Option<bool>,
+    enumerable: Option<bool>,
+    configurable: Option<bool>,
+}
+
+impl Requested {
+    /// Reads through the prototype chain, as `ToPropertyDescriptor`'s
+    /// `HasProperty`/`Get` pairs do — a descriptor built with
+    /// `Object.create({ value: 1 })` is legal.
+    fn read(desc: &Value) -> Self {
+        let has = |k: &str| {
             with_host(|h| {
-                let old = match h.get(obj) {
-                    Some(JsObj::Array(items)) => items.len(),
-                    _ => 0,
-                };
-                if let Some(JsObj::Array(items)) = h.get_mut(obj) {
-                    if i >= old {
-                        items.resize(i + 1, Value::Undef);
-                    }
-                    items[i] = v;
-                }
-                if i > old {
-                    h.mark_hole_range(obj, old..i);
-                }
-                h.clear_hole(obj, i);
-            });
-        } else {
-            with_host(|h| {
-                if let Some(JsObj::Object(p)) = h.get_mut(obj) {
-                    p.insert(key.to_string(), v);
-                    host::canonicalize_own_keys(p);
-                }
-            });
+                host::lookup_chain(h, desc, k).is_some()
+                    || host::lookup_accessor(h, desc, k).is_some()
+            })
+        };
+        let val = |k: &str| get_property(desc, k).unwrap_or(Value::Undef);
+        // Resolve the value BEFORE the borrow: `val` re-enters the host, and
+        // doing it inside the `with_host` closure aborts on the double borrow.
+        let flag = |k: &str| {
+            has(k).then(|| {
+                let v = val(k);
+                with_host(|h| h.truthy(&v))
+            })
+        };
+        Requested {
+            value: has("value").then(|| val("value")),
+            get: has("get").then(|| match val("get") {
+                Value::Undef => None,
+                g => Some(g),
+            }),
+            set: has("set").then(|| match val("set") {
+                Value::Undef => None,
+                st => Some(st),
+            }),
+            writable: flag("writable"),
+            enumerable: flag("enumerable"),
+            configurable: flag("configurable"),
         }
     }
+
+    fn is_accessor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
+    }
+
+    fn is_data(&self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+}
+
+/// The own property already at `key`, if any, read back through
+/// `Object.getOwnPropertyDescriptor` so every object kind (array indices, the
+/// fn-prop side table, Buffer bytes) is covered by one code path.
+struct Existing {
+    accessor: bool,
+    value: Value,
+    get: Option<Value>,
+    set: Option<Value>,
+    writable: bool,
+    enumerable: bool,
+    configurable: bool,
+}
+
+fn existing_property(obj: &Value, key: &str) -> Option<Existing> {
+    let k = with_host(|h| h.new_str(key.to_string()));
+    let d = own_descriptor_pub(obj, k).ok()?;
+    if matches!(d, Value::Undef) {
+        return None;
+    }
+    let field = |n: &str| get_property(&d, n).unwrap_or(Value::Undef);
+    let truthy = |n: &str| {
+        let v = field(n);
+        with_host(|h| h.truthy(&v))
+    };
+    let accessor = with_host(|h| host::lookup_chain(h, &d, "get").is_some());
+    Some(Existing {
+        accessor,
+        value: field("value"),
+        get: match field("get") {
+            Value::Undef => None,
+            g => Some(g),
+        },
+        set: match field("set") {
+            Value::Undef => None,
+            st => Some(st),
+        },
+        writable: truthy("writable"),
+        enumerable: truthy("enumerable"),
+        configurable: truthy("configurable"),
+    })
+}
+
+/// SameValue (7.2.11) — `===` except that `NaN` equals itself and `+0` and
+/// `-0` are distinct. 10.1.6.3 compares a redefined value against the current
+/// one with this, not with strict equality.
+fn same_value(a: &Value, b: &Value) -> bool {
+    let num = |v: &Value| match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    };
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => {
+            if x.is_nan() && y.is_nan() {
+                true
+            } else if x == 0.0 && y == 0.0 {
+                x.is_sign_negative() == y.is_sign_negative()
+            } else {
+                x == y
+            }
+        }
+        _ => with_host(|h| h.strict_eq(a, b)),
+    }
+}
+
+/// 10.1.6.3 `ValidateAndApplyPropertyDescriptor`.
+///
+/// None of the validation existed: every `Object.defineProperty` was applied
+/// unconditionally, so redefining a non-configurable property silently
+/// succeeded where node throws. Worse in practice, an OMITTED field was read as
+/// `false` rather than "leave alone", so the ordinary
+/// `Object.defineProperty(o, 'k', { enumerable: false })` also stripped
+/// `writable` and `configurable` from a property that had both.
+///
+/// Converting an accessor to a data property did not take effect at all: the
+/// value was written but the accessor stayed in its side table, and accessors
+/// win on read, so the getter kept answering.
+fn apply_descriptor(obj: &Value, key: &str, desc: &Value) -> Result<(), String> {
+    let req = Requested::read(desc);
+    let cur = existing_property(obj, key);
+
+    // An array's `length` is the exotic own property whose write resizes the
+    // array (10.4.2.1); routing it through the ordinary path stored a shadowing
+    // key and left the elements untouched.
+    if key == "length" && with_host(|h| h.kind_of(obj)) == Some(ObjKind::Array) {
+        if let Some(v) = req.value.clone() {
+            return set_property_pub(obj, "length", v);
+        }
+    }
+
+    if let Some(c) = &cur {
+        if !c.configurable {
+            let rejected = req.configurable == Some(true)
+                || req.enumerable.is_some_and(|e| e != c.enumerable)
+                || (req.is_accessor() && !c.accessor)
+                || (req.is_data() && c.accessor)
+                || (c.accessor
+                    && ((req.get.is_some() && req.get.clone().flatten() != c.get)
+                        || (req.set.is_some() && req.set.clone().flatten() != c.set)))
+                || (!c.accessor
+                    && !c.writable
+                    && (req.writable == Some(true)
+                        || req.value.as_ref().is_some_and(|v| !same_value(v, &c.value))));
+            if rejected {
+                return Err(host::type_error(&format!(
+                    "Cannot redefine property: {key}"
+                )));
+            }
+        }
+    }
+
+    // An omitted field keeps what the property already had; a brand-new
+    // property defaults every one of them to false.
+    let attrs = host::PropAttrs {
+        writable: req
+            .writable
+            .unwrap_or(cur.as_ref().is_some_and(|c| c.writable)),
+        enumerable: req
+            .enumerable
+            .unwrap_or(cur.as_ref().is_some_and(|c| c.enumerable)),
+        configurable: req
+            .configurable
+            .unwrap_or(cur.as_ref().is_some_and(|c| c.configurable)),
+    };
+    with_host(|h| h.set_prop_attrs(obj, key, attrs));
+
+    if req.is_accessor() {
+        let get = req
+            .get
+            .clone()
+            .unwrap_or_else(|| cur.as_ref().and_then(|c| c.get.clone()));
+        let set = req
+            .set
+            .clone()
+            .unwrap_or_else(|| cur.as_ref().and_then(|c| c.set.clone()));
+        with_host(|h| h.set_accessor(obj, key, get, set));
+        return Ok(());
+    }
+
+    if let Some(c) = &cur {
+        if c.accessor {
+            if !req.is_data() {
+                // A generic descriptor — flags only — leaves an accessor an
+                // accessor. They were already applied above.
+                return Ok(());
+            }
+            let v = req.value.clone().unwrap_or(Value::Undef);
+            with_host(|h| h.accessor_to_data(obj, key, v));
+            return Ok(());
+        }
+    }
+
+    let Some(v) = req.value else {
+        // Nothing to write: a flags-only redefinition of a data property.
+        return Ok(());
+    };
+    write_data_slot(obj, key, v);
+    Ok(())
+}
+
+/// Store `v` as an own data property, in whichever slot the object kind keeps
+/// its own properties.
+fn write_data_slot(obj: &Value, key: &str, v: Value) {
+    // A function/class receiver stores its own props in the fn-prop side table
+    // (express `mixin(app, proto)` defines methods onto the `app` *function*).
+    if matches!(
+        with_host(|h| h.get(obj).cloned()),
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_))
+    ) {
+        with_host(|h| h.set_fn_prop(obj, key, v));
+        return;
+    }
+    if let (Some(ObjKind::Array), Ok(i)) = (with_host(|h| h.kind_of(obj)), key.parse::<usize>()) {
+        // An array's index keys ARE its elements, and defining one past the end
+        // grows the array with holes in between (10.4.2.1). This whole branch
+        // used to be missing: `Object.defineProperty(arr, 1, {value})` wrote
+        // into the ordinary property map an array does not have, so it was a
+        // silent no-op.
+        with_host(|h| {
+            let old = match h.get(obj) {
+                Some(JsObj::Array(items)) => items.len(),
+                _ => 0,
+            };
+            if let Some(JsObj::Array(items)) = h.get_mut(obj) {
+                if i >= old {
+                    items.resize(i + 1, Value::Undef);
+                }
+                items[i] = v;
+            }
+            if i > old {
+                h.mark_hole_range(obj, old..i);
+            }
+            h.clear_hole(obj, i);
+        });
+        return;
+    }
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(obj) {
+            p.insert(key.to_string(), v);
+            host::canonicalize_own_keys(p);
+        }
+    });
 }
 
 /// `Object.defineProperties(obj, descriptorMap)`.
@@ -8641,7 +8896,7 @@ fn object_define_properties(args: Vec<Value>) -> Result<Value, String> {
         _ => Vec::new(),
     });
     for (k, d) in entries {
-        apply_descriptor(&obj, &k, &d);
+        apply_descriptor(&obj, &k, &d)?;
     }
     Ok(obj)
 }

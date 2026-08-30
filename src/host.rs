@@ -1415,6 +1415,52 @@ impl JsHost {
         }
     }
     /// The accessor `(get, set)` for `key` directly on `owner` (no chain walk).
+    /// Turn an own accessor property into a data property carrying `value`,
+    /// keeping its place in the own-key order.
+    ///
+    /// `set_accessor` records that order with an `@@ord:` marker in the
+    /// property map rather than a real key, so deleting the accessor and
+    /// inserting the value would append the key at the end instead. Node
+    /// reports `{ a: 1, get b() {}, c: 3 }` redefined through
+    /// `Object.defineProperty(o, 'b', { value })` as `a, b, c`.
+    pub fn accessor_to_data(&mut self, owner: &Value, key: &str, value: Value) {
+        if let Value::Obj(i) = owner {
+            if let Some(m) = self.accessors.get_mut(i) {
+                m.shift_remove(key);
+            }
+        }
+        let marker = format!("{ORD_MARKER}{key}");
+        let swap = |map: &mut IndexMap<String, Value>| match map.get_index_of(&marker) {
+            Some(pos) => {
+                *map = map
+                    .iter()
+                    .enumerate()
+                    .map(|(n, (k, v))| {
+                        if n == pos {
+                            (key.to_string(), value.clone())
+                        } else {
+                            (k.clone(), v.clone())
+                        }
+                    })
+                    .collect();
+            }
+            None => {
+                map.insert(key.to_string(), value.clone());
+            }
+        };
+        let fn_table = matches!(
+            self.get(owner),
+            Some(JsObj::Func(_)) | Some(JsObj::Class(_))
+        );
+        if fn_table {
+            if let Value::Obj(i) = owner {
+                swap(self.fn_props.entry(*i).or_default());
+            }
+        } else if let Some(JsObj::Object(props)) = self.get_mut(owner) {
+            swap(props);
+        }
+    }
+
     pub fn own_accessor(&self, owner: &Value, key: &str) -> Option<(Option<Value>, Option<Value>)> {
         if let Value::Obj(i) = owner {
             self.accessors.get(i).and_then(|m| m.get(key).cloned())
