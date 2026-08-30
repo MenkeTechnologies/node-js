@@ -201,6 +201,20 @@ ProtoNamed: boom
 Error: boom Error: boom
 CUSTOM
 0 {} true
+==== events.js ====
+order    on1:1,on2:1,once:1,on1:2,on2:2
+counts   2 2 a
+returns  false true
+prepend  zeroth,first,second,first,second
+unhandled boom
+handled  true delivered
+meta     new:removeListener,new:t,rm:t
+maxlist  10 5
+static   10 function
+raw      1 true
+chain    true
+removeAll 0
+subclass 1 true
 ==== fib.js ====
 fib: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
 1 2 3

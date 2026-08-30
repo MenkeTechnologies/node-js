@@ -358,6 +358,10 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "path" => path::constant(path::Flavor::Posix, name),
         "path/win32" => path::constant(path::Flavor::Win32, name),
         "os" => os::constant(name),
+        // `EventEmitter.defaultMaxListeners` is a DATA property, so it belongs
+        // here rather than among the static methods (which would make it read
+        // as a function). It was absent: node reports 10.
+        "EventEmitter" | "events" if name == "defaultMaxListeners" => Some(Value::Float(10.0)),
         // `Buffer.poolSize` is a DATA property, not a method, so it belongs here
         // rather than in `STATIC_METHODS` (which would make it read as a
         // function). It was absent entirely: `Buffer.poolSize` was `undefined`
