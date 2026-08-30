@@ -58,6 +58,33 @@ pub const INSTANCE_METHODS: &[&str] = &[
     "readUInt16BE",
     "readUInt16LE",
     "writeUInt8",
+    "writeInt8",
+    "writeInt16BE",
+    "writeInt16LE",
+    "readFloatBE",
+    "readFloatLE",
+    "writeFloatBE",
+    "writeFloatLE",
+    "readDoubleBE",
+    "readDoubleLE",
+    "writeDoubleBE",
+    "writeDoubleLE",
+    "readBigInt64BE",
+    "readBigInt64LE",
+    "readBigUInt64BE",
+    "readBigUInt64LE",
+    "writeBigInt64BE",
+    "writeBigInt64LE",
+    "writeBigUInt64BE",
+    "writeBigUInt64LE",
+    "readIntBE",
+    "readIntLE",
+    "readUIntBE",
+    "readUIntLE",
+    "writeIntBE",
+    "writeIntLE",
+    "writeUIntBE",
+    "writeUIntLE",
     "writeUInt16BE",
     "writeUInt16LE",
     "readUInt32BE",
@@ -751,14 +778,139 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             });
             Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
         }
+        // IEEE-754 reads/writes. `f32`/`f64` go through their raw bit patterns,
+        // so the endianness handling is the same byte reversal as the integers.
+        "readFloatBE" | "readFloatLE" => {
+            let i = read_offset(args, 4, bytes.len())?;
+            let mut raw = [0u8; 4];
+            raw.copy_from_slice(&bytes[i..i + 4]);
+            if method.ends_with("LE") {
+                raw.reverse();
+            }
+            Ok(Value::Float(f32::from_be_bytes(raw) as f64))
+        }
+        "readDoubleBE" | "readDoubleLE" => {
+            let i = read_offset(args, 8, bytes.len())?;
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&bytes[i..i + 8]);
+            if method.ends_with("LE") {
+                raw.reverse();
+            }
+            Ok(Value::Float(f64::from_be_bytes(raw)))
+        }
+        "writeFloatBE" | "writeFloatLE" => {
+            let mut raw = (super::arg_num(args, 0) as f32).to_be_bytes();
+            if method.ends_with("LE") {
+                raw.reverse();
+            }
+            let off = super::arg_num(args, 1).max(0.0) as usize;
+            store_bytes(recv, &bytes, off, &raw)?;
+            Ok(Value::Float((off + 4) as f64))
+        }
+        "writeDoubleBE" | "writeDoubleLE" => {
+            let mut raw = super::arg_num(args, 0).to_be_bytes();
+            if method.ends_with("LE") {
+                raw.reverse();
+            }
+            let off = super::arg_num(args, 1).max(0.0) as usize;
+            store_bytes(recv, &bytes, off, &raw)?;
+            Ok(Value::Float((off + 8) as f64))
+        }
+        // 64-bit integers, which exceed `f64`'s exact range and so are BigInts
+        // on both sides.
+        "readBigInt64BE" | "readBigInt64LE" | "readBigUInt64BE" | "readBigUInt64LE" => {
+            let i = read_offset(args, 8, bytes.len())?;
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&bytes[i..i + 8]);
+            if method.ends_with("LE") {
+                raw.reverse();
+            }
+            let n = if method.starts_with("readBigInt") {
+                num_bigint::BigInt::from(i64::from_be_bytes(raw))
+            } else {
+                num_bigint::BigInt::from(u64::from_be_bytes(raw))
+            };
+            Ok(with_host(|h| h.alloc(JsObj::BigInt(n))))
+        }
+        "writeBigInt64BE" | "writeBigInt64LE" | "writeBigUInt64BE" | "writeBigUInt64LE" => {
+            let v = args.first().cloned().unwrap_or(Value::Undef);
+            let n = with_host(|h| match h.get(&v) {
+                Some(JsObj::BigInt(b)) => b.clone(),
+                _ => num_bigint::BigInt::from(h.to_number(&v) as i64),
+            });
+            // Both signed and unsigned store the same 64 bits; the sign is only
+            // a question of how they are read back.
+            let bits = num_traits::ToPrimitive::to_i64(&n)
+                .map(|x| x as u64)
+                .or_else(|| num_traits::ToPrimitive::to_u64(&n))
+                .unwrap_or(0);
+            let mut raw = bits.to_be_bytes();
+            if method.ends_with("LE") {
+                raw.reverse();
+            }
+            let off = super::arg_num(args, 1).max(0.0) as usize;
+            store_bytes(recv, &bytes, off, &raw)?;
+            Ok(Value::Float((off + 8) as f64))
+        }
+        // The variable-width family: `byteLength` is an argument (1..=6), which
+        // is why these cannot share the fixed-width arms above.
+        "readIntBE" | "readIntLE" | "readUIntBE" | "readUIntLE" => {
+            let off = super::arg_num(args, 0).max(0.0) as usize;
+            let width = (super::arg_num(args, 1).max(1.0) as usize).min(6);
+            if off + width > bytes.len() {
+                return Err(range_error_out_of_bounds());
+            }
+            let mut acc: u64 = 0;
+            for k in 0..width {
+                let b = if method.ends_with("BE") {
+                    bytes[off + k]
+                } else {
+                    bytes[off + width - 1 - k]
+                };
+                acc = (acc << 8) | b as u64;
+            }
+            let signed = method.starts_with("readInt");
+            let out = if signed {
+                // Sign-extend from the top bit of the width-th byte.
+                let shift = 64 - (width * 8);
+                ((acc << shift) as i64 >> shift) as f64
+            } else {
+                acc as f64
+            };
+            Ok(Value::Float(out))
+        }
+        "writeIntBE" | "writeIntLE" | "writeUIntBE" | "writeUIntLE" => {
+            let val = super::arg_num(args, 0) as i64 as u64;
+            let off = super::arg_num(args, 1).max(0.0) as usize;
+            let width = (super::arg_num(args, 2).max(1.0) as usize).min(6);
+            let mut raw: Vec<u8> = (0..width)
+                .map(|k| (val >> (8 * (width - 1 - k))) as u8)
+                .collect();
+            if method.ends_with("LE") {
+                raw.reverse();
+            }
+            store_bytes(recv, &bytes, off, &raw)?;
+            Ok(Value::Float((off + width) as f64))
+        }
+        "writeInt8" => {
+            let off = super::arg_num(args, 1).max(0.0) as usize;
+            store_bytes(recv, &bytes, off, &[super::arg_num(args, 0) as i64 as u8])?;
+            Ok(Value::Float((off + 1) as f64))
+        }
+        "writeInt16BE" | "writeInt16LE" => {
+            let val = super::arg_num(args, 0) as i64 as u16;
+            let mut raw = val.to_be_bytes();
+            if method.ends_with("LE") {
+                raw.reverse();
+            }
+            let off = super::arg_num(args, 1).max(0.0) as usize;
+            store_bytes(recv, &bytes, off, &raw)?;
+            Ok(Value::Float((off + 2) as f64))
+        }
         // In-place writes: mutate the backing `@@bytes`, return the next offset.
         "writeUInt8" => {
-            let mut b = bytes.clone();
             let off = super::arg_num(args, 1).max(0.0) as usize;
-            if off < b.len() {
-                b[off] = super::arg_num(args, 0) as u8;
-            }
-            set_bytes(recv, &b);
+            store_bytes(recv, &bytes, off, &[super::arg_num(args, 0) as u8])?;
             Ok(Value::Float((off + 1) as f64))
         }
         "writeUInt16BE" | "writeUInt16LE" => {
@@ -771,11 +923,8 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             } else {
                 (lo, hi)
             };
-            if off + 1 < b.len() {
-                b[off] = b0;
-                b[off + 1] = b1;
-            }
-            set_bytes(recv, &b);
+            let _ = &mut b;
+            store_bytes(recv, &bytes, off, &[b0, b1])?;
             Ok(Value::Float((off + 2) as f64))
         }
         "writeUInt32BE" | "writeUInt32LE" | "writeInt32BE" | "writeInt32LE" => {
@@ -793,10 +942,8 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             } else {
                 be.iter().rev().copied().collect()
             };
-            if off + 3 < b.len() {
-                b[off..off + 4].copy_from_slice(&out);
-            }
-            set_bytes(recv, &b);
+            let _ = &mut b;
+            store_bytes(recv, &bytes, off, &out)?;
             Ok(Value::Float((off + 4) as f64))
         }
         // write(string[, offset[, length]][, encoding]) — returns bytes written.
@@ -966,6 +1113,30 @@ fn arg_is_str(args: &[Value], i: usize) -> bool {
 }
 
 /// Overwrite `recv`'s backing `@@bytes` array (for in-place buffer writes).
+/// Write `out` into the buffer's backing bytes at `off`.
+///
+/// A write that would run past the end is a `RangeError`, as in node. The
+/// fixed-width writers used to skip it silently and still return the advanced
+/// offset, so a caller writing past the end was told it had succeeded and the
+/// bytes were simply lost.
+fn store_bytes(recv: &Value, bytes: &[u8], off: usize, out: &[u8]) -> Result<(), String> {
+    if off + out.len() > bytes.len() {
+        return Err(range_error_out_of_bounds());
+    }
+    let mut b = bytes.to_vec();
+    b[off..off + out.len()].copy_from_slice(out);
+    set_bytes(recv, &b);
+    Ok(())
+}
+
+fn range_error_out_of_bounds() -> String {
+    crate::host::plain_coded_error(
+        "RangeError",
+        "ERR_OUT_OF_RANGE",
+        "Attempt to access memory outside buffer bounds",
+    )
+}
+
 fn set_bytes(recv: &Value, new: &[u8]) {
     with_host(|h| {
         let arr = match h.get(recv) {
