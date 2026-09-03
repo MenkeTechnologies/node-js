@@ -173,3 +173,66 @@ console.log("home-def", definedInA.m(), copiedIntoB.m(), definedInA.m());
 const assignedLater = { __proto__: homeB };
 assignedLater.m = definedInA.m;
 console.log("home-asn", assignedLater.m(), definedInA.m());
+
+// Subclassing a BUILTIN. A class extending an exotic used to produce a plain
+// object: `new (class extends Array {})().push` was not a function, and the
+// same for Map, Set, RegExp and Function. Their behaviour lives in the heap
+// representation, not in a property map, so copying the parent's own
+// properties — which is what an `Error` subclass needs — carried none of it.
+class MyArray extends Array {}
+const ma = new MyArray();
+ma.push(1, 2);
+console.log("array   ", ma.length, ma.join(","), Array.isArray(ma),
+  ma instanceof MyArray, ma instanceof Array);
+console.log("arr-len ", new MyArray(3).length, JSON.stringify(new MyArray(3)));
+// The leaf prototype still wins, so subclass methods resolve and the exotic
+// ones are inherited through it.
+class Tallied extends Array {
+  total() { return this.reduce((a, b) => a + b, 0); }
+}
+const tl = Tallied.from([1, 2, 3]);
+console.log("methods ", new Tallied(1, 2, 3).total(), tl.join(","), tl instanceof Array);
+
+class MyMap extends Map {}
+const mm = new MyMap([["a", 1]]);
+console.log("map     ", mm.get("a"), mm.size, mm instanceof Map, mm instanceof MyMap);
+class MySet extends Set {}
+const ms = new MySet([1, 2, 2]);
+console.log("set     ", ms.size, ms.has(1), [...ms].join(","), ms instanceof Set);
+class MyRegExp extends RegExp {}
+const mr = new MyRegExp("a+", "g");
+console.log("regexp  ", mr.source, mr.flags, mr.test("aaa"), mr instanceof RegExp);
+class MyFn extends Function {}
+console.log("function", typeof new MyFn("return 1"), new MyFn("a", "return a*2")(21));
+// An Error subclass is ordinary — its state IS own properties — and keeps
+// working through the copying path.
+class MyError extends Error {}
+const me = new MyError("boom");
+console.log("error   ", me.message, me.name, me instanceof Error, me.stack.split("\n")[0]);
+
+// 15.7.15: a base constructor that RETURNS an object makes that object the
+// instance — for the derived class too, and by identity, not by copy. The
+// returned object was being discarded, so a derived instance came back empty.
+const shared = { custom: 1 };
+class Factory { constructor() { return shared; } }
+class Sub extends Factory { constructor() { super(); } }
+const sub = new Sub();
+console.log("return  ", sub === shared, JSON.stringify(sub));
+// Writes after `super()` land on the substituted object, since `this` is
+// rebound to it.
+class Augments extends Factory { constructor() { super(); this.extra = 2; } }
+const aug = new Augments();
+console.log("rebound ", aug === shared, JSON.stringify(shared), aug.extra);
+// The implicit `constructor(...a){ super(...a) }` does the same.
+class Implicit extends Factory {}
+console.log("implicit", new Implicit() === shared);
+// A `new` inside the constructor body cannot be mistaken for the substitution.
+class Nests extends Factory {
+  constructor() { super(); this.inner = new (class Inner {})(); }
+}
+const nested = new Nests();
+console.log("nested  ", nested === shared, nested.inner.constructor.name);
+// The ordinary chain — no returned object — is untouched.
+class Base { constructor() { this.b = 1; } }
+class Derived extends Base { constructor() { super(); this.d = 2; } }
+console.log("ordinary", JSON.stringify(new Derived()), new Derived() instanceof Base);

@@ -314,10 +314,17 @@ fn b_super_call(vm: &mut VM, argc: u8) -> Value {
         None => return abort(vm, host::type_error("'super' keyword unexpected here")),
     };
     let nt = with_host(|h| h.current_new_target()).unwrap_or_else(|| this.clone());
-    let r = host::super_construct(&parent, args, &this, &nt);
-    if let Err(e) = r {
-        return abort(vm, e);
-    }
+    let this = match host::super_construct(&parent, args, &this, &nt) {
+        Err(e) => return abort(vm, e),
+        // The parent returned an object of its own: 15.7.15 makes THAT the
+        // instance, so `this` is rebound to it for the rest of the constructor
+        // and it is what `new` hands back.
+        Ok(Some(replacement)) => {
+            with_host(|h| h.set_current_this(replacement.clone()));
+            replacement
+        }
+        Ok(None) => this,
+    };
     // Run this (derived) class's own instance-field initializers after super.
     for (name, thunk, name_anon) in fields {
         if let Err(e) = host::init_one_field(&this, &name, &thunk, name_anon) {
@@ -6695,8 +6702,81 @@ fn is_number_method(name: &str) -> bool {
     )
 }
 
+/// The exotic kinds whose own dispatch table does NOT already reach the
+/// `Object.prototype` methods, so the inherited ones have to be routed to.
+///
+/// An allowlist rather than a catch-all: a primitive receiver also reaches this
+/// function, and a Number's `toString` is `Number.prototype.toString` — routing
+/// it to the object form made `(255).toString(16)` report `[object Number]`.
+fn inherits_object_methods(recv: &Value) -> bool {
+    matches!(
+        with_host(|h| h.kind_of(recv)),
+        Some(
+            ObjKind::Map
+                | ObjKind::Set
+                | ObjKind::Promise
+                | ObjKind::RegExp
+                | ObjKind::Generator
+                | ObjKind::Symbol
+                | ObjKind::BigInt
+                | ObjKind::Iter
+        )
+    )
+}
+
+/// Whether `recv`'s own prototype defines `name`, shadowing the
+/// `Object.prototype` method of that name — `RegExp.prototype.toString` does,
+/// `Map.prototype` does not.
+fn overrides_object_method(recv: &Value, name: &str) -> bool {
+    match with_host(|h| h.kind_of(recv)) {
+        Some(ObjKind::Map) => is_map_method(name),
+        Some(ObjKind::Set) => is_set_method(name),
+        Some(ObjKind::RegExp) => crate::regexp::is_regexp_method(name),
+        // A Symbol has its own `toString`; `valueOf` is the inherited one,
+        // which returns the receiver — exactly what a symbol needs.
+        Some(ObjKind::Symbol) => name == "toString",
+        Some(ObjKind::BigInt) => matches!(name, "toString" | "valueOf" | "toLocaleString"),
+        _ => false,
+    }
+}
+
 /// Dispatch `recv.name(args)` for the built-in prototype methods.
 pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // A USER method on the receiver's prototype chain wins over the builtin of
+    // the same name — that is how a `class X extends Array` method is reached,
+    // since the dispatch below goes straight to the builtin table and has no
+    // entry for it.
+    //
+    // Deliberately restricted to a user function: the shared `Object.prototype`
+    // carries real `@proto:Object:*` thunks, so accepting any callable made a
+    // bare `map.toString()` resolve to the object form instead of the builtin
+    // one the exotic is supposed to use.
+    if let Some(f) = with_host(|h| host::lookup_chain(h, recv, name)) {
+        if matches!(
+            with_host(|h| h.kind_of(&f)),
+            Some(ObjKind::Func) | Some(ObjKind::Class) | Some(ObjKind::BoundFunc)
+        ) {
+            return host::invoke(&f, args, Some(recv.clone()));
+        }
+    }
+    // Every object INHERITS the `Object.prototype` methods, and an exotic that
+    // does not define its own reaches them the same way. Each kind's dispatch
+    // table below only knows its own methods, so `new Map().toString()`,
+    // `promise.hasOwnProperty(k)` and `sym.toLocaleString()` all reported "is
+    // not a function" — `Object.prototype.toString.call(m)` worked while
+    // `m.toString()` did not.
+    if inherits_object_methods(recv)
+        && is_object_builtin_method(name)
+        && !overrides_object_method(recv, name)
+    {
+        // `toString` goes through the branded form (20.1.3.6), which reads
+        // `Symbol.toStringTag` and falls back to the receiver's own brand —
+        // `[object Map]`, not the generic stringification.
+        if name == "toString" {
+            return proto_method(recv, "Object:toString", args);
+        }
+        return object_builtin_method(recv, name, args);
+    }
     // `Object.prototype.valueOf` is inherited by every exotic that does not
     // override it (an Array does not), and returns the receiver. Without this
     // the `ToPrimitive` probe on `[o] + ''` reached `array_method("valueOf")`

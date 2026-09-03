@@ -217,6 +217,19 @@ litarrow base 0
 this     ThisCheck
 home-def A A A
 home-asn A A
+array    2 1,2 true true true
+arr-len  3 [null,null,null]
+methods  6 1,2,3 true
+map      1 1 true true
+set      2 true 1,2 true
+regexp   a+ g true true
+function function 42
+error    boom Error true Error: boom
+return   true {"custom":1}
+rebound  true {"custom":1,"extra":2} 2
+implicit true
+nested   true Inner
+ordinary {"b":1,"d":2} true
 ==== classfeatures.js ====
 private  1|privMethod|privGetter
 statics  1 static-block true false
@@ -609,6 +622,18 @@ events   2 string symbol true
 emit     7 1 1
 off      7 0 1
 distinct 7 2
+inherit map  [object Map] false false string
+inherit set  [object Set] false false string
+inherit prom [object Promise] false false string
+inherit re   /x/g false false string
+inherit gen  [object Generator] false false string
+inherit sym  Symbol(s) false false string
+inherit big  1 false false string
+brand    [object Map] [object Set] [object Promise] [object Generator]
+tag      [object Custom] [object Custom]
+valueOf  true true true
+own      1,2,3 /a+/g ff 1.5 true s
+locale   1,2 1234.5
 ==== processenv.js ====
 num      5 string 51
 coerced  true undefined null

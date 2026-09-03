@@ -78,3 +78,38 @@ console.log("off     ", seen, em.listenerCount(evt), em.eventNames().length);
 em.on("Symbol(evt)", () => { seen += 100; });
 em.emit(evt, 1);
 console.log("distinct", seen, em.eventNames().length);
+
+// Every object INHERITS the `Object.prototype` methods, and an exotic that does
+// not define its own reaches them the same way. Each kind's dispatch table only
+// knew its own methods, so `new Map().toString()` reported "is not a function"
+// while `Object.prototype.toString.call(m)` worked — the same method, reached
+// two ways, disagreeing.
+const exotics = [
+  ["map ", new Map([[1, 2]])],
+  ["set ", new Set([1])],
+  ["prom", Promise.resolve(1)],
+  ["re  ", /x/g],
+  ["gen ", (function* () {})()],
+  ["sym ", Symbol("s")],
+  ["big ", 1n],
+];
+for (const [label, v] of exotics) {
+  console.log("inherit " + label, v.toString(), v.hasOwnProperty("nope"),
+    v.propertyIsEnumerable("x"), typeof v.toLocaleString());
+}
+// `toString` goes through the branded form, so it reads the receiver's own
+// brand rather than stringifying it generically.
+console.log("brand   ", new Map().toString(), new Set().toString(),
+  Promise.resolve().toString(), (function* () {})().toString());
+// A `Symbol.toStringTag` still wins over the brand.
+class Tagged { get [Symbol.toStringTag]() { return "Custom"; } }
+console.log("tag     ", Object.prototype.toString.call(new Tagged()), String(new Tagged()));
+// `valueOf` returns the receiver for anything that does not override it.
+const sym = Symbol("v");
+console.log("valueOf ", sym.valueOf() === sym, /x/.valueOf() instanceof RegExp,
+  new Map().valueOf() instanceof Map);
+// The kinds that DO define their own keep them: an Array stringifies its
+// elements, a RegExp its source, a Number in the requested radix.
+console.log("own     ", [1, 2, 3].toString(), /a+/g.toString(), (255).toString(16),
+  (1.5).toString(), true.toString(), "s".toString());
+console.log("locale  ", [1, 2].toLocaleString(), (1234.5).toString());

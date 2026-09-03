@@ -866,6 +866,8 @@ pub struct JsHost {
     /// every index), which is the same order as the `Vec<Value>` already paid for
     /// that array — so it cannot turn a working allocation into an OOM.
     array_holes: HashMap<u32, rustc_hash::FxHashSet<usize>>,
+    /// See `take_super_replacement`.
+    super_replacement: Option<Value>,
     /// User-assigned static properties on a builtin namespace/constructor, keyed
     /// by namespace name then property (`Error` → `prepareStackTrace`,
     /// `stackTraceLimit`). Each bare `Error` reference allocates a fresh
@@ -1139,6 +1141,7 @@ impl JsHost {
             non_extensible: HashSet::new(),
             private_methods: HashSet::new(),
             array_holes: HashMap::new(),
+            super_replacement: None,
             builtin_statics: HashMap::new(),
             object_proto: Value::Undef,
             proto_class: HashMap::new(),
@@ -1512,6 +1515,27 @@ impl JsHost {
             }
         } else if let Some(JsObj::Object(props)) = self.get_mut(owner) {
             swap(props);
+        }
+    }
+
+    /// Move the per-heap-index bookkeeping of `src` onto `dst`.
+    ///
+    /// Used when one object becomes another in place (a class extending a
+    /// builtin exotic). The prototype link is deliberately NOT moved: `dst`
+    /// already points at the leaf class's prototype, which is the one its
+    /// methods must resolve through.
+    pub fn move_index_state(&mut self, src: u32, dst: u32) {
+        if let Some(holes) = self.array_holes.remove(&src) {
+            self.array_holes.insert(dst, holes);
+        }
+        if let Some(attrs) = self.prop_attrs.remove(&src) {
+            self.prop_attrs.entry(dst).or_default().extend(attrs);
+        }
+        if let Some(props) = self.fn_props.remove(&src) {
+            self.fn_props.entry(dst).or_default().extend(props);
+        }
+        if let Some(acc) = self.accessors.remove(&src) {
+            self.accessors.entry(dst).or_default().extend(acc);
         }
     }
 
@@ -2485,6 +2509,34 @@ impl JsHost {
 
     pub fn current_this(&self) -> Option<Value> {
         self.frame().this_obj.clone()
+    }
+
+    /// The object a `super()` call substituted for the instance, if any.
+    ///
+    /// `construct_class` allocates the instance up front, so when a base
+    /// constructor RETURNS an object the substitution happens deep inside the
+    /// VM, after that allocation. This carries it back out. Each
+    /// `construct_class` saves and restores the previous value around its own
+    /// run, so a `new` inside a constructor body cannot steal it.
+    pub fn take_super_replacement(&mut self) -> Option<Value> {
+        self.super_replacement.take()
+    }
+
+    pub fn swap_super_replacement(&mut self, v: Option<Value>) -> Option<Value> {
+        std::mem::replace(&mut self.super_replacement, v)
+    }
+
+    /// Rebind the running activation's `this`.
+    ///
+    /// Only `super()` does this: when the parent constructor RETURNS an object,
+    /// 15.7.15 makes that object the derived instance, so the rest of the
+    /// derived constructor has to write to it rather than to the one allocated
+    /// before the call.
+    pub fn set_current_this(&mut self, v: Value) {
+        if let Some(f) = self.frames.last_mut() {
+            f.this_obj = Some(v.clone());
+        }
+        self.super_replacement = Some(v);
     }
     /// The callbacks to run for `event`, consuming any `once` registration in
     /// the same step — so a listener that re-emits the event cannot re-enter a
@@ -6058,10 +6110,20 @@ fn construct_class(
         h.set_proto(&o, leaf_proto.clone());
         o
     });
-    // A constructor that returns an object replaces the instance (`new` semantics).
-    match run_class_ctor(&cv, &inst, args, &new_target)? {
+    // A `super()` deeper in may substitute the instance; the previous value is
+    // restored so a `new` inside a constructor body cannot be mistaken for one.
+    let saved = with_host(|h| h.swap_super_replacement(None));
+    let ran = run_class_ctor(&cv, &inst, args, &new_target);
+    let substituted = with_host(|h| {
+        let s = h.take_super_replacement();
+        h.swap_super_replacement(saved);
+        s
+    });
+    // A constructor that returns an object replaces the instance (`new`
+    // semantics); failing that, whatever `super()` substituted for it.
+    match ran? {
         Some(obj) if returns_object(&obj) => Ok(obj),
-        _ => Ok(inst),
+        _ => Ok(substituted.unwrap_or(inst)),
     }
 }
 
@@ -6093,7 +6155,12 @@ fn run_class_ctor(
             // Default constructor: `constructor(...a){ super(...a); }` for a
             // derived class, empty for a base class.
             if let Some(parent) = &cv.parent {
-                super_construct(parent, args, inst, new_target)?;
+                // A base constructor's returned object becomes the instance, so
+                // the implicit `constructor(...a){ super(...a) }` hands it on.
+                if let Some(replacement) = super_construct(parent, args, inst, new_target)? {
+                    init_fields(cv, &replacement)?;
+                    return Ok(Some(replacement));
+                }
                 init_fields(cv, inst)?;
             }
         }
@@ -6146,25 +6213,38 @@ pub fn init_one_field(
 
 /// Run a parent constructor as part of `super(...)`: dispatch on the parent's
 /// kind (class vs plain function vs builtin) using the existing instance.
+/// Run the parent constructor against `inst`.
+///
+/// Returns the object the parent's `[[Construct]]` produced when that is NOT
+/// `inst` — a base constructor is allowed to `return` one, and 15.7.15 makes it
+/// the derived instance too. The caller rebinds `this` to it, so the rest of the
+/// derived constructor writes to the object `new` will hand back.
 pub fn super_construct(
     parent: &Value,
     args: Vec<Value>,
     inst: &Value,
     new_target: &Value,
-) -> Result<(), String> {
+) -> Result<Option<Value>, String> {
     match with_host(|h| h.get(parent).cloned()) {
-        Some(JsObj::Class(pcv)) => run_class_ctor(&pcv, inst, args, new_target).map(|_| ()),
+        Some(JsObj::Class(pcv)) => Ok(run_class_ctor(&pcv, inst, args, new_target)?
+            .filter(|r| returns_object(r) && !with_host(|h| h.strict_eq(r, inst)))),
         Some(JsObj::Func(fv)) => {
-            run_user_func_nt(&fv, args, Some(inst.clone()), Some(new_target.clone()))?;
-            Ok(())
+            let r = run_user_func_nt(&fv, args, Some(inst.clone()), Some(new_target.clone()))?;
+            Ok(Some(r).filter(|r| returns_object(r) && !with_host(|h| h.strict_eq(r, inst))))
         }
         Some(JsObj::Builtin(name)) => {
-            // Extending a builtin (e.g. `class E extends Error`): copy the built
-            // object's own props onto the instance so the subclass instance
-            // carries them.
             let built = crate::builtins::construct_builtin(&name, args)?;
-            adopt_own_props(inst, &built);
-            Ok(())
+            // An EXOTIC parent (`class A extends Array`) keeps its behaviour in
+            // the heap variant, not in a property map, so copying own props
+            // cannot carry it: the instance has to BECOME the built object.
+            // Without this `new (class extends Array {})().push` was not a
+            // function, and the same for Map, Set, RegExp, Promise and
+            // Function — subclassing a builtin produced a plain object.
+            if !become_exotic(inst, &built) {
+                // An `Error` subclass is ordinary: its state IS own properties.
+                adopt_own_props(inst, &built);
+            }
+            Ok(None)
         }
         // A Proxy parent (`class D extends new Proxy(B, {})`): `super(…)` is
         // `[[Construct]]` on the proxy, so the `construct` trap runs (or forwards
@@ -6173,8 +6253,10 @@ pub fn super_construct(
         // is moved across — the same move the builtin arm makes.
         Some(JsObj::Proxy { .. }) => {
             let built = construct_nt(parent, args, new_target.clone())?;
-            adopt_own_props(inst, &built);
-            Ok(())
+            if !become_exotic(inst, &built) {
+                adopt_own_props(inst, &built);
+            }
+            Ok(None)
         }
         _ => Err(type_error("super is not a constructor")),
     }
@@ -6183,6 +6265,48 @@ pub fn super_construct(
 /// Move `built`'s own properties (and their attributes) onto `inst`. Used where
 /// a parent constructor produces a fresh object but node-js's class model has
 /// already allocated the instance `this` is bound to.
+/// Replace `inst`'s heap object with `built`'s, so an instance whose class
+/// extends a builtin EXOTIC really is one.
+///
+/// `inst` keeps its identity and its prototype link — the leaf class's
+/// prototype, which is what method resolution and `instanceof` walk — while its
+/// contents become the exotic the parent constructor produced. The side tables
+/// keyed by heap index (array holes, property attributes, the fn-prop table)
+/// move across with it.
+///
+/// Returns false for a variant whose state is ordinary own properties
+/// (`Error`), which the caller copies instead.
+fn become_exotic(inst: &Value, built: &Value) -> bool {
+    let exotic = matches!(
+        with_host(|h| h.get(built).cloned()),
+        Some(JsObj::Array(_))
+            | Some(JsObj::Map { .. })
+            | Some(JsObj::Set { .. })
+            | Some(JsObj::RegExp(_))
+            | Some(JsObj::Promise { .. })
+            | Some(JsObj::Func(_))
+            | Some(JsObj::Str(_))
+            | Some(JsObj::BigInt(_))
+            | Some(JsObj::Symbol { .. })
+    );
+    if !exotic {
+        return false;
+    }
+    let (Value::Obj(dst), Value::Obj(src)) = (inst, built) else {
+        return false;
+    };
+    let (dst, src) = (*dst, *src);
+    with_host(|h| {
+        if let Some(obj) = h.get(built).cloned() {
+            if let Some(slot) = h.get_mut(inst) {
+                *slot = obj;
+            }
+        }
+        h.move_index_state(src, dst);
+    });
+    true
+}
+
 fn adopt_own_props(inst: &Value, built: &Value) {
     let entries: Vec<(String, Value)> = with_host(|h| match h.get(built) {
         Some(JsObj::Object(p)) => p.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
