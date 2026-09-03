@@ -759,11 +759,12 @@ dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
   The `BigInt(x)` constructor + `BigInt.asIntN`/`asUintN`. BigInt is a valid
   Map/Set key.
 - **Regular expressions** — `/pat/flags` literals (with the regex-vs-divide
-  disambiguation) and `new RegExp(source[, flags])`, backed by the Rust `regex`
-  crate. `re.test`/`re.exec` (with `.index`/capture groups/named `.groups`/
+  disambiguation) and `new RegExp(source[, flags])`, backed by the `fancy-regex`
+  crate (which wraps Rust `regex` and adds backtracking). `re.test`/`re.exec`
+  (with `.index`/capture groups/named `.groups`/
   `lastIndex` under `g`/`y`), and the String methods `match`/`matchAll`/`replace`/
   `replaceAll`(with `$1`/`$&`/`` $` ``/`$'`/`$<name>`/`$$` + function replacers)/
-  `split`/`search`. Flags `g`/`i`/`m`/`s`/`u`/`y`/`d`. **Rust `regex` is NOT a JS
+  `split`/`search`. Flags `g`/`i`/`m`/`s`/`u`/`y`/`d`. **`fancy-regex` is NOT a JS
   superset** — the exact supported subset and known divergences are in the
   dedicated section below.
 - **Tagged templates** — `` tag`a${x}b` `` calls `tag(strings, ...values)` where
@@ -872,7 +873,9 @@ imperfect, not the policy.
 (translated to Rust `\x{...}`), **backreferences** (`\1`, `\k<name>`) and
 **lookahead / lookbehind** (`(?=)`, `(?!)`, `(?<=)`, `(?<!)`) — all provided by
 `fancy-regex` 0.18 — and the flags `g` (global), `i` (ignoreCase), `m`
-(multiline), `s` (dotAll), `u`, `y` (sticky), `d` (accepted; indices ignored).
+(multiline), `s` (dotAll), `u`, `y` (sticky) and `d` (hasIndices — the match
+array carries `.indices`, one `[start, end]` pair per group, with
+`.indices.groups` for the named ones).
 `test`/`exec`/`match`/`matchAll`/`replace`/`replaceAll`/`split`/`search` and the
 `$1`/`$&`/`` $` ``/`$'`/`$<name>`/`$$` replacement patterns + function replacers.
 
@@ -1798,14 +1801,6 @@ is claimed fixed anywhere in this file.
 
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
-
-- **`util.inspect` `compact` depth-gate (only under a raised `{depth}`).** Node
-  forces an object/array onto multiple lines when its deepest descendant is `≥
-  compact` (3) levels below it, even if the single-line form fits `breakLength`.
-  Only the `breakLength` 80 fit is modelled, not the depth-gate, so
-  `util.inspect(x, {depth: N>2})` on a `≥4`-level-deep structure may stay on one
-  line where Node breaks it. `console.log` (fixed `depth: 2`, where the gate can
-  never fire) is byte-identical.
 
 - **Array holes.** A node-js array is a dense `Vec<Value>`, so an elision or a
   `delete` leaves `undefined` where V8 leaves a HOLE. Everything that
