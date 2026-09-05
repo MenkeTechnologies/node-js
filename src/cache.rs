@@ -167,6 +167,17 @@ fn shard_path() -> Option<PathBuf> {
     Some(dir.join("scripts.rkyv"))
 }
 
+/// The shard file's identity as `(mtime, len)` — what "unchanged since we read
+/// it" is decided on. `None` when there is no file (or it cannot be stat'd),
+/// which compares equal to a later `None` and so still means "unchanged".
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+fn shard_stamp() -> Stamp {
+    let path = shard_path()?;
+    let md = std::fs::metadata(&path).ok()?;
+    Some((md.modified().ok()?, md.len()))
+}
+
 fn load_shard() -> Shard {
     let Some(path) = shard_path() else {
         return Shard::default();
@@ -210,6 +221,10 @@ struct ShardMem {
     entries: rustc_hash::FxHashMap<u64, (u64, Vec<u8>)>,
     /// Whether this process added anything, so an all-hits run writes nothing.
     dirty: bool,
+    /// The file's `(mtime, len)` when this process read it. [`flush`] re-reads
+    /// the shard only when this no longer matches — i.e. when a peer actually
+    /// wrote while we were running.
+    stamp: Stamp,
 }
 
 thread_local! {
@@ -223,6 +238,12 @@ fn with_shard<T>(f: impl FnOnce(&mut ShardMem) -> T) -> T {
         let mem = slot.get_or_insert_with(|| {
             let build = build_id();
             let mut mem = ShardMem::default();
+            // Stamped BEFORE the read: a peer writing between the two makes the
+            // stamp look older than the bytes we hold, which only costs `flush`
+            // a re-read it did not need. The other direction — a stamp newer
+            // than the content — would silently drop a peer's entries, and
+            // cannot happen this way round.
+            mem.stamp = shard_stamp();
             for e in load_shard().entries {
                 // Entries from another build can never be hit (the build id is
                 // part of every key), so they are not worth holding in memory
@@ -339,9 +360,23 @@ pub fn flush() {
         }
     });
     let Some(mut merged) = pending else { return };
-    for e in load_shard().entries {
-        if e.build == build {
-            merged.entry(e.key).or_insert((e.verify, e.blob));
+    // Re-read the shard only if it CHANGED since this process read it.
+    //
+    // The merge exists for the concurrent case — up to 16 instances share the
+    // file — but the common case is that nobody else wrote, and there the
+    // re-read deserializes and validates the whole shard a second time for a
+    // result already resident in `merged`. Measured on a 2 MB shard (debug
+    // build), that second `load_shard` is ~0.4 s of a ~2 s run, paid by every
+    // run that compiles anything. An unchanged `(mtime, len)` means no peer
+    // committed a write (the writer renames a temp file into place, so any
+    // commit moves both), and the entries we would merge back are exactly the
+    // ones we already hold.
+    let stamp = SHARD.with(|c| c.borrow().as_ref().and_then(|m| m.stamp));
+    if shard_stamp() != stamp {
+        for e in load_shard().entries {
+            if e.build == build {
+                merged.entry(e.key).or_insert((e.verify, e.blob));
+            }
         }
     }
     let shard = Shard {
