@@ -237,13 +237,17 @@ fn with_shard<T>(f: impl FnOnce(&mut ShardMem) -> T) -> T {
         let mut slot = c.borrow_mut();
         let mem = slot.get_or_insert_with(|| {
             let build = build_id();
-            let mut mem = ShardMem::default();
             // Stamped BEFORE the read: a peer writing between the two makes the
             // stamp look older than the bytes we hold, which only costs `flush`
             // a re-read it did not need. The other direction — a stamp newer
             // than the content — would silently drop a peer's entries, and
-            // cannot happen this way round.
-            mem.stamp = shard_stamp();
+            // cannot happen this way round. The stamp is taken in the
+            // initializer for the same reason it is taken first: `load_shard()`
+            // below must not run before it.
+            let mut mem = ShardMem {
+                stamp: shard_stamp(),
+                ..ShardMem::default()
+            };
             for e in load_shard().entries {
                 // Entries from another build can never be hit (the build id is
                 // part of every key), so they are not worth holding in memory
