@@ -106,6 +106,17 @@ fn probe_liveness(src: &str, observe: Duration) -> Liveness {
     let mut child = Command::new(env!("CARGO_BIN_EXE_node"))
         .arg(&path)
         .arg(&ticks_path)
+        // An ISOLATED cache home. The bytecode shard lives under `$HOME`, is
+        // shared by every node-js run on the machine, and is read AND rewritten
+        // by any run that compiles something new — which every probe here does,
+        // since each writes a fresh script. On a developer's machine that shard
+        // reaches megabytes, and serializing it at exit is unbounded work
+        // charged to the observation window below: the negative control failed
+        // on a 2 MB shard because the child took ~1.8 s to exit after its last
+        // tick, none of it event-loop time. Pointing `HOME` at this test's own
+        // temp dir makes each probe start from an empty shard, so what the
+        // window measures is the loop and not the developer's accumulated cache.
+        .env("HOME", dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
