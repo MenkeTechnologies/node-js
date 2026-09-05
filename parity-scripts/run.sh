@@ -24,8 +24,32 @@ VERBOSE="${1:-}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-command -v "$ORACLE" >/dev/null || { echo "parity: no reference '$ORACLE' on PATH"; exit 2; }
 [ -x "$NODEJS" ] || { echo "parity: $NODEJS not built (cargo build)"; exit 2; }
+# Resolve the oracle to an ABSOLUTE, symlink-followed path and record its
+# version. "node" alone means whatever this shell's PATH says at this moment,
+# which differs between an interactive shell, `sudo` and CI — so a report that
+# names it proves nothing about which interpreter produced the numbers.
+ORACLE_ABS="$(command -v "$ORACLE" 2>/dev/null)" || true
+[ -n "$ORACLE_ABS" ] || { echo "parity: no reference '$ORACLE' on PATH"; exit 2; }
+# `realpath` is not on every macOS; fall back to the resolved-but-unfollowed path.
+ORACLE_ABS="$(command realpath "$ORACLE_ABS" 2>/dev/null || printf '%s' "$ORACLE_ABS")"
+ORACLE_VERSION="$("$ORACLE_ABS" --version 2>&1 | head -1)"
+# Two ways the resolved binary is not an oracle at all, each of which makes
+# every case agree and the whole run vacuous: it IS the binary under test (a
+# `node` shim pointing at node-js, or target/debug on PATH), or it is a version
+# manager's shim / an unrelated program that does not answer with Node's vX.Y.Z.
+NODEJS_ABS="$(command realpath "$NODEJS" 2>/dev/null || printf '%s' "$NODEJS")"
+if [ "$ORACLE_ABS" = "$NODEJS_ABS" ]; then
+  echo "parity: the resolved oracle IS the binary under test ($ORACLE_ABS) — a run against itself compares nothing; set NODE_JS_PARITY_NODE"
+  exit 2
+fi
+case "$ORACLE_VERSION" in
+  v[0-9]*.[0-9]*.[0-9]*) ;;
+  *) echo "parity: $ORACLE_ABS answers --version with '$ORACLE_VERSION', which is not a Node version (vX.Y.Z)"; exit 2;;
+esac
+echo "oracle: $ORACLE_ABS ($ORACLE_VERSION)"
+echo "ours  : $NODEJS_ABS"
+ORACLE="$ORACLE_ABS"
 # Compiler/parser changes are not invalidated by the source-keyed rkyv cache.
 rm -f "$HOME/.node-js/scripts.rkyv"
 
@@ -80,7 +104,7 @@ done < <(find "$CORPUS" -name '*.js' | sort)
 total=$((pass+fail))
 echo ""
 echo "════════════════════════════════════════════"
-echo "BYTE PARITY: $pass / $total match  (oracle: $ORACLE $($ORACLE --version))"
+echo "BYTE PARITY: $pass / $total match  (oracle: $ORACLE $ORACLE_VERSION)"
 echo "════════════════════════════════════════════"
 if [ $fail -gt 0 ]; then
   echo "Divergences:"

@@ -131,26 +131,105 @@ fn ours_bin() -> PathBuf {
 /// it. `NODE_JS_FUZZ_NODE` names the oracle explicitly; if it is set but unusable
 /// this is a HARD ERROR — silently falling back to a different Node would answer a
 /// different question than the one that was asked.
-fn resolve_oracle() -> String {
-    if let Ok(p) = std::env::var("NODE_JS_FUZZ_NODE") {
-        if version_of(&p).is_none() {
-            eprintln!("parity-fuzz: NODE_JS_FUZZ_NODE={p}: not a usable node");
-            std::process::exit(2);
+fn resolve_oracle(ours: &Path) -> String {
+    let chosen = match std::env::var("NODE_JS_FUZZ_NODE") {
+        Ok(p) => {
+            let Some(abs) = absolutize(&p) else {
+                eprintln!("parity-fuzz: NODE_JS_FUZZ_NODE={p}: not found");
+                std::process::exit(2);
+            };
+            if version_of(&abs).is_none() {
+                eprintln!("parity-fuzz: NODE_JS_FUZZ_NODE={p}: not a usable node");
+                std::process::exit(2);
+            }
+            abs
         }
-        return p;
-    }
-    for p in [
-        "node",
-        "/opt/homebrew/bin/node",
-        "/usr/local/bin/node",
-        "/usr/bin/node",
-    ] {
-        if version_of(p).is_some() {
-            return p.to_string();
+        Err(_) => {
+            let mut found = None;
+            for p in [
+                "node",
+                "/opt/homebrew/bin/node",
+                "/usr/local/bin/node",
+                "/usr/bin/node",
+            ] {
+                if let Some(abs) = absolutize(p) {
+                    if version_of(&abs).is_some() {
+                        found = Some(abs);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(p) => p,
+                None => {
+                    eprintln!("parity-fuzz: no reference node found; set NODE_JS_FUZZ_NODE");
+                    std::process::exit(2);
+                }
+            }
         }
+    };
+    // Two ways a "node" on PATH is not the oracle this harness needs, both of
+    // which make every case agree and the whole run vacuous:
+    //
+    //  * it IS the binary under test (a `node` shim pointing at node-js, or a
+    //    `target/debug` directory on PATH). Comparing a program against itself
+    //    reports 100% parity while proving nothing.
+    //  * it is a version-manager shim or a different program that answers
+    //    `--version` with something that is not Node's `vX.Y.Z`.
+    let real = std::fs::canonicalize(&chosen).unwrap_or_else(|_| PathBuf::from(&chosen));
+    if std::fs::canonicalize(ours)
+        .map(|o| o == real)
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "parity-fuzz: the resolved oracle IS the binary under test ({}) — \
+             a run against itself compares nothing; set NODE_JS_FUZZ_NODE",
+            real.display()
+        );
+        std::process::exit(2);
     }
-    eprintln!("parity-fuzz: no reference node found; set NODE_JS_FUZZ_NODE");
-    std::process::exit(2);
+    let v = version_of(&chosen).unwrap_or_default();
+    if !is_node_version(&v) {
+        eprintln!(
+            "parity-fuzz: {} answers --version with {v:?}, which is not a Node \
+             version (vX.Y.Z) — refusing to treat it as the oracle",
+            real.display()
+        );
+        std::process::exit(2);
+    }
+    real.to_string_lossy().into_owned()
+}
+
+/// `vMAJOR.MINOR.PATCH`, the shape every `node --version` prints. A version
+/// manager's shim, or an unrelated program that happens to be named `node`,
+/// answers with something else.
+fn is_node_version(v: &str) -> bool {
+    let Some(rest) = v.strip_prefix('v') else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// An absolute path for `prog`: taken as-is when it already contains a
+/// separator, otherwise looked up along `PATH`. Naming the oracle by its
+/// absolute path is what makes a divergence report reproducible — `node` means
+/// whatever the PATH said at that moment, which differs between shells, `sudo`,
+/// and CI.
+fn absolutize(prog: &str) -> Option<String> {
+    let p = Path::new(prog);
+    if p.components().count() > 1 {
+        return p.exists().then(|| prog.to_string());
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(prog))
+            .find(|c| c.is_file())
+            .map(|c| c.to_string_lossy().into_owned())
+    })
 }
 
 /// `<prog> --version` output, or None if the program can't be run.
@@ -170,8 +249,9 @@ fn version_of(prog: &str) -> Option<String> {
     }
 }
 
-/// `<path> (<version>)`, for the run header and the report file, so a divergence
-/// record can be attributed to the exact oracle that produced it.
+/// `<absolute path> (<version>)`, for the run header and the report file, so a
+/// divergence record can be attributed to the exact binary that produced it —
+/// not to whichever `node` the reader's PATH happens to resolve.
 fn oracle_id(oracle: &str) -> String {
     let v = version_of(oracle).unwrap_or_else(|| "unknown".to_string());
     format!("{oracle} ({v})")
@@ -933,6 +1013,107 @@ fn gen_mapset(seed: u64) -> Vec<String> {
         _ => vec![format!(
             "const wm = new WeakMap(); const k = {{}}; wm.set(k, {a}); console.log(wm.get(k), wm.has(k), wm.has({{}}));"
         )],
+    }
+}
+
+/// The ES2025 set operations (`union`/`intersection`/`difference`/
+/// `symmetricDifference`/`isSubsetOf`/`isSupersetOf`/`isDisjointFrom`) against
+/// both a real `Set` and a SET-LIKE operand (`{size, has, keys}`).
+///
+/// Each operation branches on the two sizes and walks the smaller side, and
+/// which side is walked decides the RESULT ORDER and which of the operand's
+/// methods runs — so the sizes are varied deliberately rather than left equal,
+/// and the set-like arm is emitted as often as the plain one. The error paths
+/// (a non-object operand, a NaN or negative `size`, a non-callable `has`) are
+/// generated too: their messages are observable through `e.message`.
+fn gen_setops(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const OPS: &[&str] = &["union", "intersection", "difference", "symmetricDifference"];
+    const PREDS: &[&str] = &["isSubsetOf", "isSupersetOf", "isDisjointFrom"];
+    // Deliberately different lengths so both size branches are exercised.
+    const LEFT: &[&str] = &["[1,2,3]", "[3,1]", "[]", "[2]", "[1,2,3,4,5]"];
+    const RIGHT: &[&str] = &["[2,3]", "[9]", "[]", "[1,2,3]", "[3,4]"];
+    let l = pick(r, LEFT);
+    let rt = pick(r, RIGHT);
+    match r.below(7) {
+        0 => vec![format!(
+            "console.log([...new Set({l}).{}(new Set({rt}))]);",
+            pick(r, OPS)
+        )],
+        1 => vec![format!(
+            "console.log(new Set({l}).{}(new Set({rt})));",
+            pick(r, PREDS)
+        )],
+        // A set-like operand: `has`/`keys` are what the spec calls, so a run
+        // that only ever passes real Sets never checks that they are called.
+        2 => vec![
+            format!("const other = {{ size: {rt}.length, has: v => {rt}.includes(v), keys: () => {rt}[Symbol.iterator]() }};"),
+            format!("console.log([...new Set({l}).{}(other)]);", pick(r, OPS)),
+        ],
+        3 => vec![
+            format!("const other = {{ size: {rt}.length, has: v => {rt}.includes(v), keys: () => {rt}[Symbol.iterator]() }};"),
+            format!("console.log(new Set({l}).{}(other));", pick(r, PREDS)),
+        ],
+        // The result is a plain Set even for a subclass receiver, and never
+        // aliases either operand.
+        4 => vec![
+            format!("class S extends Set {{}}; const a = new S({l}); const b = new Set({rt});"),
+            format!("const c = a.{}(b);", pick(r, OPS)),
+            "console.log(c.constructor.name, c === a, c === b, c instanceof Set);".into(),
+        ],
+        5 => vec![
+            format!("const bad = {};", pick(r, &["7", "'s'", "null", "{ size: NaN, has(){}, keys(){} }", "{ size: -1, has(){}, keys(){} }", "{ size: 1, has: 1, keys(){} }"])),
+            format!("try {{ new Set({l}).{}(bad); console.log('no throw'); }} catch (e) {{ console.log(e.constructor.name, e.message); }}", pick(r, OPS)),
+        ],
+        // `-0`/`NaN` are SameValueZero keys: `-0` normalizes to `0` and `NaN`
+        // matches itself, in the result as well as in the membership tests.
+        _ => vec![format!(
+            "console.log([...new Set([-0, NaN, 1]).{}(new Set([0, NaN, 2]))]);",
+            pick(r, OPS)
+        )],
+    }
+}
+
+/// A STRING viewed as an object: its own index keys, `length`, and the
+/// descriptors of both. `Object.keys`/`values`/`entries`/`assign`, spread,
+/// `for-in` and `getOwnPropertyNames`/`Descriptor` are all the same underlying
+/// question asked through different doors, and node-js answered them
+/// inconsistently for a string PRIMITIVE (empty) while agreeing for the boxed
+/// `new String(...)` — so both spellings are generated for every view.
+fn gen_strkeys(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const STRS: &[&str] = &["''", "'a'", "'ab'", "'abc'", "'a b'", "'\\u00e9x'"];
+    let s = pick(r, STRS);
+    let boxed = if r.below(2) == 0 {
+        s.to_string()
+    } else {
+        format!("new String({s})")
+    };
+    match r.below(8) {
+        0 => vec![format!("console.log(Object.keys({boxed}), Object.values({boxed}));")],
+        1 => vec![format!("console.log(Object.entries({boxed}));")],
+        2 => vec![format!(
+            "console.log(Object.getOwnPropertyNames({boxed}));"
+        )],
+        3 => vec![format!(
+            "console.log(Object.getOwnPropertyDescriptor({boxed}, {}), Object.getOwnPropertyDescriptor({boxed}, 'length'));",
+            r.below(4)
+        )],
+        4 => vec![format!(
+            "console.log(JSON.stringify(Object.assign({{}}, {boxed})), JSON.stringify({{ ...{s} }}));"
+        )],
+        5 => vec![format!(
+            "const out = []; for (const k in {boxed}) out.push(k); console.log(out);"
+        )],
+        6 => vec![format!(
+            "console.log(Object.getOwnPropertyDescriptors({boxed}));"
+        )],
+        // `Symbol.toStringTag` decides the brand for EVERY string conversion,
+        // not only the explicit `Object.prototype.toString.call`.
+        _ => vec![
+            format!("const o = {}; ", pick(r, &["{ [Symbol.toStringTag]: 'T' }", "new (class { get [Symbol.toStringTag]() { return 'D'; } })()", "{}", "new Map()"])),
+            "console.log(String(o), `${o}`, o + '', o.toString(), Object.prototype.toString.call(o));".into(),
+        ],
     }
 }
 
@@ -1833,6 +2014,8 @@ enum Mode {
     Class,
     Generator,
     MapSet,
+    SetOps,
+    StrKeys,
     Proto,
     Async,
     Bigint,
@@ -1867,6 +2050,8 @@ const REAL_MODES: &[Mode] = &[
     Mode::Class,
     Mode::Generator,
     Mode::MapSet,
+    Mode::SetOps,
+    Mode::StrKeys,
     Mode::Proto,
     Mode::Async,
     Mode::Bigint,
@@ -1908,6 +2093,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Class => gen_class(seed),
         Mode::Generator => gen_generator(seed),
         Mode::MapSet => gen_mapset(seed),
+        Mode::SetOps => gen_setops(seed),
+        Mode::StrKeys => gen_strkeys(seed),
         Mode::Proto => gen_proto(seed),
         Mode::Async => gen_async(seed),
         Mode::Bigint => gen_bigint(seed),
@@ -1945,6 +2132,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Class => "class",
         Mode::Generator => "generator",
         Mode::MapSet => "mapset",
+        Mode::SetOps => "setops",
+        Mode::StrKeys => "strkeys",
         Mode::Proto => "proto",
         Mode::Async => "async",
         Mode::Bigint => "bigint",
@@ -1981,6 +2170,8 @@ const ALL_MODES: &[Mode] = &[
     Mode::Class,
     Mode::Generator,
     Mode::MapSet,
+    Mode::SetOps,
+    Mode::StrKeys,
     Mode::Proto,
     Mode::Async,
     Mode::Bigint,
@@ -2275,7 +2466,7 @@ fn print_help() {
 fn main() {
     let args = parse_args();
     let bin = ours_bin();
-    let oracle = resolve_oracle();
+    let oracle = resolve_oracle(&bin);
     let timeout = Duration::from_millis(args.timeout_ms);
 
     if !bin.exists() {
