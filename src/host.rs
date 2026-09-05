@@ -5229,6 +5229,22 @@ impl JsHost {
                 })
                 .filter(|k| !enum_only || self.prop_attrs(v, k).enumerable)
                 .collect(),
+            // A STRING is an index-keyed exotic too (10.4.3): its own keys are
+            // its UTF-16 code-unit indices, plus the non-enumerable `length`.
+            // Without this arm every whole-object view of a string primitive was
+            // empty — `for (const k in 'ab')` iterated nothing, `Object.keys`
+            // and `Object.assign({}, 'ab')` reported `{}` — while `'ab'[0]` and
+            // `'ab'.length` answered normally, so the two views disagreed. The
+            // spread form `{...'ab'}` went through a different path and was
+            // already right, which is what made the gap easy to miss.
+            Some(JsObj::Str(s)) => {
+                let mut keys: Vec<String> =
+                    (0..crate::utf16::len(s)).map(|i| i.to_string()).collect();
+                if !enum_only {
+                    keys.push("length".into());
+                }
+                keys
+            }
             // `OrdinaryOwnPropertyKeys` on an array exotic: the integer indices
             // ascending, then the exotic non-enumerable `length`, then the
             // ordinary string keys in insertion order. Those ordinary keys have
@@ -5393,6 +5409,20 @@ pub fn own_enum_entries_deep(v: &Value) -> Vec<(String, Value)> {
             })
             .collect();
     }
+    // A string primitive's own entries are its code units. `own_enum_entries`
+    // cannot build them: allocating the one-character string for each index
+    // needs `&mut` host access, and it runs under a shared borrow.
+    if let Some(sv) = with_host(|h| match h.get(v) {
+        Some(JsObj::Str(s)) => Some(s.clone()),
+        _ => None,
+    }) {
+        let units = crate::utf16::Units::of(&sv);
+        return with_host(|h| {
+            (0..units.len())
+                .filter_map(|i| units.unit_str(i).map(|c| (i.to_string(), h.new_str(c))))
+                .collect()
+        });
+    }
     let accessor_keys: Vec<String> = with_host(|h| {
         h.own_accessor_keys(v)
             .into_iter()
@@ -5475,6 +5505,19 @@ pub fn call_named(name: &str, args: Vec<Value>) -> Result<Value, String> {
 
 /// `recv.name(args)`.
 pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // `undefined.foo()` is a `[[Get]]` and THEN a call (13.3.6 EvaluateCall), so
+    // the failure is the property read, not the call: node reports
+    // `Cannot read properties of undefined (reading 'foo')`. node-js ran the
+    // whole method dispatch against the nullish receiver, found nothing, and
+    // reported `undefined.foo is not a function` — the wrong error class of
+    // message for the single most common runtime fault in JS, and one that
+    // points at the callee instead of at the base that was nullish.
+    if with_host(|h| h.is_nullish(recv)) {
+        return Err(type_error(&format!(
+            "Cannot read properties of {} (reading '{name}')",
+            with_host(|h| h.str_of(recv))
+        )));
+    }
     // `this.#m(…)` is a `[[PrivateGet]]` followed by a call, so the brand check
     // comes first: an unbranded receiver throws here rather than reporting the
     // method missing. Only a `#`-prefixed name pays the extra probe.
@@ -7345,7 +7388,14 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
     // TypeError is reachable only there. The exotics whose property funnel has
     // no `toString` entry of its own (`Map`, `Set`, `Promise`, …) land here and
     // get the same `[object Tag]` brand V8 gives them.
-    if !called_any && !with_host(|h| h.has_null_proto(v)) {
+    // A proxy WITH a `get` trap is not one of those exotics: the trap answered
+    // for both method names, and if what came back was not callable there is
+    // nothing left to call — `String(new Proxy({}, { get: () => undefined }))`
+    // is a TypeError on node, where branding it `[object Object]` invented a
+    // conversion the trap explicitly refused. A TRAPLESS proxy is different: its
+    // read forwarded to the target, so `String(new Proxy(new Map(), {}))` gets
+    // the target's `[object Map]` brand exactly as the bare `Map` does.
+    if !called_any && !with_host(|h| h.has_null_proto(v)) && !crate::proxy::has_trap(v, "get") {
         return crate::builtins::proto_method(v, "Object:toString", Vec::new());
     }
     Err(type_error("Cannot convert object to primitive value"))
@@ -7720,13 +7770,34 @@ impl JsHost {
                 p.insert("constructor".into(), ctor_val);
             }
             self.hide_prop(&proto, "constructor");
-            // Only the three conversions need a thunk here: they are the ones
-            // `Object.prototype` also defines, so without a shadowing entry a
-            // wrapper would inherit the object forms and `String(new
-            // String("a"))` would report `[object Object]`. Every other method
-            // (`charAt`, `toFixed`, …) has no `Object.prototype` counterpart
-            // and reaches the primitive through `call_method`.
-            for m in ["toString", "valueOf", "toLocaleString"] {
+            // The three conversions must be here because `Object.prototype`
+            // also defines them: without a shadowing entry a wrapper would
+            // inherit the object forms and `String(new String("a"))` would
+            // report `[object Object]`.
+            //
+            // The REST are here because the prototype is a real object a script
+            // can read a method OFF of. Only the three were installed, on the
+            // reasoning that `charAt`/`toFixed`/… reach the primitive through
+            // `call_method` anyway — true for `s.charAt(0)` and false for the
+            // generic-borrowing form: `String.prototype.trim` read `undefined`,
+            // so `String.prototype.trim.call(s)` — and `Number.prototype
+            // .toFixed.call(n)`, and every `Array.prototype`-style borrow of a
+            // wrapper method — threw. `Array.prototype`/`Object.prototype`
+            // already carried their whole method set; these three did not.
+            let methods: Vec<&str> = ["toString", "valueOf", "toLocaleString"]
+                .into_iter()
+                .chain(match ctor {
+                    "String" => crate::builtins::STRING_PROTO_METHODS.iter().copied(),
+                    "Number" => crate::builtins::NUMBER_PROTO_METHODS.iter().copied(),
+                    _ => [].iter().copied(),
+                })
+                .collect();
+            let mut seen: Vec<&str> = Vec::new();
+            for m in methods {
+                if seen.contains(&m) {
+                    continue;
+                }
+                seen.push(m);
                 let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
                 if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
                     p.insert(m.to_string(), thunk);

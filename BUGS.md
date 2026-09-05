@@ -2229,3 +2229,89 @@ trap contradicts a non-configurable or non-extensible property of the target
 (reporting a frozen own property as absent, say). node-js reports the trap's
 answer as given. Every trap itself is real — the gap is the after-the-fact
 consistency audit, and it is listed here rather than papered over.
+
+## The ES2025 set operations, the string exotic object, and the tag brand
+
+Three whole-value views that node-js answered inconsistently. Each was found by
+probing the reference rather than by reading code, and each is pinned by
+`examples/setoperations.js` (byte-compared against node v26.8.1) plus the
+`setops` and `strkeys` fuzz modes.
+
+- **`Set` had none of the seven set operations.** `union`, `intersection`,
+  `difference`, `symmetricDifference`, `isSubsetOf`, `isSupersetOf` and
+  `isDisjointFrom` all reported `is not a function`. They are implemented as
+  24.2.4 specifies, which means more than the obvious element math:
+  - The right-hand operand is a **set-like record** (24.2.1.2 `GetSetRecord`):
+    any object with a numeric `size` and callable `has`/`keys`, read in that
+    order. `size` goes through `ToNumber` and is truncated toward zero, so
+    `-0.5` is accepted while `-1.5` reports `RangeError: '-1' is an invalid
+    size`; `NaN` reports `TypeError: The .size property is NaN`.
+  - Each operation walks the **smaller** side. That is observable, not an
+    optimization: it decides the result's order and whether the operand's `has`
+    or its `keys` runs. `new Set([3,1,2]).intersection(new Set([2,3]))` yields
+    the operand's order, `[2, 3]`, and never calls its `has`.
+  - `union` and `symmetricDifference` take the operand's iterator **before**
+    copying the receiver, so a `keys` that mutates the receiver is reflected in
+    the result.
+  - The result is always a plain `Set`: these methods are not species-aware, so
+    `class S extends Set {}` produces a `Set`, matching node.
+- **A string PRIMITIVE owned no properties.** `ToObject` boxes a string into an
+  exotic whose own keys are its UTF-16 code-unit indices plus a non-enumerable
+  `length` (10.4.3). node-js reported those for the explicitly boxed
+  `new String('ab')` and an EMPTY result for `'ab'`, so `Object.keys`,
+  `Object.values`, `Object.entries`, `Object.getOwnPropertyNames`,
+  `Object.getOwnPropertyDescriptor(s)`, `Object.assign({}, 'ab')` and
+  `for (const k in 'ab')` all disagreed with `'ab'[0]` and `'ab'.length`, which
+  answered normally. Object spread (`{...'ab'}`) went through a different path
+  and was already right, which is what kept the gap hidden. The string arm now
+  lives in `own_enum_data_keys`, the one source of truth all of those read.
+- **`Symbol.toStringTag` only reached the EXPLICIT brand call.**
+  `Object.prototype.toString.call(o)` honored the tag; `String(o)`, `` `${o}` ``,
+  `o + ''` and `o.toString()` — the spellings ordinary code uses — did not, and
+  branded a tagged object `[object Object]`. The default `Object.prototype
+  .toString` now performs the same 20.1.3.6 steps 16-17 lookup on every path.
+- **A proxy whose `get` trap returns no callable `toString` refuses the
+  conversion.** `String(new Proxy({}, { get: () => undefined }))` is a
+  `TypeError` on node; node-js fell back to the `[object Tag]` brand and invented
+  a conversion the trap had declined. The fallback is for exotics whose property
+  funnel exposes no `toString` (`Map`, `Set`, `Promise`), so it is now skipped
+  only when the proxy actually installs a `get` trap — a TRAPLESS proxy forwards
+  to its target and still brands `String(new Proxy(new Map(), {}))` as
+  `[object Map]`.
+
+Known gaps found alongside them, unfixed:
+
+| case | node v26.8.1 | node-js |
+| --- | --- | --- |
+| `Array.prototype.map.name`, `Math.max.length` | `'map'`, `2` | `undefined` — a builtin method is a dispatch thunk with no `name`/`length`/arity table |
+| `Object.getOwnPropertyDescriptor(Math, 'PI')` | a data descriptor | `undefined` — a builtin namespace member owns no descriptor |
+| `Set.prototype.union.call([], new Set())` | `TypeError: Method Set.prototype.union called on incompatible receiver [object Array]` | `TypeError: union is not a function` — the thunk dispatches by the RECEIVER's kind, so the branded message never runs |
+| `Object.getOwnPropertyNames(Math)` order | `abs, acos, acosh, …` | declaration order of node-js's own table |
+| `'é'.localeCompare('é')` (precomposed vs decomposed) | `0` | `-1` — comparison is by code unit; there is no collation (Intl is absent) |
+
+Two more borrows and one message, found in the same pass:
+
+- **A wrapper prototype carried only its three conversion methods.**
+  `String.prototype`, `Number.prototype` and `Boolean.prototype` are real
+  objects here, and only `toString`/`valueOf`/`toLocaleString` were installed on
+  them, on the reasoning that `s.charAt(0)` reaches the primitive through the
+  method dispatcher anyway. That is true of a direct call and false of the
+  generic-borrowing form libraries use: `String.prototype.trim` read `undefined`,
+  so `String.prototype.trim.call(s)` and `Number.prototype.toFixed.call(n)` threw
+  `Cannot read properties of undefined`. The prototypes now carry every method
+  of their type, taken from the same list the dispatcher matches against, so the
+  two views cannot drift. `Array`/`Object`/`Date`/`RegExp`/`Map`/`Set` already
+  worked and are pinned alongside them in `examples/protoborrow.js`.
+- **A method call on a nullish base reported the wrong failure.**
+  `undefined.foo()` is a `[[Get]]` followed by a call (13.3.6), so the failure is
+  the property read: node says `Cannot read properties of undefined (reading
+  'foo')`. node-js ran the whole dispatch against the nullish receiver and
+  reported `undefined.foo is not a function` — pointing at the callee rather than
+  at the base that was nullish, for the most common runtime fault in JS. A base
+  that EXISTS and lacks the method still reports the call (`({}).nope()` is
+  `nope is not a function`), and optional chaining still short-circuits.
+
+| still open | node v26.8.1 | node-js |
+| --- | --- | --- |
+| `(void 0)()` | `(void 0) is not a function` | `undefined is not a function` — the call-site text table records a callee's source text, and this callee is an expression rather than a name |
+

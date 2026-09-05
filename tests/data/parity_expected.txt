@@ -682,6 +682,24 @@ strict   TypeError TypeError TypeError TypeError
 strict2  TypeError TypeError
 sealed   silent 2 TypeError
 setters  written G 4
+==== protoborrow.js ====
+string   x b
+string2  AB bc
+number   1.00 ff
+boolean  true false
+typeof   function function function
+generic  [ 'a', 'b' ]
+own      true
+date     7
+regexp   true 2
+undef    TypeError: Cannot read properties of undefined (reading 'foo')
+null     TypeError: Cannot read properties of null (reading 'foo')
+chain    TypeError: Cannot read properties of undefined (reading 'b')
+read     TypeError: Cannot read properties of undefined (reading 'foo')
+index    TypeError: Cannot read properties of null (reading '0')
+absent   TypeError: {}.nope is not a function
+absent2  TypeError: [].nope is not a function
+optional undefined undefined undefined
 ==== reflection.js ====
 set-data 1 9
 set-accs undefined 5
@@ -753,6 +771,35 @@ units    [[1,2]] 1
 absent   undefined
 paths    [[1,2]] [[0,1]] [[1,2]]
 sticky   [[1,2]]
+==== setoperations.js ====
+union    [ 3, 1, 2 ]
+inter-l  [ 2, 3 ]
+inter-r  [ 2, 3 ]
+diff     [ 1, 3 ]
+symdiff  [ 2, 3 ]
+preds    true true true
+like     [ 1, 2, 9 ] [ 1 ] [ 2 ]
+like-p   true true true
+zeros    [ 0 ] [ NaN ]
+species  Set
+e-arg    TypeError: The .size property is NaN
+e-nan    TypeError: The .size property is NaN
+e-neg    RangeError: '-1' is an invalid size
+e-has    TypeError: string "has" is not a function
+e-keys   TypeError: Result of the keys method is not an object
+keys     [ '0', '1' ] [ 'a', 'b' ]
+entries  [ [ '0', 'a' ], [ '1', 'b' ] ]
+names    [ '0', '1', 'length' ] [ '0', '1', 'length' ]
+descr    { value: 'b', writable: false, enumerable: true, configurable: false }
+length   { value: 2, writable: false, enumerable: false, configurable: false }
+assign   {"0":"a","1":"b"} {"0":"a","1":"b"}
+for-in   [ '0', '1', '2' ]
+empty    [] [ 'length' ]
+tag      [object T] [object T] [object T] [object T]
+tag-get  [object D] [object D]
+exotics  [object Map] [object Math] [object Object]
+proxy    TypeError: Cannot convert object to primitive value
+proxy-t  [object Map]
 ==== streams.js ====
 transform A,B,C
 filter    keep,last

@@ -164,7 +164,10 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
   default and rest parameters; labeled `break`/`continue`.
 - `RegExp` (literals and constructor, named groups, the `String.prototype`
   regex methods), `Map` / `Set` / `WeakMap` / `WeakSet`, `Symbol`, `BigInt`,
-  typed arrays and `Buffer`.
+  typed arrays and `Buffer`. `Set` carries the ES2025 set operations —
+  `union`/`intersection`/`difference`/`symmetricDifference`/`isSubsetOf`/
+  `isSupersetOf`/`isDisjointFrom` — including the set-like operand form
+  (`{ size, has, keys }`), so a user-written set works on the right of each.
 - `Proxy` — all thirteen traps plus `Proxy.revocable` — and the full `Reflect`
   namespace. A proxy intercepts the OPERATORS, not just the `Reflect` calls:
   reads, writes, `in`, `delete`, `for-in`, spread, `JSON.stringify`, iteration,

@@ -60,6 +60,17 @@ fn revoked_err(op: &str) -> String {
 /// `Ok(None)` means "not a proxy, or no such trap" — the caller runs its
 /// ordinary path (against the target, for the no-trap case). A revoked proxy
 /// and a non-callable trap both throw here, before any target work happens.
+/// Whether this proxy's handler installs `name` as a callable trap.
+///
+/// Distinguishes "the trap answered, and this is its answer" from "there is no
+/// trap, so the read forwarded to the target" — the two are indistinguishable
+/// in the returned value, and `ToPrimitive` has to tell them apart: a `get`
+/// trap that hands back a non-callable `toString` refuses the conversion, while
+/// a trapless proxy over a `Map` brands as its target does.
+pub fn has_trap(v: &Value, name: &str) -> bool {
+    matches!(trap(v, name), Ok(Some(_)))
+}
+
 fn trap(v: &Value, name: &str) -> Result<Option<(Value, Value, Value)>, String> {
     let Some((target, handler)) = parts(v) else {
         return Ok(None);

@@ -1300,6 +1300,28 @@ pub fn is_object_builtin_method(name: &str) -> bool {
     )
 }
 
+/// The `Symbol.toStringTag` STRING on `recv`'s chain, if any — steps 16-17 of
+/// 20.1.3.6, the hook by which a class names its own brand.
+///
+/// A Proxy has no chain to probe: the step is an unconditional
+/// `Get(O, @@toStringTag)`, so its `get` trap decides. Probing first (as an
+/// ordinary receiver does, to keep the read off objects that carry no tag)
+/// would always miss and brand every tagged proxy `[object Object]`.
+///
+/// The read runs OUTSIDE the host borrow so a getter-valued tag can be invoked.
+fn to_string_tag(recv: &Value) -> Result<Option<String>, String> {
+    let tagged = with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy)
+        || with_host(|h| {
+            host::lookup_chain(h, recv, "@@toStringTag").is_some()
+                || host::lookup_accessor(h, recv, "@@toStringTag").is_some()
+        });
+    if !tagged {
+        return Ok(None);
+    }
+    let t = get_property(recv, "@@toStringTag")?;
+    Ok(with_host(|h| h.as_str(&t)))
+}
+
 /// Dispatch an `Object.prototype` builtin method on an object/instance.
 pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
@@ -1405,12 +1427,22 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             let has = with_host(|h| h.own_enum_key_names(recv).contains(&k));
             Ok(Value::Bool(has))
         }
-        "toString" => Ok(with_host(|h| {
+        "toString" => {
             // An instance with a custom `toString` up the chain is handled by
-            // call_method before reaching here; this is the default.
-            let s = h.str_of(recv);
-            h.new_str(s)
-        })),
+            // call_method before reaching here; this is the default — and the
+            // default consults `Symbol.toStringTag` (20.1.3.6 steps 16-17).
+            // Only the EXPLICIT `Object.prototype.toString.call(o)` did, so a
+            // tagged object branded itself `[object T]` when asked one way and
+            // `[object Object]` when converted the other (`String(o)`, `${o}`,
+            // `o + ''`, `o.toString()`), which is the path ordinary code takes.
+            if let Some(t) = to_string_tag(recv)? {
+                return Ok(with_host(|h| h.new_str(format!("[object {t}]"))));
+            }
+            Ok(with_host(|h| {
+                let s = h.str_of(recv);
+                h.new_str(s)
+            }))
+        }
         // `Object.prototype.toLocaleString` (20.1.3.5) is defined as
         // `Invoke(this, "toString")` — no locale behavior of its own. It was
         // installed as a thunk on `Object.prototype` but had no dispatch arm, so
@@ -1479,7 +1511,21 @@ fn is_map_method(name: &str) -> bool {
 fn is_set_method(name: &str) -> bool {
     matches!(
         name,
-        "add" | "has" | "delete" | "clear" | "forEach" | "keys" | "values" | "entries"
+        "add"
+            | "has"
+            | "delete"
+            | "clear"
+            | "forEach"
+            | "keys"
+            | "values"
+            | "entries"
+            | "union"
+            | "intersection"
+            | "difference"
+            | "symmetricDifference"
+            | "isSubsetOf"
+            | "isSupersetOf"
+            | "isDisjointFrom"
     )
 }
 fn is_generator_method(name: &str) -> bool {
@@ -1739,16 +1785,8 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         // `Get(O, @@toStringTag)`, so the `get` trap decides. Probing first (as
         // the ordinary receiver does, to keep the read off objects that have no
         // tag) would always miss and brand every tagged proxy `[object Object]`.
-        let tagged = with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy)
-            || with_host(|h| {
-                host::lookup_chain(h, recv, "@@toStringTag").is_some()
-                    || host::lookup_accessor(h, recv, "@@toStringTag").is_some()
-            });
-        if tagged {
-            let t = get_property(recv, "@@toStringTag")?;
-            if let Some(s) = with_host(|h| h.as_str(&t)) {
-                return Ok(with_host(|h| h.new_str(format!("[object {s}]"))));
-            }
+        if let Some(s) = to_string_tag(recv)? {
+            return Ok(with_host(|h| h.new_str(format!("[object {s}]"))));
         }
         return Ok(with_host(|h| h.new_str(object_tag(h, recv))));
     }
@@ -5500,6 +5538,33 @@ fn pseudo_random() -> f64 {
 
 // ── Object.* ──────────────────────────────────────────────────────────────────
 
+/// The characters of a string PRIMITIVE, as the `ToObject` wrapper's own index
+/// properties (10.4.3 `StringExoticObject`).
+///
+/// `getOwnPropertyDescriptor` begins with `ToObject`, which boxes a string into
+/// an exotic object whose own keys are its code-unit indices plus `length`;
+/// this is the descriptor half of that. (The KEY half lives in
+/// `JsHost::own_enum_data_keys`, the single source every enumeration path
+/// reads.) Indices are UTF-16 code units, matching `.length` and `s[i]`.
+///
+/// A boxed `String` object is deliberately NOT routed here: it can carry
+/// ordinary own properties too (`const s = new String('ab'); s.x = 1`), and its
+/// existing path already reports them alongside the indices.
+fn string_primitive_units(v: &Value) -> Option<Vec<String>> {
+    // A JS string primitive rides as a `Value::Obj` handle to `JsObj::Str` (see
+    // `host.rs`); a BOXED `new String(...)` is a different heap object, so this
+    // never catches one.
+    let s = match v {
+        Value::Str(s) => (**s).clone(),
+        _ => with_host(|h| match h.get(v) {
+            Some(JsObj::Str(s)) => Some(s.clone()),
+            _ => None,
+        })?,
+    };
+    let units = crate::utf16::Units::of(&s);
+    Some((0..units.len()).filter_map(|i| units.unit_str(i)).collect())
+}
+
 fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
     let v = arg0(&args);
     require_object_coercible(&v)?;
@@ -6622,46 +6687,54 @@ fn is_array_method(name: &str) -> bool {
             | "copyWithin"
     )
 }
+/// Every `String.prototype` method node-js implements.
+///
+/// A LIST rather than a `matches!` arm because the same set has to be installed
+/// on the real `String.prototype` object: a method read off the prototype
+/// (`String.prototype.trim.call(s)`, the generic-borrowing idiom libraries use)
+/// found nothing there, so the two views of "which methods exist" would drift
+/// if they were written twice.
+pub(crate) const STRING_PROTO_METHODS: &[&str] = &[
+    "toUpperCase",
+    "toLowerCase",
+    "charAt",
+    "charCodeAt",
+    "codePointAt",
+    "indexOf",
+    "lastIndexOf",
+    "includes",
+    "slice",
+    "substring",
+    "substr",
+    "split",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "replace",
+    "replaceAll",
+    "repeat",
+    "startsWith",
+    "endsWith",
+    "padStart",
+    "padEnd",
+    "concat",
+    "at",
+    "toString",
+    "toLocaleString",
+    "valueOf",
+    "match",
+    "matchAll",
+    "search",
+    "normalize",
+    "localeCompare",
+    "toLocaleUpperCase",
+    "toLocaleLowerCase",
+    "isWellFormed",
+    "toWellFormed",
+];
+
 fn is_string_method(name: &str) -> bool {
-    matches!(
-        name,
-        "toUpperCase"
-            | "toLowerCase"
-            | "charAt"
-            | "charCodeAt"
-            | "codePointAt"
-            | "indexOf"
-            | "lastIndexOf"
-            | "includes"
-            | "slice"
-            | "substring"
-            | "substr"
-            | "split"
-            | "trim"
-            | "trimStart"
-            | "trimEnd"
-            | "replace"
-            | "replaceAll"
-            | "repeat"
-            | "startsWith"
-            | "endsWith"
-            | "padStart"
-            | "padEnd"
-            | "concat"
-            | "at"
-            | "toString"
-            | "toLocaleString"
-            | "valueOf"
-            | "match"
-            | "matchAll"
-            | "search"
-            | "normalize"
-            | "localeCompare"
-            | "toLocaleUpperCase"
-            | "toLocaleLowerCase"
-            | "isWellFormed"
-            | "toWellFormed"
-    )
+    STRING_PROTO_METHODS.contains(&name)
 }
 
 /// Whether `v` is a `RegExp` value (drives the regex path of `match`/`replace`/…).
@@ -6695,11 +6768,19 @@ fn replace_str_fn(s: &str, pat: &str, repl: &Value, all: bool) -> Result<String,
     out.push_str(rest);
     Ok(out)
 }
+/// Every `Number.prototype` method node-js implements — a list for the same
+/// reason [`STRING_PROTO_METHODS`] is one.
+pub(crate) const NUMBER_PROTO_METHODS: &[&str] = &[
+    "toFixed",
+    "toExponential",
+    "toString",
+    "toPrecision",
+    "toLocaleString",
+    "valueOf",
+];
+
 fn is_number_method(name: &str) -> bool {
-    matches!(
-        name,
-        "toFixed" | "toExponential" | "toString" | "toPrecision" | "toLocaleString" | "valueOf"
-    )
+    NUMBER_PROTO_METHODS.contains(&name)
 }
 
 /// The exotic kinds whose own dispatch table does NOT already reach the
@@ -7068,6 +7149,54 @@ fn array_len(recv: &Value) -> usize {
     .unwrap_or(0)
 }
 
+/// `ArraySpeciesCreate(originalArray, length)` (23.1.3.4) — the constructor an
+/// array method builds its RESULT with.
+///
+/// `map`, `filter`, `slice`, `concat`, `splice`, `flat` and `flatMap` all
+/// produce an array of the receiver's own species, so on a `class A extends
+/// Array` the result is an `A`. Every one of them allocated a plain array
+/// instead, so `A.from([1]).map(x => x) instanceof A` was false.
+///
+/// The default `get [Symbol.species]() { return this }` is what makes the
+/// subclass the species; a class overriding it with `Array` gets a plain array
+/// back, which is the documented way to opt out.
+fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String> {
+    let plain = || with_host(|h| h.new_array(items.clone()));
+    // Only a subclass instance can have a species of its own: a plain array's
+    // `constructor` is the `Array` builtin, whose species is `Array`.
+    let ctor = get_property(recv, "constructor").unwrap_or(Value::Undef);
+    if !matches!(
+        with_host(|h| h.kind_of(&ctor)),
+        Some(ObjKind::Class) | Some(ObjKind::Func)
+    ) {
+        return Ok(plain());
+    }
+    // An explicit `@@species` wins; absent one, the constructor itself is the
+    // species, as the inherited accessor returns `this`.
+    let species = match get_property(&ctor, "@@species") {
+        Ok(Value::Undef) => ctor,
+        Ok(s) if with_host(|h| h.is_null(&s)) => return Ok(plain()),
+        Ok(s) => s,
+        Err(_) => ctor,
+    };
+    if !matches!(
+        with_host(|h| h.kind_of(&species)),
+        Some(ObjKind::Class) | Some(ObjKind::Func)
+    ) {
+        return Ok(plain());
+    }
+    let out = host::construct(&species, vec![Value::Float(items.len() as f64)])?;
+    // The constructor is called with the LENGTH, so the elements are written
+    // afterwards — which is also what lets a subclass constructor observe the
+    // allocation, as node's does.
+    with_host(|h| {
+        if let Some(JsObj::Array(dst)) = h.get_mut(&out) {
+            *dst = items;
+        }
+    });
+    Ok(out)
+}
+
 fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     array_method_on(recv, recv, name, args)
 }
@@ -7289,11 +7418,9 @@ fn array_method_on(
         "slice" => {
             let items = array_items(recv);
             let (lo, hi) = slice_bounds(&args, items.len());
-            Ok(with_host(|h| {
-                let out = h.new_array(items[lo..hi].to_vec());
-                h.copy_holes(recv, &out, |i| (i >= lo && i < hi).then(|| i - lo));
-                out
-            }))
+            let out = array_species_create(recv, items[lo..hi].to_vec())?;
+            with_host(|h| h.copy_holes(recv, &out, |i| (i >= lo && i < hi).then(|| i - lo)));
+            Ok(out)
         }
         "concat" => {
             let mut out = array_items(recv);
@@ -7437,11 +7564,9 @@ fn array_method_on(
                     this_arg(&args, 1),
                 )?);
             }
-            Ok(with_host(|h| {
-                let arr = h.new_array(out);
-                h.install_holes(&arr, holes);
-                arr
-            }))
+            let arr = array_species_create(recv, out)?;
+            with_host(|h| h.install_holes(&arr, holes));
+            Ok(arr)
         }
         "flatMap" => {
             let items = array_items(recv);
@@ -7482,7 +7607,7 @@ fn array_method_on(
                     out.push(it.clone());
                 }
             }
-            Ok(with_host(|h| h.new_array(out)))
+            array_species_create(recv, out)
         }
         "forEach" => {
             let items = array_items(recv);
@@ -9290,6 +9415,241 @@ fn reject_non_object_weak_key(recv: &Value, key: &Value, kind: &str) -> Result<(
     }))
 }
 
+/// A `Set`-like operand of the ES2025 set methods — 24.2.1.2 `GetSetRecord`.
+///
+/// The seven set operations do NOT require a real `Set` on the right-hand side:
+/// anything with a numeric `size` and callable `has`/`keys` participates, which
+/// is what lets a `Map`'s key view or a user-written set stand in. The reads
+/// happen in this order (`size`, `has`, `keys`) and each failure has its own
+/// diagnostic, so a bad operand reports which field was wrong rather than
+/// failing later inside the iteration.
+struct SetRecord {
+    obj: Value,
+    /// `size` truncated toward zero, as the spec's `intSize` is; the fractional
+    /// part is dropped BEFORE the negative check, so `size: -0.5` truncates to
+    /// `-0` and is accepted while `-1.5` reports `'-1' is an invalid size`.
+    size: f64,
+    has: Value,
+    keys: Value,
+}
+
+fn get_set_record(other: &Value, method: &str) -> Result<SetRecord, String> {
+    if !with_host(|h| is_object_like(h, other)) {
+        return Err(host::type_error(&format!(
+            "Set.prototype.{method} argument must be an object"
+        )));
+    }
+    let raw = get_property(other, "size")?;
+    let num = host::to_number_value(&raw)?;
+    if num.is_nan() {
+        return Err(host::type_error("The .size property is NaN"));
+    }
+    let size = num.trunc();
+    if size < 0.0 {
+        return Err(host::range_error(&format!("'{size}' is an invalid size")));
+    }
+    let has = get_property(other, "has")?;
+    if !with_host(|h| host::is_callable(h, &has)) {
+        return Err(host::type_error("string \"has\" is not a function"));
+    }
+    let keys = get_property(other, "keys")?;
+    if !with_host(|h| host::is_callable(h, &keys)) {
+        return Err(host::type_error("string \"keys\" is not a function"));
+    }
+    Ok(SetRecord {
+        obj: other.clone(),
+        size,
+        has,
+        keys,
+    })
+}
+
+impl SetRecord {
+    /// `Call(has, obj, [v])`, coerced to a boolean the way the spec's
+    /// `ToBoolean(Call(...))` is — a set-like may answer with anything truthy.
+    fn has(&self, v: &Value) -> Result<bool, String> {
+        let r = host::invoke(&self.has, vec![v.clone()], Some(self.obj.clone()))?;
+        Ok(with_host(|h| h.truthy(&r)))
+    }
+
+    /// The operand's elements, drained from the iterator its `keys` method
+    /// returns. A non-object result is the spec's `Result of the keys method is
+    /// not an object`, reported before anything is iterated.
+    fn keys(&self) -> Result<Vec<Value>, String> {
+        let it = host::invoke(&self.keys, Vec::new(), Some(self.obj.clone()))?;
+        if !with_host(|h| is_object_like(h, &it)) {
+            return Err(host::type_error(
+                "Result of the keys method is not an object",
+            ));
+        }
+        host::drain_iterator(&it)
+    }
+}
+
+/// The receiver of a set operation must be a real (non-weak) `Set`: these seven
+/// methods read `[[SetData]]` directly, so a look-alike cannot stand in on the
+/// LEFT even though it can on the right.
+fn require_set_receiver(recv: &Value, method: &str) -> Result<(), String> {
+    if with_host(|h| matches!(h.get(recv), Some(JsObj::Set { weak: false, .. }))) {
+        return Ok(());
+    }
+    Err(host::type_error(&format!(
+        "Method Set.prototype.{method} called on incompatible receiver {}",
+        with_host(|h| object_tag(h, recv))
+    )))
+}
+
+/// The receiver's elements, READ AT THE POINT THE SPEC READS THEM.
+///
+/// Every one of these operations copies `[[SetData]]` *after* it has touched
+/// the operand — `union` and `symmetricDifference` call the operand's `keys`
+/// first — so a `keys` (or a `has`) that mutates the receiver is visible in the
+/// result. Snapshotting the receiver up front instead dropped such an element:
+/// node's `s.union({ keys(){ s.add(99); … } })` contains `99`.
+fn set_values(recv: &Value) -> Vec<Value> {
+    with_host(|h| match h.get(recv) {
+        Some(JsObj::Set { entries, .. }) => entries.values().cloned().collect(),
+        _ => Vec::new(),
+    })
+}
+
+fn set_size(recv: &Value) -> f64 {
+    with_host(|h| match h.get(recv) {
+        Some(JsObj::Set { entries, .. }) => entries.len() as f64,
+        _ => 0.0,
+    })
+}
+
+/// A fresh, ordinary `Set`. The set operations are NOT species-aware: on node
+/// `class S extends Set {}`, `new S([1]).union(other).constructor` is `Set`.
+fn new_set(items: Vec<Value>) -> Result<Value, String> {
+    let s = with_host(|h| {
+        h.alloc(JsObj::Set {
+            entries: IndexMap::new(),
+            weak: false,
+        })
+    });
+    for v in items {
+        set_method(&s, "add", vec![v])?;
+    }
+    Ok(s)
+}
+
+fn set_contains(s: &Value, v: &Value) -> bool {
+    let key = with_host(|h| host::map_key(h, v));
+    with_host(
+        |h| matches!(h.get(s), Some(JsObj::Set { entries, .. }) if entries.contains_key(&key)),
+    )
+}
+
+/// The seven ES2025 set operations (24.2.4.3, .8, .5, .16, .10, .12, .7).
+///
+/// Each one branches on the two sizes and iterates the SMALLER side — not an
+/// optimization but observable behaviour: which side is walked decides the
+/// result's order and whether the operand's `has` or its `keys` is the method
+/// that runs. `intersection` of a 3-element receiver with a 2-element operand
+/// yields the operand's order, and its `keys` (never its `has`) is called.
+fn set_operation(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    require_set_receiver(recv, name)?;
+    let other = get_set_record(&arg0(&args), name)?;
+    let my_size = set_size(recv);
+    match name {
+        "union" => {
+            let keys = other.keys()?;
+            let mut out = set_values(recv);
+            out.extend(keys);
+            new_set(out)
+        }
+        "intersection" => {
+            let mut out = Vec::new();
+            if my_size <= other.size {
+                for v in set_values(recv) {
+                    if other.has(&v)? {
+                        out.push(v);
+                    }
+                }
+            } else {
+                for k in other.keys()? {
+                    if set_contains(recv, &k) {
+                        out.push(k);
+                    }
+                }
+            }
+            new_set(out)
+        }
+        "difference" => {
+            if my_size <= other.size {
+                let mut out = Vec::new();
+                for v in set_values(recv) {
+                    if !other.has(&v)? {
+                        out.push(v);
+                    }
+                }
+                return new_set(out);
+            }
+            let out = new_set(set_values(recv))?;
+            for k in other.keys()? {
+                set_method(&out, "delete", vec![k])?;
+            }
+            Ok(out)
+        }
+        "symmetricDifference" => {
+            // The operand is drained FIRST — the spec takes the iterator before
+            // it copies `[[SetData]]`, so a `keys` that mutates the receiver is
+            // reflected in the result.
+            let keys = other.keys()?;
+            let out = new_set(set_values(recv))?;
+            for k in keys {
+                if set_contains(recv, &k) {
+                    set_method(&out, "delete", vec![k])?;
+                } else {
+                    set_method(&out, "add", vec![k])?;
+                }
+            }
+            Ok(out)
+        }
+        "isSubsetOf" => {
+            if my_size > other.size {
+                return Ok(Value::Bool(false));
+            }
+            for v in set_values(recv) {
+                if !other.has(&v)? {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        "isSupersetOf" => {
+            if my_size < other.size {
+                return Ok(Value::Bool(false));
+            }
+            for k in other.keys()? {
+                if !set_contains(recv, &k) {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        "isDisjointFrom" => {
+            if my_size <= other.size {
+                for v in set_values(recv) {
+                    if other.has(&v)? {
+                        return Ok(Value::Bool(false));
+                    }
+                }
+            } else {
+                for k in other.keys()? {
+                    if set_contains(recv, &k) {
+                        return Ok(Value::Bool(false));
+                    }
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        _ => Err(host::type_error(&format!("set.{name} is not a function"))),
+    }
+}
+
 fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "add" => {
@@ -9335,6 +9695,13 @@ fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
             }
             Ok(Value::Undef)
         }
+        "union"
+        | "intersection"
+        | "difference"
+        | "symmetricDifference"
+        | "isSubsetOf"
+        | "isSupersetOf"
+        | "isDisjointFrom" => set_operation(recv, name, args),
         // LIVE, as for `Map`. A Set's `keys` and `values` are the same thing.
         "keys" | "values" | "entries" | "@@iterator" => Ok(collection_iterator(
             recv,
@@ -9906,6 +10273,29 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
     require_object_coercible(&obj)?;
     let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+    // A string primitive's boxed own properties: each code-unit index is an
+    // enumerable, non-writable, non-configurable data property, and `length` is
+    // the same minus enumerable.
+    if let Some(units) = string_primitive_units(&obj) {
+        let entry = match key.parse::<usize>() {
+            Ok(i) => units
+                .get(i)
+                .map(|c| (with_host(|h| h.new_str(c.clone())), true)),
+            Err(_) if key == "length" => Some((Value::Float(units.len() as f64), false)),
+            Err(_) => None,
+        };
+        return Ok(match entry {
+            Some((value, enumerable)) => with_host(|h| {
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("value".into(), value);
+                m.insert("writable".into(), Value::Bool(false));
+                m.insert("enumerable".into(), Value::Bool(enumerable));
+                m.insert("configurable".into(), Value::Bool(false));
+                h.new_object(m)
+            }),
+            None => Value::Undef,
+        });
+    }
     if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
         return Ok(crate::proxy::get_own_descriptor(&obj, &key)?.unwrap_or(Value::Undef));
     }
