@@ -32,6 +32,14 @@ const ctors = ['Object','Function','Array','String','Number','Boolean','Symbol',
 const globals = ['parseInt','parseFloat','isNaN','isFinite','encodeURIComponent','decodeURIComponent','encodeURI','decodeURI','structuredClone','queueMicrotask','btoa','atob'];
 const rows = [];
 const add = (key, f) => { if (typeof f === 'function') rows.push(key + '\t' + f.name + '\t' + f.length); };
+// The well-known symbols this frontend represents, spelled the way it spells
+// them as property keys: `Symbol.iterator` is the internal key `@@iterator`.
+// A symbol-keyed method is a real intrinsic with a real `name` and `length`
+// (`Array.prototype[Symbol.iterator].name` is `'values'`, NOT `'@@iterator'`),
+// so leaving it out of the table did more than lose two numbers: it left the
+// caller with no way to ask whether a symbol-keyed method EXISTS, and a
+// prototype read of any absent one synthesized a function.
+const wellKnown = new Map([[Symbol.iterator,'@@iterator'],[Symbol.asyncIterator,'@@asyncIterator'],[Symbol.toPrimitive,'@@toPrimitive'],[Symbol.toStringTag,'@@toStringTag'],[Symbol.hasInstance,'@@hasInstance']]);
 const members = (holder, pre) => {
   for (const k of Object.getOwnPropertyNames(holder)) {
     if (k === 'prototype' || k === 'constructor' || k === 'caller' || k === 'arguments') continue;
@@ -39,6 +47,12 @@ const members = (holder, pre) => {
     if (pre === 'Error.' && k === 'prepareStackTrace') continue;
     let d; try { d = Object.getOwnPropertyDescriptor(holder, k); } catch { continue; }
     if (d && typeof d.value === 'function') add(pre + k, d.value);
+  }
+  for (const sym of Object.getOwnPropertySymbols(holder)) {
+    const key = wellKnown.get(sym);
+    if (!key) continue;
+    let d; try { d = Object.getOwnPropertyDescriptor(holder, sym); } catch { continue; }
+    if (d && typeof d.value === 'function') add(pre + key, d.value);
   }
 };
 for (const g of globals) add(g, globalThis[g]);

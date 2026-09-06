@@ -8147,6 +8147,43 @@ impl JsHost {
                 }
                 self.hide_prop(&proto, m);
             }
+            // `Symbol.prototype` and `BigInt.prototype` are the two wrapper
+            // prototypes that carry a `@@toStringTag`; the other three are
+            // branded by their internal slot instead, and node reports
+            // `undefined` for their tag. Without it
+            // `Object.prototype.toString.call(Symbol.prototype)` read
+            // `[object Object]` where node says `[object Symbol]`.
+            if matches!(ctor, "Symbol" | "BigInt") {
+                let tag = self.new_str(ctor.to_string());
+                if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                    p.insert("@@toStringTag".into(), tag);
+                }
+                // Not `hide_prop`: a well-known `@@toStringTag` is read-only as
+                // well as non-enumerable (20.4.3.6), and `hide_prop` leaves it
+                // writable.
+                self.set_prop_attrs(
+                    &proto,
+                    "@@toStringTag",
+                    PropAttrs {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+            // `Symbol.prototype[@@toPrimitive]` (20.4.3.5) is what a string or
+            // numeric conversion of a symbol reaches FIRST. Its absence was
+            // observable in the failure wording: `String(Symbol.prototype)`
+            // throws in node because `@@toPrimitive` rejects a non-Symbol
+            // `this`, and here the conversion fell through to `toString` and
+            // named that method in the message instead.
+            if ctor == "Symbol" {
+                let thunk = self.alloc(JsObj::Builtin("@proto:Symbol:@@toPrimitive".to_string()));
+                if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                    p.insert("@@toPrimitive".into(), thunk);
+                }
+                self.hide_prop(&proto, "@@toPrimitive");
+            }
             self.native_protos.insert(ctor.to_string(), proto);
         }
     }

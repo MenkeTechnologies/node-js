@@ -457,20 +457,46 @@ fn b_pow(vm: &mut VM, _: u8) -> Value {
 fn b_obj_rest(vm: &mut VM, _: u8) -> Value {
     let excluded = vm.pop();
     let obj = vm.pop();
+    // The excluded keys are normalized exactly as a property READ normalizes
+    // them, not merely stringified: a symbol key lives on the object under its
+    // internal `@@sym:<id>` spelling, and `str_of` renders it `Symbol(k)`, which
+    // matches no key at all — so `const { [sym]: v, ...rest } = o` left the
+    // symbol-keyed property in `rest`.
     let excl: Vec<String> = with_host(|h| h.iter_vec(&excluded))
         .unwrap_or_default()
         .iter()
-        .map(|v| with_host(|h| h.str_of(v)))
+        .filter_map(|v| host::to_property_key(v).ok())
         .collect();
     with_host(|h| {
-        let props: IndexMap<String, Value> = match h.get(&obj) {
-            Some(JsObj::Object(m)) => m
-                .iter()
-                .filter(|(k, _)| !excl.contains(k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            _ => IndexMap::new(),
+        // CopyDataProperties (ECMA-262 7.3.25) copies the own ENUMERABLE keys,
+        // symbol-keyed ones included. The filter used to be `!excl.contains(k)`
+        // alone, which also copied every non-enumerable own property —
+        // `Object.defineProperty(o, 'hidden', { enumerable: false })` then
+        // showed up in the rest object, where node omits it.
+        let keys: Vec<String> = match h.get(&obj) {
+            Some(JsObj::Object(m)) => m.keys().cloned().collect(),
+            _ => Vec::new(),
         };
+        let mut props: IndexMap<String, Value> = IndexMap::new();
+        for k in keys {
+            if excl.contains(&k) {
+                continue;
+            }
+            // An internal slot (`@@native`, `@@bytes`, …) or a private class
+            // field is not a property; a SYMBOL key shares the `@@` prefix but
+            // is one, so the two cases cannot be told apart by the prefix.
+            if !host::is_symbol_key(&k) && (k.starts_with("@@") || k.starts_with('#')) {
+                continue;
+            }
+            if !h.prop_attrs(&obj, &k).enumerable {
+                continue;
+            }
+            if let Some(JsObj::Object(m)) = h.get(&obj) {
+                if let Some(v) = m.get(&k) {
+                    props.insert(k, v.clone());
+                }
+            }
+        }
         h.new_object(props)
     })
 }
@@ -1015,7 +1041,18 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                 }
             }
             "toString" => bound_method(recv, name),
-            _ => Value::Undef,
+            // Anything else a symbol answers, it inherits from
+            // `Symbol.prototype`. The arm used to stop at `undefined`, so
+            // `Symbol('x')[Symbol.toPrimitive]` and `Symbol('x').valueOf` read
+            // as absent even though the prototype defines both — a symbol is an
+            // ordinary object for the purpose of a property LOOKUP, only its
+            // methods are branded.
+            _ => with_host(|h| {
+                h.ensure_wrapper_protos();
+                h.native_proto("Symbol")
+            })
+            .and_then(|p| with_host(|h| host::lookup_chain(h, &p, name)))
+            .unwrap_or(Value::Undef),
         },
         Some(ObjKind::BigInt) => {
             if matches!(
@@ -1860,8 +1897,40 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // A method read off a builtin prototype namespace (`Array.prototype.slice`):
     // a `@proto:<Ctor>:<method>` thunk that, when invoked (typically via
     // `.call`/`.apply`), dispatches `method` against the invoke-time `this`.
+    //
+    // The thunk is minted only for a name the prototype REALLY carries. Minting
+    // one unconditionally made every absent name answer with a function:
+    // `Array.prototype.totallyBogus` was `[Function: totallyBogus]` where node
+    // says `undefined`, and so was every well-known symbol a prototype does not
+    // define — `Array.prototype[Symbol.toStringTag]` came back a function
+    // instead of `undefined`, which is a value `Object.prototype.toString` and
+    // every `typeof`/truthiness test downstream then read wrong.
+    //
+    // Existence is decided by the generated intrinsic table, which is read out
+    // of the reference engine, so this cannot drift from what node defines.
+    // A name the prototype does not define but `Object.prototype` does is
+    // INHERITED, and node hands back Object.prototype's own function object
+    // (`Map.prototype.toString === Object.prototype.toString` is `true`), so it
+    // resolves to the `Object` thunk rather than a per-ctor one. That is also
+    // what makes `String(Map.prototype)` print `[object Map]`: `Map.prototype`
+    // has no own `toString`, and the inherited one is the generic tag reader,
+    // not a Map method that rejects a non-Map `this`.
     if let Some(ctor) = ns.strip_suffix(".prototype") {
-        return with_host(|h| h.alloc(JsObj::Builtin(format!("@proto:{ctor}:{name}"))));
+        if builtin_meta(&format!("@proto:{ctor}:{name}")).is_some() {
+            return with_host(|h| h.alloc(JsObj::Builtin(format!("@proto:{ctor}:{name}"))));
+        }
+        if ctor != "Object" && builtin_meta(&format!("@proto:Object:{name}")).is_some() {
+            return with_host(|h| h.alloc(JsObj::Builtin(format!("@proto:Object:{name}"))));
+        }
+        // `constructor` is excluded from the table because it is not a method:
+        // it is the constructor function itself, and node compares equal
+        // (`Array.prototype.constructor === Array`). It used to resolve to a
+        // `@proto:Array:constructor` thunk, which is a different object every
+        // read and so never compared equal to anything.
+        if name == "constructor" && is_builtin_ctor(ctor) {
+            return with_host(|h| h.alloc(JsObj::Builtin(ctor.to_string())));
+        }
+        return Value::Undef;
     }
     let qualified = format!("{ns}.{name}");
     if is_known_builtin(&qualified) {
@@ -2093,8 +2162,16 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     // The wording is Symbol's own, not the "incompatible receiver" form the
     // collections use.
     if ctor == "Symbol" && with_host(|h| h.kind_of(recv)) != Some(ObjKind::Symbol) {
+        // A symbol-KEYED method is named in brackets rather than after a dot:
+        // node's wording is `Symbol.prototype [ @@toPrimitive ] requires …`.
+        // That is the message `String(Symbol.prototype)` produces, since the
+        // conversion reaches `@@toPrimitive` before it would reach `toString`.
+        let named = match method.strip_prefix("@@") {
+            Some(sym) => format!("Symbol.prototype [ @@{sym} ]"),
+            None => format!("Symbol.prototype.{method}"),
+        };
         return Err(host::type_error(&format!(
-            "Symbol.prototype.{method} requires that 'this' be a Symbol"
+            "{named} requires that 'this' be a Symbol"
         )));
     }
     if let Some(label) = branded_method_label(ctor, recv) {
@@ -7341,7 +7418,7 @@ fn overrides_object_method(recv: &Value, name: &str) -> bool {
         Some(ObjKind::RegExp) => crate::regexp::is_regexp_method(name),
         // A Symbol has its own `toString`; `valueOf` is the inherited one,
         // which returns the receiver — exactly what a symbol needs.
-        Some(ObjKind::Symbol) => name == "toString",
+        Some(ObjKind::Symbol) => matches!(name, "toString" | "valueOf" | "@@toPrimitive"),
         Some(ObjKind::BigInt) => matches!(name, "toString" | "valueOf" | "toLocaleString"),
         _ => false,
     }
@@ -10354,6 +10431,11 @@ fn symbol_method(recv: &Value, name: &str, _args: Vec<Value>) -> Result<Value, S
             let s = h.str_of(recv);
             h.new_str(s)
         })),
+        // 20.4.3.5: `Symbol.prototype[@@toPrimitive]` returns the symbol
+        // itself for EVERY hint — it ignores its argument. That is what makes
+        // `sym + ''` a TypeError rather than a concatenation: the conversion
+        // succeeds and hands back a symbol, and it is `+` that then rejects it.
+        "@@toPrimitive" | "valueOf" => Ok(recv.clone()),
         _ => Err(host::type_error(&format!(
             "symbol.{name} is not a function"
         ))),

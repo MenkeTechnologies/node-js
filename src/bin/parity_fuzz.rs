@@ -2234,6 +2234,325 @@ fn gen_locale(seed: u64) -> Vec<String> {
     vec![format!("console.log({e});")]
 }
 
+/// Compound and logical ASSIGNMENT (`+=`, `>>>=`, `&&=`, `??=`).
+///
+/// A census of 40 000 generated programs found `+=` and `*=` in them and not one
+/// instance of the other thirteen assignment operators — no `-=`, no `/=`, no
+/// `%=`, no `**=`, none of the six bitwise/shift forms, and none of `&&=`,
+/// `||=`, `??=`. The whole family was untested, and the bug living in it was
+/// that the parser desugared `a op= b` into `a = a op b`: the target subtree was
+/// DUPLICATED, so `o[k()] += 1` called `k` twice where node calls it once, and
+/// the logical forms called it twice even when they short-circuited and never
+/// wrote at all.
+///
+/// Every case therefore prints a side-effect COUNT alongside the result. A
+/// generator that only printed the stored value would run this whole mode
+/// green against the very bug it exists to catch: `o[k()] += 1` lands the same
+/// number in `o.a` whether the key was computed once or twice. The count is the
+/// observable that separates them.
+fn gen_assign(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const BINOPS: &[&str] = &[
+        "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", ">>>=",
+    ];
+    const LOGOPS: &[&str] = &["&&=", "||=", "??="];
+    // Initial values that make every short-circuit branch reachable: falsy,
+    // nullish, truthy, and a string that turns `+=` into concatenation.
+    const INITS: &[&str] = &[
+        "0",
+        "1",
+        "5",
+        "-7",
+        "255",
+        "null",
+        "undefined",
+        "''",
+        "'ab'",
+        "NaN",
+        "2.5",
+        "-0",
+    ];
+    const RHS: &[&str] = &["1", "0", "2", "3", "-1", "'x'", "32", "33"];
+    let op = if r.below(2) == 0 {
+        pick(r, BINOPS)
+    } else {
+        pick(r, LOGOPS)
+    };
+    let init = pick(r, INITS);
+    let rhs = pick(r, RHS);
+    match r.below(8) {
+        // A computed key whose expression counts its own evaluations. This is
+        // the shape the desugaring got wrong.
+        0 => vec![
+            "let n = 0;".into(),
+            "const k = () => { n++; return 'a'; };".into(),
+            format!("const o = {{ a: {init} }};"),
+            format!("try {{ const v = (o[k()] {op} {rhs}); console.log(n, o.a, v); }} catch (e) {{ console.log(n, e.constructor.name); }}"),
+        ],
+        // The OBJECT expression counts too — it is evaluated before the key and
+        // must also happen exactly once.
+        1 => vec![
+            "let n = 0;".into(),
+            format!("const o = {{ a: {init} }};"),
+            "const g = () => { n++; return o; };".into(),
+            format!("try {{ const v = (g().a {op} {rhs}); console.log(n, o.a, v); }} catch (e) {{ console.log(n, e.constructor.name); }}"),
+        ],
+        // Object AND key both counted, which also pins their relative order.
+        2 => vec![
+            "const log = [];".into(),
+            format!("const o = {{ a: {init} }};"),
+            "const g = () => { log.push('o'); return o; };".into(),
+            "const k = () => { log.push('k'); return 'a'; };".into(),
+            format!("const v = () => {{ log.push('v'); return {rhs}; }};"),
+            format!("try {{ g()[k()] {op} v(); console.log(log.join(''), o.a); }} catch (e) {{ console.log(log.join(''), e.constructor.name); }}"),
+        ],
+        // An ACCESSOR target: the spec reads through the getter once and writes
+        // through the setter at most once, so both call counts are observable.
+        3 => vec![
+            "let gets = 0, sets = 0, stored;".into(),
+            format!("const o = {{ get a() {{ gets++; return {init}; }}, set a(v) {{ sets++; stored = v; }} }};"),
+            format!("try {{ o.a {op} {rhs}; console.log(gets, sets, stored); }} catch (e) {{ console.log(gets, sets, e.constructor.name); }}"),
+        ],
+        // An array element with a side-effecting index.
+        4 => vec![
+            "let i = 0;".into(),
+            format!("const a = [{init}, 9, 9];"),
+            format!("try {{ a[i++] {op} {rhs}; console.log(i, JSON.stringify(a)); }} catch (e) {{ console.log(i, e.constructor.name); }}"),
+        ],
+        // A plain identifier target: no reference to preserve, but the operator
+        // semantics still have to be right for all fifteen spellings.
+        5 => vec![
+            format!("let x = {init};"),
+            format!("try {{ const v = (x {op} {rhs}); console.log(x, v, typeof x); }} catch (e) {{ console.log(e.constructor.name); }}"),
+        ],
+        // BigInt operands: the mixing TypeError and the BigInt-preserving result
+        // both have to survive the read/compute/write round trip.
+        6 => {
+            let bop = pick(r, &["+=", "-=", "*=", "&=", "|=", "^=", "<<=", ">>=", "**=", "??=", "||="]);
+            let brhs = pick(r, &["2n", "0n", "1", "3n"]);
+            vec![
+                format!("const o = {{ v: {} }};", pick(r, &["8n", "0n", "-3n", "255n"])),
+                format!("try {{ o.v {bop} {brhs}; console.log(o.v, typeof o.v); }} catch (e) {{ console.log(e.constructor.name); }}"),
+            ]
+        }
+        // A frozen target: the write is discarded in sloppy mode, but the READ
+        // and the operator still run, and the expression still has a value.
+        _ => vec![
+            format!("const o = Object.freeze({{ a: {init} }});"),
+            "let n = 0;".into(),
+            "const k = () => { n++; return 'a'; };".into(),
+            format!("try {{ const v = (o[k()] {op} {rhs}); console.log(n, o.a, v); }} catch (e) {{ console.log(n, e.constructor.name); }}"),
+        ],
+    }
+}
+
+/// OPTIONAL CHAINING (`?.`, `?.[…]`, `?.(…)`) and its short-circuit.
+///
+/// The census found zero `?.` in 40 000 generated programs. The construct's
+/// whole point is what it SKIPS, so every case counts the evaluations of the
+/// parts after the `?.` — a short-circuited chain must not evaluate its
+/// arguments, its index expression, or anything further down the chain, and a
+/// generator that only printed the resulting value could not tell a correct
+/// short circuit from one that evaluated everything and threw the result away.
+fn gen_optional(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const BASES: &[&str] = &[
+        "null",
+        "undefined",
+        "{ a: { b: 1 } }",
+        "{ a: null }",
+        "{ a: undefined }",
+        "{ a: { b: 0 } }",
+        "0",
+        "''",
+        "false",
+    ];
+    let base = pick(r, BASES);
+    match r.below(7) {
+        // A short circuit must abandon the REST of the chain, including calls.
+        0 => vec![
+            "let n = 0;".into(),
+            "const f = () => { n++; return 1; };".into(),
+            format!("const o = {base};"),
+            "try { console.log(o?.a.b, n); } catch (e) { console.log(e.constructor.name, n); }"
+                .into(),
+            "try { console.log(o?.a?.b?.(f()), n); } catch (e) { console.log(e.constructor.name, n); }".into(),
+        ],
+        // The INDEX expression of a short-circuited `?.[…]` is never evaluated.
+        1 => vec![
+            "let n = 0;".into(),
+            "const k = () => { n++; return 'a'; };".into(),
+            format!("const o = {base};"),
+            "try { console.log(o?.[k()], n); } catch (e) { console.log(e.constructor.name, n); }"
+                .into(),
+        ],
+        // The ARGUMENTS of a short-circuited `?.(…)` are never evaluated.
+        2 => vec![
+            "let n = 0;".into(),
+            "const arg = () => { n++; return 1; };".into(),
+            format!("const o = {};", pick(r, &["null", "undefined", "{ f: x => x + 1 }", "{ f: null }", "{ f: undefined }"])),
+            "try { console.log(o?.f?.(arg()), n); } catch (e) { console.log(e.constructor.name, n); }".into(),
+        ],
+        // `delete o?.a` and `typeof o?.a` — both are defined on a short circuit.
+        3 => vec![
+            format!("const o = {base};"),
+            "try { console.log(typeof o?.a, delete o?.a?.b); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+        // Optional chaining combined with `??` and `||`, which is where the
+        // short-circuit result value (always `undefined`, never `null`) shows.
+        4 => vec![
+            format!("const o = {base};"),
+            format!("console.log(o?.a ?? 'd', o?.a {} 'e', o?.a?.b === undefined);", pick(r, &["||", "&&"])),
+        ],
+        // A method call through an optional link keeps its `this` binding.
+        5 => vec![
+            format!("const o = {};", pick(r, &["null", "undefined", "{ v: 3, m() { return this.v; } }", "{ v: 3, m: null }"])),
+            "try { console.log(o?.m?.()); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+        // A LONG chain, and a parenthesised sub-chain, which ends the chain's
+        // short-circuit scope: `(o?.a).b` throws where `o?.a.b` does not.
+        _ => vec![
+            format!("const o = {base};"),
+            "try { console.log(o?.a.b.c); } catch (e) { console.log(e.constructor.name); }".into(),
+            "try { console.log((o?.a).b); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+    }
+}
+
+/// DESTRUCTURING — array and object patterns, defaults, rest, nesting.
+///
+/// Zero of the 40 000 generated programs began with `const [` or `const {`. The
+/// pattern grammar is a second, parallel assignment language (defaults that
+/// only fire on `undefined`, a rest element, computed keys, a pattern in a
+/// parameter list, holes that skip without reading) and none of it was reached.
+fn gen_destructure(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const ARRS: &[&str] = &[
+        "[1, 2, 3]",
+        "[]",
+        "[1]",
+        "[undefined, 2]",
+        "[null, 2]",
+        "'abc'",
+        "new Set([1, 2])",
+        "[1, , 3]",
+    ];
+    const OBJS: &[&str] = &[
+        "{ a: 1, b: 2 }",
+        "{}",
+        "{ a: undefined }",
+        "{ a: null }",
+        "{ a: { b: 1 } }",
+        "{ 1: 'x', a: 2 }",
+    ];
+    match r.below(8) {
+        // Array pattern with a hole, a default and a rest.
+        0 => vec![
+            format!("const src = {};", pick(r, ARRS)),
+            "try { const [a, , b = 9, ...rest] = src; console.log(a, b, JSON.stringify(rest)); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+        // A default fires on `undefined` ONLY, never on `null` or `0`, and the
+        // default expression is not evaluated when it does not fire.
+        1 => vec![
+            "let n = 0;".into(),
+            "const d = () => { n++; return 'D'; };".into(),
+            format!("const src = {};", pick(r, ARRS)),
+            "try { const [a = d(), b = d()] = src; console.log(a, b, n); } catch (e) { console.log(e.constructor.name, n); }".into(),
+        ],
+        // Object pattern: rename, default, rest, and a computed key.
+        2 => vec![
+            format!("const src = {};", pick(r, OBJS)),
+            format!("const key = {};", pick(r, &["'a'", "'b'", "'zz'", "1"])),
+            "try { const { a: x = 7, [key]: y, ...rest } = src; console.log(x, y, JSON.stringify(rest)); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+        // Nested patterns mixing both shapes.
+        3 => vec![
+            format!("const src = {};", pick(r, &["{ a: [1, 2], b: { c: 3 } }", "{ a: [], b: {} }", "{ a: [1], b: { c: undefined } }", "{ a: null, b: null }"])),
+            "try { const { a: [p = 'P', q = 'Q'] = [], b: { c = 'C' } = {} } = src; console.log(p, q, c); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+        // Destructuring ASSIGNMENT (no declaration) into existing bindings,
+        // including the swap idiom and a member-expression target.
+        4 => vec![
+            "let a = 1, b = 2; const o = {};".into(),
+            format!("const src = {};", pick(r, ARRS)),
+            "try { [a, b] = [b, a]; console.log(a, b); } catch (e) { console.log(e.constructor.name); }".into(),
+            "try { ({ a: o.p = 5 } = src); console.log(JSON.stringify(o)); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+        // A pattern in a PARAMETER list, with its own defaults.
+        5 => vec![
+            "function f({ a = 1, b: { c = 2 } = {} } = {}, [d = 3] = []) { return [a, c, d]; }".into(),
+            format!("try {{ console.log(JSON.stringify(f({}))); }} catch (e) {{ console.log(e.constructor.name); }}", pick(r, &["", "{}", "{ a: 9 }", "{ b: { c: 9 } }", "undefined, [8]", "{ a: 0 }, []"])),
+        ],
+        // Destructuring in a `for-of` head, and over a Map's entries.
+        6 => vec![
+            format!("const src = {};", pick(r, &["[[1, 'a'], [2, 'b']]", "new Map([[1, 'a']])", "[[1], []]", "Object.entries({ x: 1, y: 2 })"])),
+            "try { const out = []; for (const [k, v = 'V'] of src) out.push(k + ':' + v); console.log(out.join(',')); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+        // A non-iterable / null source: the error KIND and message shape.
+        _ => vec![
+            format!("const src = {};", pick(r, &["null", "undefined", "5", "{}", "{ [Symbol.iterator]: null }"])),
+            "try { const [a] = src; console.log(a); } catch (e) { console.log(e.constructor.name); }".into(),
+            "try { const { b } = src; console.log(b); } catch (e) { console.log(e.constructor.name); }".into(),
+        ],
+    }
+}
+
+/// SPARSE arrays — holes, `length` writes, `delete`, and `Array(n)`.
+///
+/// The census found no `new Array(n)`, no elision (`[1, , 3]`) and no `length`
+/// assignment anywhere in the corpus. A hole is not `undefined`: it is skipped
+/// by `forEach`/`map`/`filter`/`in`, VISITED as `undefined` by `for-of` and the
+/// spread, and printed by `util.inspect` as `<n empty items>`, so the same array
+/// reads five different ways depending on the door used.
+fn gen_sparse(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const SPARSE: &[&str] = &[
+        "[1, , 3]",
+        "new Array(3)",
+        "[, , ]",
+        "[1, 2, 3]",
+        "Array(2).fill(0)",
+        "[undefined, 1]",
+    ];
+    let a = pick(r, SPARSE);
+    match r.below(6) {
+        // The skip/visit split across the iteration protocols.
+        0 => vec![
+            format!("const a = {a};"),
+            "const seen = []; a.forEach((v, i) => seen.push(i + '=' + v));".into(),
+            "console.log(a.length, seen.join(','), JSON.stringify([...a]));".into(),
+        ],
+        // `in`, `hasOwnProperty` and the key lists all agree that a hole is absent.
+        1 => vec![
+            format!("const a = {a};"),
+            "console.log(0 in a, 1 in a, JSON.stringify(Object.keys(a)), a.hasOwnProperty(1));"
+                .into(),
+        ],
+        // Methods that PRESERVE holes vs ones that fill them.
+        2 => vec![
+            format!("const a = {a};"),
+            format!("const m = a.{};", pick(r, &["map(x => x)", "filter(() => true)", "slice()", "concat([])", "flat()", "toReversed()", "toSorted()"])),
+            "console.log(m.length, JSON.stringify(m), 1 in m);".into(),
+        ],
+        // A `length` write truncates or extends with holes.
+        3 => vec![
+            format!("const a = {a};"),
+            format!("a.length = {};", pick(r, &["0", "1", "5", "2"])),
+            "console.log(a.length, JSON.stringify(a), a.join('|'));".into(),
+        ],
+        // `delete` punches a hole into a dense array.
+        4 => vec![
+            format!("const a = {a};"),
+            format!("console.log(delete a[{}], a.length, JSON.stringify(a), a.join('|'));", pick(r, &["0", "1", "9"])),
+        ],
+        // `JSON.stringify`, `join` and `toString` each render a hole their own way.
+        _ => vec![
+            format!("const a = {a};"),
+            "console.log(JSON.stringify(a), a.join('|'), String(a), a.indexOf(undefined), a.includes(undefined));".into(),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -2276,6 +2595,10 @@ enum Mode {
     Locale,
     ByteView,
     BuiltinMeta,
+    Assign,
+    Optional,
+    Destructure,
+    Sparse,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -2314,6 +2637,10 @@ const REAL_MODES: &[Mode] = &[
     Mode::Locale,
     Mode::ByteView,
     Mode::BuiltinMeta,
+    Mode::Assign,
+    Mode::Optional,
+    Mode::Destructure,
+    Mode::Sparse,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -2359,6 +2686,10 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Locale => gen_locale(seed),
         Mode::ByteView => gen_byteview(seed),
         Mode::BuiltinMeta => gen_builtinmeta(seed),
+        Mode::Assign => gen_assign(seed),
+        Mode::Optional => gen_optional(seed),
+        Mode::Destructure => gen_destructure(seed),
+        Mode::Sparse => gen_sparse(seed),
     }
 }
 
@@ -2400,6 +2731,10 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Locale => "locale",
         Mode::ByteView => "byteview",
         Mode::BuiltinMeta => "builtinmeta",
+        Mode::Assign => "assign",
+        Mode::Optional => "optional",
+        Mode::Destructure => "destructure",
+        Mode::Sparse => "sparse",
     }
 }
 
@@ -2440,6 +2775,10 @@ const ALL_MODES: &[Mode] = &[
     Mode::Locale,
     Mode::ByteView,
     Mode::BuiltinMeta,
+    Mode::Assign,
+    Mode::Optional,
+    Mode::Destructure,
+    Mode::Sparse,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {
@@ -2546,6 +2885,7 @@ fn mask_numbers(s: &str) -> String {
 
 struct Args {
     count: u64,
+    dump: bool,
     base_seed: u64,
     once: bool,
     timeout_ms: u64,
@@ -2561,6 +2901,7 @@ fn parse_args() -> Args {
     let mut count = 2000u64;
     let mut base_seed = 1u64;
     let mut once = false;
+    let mut dump = false;
     let mut timeout_ms = 5000u64;
     let mut max_report = 200usize;
     let mut mode = Mode::Mixed;
@@ -2590,6 +2931,7 @@ fn parse_args() -> Args {
                     .unwrap_or(base_seed);
             }
             "--once" => once = true,
+            "--dump" => dump = true,
             "--timeout-ms" => {
                 i += 1;
                 timeout_ms = argv
@@ -2659,6 +3001,7 @@ fn parse_args() -> Args {
     }
     Args {
         count,
+        dump,
         base_seed,
         once,
         timeout_ms,
@@ -2699,6 +3042,9 @@ fn print_help() {
          (each also accepted as a `--<mode>` shorthand)\n\
          --stderr         also require the normalized error line to match\n\
          --once           run a single case (seed) and print both outputs\n\
+         --dump           print the generated corpus and exit; runs no child.\n\
+         Feeds the coverage census: grep the dump for a\n\
+         construct that appears ZERO times, then add a mode.\n\
          --timeout-ms N   per-process wall-clock timeout (default 5000)\n\
          --out PATH       divergence corpus file\n\
          --max-report N   stop after N divergences (default 200)\n\
@@ -2718,6 +3064,23 @@ fn print_help() {
 
 fn main() {
     let args = parse_args();
+    // --dump: emit the corpus the generator would run, and stop. No child
+    // process is spawned and no oracle is consulted, so this stays usable when
+    // the reference node is missing. This is the input to the zero-coverage
+    // census: a construct that never appears in `--dump --mixed -c 20000` is a
+    // construct the fuzzer has never once tested, whatever its mode list says.
+    if args.dump {
+        let out = std::io::stdout();
+        let mut w = std::io::BufWriter::new(out.lock());
+        for i in 0..args.count {
+            let seed = args.base_seed.wrapping_add(i);
+            let stmts = gen_case(seed, args.mode);
+            let _ = writeln!(w, "{}", build_program(&stmts));
+        }
+        let _ = w.flush();
+        return;
+    }
+
     let bin = ours_bin();
     let oracle = resolve_oracle(&bin);
     let timeout = Duration::from_millis(args.timeout_ms);

@@ -244,7 +244,7 @@ fn expr_slot_safe(e: &Expr) -> bool {
         Expr::Conditional { test, cons, alt } => {
             expr_slot_safe(test) && expr_slot_safe(cons) && expr_slot_safe(alt)
         }
-        Expr::Assign { target, value } => expr_slot_safe(target) && expr_slot_safe(value),
+        Expr::Assign { target, value, .. } => expr_slot_safe(target) && expr_slot_safe(value),
         Expr::Update { target, .. } => expr_slot_safe(target),
         Expr::Call { func, args, .. } | Expr::New { callee: func, args } => {
             expr_slot_safe(func) && all(args)
@@ -451,7 +451,7 @@ impl Planner {
             Expr::Ident(n) => self.mention(n),
             // An assignment to a name that has no slot yet is a plain store to
             // whatever binding exists — a mention, not a declaration.
-            Expr::Assign { target, value } => {
+            Expr::Assign { target, value, .. } => {
                 self.walk_expr(value);
                 match &**target {
                     // A plain store of an arbitrary value: whatever the slot
@@ -693,7 +693,7 @@ fn collect_escaping_expr(e: &Expr, out: &mut FxHashSet<String>) {
             collect_escaping_expr(cons, out);
             collect_escaping_expr(alt, out);
         }
-        Expr::Assign { target, value } => {
+        Expr::Assign { target, value, .. } => {
             collect_escaping_expr(target, out);
             collect_escaping_expr(value, out);
         }
@@ -893,7 +893,7 @@ fn collect_all_idents_expr(e: &Expr, out: &mut FxHashSet<String>) {
             collect_all_idents_expr(cons, out);
             collect_all_idents_expr(alt, out);
         }
-        Expr::Assign { target, value } => {
+        Expr::Assign { target, value, .. } => {
             collect_all_idents_expr(target, out);
             collect_all_idents_expr(value, out);
         }

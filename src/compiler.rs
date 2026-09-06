@@ -744,7 +744,7 @@ impl Compiler {
             }
             Expr::Array(items) => self.destructure_array(b, items, declare)?,
             Expr::Object(props) => self.destructure_object(b, props, declare)?,
-            Expr::Assign { target, value } => {
+            Expr::Assign { target, value, .. } => {
                 // Pattern element with a default: use it when TOS is undefined.
                 b.emit(Op::Dup, 0);
                 b.emit(Op::LoadUndef, 0);
@@ -905,24 +905,51 @@ impl Compiler {
         b.emit(Op::Swap, 0);
         b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
         b.emit(Op::Pop, 0);
-        // Collect statically-known destructured key names, for a `...rest`.
-        let mut named: Vec<String> = Vec::new();
+        // The keys a `...rest` must EXCLUDE. A statically-spelled key is known
+        // here; a computed one (`{ [k]: v, ...rest }`) is only a value at run
+        // time, and only collecting the static ones left every computed key in
+        // the rest object — `const { [k]: y, ...r } = { a: 1, b: 2 }` with
+        // `k === 'b'` put `b` in BOTH `y` and `r`.
+        //
+        // A computed key must still be evaluated exactly once, so its value is
+        // stashed in a temporary as it is computed and the rest reads that
+        // temporary rather than re-running the expression.
+        enum Excl {
+            Static(String),
+            Computed(String),
+        }
+        let has_rest = props.iter().any(|p| matches!(p, Prop::Spread(_)));
+        let mut named: Vec<Excl> = Vec::new();
         for p in props {
             match p {
                 Prop::KeyValue { key, value, .. } => {
-                    if let Expr::Str(s) = key {
-                        named.push(s.clone());
-                    }
                     // Load obj, read key.
                     self.load_local(b, &obj_tmp);
-                    self.compile_expr(b, key)?;
+                    self.compile_expr(b, key)?; // [obj, key]
+                    match key {
+                        Expr::Str(s) => named.push(Excl::Static(s.clone())),
+                        // Only worth a temporary when a rest will read it.
+                        _ if has_rest => {
+                            let t = self.tmp_name("destrkey");
+                            b.emit(Op::Dup, 0); // [obj, key, key]
+                            self.name_const(b, &t); // [obj, key, key, name]
+                            b.emit(Op::Swap, 0); // [obj, key, name, key]
+                            b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0); // [obj, key, _]
+                            b.emit(Op::Pop, 0); // [obj, key]
+                            named.push(Excl::Computed(t));
+                        }
+                        _ => {}
+                    }
                     b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0); // [value]
                     self.compile_bind(b, value, declare)?;
                 }
                 Prop::Spread(target) => {
                     self.load_local(b, &obj_tmp);
                     for k in &named {
-                        self.strlit(b, k);
+                        match k {
+                            Excl::Static(s) => self.strlit(b, s),
+                            Excl::Computed(t) => self.load_local(b, t),
+                        }
                     }
                     b.emit(Op::CallBuiltin(ops::MKARR, argc(named.len())?), 0);
                     b.emit(Op::CallBuiltin(ops::OBJ_REST, 2), 0); // [rest_object]
@@ -2191,7 +2218,16 @@ impl Compiler {
                 let end = b.current_pos();
                 b.patch_jump(je, end);
             }
-            Expr::Assign { target, value } => match &**target {
+            // A COMPOUND assignment (`o[k()] += 1`) evaluates the target
+            // reference once. Handled ahead of the plain-`=` arms below because
+            // it must keep that reference on the stack across the read, the
+            // computation and the write, which a plain assignment never does.
+            Expr::Assign {
+                target,
+                op: Some(aop),
+                value,
+            } => self.compile_compound_assign(b, target, *aop, value)?,
+            Expr::Assign { target, value, .. } => match &**target {
                 // 13.15.2 steps 1.a-1.f: for a PROPERTY target the reference is
                 // evaluated first — the object, then the key — and only then the
                 // right-hand side. Routing these through `compile_bind` emitted
@@ -2591,6 +2627,164 @@ impl Compiler {
         self.compile_expr(b, r)?;
         let end = b.current_pos();
         b.patch_jump(jump, end);
+        Ok(())
+    }
+
+    /// `target op= value` with the target reference evaluated exactly ONCE.
+    ///
+    /// The parser hands the operator over instead of rewriting `a op= b` into
+    /// `a = a op b`; that rewrite duplicated the target subtree, so every side
+    /// effect in it ran twice (`o[k()] += 1` called `k` twice, and the logical
+    /// forms called it twice even when they short-circuited and never wrote).
+    /// The duplication could not be repaired downstream: after the rewrite,
+    /// `o[k()] += 1` and the genuinely-twice-calling `o[k()] = o[k()] + 1` are
+    /// the same tree.
+    ///
+    /// For a property target the reference is the pair `[recv, key]`, which
+    /// `Dup2` copies for the read while the originals serve for the write. An
+    /// identifier target has no reference to preserve — reading a name twice
+    /// has no observable effect — so it keeps the simple lowering.
+    fn compile_compound_assign(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        aop: AssignOp,
+        value: &Expr,
+    ) -> Result<(), String> {
+        // The reference: leave `[recv, key]` on the stack, and report which
+        // builtin pair reads and writes through it.
+        let (get, set) = match target {
+            Expr::Member {
+                object, property, ..
+            } => {
+                self.compile_expr(b, object)?; // [recv]
+                self.name_const(b, property); // [recv, name]
+                (ops::GETATTR, ops::SETATTR)
+            }
+            Expr::Index { object, index, .. } => {
+                self.compile_expr(b, object)?; // [recv]
+                self.compile_expr(b, index)?; // [recv, idx]
+                (ops::GETITEM, ops::SETITEM)
+            }
+            // An identifier (or anything else `compile_bind` accepts): no
+            // reference to preserve, so read it, combine, and bind the result.
+            _ => return self.compile_compound_ident(b, target, aop, value),
+        };
+        b.emit(Op::Dup2, 0); // [recv, key, recv, key]
+        b.emit(Op::CallBuiltin(get, 2), 0); // [recv, key, old]
+        match aop {
+            AssignOp::Binary(op) => {
+                self.emit_compound_binop(b, op, value)?; // [recv, key, new]
+                b.emit(Op::CallBuiltin(set, 3), 0); // [new]
+            }
+            AssignOp::Logical(lop) => {
+                // Short-circuit: the write is skipped entirely when the old
+                // value already decides the result. That is the case the
+                // duplicating desugaring got most visibly wrong — it evaluated
+                // the target a second time to perform a write that the spec
+                // says never happens.
+                b.emit(Op::Dup, 0); // [recv, key, old, old]
+                let test_op = match lop {
+                    LogicalOp::And | LogicalOp::Or => ops::TRUTHY,
+                    LogicalOp::Nullish => ops::NULLISH,
+                };
+                b.emit(Op::CallBuiltin(test_op, 1), 0); // [recv, key, old, cond]
+                let skip = match lop {
+                    LogicalOp::And => b.emit(Op::JumpIfFalse(0), 0), // falsy -> keep old
+                    LogicalOp::Or => b.emit(Op::JumpIfTrue(0), 0),   // truthy -> keep old
+                    LogicalOp::Nullish => b.emit(Op::JumpIfFalse(0), 0), // non-nullish -> keep old
+                };
+                b.emit(Op::Pop, 0); // drop old: [recv, key]
+                self.compile_expr(b, value)?; // [recv, key, rhs]
+                b.emit(Op::CallBuiltin(set, 3), 0); // [rhs]
+                let done = b.emit(Op::Jump(0), 0);
+                // Short-circuit landing: `[recv, key, old]` has to become
+                // `[old]` with no write. There is no "drop the two below the
+                // top", so the old value is rotated under and the reference
+                // popped out from beneath it.
+                let short = b.current_pos();
+                b.patch_jump(skip, short);
+                b.emit(Op::Rot, 0); // [key, old, recv]
+                b.emit(Op::Pop, 0); // [key, old]
+                b.emit(Op::Swap, 0); // [old, key]
+                b.emit(Op::Pop, 0); // [old]
+                let end = b.current_pos();
+                b.patch_jump(done, end);
+            }
+        }
+        Ok(())
+    }
+
+    /// `x op= value` for an identifier target: the name may be read twice with
+    /// no observable difference, so this keeps the pre-existing desugaring.
+    fn compile_compound_ident(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        aop: AssignOp,
+        value: &Expr,
+    ) -> Result<(), String> {
+        let rebuilt = match aop {
+            AssignOp::Binary(op) => {
+                Expr::Binary(op, Box::new(target.clone()), Box::new(value.clone()))
+            }
+            AssignOp::Logical(lop) => {
+                Expr::Logical(lop, Box::new(target.clone()), Box::new(value.clone()))
+            }
+        };
+        self.compile_expr(
+            b,
+            &Expr::Assign {
+                target: Box::new(target.clone()),
+                op: None,
+                value: Box::new(rebuilt),
+            },
+        )
+    }
+
+    /// The old value is already on the stack; compile `rhs` and combine the two
+    /// with `op`, leaving one value in their place.
+    ///
+    /// This mirrors [`Self::compile_binary`], which cannot be reused because it
+    /// compiles both operands itself — and for the bitwise family it pushes an
+    /// operator TAG *below* them, which is why those arms slide the tag under
+    /// the already-present old value rather than simply emitting it.
+    fn emit_compound_binop(
+        &mut self,
+        b: &mut ChunkBuilder,
+        op: BinOp,
+        rhs: &Expr,
+    ) -> Result<(), String> {
+        let bitwise = match op {
+            BinOp::BitAnd => Some(bop::BITAND),
+            BinOp::BitOr => Some(bop::BITOR),
+            BinOp::BitXor => Some(bop::BITXOR),
+            BinOp::Shl => Some(bop::SHL),
+            BinOp::Shr => Some(bop::SHR),
+            BinOp::UShr => Some(bop::USHR),
+            _ => None,
+        };
+        if let Some(tag) = bitwise {
+            b.emit(Op::LoadInt(tag), 0); // [old, tag]
+            b.emit(Op::Swap, 0); // [tag, old]
+            self.compile_expr(b, rhs)?; // [tag, old, rhs]
+            b.emit(Op::CallBuiltin(ops::BINOP, 3), 0);
+            return Ok(());
+        }
+        self.compile_expr(b, rhs)?; // [old, rhs]
+        match op {
+            BinOp::Add => b.emit(Op::Add, 0),
+            BinOp::Sub => b.emit(Op::Sub, 0),
+            BinOp::Mul => b.emit(Op::Mul, 0),
+            BinOp::Mod => b.emit(Op::Mod, 0),
+            // `/` and `**` are builtins rather than the native ops, for the same
+            // reason `compile_binary` routes them that way: fusevm's division
+            // answers `Undef` on a zero divisor and its `pow` is IEEE-754.
+            BinOp::Div => b.emit(Op::CallBuiltin(ops::DIV, 2), 0),
+            BinOp::Pow => b.emit(Op::CallBuiltin(ops::POW, 2), 0),
+            // No other operator has an `op=` spelling.
+            _ => return Err(format!("unsupported compound assignment operator {op:?}")),
+        };
         Ok(())
     }
 
@@ -3474,6 +3668,7 @@ fn default_stmt(name: &str, default: &Expr) -> Stmt {
         ),
         cons: Box::new(Stmt::from(StmtKind::Expr(Expr::Assign {
             target: Box::new(Expr::Ident(name.to_string())),
+            op: None,
             value: Box::new(default.clone()),
         }))),
         alt: None,

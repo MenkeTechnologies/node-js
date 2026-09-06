@@ -44,6 +44,24 @@ pub enum LogicalOp {
     Nullish, // ??
 }
 
+/// The operator carried by a COMPOUND assignment (`a += b`, `a ??= b`).
+///
+/// It rides on the [`Expr::Assign`] node rather than being desugared away at
+/// parse time. The parser used to rewrite `a op= b` into `a = a op b`, which
+/// duplicates the target expression — so every side effect in the target ran
+/// TWICE. `o[k()] += 1` called `k` once in node and twice here, and the same
+/// held for the logical forms even when they short-circuited and never wrote.
+/// Duplication cannot be undone later by inspecting the tree, because
+/// `o[k()] = o[k()] + 1` is a DIFFERENT program that legitimately calls `k`
+/// twice and is structurally identical after the rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignOp {
+    /// `+= -= *= /= %= **= &= |= ^= <<= >>= >>>=` — always reads, computes, writes.
+    Binary(BinOp),
+    /// `&&= ||= ??=` — reads, and writes only if the read did not short-circuit.
+    Logical(LogicalOp),
+}
+
 /// A unary prefix operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
@@ -160,9 +178,15 @@ pub enum Expr {
         alt: Box<Expr>,
     },
 
-    /// `target = value` (or a compound `target op= value` desugared by the parser).
+    /// `target = value`, or a compound `target op= value` when `op` is `Some`.
+    ///
+    /// A compound assignment evaluates the target reference ONCE: for
+    /// `o[k()] += 1` the object and the key are computed a single time, the
+    /// old value is read through them, and the result is written back through
+    /// the same reference (ECMA-262 13.15.2).
     Assign {
         target: Box<Expr>,
+        op: Option<AssignOp>,
         value: Box<Expr>,
     },
     /// `++x` / `x++` / `--x` / `x--`.

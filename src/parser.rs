@@ -871,6 +871,22 @@ impl Parser {
         r
     }
 
+    /// Whether `e` is an optional chain — i.e. its member/call SPINE carries a
+    /// `?.` link. Mirrors the compiler's spine walk; used only to decide
+    /// whether a set of parentheses is a chain boundary worth recording.
+    fn has_optional_link(e: &Expr) -> bool {
+        match e {
+            Expr::Member {
+                object, optional, ..
+            } => *optional || Self::has_optional_link(object),
+            Expr::Index {
+                object, optional, ..
+            } => *optional || Self::has_optional_link(object),
+            Expr::Call { func, optional, .. } => *optional || Self::has_optional_link(func),
+            _ => false,
+        }
+    }
+
     /// Run `f` with `in` re-enabled (inside a parenthesised/bracketed sub-
     /// expression of a `for` LHS, where the no-in restriction does not apply).
     fn allow_in<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
@@ -907,7 +923,11 @@ impl Parser {
             ">>=" => Some(BinOp::Shr),
             ">>>=" => Some(BinOp::UShr),
             "&&=" | "||=" | "??=" => {
-                // Logical assignment.
+                // Logical assignment. The operator is CARRIED, not desugared:
+                // building `Logical(op, left.clone(), value)` here duplicated
+                // the target, so `o[k()] ||= 1` evaluated `k` twice — once for
+                // the read and once for the write — where node evaluates it
+                // once and may not write at all.
                 self.advance();
                 let value = self.parse_assign()?;
                 let lop = match op.as_str() {
@@ -916,20 +936,18 @@ impl Parser {
                     _ => LogicalOp::Nullish,
                 };
                 return Ok(Expr::Assign {
-                    target: Box::new(left.clone()),
-                    value: Box::new(Expr::Logical(lop, Box::new(left), Box::new(value))),
+                    target: Box::new(left),
+                    op: Some(AssignOp::Logical(lop)),
+                    value: Box::new(value),
                 });
             }
             _ => return Ok(left),
         };
         self.advance();
         let value = self.parse_assign()?;
-        let value = match compound {
-            None => value,
-            Some(b) => Expr::Binary(b, Box::new(left.clone()), Box::new(value)),
-        };
         Ok(Expr::Assign {
             target: Box::new(left),
+            op: compound.map(AssignOp::Binary),
             value: Box::new(value),
         })
     }
@@ -1289,6 +1307,24 @@ impl Parser {
                 self.advance();
                 let e = self.parse_expr()?;
                 self.expect_punct(")")?;
+                // Parentheses are otherwise erased, but around an OPTIONAL CHAIN
+                // they are load-bearing: they END the chain, so a `?.` inside
+                // them cannot short-circuit an access written outside them.
+                // `o?.a.b` is `undefined` when `o` is nullish; `(o?.a).b` reads
+                // `.b` off that `undefined` and THROWS (ECMA-262 13.3.1 —
+                // `ParenthesizedExpression` is not an `OptionalExpression`).
+                // With the parentheses dropped the two parsed to the same tree
+                // and both answered `undefined`.
+                //
+                // The boundary is spelled as a one-element sequence rather than
+                // a new node type: `(e)` and `e,` evaluate identically, every
+                // existing pass already walks `Sequence` correctly, and the
+                // chain-spine walk does not descend through it — which is the
+                // whole point. Only chains are wrapped, so no other expression's
+                // tree shape changes.
+                if Self::has_optional_link(&e) {
+                    return Ok(Expr::Sequence(vec![e]));
+                }
                 Ok(e)
             }
             Tok::Punct(p) if p == "[" => self.parse_array_literal(),
@@ -1489,6 +1525,7 @@ impl Parser {
                     let d = self.parse_assign()?;
                     Expr::Assign {
                         target: Box::new(Expr::Ident(name.clone())),
+                        op: None,
                         value: Box::new(d),
                     }
                 } else {

@@ -122,7 +122,7 @@ pub fn expr_captures(e: &Expr) -> bool {
         Expr::Conditional { test, cons, alt } => {
             expr_captures(test) || expr_captures(cons) || expr_captures(alt)
         }
-        Expr::Assign { target, value } => expr_captures(target) || expr_captures(value),
+        Expr::Assign { target, value, .. } => expr_captures(target) || expr_captures(value),
         Expr::Update { target, .. } => expr_captures(target),
         Expr::Call { func, args, .. } | Expr::New { callee: func, args } => {
             expr_captures(func) || args.iter().any(expr_captures)
@@ -168,7 +168,7 @@ fn mentions_eval(e: &Expr) -> bool {
         Expr::Call { func, args, .. } | Expr::New { callee: func, args } => {
             mentions_eval(func) || args.iter().any(mentions_eval)
         }
-        Expr::Assign { target, value } => mentions_eval(target) || mentions_eval(value),
+        Expr::Assign { target, value, .. } => mentions_eval(target) || mentions_eval(value),
         Expr::Sequence(items) => items.iter().any(mentions_eval),
         Expr::Logical(_, l, r) | Expr::Binary(_, l, r) => mentions_eval(l) || mentions_eval(r),
         Expr::Conditional { test, cons, alt } => {
