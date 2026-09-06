@@ -4504,6 +4504,49 @@ fn bigint_convert_error(v: &Value) -> String {
     host::type_error(&format!("Cannot convert {shown} to a BigInt"))
 }
 
+/// `ToBigInt(v)` — 7.1.13. The conversion every BigInt-typed SINK performs: a
+/// 64-bit typed array's element write, `DataView.prototype.setBigInt64`, and
+/// BigInt arithmetic's operand check.
+///
+/// It is NOT `BigInt(v)`: a Number is a `TypeError` here (`BigInt(1)` is `1n`,
+/// but `new BigInt64Array(1)[0] = 1` throws), which is the whole point of the
+/// separate abstract op. Everything else follows `ToPrimitive(v, number)` then
+/// the type table — booleans convert (`true` → `1n`), strings parse with a
+/// `SyntaxError` on failure, and `undefined`/`null`/symbols throw.
+///
+/// Measured on node v26.8.1, receiver `new BigInt64Array(1)`:
+///
+/// ```text
+/// a[0] = true            → 1n
+/// a[0] = '12'            → 12n
+/// a[0] = []              → 0n        (ToPrimitive → "" → 0n)
+/// a[0] = ['3']           → 3n
+/// a[0] = 1               → TypeError: Cannot convert 1 to a BigInt
+/// a[0] = new Number(3)   → TypeError: Cannot convert 3 to a BigInt
+/// a[0] = 'a'             → SyntaxError: Cannot convert a to a BigInt
+/// a[0] = {}              → SyntaxError: Cannot convert [object Object] to a BigInt
+/// ```
+pub fn to_bigint(v: &Value) -> Result<num_bigint::BigInt, String> {
+    let prim = host::to_primitive(v, "number")?;
+    if let Some(b) = with_host(|h| match h.get(&prim) {
+        Some(JsObj::BigInt(b)) => Some(b.clone()),
+        _ => None,
+    }) {
+        return Ok(b);
+    }
+    match &prim {
+        Value::Bool(b) => Ok(num_bigint::BigInt::from(*b as i64)),
+        Value::Str(s) => host::parse_bigint_str(s)
+            .ok_or_else(|| format!("SyntaxError: Cannot convert {s} to a BigInt")),
+        _ if with_host(|h| matches!(h.get(&prim), Some(JsObj::Str(_)))) => {
+            let s = with_host(|h| h.str_of(&prim));
+            host::parse_bigint_str(&s)
+                .ok_or_else(|| format!("SyntaxError: Cannot convert {s} to a BigInt"))
+        }
+        _ => Err(bigint_convert_error(&prim)),
+    }
+}
+
 fn bigint_ctor(v: &Value) -> Result<Value, String> {
     use num_bigint::BigInt;
     let big = match v {

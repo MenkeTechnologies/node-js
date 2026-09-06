@@ -185,6 +185,38 @@ chunks   true
 from-ok  1,2,3 ab 5 0
 from-alk 0,0 65,66
 from-bad TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE
+==== byteviews.js ====
+fill       Uint8Array(5) [ 255, 9, 9, 65, 128 ] true
+through    Uint8Array(4) [ 7, 7, 0, 0 ] true
+relative   Uint8Array(4) [ 0, 0, 1, 1 ] Uint8Array(3) [ 1, 2, 3 ]
+wrap       Uint8Array(3) [ 1, 1, 3 ] Int8Array(2) [ -56, -56 ]
+toSorted   Uint8Array(3) [ 1, 2, 3 ] Uint8Array(3) [ 3, 1, 2 ] Uint8Array(3) [ 3, 2, 1 ]
+toReversed Uint8Array(3) [ 2, 1, 3 ] Float64Array(2) [ NaN, 1.5 ]
+with       Uint8Array(3) [ 9, 1, 2 ] Uint8Array(3) [ 3, 1, 44 ] Uint8Array(3) [ 3, 1, 2 ]
+fromBuffer Uint8Array
+withRange  RangeError Invalid typed array index
+bpe        Uint8Array 1 2
+bpe        Int16Array 2 4
+bpe        Float64Array 8 16
+bpe        BigInt64Array 8 16
+tobigint   true -> 1
+tobigint   "12" -> 12
+tobigint   "" -> 0
+tobigint   [] -> 0
+tobigint   ["3"] -> 3
+tobigint   5n -> 5
+tobigint   1 -> TypeError: Cannot convert 1 to a BigInt
+tobigint   1.5 -> TypeError: Cannot convert 1.5 to a BigInt
+tobigint   "a" -> SyntaxError: Cannot convert a to a BigInt
+tobigint   {} -> SyntaxError: Cannot convert [object Object] to a BigInt
+tobigint   null -> TypeError: Cannot convert null to a BigInt
+tobigint   undefined -> TypeError: Cannot convert undefined to a BigInt
+dvIndex    20 10 10
+dvBounds   -2 RangeError Offset is outside the bounds of the DataView
+dvBounds   -1 RangeError Offset is outside the bounds of the DataView
+dvBounds   4 RangeError Offset is outside the bounds of the DataView
+dvBounds   100 RangeError Offset is outside the bounds of the DataView
+dvWrite    190 239 48879 61374
 ==== classes.js ====
 rectangle with area 12
 perimeter 14

@@ -49,8 +49,11 @@ pub const PROTOTYPE_METHODS: &[&str] = &[
     "some",
     "sort",
     "subarray",
+    "toReversed",
+    "toSorted",
     "toString",
     "values",
+    "with",
 ];
 
 /// The eleven element kinds plus the two buffer types.
@@ -128,13 +131,12 @@ fn coerce_val(kind: &str, v: &Value) -> Result<Value, String> {
     if !is_bigint_kind(kind) {
         return Ok(Value::Float(coerce(kind, with_host(|h| h.to_number(v)))));
     }
-    // 7.1.15/7.1.16: the operand must already BE a BigInt — a Number throws,
-    // which is what makes `new BigInt64Array(1)[0] = 1` a TypeError in node.
-    let big = with_host(|h| match h.get(v) {
-        Some(JsObj::BigInt(b)) => Some(b.clone()),
-        _ => None,
-    })
-    .ok_or_else(|| crate::host::type_error("Cannot convert a Number value to a BigInt"))?;
+    // 7.1.15/7.1.16 route through `ToBigInt`, which is not "must already be a
+    // BigInt": a boolean, a string and any object that converts to one are all
+    // accepted (`a[0] = '12'` stores `12n`), and only a Number is refused. The
+    // check here was the identity test, so it rejected every one of those and
+    // reported the same wrong text — node names the value it could not convert.
+    let big = crate::builtins::to_bigint(v)?;
     Ok(with_host(|h| h.new_bigint(wrap_bigint(kind, big))))
 }
 
@@ -422,16 +424,26 @@ pub fn dataview_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
     };
     let is_get = method.starts_with("get");
-    let at = super::arg_num(args, 0).max(0.0) as usize;
+    // `ToIndex(requestIndex)` (25.3.1.1 step 3): NaN is 0 and a fraction
+    // truncates toward zero, so `dv.getUint8(1.9)` reads index 1. A NEGATIVE
+    // index was being clamped to 0 — `dv.getUint8(-2)` quietly read the first
+    // byte where node reports the out-of-bounds RangeError.
+    let requested = super::arg_num(args, 0);
+    let requested = if requested.is_nan() {
+        0.0
+    } else {
+        requested.trunc()
+    };
     let span = with_host(|h| match h.get(recv) {
         Some(JsObj::Object(p)) => p.get("byteLength").map(|l| h.to_number(l)).unwrap_or(0.0),
         _ => 0.0,
-    }) as usize;
-    if at + width > span {
+    });
+    if requested < 0.0 || requested + width as f64 > span {
         return Err(crate::host::range_error(
             "Offset is outside the bounds of the DataView",
         ));
     }
+    let at = requested as usize;
     // The endianness flag is the LAST argument, and it is the second for a
     // getter but the third for a setter.
     let le = with_host(|h| {
@@ -468,11 +480,9 @@ pub fn dataview_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
     let mut b = match spec {
         "BigInt64" | "BigUint64" => {
             use num_traits::cast::ToPrimitive;
-            let big = with_host(|h| match h.get(&val) {
-                Some(JsObj::BigInt(x)) => Some(x.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| crate::host::type_error("Cannot convert a Number value to a BigInt"))?;
+            // `setBigInt64`/`setBigUint64` take `ToBigInt(value)` (25.3.4.x via
+            // `SetViewValue` step 5), the same conversion an element write does.
+            let big = crate::builtins::to_bigint(&val)?;
             let raw = if spec == "BigInt64" {
                 big.to_i64().unwrap_or(0) as u64
             } else {
@@ -1065,6 +1075,40 @@ fn write_elems(recv: &Value, kind: &str, vals: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+/// Order `elems` the way `%TypedArray%.prototype.sort` (23.2.3.29) does, with
+/// `cmp` as the optional user comparator. Shared with `toSorted` (23.2.3.33),
+/// which is the same ordering over a copy.
+fn sort_elements(elems: &mut Vec<Value>, kind: &str, cmp: Option<&Value>) -> Result<(), String> {
+    let cmp = cmp.cloned().unwrap_or(Value::Undef);
+    if with_host(|h| crate::host::is_callable(h, &cmp)) {
+        // A user comparator goes through the same fallible merge sort
+        // `Array.prototype.sort` uses: O(n log n) rather than the insertion sort
+        // this was, and a comparator returning NaN keeps the pair's order
+        // (23.2.4.1 step 3: NaN is +0) instead of swapping, which the `<= 0.0`
+        // break got wrong.
+        return crate::builtins::sort_values(elems, Some(&cmp));
+    }
+    // A typed array sorts NUMERICALLY by default, unlike `Array` which sorts by
+    // string. Verified against node v26.7.0: `new Uint8Array([10,9,1]).sort()`
+    // is `1,9,10` while `[10,9,1].sort()` is `1,10,9`.
+    // A BigInt element cannot be ordered through an `f64` without collapsing
+    // values more than 2^53 apart, so the 64-bit views compare the integers
+    // themselves.
+    if is_bigint_kind(kind) {
+        let keys: Vec<num_bigint::BigInt> = elems.iter().map(bigint_of).collect();
+        let mut idx: Vec<usize> = (0..elems.len()).collect();
+        idx.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
+        *elems = idx.into_iter().map(|i| elems[i].clone()).collect();
+    } else {
+        elems.sort_by(|a, b| {
+            num(a)
+                .partial_cmp(&num(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    Ok(())
+}
+
 /// Resolve a relative index argument against `len` (negative counts from the
 /// end), clamped into range — the `RelativeIndex` coercion the typed-array
 /// methods share.
@@ -1205,35 +1249,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
         "sort" => {
             let mut out = elems.clone();
-            let cmp = args.first().cloned().unwrap_or(Value::Undef);
-            if with_host(|h| crate::host::is_callable(h, &cmp)) {
-                // A user comparator goes through the same fallible merge sort
-                // `Array.prototype.sort` uses: O(n log n) rather than the
-                // insertion sort this was, and a comparator returning NaN keeps
-                // the pair's order (23.2.4.1 step 3: NaN is +0) instead of
-                // swapping, which the `<= 0.0` break got wrong.
-                crate::builtins::sort_values(&mut out, Some(&cmp))?;
-            } else {
-                // A typed array sorts NUMERICALLY by default, unlike `Array`
-                // which sorts by string. Verified against node v26.7.0:
-                // `new Uint8Array([10,9,1]).sort()` is `1,9,10` while
-                // `[10,9,1].sort()` is `1,10,9`.
-                // A BigInt element cannot be ordered through an `f64` without
-                // collapsing values more than 2^53 apart, so the 64-bit views
-                // compare the integers themselves.
-                if is_bigint_kind(&kind) {
-                    let keys: Vec<num_bigint::BigInt> = out.iter().map(bigint_of).collect();
-                    let mut idx: Vec<usize> = (0..out.len()).collect();
-                    idx.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
-                    out = idx.into_iter().map(|i| out[i].clone()).collect();
-                } else {
-                    out.sort_by(|a, b| {
-                        num(a)
-                            .partial_cmp(&num(b))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-            }
+            sort_elements(&mut out, &kind, args.first())?;
             write_elems(recv, &kind, &out)?;
             Ok(recv.clone())
         }
@@ -1343,9 +1359,47 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                     .any(|x| same_element(x, &needle, true)),
             ))
         }
+        // 23.2.3.9: `fill` writes THROUGH the view and answers the receiver. It
+        // was building a fresh array instead, so the write was invisible —
+        // `u.fill(9)` left `u` untouched, `u.fill(9) === u` was false, and a
+        // second view onto the same `ArrayBuffer` saw none of it. The `start`
+        // and `end` arguments were dropped too, so `fill(9, 1, 2)` overwrote the
+        // whole array rather than one element.
         "fill" => {
+            let len = elems.len();
             let v = coerce_val(&kind, args.first().unwrap_or(&Value::Undef))?;
-            Ok(make(&kind, vec![v; elems.len()]))
+            let start = rel_index(args, 1, len, 0);
+            let end = rel_index(args, 2, len, len);
+            let mut out = elems.clone();
+            for slot in out.iter_mut().take(end).skip(start) {
+                *slot = v.clone();
+            }
+            write_elems(recv, &kind, &out)?;
+            Ok(recv.clone())
+        }
+        // The change-by-copy trio (23.2.3.32-34). Each answers a NEW view of the
+        // receiver's own element kind — `TypedArrayCreateSameType`, not the
+        // species path — so a `Buffer` receiver yields a `Uint8Array`, which is
+        // what node reports.
+        "toReversed" | "toSorted" => {
+            let mut out = elems.clone();
+            if method == "toReversed" {
+                out.reverse();
+            } else {
+                sort_elements(&mut out, &kind, args.first())?;
+            }
+            Ok(make(&kind, out))
+        }
+        "with" => {
+            let len = elems.len();
+            let n = super::arg_num(args, 0);
+            let i = if n < 0.0 { len as f64 + n } else { n };
+            if !(0.0..len as f64).contains(&i) {
+                return Err("RangeError: Invalid typed array index".into());
+            }
+            let mut out = elems.clone();
+            out[i as usize] = coerce_val(&kind, args.get(1).unwrap_or(&Value::Undef))?;
+            Ok(make(&kind, out))
         }
         "set" => {
             // `ta.set(src[, offset])` — write `src`'s values in place.

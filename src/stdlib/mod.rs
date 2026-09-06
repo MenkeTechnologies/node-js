@@ -425,6 +425,16 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         // where node v26.7.0 reports 65536. node-js allocates each Buffer on its
         // own, so this is the documented constant, not a live allocator figure.
         "Buffer" if name == "poolSize" => Some(Value::Float(65536.0)),
+        // `Uint8Array.BYTES_PER_ELEMENT` is a property of the CONSTRUCTOR as
+        // well as of every instance (23.2.6.2 / 23.2.5.1); only the instance
+        // carried it, so the constructor read `undefined` — the form the
+        // `byteLength = n * Ctor.BYTES_PER_ELEMENT` idiom uses.
+        n if typedarray::is_ctor(n) && name == "BYTES_PER_ELEMENT" => {
+            // `ArrayBuffer`/`DataView` are element-less and report nothing.
+            typedarray::ELEMENT_KINDS
+                .contains(&n)
+                .then(|| Value::Float(typedarray::bytes_per_element(n) as f64))
+        }
         "buffer" if name == "Buffer" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("Buffer".into()))))
         }

@@ -2315,3 +2315,33 @@ Two more borrows and one message, found in the same pass:
 | --- | --- | --- |
 | `(void 0)()` | `(void 0) is not a function` | `undefined is not a function` — the call-site text table records a callee's source text, and this callee is an expression rather than a name |
 
+
+## Byte views
+
+A typed array is a window onto an `ArrayBuffer` here, but three of its methods
+did not treat it as one. Each was found by the `byteview` fuzz mode, which is
+new: the fuzzer's grammar named `Uint8Array` twice in 2,700 lines and `DataView`
+not at all, so none of this had ever been generated. Pinned in
+`examples/byteviews.js`.
+
+- **`fill` did not fill.** 23.2.3.9 writes THROUGH the view and answers the
+  receiver; this built a fresh array instead, so `u.fill(9)` left `u` untouched,
+  `u.fill(9) === u` was `false`, and a second view onto the same buffer saw
+  nothing. The `start`/`end` arguments were dropped as well, so `fill(9, 1, 2)`
+  overwrote the whole array rather than one element.
+- **`toReversed` / `toSorted` / `with` were missing.** All three reported `is not
+  a function`. They answer a new view of the receiver's own element kind
+  (`TypedArrayCreateSameType`, so a `Buffer` receiver yields a `Uint8Array`), and
+  `with` rejects an out-of-range index with `RangeError: Invalid typed array
+  index`.
+- **`Uint8Array.BYTES_PER_ELEMENT` was `undefined`** on the constructor — only
+  the instance carried it, which breaks the `n * Ctor.BYTES_PER_ELEMENT` idiom.
+- **A 64-bit view accepted only a BigInt.** `ToBigInt` (7.1.13) is not the
+  identity test: `a[0] = true` stores `1n`, `'12'` stores `12n`, `[]` stores
+  `0n`, and only a Number is refused — with the value named
+  (`Cannot convert 1 to a BigInt`), not the constant text this reported for all
+  seventeen inputs. `DataView.prototype.setBigInt64` took the same wrong path.
+- **A negative `DataView` index was clamped to zero.** `dv.getUint8(-2)` quietly
+  read the first byte where node throws `RangeError: Offset is outside the bounds
+  of the DataView`. `ToIndex` still truncates a fraction toward zero, so
+  `dv.getUint8(1.9)` reads index 1.
