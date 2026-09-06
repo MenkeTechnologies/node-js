@@ -1944,6 +1944,249 @@ fn gen_entry(seed: u64) -> Vec<String> {
     }
 }
 
+/// Byte views: typed arrays, `DataView` and `Buffer`. A ZERO-coverage surface
+/// before this mode — the grammar named `Uint8Array` twice in 2700 lines and
+/// `DataView` not at all — and the first run of it found that `fill` neither
+/// wrote through the view nor honoured its `start`/`end`, that `toReversed` /
+/// `toSorted` / `with` were missing outright, and that a 64-bit view rejected
+/// every `ToBigInt`-convertible value except a BigInt.
+///
+/// Element bytes are drawn from the full 0-255 range, never ASCII, so a "is this
+/// a Buffer" check that stringifies its input cannot pass by accident: 0xff and
+/// 0x80 are not valid UTF-8 and 0x00 truncates a C-style read.
+fn gen_byteview(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const KINDS: &[&str] = &[
+        "Uint8Array",
+        "Int8Array",
+        "Uint8ClampedArray",
+        "Int16Array",
+        "Uint16Array",
+        "Int32Array",
+        "Uint32Array",
+        "Float32Array",
+        "Float64Array",
+    ];
+    const BYTES: &[&str] = &[
+        "[0xff, 0xfe, 0x00, 0x41, 0x80]",
+        "[1, 2, 3]",
+        "[]",
+        "[255, 0]",
+        "[3, 1, 2, 1]",
+        "[0x80, 0x7f, 0xff, 0x01]",
+    ];
+    const IDX: &[&str] = &["0", "1", "2", "-1", "-2", "5", "100"];
+    let k = pick(r, KINDS);
+    let b = pick(r, BYTES);
+    match r.below(10) {
+        // `fill` writes THROUGH the view and answers the receiver, so a second
+        // view onto the same buffer must see it.
+        0 => vec![
+            format!("const a = new {k}({b});"),
+            format!(
+                "const ret = a.fill({}, {}, {});",
+                pick(r, &["0", "9", "255", "-1", "1.7"]),
+                pick(r, IDX),
+                pick(r, IDX)
+            ),
+            "console.log(a, ret === a);".into(),
+        ],
+        1 => vec![
+            format!("const buf = new ArrayBuffer(8); const a = new {k}(buf); const b = new {k}(buf);"),
+            format!("a.fill({});", pick(r, &["7", "255", "-3"])),
+            "console.log(b, a.byteLength, b.buffer === a.buffer);".into(),
+        ],
+        // The change-by-copy trio, which must leave the receiver untouched.
+        2 => vec![
+            format!("const a = new {k}({b});"),
+            format!(
+                "const c = a.{};",
+                pick(r, &["toReversed()", "toSorted()", "toSorted((x, y) => y - x)"])
+            ),
+            "console.log(a, c, c === a, c.constructor.name);".into(),
+        ],
+        3 => vec![
+            format!("const a = new {k}({b});"),
+            format!(
+                "try {{ console.log(a.with({}, {})); }} catch (e) {{ console.log(e.constructor.name, e.message); }}",
+                pick(r, IDX),
+                pick(r, &["9", "300", "-1", "1.5", "'7'"])
+            ),
+            "console.log(a);".into(),
+        ],
+        // `DataView`, which the grammar never mentioned at all.
+        4 => vec![
+            "const dv = new DataView(new ArrayBuffer(8));".into(),
+            format!(
+                "dv.{}(0, {});",
+                pick(r, &["setUint16", "setInt16", "setUint32", "setInt32", "setFloat32", "setFloat64", "setUint8"]),
+                pick(r, &["0xbeef", "-1", "255", "1.5", "0"])
+            ),
+            "console.log(dv.getUint8(0), dv.getUint8(1), dv.getUint16(0), dv.byteLength, dv.byteOffset);".into(),
+        ],
+        5 => vec![
+            "const dv = new DataView(new ArrayBuffer(4), 1);".into(),
+            format!(
+                "try {{ console.log(dv.{}({})); }} catch (e) {{ console.log(e.constructor.name, e.message); }}",
+                pick(r, &["getUint32", "getUint16", "getUint8"]),
+                pick(r, IDX)
+            ),
+        ],
+        // The 64-bit views take `ToBigInt`, which is NOT "must already be a
+        // BigInt" — a boolean and a numeric string convert, a Number does not.
+        6 => vec![
+            format!("const a = new {}(1);", pick(r, &["BigInt64Array", "BigUint64Array"])),
+            format!(
+                "try {{ a[0] = {}; console.log(a[0]); }} catch (e) {{ console.log(e.constructor.name, e.message); }}",
+                pick(r, &["1", "true", "'12'", "''", "[]", "['3']", "{}", "5n", "-1n", "null", "undefined", "1.5"])
+            ),
+        ],
+        // Buffer <-> typed array: the same bytes through both doors.
+        7 => vec![
+            format!("const buf = Buffer.from({b});"),
+            format!(
+                "console.log(buf, buf.toString('{}'), buf.length);",
+                pick(r, &["hex", "base64", "latin1", "utf8", "base64url"])
+            ),
+        ],
+        8 => vec![
+            format!("const a = new {k}({b});"),
+            format!(
+                "console.log(a.{}, {k}.BYTES_PER_ELEMENT, a.BYTES_PER_ELEMENT, a.byteLength);",
+                pick(r, &["subarray(1)", "slice(0, 2)", "at(-1)", "join('-')", "indexOf(255)", "includes(0)", "lastIndexOf(1)"])
+            ),
+        ],
+        // A prototype method invoked with a receiver that is not a view at all:
+        // the brand check, not "is not a function".
+        _ => vec![format!(
+            "try {{ Uint8Array.prototype.{}.call({}); console.log('no throw'); }} catch (e) {{ console.log(e.constructor.name, e.message); }}",
+            pick(r, &["slice", "fill", "subarray", "join", "sort"]),
+            pick(r, &["[]", "{}", "5", "'s'", "new Map()", "new Set()", "null", "new Date(0)"])
+        )],
+    }
+}
+
+/// The metadata every builtin carries as a function or as a namespace object:
+/// `name`, `length`, `String(fn)`, the descriptor of a member, the own-name
+/// list, and the branded `TypeError` a prototype method throws when its receiver
+/// has no such internal slot.
+///
+/// Another surface with no coverage at all: the grammar could describe what
+/// `Math.max(1, 2)` RETURNS but never what `Math.max` IS, and the answer was
+/// `undefined` for every one of `name`, `length` and
+/// `getOwnPropertyDescriptor`, with `[Function: @proto:TypedArray:set]` leaking
+/// an internal key into `console.log`.
+fn gen_builtinmeta(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const FNS: &[&str] = &[
+        "Math.max",
+        "Math.floor",
+        "Object.keys",
+        "Object.assign",
+        "JSON.parse",
+        "parseInt",
+        "isNaN",
+        "Array.from",
+        "Array.prototype.slice",
+        "String.prototype.replace",
+        "Object.prototype.toString",
+        "Set.prototype.union",
+        "Uint8Array.prototype.set",
+        "Promise.resolve",
+        "Number.isInteger",
+        "Reflect.ownKeys",
+        "encodeURIComponent",
+    ];
+    const CTORS: &[&str] = &[
+        "Array",
+        "Object",
+        "Map",
+        "Set",
+        "Promise",
+        "Number",
+        "String",
+        "Boolean",
+        "Symbol",
+        "WeakMap",
+        "Uint8Array",
+        "Error",
+        "TypeError",
+        "RegExp",
+        "Date",
+    ];
+    const NS: &[&str] = &[
+        "Math", "JSON", "Reflect", "Number", "Object", "Array", "Symbol",
+    ];
+    const MEMBERS: &[&str] = &[
+        "'PI'",
+        "'floor'",
+        "'max'",
+        "'parse'",
+        "'keys'",
+        "'MAX_SAFE_INTEGER'",
+        "'EPSILON'",
+        "'isNaN'",
+        "'prototype'",
+        "'name'",
+        "'length'",
+        "'nope'",
+    ];
+    match r.below(9) {
+        0 => vec![format!(
+            "const f = {}; console.log(f.name, f.length, typeof f.call, typeof f.bind);",
+            pick(r, FNS)
+        )],
+        1 => vec![format!("console.log(String({}));", pick(r, FNS))],
+        2 => vec![format!(
+            "const C = {}; console.log(C.name, C.length, typeof C.prototype);",
+            pick(r, CTORS)
+        )],
+        3 => vec![format!(
+            "console.log(Object.getOwnPropertyDescriptor({}, {}));",
+            pick(r, NS),
+            pick(r, MEMBERS)
+        )],
+        4 => vec![format!(
+            "console.log(Object.getOwnPropertyDescriptor({}, 'name'), Object.getOwnPropertyNames({}));",
+            pick(r, FNS),
+            pick(r, FNS)
+        )],
+        5 => vec![format!(
+            "console.log(Object.keys({}).length, JSON.stringify({}));",
+            pick(r, NS),
+            pick(r, NS)
+        )],
+        // The brand check, whose message names the receiver the way V8's
+        // side-effect-free renderer does.
+        6 => vec![format!(
+            "try {{ {}.call({}); console.log('no throw'); }} catch (e) {{ console.log(e.constructor.name, e.message); }}",
+            pick(r, &[
+                "Set.prototype.union",
+                "Set.prototype.has",
+                "Map.prototype.get",
+                "WeakMap.prototype.has",
+                "Promise.prototype.then",
+                "Date.prototype.getTime",
+                "Date.prototype.toISOString",
+                "Uint8Array.prototype.slice",
+            ]),
+            pick(r, &[
+                "[]", "{}", "5", "'s'", "null", "undefined", "new Map()", "new Set()",
+                "new Date(0)", "Object.create(null)", "new (class A {})()", "true", "9n",
+                "new Uint8Array(1)", "Promise.resolve(1)", "new WeakSet()",
+            ])
+        )],
+        7 => vec![format!(
+            "console.log(typeof {0}, {0} instanceof Function, Object.prototype.toString.call({0}));",
+            pick(r, &["Math", "JSON", "Reflect", "Math.max", "Array", "console.log"])
+        )],
+        _ => vec![format!(
+            "console.log(Object.getOwnPropertyDescriptor(globalThis, {}));",
+            pick(r, &["'Math'", "'parseInt'", "'undefined'", "'NaN'", "'Infinity'", "'JSON'", "'structuredClone'", "'nope'"])
+        )],
+    }
+}
+
 /// The locale/`toLocale*` surface, plus the case and normalization methods that
 /// sit next to it.
 ///
@@ -2031,6 +2274,8 @@ enum Mode {
     Stdio,
     Entry,
     Locale,
+    ByteView,
+    BuiltinMeta,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -2067,6 +2312,8 @@ const REAL_MODES: &[Mode] = &[
     Mode::Stdio,
     Mode::Entry,
     Mode::Locale,
+    Mode::ByteView,
+    Mode::BuiltinMeta,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -2110,6 +2357,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Stdio => gen_stdio(seed),
         Mode::Entry => gen_entry(seed),
         Mode::Locale => gen_locale(seed),
+        Mode::ByteView => gen_byteview(seed),
+        Mode::BuiltinMeta => gen_builtinmeta(seed),
     }
 }
 
@@ -2149,6 +2398,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Stdio => "stdio",
         Mode::Entry => "entry",
         Mode::Locale => "locale",
+        Mode::ByteView => "byteview",
+        Mode::BuiltinMeta => "builtinmeta",
     }
 }
 
@@ -2187,6 +2438,8 @@ const ALL_MODES: &[Mode] = &[
     Mode::Stdio,
     Mode::Entry,
     Mode::Locale,
+    Mode::ByteView,
+    Mode::BuiltinMeta,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {
