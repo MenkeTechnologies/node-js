@@ -2191,17 +2191,42 @@ impl Compiler {
                 let end = b.current_pos();
                 b.patch_jump(je, end);
             }
-            Expr::Assign { target, value } => {
-                self.compile_expr(b, value)?;
-                // 13.15.2 step 1.e: `h = function(){}` names the function `h`.
-                // Only an IdentifierReference target counts — `o.p = function(){}`
-                // leaves the name empty in node too.
-                if let Expr::Ident(n) = &**target {
-                    self.infer_name(b, value, n);
+            Expr::Assign { target, value } => match &**target {
+                // 13.15.2 steps 1.a-1.f: for a PROPERTY target the reference is
+                // evaluated first — the object, then the key — and only then the
+                // right-hand side. Routing these through `compile_bind` emitted
+                // the value first and the reference after, so every side effect
+                // in the target ran in the wrong order: `o[k()] = v()` called
+                // `v` before `k`, and `a[i++] = f()` passed `f` the
+                // already-incremented index. Both builtins return the value they
+                // stored, which is also the value of the assignment expression,
+                // so the `Dup`/`Rot`/`Pop` the generic path needed all fall away.
+                Expr::Member {
+                    object, property, ..
+                } => {
+                    self.compile_expr(b, object)?; // [recv]
+                    self.name_const(b, property); // [recv, name]
+                    self.compile_expr(b, value)?; // [recv, name, value]
+                    b.emit(Op::CallBuiltin(ops::SETATTR, 3), 0); // [value]
                 }
-                b.emit(Op::Dup, 0); // assignment yields the value
-                self.compile_bind(b, target, BindMode::Assign)?;
-            }
+                Expr::Index { object, index, .. } => {
+                    self.compile_expr(b, object)?; // [recv]
+                    self.compile_expr(b, index)?; // [recv, idx]
+                    self.compile_expr(b, value)?; // [recv, idx, value]
+                    b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0); // [value]
+                }
+                _ => {
+                    self.compile_expr(b, value)?;
+                    // 13.15.2 step 1.e: `h = function(){}` names the function `h`.
+                    // Only an IdentifierReference target counts — `o.p = function(){}`
+                    // leaves the name empty in node too.
+                    if let Expr::Ident(n) = &**target {
+                        self.infer_name(b, value, n);
+                    }
+                    b.emit(Op::Dup, 0); // assignment yields the value
+                    self.compile_bind(b, target, BindMode::Assign)?;
+                }
+            },
             Expr::Update { op, prefix, target } => self.compile_update(b, *op, *prefix, target)?,
             // A chain's ROOT opens the frame its `?.` links park their jumps
             // in; nested links see it already open and add to it.

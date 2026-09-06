@@ -54,16 +54,18 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "format" => {
             // `format` re-enters `with_host` internally, so build the string first
             // and only then allocate — never nest the borrow.
-            let s = format(args);
-            Ok(with_host(|h| h.new_str(s)))
+            match format(args) {
+                Ok(s) => Ok(with_host(|h| h.new_str(s))),
+                Err(e) => Err(e),
+            }
         }
         // `formatWithOptions(inspectOptions, fmt, ...args)`: the options object
         // only tunes `inspect` styling, which we do not vary — drop it and format
         // the remaining arguments exactly like `format`.
-        "formatWithOptions" => {
-            let s = format(args.get(1..).unwrap_or(&[]));
-            Ok(with_host(|h| h.new_str(s)))
-        }
+        "formatWithOptions" => match format(args.get(1..).unwrap_or(&[])) {
+            Ok(s) => Ok(with_host(|h| h.new_str(s))),
+            Err(e) => Err(e),
+        },
         "inspect" => {
             if let Some(v) = args.first() {
                 crate::builtins::materialize_stack(v);
@@ -114,8 +116,43 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                     }
                 }
             };
+            // `sorted` accepts a comparator function in node; only the boolean
+            // form is honored here, and any truthy value turns plain sorting on.
+            // Read the option OUT of the host before borrowing it: `read` borrows
+            // the host itself, so `with_host(|h| h.truthy(&read("sorted")))` is a
+            // nested borrow and aborts the process with "RefCell already
+            // borrowed", which no script can catch.
+            let sorted_opt = read("sorted");
+            let sorted = with_host(|h| h.truthy(&sorted_opt));
+            // `customInspect` defaults to TRUE, so only an explicit `false`
+            // turns a value's own `[util.inspect.custom]` rendering off.
+            let custom_inspect = match read("customInspect") {
+                Value::Undef => true,
+                v => with_host(|h| h.truthy(&v)),
+            };
+            let show_hidden_opt = read("showHidden");
+            let show_hidden = with_host(|h| h.truthy(&show_hidden_opt));
+            // `maxArrayLength: null | Infinity` means "no limit". Node also
+            // accepts 0 (show none but the tail count), which falls out of the
+            // clamp below without a special case.
+            let max_array_length = match read("maxArrayLength") {
+                Value::Undef => crate::host::DEFAULT_MAX_ARRAY_LENGTH,
+                v if with_host(|h| h.is_null(&v)) => usize::MAX,
+                v => {
+                    let n = with_host(|h| h.to_number(&v));
+                    if n.is_finite() {
+                        n.max(0.0) as usize
+                    } else {
+                        usize::MAX
+                    }
+                }
+            };
             crate::host::set_inspect_compact(compact);
             crate::host::set_inspect_break_length(break_length);
+            crate::host::set_inspect_sorted(sorted);
+            crate::host::set_inspect_max_array_length(max_array_length);
+            crate::host::set_inspect_custom(custom_inspect);
+            crate::host::set_inspect_show_hidden(show_hidden);
             let out = with_host(|h| {
                 let s = h.inspect(&args.first().cloned().unwrap_or(Value::Undef));
                 h.new_str(s)
@@ -123,6 +160,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             crate::host::set_inspect_max_depth(2);
             crate::host::set_inspect_compact(3);
             crate::host::set_inspect_break_length(80);
+            crate::host::set_inspect_sorted(false);
+            crate::host::set_inspect_max_array_length(crate::host::DEFAULT_MAX_ARRAY_LENGTH);
+            crate::host::set_inspect_custom(true);
+            crate::host::set_inspect_show_hidden(false);
             Ok(out)
         }
         // `deprecate(fn, msg)`: return a callable that behaves like `fn`. The
@@ -239,16 +280,23 @@ fn fmt_directive_number(n: f64) -> String {
 /// Run one of the global numeric parsers over a directive argument. `%i` is
 /// `parseInt` and `%f` is `parseFloat` — string-prefix parses, NOT `Number()`,
 /// which is why `"3.9abc"` yields `3`/`3.9` rather than `NaN`.
-fn coerce_via(parser: &str, arg: &Value) -> f64 {
-    crate::builtins::call_builtin_function(parser, vec![arg.clone()])
-        .ok()
-        .map(|v| with_host(|h| h.to_number(&v)))
-        .unwrap_or(f64::NAN)
+fn coerce_via(parser: &str, arg: &Value) -> Result<f64, String> {
+    // The parse itself cannot fail, but coercing the ARGUMENT to a string can:
+    // `parseInt([Symbol()])` joins the array, and a Symbol has no string form.
+    // Node lets that TypeError out of `util.format`; swallowing it turned a
+    // throwing program into one that printed `NaN`.
+    let v = crate::builtins::call_builtin_function(parser, vec![arg.clone()])?;
+    Ok(with_host(|h| h.to_number(&v)))
 }
 
 /// `util.format(fmt, ...args)` — printf-style substitution (`%s %d %i %f %j %o %O
 /// %c %%`) with any leftover arguments appended space-separated.
-pub fn format(args: &[Value]) -> String {
+/// Fallible because three of the directives can throw and node lets those
+/// throws out: `%j` on a BigInt is `TypeError: Do not know how to serialize a
+/// BigInt`, and `%d`/`%i`/`%f` on a value whose coercion reaches a Symbol is
+/// `TypeError: Cannot convert a Symbol value to a string`. Returning a bare
+/// `String` meant each of those printed `undefined` or `NaN` instead.
+pub fn format(args: &[Value]) -> Result<String, String> {
     // Node's inspect reads `err.stack`, and that read is what FORMATS the header
     // and freezes it. Doing it here, before the inspect borrow, keeps
     // `console.log(err)` showing the error's current `name` — the inspect walk
@@ -257,24 +305,24 @@ pub fn format(args: &[Value]) -> String {
         crate::builtins::materialize_stack(a);
     }
     if args.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
     // Node: a single argument is returned as-is (no specifier processing) —
     // `util.format("100%% done")` === "100%% done".
     if args.len() == 1 {
-        return with_host(|h| h.console_format(&args[0]));
+        return Ok(with_host(|h| h.console_format(&args[0])));
     }
     let fmt = with_host(|h| h.str_of(&args[0]));
     // A non-string first argument: inspect everything, space-joined.
     if !matches!(args[0], Value::Str(_))
         && !with_host(|h| matches!(h.get(&args[0]), Some(JsObj::Str(_))))
     {
-        return with_host(|h| {
+        return Ok(with_host(|h| {
             args.iter()
                 .map(|a| h.console_format(a))
                 .collect::<Vec<_>>()
                 .join(" ")
-        });
+        }));
     }
 
     let mut out = String::new();
@@ -303,12 +351,82 @@ pub fn format(args: &[Value]) -> String {
         ai += 1;
         match spec {
             // Node's %s renders a BigInt with the trailing `n` (unlike String()).
+            // `%s` is NOT `String(x)` for objects. Node stringifies an object
+            // only when its `toString` is one the SCRIPT wrote; an object that
+            // would merely inherit the built-in is inspected instead, at
+            // `depth: 0`. So `%s` on `{a:{b:1}}` is `{ a: [Object] }`, on a Date
+            // the ISO form, and on a Map `Map(1) { 'a' => 1 }` — where plain
+            // `String()` would flatten all three to `[object Object]`, which is
+            // what this printed for every object, Map, Set, Date and boxed
+            // primitive. A class that defines `toString` (or `Symbol
+            // .toPrimitive`) still wins, at any depth of its prototype chain.
             's' => {
-                let s = with_host(|h| match h.get(arg) {
-                    Some(JsObj::BigInt(b)) => format!("{b}n"),
-                    _ => h.str_of(arg),
+                // A NUMBER goes through node's number formatter, not `String()`:
+                // that is the only path that distinguishes `-0` from `0`, and
+                // `util.format('%s', -0)` is `-0` where `String(-0)` is `0`.
+                if let Value::Float(n) = arg {
+                    out.push_str(&fmt_directive_number(*n));
+                    continue;
+                }
+                let (bigint, use_inspect) = with_host(|h| match h.get(arg) {
+                    Some(JsObj::BigInt(b)) => (Some(format!("{b}n")), false),
+                    _ => {
+                        let is_obj = h.type_of(arg) == "object" && !h.is_null(arg);
+                        // Only a SCRIPT-DEFINED conversion counts. A boxed
+                        // primitive carries a real `toString` on its prototype,
+                        // but it is the built-in one, so node still inspects it
+                        // (`new String('b')` under `%s` is `[String: 'b']`, not
+                        // `b`) — testing merely for the property's presence put
+                        // every boxed primitive on the stringifying path.
+                        // A Buffer is the one core type whose `toString` node
+                        // does NOT count as built-in: `lib/buffer.js` is ordinary
+                        // JavaScript, so `%s` decodes the bytes
+                        // (`util.format('%s', Buffer.from('hi'))` is `hi`) rather
+                        // than inspecting them. Its `toString` is native here and
+                        // would otherwise be classified the other way. Read from
+                        // the ALREADY-BORROWED host: `stdlib::native_tag` opens
+                        // its own borrow and would abort the process from here.
+                        // The same applies to every BYTE VIEW: node stringifies
+                        // a `Uint8Array` under `%s` as `1,2`, where a plain Array
+                        // is inspected as `[ 1, 2 ]`. An ArrayBuffer is NOT one of
+                        // these — it has no `toString` of its own and is inspected.
+                        let stringifies = matches!(h.get(arg), Some(JsObj::Object(p))
+                        if matches!(
+                            p.get("@@native").map(|t| h.str_of(t)).as_deref(),
+                            Some("Buffer") | Some("TypedArray")
+                        ));
+                        if stringifies {
+                            return (None, false);
+                        }
+                        let scripted = ["toString", "@@toPrimitive"].iter().any(|k| {
+                            crate::host::lookup_chain(h, arg, k).is_some_and(|f| {
+                                matches!(
+                                    h.get(&f),
+                                    Some(JsObj::Func(_))
+                                        | Some(JsObj::Class(_))
+                                        | Some(JsObj::BoundFunc { .. })
+                                )
+                            })
+                        });
+                        (None, is_obj && !scripted)
+                    }
                 });
-                out.push_str(&s);
+                if let Some(b) = bigint {
+                    out.push_str(&b);
+                } else if use_inspect {
+                    crate::host::set_inspect_max_depth(0);
+                    let s = with_host(|h| h.inspect(arg));
+                    crate::host::set_inspect_max_depth(2);
+                    out.push_str(&s);
+                } else {
+                    // Full `ToPrimitive`, so a scripted `toString` actually runs;
+                    // `str_of` reads the object's brand and would answer
+                    // `[object Object]` without calling anything.
+                    let s = crate::host::to_string_value(arg)
+                        .map(|v| with_host(|h| h.str_of(&v)))
+                        .unwrap_or_else(|_| with_host(|h| h.str_of(arg)));
+                    out.push_str(&s);
+                }
             }
             // The three numeric directives use three DIFFERENT conversions, and
             // collapsing them to one truncating `to_number` got all three wrong:
@@ -323,23 +441,52 @@ pub fn format(args: &[Value]) -> String {
                     Some(JsObj::BigInt(b)) => Some(format!("{b}n")),
                     _ => None,
                 });
+                // A bare Symbol is `NaN` under %d rather than a throw — node
+                // tests `typeof === 'symbol'` before it ever coerces. Only a
+                // Symbol reached THROUGH a coercion (inside an array, say) throws.
+                let is_symbol = with_host(|h| h.type_of(arg) == "symbol");
                 match big {
                     Some(s) => out.push_str(&s),
+                    None if is_symbol => out.push_str("NaN"),
                     None if spec == 'd' => {
-                        out.push_str(&fmt_directive_number(with_host(|h| h.to_number(arg))))
+                        out.push_str(&fmt_directive_number(crate::host::to_number_value(arg)?))
                     }
-                    None => out.push_str(&fmt_directive_number(coerce_via("parseInt", arg))),
+                    None => out.push_str(&fmt_directive_number(coerce_via("parseInt", arg)?)),
                 }
             }
-            'f' => out.push_str(&fmt_directive_number(coerce_via("parseFloat", arg))),
+            'f' => {
+                let is_symbol = with_host(|h| h.type_of(arg) == "symbol");
+                if is_symbol {
+                    out.push_str("NaN");
+                } else {
+                    out.push_str(&fmt_directive_number(coerce_via("parseFloat", arg)?));
+                }
+            }
             'j' => {
-                let s = crate::builtins::call_builtin_function("JSON.stringify", vec![arg.clone()])
-                    .ok()
-                    .map(|v| with_host(|h| h.str_of(&v)))
-                    .unwrap_or_else(|| "undefined".into());
+                // A CIRCULAR structure is the one JSON failure node absorbs,
+                // rendering it as `[Circular]`; every other failure — a BigInt
+                // above all — propagates.
+                match crate::builtins::call_builtin_function("JSON.stringify", vec![arg.clone()]) {
+                    Ok(v) => out.push_str(&with_host(|h| h.str_of(&v))),
+                    Err(e) if e.contains("circular structure") => out.push_str("[Circular]"),
+                    Err(e) => return Err(e),
+                }
+            }
+            // `%o` and `%O` are NOT the same directive. `%O` is a plain
+            // `inspect` at the default depth; `%o` is `inspect(v, { showHidden:
+            // true, showProxy: true, depth: 4 })`, so it reveals an array's
+            // `[length]`, a typed array's window onto its buffer, and four levels
+            // instead of two. Rendering both as the default inspect made `%o` a
+            // silent alias of `%O`.
+            'O' => out.push_str(&with_host(|h| h.inspect(arg))),
+            'o' => {
+                crate::host::set_inspect_show_hidden(true);
+                crate::host::set_inspect_max_depth(4);
+                let s = with_host(|h| h.inspect(arg));
+                crate::host::set_inspect_show_hidden(false);
+                crate::host::set_inspect_max_depth(2);
                 out.push_str(&s);
             }
-            'o' | 'O' => out.push_str(&with_host(|h| h.inspect(arg))),
             'c' => {} // CSS directive: consumes the arg, emits nothing.
             _ => {}
         }
@@ -349,7 +496,7 @@ pub fn format(args: &[Value]) -> String {
         out.push(' ');
         out.push_str(&with_host(|h| h.console_format(a)));
     }
-    out
+    Ok(out)
 }
 
 // ── promisify / callbackify ──────────────────────────────────────────────────

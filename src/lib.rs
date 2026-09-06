@@ -227,7 +227,9 @@ pub fn eval_str_print(src: &str, origin: &str) -> Result<(), String> {
     }
     module::install_entry_globals(origin);
     let value = run_compiled(compile_completion(src)?)?;
-    let line = stdlib::util::format(std::slice::from_ref(&value));
+    // One argument means no directive processing at all (node returns a lone
+    // argument as-is), so this call has nothing that can throw.
+    let line = stdlib::util::format(std::slice::from_ref(&value))?;
     host::with_host(|h| h.write_out(&format!("{line}\n"), false));
     Ok(())
 }

@@ -390,7 +390,36 @@ fn check(
         return Ok(Value::Undef);
     }
     let custom = message(args, msg_idx);
-    let (sa, sb) = with_host(|h| (h.inspect(a), h.inspect(b)));
+    // `strictEqual`, `deepStrictEqual` and `partialDeepStrictEqual` are Node's
+    // `kMethodsWithCustomMessageDiff`: they render a structural `+ actual -
+    // expected` diff of the two operands, and they keep rendering it when a
+    // custom message is supplied (the custom text replaces the heading only).
+    // Every other comparison writes a fixed sentence.
+    let diff_operator = match op {
+        "===" => Some("strictEqual"),
+        "deepStrictEqual" => Some("deepStrictEqual"),
+        "partialDeepStrictEqual" => Some("partialDeepStrictEqual"),
+        _ => None,
+    };
+    if let Some(diff_op) = diff_operator {
+        let msg = super::assert_diff::create_err_diff(a, b, diff_op, custom.as_deref());
+        let operator = if op == "===" { "strictEqual" } else { op };
+        return Err(throw_assertion(
+            &msg,
+            custom.is_none(),
+            operator,
+            a.clone(),
+            b.clone(),
+        ));
+    }
+    // The remaining messages echo one or both operands, and do so with assert's
+    // OWN inspect settings (expanded and sorted), not `console.log`'s: node
+    // reports `notDeepStrictEqual({a:1},{a:1})` as `{\n  a: 1\n}`, one property
+    // per line, where the default rendering is `{ a: 1 }`.
+    let (sa, sb) = (
+        super::assert_diff::inspect_operand(a),
+        super::assert_diff::inspect_operand(b),
+    );
     // Each comparison has its OWN generated-message shape in Node; `{a} {op} {b}`
     // is only right for the two loose forms. `strictEqual(1, 2)` produced
     // `1 strictEqual 2` here, which is not a sentence any Node emits — the
@@ -576,12 +605,60 @@ fn deep_equal_body(
             if ea.len() != eb.len() {
                 return false;
             }
-            ea.iter().all(|(k, va)| {
+            let props_match = ea.iter().all(|(k, va)| {
                 eb.iter()
+                    .find(|(k2, _)| k2 == k)
+                    .is_some_and(|(_, vb)| deep_equal_seen(va, vb, strict_mode, seen))
+            });
+            if !props_match {
+                return false;
+            }
+            // The brands whose whole state lives in INTERNAL slots — a Date's
+            // `@@ms`, a typed array's `@@buffer`/`byteOffset`, an Error's name
+            // and message — are objects with no enumerable own properties at
+            // all. Comparing only the public ones therefore reported every pair
+            // of them as deep-equal: `deepStrictEqual(new Date(0), new Date(1))`
+            // PASSED, as did two Buffers with different bytes. Slots are
+            // compared here rather than folded into `object_of` because they are
+            // not properties — they must not affect the key COUNT above, which
+            // node takes over enumerable keys only.
+            let (ia, ib) = with_host(|h| (internals_of(h, a), internals_of(h, b)));
+            if ia.len() != ib.len() {
+                return false;
+            }
+            ia.iter().all(|(k, va)| {
+                ib.iter()
                     .find(|(k2, _)| k2 == k)
                     .is_some_and(|(_, vb)| deep_equal_seen(va, vb, strict_mode, seen))
             })
         }
+        // A Map compares by ENTRIES and a Set by MEMBERS, both order-insensitively
+        // (`new Set([1, 2])` deep-equals `new Set([2, 1])`), so each entry on the
+        // left is matched against an as-yet-unclaimed entry on the right rather
+        // than against the one at its own index.
+        (Some(Kind::Map), Some(Kind::Map)) => {
+            let (ea, eb) = with_host(|h| (map_entries_of(h, a), map_entries_of(h, b)));
+            unordered_match(&ea, &eb, seen, |(ka, va), (kb, vb), seen| {
+                deep_equal_seen(ka, kb, strict_mode, seen)
+                    && deep_equal_seen(va, vb, strict_mode, seen)
+            })
+        }
+        (Some(Kind::Set), Some(Kind::Set)) => {
+            let (ea, eb) = with_host(|h| (set_members_of(h, a), set_members_of(h, b)));
+            unordered_match(&ea, &eb, seen, |x, y, seen| {
+                deep_equal_seen(x, y, strict_mode, seen)
+            })
+        }
+        // Two distinct RegExp objects are deep-equal when their pattern and flags
+        // are; `same_value` would call every one of them unequal.
+        (Some(Kind::RegExp), Some(Kind::RegExp)) => {
+            with_host(|h| regexp_key(h, a) == regexp_key(h, b))
+        }
+        // Everything else — strings, symbols, bigints, functions, and any two
+        // values of DIFFERENT kinds — is compared as a leaf. This arm used to be
+        // unreachable for heap values because `kind` called them all `Object`,
+        // and `object_of` then reported each as having zero properties, so any
+        // two of them matched: `deepStrictEqual('abc', 'abd')` passed silently.
         _ => {
             if strict_mode {
                 strict(a, b)
@@ -592,14 +669,86 @@ fn deep_equal_body(
     }
 }
 
+/// Whether every element of `ea` can be paired off with a DISTINCT element of
+/// `eb` under `eq`. Greedy matching is enough here because the relation is an
+/// equivalence: anything that matches a claimed element would have matched
+/// whatever claimed it.
+fn unordered_match<T>(
+    ea: &[T],
+    eb: &[T],
+    seen: &mut Vec<(Value, Value)>,
+    eq: impl Fn(&T, &T, &mut Vec<(Value, Value)>) -> bool,
+) -> bool {
+    if ea.len() != eb.len() {
+        return false;
+    }
+    let mut claimed = vec![false; eb.len()];
+    'outer: for x in ea {
+        for (i, y) in eb.iter().enumerate() {
+            if !claimed[i] && eq(x, y, seen) {
+                claimed[i] = true;
+                continue 'outer;
+            }
+        }
+        return false;
+    }
+    true
+}
+
 enum Kind {
     Array,
     Object,
+    Map,
+    Set,
+    RegExp,
+    /// A leaf: compared with `===`, never structurally.
+    Other,
 }
 fn kind(o: &JsObj) -> Kind {
     match o {
         JsObj::Array(_) => Kind::Array,
-        _ => Kind::Object,
+        JsObj::Object(_) => Kind::Object,
+        // A WEAK collection exposes no entries, so there is nothing to compare
+        // structurally; node treats two of them as equal only by identity.
+        JsObj::Map { weak: false, .. } => Kind::Map,
+        JsObj::Set { weak: false, .. } => Kind::Set,
+        JsObj::RegExp(_) => Kind::RegExp,
+        _ => Kind::Other,
+    }
+}
+/// A Map's entries as `(key, value)` pairs, in insertion order.
+fn map_entries_of(h: &crate::host::JsHost, v: &Value) -> Vec<(Value, Value)> {
+    match h.get(v) {
+        Some(JsObj::Map { entries, .. }) => entries.values().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+/// A Set's members, in insertion order.
+fn set_members_of(h: &crate::host::JsHost, v: &Value) -> Vec<Value> {
+    match h.get(v) {
+        Some(JsObj::Set { entries, .. }) => entries.values().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+/// The identity of a regular expression for comparison: its pattern and flags.
+fn regexp_key(h: &crate::host::JsHost, v: &Value) -> Option<(String, String)> {
+    match h.get(v) {
+        Some(JsObj::RegExp(r)) => Some((r.source.clone(), r.flags.clone())),
+        _ => None,
+    }
+}
+/// An object's INTERNAL slots — the `@@`-prefixed keys that carry brand state
+/// (`@@ms`, `@@buffer`, `@@kind`) and are deliberately absent from `object_of`.
+/// Private class fields (`#`-prefixed) stay excluded: node's `deepStrictEqual`
+/// compares own ENUMERABLE properties, and a private field is neither.
+fn internals_of(h: &crate::host::JsHost, v: &Value) -> Vec<(String, Value)> {
+    match h.get(v) {
+        Some(JsObj::Object(p)) => p
+            .iter()
+            .filter(|(k, _)| k.starts_with("@@"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 fn array_of(h: &crate::host::JsHost, v: &Value) -> Vec<Value> {

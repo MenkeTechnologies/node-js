@@ -59,13 +59,23 @@ thread_local! {
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "log" | "info" | "debug" | "dirxml" => {
-            emit(&format_args(args), false);
-            Ok(Value::Undef)
+            // A throwing directive aborts the call BEFORE anything is written,
+            // which is what node does: `console.log('%j', 1n)` prints no line.
+            match format_args(args) {
+                Ok(s) => {
+                    emit(&s, false);
+                    Ok(Value::Undef)
+                }
+                Err(e) => Err(e),
+            }
         }
-        "error" | "warn" => {
-            emit(&format_args(args), true);
-            Ok(Value::Undef)
-        }
+        "error" | "warn" => match format_args(args) {
+            Ok(s) => {
+                emit(&s, true);
+                Ok(Value::Undef)
+            }
+            Err(e) => Err(e),
+        },
         // `console.dir` renders its first argument through the same inspector,
         // ignoring the (rarely-used) options argument.
         "dir" => {
@@ -77,7 +87,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // captured stack is not attached here (no cheap synchronous stack source
         // at this layer); the message content matches Node.
         "trace" => {
-            let msg = format_args(args);
+            let msg = match format_args(args) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
             let line = if msg.is_empty() {
                 "Trace".to_string()
             } else {
@@ -91,7 +104,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "assert" => {
             let ok = with_host(|h| h.truthy(&args.first().cloned().unwrap_or(Value::Undef)));
             if !ok {
-                let msg = format_args(&args[1.min(args.len())..]);
+                let msg = match format_args(&args[1.min(args.len())..]) {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(e)),
+                };
                 let line = if msg.is_empty() {
                     "Assertion failed".to_string()
                 } else {
@@ -121,7 +137,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // subsequent output one level; `groupEnd` pops a level.
         "group" | "groupCollapsed" => {
             if !args.is_empty() {
-                emit(&format_args(args), false);
+                match format_args(args) {
+                    Ok(s) => emit(&s, false),
+                    Err(e) => return Some(Err(e)),
+                }
             }
             GROUP_DEPTH.with(|d| d.set(d.get() + 1));
             Ok(Value::Undef)
@@ -146,7 +165,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                     let ms = d.as_secs_f64() * 1000.0;
                     // Any extra args after the label are appended, matching Node.
                     let extra = if args.len() > 1 {
-                        format!(" {}", format_args(&args[1..]))
+                        match format_args(&args[1..]) {
+                            Ok(s) => format!(" {s}"),
+                            Err(e) => return Some(Err(e)),
+                        }
                     } else {
                         String::new()
                     };
@@ -167,7 +189,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "table" => {
             match render_table(args) {
                 Some(t) => emit(&t, false),
-                None => emit(&format_args(args), false),
+                None => match format_args(args) {
+                    Ok(s) => emit(&s, false),
+                    Err(e) => return Some(Err(e)),
+                },
             }
             Ok(Value::Undef)
         }
@@ -241,7 +266,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
 
 /// Space-join every argument through the shared console formatter (identical to
 /// the global `console.log` path in `builtins::print_line`).
-fn format_args(args: &[Value]) -> String {
+fn format_args(args: &[Value]) -> Result<String, String> {
     // console.log(...args) === util.format(...args): printf substitution when the
     // first arg is a format string, else inspect-and-join.
     super::util::format(args)

@@ -2413,3 +2413,68 @@ not at all, so none of this had ever been generated. Pinned in
   read the first byte where node throws `RangeError: Offset is outside the bounds
   of the DataView`. `ToIndex` still truncates a fraction toward zero, so
   `dv.getUint8(1.9)` reads index 1.
+
+## Inspection, structural equality, and the assert diff
+
+The renderer and the comparison behind `assert` were both blind to a value's
+INTERNAL state — the part of a Date, a byte view or a collection that is not an
+enumerable property — and each was wrong in a way the other hid. Pinned in
+`examples/inspectoptions.js`, `examples/assertdiff.js`, `examples/deepequal.js`
+and `examples/dates.js`.
+
+- **`deepStrictEqual` passed for values that differ.** Every heap value that was
+  not an Array or a plain Object took the object path, whose property list came
+  back EMPTY for it; two empty property lists compare equal, so
+  `assert.deepStrictEqual('abc', 'abd')` passed, as did any two Dates, RegExps,
+  byte views, Buffers, Errors, Symbols, BigInts, boxed primitives, functions,
+  Sets and Maps — and anything containing one. An assertion that cannot fail is
+  worse than no assertion. Values that are leaves are now compared as leaves,
+  Maps and Sets structurally and order-insensitively, RegExps by source and
+  flags, and an object's brand slots alongside its properties.
+- **A Date rendered as `{}`.** Its time value lives in an internal slot, so
+  `console.log(new Date())` — and a Date inside any array, object, Map or Set —
+  printed an empty object.
+- **A Map or Set never wrapped.** Both joined their members onto one line
+  regardless of `breakLength` or `compact`, where node lays them out with the
+  same routine as a plain object.
+- **`util.format('%s')` was `String()` for everything.** Node inspects an object
+  unless the SCRIPT gave it a `toString`, so `%s` on a Map, Set, Date or boxed
+  primitive printed `[object Object]`. Buffers and typed arrays are the
+  exception node stringifies. `%s` on a number also goes through node's number
+  formatter, which is what distinguishes `-0` from `0`.
+- **`%o` was an alias of `%O`.** It implies `showHidden` and depth 4.
+- **`inspect` ignored `sorted`, `maxArrayLength`, `customInspect` and
+  `showHidden`,** and `compact: false` left the array column grid on while
+  `compact: N` capped it at a hardcoded twelve columns instead of `N * 4`.
+- **`AssertionError` carried no diff.** Node renders both operands and prints a
+  line diff of the renderings; only two single-line operands take the
+  `actual !== expected` form. Ported from `lib/internal/assert/myers_diff.js`.
+- **`util.format` swallowed throws.** `%j` on a BigInt and `%d`/`%i`/`%f` on a
+  value whose coercion reaches a Symbol are TypeErrors in node; each printed
+  `undefined` or `NaN`. `parseInt`/`parseFloat` had the same root cause — they
+  read the argument's brand instead of running `ToString`, so a scripted
+  `toString` was ignored too.
+
+Still divergent, and why:
+
+- **Compound and logical assignment evaluate a computed key TWICE.**
+  `o[k()] += 1` calls `k` twice where node calls it once; the parser desugars
+  `a op= b` to `a = a op b`, which duplicates the target expression. Simple
+  assignment is fixed (the target reference is evaluated before the right-hand
+  side, 13.15.2, pinned in `examples/assignorder.js`); the compound forms need
+  the operator carried on the AST node so the reference can be evaluated once.
+- **`Symbol.prototype` is missing `[Symbol.toPrimitive]`, its branded
+  `description` getter, and its `Symbol.toStringTag`.** The brand check on its
+  methods is in place — `String(Symbol.prototype)` used to recurse until the
+  stack overflowed and ABORTED the process, and now throws a catchable
+  TypeError — but node reaches that TypeError through `@@toPrimitive` and so
+  words it differently, `Symbol.prototype.description` answers `undefined`
+  rather than throwing, and
+  `Object.getOwnPropertyDescriptor(Symbol,'prototype').value` renders `{}` where
+  node renders `Object [Symbol] {}`. Every other builtin namespace already
+  carries its tag.
+- **`String(Map.prototype)` throws** where node answers `[object Map]`.
+- **A Buffer under `showHidden` cannot match.** Node's output exposes its 8 KB
+  pool allocator — `[byteOffset]: 144`, a `[buffer]` of `[byteLength]: 65599`,
+  and `parent`/`offset` getters — none of which exist here, where a Buffer owns
+  its bytes. The values are allocator state, not observable semantics.

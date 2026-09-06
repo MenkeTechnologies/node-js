@@ -177,7 +177,12 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
   module-by-module coverage list and the honest not-implemented set.
 - The persistent bytecode cache runs on EVERY invocation (schema-versioned, so
   an older cached script never replays incompatible bytecode), and AOT
-  native-executable emission is on the CLI as `--build`.
+  native-executable emission is on the CLI as `--build`. The shard is read
+  zero-copy: the archive is indexed in place and only the entry about to run is
+  decoded, so a lookup costs the same whether the cache holds one script or a
+  thousand. Measured interleaved against the previous read-and-deserialize-all
+  design on a 2.3 MB shard (debug build), a cache-hit run went from 78.8 ms to
+  51.5 ms against a ±2.0 ms same-binary control.
 - An LSP server (`--lsp`) and a DAP debug adapter (`--dap`) — source-line and
   function breakpoints, stepping, call stack, locals, and expression
   `evaluate` — are wired.

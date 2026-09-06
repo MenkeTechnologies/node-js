@@ -2131,7 +2131,7 @@ impl JsHost {
         // The first index not yet accounted for by an entry.
         let mut index = 0usize;
         for (i, it) in items.iter().enumerate() {
-            if out.len() >= MAX_ARRAY_LENGTH {
+            if out.len() >= inspect_max_array_length() {
                 break;
             }
             if holes.contains(&i) {
@@ -2140,7 +2140,7 @@ impl JsHost {
             if i > index {
                 out.push(empties(i - index));
                 index = i;
-                if out.len() >= MAX_ARRAY_LENGTH {
+                if out.len() >= inspect_max_array_length() {
                     break;
                 }
             }
@@ -2151,7 +2151,7 @@ impl JsHost {
         if remaining == 0 {
             return (out, false);
         }
-        if out.len() < MAX_ARRAY_LENGTH {
+        if out.len() < inspect_max_array_length() {
             // Trailing holes are still `<N empty items>`, not a truncation.
             out.push(empties(remaining));
             (out, false)
@@ -3630,6 +3630,37 @@ impl JsHost {
     /// The `*N` id is only assigned when the back-edge is reached, i.e. while
     /// the target's own children are being rendered — so the prefix can only be
     /// decided after `inspect_value` returns.
+    /// Whether `v` renders as a LEAF — a finished string produced without
+    /// recursing into any child.
+    ///
+    /// Node assigns `ctx.currentDepth = recurseTimes` in `formatRaw`, but only
+    /// after the early returns for the shapes that answer immediately: a bare
+    /// Date is its ISO string, a regex is its literal, an empty container is its
+    /// braces, and a Buffer is whatever its `[util.inspect.custom]` says. None of
+    /// those record a depth, so a group containing one is not pushed over the
+    /// `compact` threshold by it — `util.inspect([new Date(0), null], { compact:
+    /// 1 })` stays on one line. Charging them a level broke exactly those groups.
+    fn renders_without_expanding(&self, v: &Value) -> bool {
+        let plain_props = |p: &IndexMap<String, Value>| {
+            p.keys().all(|k| k.starts_with("@@") || k.starts_with('#'))
+        };
+        match self.get(v) {
+            // A regex never recurses, with or without its hidden `lastIndex`.
+            Some(JsObj::RegExp(_)) => true,
+            Some(JsObj::Map { entries, .. }) => entries.is_empty(),
+            Some(JsObj::Set { entries, .. }) => entries.is_empty(),
+            Some(JsObj::Array(items)) => items.is_empty() && self.own_symbol_entries(v).is_empty(),
+            Some(JsObj::Object(p)) => match p.get("@@native").map(|t| self.str_of(t)).as_deref() {
+                Some("Buffer") => inspect_custom(),
+                // Own properties added to a Date DO get expanded after it.
+                Some("Date") => plain_props(p),
+                Some(_) => false,
+                None => plain_props(p) && self.own_symbol_entries(v).is_empty(),
+            },
+            _ => false,
+        }
+    }
+
     fn inspect_lvl(&self, v: &Value, indent: usize, st: &mut InspectCycles) -> String {
         if !matches!(v, Value::Obj(_)) {
             return self.inspect_value(v, indent, st);
@@ -3644,7 +3675,18 @@ impl JsHost {
         // is what `reduceToSingleString` compares. A value the depth limit
         // stubs out as `[Object]` is never expanded and must not count, or an
         // object whose deepest level was elided would break where node joins.
-        if indent as i64 <= inspect_indent_limit() {
+        // Only a value node actually EXPANDS advances the depth. A string,
+        // symbol or bigint is a JS primitive that this host happens to store on
+        // the heap, so it reaches here as `Value::Obj` where an unboxed number
+        // returns above — and counting it as a level made any group holding one
+        // look deeper than it was. Under `compact: 1` that is the difference
+        // between node's `Map(2) { 'k2' => 8, 'j' => 5 }` and breaking the same
+        // Map across four lines, because its string KEYS were being charged a
+        // nesting level.
+        if indent as i64 <= inspect_indent_limit()
+            && !is_primitive(self, v)
+            && !self.renders_without_expanding(v)
+        {
             st.deepest = indent;
         }
         let body = self.inspect_value(v, indent, st);
@@ -3674,7 +3716,17 @@ impl JsHost {
                 Some(JsObj::Null) => "null".into(),
                 // `util.inspect` renders a bigint with the `n` suffix, a regex bare.
                 Some(JsObj::BigInt(b)) => format!("{b}n"),
-                Some(JsObj::RegExp(r)) => format!("/{}/{}", r.source, r.flags),
+                // `lastIndex` is a non-enumerable own property of every regex,
+                // so `showHidden` (and therefore `%o`) appends it:
+                // `/x/g { [lastIndex]: 0 }`.
+                Some(JsObj::RegExp(r)) => {
+                    let body = format!("/{}/{}", r.source, r.flags);
+                    if inspect_show_hidden() {
+                        format!("{body} {{ [lastIndex]: {} }}", r.last_index.get())
+                    } else {
+                        body
+                    }
+                }
                 // `util.inspect` on node v26.7.0 renders a proxy as
                 // `Proxy(<target>)` — the target's own rendering, wrapped. It
                 // deliberately does NOT run the handler's traps, so this stays a
@@ -3699,7 +3751,13 @@ impl JsHost {
                     // string keys as `Symbol(desc): value`, as it does on an
                     // object receiver.
                     let sym_entries = self.own_symbol_entries(v);
-                    if items.is_empty() && prop_keys.is_empty() && sym_entries.is_empty() {
+                    // Under `showHidden` even an empty array has something to
+                    // show — node prints `[ [length]: 0 ]`, not `[]`.
+                    if items.is_empty()
+                        && prop_keys.is_empty()
+                        && sym_entries.is_empty()
+                        && !inspect_show_hidden()
+                    {
                         return "[]".into();
                     }
                     // Node's default inspect depth is 2 (root = depth 0); deeper
@@ -3719,7 +3777,7 @@ impl JsHost {
                     let (mut inner, has_tail) = if self.has_holes(v) {
                         self.inspect_sparse(v, items, indent, st)
                     } else {
-                        let shown = items.len().min(MAX_ARRAY_LENGTH);
+                        let shown = items.len().min(inspect_max_array_length());
                         let mut inner: Vec<String> = items[..shown]
                             .iter()
                             .map(|x| self.inspect_lvl(x, indent + 2, st))
@@ -3731,7 +3789,17 @@ impl JsHost {
                         }
                         (inner, remaining > 0)
                     };
-                    let has_props = !prop_keys.is_empty() || !sym_entries.is_empty();
+                    // `showHidden` exposes the non-enumerable `length`, which an
+                    // array always has. It sorts BEFORE any own property node
+                    // shows (`[ 1, [length]: 1, x: 2 ]`) and, being an entry
+                    // rather than an element, it also turns the column grid off —
+                    // which is why a ten-element array under `showHidden` prints
+                    // on one line rather than as a grid.
+                    let show_hidden = inspect_show_hidden();
+                    if show_hidden {
+                        inner.push(format!("[length]: {}", items.len()));
+                    }
+                    let has_props = show_hidden || !prop_keys.is_empty() || !sym_entries.is_empty();
                     for k in &prop_keys {
                         let val = self.fn_prop(v, k).unwrap_or(Value::Undef);
                         inner.push(format!(
@@ -3814,19 +3882,60 @@ impl JsHost {
                     if indent as i64 > inspect_indent_limit() {
                         return format!("[{kind}]");
                     }
-                    let shown = elems.len().min(MAX_ARRAY_LENGTH);
+                    let shown = elems.len().min(inspect_max_array_length());
                     let mut inner: Vec<String> = elems[..shown].to_vec();
                     let remaining = elems.len() - shown;
                     if remaining > 0 {
                         let unit = if remaining == 1 { "item" } else { "items" };
                         inner.push(format!("... {remaining} more {unit}"));
                     }
+                    // A view's whole identity — its element width, its window
+                    // onto the backing store, and the store itself — is
+                    // non-enumerable, so `showHidden` is the only way to see it.
+                    // `util.format('%o', view)` goes through here, since `%o`
+                    // implies `showHidden`.
+                    let show_hidden = inspect_show_hidden();
+                    if show_hidden {
+                        let bpe = crate::stdlib::typedarray::bytes_per_element(&kind);
+                        let byte_offset = props
+                            .get("byteOffset")
+                            .map(|x| self.to_number(x))
+                            .unwrap_or(0.0);
+                        inner.push(format!("[BYTES_PER_ELEMENT]: {bpe}"));
+                        inner.push(format!("[length]: {}", elems.len()));
+                        inner.push(format!("[byteLength]: {}", elems.len() * bpe));
+                        inner.push(format!("[byteOffset]: {}", fmt_number(byte_offset)));
+                        // An ArrayBuffer reached AS a view's backing store is
+                        // rendered by node WITHOUT its contents — just
+                        // `ArrayBuffer { [byteLength]: N }` — even though the
+                        // same buffer inspected on its own leads with
+                        // `[Uint8Contents]`. Recursing through the normal
+                        // ArrayBuffer branch therefore printed the bytes twice,
+                        // once as the view's elements and again as the store's.
+                        let buf_len = props
+                            .get("@@buffer")
+                            .and_then(|b| self.get(b))
+                            .and_then(|o| match o {
+                                JsObj::Object(bp) => bp.get("@@bytes").cloned(),
+                                _ => None,
+                            })
+                            .and_then(|b| {
+                                self.get(&b).map(|o| match o {
+                                    JsObj::Array(items) => items.len(),
+                                    _ => 0,
+                                })
+                            })
+                            .unwrap_or(0);
+                        inner.push(format!(
+                            "[buffer]: ArrayBuffer {{ [byteLength]: {buf_len} }}"
+                        ));
+                    }
                     self.render_array(
                         &inner,
                         &vals,
                         indent,
                         ArrayLayout {
-                            has_props: false,
+                            has_props: show_hidden,
                             has_tail: remaining > 0,
                             base: &base,
                         },
@@ -3860,6 +3969,29 @@ impl JsHost {
                     }
                     self.render_object(&parts, "ArrayBuffer ", indent, st)
                 }
+                // A `Date` renders as its ISO-8601 form. Its time value lives in
+                // the internal `@@ms` slot, which the generic object branch below
+                // does not show, so without this arm every Date printed as `{}` —
+                // including through `console.log(d)`, inside arrays, objects and
+                // Maps, and in an `assert` diff.
+                Some(JsObj::Object(props))
+                    if props.get("@@native").map(|t| self.str_of(t)).as_deref() == Some("Date") =>
+                {
+                    let base = crate::stdlib::date::inspect_with_host(self, v);
+                    // Own properties added to a Date follow the date itself, the
+                    // way node appends them: `2020-01-01T00:00:00.000Z { x: 1 }`.
+                    let extra = self.side_table_parts(v, indent, st);
+                    let mut inner: Vec<String> = props
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with("@@") && !k.starts_with('#'))
+                        .map(|(k, val)| format!("{k}: {}", self.inspect_lvl(val, indent + 2, st)))
+                        .collect();
+                    inner.extend(extra);
+                    if inner.is_empty() {
+                        return base;
+                    }
+                    self.render_object(&inner, &format!("{base} "), indent, st)
+                }
                 // A `Buffer` renders as `<Buffer 01 02 03>` — hex bytes, capped
                 // at 50 with a `... N more byte(s)` tail, exactly as
                 // `util.inspect` does. Without this a `console.log(buf)` (the
@@ -3875,6 +4007,43 @@ impl JsHost {
                         }
                         _ => Vec::new(),
                     };
+                    // `<Buffer …>` is Buffer's `[util.inspect.custom]` hook, not
+                    // the shape of the object. Under `customInspect: false` node
+                    // does not call that hook and falls back to the generic
+                    // byte-view rendering — which is what an `assert` diff shows,
+                    // since assert inspects with the hook disabled so that a
+                    // failure names the differing BYTE rather than two opaque hex
+                    // blobs. The constructor is `Buffer` while the brand is still
+                    // `Uint8Array`, so node prints both.
+                    if !inspect_custom() {
+                        let base = format!("Buffer({}) [Uint8Array] ", bytes.len());
+                        if indent as i64 > inspect_indent_limit() {
+                            return "[Buffer [Uint8Array]]".into();
+                        }
+                        let shown = bytes.len().min(inspect_max_array_length());
+                        let mut inner: Vec<String> =
+                            bytes[..shown].iter().map(|b| b.to_string()).collect();
+                        let vals: Vec<Value> = bytes[..shown]
+                            .iter()
+                            .map(|b| Value::Float(*b as f64))
+                            .collect();
+                        let remaining = bytes.len() - shown;
+                        if remaining > 0 {
+                            let unit = if remaining == 1 { "item" } else { "items" };
+                            inner.push(format!("... {remaining} more {unit}"));
+                        }
+                        return self.render_array(
+                            &inner,
+                            &vals,
+                            indent,
+                            ArrayLayout {
+                                has_props: false,
+                                has_tail: remaining > 0,
+                                base: &base,
+                            },
+                            st,
+                        );
+                    }
                     const MAX: usize = 50;
                     let shown: Vec<String> =
                         bytes.iter().take(MAX).map(|b| format!("{b:02x}")).collect();
@@ -4073,7 +4242,18 @@ impl JsHost {
                         })
                         .collect();
                     inner.extend(extra);
-                    format!("Map({}) {{ {} }}", entries.len(), inner.join(", "))
+                    // Laid out by the SAME routine as a plain object, not joined
+                    // onto one line unconditionally. `Map`/`Set` were the only
+                    // containers that never consulted `breakLength` or `compact`,
+                    // so every collection wide enough to wrap printed as one long
+                    // line: node breaks a seven-member Set of ten-character
+                    // strings across seven lines, and `util.inspect(m, {compact:
+                    // false})` — which assert's own diff renderer depends on —
+                    // could not break a Map at all. Node builds these through
+                    // `reduceToSingleString` with `braces[0]` of `Map(n) {`, which
+                    // is this `prefix` (the trailing space is the brace gap).
+                    let prefix = format!("Map({}) ", entries.len());
+                    self.render_object(&inner, &prefix, indent, st)
                 }
                 Some(JsObj::Set { entries, .. }) => {
                     let extra = self.side_table_parts(v, indent, st);
@@ -4088,7 +4268,12 @@ impl JsHost {
                         .map(|v| self.inspect_lvl(v, indent + 2, st))
                         .collect();
                     inner.extend(extra);
-                    format!("Set({}) {{ {} }}", entries.len(), inner.join(", "))
+                    // Same layout routine as a Map (see above). Note node does
+                    // NOT column-group a wide Set the way it grids an array:
+                    // `groupArrayElements` is reached only from the list
+                    // formatter, so a 30-member Set is thirty lines.
+                    let prefix = format!("Set({}) ", entries.len());
+                    self.render_object(&inner, &prefix, indent, st)
                 }
                 Some(JsObj::Generator { .. }) => "Object [Generator] {}".into(),
                 Some(JsObj::Promise { id }) => match self.promises.get(*id as usize) {
@@ -4217,8 +4402,15 @@ impl JsHost {
         // Group array elements together if the array has more than six entries.
         // Arrays carrying extra own props (`index`/`input`/… on a match result)
         // are never grid-grouped — Node lays those out plainly.
+        // `compact: false` (held as 0) also turns the GRID off, not just the
+        // single-line join. Node reaches `groupArrayElements` only under
+        // `ctx.compact >= 1`, so `util.inspect(arr, { compact: false })` is one
+        // element per line however many there are; without this gate a 30-element
+        // array still came back column-aligned in three rows, which is the form
+        // assert's diff renderer splits on — every array diff would have been
+        // computed over grid rows instead of elements.
         let entries = output.len();
-        let (lines, grouped) = if entries > 6 && !has_props {
+        let (lines, grouped) = if entries > 6 && !has_props && inspect_compact() >= 1 {
             group_array_elements(self, output, values, indent, has_tail)
         } else {
             (output.to_vec(), false)
@@ -4275,6 +4467,22 @@ impl JsHost {
         // For a tagged object Node folds the tag into `braces[0]` (e.g.
         // `"Point {"`, `"[Object: null prototype] {"`), so its length is the
         // prefix (which carries the trailing space) plus the `{`.
+        // `sorted: true` orders the RENDERED entries, not the keys. Node sorts
+        // the finished `key: value` strings (`output.sort()` in `formatRaw` for
+        // the object shape), which is observably different from sorting keys
+        // whenever a key needs quoting — `'b-b': 1` sorts under `'`, not `b`.
+        // `assert`'s diff renderer depends on this: without it two objects
+        // carrying the same properties in a different insertion order diffed as
+        // a wholesale rewrite of every line instead of as equal.
+        let sorted_output;
+        let output = if inspect_sorted() {
+            let mut v = output.to_vec();
+            v.sort();
+            sorted_output = v;
+            &sorted_output[..]
+        } else {
+            output
+        };
         let braces0 = prefix.chars().count() + 1;
         let start = output.len() + indent + braces0 + 10;
         if self.may_compact(indent, st) && is_below_break_length(output, start) {
@@ -4790,11 +4998,69 @@ thread_local! {
     /// group is put on one line only when the subtree below it is shallower
     /// than this. `compact: false` is held as 0, which no subtree depth is
     /// below, so every group breaks — which is exactly what node does.
-    static INSPECT_COMPACT: std::cell::Cell<i64> = const { std::cell::Cell::new(3) };
+    static INSPECT_COMPACT: std::cell::Cell<i64> = const { std::cell::Cell::new(DEFAULT_COMPACT) };
 
     /// `util.inspect`'s `breakLength`. Node's default is 128, but `util.inspect`
     /// itself passes 80.
     static INSPECT_BREAK_LENGTH: std::cell::Cell<usize> = const { std::cell::Cell::new(80) };
+
+    /// `util.inspect`'s `sorted` option: emit an object's own keys in code-unit
+    /// order instead of insertion order. Off by default. `assert`'s diff renderer
+    /// turns it on so that two objects built with the same keys in a different
+    /// order diff as equal rather than as a wholesale rewrite.
+    static INSPECT_SORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// `util.inspect`'s `maxArrayLength`: how many entries are formatted before
+    /// the rest collapse into `... N more items`. Node's default is 100;
+    /// `Infinity`/`null` means "all", held here as `usize::MAX`.
+    static INSPECT_MAX_ARRAY_LENGTH: std::cell::Cell<usize> = const { std::cell::Cell::new(DEFAULT_MAX_ARRAY_LENGTH) };
+
+    /// `util.inspect`'s `customInspect` option: whether a value's own
+    /// `[util.inspect.custom]` rendering is used. On by default; `assert` turns
+    /// it off so a diff shows an object's real structure rather than whatever
+    /// summary it prefers to print.
+    static INSPECT_CUSTOM: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+
+    /// `util.inspect`'s `showHidden`: reveal the non-enumerable slots a value
+    /// carries — an array's `length`, a typed array's element width and window
+    /// onto its backing store. Off by default; `util.format`'s `%o` turns it on.
+    static INSPECT_SHOW_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set the `util.inspect` `showHidden` option for the next render.
+pub fn set_inspect_show_hidden(s: bool) {
+    INSPECT_SHOW_HIDDEN.with(|x| x.set(s));
+}
+
+pub(crate) fn inspect_show_hidden() -> bool {
+    INSPECT_SHOW_HIDDEN.with(|x| x.get())
+}
+
+/// Set the `util.inspect` `customInspect` option for the next render.
+pub fn set_inspect_custom(c: bool) {
+    INSPECT_CUSTOM.with(|x| x.set(c));
+}
+
+pub(crate) fn inspect_custom() -> bool {
+    INSPECT_CUSTOM.with(|x| x.get())
+}
+
+/// Set the `util.inspect` `sorted` option for the next render.
+pub fn set_inspect_sorted(s: bool) {
+    INSPECT_SORTED.with(|x| x.set(s));
+}
+
+pub(crate) fn inspect_sorted() -> bool {
+    INSPECT_SORTED.with(|x| x.get())
+}
+
+/// Set the `util.inspect` `maxArrayLength` for the next render.
+pub fn set_inspect_max_array_length(n: usize) {
+    INSPECT_MAX_ARRAY_LENGTH.with(|x| x.set(n));
+}
+
+pub(crate) fn inspect_max_array_length() -> usize {
+    INSPECT_MAX_ARRAY_LENGTH.with(|x| x.get())
 }
 
 /// Set the `util.inspect` `compact` option for the next render (0 for `false`).
@@ -4879,10 +5145,17 @@ fn break_length() -> usize {
     INSPECT_BREAK_LENGTH.with(|x| x.get())
 }
 /// Node's default `compact` setting (the `compact * 4` column cap term).
-const COMPACT: usize = 3;
-/// Node's default `maxArrayLength` — how many array elements `util.inspect`
-/// formats before collapsing the rest into `... N more items`.
-const MAX_ARRAY_LENGTH: usize = 100;
+/// Node's DEFAULT `compact` setting, and the initial value of
+/// `INSPECT_COMPACT`. The grid's column cap is `compact * 4`, so it has to be
+/// read through `inspect_compact()` at render time: under `{ compact: 1 }` node
+/// lays a byte array out four columns wide, and the hardcoded 3 gave twelve.
+const DEFAULT_COMPACT: i64 = 3;
+/// Node's default `maxArrayLength` — the initial value of
+/// `INSPECT_MAX_ARRAY_LENGTH`, which `util.inspect(v, { maxArrayLength: N })`
+/// overrides per call. Read it through `inspect_max_array_length()`, never
+/// directly: as a bare constant the option had no effect and a 120-element array
+/// was truncated at 100 even under `maxArrayLength: Infinity`.
+pub(crate) const DEFAULT_MAX_ARRAY_LENGTH: usize = 100;
 
 /// Whether `output` fits on a single line — a faithful port of Node's
 /// `isBelowBreakLength` (no colors, no `base`). `start` is the caller's seed
@@ -4945,7 +5218,7 @@ fn group_array_elements(
         ((approx_char_heights * biased_max * output_length as f64).sqrt() / biased_max).round()
             as i64,
         ((break_length() - indentation_lvl) as f64 / actual_max as f64).floor() as i64,
-        (COMPACT * 4) as i64,
+        inspect_compact().saturating_mul(4),
         15,
     ]
     .into_iter()

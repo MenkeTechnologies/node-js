@@ -64,6 +64,184 @@ search   1 true 1
 invoked  true true
 shrink   1,9 2
 plain    1 1 3 [1,null,null]
+==== assertdiff.js ====
+### one key differs  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  {
+    a: 1,
++   b: 2
+-   b: 3
+  }
+
+<<<
+### extra key  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  {
+    a: 2,
+-   c: 9,
+    z: 1
+  }
+
+<<<
+### longer array  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  [
+    1,
+    2,
+-   3
+  ]
+
+<<<
+### every key differs  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  {
++   a: 1,
++   b: 2,
++   c: 3
+-   a: 9,
+-   b: 8,
+-   c: 7
+  }
+
+<<<
+### nested  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  {
+    x: {
++     y: 1
+-     y: 2
+    }
+  }
+
+<<<
+### sets  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  Set(2) {
+    1,
++   2
+-   3
+  }
+
+<<<
+### maps  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  Map(1) {
++   'a' => 1
+-   'a' => 2
+  }
+
+<<<
+### buffers  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  Buffer(2) [Uint8Array] [
+    255,
++   0
+-   1
+  ]
+
+<<<
+### collapsed run  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
++ actual - expected
+... Skipped lines
+
+  [
+    0,
+    1,
+    2,
+    3,
+...
+    24,
++   25,
+-   999,
+    26,
+    27,
+    28,
+    29
+  ]
+
+<<<
+### short strings  (operator=deepStrictEqual, generated=true)
+Expected values to be strictly deep-equal:
+
+'abc' !== 'abd'
+
+<<<
+### short numbers  (operator=strictEqual, generated=true)
+Expected values to be strictly equal:
+
+1 !== 2
+
+<<<
+### zeros  (operator=strictEqual, generated=true)
+Expected values to be strictly equal:
++ actual - expected
+
++ 0
+- -0
+
+<<<
+### long strings  (operator=strictEqual, generated=true)
+Expected values to be strictly equal:
++ actual - expected
+
++ 'hello world foo'
+- 'hello world bar'
+               ^
+
+<<<
+### two objects  (operator=strictEqual, generated=true)
+Expected "actual" to be reference-equal to "expected":
++ actual - expected
+
+  {
++   a: 1
+-   a: 2
+  }
+
+<<<
+### same structure  (operator=strictEqual, generated=true)
+Values have same structure but are not reference-equal:
+
+{
+  a: 1
+}
+
+<<<
+### custom message  (operator=deepStrictEqual, generated=false)
+boom
++ actual - expected
+
+  {
++   a: 1
+-   a: 2
+  }
+
+<<<
+### notDeepStrictEqual  (operator=notDeepStrictEqual, generated=true)
+Expected "actual" not to be strictly deep-equal to:
+
+{
+  a: 1
+}
+
+<<<
 ==== assertions.js ====
 nan      pass throw:ERR_ASSERTION
 zero     throw:ERR_ASSERTION pass
@@ -80,6 +258,15 @@ strictdp throw:ERR_ASSERTION throw:ERR_ASSERTION
 loose    pass pass
 shapes   pass throw:ERR_ASSERTION pass
 more     pass pass function
+==== assignorder.js ====
+computed member: key,val
+index: 0,v
+object, key, value: [object Object],k,1
+i = 1 arr = 20,20,30
+value of assignment: 7
+chained: 5 5 5
+setter result: 9 order: 9,set:9
+nested computed: m,n,z {"m":{"n":"z"}}
 ==== async.js ====
 start
 end
@@ -478,6 +665,48 @@ total 12
 negative zero positive
 caught: failure
 done
+==== dates.js ====
+1970-01-01T00:00:00.001Z
+[ 1970-01-01T00:00:00.001Z ]
+{ d: 1970-01-01T00:00:00.001Z }
+Map(1) { 'k' => 1970-01-01T00:00:00.001Z }
+Set(1) { 1970-01-01T00:00:00.001Z }
+1970-01-01T00:00:00.001Z
+{ a: { b: { c: 1970-01-01T00:00:00.001Z } } }
+1970-01-01T00:00:00.000Z 1970-01-02T00:00:00.000Z 1969-12-31T23:59:59.999Z
+Invalid Date
+1970-01-01T00:00:00.000Z { note: 'x' }
+1970-01-01T00:00:00.001Z
+Expected values to be strictly deep-equal:
++ actual - expected
+
+  {
++   when: 1970-01-01T00:00:00.000Z
+-   when: 1970-01-01T00:00:00.001Z
+  }
+
+==== deepequal.js ====
+string ne => false
+date ne => false
+date eq => true
+regexp ne => false
+regexp eq => true
+regexp flags => false
+u8 ne => false
+buffer ne => false
+buffer eq => true
+error ne => false
+bigint ne => false
+boxed ne => false
+set ne => false
+set reordered => true
+set size => false
+map ne => false
+map reordered => true
+nested set => false
+nested date => false
+typed kind => false
+threw: 15
 ==== destructuring.js ====
 1 2 dflt { c: 3, d: 4 }
 10 99 [ 40, 50 ]
@@ -590,6 +819,36 @@ cb-b64   null "aGVsbG8="
 cb-buf   null true
 prom-hex "68656c6c6f"
 cleanup  false
+==== formatdirectives.js ====
+plain => "{ a: 1 }"
+nested => "{ a: [Object] }"
+array => "[ 1, 2 ]"
+date => "1970-01-01T00:00:00.000Z"
+regexp => "/a/g"
+map => "Map(1) { 'a' => 1 }"
+set => "Set(1) { 1 }"
+custom toString => "CUSTOM"
+no toString => "Plain {}"
+null proto => "[Object: null prototype] {}"
+boxed => "[String: 'b']"
+bigint => "7n"
+negative zero => "-0"
+nan => "NaN"
+typed array => "1,2"
+buffer => "hi"
+array buffer => "ArrayBuffer { [Uint8Contents]: <00 00>, [byteLength]: 2 }"
+'[ 1, 2, [length]: 2 ]' array:
+'/x/g { [lastIndex]: 0 }' regexp:
+'"{\\n  a: {\\n    b: { c: { d: { e: 1 } } }\\n  }\\n}"' depth:
+'"{ a: { b: { c: [Object] } } }"' depth:
+1.7 3 1.5
+"THREW" bigint TypeError: Do not know how to serialize a BigInt
+NaN symbol in array TypeError: Cannot convert a Symbol value to a string
+"=>" circular "[Circular]"
+parseInt array => 12
+parseInt object => 42
+parseInt symbol in array THREW TypeError: Cannot convert a Symbol value to a string
+parseFloat object => 1.5
 ==== generators.js ====
 range [ 2, 3, 4, 5, 6 ]
 fib [ 0, 1, 1, 2, 3, 5 ]
@@ -661,6 +920,66 @@ bl-1     "{\n  a: 1,\n  b: 2\n}"
 bl-grid  "[\n  0, 1, 2, 3,\n  4, 5, 6, 7\n]"
 combo    "[\n  1,\n  2\n]"
 console  { a: { b: { c: [Object] } } } [ 1, 2, 3 ] { x: { y: { z: [Object] } } }
+==== inspectoptions.js ====
+Set(7) {
+  'aaaaaaaaaa',
+  'bbbbbbbbbb',
+  'cccccccccc',
+  'dddddddddd',
+  'eeeeeeeeee',
+  'ffffffffff',
+  'gggggggggg'
+}
+Map(6) {
+  'alphaalpha' => 1,
+  'bravobravo' => 2,
+  'charliecharlie' => 3,
+  'deltadelta' => 4,
+  'echoecho' => 5,
+  'foxtrotfox' => 6
+}
+Set(12) { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }
+Set(2) {
+  1,
+  2
+}
+Map(1) {
+  'a' => 1
+}
+[
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10
+]
+[
+  95, 34, 51, 66,
+  83, 49, 20, 21,
+  70, 85
+]
+[ 1970-01-01T00:00:00.000Z, null ]
+{ a: 2, m: 3, zz: 1 }
+11
+<Buffer ff fe 00 41 80>
+Buffer(5) [Uint8Array] [ 255, 254, 0, 65, 128 ]
+[ 1, 2, [length]: 2 ]
+[ [length]: 0 ]
+Uint8Array(2) [
+  1,
+  2,
+  [BYTES_PER_ELEMENT]: 1,
+  [length]: 2,
+  [byteLength]: 2,
+  [byteOffset]: 0,
+  [buffer]: ArrayBuffer { [byteLength]: 2 }
+]
+/ab+c/gi { [lastIndex]: 0 }
 ==== iterhelpers.js ====
 global   function function function
 lazy     1,2 3,4 2,4,6,8 2,4

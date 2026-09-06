@@ -63,7 +63,14 @@ use std::path::PathBuf;
 ///     `.throw()` was injected, and their `finally` never ran — the same script
 ///     printed one thing on its first run and another on its second. A v9 blob
 ///     has no tables to restore, so it must not be replayed.
-const SCHEMA: u64 = 10;
+/// v11: assignment to a PROPERTY evaluates its target reference before the
+///     right-hand side (13.15.2). `o[k()] = v()` now emits the object, then the
+///     key, then the value, and calls `SETATTR`/`SETITEM` on the result directly
+///     instead of the old `value`-first sequence with its `Dup`/`Rot`/`Pop`. A
+///     v10 blob still carries that sequence, so every cached script would keep
+///     running its side effects in the wrong order — the exact bug the change
+///     fixes, replayed from disk.
+const SCHEMA: u64 = 11;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -218,13 +225,94 @@ fn write_shard(shard: &Shard) -> Result<(), String> {
 /// and writing once is what makes per-module caching possible at all.
 #[derive(Default)]
 struct ShardMem {
-    entries: rustc_hash::FxHashMap<u64, (u64, Vec<u8>)>,
+    /// The shard file exactly as read, kept resident so an entry's blob can be
+    /// BORROWED out of it rather than copied.
+    ///
+    /// This used to be a map of owned blobs built by deserializing the whole
+    /// archive, which meant a run paid to materialize EVERY cached program in
+    /// order to look up the one it was about to execute — and `load` then cloned
+    /// the blob a second time. rkyv is a zero-copy format, so the archive is
+    /// instead indexed in place and only the matching entry is decoded. Measured
+    /// on a 227 KB shard of 300 scripts (debug build), a cache-hit run went from
+    /// 15.3 ms to 11.4 ms against an 8.7 ms floor for `--version`, which touches
+    /// no cache at all; the cost it removes grows with the shard, so a 3 MB one
+    /// pays it back roughly thirteen times over.
+    backing: Vec<u8>,
+    /// `key -> (verify, blob range within `backing`)` for entries read from disk.
+    disk: rustc_hash::FxHashMap<u64, (u64, std::ops::Range<usize>)>,
+    /// Entries stored by THIS process, which are not in `backing`.
+    added: rustc_hash::FxHashMap<u64, (u64, Vec<u8>)>,
     /// Whether this process added anything, so an all-hits run writes nothing.
     dirty: bool,
     /// The file's `(mtime, len)` when this process read it. [`flush`] re-reads
     /// the shard only when this no longer matches — i.e. when a peer actually
     /// wrote while we were running.
     stamp: Stamp,
+}
+
+impl ShardMem {
+    /// The blob for `key`, borrowed from wherever it lives.
+    fn get(&self, key: u64) -> Option<(u64, &[u8])> {
+        if let Some((v, b)) = self.added.get(&key) {
+            return Some((*v, b.as_slice()));
+        }
+        let (v, r) = self.disk.get(&key)?;
+        Some((*v, &self.backing[r.clone()]))
+    }
+
+    /// Every live entry as `(key, verify, blob)`, this process's own additions
+    /// shadowing the on-disk copy of the same key.
+    fn iter(&self) -> impl Iterator<Item = (u64, u64, &[u8])> {
+        self.added
+            .iter()
+            .map(|(k, (v, b))| (*k, *v, b.as_slice()))
+            .chain(
+                self.disk
+                    .iter()
+                    .filter(|(k, _)| !self.added.contains_key(k))
+                    .map(|(k, (v, r))| (*k, *v, &self.backing[r.clone()])),
+            )
+    }
+}
+
+/// Read the shard and index it WITHOUT deserializing it: the archive is
+/// validated once, then each entry contributes only its key and the byte range
+/// its blob occupies inside `backing`.
+///
+/// Entries from another build can never be hit (the build id is part of every
+/// key), so they are skipped here and dropped on the next write.
+fn load_shard_indexed() -> ShardMem {
+    let mut mem = ShardMem {
+        stamp: shard_stamp(),
+        ..ShardMem::default()
+    };
+    let Some(path) = shard_path() else {
+        return mem;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return mem;
+    };
+    let build = build_id();
+    let Ok(shard) = rkyv::check_archived_root::<Shard>(&bytes) else {
+        // A corrupt or older-layout shard is simply not readable; every lookup
+        // misses and the next write replaces it.
+        return mem;
+    };
+    let base = bytes.as_ptr() as usize;
+    for e in shard.entries.iter() {
+        if u64::from(e.build) != build {
+            continue;
+        }
+        // The archived blob points INTO `bytes`, so its offset is the difference
+        // between the two addresses — no copy, and the range stays valid for as
+        // long as `backing` holds those bytes.
+        let blob: &[u8] = &e.blob;
+        let off = blob.as_ptr() as usize - base;
+        mem.disk
+            .insert(e.key.into(), (e.verify.into(), off..off + blob.len()));
+    }
+    mem.backing = bytes;
+    mem
 }
 
 thread_local! {
@@ -235,29 +323,12 @@ thread_local! {
 fn with_shard<T>(f: impl FnOnce(&mut ShardMem) -> T) -> T {
     SHARD.with(|c| {
         let mut slot = c.borrow_mut();
-        let mem = slot.get_or_insert_with(|| {
-            let build = build_id();
-            // Stamped BEFORE the read: a peer writing between the two makes the
-            // stamp look older than the bytes we hold, which only costs `flush`
-            // a re-read it did not need. The other direction — a stamp newer
-            // than the content — would silently drop a peer's entries, and
-            // cannot happen this way round. The stamp is taken in the
-            // initializer for the same reason it is taken first: `load_shard()`
-            // below must not run before it.
-            let mut mem = ShardMem {
-                stamp: shard_stamp(),
-                ..ShardMem::default()
-            };
-            for e in load_shard().entries {
-                // Entries from another build can never be hit (the build id is
-                // part of every key), so they are not worth holding in memory
-                // and are dropped on the next write.
-                if e.build == build {
-                    mem.entries.insert(e.key, (e.verify, e.blob));
-                }
-            }
-            mem
-        });
+        // Stamped BEFORE the read (inside `load_shard_indexed`): a peer writing
+        // between the two makes the stamp look older than the bytes we hold,
+        // which only costs `flush` a re-read it did not need. The other
+        // direction — a stamp newer than the content — would silently drop a
+        // peer's entries, and cannot happen this way round.
+        let mem = slot.get_or_insert_with(load_shard_indexed);
         f(mem)
     })
 }
@@ -266,13 +337,16 @@ fn with_shard<T>(f: impl FnOnce(&mut ShardMem) -> T) -> T {
 pub fn load(src: &str) -> Option<Program> {
     let key = key_for(src);
     let verify = verify_for(src);
-    let blob = with_shard(|m| {
-        m.entries
-            .get(&key)
-            .filter(|(v, _)| *v == verify)
-            .map(|(_, b)| b.clone())
+    // Decoded INSIDE the borrow, straight out of the resident shard bytes. The
+    // blob used to be cloned out first, which copied the whole program a second
+    // time for no reason.
+    let cp: CProg = with_shard(|m| {
+        let (v, blob) = m.get(key)?;
+        if v != verify {
+            return None;
+        }
+        bincode::deserialize(blob).ok()
     })?;
-    let cp: CProg = bincode::deserialize(&blob).ok()?;
     let mut prog = Program {
         main: cp.main,
         functions: cp.functions,
@@ -338,7 +412,7 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
     let key = key_for(src);
     let verify = verify_for(src);
     with_shard(|m| {
-        m.entries.insert(key, (verify, blob));
+        m.added.insert(key, (verify, blob));
         m.dirty = true;
     });
     Ok(())
@@ -353,12 +427,18 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
 /// itself is a temp-plus-rename.
 pub fn flush() {
     let build = build_id();
+    // Materialized here and nowhere else: writing is the one operation that
+    // genuinely needs owned blobs, and it happens at most once per run.
     let pending = SHARD.with(|c| {
         let mut slot = c.borrow_mut();
         match slot.as_mut() {
             Some(m) if m.dirty => {
                 m.dirty = false;
-                Some(m.entries.clone())
+                Some(
+                    m.iter()
+                        .map(|(k, v, b)| (k, (v, b.to_vec())))
+                        .collect::<rustc_hash::FxHashMap<u64, (u64, Vec<u8>)>>(),
+                )
             }
             _ => None,
         }

@@ -19,6 +19,7 @@ use crate::host::{with_host, JsObj};
 use fusevm::Value;
 
 pub mod assert;
+pub mod assert_diff;
 pub mod async_hooks;
 pub mod buffer;
 pub mod child_process;

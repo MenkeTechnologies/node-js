@@ -624,3 +624,26 @@ fn parse_rfc1123(s: &str) -> Option<f64> {
             + sec as f64 * 1000.0,
     )
 }
+
+/// A Date's `util.inspect` rendering, resolved against an ALREADY-BORROWED host.
+///
+/// Node prints a Date as its ISO-8601 form — `console.log(new Date(1))` is
+/// `1970-01-01T00:00:00.001Z`, not an object literal — and prints the string
+/// `Invalid Date` for a NaN time value. Without this the inspect walk reached a
+/// Date through the generic object branch, found its time value in the internal
+/// `@@ms` slot rather than in an enumerable property, and rendered every Date
+/// ever logged as `{}`.
+///
+/// Takes `&JsHost` rather than calling `with_host` because the inspect walk is
+/// already inside that borrow; borrowing again aborts the process.
+pub(crate) fn inspect_with_host(h: &crate::host::JsHost, v: &Value) -> String {
+    let ms = match h.get(v) {
+        Some(JsObj::Object(p)) => p.get("@@ms").map(|x| h.to_number(x)).unwrap_or(f64::NAN),
+        _ => f64::NAN,
+    };
+    if ms.is_nan() {
+        "Invalid Date".into()
+    } else {
+        iso_string(ms)
+    }
+}

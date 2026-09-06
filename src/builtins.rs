@@ -2084,6 +2084,19 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
             return Err(host::type_error("this is not a typed array."));
         }
     }
+    // `Symbol.prototype`'s methods are branded, and the receiver that reaches
+    // them is very often NOT a symbol: `Symbol.prototype` itself is an ordinary
+    // object. Without this check `Symbol.prototype.toString()` re-entered the
+    // generic string conversion, which looked `toString` up again and called it
+    // again — an infinite recursion that overflowed the stack and ABORTED the
+    // process, which no `try`/`catch` can see. Node throws a plain TypeError.
+    // The wording is Symbol's own, not the "incompatible receiver" form the
+    // collections use.
+    if ctor == "Symbol" && with_host(|h| h.kind_of(recv)) != Some(ObjKind::Symbol) {
+        return Err(host::type_error(&format!(
+            "Symbol.prototype.{method} requires that 'this' be a Symbol"
+        )));
+    }
     if let Some(label) = branded_method_label(ctor, recv) {
         return Err(host::type_error(&format!(
             "Method {label}.prototype.{method} called on incompatible receiver {}",
@@ -4247,10 +4260,36 @@ pub fn builtin_name(key: &str) -> &str {
 }
 
 pub fn is_known_builtin(name: &str) -> bool {
-    GLOBAL_FUNCS.contains(&name)
-        || NS_METHODS.contains(&name)
-        || is_namespace(name)
-        || crate::stdlib::is_method(name)
+    // Binary search over a sorted INDEX of the two tables rather than a scan of
+    // both. This runs on every call whose callee is a builtin — `call_method`
+    // asks it before dispatching `Math.max(…)` or `JSON.parse(…)` — and the
+    // answer came only after a full scan of `GLOBAL_FUNCS` (77) plus a scan of
+    // `NS_METHODS` up to the entry — 106 string comparisons for `Math.max`, 120
+    // for `Object.keys` — because those tables are ordered for ENUMERATION (V8's
+    // own order for `Math`/`Number`/`Reflect`), not for lookup. Eight probes
+    // now. The index is built once per process and derived FROM those tables, so
+    // it cannot drift from them.
+    //
+    // That is an operation count, not a measured time, and NO wall-clock win is
+    // claimed. Re-measured in isolation (this hunk alone applied to the previous
+    // commit, interleaved against it, minimums over ten rounds each): the A/B
+    // ratio came out 0.753, 1.072, 0.994 and 0.744 across four repeats, while
+    // the A/A control — the SAME binary under both labels — came out 1.084,
+    // 1.072, 0.787 and 1.093. The A/B spread lies inside the A/A spread, so on
+    // this machine the change is not distinguishable from noise. It is kept for
+    // the comparison count and because it cannot drift from the tables it is
+    // derived from, not because anything got faster.
+    static SORTED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    let sorted = SORTED.get_or_init(|| {
+        let mut v: Vec<&'static str> = GLOBAL_FUNCS
+            .iter()
+            .chain(NS_METHODS.iter())
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    });
+    sorted.binary_search(&name).is_ok() || is_namespace(name) || crate::stdlib::is_method(name)
 }
 
 // ── dynamic functions (runtime source → callable) ────────────────────────────
@@ -4401,15 +4440,15 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
     }
     match name {
         "console.log" | "console.info" | "console.debug" => {
-            print_line(&args, false);
+            print_line(&args, false)?;
             Ok(Value::Undef)
         }
         "console.error" | "console.warn" => {
-            print_line(&args, true);
+            print_line(&args, true)?;
             Ok(Value::Undef)
         }
-        "parseInt" | "Number.parseInt" => Ok(Value::Float(parse_int(&args))),
-        "parseFloat" | "Number.parseFloat" => Ok(Value::Float(parse_float(&args))),
+        "parseInt" | "Number.parseInt" => Ok(Value::Float(parse_int(&args)?)),
+        "parseFloat" | "Number.parseFloat" => Ok(Value::Float(parse_float(&args)?)),
         "isNaN" => Ok(Value::Bool(arg_num(&args, 0).is_nan())),
         "isFinite" => Ok(Value::Bool(arg_num(&args, 0).is_finite())),
         "encodeURIComponent" => uri_encode(&with_host(|h| h.str_of(&arg0(&args))), false),
@@ -5471,11 +5510,14 @@ fn make_error(name: &str, args: &[Value]) -> Value {
     })
 }
 
-fn print_line(args: &[Value], stderr: bool) {
+fn print_line(args: &[Value], stderr: bool) -> Result<(), String> {
     // Node's console.log(...args) === util.format(...args): printf-style
     // substitution when the first arg is a format string, else inspect-and-join.
-    let line: String = crate::stdlib::util::format(args);
+    // A directive can THROW (`console.log('%j', 1n)`), and node lets that reach
+    // the caller instead of printing a line — so nothing is written on failure.
+    let line: String = crate::stdlib::util::format(args)?;
     with_host(|h| h.write_out(&format!("{line}\n"), stderr));
+    Ok(())
 }
 
 fn arg0(args: &[Value]) -> Value {
@@ -5645,8 +5687,18 @@ fn legacy_unescape(s: &str) -> Result<Value, String> {
     }))
 }
 
-fn parse_int(args: &[Value]) -> f64 {
-    let s = with_host(|h| h.str_of(&arg0(args)));
+/// `parseInt` begins with `ToString(argument)` (19.2.5 step 1), and that step can
+/// THROW — a Symbol has no string form, so `parseInt([Symbol()])` is a TypeError
+/// rather than `NaN`. Reading the argument with `str_of` took the object's brand
+/// instead of converting it, which both swallowed that throw and ignored any
+/// `toString` the value defines.
+fn parse_int(args: &[Value]) -> Result<f64, String> {
+    // Converted BEFORE the host borrow: `to_string_value` can call back into JS.
+    let sv = host::to_string_value(&arg0(args))?;
+    Ok(parse_int_str(&with_host(|h| h.str_of(&sv)), args))
+}
+
+fn parse_int_str(s: &str, args: &[Value]) -> f64 {
     // 19.2.5 step 8: an EXPLICIT radix outside 2..=36 is `NaN`, it does not fall
     // back to auto-detection. The old `.filter()` silently discarded a bad radix,
     // so `parseInt("10", 37)` answered 10 where every engine says NaN.
@@ -5712,8 +5764,13 @@ fn parse_int(args: &[Value]) -> f64 {
     }
 }
 
-fn parse_float(args: &[Value]) -> f64 {
-    let s = with_host(|h| h.str_of(&arg0(args)));
+/// `parseFloat` likewise starts from `ToString(argument)`; see `parse_int`.
+fn parse_float(args: &[Value]) -> Result<f64, String> {
+    let sv = host::to_string_value(&arg0(args))?;
+    Ok(parse_float_str(&with_host(|h| h.str_of(&sv))))
+}
+
+fn parse_float_str(s: &str) -> f64 {
     let t = crate::utf16::js_trim_start(&s);
     // `Infinity` / `+Infinity` / `-Infinity` are valid parseFloat prefixes.
     let inf_body = t
