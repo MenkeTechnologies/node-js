@@ -217,6 +217,15 @@ diffs `node -e` against the reference `node -e`, delta-debugging every divergenc
 to a minimal repro. It is subprocess-only (never links the lib), std-only (no
 `rand`), and needs `node` on `PATH`, so CI never runs it.
 
+**`gen-arity`** regenerates `src/arity.rs`, the `name` and `length` of every
+ECMAScript intrinsic function keyed the way this frontend names its builtins.
+Those values are normative — ECMA-262 gives each intrinsic a `length` — so the
+reference engine is a transcription source here rather than an oracle to agree
+with, and the generated table is checked in (`cargo run --bin gen-arity >
+src/arity.rs`). The core-module surface is deliberately excluded: `fs
+.readFileSync.length` is a property of node's own JavaScript, not of any
+specification.
+
 The two tools deliberately drive DIFFERENT entry points — the corpus runs each
 case as a script FILE, the fuzzer through `-e` — because Node itself answers
 differently at each (`__filename`, `module.id`, `process.argv`,

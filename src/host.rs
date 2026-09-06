@@ -3340,73 +3340,10 @@ impl JsHost {
                 // `typeof === "function"` — EXCEPT the non-callable namespace
                 // objects (`Math`, `JSON`, `require('fs')`, …) which are "object".
                 Some(JsObj::Builtin(n)) => {
-                    const NON_CALLABLE_NS: &[&str] = &[
-                        // The live `require.cache` view is a plain object to a
-                        // script, not something it can call.
-                        crate::builtins::REQUIRE_CACHE,
-                        "Math",
-                        "JSON",
-                        "console",
-                        "Reflect",
-                        "process",
-                        "Atomics",
-                        "performance",
-                        "fs",
-                        "path",
-                        "os",
-                        "util",
-                        "crypto",
-                        "webcrypto",
-                        "SubtleCrypto",
-                        "querystring",
-                        "events",
-                        "timers",
-                        "perf_hooks",
-                        "async_hooks",
-                        "diagnostics_channel",
-                        "v8",
-                        "dns",
-                        "punycode",
-                        "child_process",
-                        "tty",
-                        "url",
-                        "zlib",
-                        "string_decoder",
-                        "http",
-                        "net",
-                        "buffer",
-                        // The sub-path and later-added modules were all absent,
-                        // so `typeof require('tls')` and every one of these
-                        // reported "function". Measured against node v26.8.1 by
-                        // taking `typeof` of every builtin module. `path/posix`
-                        // is not listed because it resolves to the `path`
-                        // namespace, which already is.
-                        "path/win32",
-                        "fs/promises",
-                        "stream/promises",
-                        "stream/consumers",
-                        "stream/web",
-                        "timers/promises",
-                        "dns/promises",
-                        "https",
-                        "http2",
-                        "tls",
-                        "dgram",
-                        "cluster",
-                        "worker_threads",
-                        "readline",
-                        "readline/promises",
-                        "repl",
-                        "vm",
-                        "domain",
-                        "trace_events",
-                        "wasi",
-                        "inspector",
-                    ];
-                    if NON_CALLABLE_NS.contains(&n.as_str()) {
-                        "object"
-                    } else {
+                    if builtin_is_callable(n) {
                         "function"
+                    } else {
+                        "object"
                     }
                 }
                 Some(JsObj::Symbol { .. }) => "symbol",
@@ -3536,10 +3473,29 @@ impl JsHost {
                         .unwrap_or_default();
                     format!("function {name}() {{ [code] }}")
                 }
-                Some(JsObj::Builtin(n)) => format!("function {n}() {{ [native code] }}"),
-                Some(JsObj::BoundMethod { .. }) | Some(JsObj::BoundFunc { .. }) => {
-                    "function () { [native code] }".into()
+                // The native-code form names the FUNCTION, not its key:
+                // `String(Math.max)` is `function max() { [native code] }`.
+                Some(JsObj::Builtin(n)) => {
+                    // The `console` methods are the exception node itself makes:
+                    // each is a wrapper, so `String(console.log)` is the
+                    // ANONYMOUS native-code form even though `console.log.name`
+                    // is `log`. Measured on v26.8.1.
+                    if n.starts_with("console.") {
+                        "function () { [native code] }".into()
+                    } else {
+                        format!(
+                            "function {}() {{ [native code] }}",
+                            crate::builtins::builtin_name(n)
+                        )
+                    }
                 }
+                // A method read off an instance names itself the same way the
+                // prototype method it resolves to does: `String([].slice)` is
+                // `function slice() { [native code] }`.
+                Some(JsObj::BoundMethod { name, .. }) => {
+                    format!("function {name}() {{ [native code] }}")
+                }
+                Some(JsObj::BoundFunc { .. }) => "function () { [native code] }".into(),
                 // `Function.prototype.toString` refuses to expose a proxy's
                 // target: V8 reports the native-code form for a proxy of ANY
                 // callable, so `String(new Proxy(function f(){}, {}))` is
@@ -4164,10 +4120,31 @@ impl JsHost {
                     self.with_callable_props(v, base, indent, st)
                 }
                 Some(JsObj::Builtin(n)) => {
-                    let short = n.rsplit('.').next().unwrap_or(n);
-                    format!("[Function: {short}]")
+                    // A namespace object is not a function and must not be
+                    // printed as one. The three ECMAScript namespaces carry a
+                    // `Symbol.toStringTag` and inspect as `Object [Math] {}`;
+                    // their members are all non-enumerable, so the braces really
+                    // are empty. A `require()`d module namespace has no tag and
+                    // node prints its members, which cannot be rendered here —
+                    // formatting a member means allocating its value, and this
+                    // runs under the host borrow.
+                    if !builtin_is_callable(n) {
+                        match crate::builtins::well_known_tag(self, v) {
+                            Some(tag) => format!("Object [{tag}] {{}}"),
+                            // `Set.prototype` inspects under the CONSTRUCTOR's
+                            // name, not the key: node prints `Object [Set] {}`.
+                            None => {
+                                format!("Object [{}] {{}}", n.trim_end_matches(".prototype"))
+                            }
+                        }
+                    } else {
+                        format!("[Function: {}]", crate::builtins::builtin_name(n))
+                    }
                 }
-                Some(JsObj::BoundMethod { .. }) => "[Function (anonymous)]".into(),
+                // A bound method is not anonymous: it is the prototype method it
+                // resolves to, so `console.log(new Uint8Array(1).set)` reports
+                // `[Function: set]`.
+                Some(JsObj::BoundMethod { name, .. }) => format!("[Function: {name}]"),
                 Some(JsObj::BoundFunc { target, .. }) => {
                     let n = self.callable_name(target);
                     if n.is_empty() {
@@ -4321,10 +4298,16 @@ impl JsHost {
                 .map(|d| d.name.clone())
                 .unwrap_or_default(),
             Some(JsObj::Class(c)) => c.name.clone(),
-            Some(JsObj::Builtin(n)) => n.rsplit('.').next().unwrap_or(n).to_string(),
+            // Not the whole key: a builtin's `.name` is its last segment, and a
+            // prototype thunk's key is `@proto:<Ctor>:<method>` — which has no
+            // `.` at all, so this reported the internal spelling verbatim and
+            // `console.log(Uint8Array.prototype.set)` printed
+            // `[Function: @proto:TypedArray:set]`.
+            Some(JsObj::Builtin(n)) => crate::builtins::builtin_name(n).to_string(),
             Some(JsObj::BoundFunc { target, .. }) => {
                 format!("bound {}", self.callable_name(target))
             }
+            Some(JsObj::BoundMethod { name, .. }) => name.clone(),
             _ => String::new(),
         }
     }
@@ -6707,6 +6690,9 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
                     kind,
                     Some(JsObj::Object(_))
                         | Some(JsObj::Array(_))
+                        // A namespace object and a builtin function are both
+                        // `instanceof Object`: `Math instanceof Object` is true.
+                        | Some(JsObj::Builtin(_))
                         | Some(JsObj::Func(_))
                         | Some(JsObj::Class(_))
                         | Some(JsObj::Map { .. })
@@ -7294,6 +7280,87 @@ pub(crate) fn drain_iterator(iterator: &Value) -> Result<Vec<Value>, String> {
 }
 
 /// Property read that walks the prototype chain (used by iteration helpers).
+/// Whether the builtin named `n` is CALLABLE. Most are (`Array`, `parseInt`,
+/// `Math.floor`); the exceptions are the namespace objects a script can only
+/// read properties off (`Math`, `JSON`, every `require()`d core module), which
+/// report `typeof === "object"` and carry no `name`/`length`.
+pub fn builtin_is_callable(n: &str) -> bool {
+    // A `<Ctor>.prototype` handle is a namespace of methods, not a function:
+    // `typeof Set.prototype` is `"object"`, and treating it as callable made it
+    // brand `[object Function]`, inspect as `[Function: prototype]`, and answer
+    // `true` to `instanceof Function`. `Function.prototype` is the one that
+    // really IS callable (10.2.4: it is an anonymous built-in that returns
+    // undefined), which is why it is not stripped here.
+    if n != "Function.prototype" && n.ends_with(".prototype") {
+        return false;
+    }
+    // A `match` rather than a slice scan: this runs on every callability test,
+    // which is every call and every `ToPrimitive`, and a `contains` over the
+    // list below compares against all 56 entries before answering "callable" —
+    // the common case. The compiler turns the arms into a length-then-bytes
+    // decision tree instead.
+    !matches!(
+        n,
+        "Math"
+            | "JSON"
+            | "console"
+            | "Reflect"
+            | "process"
+            | "Atomics"
+            | "performance"
+            | "fs"
+            | "path"
+            | "os"
+            | "util"
+            | "crypto"
+            | "webcrypto"
+            | "SubtleCrypto"
+            | "querystring"
+            | "events"
+            | "timers"
+            | "perf_hooks"
+            | "async_hooks"
+            | "diagnostics_channel"
+            | "v8"
+            | "dns"
+            | "punycode"
+            | "child_process"
+            | "tty"
+            | "url"
+            | "zlib"
+            | "string_decoder"
+            | "http"
+            | "net"
+            | "buffer"
+            | "function"
+            | "path/win32"
+            | "fs/promises"
+            | "stream/promises"
+            | "stream/consumers"
+            | "stream/web"
+            | "timers/promises"
+            | "dns/promises"
+            | "https"
+            | "http2"
+            | "tls"
+            | "dgram"
+            | "cluster"
+            | "worker_threads"
+            | "readline"
+            | "readline/promises"
+            | "repl"
+            | "vm"
+            | "domain"
+            | "trace_events"
+            | "wasi"
+            | "inspector"
+            | "object"
+    )
+        // The live `require.cache` view is a plain object to a script, not
+        // something it can call.
+        && n != crate::builtins::REQUIRE_CACHE
+}
+
 pub fn get_prop_chain(recv: &Value, name: &str) -> Result<Value, String> {
     crate::builtins::get_property(recv, name)
 }
@@ -7469,8 +7536,11 @@ pub fn to_property_key(v: &Value) -> Result<String, String> {
 /// target), so `typeof` and every `is_callable` guard agree on one answer.
 pub fn is_callable(h: &JsHost, v: &Value) -> bool {
     match h.get(v) {
+        // Not every builtin is a function: the namespace objects (`Math`,
+        // `require('fs')`) and the `<Ctor>.prototype` handles are data, and
+        // calling one is a `TypeError` in node exactly as `typeof` says.
+        Some(JsObj::Builtin(n)) => builtin_is_callable(n),
         Some(JsObj::Func(_))
-        | Some(JsObj::Builtin(_))
         | Some(JsObj::BoundMethod { .. })
         | Some(JsObj::BoundFunc { .. })
         | Some(JsObj::Class(_)) => true,
@@ -7934,6 +8004,13 @@ impl JsHost {
         // recognised as one.
         if let Some(JsObj::BoundFunc { target, args, .. }) = self.get(v) {
             return self.func_arity(&target.clone()).saturating_sub(args.len());
+        }
+        // A builtin's arity is the specified one, so `Math.max.bind(null,1)`
+        // reports 1 rather than the 0 a target of unknown arity would give.
+        if let Some(JsObj::Builtin(n)) = self.get(v) {
+            return crate::builtins::builtin_meta(n)
+                .map(|(_, len)| len as usize)
+                .unwrap_or(0);
         }
         let def_id = match self.get(v) {
             Some(JsObj::Func(f)) => Some(f.def_id),

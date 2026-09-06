@@ -742,6 +742,42 @@ pub(crate) fn proxy_proto_link(recv: &Value, name: &str) -> Option<Value> {
     })
 }
 
+/// The CommonJS wrapper's parameters. They are function locals in Node, not
+/// global-object properties, so `globalThis.require` is `undefined` and
+/// `Object.getOwnPropertyDescriptor(globalThis, 'module')` reports no property —
+/// even though the bare `require` and `module` both work.
+const CJS_WRAPPER_LOCALS: &[&str] = &[
+    "require",
+    "module",
+    "exports",
+    "__filename",
+    "__dirname",
+    "__cjs_require",
+    "__cjs_resolve",
+];
+
+/// The globals node exposes as ENUMERABLE own properties of the global object —
+/// the timer family and the WHATWG additions, measured on v26.8.1. Everything
+/// else (`Math`, `parseInt`, the constructors) is non-enumerable.
+const ENUMERABLE_GLOBALS: &[&str] = &[
+    "global",
+    "clearImmediate",
+    "setImmediate",
+    "clearInterval",
+    "clearTimeout",
+    "setInterval",
+    "setTimeout",
+    "queueMicrotask",
+    "structuredClone",
+    "atob",
+    "btoa",
+    "performance",
+    "fetch",
+    "crypto",
+    "navigator",
+    "sessionStorage",
+];
+
 pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
     // A `#`-prefixed key is a PRIVATE name. `[[PrivateGet]]` (7.3.31) throws
     // when the receiver carries no such private element — it does NOT read back
@@ -846,15 +882,6 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         // The CommonJS wrapper's parameters are function locals in Node, not
         // global-object properties: `typeof globalThis.require` is `undefined`
         // there even though the bare `require` works.
-        const CJS_WRAPPER_LOCALS: &[&str] = &[
-            "require",
-            "module",
-            "exports",
-            "__filename",
-            "__dirname",
-            "__cjs_require",
-            "__cjs_resolve",
-        ];
         if !own && !CJS_WRAPPER_LOCALS.contains(&name) {
             if let Some(v) = global_binding(name) {
                 return Ok(v);
@@ -971,6 +998,12 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         Some(ObjKind::Class) | Some(ObjKind::Func) | Some(ObjKind::BoundFunc) => {
             function_property(recv, name)
         }
+        // A method READ off an instance (`[].slice`, `new Map().get`) is a bound
+        // thunk here. It is a function value, so it answers the function
+        // properties: `[].slice.name` was `undefined` where node reports
+        // `slice`, and `String([].slice)` fell through to
+        // `Object.prototype.toString`.
+        Some(ObjKind::BoundMethod) => bound_method_property(recv, name),
         Some(ObjKind::Symbol) => match name {
             "description" => {
                 match peek(recv, |o| match o {
@@ -1118,7 +1151,20 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                 _ => None,
             })
             .unwrap_or_default();
-            namespace_property(&ns, name)
+            let v = namespace_property(&ns, name);
+            // `Function.prototype`'s methods READ off a builtin function. The
+            // CALL forms (`Math.max.call(null, 1, 2)`) already dispatched, but
+            // the read answered `undefined` — so `typeof Math.max.bind` was
+            // `"undefined"`, and `String(Math.max)` found no `toString` to
+            // invoke and fell back to `Object.prototype.toString`'s
+            // `[object Function]` where node reports the native-code form.
+            if matches!(v, Value::Undef)
+                && is_function_method(name)
+                && host::builtin_is_callable(&ns)
+            {
+                return Ok(bound_method(recv, name));
+            }
+            v
         }
         _ => {
             // Primitive numbers/booleans: method access -> bound method.
@@ -1239,6 +1285,46 @@ fn is_builtin_ctor(name: &str) -> bool {
         // The stream base classes are constructors too, and `require('stream')`
         // IS `Stream`, so `require('stream').name` has to answer.
         || crate::stdlib::stream::is_class(name)
+}
+
+/// The intrinsic key of the method `<instance>.<method>` resolves to, so a bound
+/// thunk can look its `name`/`length` up in the same table a
+/// `<Ctor>.prototype.<method>` thunk uses. `None` when the receiver has no
+/// builtin constructor to name (a native stdlib instance, whose methods are
+/// node's own JS and have no specified arity).
+fn bound_method_key(recv: &Value, method: &str) -> Option<String> {
+    let ctor = with_host(|h| default_ctor_name(h, recv))?;
+    Some(format!("@proto:{ctor}:{method}"))
+}
+
+/// `[[Get]]` on a bound method thunk. It is a function, so `name`, `length` and
+/// the `Function.prototype` methods all answer; `length` only when the intrinsic
+/// table knows the method, because inventing an arity is worse than the
+/// `undefined` a caller can test for.
+fn bound_method_property(recv: &Value, name: &str) -> Value {
+    let method = peek(recv, |o| match o {
+        JsObj::BoundMethod { name, .. } => Some(name.clone()),
+        _ => None,
+    })
+    .unwrap_or_default();
+    let key = peek(recv, |o| match o {
+        JsObj::BoundMethod { recv, .. } => Some(recv.clone()),
+        _ => None,
+    })
+    .and_then(|inner| bound_method_key(&inner, &method));
+    let meta = key.as_deref().and_then(builtin_meta);
+    match name {
+        "name" => {
+            let n = meta.map(|(n, _)| n.to_string()).unwrap_or(method);
+            with_host(|h| h.new_str(n))
+        }
+        "length" => match meta {
+            Some((_, len)) => Value::Float(len as f64),
+            None => Value::Undef,
+        },
+        _ if is_function_method(name) => bound_method(recv, name),
+        _ => with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef),
+    }
 }
 
 fn bound_method(recv: &Value, name: &str) -> Value {
@@ -1598,6 +1684,90 @@ fn ensure_fn_prototype(recv: &Value) -> Value {
     })
 }
 
+/// The numeric constants a core namespace owns, in the order node reports them
+/// under `getOwnPropertyNames`. ONE table rather than a value match plus a name
+/// list: the enumeration and the read have to agree, and they did not — every
+/// one of these read correctly while `Object.getOwnPropertyNames(Math)` omitted
+/// all eight of Math's, so a member that plainly exists was invisible to any
+/// reflective copy of the namespace.
+///
+/// Each is `{ writable: false, enumerable: false, configurable: false }`, which
+/// is what separates them from the methods alongside them.
+pub fn namespace_constants(ns: &str) -> &'static [(&'static str, f64)] {
+    const MATH: &[(&str, f64)] = &[
+        ("E", std::f64::consts::E),
+        ("LN10", std::f64::consts::LN_10),
+        ("LN2", std::f64::consts::LN_2),
+        ("LOG10E", std::f64::consts::LOG10_E),
+        ("LOG2E", std::f64::consts::LOG2_E),
+        ("PI", std::f64::consts::PI),
+        ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+        ("SQRT2", std::f64::consts::SQRT_2),
+    ];
+    const NUMBER: &[(&str, f64)] = &[
+        ("MAX_VALUE", f64::MAX),
+        // The smallest positive value a Number can hold, which is the
+        // smallest SUBNORMAL double (`5e-324`), not Rust's
+        // `f64::MIN_POSITIVE` — that is the smallest *normal* double,
+        // `2.2250738585072014e-308`, ~256 binary orders of magnitude too
+        // large.
+        // The literal, not `f64::from_bits(1)`: that is only const-callable from
+        // Rust 1.83 and this crate's MSRV is 1.80. It parses to the same
+        // bit pattern — the smallest positive subnormal.
+        ("MIN_VALUE", 5e-324),
+        ("NaN", f64::NAN),
+        ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+        ("POSITIVE_INFINITY", f64::INFINITY),
+        ("MAX_SAFE_INTEGER", 9007199254740991.0),
+        ("MIN_SAFE_INTEGER", -9007199254740991.0),
+        ("EPSILON", f64::EPSILON),
+    ];
+    match ns {
+        "Math" => MATH,
+        "Number" => NUMBER,
+        _ => &[],
+    }
+}
+
+/// The descriptor of `<ns>.<key>`, whose attributes fall into four groups —
+/// measured on node v26.8.1:
+///
+/// ```text
+/// Math.PI, Number.MAX_SAFE_INTEGER, Number.prototype   w=false e=false c=false
+/// Math.max.name, Math.max.length                       w=false e=false c=true
+/// Math.floor, Array.from, Array.prototype.slice        w=true  e=false c=true
+/// require('path').join                                 w=true  e=true  c=true
+/// ```
+///
+/// So: a constant (and a constructor's `prototype`) is frozen, a function's own
+/// `name`/`length` is read-only but configurable, and everything else is an
+/// ordinary method — enumerable exactly when the namespace enumerates it, which
+/// is what separates a core module's exports from an ECMAScript namespace's.
+fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
+    let frozen = namespace_constants(ns).iter().any(|(k, _)| *k == key)
+        || key == "prototype"
+        || (ns == "Symbol" && host::WELL_KNOWN_SYMBOLS.contains(&key));
+    let own_fn_meta = matches!(key, "name" | "length") && host::builtin_is_callable(ns);
+    let enumerable =
+        !frozen && !own_fn_meta && crate::stdlib::namespace_keys(ns).iter().any(|k| k == key);
+    with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert("value".into(), value);
+        m.insert("writable".into(), Value::Bool(!frozen && !own_fn_meta));
+        m.insert("enumerable".into(), Value::Bool(enumerable));
+        m.insert("configurable".into(), Value::Bool(!frozen));
+        h.new_object(m)
+    })
+}
+
+/// The value of `<ns>.<name>` when it is one of those constants.
+fn namespace_constant(ns: &str, name: &str) -> Option<f64> {
+    namespace_constants(ns)
+        .iter()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| *v)
+}
+
 /// A property on a builtin namespace object (`Math.PI`, `Number.MAX_SAFE_INTEGER`,
 /// `console.log`).
 pub fn namespace_property(ns: &str, name: &str) -> Value {
@@ -1623,30 +1793,7 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
         }
     }
     // Numeric constants.
-    let konst = match (ns, name) {
-        ("Math", "PI") => Some(std::f64::consts::PI),
-        ("Math", "E") => Some(std::f64::consts::E),
-        ("Math", "LN2") => Some(std::f64::consts::LN_2),
-        ("Math", "LN10") => Some(std::f64::consts::LN_10),
-        ("Math", "LOG2E") => Some(std::f64::consts::LOG2_E),
-        ("Math", "LOG10E") => Some(std::f64::consts::LOG10_E),
-        ("Math", "SQRT2") => Some(std::f64::consts::SQRT_2),
-        ("Math", "SQRT1_2") => Some(std::f64::consts::FRAC_1_SQRT_2),
-        ("Number", "MAX_SAFE_INTEGER") => Some(9007199254740991.0),
-        ("Number", "MIN_SAFE_INTEGER") => Some(-9007199254740991.0),
-        ("Number", "MAX_VALUE") => Some(f64::MAX),
-        // The smallest positive value a Number can hold, which is the smallest
-        // SUBNORMAL double (`5e-324`), not Rust's `f64::MIN_POSITIVE` — that is
-        // the smallest *normal* double, `2.2250738585072014e-308`, ~256 binary
-        // orders of magnitude too large.
-        ("Number", "MIN_VALUE") => Some(f64::from_bits(1)),
-        ("Number", "EPSILON") => Some(f64::EPSILON),
-        ("Number", "POSITIVE_INFINITY") => Some(f64::INFINITY),
-        ("Number", "NEGATIVE_INFINITY") => Some(f64::NEG_INFINITY),
-        ("Number", "NaN") => Some(f64::NAN),
-        _ => None,
-    };
-    if let Some(k) = konst {
+    if let Some(k) = namespace_constant(ns, name) {
         return Value::Float(k);
     }
     // `Ctor.name` on a builtin constructor is the constructor name (`Array.name`
@@ -1723,6 +1870,24 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // A property the user stuck on this builtin namespace (`Error.prepareStackTrace`).
     if let Some(v) = with_host(|h| h.builtin_static(ns, name)) {
         return v;
+    }
+    // A builtin FUNCTION's own `name` and `length` (10.3.3-4: every one has
+    // both). `Math.max.name` was `undefined` — as was every `.name` a library
+    // reads to identify a callback it was handed. The non-callable namespaces
+    // fall through: `Math.name` and `require('fs').length` really are undefined.
+    if host::builtin_is_callable(ns) {
+        match name {
+            "name" => return with_host(|h| h.new_str(builtin_name(ns).to_string())),
+            // Only the intrinsics have a specified arity; a core-module
+            // function's is a property of node's own JS source, so it stays
+            // `undefined` rather than being invented here.
+            "length" => {
+                if let Some((_, len)) = builtin_meta(ns) {
+                    return Value::Float(len as f64);
+                }
+            }
+            _ => {}
+        }
     }
     Value::Undef
 }
@@ -1839,7 +2004,187 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     if crate::stdlib::native_tag(recv).as_deref() == Some(ctor) {
         return crate::stdlib::instance_call(ctor, recv, method, args);
     }
+    // A BRANDED method reached with a receiver that has no such internal slot.
+    // Every arm above dispatches a receiver that IS an instance, so arriving
+    // here with one of these constructors means the brand check failed — the
+    // spec's very first step for each of them (24.2.3.x reads `[[SetData]]`,
+    // 24.1.3.x `[[MapData]]`, 27.2.5.4 `[[PromiseState]]`, 23.2.3.x
+    // `ValidateTypedArray`). Falling through to ordinary dispatch reported
+    // `union is not a function`, which says the method does not exist rather
+    // than that the receiver is the wrong kind of object.
+    // `Date.prototype`'s methods split in two: the ones that read the time value
+    // (`ThisTimeValue`, 21.4.4.x) report `this is not a Date object.`, and the
+    // rest take the ordinary branded form. Measured on node v26.8.1:
+    // `Date.prototype.getTime.call({})` is the first, `.toISOString.call({})`
+    // and `.setHours.call({})` the second.
+    if ctor == "Date" && crate::stdlib::native_tag(recv).as_deref() != Some("Date") {
+        const THIS_TIME_VALUE: &[&str] = &[
+            "getTime",
+            "valueOf",
+            "getYear",
+            "getFullYear",
+            "getMonth",
+            "getDate",
+            "getDay",
+            "getHours",
+            "getMinutes",
+            "getSeconds",
+            "getMilliseconds",
+            "getUTCFullYear",
+            "getUTCMonth",
+            "getUTCDate",
+            "getUTCDay",
+            "getUTCHours",
+            "getUTCMinutes",
+            "getUTCSeconds",
+            "getUTCMilliseconds",
+            "getTimezoneOffset",
+        ];
+        if THIS_TIME_VALUE.contains(&method) {
+            return Err(host::type_error("this is not a Date object."));
+        }
+        // `toJSON` (21.4.4.37) is deliberately generic — it converts the
+        // receiver and INVOKES `toISOString` on it, so it fails on the missing
+        // method rather than on a brand.
+        if method != "toJSON" {
+            return Err(host::type_error(&format!(
+                "Method Date.prototype.{method} called on incompatible receiver {}",
+                no_side_effects_string(recv)
+            )));
+        }
+    }
+    // `%TypedArray%.prototype`'s methods split the same way: `ValidateTypedArray`
+    // (23.2.4.4) reports `this is not a typed array.`, while the handful that
+    // check the receiver at the call boundary take the branded form. Measured
+    // over all 27 shared methods on node v26.8.1; `toString` is the one that is
+    // genuinely generic (it is `Array.prototype.toString`) and never brands.
+    if matches!(ctor, "TypedArray" | "Uint8Array")
+        && !matches!(
+            crate::stdlib::native_tag(recv).as_deref(),
+            Some("TypedArray") | Some("Buffer")
+        )
+    {
+        const BRANDED: &[&str] = &[
+            "slice",
+            "subarray",
+            "join",
+            "sort",
+            "at",
+            "toReversed",
+            "toSorted",
+            "toLocaleString",
+        ];
+        if BRANDED.contains(&method) {
+            return Err(host::type_error(&format!(
+                "Method %TypedArray%.prototype.{method} called on incompatible receiver {}",
+                no_side_effects_string(recv)
+            )));
+        }
+        if method != "toString" {
+            return Err(host::type_error("this is not a typed array."));
+        }
+    }
+    if let Some(label) = branded_method_label(ctor, recv) {
+        return Err(host::type_error(&format!(
+            "Method {label}.prototype.{method} called on incompatible receiver {}",
+            no_side_effects_string(recv)
+        )));
+    }
     host::call_method(recv, method, args)
+}
+
+/// The name a branded prototype method reports itself under when its receiver
+/// fails the brand check, or `None` when `ctor`'s methods are generic over
+/// `this` (every `Array.prototype` and `Object.prototype` method is) or the
+/// receiver really is an instance.
+///
+fn branded_method_label(ctor: &str, recv: &Value) -> Option<&'static str> {
+    let kind = with_host(|h| h.kind_of(recv));
+    // `weak` is part of the brand: a `WeakSet` has `[[WeakSetData]]`, not
+    // `[[SetData]]`, so `Set.prototype.has.call(new WeakSet())` is incompatible
+    // even though both are `JsObj::Set` here.
+    let weak = peek(recv, |o| match o {
+        JsObj::Set { weak, .. } | JsObj::Map { weak, .. } => Some(*weak),
+        _ => None,
+    })
+    .unwrap_or(false);
+    let ok = match ctor {
+        "Set" => kind == Some(ObjKind::Set) && !weak,
+        "WeakSet" => kind == Some(ObjKind::Set) && weak,
+        "Map" => kind == Some(ObjKind::Map) && !weak,
+        "WeakMap" => kind == Some(ObjKind::Map) && weak,
+        "Promise" => kind == Some(ObjKind::Promise),
+        _ => return None,
+    };
+    if ok {
+        return None;
+    }
+    Some(match ctor {
+        "Set" => "Set",
+        "WeakSet" => "WeakSet",
+        "Map" => "Map",
+        "WeakMap" => "WeakMap",
+        _ => "Promise",
+    })
+}
+
+/// V8's `Object::NoSideEffectsToString`, the rendering an engine-thrown message
+/// uses for a value it must not run user code on. Measured on node v26.8.1
+/// through `Map.prototype.get.call(x)`:
+///
+/// ```text
+/// 5 / 'str' / true / null / undefined / 9n   the value's own ToString
+/// Symbol('s')                                Symbol(s)
+/// function f(){}                             its source text
+/// new Error('e')                             Error: e
+/// {} / new (class A {})                      #<Object> / #<A>
+/// new Map() / Promise.resolve()              #<Map> / #<Promise>
+/// [] / new Date() / /re/ / new Uint8Array()  [object Array] / [object Date] / …
+/// { toString() {} } / Object.create(null)    [object Object]
+/// ```
+///
+/// The split is one test: a receiver whose `toString` is still
+/// `Object.prototype.toString` prints `#<Constructor>`, and any other receiver
+/// prints what the BUILTIN brand would be — V8 never calls the user's method,
+/// which is why an object with its own `toString` prints `[object Object]` and
+/// not what that method returns.
+fn no_side_effects_string(recv: &Value) -> String {
+    if with_host(|h| host::is_primitive(h, recv)) || with_host(|h| host::is_callable(h, recv)) {
+        return with_host(|h| h.str_of(recv));
+    }
+    if let Some(s) = with_host(|h| h.error_to_string(recv)) {
+        return s;
+    }
+    // `native_tag` re-enters the host, so it is read BEFORE the borrow below
+    // rather than inside it.
+    let native = crate::stdlib::native_tag(recv).is_some();
+    let brands_itself = with_host(|h| {
+        // `Object.prototype.toString` reaches every object as a thunk on the
+        // real prototype object, so its presence proves nothing; only a
+        // toString the receiver's chain OVERRIDES it with counts.
+        let overridden = host::lookup_chain(h, recv, "toString")
+            .map(|f| !matches!(h.get(&f), Some(JsObj::Builtin(n)) if n == "@proto:Object:toString"))
+            .unwrap_or(false);
+        native
+            || overridden
+            || h.has_null_proto(recv)
+            || !matches!(
+                h.kind_of(recv),
+                Some(ObjKind::Object)
+                    | Some(ObjKind::Map)
+                    | Some(ObjKind::Set)
+                    | Some(ObjKind::Promise)
+            )
+    });
+    if brands_itself {
+        return with_host(|h| object_tag(h, recv));
+    }
+    let ctor = get_property(recv, "constructor")
+        .ok()
+        .map(|c| with_host(|h| h.callable_name(&c)))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Object".to_string());
+    format!("#<{ctor}>")
 }
 
 /// The value of `v[Symbol.toStringTag]` for a builtin that genuinely carries
@@ -1854,7 +2199,7 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
 /// `DataView`/`WeakRef`/`FinalizationRegistry`/`BigInt`/`Symbol`/generators/
 /// async+generator functions/`Math`/`JSON`/`Reflect`/`URL`/`URLSearchParams`/
 /// `TextEncoder`/`TextDecoder` all read their brand.
-fn well_known_tag(h: &host::JsHost, v: &Value) -> Option<String> {
+pub(crate) fn well_known_tag(h: &host::JsHost, v: &Value) -> Option<String> {
     // A primitive never carries the symbol except a BigInt/Symbol wrapper, both
     // of which `object_tag` already brands.
     let tag = object_brand(h, v);
@@ -1945,6 +2290,16 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             // brand by name (21.3.1.9, 25.5.3, 28.1.14).
             Some(JsObj::Builtin(n)) if matches!(n.as_str(), "Math" | "JSON" | "Reflect") => {
                 n.clone()
+            }
+            // A `<Ctor>.prototype` object brands as the constructor it belongs
+            // to — `Object.prototype.toString.call(Set.prototype)` is
+            // `[object Set]` — and a `require()`d module namespace is a plain
+            // object. Neither is a function, so neither brands as one.
+            Some(JsObj::Builtin(n)) if !host::builtin_is_callable(n) => {
+                match n.strip_suffix(".prototype") {
+                    Some(ctor) if !ctor.is_empty() => ctor.to_string(),
+                    _ => "Object".into(),
+                }
             }
             Some(JsObj::Class(_))
             | Some(JsObj::Builtin(_))
@@ -3753,41 +4108,41 @@ const NS_METHODS: &[&str] = &[
     "console.warn",
     "console.info",
     "console.debug",
-    "Math.floor",
-    "Math.ceil",
-    "Math.round",
-    "Math.trunc",
     "Math.abs",
-    "Math.sign",
+    "Math.acos",
+    "Math.acosh",
+    "Math.asin",
+    "Math.asinh",
+    "Math.atan",
+    "Math.atanh",
+    "Math.atan2",
+    "Math.ceil",
+    "Math.cbrt",
+    "Math.expm1",
+    "Math.clz32",
+    "Math.cos",
+    "Math.cosh",
+    "Math.exp",
+    "Math.floor",
+    "Math.fround",
+    "Math.hypot",
+    "Math.imul",
+    "Math.log",
+    "Math.log1p",
+    "Math.log2",
+    "Math.log10",
     "Math.max",
     "Math.min",
     "Math.pow",
-    "Math.sqrt",
-    "Math.cbrt",
     "Math.random",
-    "Math.hypot",
-    "Math.clz32",
-    "Math.fround",
-    "Math.imul",
-    "Math.sinh",
-    "Math.cosh",
-    "Math.tanh",
-    "Math.asinh",
-    "Math.acosh",
-    "Math.atanh",
-    "Math.log1p",
-    "Math.expm1",
-    "Math.log",
-    "Math.log2",
-    "Math.log10",
-    "Math.exp",
+    "Math.round",
+    "Math.sign",
     "Math.sin",
-    "Math.cos",
+    "Math.sinh",
+    "Math.sqrt",
     "Math.tan",
-    "Math.atan",
-    "Math.atan2",
-    "Math.asin",
-    "Math.acos",
+    "Math.tanh",
+    "Math.trunc",
     "JSON.stringify",
     "JSON.parse",
     "Object.keys",
@@ -3817,12 +4172,12 @@ const NS_METHODS: &[&str] = &[
     "Array.from",
     "Array.fromAsync",
     "Array.of",
+    "Number.isFinite",
     "Number.isInteger",
     "Number.isNaN",
-    "Number.isFinite",
     "Number.isSafeInteger",
-    "Number.parseInt",
     "Number.parseFloat",
+    "Number.parseInt",
     "String.fromCharCode",
     "String.fromCodePoint",
     "String.raw",
@@ -3831,19 +4186,19 @@ const NS_METHODS: &[&str] = &[
     "BigInt.asIntN",
     "BigInt.asUintN",
     "Proxy.revocable",
-    "Reflect.ownKeys",
-    "Reflect.has",
-    "Reflect.get",
-    "Reflect.set",
-    "Reflect.getPrototypeOf",
-    "Reflect.setPrototypeOf",
-    "Reflect.getOwnPropertyDescriptor",
     "Reflect.defineProperty",
     "Reflect.deleteProperty",
     "Reflect.apply",
     "Reflect.construct",
+    "Reflect.get",
+    "Reflect.getOwnPropertyDescriptor",
+    "Reflect.getPrototypeOf",
+    "Reflect.has",
     "Reflect.isExtensible",
+    "Reflect.ownKeys",
     "Reflect.preventExtensions",
+    "Reflect.set",
+    "Reflect.setPrototypeOf",
     "Promise.resolve",
     "Promise.reject",
     "Promise.all",
@@ -3861,6 +4216,35 @@ const NS_METHODS: &[&str] = &[
     "Error.captureStackTrace",
     "require.resolve",
 ];
+
+/// The `name` and `length` a builtin function reports, from the generated
+/// intrinsic table ([`crate::arity::BUILTIN_ARITY`]). `None` for a key the table
+/// does not cover — every non-function namespace (`Math`, `require('fs')`),
+/// and the core-module functions, whose arity is not specified anywhere.
+pub fn builtin_meta(key: &str) -> Option<(&'static str, u32)> {
+    crate::arity::BUILTIN_ARITY
+        .binary_search_by(|(k, _, _)| (*k).cmp(key))
+        .ok()
+        .map(|i| {
+            let (_, name, len) = crate::arity::BUILTIN_ARITY[i];
+            (name, len)
+        })
+}
+
+/// The `name` a builtin function reports. The table answers for an intrinsic;
+/// anything else falls back to the last segment of the key, which is what the
+/// name is for every builtin this frontend synthesizes: `@proto:TypedArray:set`
+/// is `set` and `fs.readFileSync` is `readFileSync`. Reporting the whole key was
+/// how `[Function: @proto:TypedArray:set]` reached `console.log`.
+pub fn builtin_name(key: &str) -> &str {
+    if let Some((name, _)) = builtin_meta(key) {
+        return name;
+    }
+    match key.strip_prefix("@proto:") {
+        Some(rest) => rest.rsplit(':').next().unwrap_or(rest),
+        None => key.rsplit('.').next().unwrap_or(key),
+    }
+}
 
 pub fn is_known_builtin(name: &str) -> bool {
     GLOBAL_FUNCS.contains(&name)
@@ -5690,11 +6074,38 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
         // `getOwnPropertyNames`/`Reflect.ownKeys` (mode 3), never `Object.keys`.
         if names.is_empty() && mode == 3 {
             let prefix = format!("{ns}.");
-            names = NS_METHODS
-                .iter()
-                .filter_map(|q| q.strip_prefix(&prefix))
-                .map(|m| m.to_string())
-                .collect();
+            // A builtin constructor's own `length`/`name`/`prototype` come
+            // first, as they do in V8.
+            if is_builtin_ctor(&ns) {
+                names.extend(["length", "name", "prototype"].map(str::to_string));
+            }
+            names.extend(
+                NS_METHODS
+                    .iter()
+                    .filter_map(|q| q.strip_prefix(&prefix))
+                    .map(|m| m.to_string()),
+            );
+            // The numeric constants are members too. Without them
+            // `getOwnPropertyNames(Math)` reported 35 of the 43 names node-js
+            // actually answers — the eight it dropped being `PI` and its
+            // siblings, which read fine and now own a descriptor as well.
+            names.extend(
+                namespace_constants(&ns)
+                    .iter()
+                    .map(|(k, _)| (*k).to_string()),
+            );
+        }
+        // A builtin FUNCTION owns exactly `length` and `name` (10.3.3-4), so
+        // `Object.getOwnPropertyNames(Math.max)` is `[ 'length', 'name' ]` — it
+        // was `[]`, which said the function had no properties at all while both
+        // of them read back a value. `length` is listed only where the intrinsic
+        // table has an arity, so the names never advertise a read that answers
+        // `undefined`.
+        if names.is_empty() && mode == 3 && host::builtin_is_callable(&ns) {
+            if builtin_meta(&ns).is_some() {
+                names.push("length".to_string());
+            }
+            names.push("name".to_string());
         }
         if !names.is_empty() {
             let entries: Vec<(String, Value)> = names
@@ -6200,6 +6611,21 @@ fn json_str(
                     .into_iter()
                     .filter(|(k, _)| !k.starts_with("@@") && !host::is_symbol_key(k))
                     .filter_map(|(k, val)| {
+                        json_str(h, &val, indent, depth + 1, keys)
+                            .map(|s| format!("{}{sep}{s}", json_quote(&k)))
+                    })
+                    .collect();
+                Some(wrap(&parts, "{", "}", indent, depth))
+            }
+            // A NON-callable builtin is a namespace object, not a function, so
+            // it serializes as one: `JSON.stringify(Math)` is `{}` (its members
+            // are all non-enumerable), where omitting it made the whole property
+            // disappear from its holder.
+            Some(JsObj::Builtin(n)) if !host::builtin_is_callable(n) => {
+                let parts: Vec<String> = crate::stdlib::namespace_keys(n)
+                    .into_iter()
+                    .filter_map(|k| {
+                        let val = h.builtin_static(n, &k)?;
                         json_str(h, &val, indent, depth + 1, keys)
                             .map(|s| format!("{}{sep}{s}", json_quote(&k)))
                     })
@@ -10360,6 +10786,49 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
                     h.new_object(m)
                 }));
             }
+        }
+    }
+    // A global the object does not own outright is still an own property of the
+    // global object — the same lazy binding the bare identifier resolves to.
+    // Every one of them reported `undefined`, so a feature probe written as
+    // `getOwnPropertyDescriptor(globalThis, 'structuredClone')` concluded the
+    // global was absent. The immutable trio (11.1.1 / 19.1.1-3) is frozen; the
+    // rest are ordinary writable, non-enumerable, configurable bindings.
+    if with_host(|h| h.is_global_object(&obj)) {
+        let owned = with_host(|h| match h.get(&obj) {
+            Some(JsObj::Object(p)) => p.contains_key(&key),
+            _ => false,
+        });
+        if !owned && !CJS_WRAPPER_LOCALS.contains(&key.as_str()) {
+            if let Some(v) = global_binding(&key) {
+                let frozen = matches!(key.as_str(), "undefined" | "NaN" | "Infinity");
+                return Ok(with_host(|h| {
+                    let mut m: IndexMap<String, Value> = IndexMap::new();
+                    m.insert("value".into(), v);
+                    m.insert("writable".into(), Value::Bool(!frozen));
+                    m.insert(
+                        "enumerable".into(),
+                        Value::Bool(ENUMERABLE_GLOBALS.contains(&key.as_str())),
+                    );
+                    m.insert("configurable".into(), Value::Bool(!frozen));
+                    h.new_object(m)
+                }));
+            }
+        }
+    }
+    // Any other member of a builtin namespace (`Math.PI`, `Math.floor`,
+    // `Array.prototype.slice`, a builtin function's own `name`/`length`). Every
+    // one of these reads back a value, but none owned a DESCRIPTOR:
+    // `Object.getOwnPropertyDescriptor(Math, 'PI')` was `undefined`, which reads
+    // as "no such property" to the shim/polyfill family that probes a namespace
+    // before patching it.
+    if let Some(ns) = with_host(|h| match h.get(&obj) {
+        Some(JsObj::Builtin(ns)) => Some(ns.clone()),
+        _ => None,
+    }) {
+        let value = namespace_property(&ns, &key);
+        if !matches!(value, Value::Undef) {
+            return Ok(builtin_member_descriptor(&ns, &key, value));
         }
     }
     // Accessor descriptor?

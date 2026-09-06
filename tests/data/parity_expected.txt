@@ -185,6 +185,141 @@ chunks   true
 from-ok  1,2,3 ab 5 0
 from-alk 0,0 65,66
 from-bad TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE TypeError/ERR_INVALID_ARG_TYPE
+==== builtinmeta.js ====
+fn         max 2 function function function max() { [native code] }
+fn         keys 1 function function function keys() { [native code] }
+fn         parseInt 2 function function function parseInt() { [native code] }
+fn         slice 2 function function function slice() { [native code] }
+fn         union 1 function function function union() { [native code] }
+bound      slice 2 get padStart
+inspect    [Function: set] [Function: slice] [Function: max]
+ctor       Array 1 0 object
+namespace  object false true
+brand      [object Math] [object Set]
+enumerate  0 {} undefined
+names      length,name,prototype,isFinite,isInteger,isNaN,isSafeInteger,parseFloat,parseInt,MAX_VALUE,MIN_VALUE,NaN,NEGATIVE_INFINITY,POSITIVE_INFINITY,MAX_SAFE_INTEGER,MIN_SAFE_INTEGER,EPSILON
+fnNames    length,name
+descr      Math.PI       w=false e=false c=false
+descr      Math.floor    w=true e=false c=true
+descr      Number.MAX    w=false e=false c=false
+descr      Number.proto  w=false e=false c=false
+descr      max.name      w=false e=false c=true
+descr      A.p.slice     w=true e=false c=true
+descr      global.Math   w=true e=false c=true
+descr      global.undef  w=false e=false c=false
+descr      global.sClone w=true e=true c=true
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver [object Array]
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver #<Object>
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver 5
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver str
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver null
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver undefined
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver #<Map>
+brandcheck Set.prototype.union          ok
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver [object Date]
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver [object Object]
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver #<A>
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver true
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver 9
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver [object Uint8Array]
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver #<Promise>
+brandcheck Set.prototype.union          TypeError: Method Set.prototype.union called on incompatible receiver #<WeakMap>
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver [object Array]
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver #<Object>
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver 5
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver str
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver null
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver undefined
+brandcheck Map.prototype.get            ok
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver #<Set>
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver [object Date]
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver [object Object]
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver #<A>
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver true
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver 9
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver [object Uint8Array]
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver #<Promise>
+brandcheck Map.prototype.get            TypeError: Method Map.prototype.get called on incompatible receiver #<WeakMap>
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver [object Array]
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver #<Object>
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver 5
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver str
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver null
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver undefined
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver #<Map>
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver #<Set>
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver [object Date]
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver [object Object]
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver #<A>
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver true
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver 9
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver [object Uint8Array]
+brandcheck Promise.prototype.then       ok
+brandcheck Promise.prototype.then       TypeError: Method Promise.prototype.then called on incompatible receiver #<WeakMap>
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       ok
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.getTime       TypeError: this is not a Date object.
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver [object Array]
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver #<Object>
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver 5
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver str
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver null
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver undefined
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver #<Map>
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver #<Set>
+brandcheck Date.prototype.toISOString   ok
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver [object Object]
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver #<A>
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver true
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver 9
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver [object Uint8Array]
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver #<Promise>
+brandcheck Date.prototype.toISOString   TypeError: Method Date.prototype.toISOString called on incompatible receiver #<WeakMap>
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver [object Array]
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver #<Object>
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver 5
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver str
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver null
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver undefined
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver #<Map>
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver #<Set>
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver [object Date]
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver [object Object]
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver #<A>
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver true
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver 9
+brandcheck Uint8Array.prototype.slice   ok
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver #<Promise>
+brandcheck Uint8Array.prototype.slice   TypeError: Method %TypedArray%.prototype.slice called on incompatible receiver #<WeakMap>
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    ok
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
 ==== byteviews.js ====
 fill       Uint8Array(5) [ 255, 9, 9, 65, 128 ] true
 through    Uint8Array(4) [ 7, 7, 0, 0 ] true

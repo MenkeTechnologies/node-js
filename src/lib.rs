@@ -9,6 +9,7 @@
 
 pub mod aot;
 pub mod aot_native;
+pub mod arity;
 pub mod ast;
 pub mod banner;
 pub mod builtins;

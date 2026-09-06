@@ -2283,11 +2283,79 @@ Known gaps found alongside them, unfixed:
 
 | case | node v26.8.1 | node-js |
 | --- | --- | --- |
-| `Array.prototype.map.name`, `Math.max.length` | `'map'`, `2` | `undefined` — a builtin method is a dispatch thunk with no `name`/`length`/arity table |
-| `Object.getOwnPropertyDescriptor(Math, 'PI')` | a data descriptor | `undefined` — a builtin namespace member owns no descriptor |
-| `Set.prototype.union.call([], new Set())` | `TypeError: Method Set.prototype.union called on incompatible receiver [object Array]` | `TypeError: union is not a function` — the thunk dispatches by the RECEIVER's kind, so the branded message never runs |
-| `Object.getOwnPropertyNames(Math)` order | `abs, acos, acosh, …` | declaration order of node-js's own table |
 | `'é'.localeCompare('é')` (precomposed vs decomposed) | `0` | `-1` — comparison is by code unit; there is no collation (Intl is absent) |
+
+The first four rows of that table are CLOSED — see "What a builtin is" below.
+`'é'.localeCompare` stays: it needs collation data this runtime has none of.
+
+## What a builtin IS
+
+A builtin was a callable dispatch thunk and nothing else: it answered a CALL and
+had no properties, no identity and no brand. Everything in this section is one
+consequence of that, each measured against node v26.8.1 and pinned in
+`examples/builtinmeta.js`.
+
+- **`name` and `length`.** `Math.max.name` and `[].slice.name` were `undefined`,
+  and so was every `length`. `name` is now the function's own (the last segment
+  of the key, or the table's when a legacy alias shares a function object:
+  `String.prototype.trimLeft.name` is `trimStart`), and `length` comes from
+  `src/arity.rs` — the ECMAScript intrinsics' arities, which are normative, read
+  out of a reference engine by `cargo run --bin gen-arity` rather than typed by
+  hand. A core-module function (`fs.readFileSync.length`) still reads
+  `undefined`: those arities come from the signatures of node's own JavaScript
+  and are specified nowhere.
+- **The internal key leaked into output.** `console.log(Uint8Array.prototype.set)`
+  printed `[Function: @proto:TypedArray:set]`, and `String(Math.max)` printed
+  `[object Function]` because a builtin exposed no `toString` to invoke. Both now
+  report node's forms — `[Function: set]` and
+  `function max() { [native code] }` — and `typeof Math.max.bind` is `function`
+  rather than `undefined`. `String(console.log)` is the ANONYMOUS native-code
+  form, as it is in node, where the console methods are wrappers.
+- **Namespace members owned no descriptor.**
+  `Object.getOwnPropertyDescriptor(Math, 'PI')` was `undefined`, which reads as
+  "no such property" to the shim/polyfill family that probes before patching.
+  Members now answer with the attributes node reports: a constant (and a
+  constructor's `prototype`) frozen, a function's own `name`/`length` read-only
+  but configurable, an ordinary method writable, and a core module's exports
+  enumerable as well. Globals answer too: `getOwnPropertyDescriptor(globalThis,
+  'structuredClone')` was `undefined` for every lazy global binding.
+- **Enumeration disagreed with what could be read.**
+  `Object.getOwnPropertyNames(Math)` listed 35 methods and none of the eight
+  constants that read back fine; `Number` listed neither its constants nor
+  `length`/`name`/`prototype`; a builtin function reported no own names at all
+  where node reports `[ 'length', 'name' ]`. The method tables for
+  `Math`/`Number`/`Reflect` are now in V8's own order, so those three lists match
+  node exactly.
+- **A namespace was a function.** `typeof Set.prototype` was `"function"`,
+  `Math instanceof Function` was `true`, `Math instanceof Object` was `false`,
+  `Object.prototype.toString.call(Set.prototype)` was `[object Function]`, and
+  `console.log(Math)` printed `[Function: Math]`. Callability is now a property
+  of the builtin rather than of its representation: the namespace objects and the
+  `<Ctor>.prototype` handles are data (`Function.prototype` excepted — that one
+  really is callable), so `typeof`, `instanceof`, the brand and `util.inspect`
+  all agree, and `JSON.stringify(Math)` is `{}` instead of `undefined`.
+- **The brand check never ran.** `Set.prototype.union.call([], new Set())`
+  reported `union is not a function` — that the method does not exist, rather
+  than that the receiver is the wrong kind of object. `Set`, `WeakSet`, `Map`,
+  `WeakMap`, `Promise`, `Date` and `%TypedArray%` now throw node's message, with
+  the receiver rendered the way V8's side-effect-free stringifier renders it: a
+  primitive by value, an object that still inherits `Object.prototype.toString`
+  as `#<Ctor>`, anything with its own `toString` by its builtin brand. `Date` and
+  `%TypedArray%` each split their methods in two, because V8 does: `getTime` and
+  `fill` report `this is not a Date object.` / `this is not a typed array.`,
+  while `toISOString` and `slice` take the branded form.
+
+Still open in the same area:
+
+| case | node v26.8.1 | node-js |
+| --- | --- | --- |
+| `console.log(require('util'))` | the module's members | `Object [util] {}` — rendering a member means allocating its value, and inspect runs under the host borrow |
+| `console.log(Object.prototype)` | `[Object: null prototype] {}` | `{}` — the prototype object is ordinary here |
+| `Set.prototype.union.call(function f(){})` | `… incompatible receiver function f(){}` | `… function f() { [code] }` — the compiler keeps no source spans |
+| `Object.getOwnPropertyDescriptor(globalThis, 'process')` | an ACCESSOR (node defines it lazily) | a data descriptor |
+| `Object.getOwnPropertyDescriptor(Set.prototype, 'size')` | an accessor descriptor | `undefined` — a builtin prototype's accessors own no descriptor |
+| `Object.create(Map.prototype).constructor` | `Map` | `Object`, and `instanceof Set` is false for `Object.create(Set.prototype)` — a builtin prototype carries no `constructor` link |
+| `Math.f16round`, `JSON.rawJSON`/`isRawJSON` | implemented | absent, and correspondingly absent from `getOwnPropertyNames` |
 
 Two more borrows and one message, found in the same pass:
 

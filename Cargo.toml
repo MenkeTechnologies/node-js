@@ -66,6 +66,14 @@ path = "src/bin/parity.rs"
 name = "parity-fuzz"
 path = "src/bin/parity_fuzz.rs"
 
+# Regenerates `src/arity.rs`, the `name`/`length` of every ECMAScript intrinsic
+# function, by reading them out of a reference engine (the values are normative,
+# so the reference is a transcription source, not an oracle to agree with).
+# Dev tool — needs `node`; the generated table is checked in, so CI never runs it.
+[[bin]]
+name = "gen-arity"
+path = "src/bin/gen_arity.rs"
+
 [dependencies]
 # JavaScript executes on fusevm. node-js is a pure frontend: it lowers JS to
 # fusevm bytecode (src/compiler.rs) and hosts the JS object heap (src/host.rs,
