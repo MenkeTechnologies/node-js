@@ -2553,6 +2553,537 @@ fn gen_sparse(seed: u64) -> Vec<String> {
     }
 }
 
+/// TAGGED TEMPLATES — the template object's identity, its integrity level, and
+/// the tag's receiver.
+///
+/// The census found zero of them in 40 000 generated programs, and four bugs
+/// were living in the hole: the template object was rebuilt on every evaluation
+/// of a site (13.2.8.4 caches it by Parse Node), neither it nor its `raw` array
+/// was frozen (steps 12-13), and a tag written as a method ran with `this`
+/// undefined (13.3.11.1 passes the reference's base).
+///
+/// Every case therefore prints an IDENTITY or an INTEGRITY answer, never only
+/// the cooked strings. The cooked strings were already right — a generator that
+/// printed `tag`a${1}b`` and nothing else would have run this whole mode green
+/// against all four bugs.
+fn gen_tagged(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const TMPL: &[&str] = &[
+        "`a${1}b`",
+        "`${1}`",
+        "``",
+        "`x`",
+        "`\\n\\t${'q'}`",
+        "`a${1}b${2}c`",
+        "`${'s'}${2}`",
+    ];
+    let t = pick(r, TMPL);
+    match r.below(8) {
+        // One SITE evaluated twice is one object; two sites with identical text
+        // are two. Both halves matter: caching by TEXT would pass the first and
+        // fail the second.
+        0 => vec![
+            "const id = (s) => s;".into(),
+            format!("const site = () => id{t};"),
+            format!("const twin = () => id{t};"),
+            "console.log(site() === site(), site() === twin(), site().raw === site().raw);".into(),
+        ],
+        // The template object and its `raw` array are frozen, and the frozen
+        // state is observable through a write that must not land.
+        1 => vec![
+            "const id = (s) => s;".into(),
+            format!("const s = id{t};"),
+            "console.log(Object.isFrozen(s), Object.isFrozen(s.raw), Object.isExtensible(s));"
+                .into(),
+            "s[0] = 'MUT'; s.raw[0] = 'MUT'; s.extra = 1;".into(),
+            "console.log(JSON.stringify(s), JSON.stringify(s.raw), s.extra);".into(),
+        ],
+        // The own-property attributes of an element, of `raw` and of `length`.
+        2 => vec![
+            "const id = (s) => s;".into(),
+            format!("const s = id{t};"),
+            format!(
+                "console.log(JSON.stringify(Object.getOwnPropertyDescriptor(s, {})));",
+                pick(r, &["'0'", "'raw'", "'length'", "'1'"])
+            ),
+            "console.log(JSON.stringify(Object.keys(s)), JSON.stringify(Object.getOwnPropertyNames(s)));".into(),
+        ],
+        // A METHOD tag: the receiver is the reference's base, and it is
+        // evaluated exactly once.
+        3 => vec![
+            "let n = 0;".into(),
+            "const o = { p: 'P', m(s, ...v) { return String(this && this.p) + s.join('|') + v.join(','); } };".into(),
+            "const get = () => { n++; return o; };".into(),
+            format!("console.log(get().m{t}, n);"),
+        ],
+        // A bare identifier tag has no base at all, so `this` is undefined even
+        // in sloppy code (the tag call is not a method call).
+        4 => vec![
+            "function tag(s, ...v) { return [this === undefined, this === globalThis, s.length, v.length].join(' '); }".into(),
+            format!("console.log(tag{t});"),
+        ],
+        // Cooked vs raw across the escapes that differ between them.
+        5 => {
+            let esc = pick(
+                r,
+                &[
+                    "`\\n`",
+                    "`\\t${1}\\\\`",
+                    "`\\x41${'z'}`",
+                    "`\\u0042`",
+                    "`a\\`b`",
+                    "`\\0`",
+                ],
+            );
+            vec![
+                "const tag = (s, ...v) => JSON.stringify([s, s.raw, v]);".into(),
+                format!("console.log(tag{esc});"),
+            ]
+        }
+        // `String.raw` over a real site and over a hand-rolled strings object.
+        6 => vec![
+            format!("console.log(String.raw{t});"),
+            format!(
+                "console.log(String.raw({{ raw: {} }}, {}));",
+                pick(r, &["['x','y','z']", "['a']", "[]", "'ab'"]),
+                pick(r, &["1, 2", "'-'", "", "0, 0, 0"])
+            ),
+        ],
+        // The site inside a LOOP and inside a re-entered function: the same
+        // Parse Node, so the same object every time round.
+        _ => vec![
+            "const id = (s) => s;".into(),
+            format!("function f() {{ return id{t}; }}"),
+            "const seen = [];".into(),
+            "for (let i = 0; i < 3; i++) seen.push(f());".into(),
+            "console.log(seen[0] === seen[1], seen[1] === seen[2], new Set(seen).size);".into(),
+        ],
+    }
+}
+
+/// The WELL-KNOWN protocol hooks: `new.target`, class static blocks,
+/// `Symbol.hasInstance`, `Symbol.species` and `Symbol.toPrimitive`.
+///
+/// All five appeared ZERO times in the census. They are the hooks a value uses
+/// to answer a question about ITSELF, so each case prints the answer the
+/// operator gives rather than the hook's return value: `instanceof` for
+/// `hasInstance`, the constructor of a derived result for `species`, and the
+/// three coercion hints for `toPrimitive`.
+fn gen_wellknown(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    match r.below(7) {
+        // `new.target` across a plain call, a `new`, a derived constructor and
+        // `Reflect.construct` with an explicit newTarget.
+        0 => vec![
+            "const seen = [];".into(),
+            "function F() { seen.push(new.target === undefined ? 'undef' : new.target.name); }"
+                .into(),
+            "class A { constructor() { seen.push('A:' + (new.target && new.target.name)); } }"
+                .into(),
+            "class B extends A { constructor() { super(); seen.push('B:' + new.target.name); } }"
+                .into(),
+            format!("{};", pick(r, &["F()", "new F()", "new A()", "new B()", "Reflect.construct(F, [], A)", "Reflect.construct(A, [], B)"])),
+            "console.log(seen.join(' '));".into(),
+        ],
+        // A static block runs once, in declaration order with the static fields
+        // around it, with `this` the class.
+        1 => vec![
+            "const log = [];".into(),
+            format!(
+                "class S {{ static a = {}; static {{ log.push('blk ' + this.name + ' ' + S.a); S.b = S.a + 1; }} static c = S.b * 2; }}",
+                pick(r, &["1", "0", "'x'", "S_INIT"]).replace("S_INIT", "2")
+            ),
+            "console.log(log.join('|'), S.a, S.b, S.c);".into(),
+        ],
+        // `Symbol.hasInstance` overrides `instanceof` entirely, including for
+        // primitives, which the ordinary algorithm never accepts.
+        2 => {
+            let pred = pick(
+                r,
+                &[
+                    "typeof v === 'number'",
+                    "typeof v === 'string'",
+                    "false",
+                    "true",
+                    "v != null && 'q' in Object(v)",
+                ],
+            );
+            vec![
+                format!("class H {{ static [Symbol.hasInstance](v) {{ return {pred}; }} }}"),
+                "const probes = [1, 'x', {}, { q: 1 }, null, undefined, [], H];".into(),
+                "console.log(probes.map((p) => { try { return String(p instanceof H); } catch (e) { return e.constructor.name; } }).join(' '));".into(),
+            ]
+        }
+        // `Symbol.species` decides the constructor of a derived array.
+        3 => {
+            let sp = pick(r, &["Array", "MyArr", "undefined", "null"]);
+            vec![
+                format!("class MyArr extends Array {{ static get [Symbol.species]() {{ return {sp}; }} }}"),
+                "const m = MyArr.from([1, 2, 3]);".into(),
+                format!("const d = m.{};", pick(r, &["map((x) => x * 2)", "filter(() => true)", "slice(1)", "concat([4])", "flat()"])),
+                "console.log(m instanceof MyArr, d instanceof MyArr, d instanceof Array, JSON.stringify(d), d.constructor.name);".into(),
+            ]
+        }
+        // Every hint a coercion can ask for, and the order the hooks are tried.
+        4 => {
+            let body = pick(
+                r,
+                &[
+                    "h === 'number' ? 42 : 'S:' + h",
+                    "h",
+                    "h === 'default' ? 7 : 'x'",
+                    "1",
+                ],
+            );
+            vec![
+                "const log = [];".into(),
+                format!("const o = {{ [Symbol.toPrimitive](h) {{ log.push(h); return {body}; }}, valueOf() {{ log.push('valueOf'); return 1; }}, toString() {{ log.push('toString'); return 't'; }} }};"),
+                "const out = [];".into(),
+                "out.push(String(`${o}`)); out.push(String(+o)); out.push(String(o + '')); out.push(String(o == 1));".into(),
+                "console.log(out.join(' '), '|', log.join(','));".into(),
+            ]
+        }
+        // A `Symbol.toPrimitive` that throws or returns an object: both are
+        // TypeErrors from the CONVERSION, not from the hook.
+        5 => {
+            let ret = pick(r, &["({})", "[]", "Symbol('s')", "'ok'", "5"]);
+            vec![
+                format!("const o = {{ [Symbol.toPrimitive]() {{ return {ret}; }} }};"),
+                "for (const f of [(v) => `${v}`, (v) => +v, (v) => v + 1]) { try { console.log(String(f(o))); } catch (e) { console.log(e.constructor.name); } }".into(),
+            ]
+        }
+        // The hooks a builtin prototype really carries, and the ones it does not.
+        _ => {
+            let sym = pick(
+                r,
+                &[
+                    "Symbol.iterator",
+                    "Symbol.toStringTag",
+                    "Symbol.hasInstance",
+                    "Symbol.toPrimitive",
+                    "Symbol.asyncIterator",
+                ],
+            );
+            let holder = pick(
+                r,
+                &[
+                    "Array.prototype",
+                    "String.prototype",
+                    "Map.prototype",
+                    "Set.prototype",
+                    "Function.prototype",
+                    "Date.prototype",
+                    "Symbol.prototype",
+                    "Object.prototype",
+                ],
+            );
+            vec![format!(
+                "const h = {holder}[{sym}]; console.log(typeof h, h === undefined ? '-' : h.name, h === undefined ? '-' : h.length);"
+            )]
+        }
+    }
+}
+
+/// PROXY traps — which trap each operation invokes, in order.
+///
+/// `Proxy` never appeared in the census. The observable that matters is not the
+/// RESULT (a handler that forwards to `Reflect` produces the target's own answer
+/// either way) but the trap LOG: an operation that reaches the target without
+/// going through the traps the specification names is a proxy that library code
+/// cannot observe. `p.k = v` on a handler with no `set` trap has to run
+/// OrdinarySet, which calls `getOwnPropertyDescriptor` and then
+/// `defineProperty` — both traps, both skipped when the write goes straight to
+/// the target.
+fn gen_proxytrap(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const TARGET: &[&str] = &[
+        "{ a: 1 }",
+        "{}",
+        "[1, 2]",
+        "{ a: 1, b: 2 }",
+        "Object.create({ inherited: 1 })",
+    ];
+    let t = pick(r, TARGET);
+    // A handler that LOGS and forwards. Which traps it defines is the variable:
+    // an absent trap must make the operation fall back to the ordinary
+    // algorithm, which itself calls other traps.
+    let traps = pick(
+        r,
+        &[
+            "get,set,has,deleteProperty,ownKeys,getOwnPropertyDescriptor,defineProperty",
+            "get,has,ownKeys,getOwnPropertyDescriptor,defineProperty",
+            "getOwnPropertyDescriptor,defineProperty,ownKeys",
+            "get,set",
+            "ownKeys,getOwnPropertyDescriptor",
+            "",
+        ],
+    );
+    let handler = {
+        let mut parts = vec!["const log = [];".to_string(), "const H = {};".to_string()];
+        for name in traps.split(',').filter(|s| !s.is_empty()) {
+            // Every trap logs its key then forwards through Reflect, so the
+            // RESULT is the target's and only the log distinguishes the runs.
+            let body = match name {
+                "get" => "H.get = (t, k, rc) => { if (typeof k !== 'symbol') log.push('get:' + String(k)); return Reflect.get(t, k, rc); };",
+                "set" => "H.set = (t, k, v, rc) => { log.push('set:' + String(k)); return Reflect.set(t, k, v, rc); };",
+                "has" => "H.has = (t, k) => { log.push('has:' + String(k)); return Reflect.has(t, k); };",
+                "deleteProperty" => "H.deleteProperty = (t, k) => { log.push('del:' + String(k)); return Reflect.deleteProperty(t, k); };",
+                "ownKeys" => "H.ownKeys = (t) => { log.push('ownKeys'); return Reflect.ownKeys(t); };",
+                "getOwnPropertyDescriptor" => "H.getOwnPropertyDescriptor = (t, k) => { if (typeof k !== 'symbol') log.push('gopd:' + String(k)); return Reflect.getOwnPropertyDescriptor(t, k); };",
+                _ => "H.defineProperty = (t, k, d) => { log.push('def:' + String(k)); return Reflect.defineProperty(t, k, d); };",
+            };
+            parts.push(body.to_string());
+        }
+        parts
+    };
+    let op = pick(
+        r,
+        &[
+            "p.a",
+            "p.zz",
+            "p.b = 9",
+            "p.newKey = 1",
+            "'a' in p",
+            "delete p.a",
+            "Object.keys(p)",
+            "JSON.stringify(p)",
+            "Object.assign({}, p)",
+            "({ ...p })",
+            "Object.entries(p)",
+            "Object.getOwnPropertyNames(p)",
+            "Object.freeze(p)",
+            "String(p)",
+        ],
+    );
+    let mut stmts = handler;
+    stmts.push(format!("const p = new Proxy({t}, H);"));
+    // The operation is evaluated EXACTLY ONCE and rendered without touching the
+    // proxy again — a renderer that re-read the result would append its own trap
+    // calls to the log this case exists to compare.
+    stmts.push(format!(
+        "let out; try {{ const v = ({op}); out = v === p ? 'self' : (v !== null && typeof v === 'object' ? JSON.stringify(v) : String(v)); }} catch (e) {{ out = e.constructor.name; }}"
+    ));
+    stmts.push("console.log(out, '|', log.join(' '));".into());
+    stmts
+}
+
+/// MICROTASK and macrotask scheduling: `queueMicrotask`, `setImmediate`,
+/// `setInterval`, `process.nextTick` and promise reactions.
+///
+/// None of the first three appeared in the census. Two things are pinned: the
+/// ORDER the queues drain in, and the synchronous argument validation every one
+/// of these entry points performs — `queueMicrotask(1)` throws where it reaches
+/// the caller, and queuing the value unchecked instead turns it into an uncaught
+/// failure out of the loop that no `try` around the call can see.
+///
+/// Deliberately NOT pinned: `setImmediate` against `setTimeout(…, 0)` from the
+/// main module, whose relative order Node itself documents as non-deterministic.
+fn gen_microtask(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    match r.below(5) {
+        // The drain order of the four queues that all run before any timer.
+        0 => vec![
+            "const log = [];".into(),
+            "process.nextTick(() => log.push('tick1'));".into(),
+            "queueMicrotask(() => log.push('qm1'));".into(),
+            "Promise.resolve().then(() => log.push('p1'));".into(),
+            "process.nextTick(() => log.push('tick2'));".into(),
+            "queueMicrotask(() => log.push('qm2'));".into(),
+            "setTimeout(() => { log.push('timer'); console.log(log.join(' ')); }, 0);".into(),
+        ],
+        // A microtask queued FROM a microtask joins the same drain.
+        1 => vec![
+            "const log = [];".into(),
+            "queueMicrotask(() => { log.push('a'); queueMicrotask(() => log.push('a2')); process.nextTick(() => log.push('a-tick')); });".into(),
+            "Promise.resolve().then(() => { log.push('b'); queueMicrotask(() => log.push('b2')); });".into(),
+            "setTimeout(() => { log.push('end'); console.log(log.join(' ')); }, 0);".into(),
+        ],
+        // Every entry point validates its callback synchronously.
+        2 => {
+            let bad = pick(
+                r,
+                &["1", "'s'", "null", "undefined", "{}", "[]", "true", "9n"],
+            );
+            let f = pick(
+                r,
+                &[
+                    "queueMicrotask",
+                    "process.nextTick",
+                    "setTimeout",
+                    "setImmediate",
+                    "setInterval",
+                ],
+            );
+            vec![
+                format!("try {{ {f}({bad}, 0); console.log('accepted'); }} catch (e) {{ console.log(e.constructor.name, e.code, e.message); }}"),
+                "console.log('still running');".into(),
+            ]
+        }
+        // `setInterval` repeats until cleared, and `clearInterval` from inside
+        // the callback stops it.
+        3 => {
+            let n = pick(r, &["1", "2", "3"]);
+            vec![
+                "const log = [];".into(),
+                "let i = 0;".into(),
+                format!("const h = setInterval(() => {{ log.push('iv' + i); if (++i === {n}) {{ clearInterval(h); console.log(log.join(' '), i); }} }}, 1);"),
+            ]
+        }
+        // The scheduling functions' own identity: a handle object, its methods,
+        // and the arity node reports.
+        _ => vec![
+            format!(
+                "const f = {};",
+                pick(
+                    r,
+                    &[
+                        "queueMicrotask",
+                        "setImmediate",
+                        "setTimeout",
+                        "setInterval",
+                        "clearTimeout",
+                        "process.nextTick"
+                    ]
+                )
+            ),
+            "console.log(typeof f, f.name, f.length);".into(),
+            format!(
+                "const h = {};",
+                pick(
+                    r,
+                    &[
+                        "setTimeout(() => {}, 1000)",
+                        "setInterval(() => {}, 1000)",
+                        "setImmediate(() => {})"
+                    ]
+                )
+            ),
+            "console.log(typeof h, typeof h.ref, typeof h.unref, typeof h.hasRef, h.hasRef());"
+                .into(),
+            "h.unref(); console.log(h.hasRef());".into(),
+            "clearTimeout(h); clearInterval(h); clearImmediate(h);".into(),
+        ],
+    }
+}
+
+/// The array methods the census found at ZERO occurrences: `reduceRight`,
+/// `copyWithin`, `findLast`/`findLastIndex`, `toSpliced`, `with`, `at`,
+/// `Object.groupBy`/`Map.groupBy` and `Array.of`.
+///
+/// Each case prints the RESULT and, where the method has one, the failure mode
+/// the specification demands: `reduceRight` over an empty array with no seed and
+/// `with`/`at` past the end are TypeError and RangeError, not silent answers.
+fn gen_arraylate(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const ARR: &[&str] = &[
+        "[1, 2, 3, 4, 5]",
+        "[]",
+        "[7]",
+        "['a', 'b', 'c']",
+        "[1, , 3]",
+        "[0, -0, NaN, 2]",
+        "[[1], [2, 3]]",
+    ];
+    let a = pick(r, ARR);
+    let i = pick(r, &["0", "1", "2", "-1", "-2", "5", "-9"]);
+    match r.below(7) {
+        // `reduceRight` walks right to left and rejects an empty array with no
+        // initial value.
+        0 => vec![
+            format!("const a = {a};"),
+            format!(
+                "try {{ console.log(JSON.stringify(a.reduceRight({}))); }} catch (e) {{ console.log(e.constructor.name + ': ' + e.message); }}",
+                pick(r, &["(x, y) => String(x) + '-' + String(y)", "(x, y) => [x, y]", "(x, y) => x, 'SEED'", "(x, y, i) => String(x) + i"])
+            ),
+        ],
+        // `copyWithin` is in-place and clamps both ends.
+        1 => vec![
+            format!("const a = {a};"),
+            format!(
+                "console.log(JSON.stringify(a.copyWithin({i}, {})), a.length);",
+                pick(r, &["0", "1", "-2", "3", "-1, -1", "0, 2"])
+            ),
+        ],
+        // `findLast`/`findLastIndex` scan from the end.
+        2 => {
+            let p = pick(
+                r,
+                &[
+                    "(x) => x > 1",
+                    "() => false",
+                    "() => true",
+                    "(x) => x === undefined",
+                    "(x, idx) => idx === 1",
+                ],
+            );
+            vec![
+                format!("const a = {a};"),
+                format!("console.log(String(a.findLast({p})), a.findLastIndex({p}), String(a.find({p})), a.findIndex({p}));"),
+            ]
+        }
+        // `toSpliced`/`toSorted`/`toReversed`/`with` all copy, so the source is
+        // printed after to prove it did not move.
+        3 => {
+            let m = pick(
+                r,
+                &[
+                    "toSpliced(1, 1, 'X', 'Y')",
+                    "toSpliced(0, 0)",
+                    "toSpliced(-1, 5)",
+                    "toReversed()",
+                    "toSorted()",
+                    "toSorted((x, y) => String(y).localeCompare(String(x)))",
+                ],
+            );
+            vec![
+                format!("const a = {a};"),
+                format!("const b = a.{m};"),
+                "console.log(JSON.stringify(b), JSON.stringify(a), b === a, Array.isArray(b));"
+                    .into(),
+            ]
+        }
+        // `with` and `at` on the same index: one throws past the end, the other
+        // answers undefined.
+        4 => vec![
+            format!("const a = {a};"),
+            format!("try {{ console.log(JSON.stringify(a.with({i}, 'W'))); }} catch (e) {{ console.log(e.constructor.name); }}"),
+            format!("console.log(String(a.at({i})), String('abcd'.at({i})), JSON.stringify(a));"),
+        ],
+        // `Object.groupBy` yields a NULL-prototype object; `Map.groupBy` a Map
+        // keyed by the raw value under SameValueZero.
+        5 => {
+            let k = pick(
+                r,
+                &[
+                    "(x) => (typeof x === 'number' && x % 2 ? 'odd' : 'even')",
+                    "(x) => String(x)",
+                    "(x, idx) => idx % 2",
+                    "() => 'all'",
+                ],
+            );
+            vec![
+                format!("const a = {a};"),
+                format!("const g = Object.groupBy(a, {k});"),
+                "console.log(JSON.stringify(g), String(Object.getPrototypeOf(g)), JSON.stringify(Object.keys(g)));".into(),
+                format!("const m = Map.groupBy(a, {k});"),
+                "console.log(m instanceof Map, m.size, JSON.stringify([...m.entries()]));".into(),
+            ]
+        }
+        // `Array.of` versus `Array(n)`, and `flat` at an explicit depth.
+        _ => vec![
+            format!(
+                "console.log(JSON.stringify(Array.of({0})), Array.of({0}).length, JSON.stringify(Array({0})), Array({0}).length);",
+                pick(r, &["7", "0", "1, 2", "'x'", ""])
+            ),
+            format!(
+                "console.log(JSON.stringify({}.flat({})));",
+                pick(r, &["[1, [2, [3, [4]]]]", "[[], [[]]]", "[1, , [2, , 3]]"]),
+                pick(r, &["", "0", "1", "2", "Infinity", "-1"])
+            ),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -2599,6 +3130,11 @@ enum Mode {
     Optional,
     Destructure,
     Sparse,
+    Tagged,
+    WellKnown,
+    ProxyTrap,
+    Microtask,
+    ArrayLate,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -2641,6 +3177,11 @@ const REAL_MODES: &[Mode] = &[
     Mode::Optional,
     Mode::Destructure,
     Mode::Sparse,
+    Mode::Tagged,
+    Mode::WellKnown,
+    Mode::ProxyTrap,
+    Mode::Microtask,
+    Mode::ArrayLate,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -2690,6 +3231,11 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Optional => gen_optional(seed),
         Mode::Destructure => gen_destructure(seed),
         Mode::Sparse => gen_sparse(seed),
+        Mode::ArrayLate => gen_arraylate(seed),
+        Mode::Microtask => gen_microtask(seed),
+        Mode::ProxyTrap => gen_proxytrap(seed),
+        Mode::WellKnown => gen_wellknown(seed),
+        Mode::Tagged => gen_tagged(seed),
     }
 }
 
@@ -2735,6 +3281,11 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Optional => "optional",
         Mode::Destructure => "destructure",
         Mode::Sparse => "sparse",
+        Mode::ArrayLate => "arraylate",
+        Mode::Microtask => "microtask",
+        Mode::ProxyTrap => "proxytrap",
+        Mode::WellKnown => "wellknown",
+        Mode::Tagged => "tagged",
     }
 }
 
@@ -2779,6 +3330,11 @@ const ALL_MODES: &[Mode] = &[
     Mode::Optional,
     Mode::Destructure,
     Mode::Sparse,
+    Mode::Tagged,
+    Mode::WellKnown,
+    Mode::ProxyTrap,
+    Mode::Microtask,
+    Mode::ArrayLate,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {
