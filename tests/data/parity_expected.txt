@@ -1391,6 +1391,26 @@ keys     plain 1 v
 proxy    get:a set:b has:a del:b ownKeys
 applyTrp 11
 reflect  true a,b
+==== taggedtemplates.js ====
+true false true
+true true false
+{"value":"x","writable":false,"enumerable":true,"configurable":false}
+{"value":["x"],"writable":false,"enumerable":false,"configurable":false}
+{"value":1,"writable":false,"enumerable":false,"configurable":false}
+H:a|b|c<1,2>
+[["\n\t",""],["\\n\\t",""],["x"]]
+a\nb1c x1y2z
+true true false
+{"value":"x","writable":false,"enumerable":true,"configurable":false}
+{"value":2,"writable":false,"enumerable":false,"configurable":false}
+x,y 2
+{"value":"x","writable":true,"enumerable":true,"configurable":false}
+w
+queueMicrotask TypeError ERR_INVALID_ARG_TYPE The "callback" argument must be of type function. Received type number (1)
+nextTick TypeError ERR_INVALID_ARG_TYPE The "callback" argument must be of type function. Received type string ('s')
+setTimeout TypeError ERR_INVALID_ARG_TYPE The "callback" argument must be of type function. Received null
+setImmediate TypeError ERR_INVALID_ARG_TYPE The "callback" argument must be of type function. Received an instance of Object
+setInterval TypeError ERR_INVALID_ARG_TYPE The "callback" argument must be of type function. Received an instance of Array
 ==== thisbinding.js ====
 forEach  T
 array    T 1

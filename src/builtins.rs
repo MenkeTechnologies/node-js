@@ -162,42 +162,85 @@ fn b_mkbigint(vm: &mut VM, _: u8) -> Value {
 /// `[tag, n, m, cooked×n, raw×n, values×m]` (see `compile_tagged_template`).
 /// Builds the `strings` array (carrying its `.raw` array) and calls
 /// `tag(strings, ...values)`.
+/// Reject a non-callable where node's scheduling entry points demand one.
+///
+/// Every one of them validates SYNCHRONOUSLY — `try { queueMicrotask(1) }
+/// catch` catches an `ERR_INVALID_ARG_TYPE` in node. Here the value was queued
+/// unchecked and the failure surfaced from the event loop instead, as an
+/// uncaught `1 is not a function` that killed the process past any `try` around
+/// the call.
+fn require_callback(cb: &Value) -> Result<(), String> {
+    if with_host(|h| host::is_callable(h, cb)) {
+        return Ok(());
+    }
+    Err(host::invalid_arg_type(
+        "callback", "argument", "function", cb,
+    ))
+}
+
 fn b_tag_tmpl(vm: &mut VM, argc: u8) -> Value {
+    // The chunk holding this site, read before the operands are popped and
+    // before any host borrow: together with the compiler's per-site ordinal it
+    // names the Parse Node whose template object 13.2.8.4 caches.
+    let chunk = vm.chunk.op_hash;
     let mut all = pop_n(vm, argc as usize);
     let int_of = |v: &Value| match v {
         Value::Int(n) => *n as usize,
         Value::Float(f) => *f as usize,
         _ => 0,
     };
+    let this = all.remove(0);
     let tag = all.remove(0);
     let n = int_of(&all.remove(0));
     let mcount = int_of(&all.remove(0));
+    let site = int_of(&all.remove(0)) as u64;
     let cooked: Vec<Value> = all.drain(0..n.min(all.len())).collect();
     let raw: Vec<Value> = all.drain(0..n.min(all.len())).collect();
     let values: Vec<Value> = all.drain(0..mcount.min(all.len())).collect();
-    // strings = cooked array; strings.raw = raw array (frozen in JS; nothing here
-    // mutates it).
-    let strings = with_host(|h| h.new_array(cooked));
-    let raw_arr = with_host(|h| h.new_array(raw));
-    // `GetTemplateObject` (13.2.8.4) defines `raw` as an own property that is
-    // neither writable, enumerable, nor configurable, then integrity-seals the
-    // template object. So `raw` stays out of `Object.keys(strings)` while
-    // `getOwnPropertyNames` still reports it.
-    with_host(|h| {
-        h.set_fn_prop(&strings, "raw", raw_arr);
-        h.set_prop_attrs(
-            &strings,
-            "raw",
-            host::PropAttrs {
-                writable: false,
-                enumerable: false,
-                configurable: false,
-            },
-        );
-    });
+    // GetTemplateObject caches by Parse Node, so a site evaluated twice hands
+    // back the SAME object — the whole point of the caching, since a tag that
+    // memoizes on the strings array (lit-html, graphql-tag) re-parses its
+    // template on every call without it.
+    let key = (chunk, site);
+    let strings = match with_host(|h| h.template_object(key)) {
+        Some(cached) => cached,
+        None => {
+            // strings = cooked array; strings.raw = raw array.
+            let strings = with_host(|h| h.new_array(cooked));
+            let raw_arr = with_host(|h| h.new_array(raw));
+            // `raw` is an own property that is neither writable, enumerable, nor
+            // configurable, so it stays out of `Object.keys(strings)` while
+            // `getOwnPropertyNames` still reports it.
+            with_host(|h| {
+                h.set_fn_prop(&strings, "raw", raw_arr.clone());
+                h.set_prop_attrs(
+                    &strings,
+                    "raw",
+                    host::PropAttrs {
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    },
+                );
+                // Steps 12-13 run SetIntegrityLevel(frozen) on the raw array and
+                // then on the template object itself. Without them a tag could
+                // write through its own strings array and corrupt every later
+                // evaluation of the site — which is exactly what caching makes
+                // reachable, so the freeze and the cache belong together.
+                h.seal_object(&raw_arr, true);
+                h.seal_object(&strings, true);
+                h.set_template_object(key, strings.clone());
+            });
+            strings
+        }
+    };
     let mut call_args = vec![strings];
     call_args.extend(values);
-    let r = host::invoke(&tag, call_args, None);
+    let this = match this {
+        Value::Undef => None,
+        v => Some(v),
+    };
+    let r = host::invoke(&tag, call_args, this);
     finish(vm, r)
 }
 
@@ -1274,6 +1317,15 @@ fn default_ctor_name(h: &host::JsHost, recv: &Value) -> Option<&'static str> {
 /// Most are also globals, but not all: `Timeout`/`Immediate` are unexposed in
 /// Node (`typeof Timeout === 'undefined'`) yet still name themselves through a
 /// handle's `.constructor.name`, so they belong here and not in `GLOBALS`.
+/// The builtins that expose a `Symbol.species` accessor. Each returns `this`,
+/// so a subclass is its own species unless it overrides the getter.
+fn has_species(name: &str) -> bool {
+    matches!(
+        name,
+        "Array" | "Map" | "Set" | "WeakMap" | "WeakSet" | "Promise" | "RegExp" | "ArrayBuffer"
+    ) || crate::stdlib::typedarray::is_ctor(name)
+}
+
 fn is_builtin_ctor(name: &str) -> bool {
     matches!(
         name,
@@ -1663,6 +1715,32 @@ fn function_property(recv: &Value, name: &str) -> Value {
         if let Some(v) = with_host(|h| h.class_static(recv, name)) {
             return v;
         }
+        // A class's own `name` and `length` are its own, not the builtin
+        // ancestor's: `class A extends Array {}` has `A.name === "A"`, and
+        // reading it off `Array` reported `"Array"`.
+        if matches!(name, "name" | "length")
+            && with_host(|h| h.class_static(recv, name)).is_none()
+        {
+            if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
+                return v;
+            }
+            if name == "name" {
+                let n = with_host(|h| h.callable_name(recv));
+                return with_host(|h| h.new_str(n));
+            }
+        }
+        // `Symbol.species` is an accessor returning `this`, so a subclass that
+        // does not override it IS its own species. Reading it off the builtin
+        // ancestor below would answer with the ancestor — `A[Symbol.species]`
+        // came back as `Array`, which sent every derived result to a plain
+        // array.
+        if name == "@@species"
+            && with_host(|h| h.class_static(recv, "@@species")).is_none()
+            && with_host(|h| h.class_builtin_ancestor(recv))
+                .is_some_and(|a| matches!(with_host(|h| h.kind_of(&a)), Some(ObjKind::Builtin)))
+        {
+            return recv.clone();
+        }
         // The chain may bottom out in a BUILTIN constructor (`class D extends
         // Array {}`), whose statics `class_static` cannot see — it only walks
         // `ClassVal.parent` links between user classes. Finish the lookup with an
@@ -1836,6 +1914,13 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // `Ctor.name` on a builtin constructor is the constructor name (`Array.name`
     // === "Array"); non-callable namespaces (`Math`/`JSON`) fall through to
     // `undefined`.
+    // `Ctor[Symbol.species]` is an accessor returning `this` on every builtin
+    // that has one (23.1.2.5, 27.2.4.7, …). It was absent, so the species
+    // protocol had nothing to read and every derived result came back a plain
+    // builtin.
+    if name == "@@species" && has_species(ns) {
+        return with_host(|h| h.alloc(JsObj::Builtin(ns.to_string())));
+    }
     if name == "name" && is_builtin_ctor(ns) {
         return with_host(|h| h.new_str(ns.to_string()));
     }
@@ -4641,7 +4726,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "String.raw" => string_raw(&args),
         // `Array(5)` === `new Array(5)` (length-5 empty), but `Array.of(5)` is `[5]`.
         "Array" => construct_builtin("Array", args),
-        "Array.of" => Ok(with_host(|h| h.new_array(args))),
+        "Array.of" => construct_array_like(host::current_static_this(), args),
         // 23.1.2.2 `IsArray` follows a Proxy to its `[[ProxyTarget]]` rather than
         // consulting any trap, so `Array.isArray(new Proxy([], {}))` is `true`.
         "Array.isArray" => {
@@ -4936,11 +5021,15 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "@@streamWriteCallback" => Ok(Value::Undef),
         "queueMicrotask" | "process.nextTick" => {
             let cb = arg0(&args);
+            require_callback(&cb)?;
             let rest = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
             enqueue_microtask(name == "process.nextTick", cb, rest);
             Ok(Value::Undef)
         }
-        "setTimeout" | "setInterval" | "setImmediate" => Ok(schedule_timer(name, args)),
+        "setTimeout" | "setInterval" | "setImmediate" => {
+            require_callback(&arg0(&args))?;
+            Ok(schedule_timer(name, args))
+        }
         "clearTimeout" | "clearInterval" | "clearImmediate" => {
             clear_timer(&arg0(&args));
             Ok(Value::Undef)
@@ -6491,9 +6580,13 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
                 this_arg(&args, 2),
             )?);
         }
-        return Ok(with_host(|h| h.new_array(out)));
+        return construct_array_like(host::current_static_this(), out);
     }
-    Ok(with_host(|h| h.new_array(items)))
+    // 23.1.2.1 step 5: `Array.from` builds through `this`, so on a subclass the
+    // result is an instance of it. It always allocated a plain array, which is
+    // also why `A.from([1]).map(f) instanceof A` was false — the species chain
+    // never started.
+    construct_array_like(host::current_static_this(), items)
 }
 
 /// Items of an array-like `{ length, 0, 1, … }` object (for `Array.from`).
@@ -7839,11 +7932,38 @@ fn array_len(recv: &Value) -> usize {
 /// The default `get [Symbol.species]() { return this }` is what makes the
 /// subclass the species; a class overriding it with `Array` gets a plain array
 /// back, which is the documented way to opt out.
+/// Build an array-shaped result through `ctor`, or a plain array when there is
+/// none to build through.
+///
+/// The constructor is called with the LENGTH and the elements written after, as
+/// 23.1.2.1 and 23.1.3.4 both specify — which is what lets a subclass
+/// constructor observe the allocation.
+fn construct_array_like(ctor: Option<Value>, items: Vec<Value>) -> Result<Value, String> {
+    let Some(ctor) = ctor.filter(|c| {
+        matches!(
+            with_host(|h| h.kind_of(c)),
+            Some(ObjKind::Class) | Some(ObjKind::Func)
+        )
+    }) else {
+        return Ok(with_host(|h| h.new_array(items)));
+    };
+    let out = host::construct(&ctor, vec![Value::Float(items.len() as f64)])?;
+    with_host(|h| {
+        if let Some(JsObj::Array(dst)) = h.get_mut(&out) {
+            *dst = items;
+        }
+    });
+    Ok(out)
+}
+
 fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String> {
     let plain = || with_host(|h| h.new_array(items.clone()));
     // Only a subclass instance can have a species of its own: a plain array's
     // `constructor` is the `Array` builtin, whose species is `Array`.
-    let ctor = get_property(recv, "constructor").unwrap_or(Value::Undef);
+    // A chain lookup, not `get_property`: an Array receiver resolves its
+    // properties through the stdlib funnel, which has no `constructor` entry,
+    // so the read alone reports `undefined` for every subclass instance.
+    let ctor = with_host(|h| host::lookup_chain(h, recv, "constructor")).unwrap_or(Value::Undef);
     if !matches!(
         with_host(|h| h.kind_of(&ctor)),
         Some(ObjKind::Class) | Some(ObjKind::Func)

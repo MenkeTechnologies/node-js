@@ -486,6 +486,18 @@ pub const WELL_KNOWN_SYMBOLS: &[&str] = &[
     "toPrimitive",
     "toStringTag",
     "hasInstance",
+    // Nine more the table was missing entirely, so `Symbol.species` and friends
+    // read `undefined` and no protocol keyed on them could be expressed.
+    "species",
+    "isConcatSpreadable",
+    "match",
+    "matchAll",
+    "replace",
+    "search",
+    "split",
+    "unscopables",
+    "dispose",
+    "asyncDispose",
 ];
 
 /// Whether the internal key `k` came from a SYMBOL used as a property key
@@ -885,6 +897,17 @@ pub struct JsHost {
     class_registry: HashMap<String, Value>,
     /// Well-known prototype objects for the builtin error constructors, by name.
     error_protos: HashMap<String, Value>,
+    /// The template object of each tagged-template SITE, keyed by the chunk that
+    /// holds the site and the site's ordinal within its compilation.
+    ///
+    /// GetTemplateObject (13.2.8.4) caches by Parse Node, so a site evaluated
+    /// twice hands back the SAME object: ``const t = () => tag`x`;`` makes
+    /// `t() === t()` true, and a tag that memoizes on the strings array — the
+    /// documented reason the object is cached, and how `lit-html` and `graphql`
+    /// avoid re-parsing — saw a fresh array every call here. Two sites with
+    /// identical text are still distinct objects, which the chunk hash plus the
+    /// ordinal keep apart.
+    template_objects: HashMap<(u64, u64), Value>,
     /// Real prototype *objects* for the builtin exotics whose instances need a
     /// genuine `[[Prototype]]` link (`Buffer`, `Uint8Array`). Most builtin
     /// prototypes are `Builtin("<Ctor>.prototype")` thunk namespaces, which
@@ -1147,6 +1170,7 @@ impl JsHost {
             proto_class: HashMap::new(),
             class_registry: HashMap::new(),
             error_protos: HashMap::new(),
+            template_objects: HashMap::new(),
             native_protos: HashMap::new(),
             symbol_registry: HashMap::new(),
             next_symbol: 1,
@@ -1607,10 +1631,24 @@ impl JsHost {
     /// The attributes of own property `owner[key]` (all-true when unrecorded).
     pub fn prop_attrs(&self, owner: &Value, key: &str) -> PropAttrs {
         // An array's `length` is the array exotic's own property (10.4.2):
-        // writable, but never enumerated and never configurable.
+        // never enumerated and never configurable, and writable until
+        // `Object.freeze` clears that — which is what stops a `push` from
+        // extending a frozen array. Reporting it unconditionally writable made
+        // `Object.isFrozen(Object.freeze([]))` false once the elements started
+        // being sealed, because `length` was then the one key that never
+        // followed.
         if key == "length" && matches!(self.get(owner), Some(JsObj::Array(_))) {
+            let writable = match owner {
+                Value::Obj(i) => self
+                    .prop_attrs
+                    .get(i)
+                    .and_then(|m| m.get(key))
+                    .map(|a| a.writable)
+                    .unwrap_or(true),
+                _ => true,
+            };
             return PropAttrs {
-                writable: true,
+                writable,
                 enumerable: false,
                 configurable: false,
             };
@@ -1700,10 +1738,7 @@ impl JsHost {
     /// from every own property, data and accessor alike.
     pub fn seal_object(&mut self, v: &Value, freeze: bool) {
         self.prevent_extensions(v);
-        let mut keys = match self.get(v) {
-            Some(JsObj::Object(p)) => p.keys().cloned().collect::<Vec<_>>(),
-            _ => Vec::new(),
-        };
+        let mut keys = self.integrity_keys(v);
         keys.extend(self.own_accessor_keys(v));
         for k in keys {
             let mut a = self.prop_attrs(v, &k);
@@ -1715,15 +1750,31 @@ impl JsHost {
         }
     }
 
+    /// The own DATA-property keys SetIntegrityLevel (7.3.15) walks.
+    ///
+    /// An array's elements are own properties too, and only the `Object` arm was
+    /// walked — so `Object.freeze([1, 2])` sealed nothing: `a[0] = 9` wrote
+    /// through, and the elements still reported `writable: true,
+    /// configurable: true` while `Object.isFrozen` answered true over an empty
+    /// key list. `length` is an own property as well, and freezing it is what
+    /// stops a `push` from extending a frozen array.
+    fn integrity_keys(&self, v: &Value) -> Vec<String> {
+        match self.get(v) {
+            Some(JsObj::Object(p)) => p.keys().cloned().collect(),
+            Some(JsObj::Array(items)) => (0..items.len())
+                .map(|i| i.to_string())
+                .chain(std::iter::once("length".to_string()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// `Object.isSealed` (`freeze == false`) / `Object.isFrozen` (`true`).
     pub fn is_sealed(&self, v: &Value, freeze: bool) -> bool {
         if self.is_extensible(v) {
             return false;
         }
-        let mut keys = match self.get(v) {
-            Some(JsObj::Object(p)) => p.keys().cloned().collect::<Vec<_>>(),
-            _ => Vec::new(),
-        };
+        let mut keys = self.integrity_keys(v);
         keys.extend(self.own_accessor_keys(v));
         keys.iter().all(|k| {
             let a = self.prop_attrs(v, k);
@@ -5772,6 +5823,34 @@ pub fn call_named(name: &str, args: Vec<Value>) -> Result<Value, String> {
     Err(ref_error(name))
 }
 
+thread_local! {
+    /// The constructor a builtin STATIC is currently being invoked on.
+    ///
+    /// `A.from(x)` on `class A extends Array` re-dispatches against the `Array`
+    /// builtin, which is reached by NAME and so cannot see `A`. The species
+    /// rules need it: `Array.from`, `Array.of` and every `Promise` static build
+    /// their result with `this`, so on a subclass they must construct through
+    /// it. A stack, since one static can call another.
+    static STATIC_THIS: std::cell::RefCell<Vec<Value>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `recv` recorded as the receiver of a builtin static call.
+pub fn with_static_this<R>(recv: &Value, f: impl FnOnce() -> R) -> R {
+    STATIC_THIS.with(|s| s.borrow_mut().push(recv.clone()));
+    let out = f();
+    STATIC_THIS.with(|s| {
+        s.borrow_mut().pop();
+    });
+    out
+}
+
+/// The constructor the running builtin static was called on, if it was reached
+/// through a subclass rather than directly.
+pub fn current_static_this() -> Option<Value> {
+    STATIC_THIS.with(|s| s.borrow().last().cloned())
+}
+
 /// `recv.name(args)`.
 pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     // `undefined.foo()` is a `[[Get]]` and THEN a call (13.3.6 EvaluateCall), so
@@ -5963,7 +6042,10 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
         if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Class) {
             if let Some(anc) = with_host(|h| h.class_builtin_ancestor(recv)) {
                 if with_host(|h| h.kind_of(&anc)) == Some(ObjKind::Builtin) {
-                    return call_method(&anc, name, args);
+                    // The subclass is recorded so a species-aware static
+                    // (`Array.from`, `Promise.resolve`, …) builds its result
+                    // through it rather than through the builtin.
+                    return with_static_this(recv, || call_method(&anc, name, args));
                 }
             }
         }
@@ -8204,6 +8286,16 @@ impl JsHost {
             }
             self.native_protos.insert(ctor.to_string(), proto);
         }
+    }
+
+    /// The cached template object for one tagged-template site, if it has been
+    /// evaluated before.
+    pub fn template_object(&self, key: (u64, u64)) -> Option<Value> {
+        self.template_objects.get(&key).cloned()
+    }
+    /// Record the template object for one tagged-template site.
+    pub fn set_template_object(&mut self, key: (u64, u64), v: Value) {
+        self.template_objects.insert(key, v);
     }
 
     /// The real prototype object for a builtin exotic, if it has one.

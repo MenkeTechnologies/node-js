@@ -164,6 +164,12 @@ pub struct Compiler {
     /// than the host's scope chain — see [`crate::slots`]. Empty for a chunk the
     /// analysis refused, so `slot_of` answering `None` is the old path.
     slots: crate::slots::Plan,
+    /// Number of tagged-template sites emitted so far in this compilation, so
+    /// each site carries an ordinal the runtime can cache its template object
+    /// under. Monotonic across the whole compilation rather than per chunk: two
+    /// textually identical arrow bodies are separate chunks, and this operand is
+    /// what makes their bytecode — and therefore their chunk hashes — differ.
+    tmpl_sites: u64,
 }
 
 // ── early errors: duplicate lexical declarations ─────────────────────────────
@@ -2364,8 +2370,19 @@ impl Compiler {
     }
 
     /// Lower a tagged template to `TAG_TMPL`. Operand layout (matching
-    /// `builtins::b_tag_tmpl`): `[tag, n, m, cooked×n, raw×n, values×m]`, where
-    /// `n = quasis.len()` and `m = exprs.len()` (`n == m + 1`).
+    /// `builtins::b_tag_tmpl`): `[this, tag, n, m, site, cooked×n, raw×n,
+    /// values×m]`, where `n = quasis.len()` and `m = exprs.len()`
+    /// (`n == m + 1`).
+    ///
+    /// `this` is the tag's receiver. A tagged template IS a call (13.3.11.1
+    /// evaluates the tag as a MemberExpression and passes its reference's base
+    /// as the `this` argument), so ``o.m`a` `` runs `m` with `this === o` — it
+    /// ran with `this` undefined, which broke every tag written as a method.
+    /// `undefined` for a tag that is not a property reference.
+    ///
+    /// `site` is this site's ordinal in the compilation; the runtime caches the
+    /// template object under it so a site evaluated twice hands back the same
+    /// object.
     fn compile_tagged_template(
         &mut self,
         b: &mut ChunkBuilder,
@@ -2374,11 +2391,31 @@ impl Compiler {
         raws: &[String],
         exprs: &[Expr],
     ) -> Result<(), String> {
-        self.compile_expr(b, tag)?;
+        match tag {
+            // `o.m`…`` / `o?.m`…`` — the receiver stays on the stack under the
+            // method, so both are evaluated exactly once.
+            Expr::Member {
+                object,
+                property,
+                optional: false,
+            } if !matches!(**object, Expr::Super) => {
+                self.compile_expr(b, object)?; // [o]
+                b.emit(Op::Dup, 0); // [o, o]
+                self.name_const(b, property);
+                b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [o, f]
+            }
+            _ => {
+                b.emit(Op::LoadUndef, 0);
+                self.compile_expr(b, tag)?;
+            }
+        }
         let n = quasis.len();
         let m = exprs.len();
+        let site = self.tmpl_sites;
+        self.tmpl_sites += 1;
         b.emit(Op::LoadInt(n as i64), 0);
         b.emit(Op::LoadInt(m as i64), 0);
+        b.emit(Op::LoadInt(site as i64), 0);
         for q in quasis {
             self.strlit(b, q); // cooked strings (heap)
         }
@@ -2388,7 +2425,7 @@ impl Compiler {
         for e in exprs {
             self.compile_expr(b, e)?; // substitution values
         }
-        b.emit(Op::CallBuiltin(ops::TAG_TMPL, argc(3 + 2 * n + m)?), 0);
+        b.emit(Op::CallBuiltin(ops::TAG_TMPL, argc(5 + 2 * n + m)?), 0);
         Ok(())
     }
 
