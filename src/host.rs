@@ -1716,8 +1716,20 @@ impl JsHost {
         if self.is_extensible(owner) {
             return true;
         }
+        // A non-extensible object refuses a NEW key. Only the plain-object arm
+        // could name its own keys, so every other shape answered "own" for any
+        // key at all: `Object.freeze(arr).extra = 1` landed, and so did a write
+        // to the frozen template object a tagged template hands its tag.
         match self.get(owner) {
             Some(JsObj::Object(p)) => p.contains_key(key),
+            Some(JsObj::Array(items)) => {
+                key == "length"
+                    || key
+                        .parse::<usize>()
+                        .map(|i| i < items.len())
+                        .unwrap_or(false)
+                    || self.fn_prop(owner, key).is_some()
+            }
             _ => true,
         }
     }
@@ -1764,6 +1776,17 @@ impl JsHost {
             Some(JsObj::Array(items)) => (0..items.len())
                 .map(|i| i.to_string())
                 .chain(std::iter::once("length".to_string()))
+                // A named property stuck on an array (`a.tag = 't'`, a match
+                // array's `.index`/`.groups`) is an own property too, and
+                // freezing has to reach it.
+                .chain(match v {
+                    Value::Obj(i) => self
+                        .fn_props
+                        .get(i)
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                })
                 .collect(),
             _ => Vec::new(),
         }
@@ -4985,7 +5008,7 @@ pub fn parse_bigint_str(s: &str) -> Option<num_bigint::BigInt> {
 
 /// Coerce a BigInt to `f64` (for `Number(bigint)` and mixed relational compares);
 /// out-of-range magnitudes become ±Infinity, matching Node.
-fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
+pub fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
     num_traits::ToPrimitive::to_f64(b).unwrap_or_else(|| {
         if num_traits::Signed::is_negative(b) {
             f64::NEG_INFINITY
@@ -7883,7 +7906,17 @@ pub fn to_number_value(v: &Value) -> Result<f64, String> {
         return Ok(n);
     }
     let p = to_primitive(v, "number")?;
-    Ok(with_host(|h| h.to_number(&p)))
+    // Steps 2-3 apply to the ToPrimitive RESULT, not only to the argument. Only
+    // the argument was checked, so an object whose conversion yields a symbol or
+    // a BigInt slipped past: `+Object(9n)` answered 9 and
+    // `+{ [Symbol.toPrimitive]() { return Symbol('s') } }` answered NaN, where
+    // both are TypeErrors. `Number(x)` is ToNumeric and keeps its own path,
+    // which is why `Number(Object(9n))` is still 9.
+    match with_host(|h| h.get(&p).cloned()) {
+        Some(JsObj::Symbol { .. }) => Err(type_error("Cannot convert a Symbol value to a number")),
+        Some(JsObj::BigInt(_)) => Err(type_error("Cannot convert a BigInt value to a number")),
+        _ => Ok(with_host(|h| h.to_number(&p))),
+    }
 }
 
 /// `ToPropertyKey(v)` — ECMA-262 7.1.19. A symbol keeps its stable internal
@@ -9278,7 +9311,12 @@ pub fn promise_then(p: &Value, on_ful: Value, on_rej: Value) -> Value {
         None => return Value::Undef,
     };
     with_host(|h| h.promise_mark_handled(id));
-    let result = with_host(|h| h.new_promise());
+    // The result is built with the RECEIVER's species, so a subclass promise
+    // stays a subclass promise through a `.then` chain.
+    let result = match crate::builtins::promise_species_from(p) {
+        Ok(Some(sp)) => sp,
+        _ => with_host(|h| h.new_promise()),
+    };
     let reaction = PromiseReaction::Js {
         on_ful,
         on_rej,

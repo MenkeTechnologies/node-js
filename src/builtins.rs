@@ -1716,10 +1716,14 @@ fn function_property(recv: &Value, name: &str) -> Value {
             return v;
         }
         // A class's own `name` and `length` are its own, not the builtin
-        // ancestor's: `class A extends Array {}` has `A.name === "A"`, and
-        // reading it off `Array` reported `"Array"`.
+        // ancestor's: `class A extends Array {}` has `A.name === "A"` and
+        // `A.length === 0`, but both were read off `Array`. Only a class that
+        // WOULD fall through to an ancestor takes this path; a plain class keeps
+        // the ordinary computation below.
         if matches!(name, "name" | "length")
             && with_host(|h| h.class_static(recv, name)).is_none()
+            && with_host(|h| h.class_builtin_ancestor(recv))
+                .is_some_and(|a| matches!(with_host(|h| h.kind_of(&a)), Some(ObjKind::Builtin)))
         {
             if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
                 return v;
@@ -1728,6 +1732,16 @@ fn function_property(recv: &Value, name: &str) -> Value {
                 let n = with_host(|h| h.callable_name(recv));
                 return with_host(|h| h.new_str(n));
             }
+            // The class's own constructor decides its arity; with no explicit
+            // one the implicit `constructor(...args)` has length 0.
+            let ctor = with_host(|h| match h.get(recv) {
+                Some(JsObj::Class(c)) => c.ctor.clone(),
+                _ => None,
+            });
+            return match ctor {
+                Some(c) => get_property(&c, "length").unwrap_or(Value::Float(0.0)),
+                None => Value::Float(0.0),
+            };
         }
         // `Symbol.species` is an accessor returning `this`, so a subclass that
         // does not override it IS its own species. Reading it off the builtin
@@ -2093,6 +2107,20 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     if matches!(ctor, "String" | "Number" | "Boolean") {
         let prim = wrapped_primitive(recv).unwrap_or_else(|| recv.clone());
         return host::call_method(&prim, method, args);
+    }
+    // `thisSymbolValue`/`thisBigIntValue` (20.4.3, 21.2.3) accept a WRAPPER as
+    // readily as the primitive, and neither was unwrapped here. A BigInt
+    // wrapper's `valueOf` therefore re-entered the generic conversion, which
+    // looked `valueOf` up again and called it again: `+Object(9n)` recursed
+    // until the stack overflowed and ABORTED the process, which no try/catch can
+    // see. A Symbol wrapper failed the brand check below instead and reported
+    // that `this` was not a Symbol, when it is one. Only a real wrapper is
+    // unwrapped — `Symbol.prototype` itself boxes nothing and still has to reach
+    // the brand check.
+    if matches!(ctor, "Symbol" | "BigInt") {
+        if let Some(prim) = wrapped_primitive(recv) {
+            return host::call_method(&prim, method, args);
+        }
     }
     if ctor == "Object" && method == "toString" {
         // Steps 16-17 of 20.1.3.6: a `Symbol.toStringTag` STRING on the receiver
@@ -4678,11 +4706,18 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 host::string_ctor_value(&args[0])
             }
         }
+        // `Number(v)` is NOT plain ToNumber: 21.1.1.1 step 2 converts the object
+        // first and then explicitly ACCEPTS a BigInt, returning its mathematical
+        // value as a Number. Only `Number` does — `+v` and `Math.abs(v)` reject
+        // one — which is why this cannot just call `to_number_value`.
         "Number" => Ok(Value::Float(if args.is_empty() {
             0.0
         } else {
-            // ToNumber, which for an object runs ToPrimitive (a JS `valueOf` call).
-            host::to_number_value(&args[0])?
+            let prim = host::to_primitive(&args[0], "number")?;
+            match with_host(|h| h.as_bigint(&prim)) {
+                Some(b) => host::bigint_to_f64(&b),
+                None => host::to_number_value(&prim)?,
+            }
         })),
         "BigInt" => bigint_ctor(&arg0(&args)),
         "RegExp" => regexp_ctor(&args),
@@ -5049,6 +5084,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         n if host::ERROR_NAMES.contains(&n) => Ok(make_error(name, &args)),
         _ if name.starts_with("Math.") => math_fn(&name[5..], &args),
         // Internal continuations (Promise resolve/reject fns, `.finally` wrappers).
+        // The executor a species-constructed promise is built with: it does
+        // nothing, because the caller settles the result through its id.
+        "@@pnoop" => Ok(Value::Undef),
         _ if name.starts_with("@@presolve:") => {
             let id: u32 = name[11..].parse().unwrap_or(0);
             host::resolve_promise_val(id, arg0(&args));
@@ -6026,11 +6064,20 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
     // a separate numeric type. `arg_num` reads a BigInt's magnitude instead, so
     // `Math.max(1n)` quietly answered 1 where V8 throws. `Math.random` is the one
     // exception: it never reads an argument, so `Math.random(1n)` is fine.
-    if fname != "random"
-        && args
-            .iter()
-            .any(|a| with_host(|h| matches!(h.get(a), Some(JsObj::BigInt(_)))))
-    {
+    // A BigInt WRAPPER converts to a BigInt and is rejected just as the
+    // primitive is: `Math.abs(Object(9n))` is a TypeError where it answered NaN.
+    // The boxed value is read BEFORE the borrow — `wrapped_primitive` borrows
+    // the host itself and cannot run inside another borrow.
+    let is_bigint = |a: &Value| {
+        if with_host(|h| matches!(h.get(a), Some(JsObj::BigInt(_)))) {
+            return true;
+        }
+        match wrapped_primitive(a) {
+            Some(p) => with_host(|h| matches!(h.get(&p), Some(JsObj::BigInt(_)))),
+            None => false,
+        }
+    };
+    if fname != "random" && args.iter().any(is_bigint) {
         return Err(host::type_error(
             "Cannot convert a BigInt value to a number",
         ));
@@ -7510,6 +7557,21 @@ pub(crate) const BRANDED_PROTOS: &[&str] = &[
 ];
 
 /// Whether `v` is a `RegExp` value (drives the regex path of `match`/`replace`/…).
+/// A user `Symbol.match`/`replace`/`search`/`split`/`matchAll` method on the
+/// ARGUMENT, which the string method must delegate to (22.1.3.x step 2).
+///
+/// `"abc".match(o)` where `o` defines `Symbol.match` calls that method rather
+/// than coercing `o` to a pattern — the protocol every regexp-like library
+/// implements. None of the five were consulted, so a custom matcher was
+/// silently stringified instead.
+fn symbol_protocol(arg: &Value, sym: &str) -> Option<Value> {
+    if matches!(arg, Value::Undef) || with_host(|h| h.is_null(arg)) {
+        return None;
+    }
+    let f = get_property(arg, sym).ok()?;
+    with_host(|h| host::is_callable(h, &f)).then_some(f)
+}
+
 fn is_regexp_arg(v: &Value) -> bool {
     with_host(|h| h.kind_of(v)) == Some(ObjKind::RegExp)
 }
@@ -7948,12 +8010,24 @@ fn construct_array_like(ctor: Option<Value>, items: Vec<Value>) -> Result<Value,
         return Ok(with_host(|h| h.new_array(items)));
     };
     let out = host::construct(&ctor, vec![Value::Float(items.len() as f64)])?;
+    write_elements(&out, items);
+    Ok(out)
+}
+
+/// Write `items` into a freshly constructed array-shaped `out`, clearing the
+/// hole marks the length-only construction left behind.
+///
+/// `new A(3)` on `class A extends Array` really does produce three HOLES, and
+/// the elements written over them stayed marked — so every subclass result of
+/// `map`/`filter`/`flat` read back as holes: `A.from([1,2,3]).map(x => x * 2)`
+/// had length 3 and printed `[null,null,null]`, and `0 in` it was false.
+fn write_elements(out: &Value, items: Vec<Value>) {
     with_host(|h| {
-        if let Some(JsObj::Array(dst)) = h.get_mut(&out) {
+        h.clear_holes(out);
+        if let Some(JsObj::Array(dst)) = h.get_mut(out) {
             *dst = items;
         }
     });
-    Ok(out)
 }
 
 fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String> {
@@ -7988,11 +8062,7 @@ fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String
     // The constructor is called with the LENGTH, so the elements are written
     // afterwards — which is also what lets a subclass constructor observe the
     // allocation, as node's does.
-    with_host(|h| {
-        if let Some(JsObj::Array(dst)) = h.get_mut(&out) {
-            *dst = items;
-        }
-    });
+    write_elements(&out, items);
     Ok(out)
 }
 
@@ -8243,11 +8313,9 @@ fn array_method_on(
                         .map(|i| i + base),
                 );
             }
-            Ok(with_host(|h| {
-                let arr = h.new_array(out);
-                h.install_holes(&arr, holes);
-                arr
-            }))
+            let arr = array_species_create(recv, out)?;
+            with_host(|h| h.install_holes(&arr, holes));
+            Ok(arr)
         }
         "reverse" => {
             let len = array_len(recv);
@@ -8386,7 +8454,7 @@ fn array_method_on(
                     _ => out.push(r),
                 }
             }
-            Ok(with_host(|h| h.new_array(out)))
+            array_species_create(recv, out)
         }
         "filter" => {
             let items = array_items(recv);
@@ -8681,7 +8749,7 @@ fn array_method_on(
             };
             let mut out = Vec::new();
             flatten_into(recv, depth, &mut out)?;
-            Ok(with_host(|h| h.new_array(out)))
+            array_species_create(recv, out)
         }
         "keys" => {
             let n = array_len(recv);
@@ -8954,7 +9022,7 @@ fn array_splice(recv: &Value, args: Vec<Value>) -> Result<Value, String> {
             Vec::new()
         }
     });
-    Ok(with_host(|h| {
+    let spliced = with_host(|h| {
         h.install_holes(
             recv,
             holes
@@ -8970,7 +9038,13 @@ fn array_splice(recv: &Value, args: Vec<Value>) -> Result<Value, String> {
                 })
                 .collect(),
         );
-        let out = h.new_array(removed);
+        (removed, holes.clone())
+    });
+    // The REMOVED elements come back as an array of the receiver's species
+    // (23.1.3.31 step 8), so a subclass gets one of its own kind.
+    let (removed, holes) = spliced;
+    let out = array_species_create(recv, removed)?;
+    with_host(|h| {
         h.install_holes(
             &out,
             holes
@@ -8979,8 +9053,8 @@ fn array_splice(recv: &Value, args: Vec<Value>) -> Result<Value, String> {
                 .map(|&i| i - start)
                 .collect(),
         );
-        out
-    }))
+    });
+    Ok(out)
 }
 
 fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
@@ -9255,6 +9329,32 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         "padEnd" => Ok(new_s(pad(s, &args, false)?)),
         // Regex-taking string methods: dispatch to the regexp module when the
         // argument is a RegExp; otherwise keep the plain-string behavior.
+        "match" | "matchAll" | "search" | "split" | "replace" | "replaceAll"
+            if symbol_protocol(
+                &arg0(&args),
+                match name {
+                    "match" => "@@match",
+                    "matchAll" => "@@matchAll",
+                    "search" => "@@search",
+                    "split" => "@@split",
+                    _ => "@@replace",
+                },
+            )
+            .is_some() =>
+        {
+            let sym = match name {
+                "match" => "@@match",
+                "matchAll" => "@@matchAll",
+                "search" => "@@search",
+                "split" => "@@split",
+                _ => "@@replace",
+            };
+            let f = symbol_protocol(&arg0(&args), sym).expect("guard checked");
+            let sv = with_host(|h| h.new_str(s.to_string()));
+            let mut rest = vec![sv];
+            rest.extend(args.iter().skip(1).cloned());
+            host::invoke(&f, rest, Some(arg0(&args)))
+        }
         "match" => crate::regexp::str_match(s, &arg0(&args)),
         "matchAll" => crate::regexp::str_match_all(s, &arg0(&args)),
         "search" => {
@@ -11525,6 +11625,76 @@ pub fn prototype_of(v: &Value) -> Value {
 
 /// `new Promise((resolve, reject) => …)` — run the executor synchronously with
 /// internal resolve/reject functions.
+/// A fresh promise built through the SPECIES constructor, when a `Promise`
+/// static was reached through a subclass.
+///
+/// `class P extends Promise {}` makes `P.resolve(1)` a `P`, because every
+/// combinator builds its result with `this` (27.2.4.x). They all allocated a
+/// plain promise, so nothing a subclass produced was an instance of it. The
+/// executor is a no-op: the result is settled through its promise id, which is
+/// what the ordinary path does too.
+fn promise_species_create() -> Result<Option<Value>, String> {
+    let Some(ctor) = None::<Value> else {
+        return Ok(None);
+    };
+    if !matches!(
+        with_host(|h| h.kind_of(&ctor)),
+        Some(ObjKind::Class) | Some(ObjKind::Func)
+    ) {
+        return Ok(None);
+    }
+    let species = match get_property(&ctor, "@@species") {
+        Ok(Value::Undef) => ctor,
+        Ok(s) if with_host(|h| h.is_null(&s)) => return Ok(None),
+        Ok(s) => s,
+        Err(_) => ctor,
+    };
+    if !matches!(
+        with_host(|h| h.kind_of(&species)),
+        Some(ObjKind::Class) | Some(ObjKind::Func)
+    ) {
+        return Ok(None);
+    }
+    let noop = make_builtin("@@pnoop".to_string());
+    let p = host::construct(&species, vec![noop])?;
+    // Only usable if the subclass really produced a promise; a constructor that
+    // returned something else has no id to settle.
+    Ok(with_host(|h| h.promise_id(&p)).map(|_| p))
+}
+
+/// The species constructor of a promise RECEIVER — what `then`/`catch`/`finally`
+/// build their result with (`SpeciesConstructor(p, %Promise%)`, 27.2.5.4 step 3).
+///
+/// Distinct from `promise_species_create`, which answers for a STATIC reached
+/// through a subclass. Here the subclass comes from the receiver itself, so
+/// `P.resolve(1).then(f)` is also a `P`.
+pub fn promise_species_from(recv: &Value) -> Result<Option<Value>, String> {
+    // A chain lookup: a Promise receiver resolves through the stdlib funnel,
+    // which has no `constructor` entry of its own.
+    let ctor = with_host(|h| host::lookup_chain(h, recv, "constructor")).unwrap_or(Value::Undef);
+    if !matches!(
+        with_host(|h| h.kind_of(&ctor)),
+        Some(ObjKind::Class) | Some(ObjKind::Func)
+    ) {
+        return Ok(None);
+    }
+    let species = match get_property(&ctor, "@@species") {
+        Ok(Value::Undef) => ctor,
+        Ok(s) if with_host(|h| h.is_null(&s)) => return Ok(None),
+        Ok(s) => s,
+        Err(_) => ctor,
+    };
+    if !matches!(
+        with_host(|h| h.kind_of(&species)),
+        Some(ObjKind::Class) | Some(ObjKind::Func)
+    ) {
+        return Ok(None);
+    }
+    let noop = make_builtin("@@pnoop".to_string());
+    let p = host::construct(&species, vec![noop])?;
+    Ok(with_host(|h| h.promise_id(&p)).map(|_| p))
+}
+
 fn new_promise(executor: Value) -> Result<Value, String> {
     let p = with_host(|h| h.new_promise());
     let id = with_host(|h| h.promise_id(&p).unwrap());
@@ -11545,10 +11715,18 @@ pub fn promise_resolve_pub(v: Value) -> Result<Value, String> {
 }
 
 fn promise_resolve(v: Value) -> Result<Value, String> {
+    if let Some(p) = promise_species_create()? {
+        let id = with_host(|h| h.promise_id(&p).unwrap());
+        host::resolve_promise_val(id, v);
+        return Ok(p);
+    }
     Ok(host::promise_of(&v))
 }
 fn promise_reject(v: Value) -> Result<Value, String> {
-    let p = with_host(|h| h.new_promise());
+    let p = match promise_species_create()? {
+        Some(p) => p,
+        None => with_host(|h| h.new_promise()),
+    };
     let id = with_host(|h| h.promise_id(&p).unwrap());
     host::reject_promise_val(id, v);
     Ok(p)
@@ -11578,7 +11756,12 @@ enum AllMode {
 /// `Promise.all` / `Promise.allSettled`.
 fn promise_all(args: Vec<Value>, mode: AllMode) -> Result<Value, String> {
     let items = host::iter_all(&arg0(&args))?;
-    let result = with_host(|h| h.new_promise());
+    // 27.2.4.1 step 3: the combinator builds its result with `this`, so on a
+    // subclass the promise it hands back is an instance of that subclass.
+    let result = match promise_species_create()? {
+        Some(p) => p,
+        None => with_host(|h| h.new_promise()),
+    };
     let rid = with_host(|h| h.promise_id(&result).unwrap());
     let n = items.len();
     if n == 0 {
@@ -11634,7 +11817,11 @@ fn promise_all(args: Vec<Value>, mode: AllMode) -> Result<Value, String> {
 /// `Promise.race` (first to settle wins) / `Promise.any` (first to fulfill wins).
 fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
     let items = host::iter_all(&arg0(&args))?;
-    let result = with_host(|h| h.new_promise());
+    // Built with `this`, as every combinator is (27.2.4.5 / 27.2.4.3).
+    let result = match promise_species_create()? {
+        Some(p) => p,
+        None => with_host(|h| h.new_promise()),
+    };
     let rid = with_host(|h| h.promise_id(&result).unwrap());
     let n = items.len();
     let errors = std::rc::Rc::new(std::cell::RefCell::new(vec![Value::Undef; n]));
