@@ -1216,6 +1216,19 @@ impl JsHost {
     pub fn has_null_proto(&self, v: &Value) -> bool {
         matches!(v, Value::Obj(i) if self.null_proto_objs.contains(i))
     }
+    /// Whether `util.inspect` renders `v` with the `[Object: null prototype]`
+    /// tag. That is a question about the object's ACTUAL `[[Prototype]]`, which
+    /// for `Object.prototype` is null even though nothing ever set it so: it is
+    /// the chain root and was never passed through `set_proto`, so the
+    /// explicitly-nulled registry does not hold it and `console.log(Object
+    /// .prototype)` printed a bare `{}` where node prints the tag.
+    ///
+    /// Kept apart from [`Self::has_null_proto`], which nine other call sites ask
+    /// about whether Object.prototype's own methods and `__proto__` accessor are
+    /// INHERITED. `Object.prototype` inherits nothing and still owns all of them.
+    pub fn inspects_null_proto(&self, v: &Value) -> bool {
+        self.has_null_proto(v) || *v == self.object_proto
+    }
     pub fn object_proto(&self) -> Value {
         self.object_proto.clone()
     }
@@ -4114,7 +4127,7 @@ impl JsHost {
                     } else {
                         format!("{ctor} ")
                     };
-                    let prefix = if self.has_null_proto(v) {
+                    let prefix = if self.inspects_null_proto(v) {
                         "[Object: null prototype] ".to_string()
                     } else {
                         // An inherited `Symbol.toStringTag` shows as `Ctor [Tag] `.
@@ -4171,7 +4184,7 @@ impl JsHost {
                     // Depth limit (Node default 2): deeper objects collapse to
                     // `[Object]` (or `[ClassName]` for a named instance).
                     if indent as i64 > inspect_indent_limit() {
-                        return if self.has_null_proto(v) {
+                        return if self.inspects_null_proto(v) {
                             // Already bracketed (`[Object: null prototype]`).
                             prefix.trim_end().to_string()
                         } else if plain_prefix.is_empty() {
@@ -8134,6 +8147,11 @@ impl JsHost {
                     "Number" => crate::builtins::NUMBER_PROTO_METHODS.iter().copied(),
                     _ => [].iter().copied(),
                 })
+                // The symbol-keyed methods come from the generated intrinsic
+                // table, so this object advertises exactly the symbol methods
+                // node defines on it — `String.prototype[Symbol.iterator]` was
+                // `undefined` because only the string-keyed lists were walked.
+                .chain(crate::builtins::proto_symbol_methods(ctor))
                 .collect();
             let mut seen: Vec<&str> = Vec::new();
             for m in methods {
@@ -8193,6 +8211,26 @@ impl JsHost {
         self.native_protos.get(ctor).cloned()
     }
 
+    /// The constructor name whose `.prototype` object IS `v`, for a prototype
+    /// this host built as a real object (`String.prototype`, `TypeError
+    /// .prototype`, `Buffer.prototype`) rather than as a `Builtin` namespace.
+    ///
+    /// A prototype is an ORDINARY object: it carries no instance's internal
+    /// slot, so `Object.prototype.toString.call(TypeError.prototype)` is
+    /// `[object Object]` and not `[object Error]`. Nothing distinguished the two
+    /// before, so the brand fell through to the "does it look like an Error"
+    /// test and answered for the prototype as if it were an instance.
+    pub fn intrinsic_proto_ctor(&self, v: &Value) -> Option<&str> {
+        if !matches!(v, Value::Obj(_)) {
+            return None;
+        }
+        self.native_protos
+            .iter()
+            .chain(self.error_protos.iter())
+            .find(|(_, p)| *p == v)
+            .map(|(name, _)| name.as_str())
+    }
+
     /// The real `.prototype` object for a native stdlib constructor (`StringDecoder`,
     /// `Hash`, `URLSearchParams`, …), built on first read and cached.
     ///
@@ -8242,7 +8280,8 @@ impl JsHost {
             p.insert("constructor".into(), ctor_val);
         }
         self.hide_prop(&proto, "constructor");
-        for m in own.iter().chain(emitter.iter()) {
+        let symbols = crate::builtins::proto_symbol_methods(ctor);
+        for m in own.iter().chain(emitter.iter()).chain(symbols.iter()) {
             let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
             if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
                 p.insert((*m).to_string(), thunk);

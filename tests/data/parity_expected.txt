@@ -980,6 +980,43 @@ Uint8Array(2) [
   [buffer]: ArrayBuffer { [byteLength]: 2 }
 ]
 /ab+c/gi { [lastIndex]: 0 }
+==== intrinsicprotos.js ====
+Object                [object Object] undefined
+Array                 [object Array] undefined
+Function              [object Function] undefined
+Date                  [object Object] undefined
+RegExp                [object Object] undefined
+Error                 [object Object] undefined
+TypeError             [object Object] undefined
+Map                   [object Map] Map
+Set                   [object Set] Set
+WeakMap               [object WeakMap] WeakMap
+WeakSet               [object WeakSet] WeakSet
+Promise               [object Promise] Promise
+Symbol                [object Symbol] Symbol
+BigInt                [object BigInt] BigInt
+Number                [object Number] undefined
+String                [object String] undefined
+Boolean               [object Boolean] undefined
+ArrayBuffer           [object ArrayBuffer] ArrayBuffer
+DataView              [object DataView] DataView
+Uint8Array            [object Object] undefined
+WeakRef               [object WeakRef] WeakRef
+FinalizationRegistry  [object FinalizationRegistry] FinalizationRegistry
+Method Date.prototype.toString called on incompatible receiver #<Object>
+Method Date.prototype.toString called on incompatible receiver [object Object]
+function [Symbol.iterator]
+a|b
+function values
+null
+[Object: null prototype] {}
+{
+  value: [Object: null prototype] {},
+  writable: false,
+  enumerable: false,
+  configurable: false
+}
+[Object: null prototype] {}
 ==== iterhelpers.js ====
 global   function function function
 lazy     1,2 3,4 2,4,6,8 2,4

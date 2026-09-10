@@ -2325,6 +2325,19 @@ fn object_tag(h: &host::JsHost, v: &Value) -> String {
 /// …), without the `[object …]` wrapper. Split out so the brand and the
 /// `Symbol.toStringTag` property read cannot disagree about what a value is.
 fn object_brand(h: &host::JsHost, v: &Value) -> String {
+    // A `<C>.prototype` this host built as a real object is an ORDINARY object:
+    // it holds no instance slot, so only the branded few report anything but
+    // `[object Object]`. Checked before the match because those prototypes are
+    // plain `JsObj::Object`s and would otherwise be branded by whatever their
+    // own properties happen to look like — `TypeError.prototype` has `name` and
+    // `message`, which read as an Error instance.
+    if let Some(ctor) = h.intrinsic_proto_ctor(v) {
+        return if BRANDED_PROTOS.contains(&ctor) {
+            ctor.to_string()
+        } else {
+            "Object".to_string()
+        };
+    }
     let tag: String = match v {
         Value::Undef => "Undefined".into(),
         Value::Bool(_) => "Boolean".into(),
@@ -2387,7 +2400,7 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             // object. Neither is a function, so neither brands as one.
             Some(JsObj::Builtin(n)) if !host::builtin_is_callable(n) => {
                 match n.strip_suffix(".prototype") {
-                    Some(ctor) if !ctor.is_empty() => ctor.to_string(),
+                    Some(ctor) if BRANDED_PROTOS.contains(&ctor) => ctor.to_string(),
                     _ => "Object".into(),
                 }
             }
@@ -7339,6 +7352,69 @@ pub(crate) const STRING_PROTO_METHODS: &[&str] = &[
 fn is_string_method(name: &str) -> bool {
     STRING_PROTO_METHODS.contains(&name)
 }
+
+/// Every SYMBOL-keyed intrinsic method the generated table lists for `ctor`,
+/// spelled the way this frontend spells the key (`@@iterator`).
+///
+/// A prototype built as a REAL object (`String.prototype`, `URLSearchParams
+/// .prototype`) installs its methods from a list, and only the string-keyed
+/// list was walked — so `String.prototype[Symbol.iterator]` read `undefined`
+/// while `Array.prototype[Symbol.iterator]`, which resolves through the
+/// `Builtin` namespace and its table gate, answered a function. Derived from
+/// the table rather than written out, so it cannot name a method node does not
+/// define nor miss one it does.
+pub(crate) fn proto_symbol_methods(ctor: &str) -> Vec<&'static str> {
+    let prefix = format!("@proto:{ctor}:");
+    crate::arity::BUILTIN_ARITY
+        .iter()
+        .filter_map(|(k, _, _)| k.strip_prefix(prefix.as_str()))
+        .filter(|m| m.starts_with("@@"))
+        .collect()
+}
+
+/// The builtin constructors whose `.prototype` object is BRANDED — every other
+/// `<C>.prototype` is an ordinary object and reports `[object Object]`.
+///
+/// Measured on node v26.8.1 over every constructor this frontend knows:
+///
+/// ```text
+/// Array/Object/Number/String/Boolean/Function   the ES5 legacy slot prototypes
+/// Symbol/BigInt/Map/Set/WeakMap/WeakSet         carry an own @@toStringTag
+/// Promise/Iterator/ArrayBuffer/DataView         "
+/// WeakRef/FinalizationRegistry/URL              "
+/// URLSearchParams/TextEncoder/TextDecoder       "
+/// Date/RegExp/Error/TypeError/Uint8Array/…      [object Object]
+/// ```
+///
+/// The rule this replaces branded EVERY `<C>.prototype` as `C`, so
+/// `Object.prototype.toString.call(Date.prototype)` read `[object Date]` — and
+/// a `Date.prototype.toString` call on a plain object named `[object Date]` in
+/// its own failure message where node names `[object Object]`.
+pub(crate) const BRANDED_PROTOS: &[&str] = &[
+    "Array",
+    "ArrayBuffer",
+    "BigInt",
+    "Boolean",
+    "DataView",
+    "FinalizationRegistry",
+    "Function",
+    "Iterator",
+    "Map",
+    "Number",
+    "Object",
+    "Promise",
+    "Set",
+    "SharedArrayBuffer",
+    "String",
+    "Symbol",
+    "TextDecoder",
+    "TextEncoder",
+    "URL",
+    "URLSearchParams",
+    "WeakMap",
+    "WeakRef",
+    "WeakSet",
+];
 
 /// Whether `v` is a `RegExp` value (drives the regex path of `match`/`replace`/…).
 fn is_regexp_arg(v: &Value) -> bool {
