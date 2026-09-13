@@ -7118,7 +7118,15 @@ fn json_str(
             // but any own property a script attached is serialized like an
             // ordinary object's: `JSON.stringify(Object.assign(new Map(), {a:1}))`
             // is `{"a":1}`.
-            Some(JsObj::Map { .. }) | Some(JsObj::Set { .. }) | Some(JsObj::RegExp(_)) => {
+            Some(JsObj::Map { .. })
+            | Some(JsObj::Set { .. })
+            | Some(JsObj::RegExp(_))
+            // A Promise and a generator are ORDINARY objects to the serializer:
+            // their state is internal slots, so they contribute no entries and
+            // render as `{}`. They were being omitted entirely instead, so a
+            // promise in an array became `null` and one in an object vanished.
+            | Some(JsObj::Promise { .. })
+            | Some(JsObj::Generator { .. }) => {
                 let parts: Vec<String> = h
                     .own_enum_entries(v)
                     .into_iter()
@@ -7151,8 +7159,7 @@ fn json_str(
             | Some(JsObj::BoundMethod { .. })
             | Some(JsObj::BoundFunc { .. })
             | Some(JsObj::Class(_))
-            | Some(JsObj::Symbol { .. })
-            | Some(JsObj::Generator { .. }) => None,
+            | Some(JsObj::Symbol { .. }) => None,
             Some(JsObj::Array(items)) => {
                 if items.is_empty() {
                     return Some("[]".into());

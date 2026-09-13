@@ -67,3 +67,50 @@ Promise.reject(new Error("q")).finally(undefined).catch((e) => note("undefcb:" +
 Promise.resolve("keep").finally(() => "discard").then((v) => note("kept:" + v));
 Promise.resolve("s").finally(() => { throw new Error("sync"); }).catch((e) => note("syncthrow:" + e.message));
 setTimeout(() => console.log(fin.join("\n")), 50);
+
+{
+// `processTicksAndRejections` runs in ROUNDS: drain the nextTick queue, then
+// drain the microtask queue IN FULL, then repeat if those microtasks queued
+// more ticks. Preferring ticks on every step interleaved the two, so a tick
+// scheduled from inside a `.then` jumped ahead of the promise callbacks already
+// queued behind it.
+const order = [];
+Promise.resolve().then(() => { order.push("p1"); process.nextTick(() => order.push("tick-in-p1")); });
+Promise.resolve().then(() => order.push("p2"));
+Promise.resolve().then(() => order.push("p3"));
+setTimeout(() => console.log("rounds  ", order.join(" ")), 15);
+
+// The full interleaving, including an await resumption and a tick nested in a
+// tick. Ticks still win the FIRST round; only ones queued mid-round wait.
+const full = [];
+process.nextTick(() => full.push("tick1"));
+queueMicrotask(() => full.push("micro1"));
+Promise.resolve().then(() => full.push("promise1"));
+setImmediate(() => full.push("immediate1"));
+setTimeout(() => full.push("timeout0"), 0);
+process.nextTick(() => { full.push("tick2"); process.nextTick(() => full.push("tick-nested")); });
+Promise.resolve().then(() => { full.push("promise2"); process.nextTick(() => full.push("tick-from-promise")); });
+(async () => { full.push("async-sync"); await null; full.push("async-after-await"); })();
+full.push("sync");
+// The tail is deliberately trimmed: whether a 0ms timeout or a setImmediate
+// runs first depends on how far into the loop turn the queue already is, and
+// node itself is not stable on it once other work is pending.
+setTimeout(() => console.log("full    ",
+  full.slice(0, full.indexOf("tick-from-promise") + 1).join(" ")), 25);
+
+// A Promise and a generator are ORDINARY objects to `JSON.stringify`: their
+// state is internal slots, so they contribute no entries and render as `{}`.
+// They were omitted entirely, so one in an array became `null` and one in an
+// object vanished.
+console.log("json    ", JSON.stringify(Promise.resolve(1)),
+  JSON.stringify((function* () {})()), JSON.stringify([Promise.resolve(1)]),
+  JSON.stringify({ p: Promise.resolve(1) }));
+
+// A `Timeout` coerces to its own id, which is how a handle stored as
+// `Number(t)` can be passed back to `clearTimeout`. The symbol form was missing.
+const handle = setTimeout(() => {}, 1000);
+console.log("timer   ", typeof handle[Symbol.toPrimitive],
+  Number(handle) === handle[Symbol.toPrimitive](), Number.isFinite(Number(handle)),
+  handle.valueOf() === handle);
+clearTimeout(handle);
+}

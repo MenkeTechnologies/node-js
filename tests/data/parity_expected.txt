@@ -270,6 +270,8 @@ nested computed: m,n,z {"m":{"n":"z"}}
 ==== async.js ====
 start
 end
+json     {} {} [{}] {"p":{}}
+timer    function true true true
 nextTick
 microtask
 chain 20
@@ -278,6 +280,8 @@ allSettled [ 'fulfilled', 'rejected' ]
 caught: boom
 compute result 7
 timeout
+rounds   p1 p2 p3 tick-in-p1
+full     async-sync sync tick1 tick2 tick-nested micro1 promise1 promise2 async-after-await tick-from-promise
 F
 a1
 a2

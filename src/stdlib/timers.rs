@@ -26,7 +26,16 @@ use indexmap::IndexMap;
 /// `valueOf`/`toString` back the primitive coercion described on
 /// [`new_handle`].
 pub const TIMEOUT_METHODS: &[&str] = &[
-    "ref", "unref", "hasRef", "refresh", "close", "valueOf", "toString",
+    "ref",
+    "unref",
+    "hasRef",
+    "refresh",
+    "close",
+    "toString",
+    // A `Timeout` coerces to its own id, which is how the handle can be passed
+    // straight back to `clearTimeout` in code that stored `Number(t)`. The
+    // symbol form was missing, so `t[Symbol.toPrimitive]` was not a function.
+    "@@toPrimitive",
 ];
 
 /// Methods on an `Immediate` (returned by `setImmediate`). Node's `Immediate`
@@ -87,7 +96,11 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             with_host(|h| h.cancel_timer(id));
             Ok(recv.clone())
         }
-        "valueOf" => Ok(Value::Float(id as f64)),
+        // Only the SYMBOL form yields the id. `valueOf` is the inherited
+        // `Object.prototype.valueOf`, which returns the receiver — node's
+        // `Timeout` does not override it, and reporting the id there made
+        // `t.valueOf() === t` false.
+        "@@toPrimitive" => Ok(Value::Float(id as f64)),
         "toString" => Ok(with_host(|h| h.new_str(id.to_string()))),
         _ => Err(crate::host::type_error(&format!(
             "timeout.{method} is not a function"

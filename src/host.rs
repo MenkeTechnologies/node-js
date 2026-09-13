@@ -928,6 +928,10 @@ pub struct JsHost {
     generators: Vec<GenCell>,
     /// Promise cells, indexed by `JsObj::Promise.id`.
     promises: Vec<PromiseCell>,
+    /// Whether the loop is part-way through draining the microtask queue, so a
+    /// `nextTick` queued by one of them waits for the round to finish. See
+    /// `next_microtask`.
+    draining_micro: bool,
     /// `process.nextTick` callbacks (drained before promise microtasks).
     pub nextticks: std::collections::VecDeque<Task>,
     /// Promise-reaction / `queueMicrotask` microtasks.
@@ -1179,6 +1183,7 @@ impl JsHost {
             generators: Vec::new(),
             promises: Vec::new(),
             microtasks: std::collections::VecDeque::new(),
+            draining_micro: false,
             nextticks: std::collections::VecDeque::new(),
             macrotasks: Vec::new(),
             next_timer: 1,
@@ -8772,10 +8777,27 @@ impl JsHost {
         idx.map(|i| self.macrotasks.remove(i))
     }
     fn next_microtask(&mut self) -> Option<Task> {
-        // nextTick drains before promise microtasks (Node ordering).
-        self.nextticks
-            .pop_front()
-            .or_else(|| self.microtasks.pop_front())
+        // Node's `processTicksAndRejections` runs in ROUNDS: drain the nextTick
+        // queue, then drain the microtask queue in full, then repeat if the
+        // microtasks queued more ticks. A tick queued from INSIDE a microtask
+        // therefore waits for the rest of that microtask queue.
+        //
+        // Preferring ticks on every step interleaved the two, so
+        // `Promise.resolve().then(() => process.nextTick(f))` ran `f` before the
+        // promise callbacks queued behind it — the one ordering difference a
+        // library scheduling work from a `.then` can actually observe.
+        if !self.draining_micro {
+            if let Some(t) = self.nextticks.pop_front() {
+                return Some(t);
+            }
+        }
+        if let Some(t) = self.microtasks.pop_front() {
+            // Stay in the microtask phase until this queue is exhausted.
+            self.draining_micro = !self.microtasks.is_empty();
+            return Some(t);
+        }
+        self.draining_micro = false;
+        self.nextticks.pop_front()
     }
     fn has_microtasks(&self) -> bool {
         !self.nextticks.is_empty() || !self.microtasks.is_empty()
