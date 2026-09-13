@@ -36,6 +36,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::FORIN_KEYS, b_forin_keys);
     vm.register_builtin(ops::FORIN_ALIVE, b_forin_alive);
     vm.register_builtin(ops::HOIST_TDZ, b_hoist_tdz);
+    vm.register_builtin(ops::NEW_SPREAD, b_new_spread);
     vm.register_builtin(ops::CONTAINS, b_contains);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
     vm.register_builtin(ops::BINOP, b_binop);
@@ -1926,10 +1927,15 @@ pub fn function_builtin_method(
         "apply" => {
             let this = args.first().cloned();
             let arr = args.get(1).cloned().unwrap_or(Value::Undef);
+            // `Function.prototype.apply` takes an ARRAY-LIKE, not an iterable
+            // (10.2.4.3 → CreateListFromArrayLike): `f.apply(null, arguments)`
+            // and `f.apply(null, {length: 2, 0: 'x', 1: 'y'})` are the shapes
+            // this is written for, and both produced an empty list. A nullish
+            // second argument means no arguments at all.
             let call_args = if matches!(arr, Value::Undef) || with_host(|h| h.is_null(&arr)) {
                 Vec::new()
             } else {
-                with_host(|h| h.iter_vec(&arr)).unwrap_or_default()
+                create_list_from_array_like(&arr)?
             };
             Ok(Some(host::invoke(recv, call_args, this)?))
         }
@@ -4675,9 +4681,32 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
     while i + 1 < flat.len() {
         let val = flat[i + 1].clone();
         match flat[i] {
+            // Tag 1 is an ARRAY-LITERAL spread, tag 3 a CALL-ARGUMENT one. They
+            // report a non-iterable differently, which is the only reason the
+            // two are told apart here.
             Value::Int(1) => match host::iter_all(&val) {
                 Ok(items) => out.extend(items),
                 Err(e) => return abort(vm, e),
+            },
+            Value::Int(3) => match host::iter_all(&val) {
+                Ok(items) => out.extend(items),
+                Err(e) => {
+                    // A NULLISH spread names the value and what could not be
+                    // read off it; anything else names the missing protocol.
+                    let shown = with_host(|h| h.is_nullish(&val).then(|| h.str_of(&val)));
+                    return abort(
+                        vm,
+                        match shown {
+                            Some(s) => host::type_error(&format!(
+                                "{s} is not iterable (cannot read property {s})"
+                            )),
+                            None if e.ends_with(" is not iterable") => host::type_error(
+                                "Spread syntax requires ...iterable[Symbol.iterator] to be a function",
+                            ),
+                            None => e,
+                        },
+                    );
+                }
             },
             Value::Int(2) => {
                 holes.insert(out.len());
@@ -4767,6 +4796,24 @@ fn b_call_value(vm: &mut VM, argc: u8) -> Value {
     // expression. Same site table, keyed on that rendering.
     let r = r.map_err(|e| {
         let shown = with_host(|h| h.str_of(&callable));
+        host::name_call_site(vm, &shown, e)
+    });
+    finish(vm, r)
+}
+
+/// `NEW_SPREAD` — `new C(...xs)`, where the argument list is a run-time array
+/// rather than a fixed count of stack slots.
+///
+/// `compile_new` used to compile each argument with `compile_expr`, and a
+/// spread there evaluates to the SPREAD OBJECT itself — so `new C(...[1, 2])`
+/// passed the array as one argument and `new Date(...[2020, 0, 1])` built an
+/// Invalid Date.
+fn b_new_spread(vm: &mut VM, _: u8) -> Value {
+    let args_arr = vm.pop();
+    let ctor = vm.pop();
+    let args = host::iter_all(&args_arr).unwrap_or_default();
+    let r = host::construct(&ctor, args).map_err(|e| {
+        let shown = with_host(|h| h.str_of(&ctor));
         host::name_call_site(vm, &shown, e)
     });
     finish(vm, r)

@@ -3951,8 +3951,12 @@ impl Compiler {
     fn compile_spread_args(&mut self, b: &mut ChunkBuilder, args: &[Expr]) -> Result<(), String> {
         for a in args {
             match a {
+                // Tag 3, not 1: a spread in a CALL argument list reports a
+                // non-iterable differently from one in an ARRAY LITERAL, and
+                // `BUILD_ARGS` serves both. Node names the missing protocol
+                // here (`Spread syntax requires ...`) and the VALUE there.
                 Expr::Spread(inner) => {
-                    b.emit(Op::LoadInt(1), 0);
+                    b.emit(Op::LoadInt(3), 0);
                     self.compile_expr(b, inner)?;
                 }
                 _ => {
@@ -3972,6 +3976,17 @@ impl Compiler {
         args: &[Expr],
     ) -> Result<(), String> {
         self.compile_expr(b, callee)?;
+        // A `...spread` argument has to be EXPANDED into the argument list. A
+        // plain `compile_expr` of one yields the spread object itself, so
+        // `new C(...[1, 2])` passed the array as a single argument.
+        if args.iter().any(|a| matches!(a, Expr::Spread(_))) {
+            // `compile_spread_args` emits its own `BUILD_ARGS`, leaving the flat
+            // argument array on the stack above the constructor.
+            self.compile_spread_args(b, args)?;
+            let at = b.emit(Op::CallBuiltin(ops::NEW_SPREAD, 2), 0);
+            self.note_call_site(at, callee);
+            return Ok(());
+        }
         for a in args {
             self.compile_expr(b, a)?;
         }

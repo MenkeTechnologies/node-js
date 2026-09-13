@@ -1809,6 +1809,39 @@ px-spec  true true true
 px-plain true true 0,1,2
 px-trap  true true
 value    7
+==== spreadargs.js ====
+new-spread   {"a":1,"b":2}
+new-mixed    {"a":0,"b":1}
+new-legacy   {"s":[3,4]}
+new-native    2020
+new-iterable  {"a":5,"b":6}
+new-string    {"a":"a","b":"b"}
+new-empty     {}
+new-trailing  {"a":1,"b":9}
+apply-like    5
+apply-args    9
+apply-user    ["x","y"]
+apply-array   3
+apply-null    null
+apply-none    null
+apply-number  TypeError: CreateListFromArrayLike called on non-object
+apply-string  TypeError: CreateListFromArrayLike called on non-object
+call-object   TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function
+call-number   TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function
+call-null     TypeError: null is not iterable (cannot read property null)
+call-undef    TypeError: undefined is not iterable (cannot read property undefined)
+new-object    TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function
+array-number  TypeError: 5 is not iterable
+destructure   TypeError: {} is not iterable
+ok-array      5
+ok-string     ["a","b"]
+ok-set        [1,2]
+ok-map        [[1,2]]
+ok-generator  [1,2]
+ok-arguments  [1,2]
+ok-custom     [7]
+ok-method     [1,2]
+ok-mixed      [0,1,2,3]
 ==== streams.js ====
 transform A,B,C
 filter    keep,last
