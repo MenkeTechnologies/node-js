@@ -319,8 +319,8 @@ fn stacked_diff(actual: &str, expected: &str) -> String {
     let a: Vec<char> = actual.chars().collect();
     let e: Vec<char> = expected.chars().collect();
     let mut indicator_idx: Option<usize> = None;
-    for i in 0..a.len() {
-        if e.get(i) != Some(&a[i]) {
+    for (i, ch) in a.iter().enumerate() {
+        if e.get(i) != Some(ch) {
             // The first two characters are skipped because a difference there is
             // already obvious; the bound is 3 rather than 2 to account for the
             // opening quote a rendered string carries.
@@ -394,9 +394,11 @@ pub fn create_err_diff(
     // Node's `isSimpleDiff`: a diff needs something to align, so it applies only
     // once at least one side rendered to more than one line AND both sides are
     // objects.
-    let show_simple = (split_actual.len() > 1 || split_expected.len() > 1)
-        .then_some(false)
-        .unwrap_or(!is_object(actual) || !is_object(expected));
+    let show_simple = if split_actual.len() > 1 || split_expected.len() > 1 {
+        false
+    } else {
+        !is_object(actual) || !is_object(expected)
+    };
 
     if show_simple {
         let (m, h) = simple_diff(actual, split_actual[0], expected, split_expected[0]);

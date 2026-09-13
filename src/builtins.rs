@@ -5969,7 +5969,7 @@ fn parse_int_str(s: &str, args: &[Value]) -> f64 {
         Some(r) if (2..=36).contains(&r) => Some(r as u32),
         Some(_) => return f64::NAN,
     };
-    let t = crate::utf16::js_trim_start(&s);
+    let t = crate::utf16::js_trim_start(s);
     let (neg, digits) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
@@ -6030,7 +6030,7 @@ fn parse_float(args: &[Value]) -> Result<f64, String> {
 }
 
 fn parse_float_str(s: &str) -> f64 {
-    let t = crate::utf16::js_trim_start(&s);
+    let t = crate::utf16::js_trim_start(s);
     // `Infinity` / `+Infinity` / `-Infinity` are valid parseFloat prefixes.
     let inf_body = t
         .strip_prefix('+')
