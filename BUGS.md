@@ -2526,15 +2526,6 @@ Still divergent, and why:
   (`examples/deadzone.js`), but parameters are initialized into one scope with
   no per-parameter hoist, so `function f(a = b, b = 2) {}` reads `b` as
   `undefined` where node throws `Cannot access 'b' before initialization`.
-- **`structuredClone`'s `transfer` option is ignored, and an ArrayBuffer cannot
-  be detached at all.** The clone itself is correct; the source buffer is not
-  detached, so `structuredClone(buf, {transfer:[buf]})` leaves
-  `buf.byteLength` at its original value where node leaves 0. The underlying
-  gap is that `ArrayBuffer.prototype.detached` and
-  `ArrayBuffer.prototype.transfer` do not exist — detaching needs a flag every
-  view honours, not just a field on the buffer. Cloning a detached buffer
-  should also throw `DataCloneError: An ArrayBuffer is detached and could not
-  be cloned.`
 - **A function's source text is not retained**, so anything that quotes it
   differs. `Function.prototype.toString` renders `function f() { [code] }`
   where node returns the original text, and `structuredClone(() => {})` throws

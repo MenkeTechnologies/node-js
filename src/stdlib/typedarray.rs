@@ -334,6 +334,12 @@ pub fn construct(kind: &str, args: &[Value]) -> Result<Value, String> {
     // branch and produced an empty array.
     if let Some(first) = args.first() {
         if super::native_tag(first).as_deref() == Some("ArrayBuffer") {
+            // A DETACHED buffer has no bytes to view.
+            if is_detached(first) {
+                return Err(crate::host::type_error(
+                    "Cannot perform Construct on a detached ArrayBuffer",
+                ));
+            }
             let bpe = bytes_per_element(kind);
             let total = buffer_byte_length(first);
             let off = super::arg_num(args, 1).max(0.0) as usize;
@@ -424,6 +430,9 @@ pub fn construct_dataview(args: &[Value]) -> Result<Value, String> {
 /// `dv.getUint16(off[, littleEndian])` and its siblings. A `DataView` defaults
 /// to BIG-endian, unlike a typed array, which is the whole reason it exists.
 pub fn dataview_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    if view_detached(recv) {
+        return Err(detached_error("DataView.prototype", method, false));
+    }
     let Some(spec) = method.get(3..) else {
         return Err(crate::host::type_error(&format!(
             "{method} is not a function"
@@ -950,8 +959,18 @@ pub fn new_array_buffer(n: usize) -> Value {
         m.insert("@@native".into(), h.new_str("ArrayBuffer"));
         m.insert("@@bytes".into(), arr);
         m.insert("byteLength".into(), Value::Float(n as f64));
+        // `detached` is a prototype accessor in the spec; kept as a hidden own
+        // property here so it reads back without appearing in `Object.keys` or
+        // `console.log`, the same way `byteLength` is.
+        m.insert("detached".into(), Value::Bool(false));
+        // A FIXED buffer still reports both, as `false` and its own length —
+        // they are prototype accessors in the spec, so they always answer.
+        m.insert("resizable".into(), Value::Bool(false));
+        m.insert("maxByteLength".into(), Value::Float(n as f64));
         let obj = h.new_object(m);
-        h.hide_prop(&obj, "byteLength");
+        for k in ["byteLength", "detached", "resizable", "maxByteLength"] {
+            h.hide_prop(&obj, k);
+        }
         // `ensure_ctor_proto` builds the prototype WITH a `constructor` slot, so
         // `ab.constructor.name` reports `ArrayBuffer` rather than `Object`.
         if let Some(p) = h.ensure_ctor_proto("ArrayBuffer") {
@@ -959,6 +978,144 @@ pub fn new_array_buffer(n: usize) -> Value {
         }
         obj
     })
+}
+
+/// Whether `ab` has been DETACHED — its bytes handed to another buffer by
+/// `transfer`, or given away by `structuredClone`'s `transfer` option.
+///
+/// A detached buffer is not an empty one: reading a view over it answers
+/// `undefined` and its `length` is 0, but every METHOD on that view throws.
+pub fn is_detached(ab: &Value) -> bool {
+    with_host(|h| match h.get(ab) {
+        Some(JsObj::Object(p)) => p.get("detached").map(|v| h.truthy(v)).unwrap_or(false),
+        _ => false,
+    })
+}
+
+/// Whether `v` is a view whose backing buffer has been detached.
+pub fn view_detached(v: &Value) -> bool {
+    with_host(|h| view_detached_h(h, v))
+}
+
+/// `view_detached` for a caller that already holds the host borrow — the
+/// iteration entry point runs under one, and re-entering aborts the process.
+pub fn view_detached_h(h: &crate::host::JsHost, v: &Value) -> bool {
+    let buf = match h.get(v) {
+        Some(JsObj::Object(p)) => p.get("@@buffer").cloned(),
+        _ => None,
+    };
+    match buf.and_then(|b| match h.get(&b) {
+        Some(JsObj::Object(p)) => p.get("detached").cloned(),
+        _ => None,
+    }) {
+        Some(d) => h.truthy(&d),
+        None => false,
+    }
+}
+
+/// Detach `ab`: drop its bytes and mark it, so every later read reports zero
+/// length and every method over it throws.
+pub fn detach_buffer(ab: &Value) {
+    detach(ab)
+}
+
+fn detach(ab: &Value) {
+    with_host(|h| {
+        let empty = h.new_array(Vec::new());
+        if let Some(JsObj::Object(p)) = h.get_mut(ab) {
+            p.insert("@@bytes".into(), empty);
+            p.insert("byteLength".into(), Value::Float(0.0));
+            p.insert("detached".into(), Value::Bool(true));
+        }
+        h.hide_prop(ab, "byteLength");
+        h.hide_prop(ab, "detached");
+    });
+}
+
+/// `ArrayBuffer.prototype.transfer([newLength])` and `transferToFixedLength`.
+///
+/// A fresh buffer takes the bytes — truncated or zero-padded to `newLength` —
+/// and the receiver is detached. The two differ only in whether the result may
+/// still grow.
+pub fn buffer_transfer(ab: &Value, args: &[Value], fixed: bool) -> Result<Value, String> {
+    let method = if fixed {
+        "transferToFixedLength"
+    } else {
+        "transfer"
+    };
+    if is_detached(ab) {
+        return Err(crate::host::type_error(&format!(
+            "Cannot perform ArrayBuffer.prototype.{method} on a detached ArrayBuffer"
+        )));
+    }
+    let old = byte_len_of(ab);
+    let new_len = match args.first().filter(|v| !matches!(v, Value::Undef)) {
+        Some(v) => with_host(|h| h.to_number(v)).max(0.0) as usize,
+        None => old,
+    };
+    let mut bytes = view_bytes_of_buffer(ab, old);
+    bytes.resize(new_len, 0);
+    let out = new_array_buffer(new_len);
+    write_buffer_bytes(&out, &bytes);
+    if !fixed {
+        // `transfer` keeps the source's resizability; `transferToFixedLength`
+        // never does.
+        let resizable = with_host(|h| match h.get(ab) {
+            Some(JsObj::Object(p)) => p.contains_key("@@maxByteLength"),
+            _ => false,
+        });
+        if resizable {
+            let max = with_host(|h| match h.get(ab) {
+                Some(JsObj::Object(p)) => p.get("@@maxByteLength").cloned(),
+                _ => None,
+            });
+            if let Some(max) = max {
+                with_host(|h| {
+                    if let Some(JsObj::Object(p)) = h.get_mut(&out) {
+                        p.insert("@@maxByteLength".into(), max);
+                    }
+                });
+            }
+        }
+    }
+    detach(ab);
+    Ok(out)
+}
+
+/// An ArrayBuffer's `byteLength`.
+fn byte_len_of(ab: &Value) -> usize {
+    with_host(|h| match h.get(ab) {
+        Some(JsObj::Object(p)) => {
+            p.get("byteLength").map(|l| h.to_number(l)).unwrap_or(0.0) as usize
+        }
+        _ => 0,
+    })
+}
+
+/// An ArrayBuffer's bytes.
+fn view_bytes_of_buffer(ab: &Value, n: usize) -> Vec<u8> {
+    let Some(store) = store_of(ab) else {
+        return Vec::new();
+    };
+    with_host(|h| match h.get(&store) {
+        Some(JsObj::Array(items)) => items
+            .iter()
+            .take(n)
+            .map(|x| h.to_number(x) as i64 as u8)
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// The TypeError a method over a DETACHED buffer throws. Node names the method
+/// and distinguishes a view's from a DataView's from the buffer's own.
+pub fn detached_error(label: &str, method: &str, buffer_only: bool) -> String {
+    let tail = if buffer_only {
+        "a detached ArrayBuffer"
+    } else {
+        "a detached or out-of-bounds ArrayBuffer"
+    };
+    crate::host::type_error(&format!("Cannot perform {label}.{method} on {tail}"))
 }
 
 /// The heap array holding an `ArrayBuffer`'s bytes.
@@ -1109,7 +1266,14 @@ fn raw_elems(h: &crate::host::JsHost, v: &Value) -> Option<(String, Vec<Vec<u8>>
         .map(|k| h.str_of(k))
         .unwrap_or_else(|| "Uint8Array".into());
     let bpe = bytes_per_element(&kind);
-    let len = p.get("length").map(|l| h.to_number(l)).unwrap_or(0.0) as usize;
+    // A view over a DETACHED buffer has no elements. Its own `length` still
+    // holds the old count, so `util.inspect` showed `Uint8Array(4) [0,0,0,0]`
+    // over a buffer with no bytes left.
+    let len = if view_detached_h(h, v) {
+        0
+    } else {
+        p.get("length").map(|l| h.to_number(l)).unwrap_or(0.0) as usize
+    };
     let off = p.get("byteOffset").map(|o| h.to_number(o)).unwrap_or(0.0) as usize;
     let store = match p.get("@@buffer").and_then(|b| h.get(b)) {
         Some(JsObj::Object(bp)) => bp.get("@@bytes").and_then(|a| h.get(a)),
@@ -1187,6 +1351,11 @@ pub fn elems_display(h: &crate::host::JsHost, v: &Value) -> Vec<String> {
 
 /// The element count a view exposes, from its own `length` slot.
 fn view_len(v: &Value) -> usize {
+    // A view over a DETACHED buffer has length 0 — its own `length` property
+    // still holds the old count, which is why this cannot just read it.
+    if view_detached(v) {
+        return 0;
+    }
     with_host(|h| match h.get(v) {
         Some(JsObj::Object(p)) => p.get("length").map(|l| h.to_number(l)).unwrap_or(0.0) as usize,
         _ => 0,
@@ -1409,6 +1578,12 @@ fn base64_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Va
 }
 
 pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    // Every method over a DETACHED buffer throws, naming itself. An element
+    // read and `length` answer zero instead, which is why this is a per-method
+    // guard rather than a check inside the element accessors.
+    if view_detached(recv) {
+        return Err(detached_error("%TypedArray%.prototype", method, false));
+    }
     if matches!(
         method,
         "toBase64" | "toHex" | "setFromBase64" | "setFromHex"

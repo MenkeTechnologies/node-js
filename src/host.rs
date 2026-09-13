@@ -5568,6 +5568,16 @@ impl JsHost {
             Some(JsObj::Object(props))
                 if props.contains_key("@@bytes") || props.contains_key("@@buffer") =>
             {
+                // Iterating a view over a DETACHED buffer throws, naming the
+                // `values` iterator — reading its elements answers zero length,
+                // but spreading it is a method call and does not.
+                if crate::stdlib::typedarray::view_detached_h(self, v) {
+                    return Err(crate::stdlib::typedarray::detached_error(
+                        "%TypedArray%.prototype",
+                        "values",
+                        false,
+                    ));
+                }
                 Ok(crate::stdlib::typedarray::elems_mut_host(self, v))
             }
             // V8 names the VALUE, not its type: `[...5]` is `5 is not iterable`,
@@ -5653,6 +5663,12 @@ impl JsHost {
                     Some("Buffer") | Some("TypedArray")
                 ) =>
             {
+                // A view over a DETACHED buffer has no index properties at all:
+                // its own `length` still holds the old count, so reading that
+                // back left `Object.keys` listing eight names over no bytes.
+                if crate::stdlib::typedarray::view_detached_h(self, v) {
+                    return Vec::new();
+                }
                 // A Buffer counts its byte store; every other view reports the
                 // element count of its window onto the ArrayBuffer.
                 let n = match props.get("@@bytes").and_then(|b| self.get(b)) {

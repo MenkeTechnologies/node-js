@@ -680,7 +680,7 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         "IncomingMessage" => &["pause", "resume", "setEncoding", "destroy"],
         "Buffer" => buffer::INSTANCE_METHODS,
         "DataView" => typedarray::DATAVIEW_METHODS,
-        "ArrayBuffer" => &["slice", "resize"],
+        "ArrayBuffer" => &["slice", "resize", "transfer", "transferToFixedLength"],
         "Date" => date::INSTANCE_METHODS,
         "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream" => &[
             "read",
@@ -856,8 +856,21 @@ pub fn instance_call(
         "DataView" => typedarray::dataview_call(recv, method, &args),
         // An `ArrayBuffer`'s only instance method is `slice`, which copies the
         // byte range into a fresh buffer.
-        "ArrayBuffer" if method == "slice" => Ok(typedarray::buffer_slice(recv, &args)),
+        "ArrayBuffer" if method == "slice" => {
+            if typedarray::is_detached(recv) {
+                return Err(typedarray::detached_error(
+                    "ArrayBuffer.prototype",
+                    "slice",
+                    true,
+                ));
+            }
+            Ok(typedarray::buffer_slice(recv, &args))
+        }
         "ArrayBuffer" if method == "resize" => typedarray::buffer_resize(recv, &args),
+        "ArrayBuffer" if method == "transfer" => typedarray::buffer_transfer(recv, &args, false),
+        "ArrayBuffer" if method == "transferToFixedLength" => {
+            typedarray::buffer_transfer(recv, &args, true)
+        }
         t if fetch::is_class(t) => fetch::instance_call(t, recv, method, &args),
         "Hash" => crypto::instance_call(recv, method, &args),
         "Hmac" => crypto::hmac_instance_call(recv, method, &args),

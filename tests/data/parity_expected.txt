@@ -787,6 +787,34 @@ hole     1 2,1
 rest     1 2,3
 cleanup 
 gen      a
+==== detach.js ====
+before     8 false 8 7
+after      0 true 8 7
+resizable  false 4 true
+grow       [8,true]
+shrink     [2,false]
+retransfer TypeError: Cannot perform ArrayBuffer.prototype.transfer on a detached ArrayBuffer
+bufferSlice TypeError: Cannot perform ArrayBuffer.prototype.slice on a detached ArrayBuffer
+construct  TypeError: Cannot perform Construct on a detached ArrayBuffer
+view       0 0 undefined true
+enumerate  0 [] 0
+membership false false undefined
+write      undefined undefined
+inspect    Uint8Array(0) [] {}
+spread     TypeError: Cannot perform %TypedArray%.prototype.values on a detached or out-of-bounds ArrayBuffer
+join       TypeError: Cannot perform %TypedArray%.prototype.join on a detached or out-of-bounds ArrayBuffer
+slice      TypeError: Cannot perform %TypedArray%.prototype.slice on a detached or out-of-bounds ArrayBuffer
+forEach    TypeError: Cannot perform %TypedArray%.prototype.forEach on a detached or out-of-bounds ArrayBuffer
+indexOf    TypeError: Cannot perform %TypedArray%.prototype.indexOf on a detached or out-of-bounds ArrayBuffer
+dataview   TypeError: Cannot perform DataView.prototype.getInt8 on a detached or out-of-bounds ArrayBuffer
+dv-extent  TypeError: Cannot perform get DataView.prototype.byteLength on a detached or out-of-bounds ArrayBuffer
+sc-transfer [8,0,true]
+sc-bytes   [9,true]
+sc-outside ["{}",true]
+sc-badlist DOMException: Found invalid value in transferList.
+sc-detached DOMException: An ArrayBuffer is detached and could not be cloned.
+sc-empty   1
+sc-noopts  [1,1]
 ==== dynamic.js ====
 direct   42
 literal  42

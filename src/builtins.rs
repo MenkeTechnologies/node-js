@@ -1081,6 +1081,29 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
     Ok(match kind {
         Some(ObjKind::Object) => {
             let numeric = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
+            // A view over a DETACHED buffer reports zero extent. Its own
+            // `length`/`byteLength`/`byteOffset` properties still hold the old
+            // numbers — the buffer does not know its views, so it cannot rewrite
+            // them — and reading them straight back made a detached view still
+            // look eight bytes long.
+            if matches!(name, "length" | "byteLength" | "byteOffset")
+                && crate::stdlib::typedarray::view_detached(recv)
+            {
+                match crate::stdlib::native_tag(recv).as_deref() {
+                    Some("TypedArray") => return Ok(Value::Float(0.0)),
+                    // A DataView THROWS where a typed array answers zero — its
+                    // extent accessors are brand-checked and node reports the
+                    // getter by name.
+                    Some("DataView") => {
+                        return Err(crate::stdlib::typedarray::detached_error(
+                            "get DataView.prototype",
+                            name,
+                            false,
+                        ))
+                    }
+                    _ => {}
+                }
+            }
             // Typed-array element read (`ta[i]`): elements live in a hidden
             // `@@elems`, not as own numeric props, so intercept integer keys.
             if numeric && crate::stdlib::native_tag(recv).as_deref() == Some("TypedArray") {
@@ -3259,6 +3282,12 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
         let is_ta = crate::stdlib::native_tag(recv).as_deref() == Some("TypedArray");
         if is_ta && crate::stdlib::typedarray::elem_set(recv, name, &val)? {
+            return Ok(());
+        }
+        // An index write to a view over a DETACHED buffer is DROPPED. Falling
+        // through would store it as an ordinary own property, which then showed
+        // up in `getOwnPropertyDescriptor` over a buffer with no bytes.
+        if is_ta && crate::stdlib::typedarray::view_detached(recv) {
             return Ok(());
         }
         // `buf[i] = n` writes through to the Buffer's hidden byte array.
@@ -5522,7 +5551,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "JSON.parse" => json_parse(args),
         "JSON.rawJSON" => json_raw(args),
         "JSON.isRawJSON" => json_is_raw(args),
-        "structuredClone" => deep_clone(&arg0(&args)),
+        "structuredClone" => structured_clone(args),
         // The deferred drain a `Readable.from` schedules; the suffix is the
         // stream's heap index.
         _ if name.starts_with("@@transformCb:") => {
@@ -12248,6 +12277,39 @@ fn clone_refusal(v: &Value) -> Option<String> {
     }
 }
 
+/// `structuredClone(value[, { transfer }])`.
+///
+/// Everything in `transfer` must be an `ArrayBuffer`, and each one is DETACHED
+/// after the clone — its bytes belong to the copy. The option used to be
+/// ignored entirely, so the source buffer stayed usable where node leaves it
+/// with zero length.
+fn structured_clone(args: Vec<Value>) -> Result<Value, String> {
+    let list: Vec<Value> = match args.get(1).filter(|v| !matches!(v, Value::Undef)) {
+        Some(opts) => {
+            let t = get_property(opts, "transfer")?;
+            if matches!(t, Value::Undef) {
+                Vec::new()
+            } else {
+                host::iter_all(&t)?
+            }
+        }
+        None => Vec::new(),
+    };
+    for item in &list {
+        if crate::stdlib::native_tag(item).as_deref() != Some("ArrayBuffer") {
+            return Err(host::dom_error(
+                "DataCloneError",
+                "Found invalid value in transferList.",
+            ));
+        }
+    }
+    let out = deep_clone(&arg0(&args))?;
+    for item in &list {
+        crate::stdlib::typedarray::detach_buffer(item);
+    }
+    Ok(out)
+}
+
 pub(crate) fn deep_clone(v: &Value) -> Result<Value, String> {
     deep_clone_seen(v, &mut std::collections::HashMap::new())
 }
@@ -12262,6 +12324,12 @@ fn deep_clone_seen(
     };
     if let Some(done) = seen.get(&idx) {
         return Ok(done.clone());
+    }
+    if crate::stdlib::typedarray::is_detached(v) {
+        return Err(host::dom_error(
+            "DataCloneError",
+            "An ArrayBuffer is detached and could not be cloned.",
+        ));
     }
     if let Some(render) = clone_refusal(v) {
         return Err(host::dom_error(
