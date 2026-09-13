@@ -1452,10 +1452,26 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
         ));
     }
-    // A monkey-patched intrinsic prototype member shadows the synthesized one:
-    // after `Array.prototype.join = f`, `[1, 2].join` must BE `f`. An own
-    // property on the receiver still wins, as it does on any chain.
+    // A key the receiver does not OWN is looked up on its prototype chain. The
+    // exotic arms above answer from their own storage and stop, so an array
+    // given a prototype inherited nothing through a read: with
+    // `Object.setPrototypeOf(a, {1: 'q'})`, `a[1]` was `undefined` at an elided
+    // index and at one past the end, while `1 in a` already answered true —
+    // the two views of the same question disagreeing. An accessor was found
+    // (`lookup_accessor` walks), so only DATA properties went missing.
+    //
+    // A plain object's arm already consults the chain, and an array with no
+    // explicit prototype has no links to walk, so this changes neither.
     if !name.starts_with('#') && !name.starts_with("@@") && !has_own_for_shadow(recv, name) {
+        if matches!(out, Value::Undef) {
+            if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
+                return Ok(v);
+            }
+        }
+        // Then a monkey-patched intrinsic prototype member, which shadows the
+        // synthesized one: after `Array.prototype.join = f`, `[1, 2].join` must
+        // BE `f`. An explicitly-set prototype above wins over it, as the chain
+        // order requires.
         if let Some(v) = inherited_builtin_static(recv, name) {
             return Ok(v);
         }
@@ -4649,8 +4665,40 @@ fn b_forin_keys(vm: &mut VM, _: u8) -> Value {
             Err(e) => abort(vm, e),
         };
     }
-    let keys = with_host(|h| h.enum_keys(&v));
+    let mut keys = with_host(|h| h.enum_keys(&v));
+    // A member patched onto the receiver's INTRINSIC prototype is enumerable
+    // and inherited, so `for-in` visits it after the own keys — but the
+    // intrinsic prototypes are not links `enum_keys` can walk, so its chain
+    // pass never reaches them.
+    if !with_host(|h| h.has_null_proto(&v)) {
+        let seen: Vec<String> = keys.iter().map(|k| with_host(|h| h.str_of(k))).collect();
+        for ns in intrinsic_proto_namespaces(&v) {
+            for k in with_host(|h| h.builtin_static_keys(&ns)) {
+                if !seen.contains(&k) && !intrinsic_proto_member(&ns, &k) {
+                    keys.push(with_host(|h| h.new_str(k)));
+                }
+            }
+        }
+    }
     with_host(|h| h.new_array(keys))
+}
+
+/// The intrinsic prototype namespaces `v` inherits from, nearest first — its
+/// own constructor's and then `Object`'s, the same two steps
+/// `inherited_builtin_static` looks a value up in.
+fn intrinsic_proto_namespaces(v: &Value) -> Vec<String> {
+    let ctor = match wrapped_primitive(v).as_ref().and_then(wrapper_ctor_of) {
+        Some(c) => Some(c),
+        None if is_arguments(v) => Some("Object"),
+        None => with_host(|h| default_ctor_name(h, v)),
+    };
+    let mut out: Vec<String> = ctor
+        .filter(|c| *c != "Object")
+        .map(|c| format!("{c}.prototype"))
+        .into_iter()
+        .collect();
+    out.push("Object.prototype".to_string());
+    out
 }
 
 /// `FORIN_ALIVE` — is `key` STILL an enumerable property of `obj`?
@@ -9240,7 +9288,7 @@ fn array_walk<T>(
     for i in 0..len {
         // A HOLE — and an index a shrinking mutation has dropped — is skipped
         // without calling the callback.
-        if with_host(|h| h.is_hole(recv, i)) || i >= array_len(recv) {
+        if index_absent(recv, i) || i >= array_len(recv) {
             continue;
         }
         let v = get_property(recv, &i.to_string())?;
@@ -9261,7 +9309,7 @@ fn array_walk_rev<T>(
     mut f: impl FnMut(usize, Value) -> Result<Option<T>, String>,
 ) -> Result<Option<T>, String> {
     for i in (0..from).rev() {
-        if with_host(|h| h.is_hole(recv, i)) || i >= array_len(recv) {
+        if index_absent(recv, i) || i >= array_len(recv) {
             continue;
         }
         let v = get_property(recv, &i.to_string())?;
@@ -9299,11 +9347,21 @@ pub(crate) fn resolve_index_accessors_pub(recv: &Value, items: &mut [Value]) {
 /// the ORIGINAL array when nothing changed, and the original still holds the
 /// stale slots.
 fn resolve_index_accessors(recv: &Value, items: &mut [Value]) -> bool {
-    let indices: Vec<usize> = with_host(|h| h.own_accessor_keys(recv))
+    let mut indices: Vec<usize> = with_host(|h| h.own_accessor_keys(recv))
         .into_iter()
         .filter_map(|k| k.parse::<usize>().ok())
         .filter(|i| *i < items.len())
         .collect();
+    // An ELIDED index the prototype chain supplies is stale in the backing
+    // vector too — it holds `undefined` where `[[Get]]` answers the inherited
+    // value. Spread and `JSON.stringify` both read through here, and both
+    // rendered the hole rather than what `a[i]` reads.
+    let inherited: Vec<usize> = with_host(|h| h.hole_indices(recv))
+        .into_iter()
+        .filter(|i| *i < items.len() && !indices.contains(i))
+        .filter(|i| has_property(recv, &i.to_string()).unwrap_or(false))
+        .collect();
+    indices.extend(inherited);
     let mut replaced = false;
     for i in indices {
         if let Ok(v) = get_property(recv, &i.to_string()) {
@@ -9325,6 +9383,32 @@ fn resolve_index_accessors(recv: &Value, items: &mut [Value]) -> bool {
 /// `join`, `entries`, `Array.from`) see the `undefined` a hole reads back as.
 fn hole_set(recv: &Value) -> rustc_hash::FxHashSet<usize> {
     with_host(|h| h.hole_indices(recv)).into_iter().collect()
+}
+
+/// The indices `recv` genuinely has NO property at — the elided ones the
+/// prototype chain does not supply either.
+///
+/// Every array method tests `HasProperty` before deciding to skip a position
+/// (23.1.3.x, uniformly), and `HasProperty` walks the chain. Testing elision
+/// alone made an inherited element invisible to all of them: with
+/// `Array.prototype[1] = 'p'`, `[1,,3].map(v => v)` produced a hole where node
+/// produces `'p'`, and `flat`/`concat`/`slice`/`sort`/`indexOf` each dropped
+/// the same position.
+///
+/// `hole_set` remains the elision record itself, which is what `splice` moves
+/// around — that bookkeeping is about the array's OWN storage and must not
+/// consult the chain.
+fn absent_set(recv: &Value) -> rustc_hash::FxHashSet<usize> {
+    hole_set(recv)
+        .into_iter()
+        .filter(|i| !has_property(recv, &i.to_string()).unwrap_or(false))
+        .collect()
+}
+
+/// The single-index form of [`absent_set`], for the walkers that test one
+/// position at a time.
+fn index_absent(recv: &Value, i: usize) -> bool {
+    with_host(|h| h.is_hole(recv, i)) && !has_property(recv, &i.to_string()).unwrap_or(false)
 }
 
 /// The element count, without copying the elements.
@@ -9626,7 +9710,7 @@ fn array_method_on(
             for i in start..len {
                 // 23.1.3.17 steps 8a-8b: HasProperty first, so a hole — and an
                 // index a mutation has since dropped — is skipped, not compared.
-                if with_host(|h| h.is_hole(recv, i)) || i >= array_len(recv) {
+                if index_absent(recv, i) || i >= array_len(recv) {
                     continue;
                 }
                 let x = get_property(recv, &i.to_string())?;
@@ -9639,7 +9723,7 @@ fn array_method_on(
         }
         "lastIndexOf" => {
             let items = array_items(recv);
-            let holes = hole_set(recv);
+            let holes = absent_set(recv);
             let target = arg0(&args);
             let from = (args.len() > 1).then(|| arg_num(&args, 1));
             let idx = match search_start_last(from, items.len()) {
@@ -9686,7 +9770,7 @@ fn array_method_on(
             let mut out = array_items(recv);
             // A hole in either the receiver or a spreadable argument stays a hole
             // in the result, at its shifted position.
-            let mut holes = hole_set(recv);
+            let mut holes = absent_set(recv);
             let mut sources: Vec<(Value, usize)> = Vec::new();
             for a in &args {
                 // `Symbol.isConcatSpreadable` (23.1.3.1) decides whether an
@@ -9705,7 +9789,13 @@ fn array_method_on(
                     continue;
                 }
                 match with_host(|h| h.get(a).cloned()) {
-                    Some(JsObj::Array(items)) => {
+                    // Read off the backing vector rather than through
+                    // `array_items`, so the resolve that does for the receiver
+                    // has to be done here too: 23.1.3.1 step 5.c.iv is a
+                    // `[[Get]]`, and an index with a getter — or an elided one
+                    // the chain supplies — is stale in that vector.
+                    Some(JsObj::Array(mut items)) => {
+                        resolve_index_accessors(a, &mut items);
                         sources.push((a.clone(), out.len()));
                         out.extend(items);
                     }
@@ -9796,7 +9886,7 @@ fn array_method_on(
             // A copied position takes its SOURCE's hole-ness (10.4.2 copyWithin
             // deletes the target when the source has no such property);
             // everything outside the written range keeps its own.
-            let src_holes = hole_set(recv);
+            let src_holes = absent_set(recv);
             with_host(|h| {
                 if let Some(JsObj::Array(a)) = h.get_mut(recv) {
                     for (k, v) in slice.into_iter().enumerate() {
@@ -9836,7 +9926,7 @@ fn array_method_on(
         // result array is created with the SAME holes — `[1,,3].map(f)` calls `f`
         // twice and yields `[2, <1 empty item>, 6]`.
         "map" => {
-            let holes = hole_set(recv);
+            let holes = absent_set(recv);
             let cb = arg0(&args);
             // The result keeps the source's LENGTH, so a skipped index still
             // occupies a slot; `array_walk` only tells us which ones ran.
@@ -9959,7 +10049,7 @@ fn array_method_on(
         }
         "reduce" => {
             let items = array_items(recv);
-            let holes = hole_set(recv);
+            let holes = absent_set(recv);
             let cb = arg0(&args);
             let acc;
             let mut start = 0;
@@ -10010,7 +10100,7 @@ fn array_method_on(
             if args.len() >= 2 {
                 acc = args[1].clone();
             } else {
-                let holes = hole_set(recv);
+                let holes = absent_set(recv);
                 match (0..n).rev().find(|i| !holes.contains(i)) {
                     Some(k) => {
                         acc = get_property(recv, &k.to_string())?;
@@ -10073,7 +10163,7 @@ fn array_method_on(
         // `[1, 3, <1 empty item>]` with own keys `['0','1']`.
         "sort" => {
             let all = array_items(recv);
-            let holes = hole_set(recv);
+            let holes = absent_set(recv);
             let mut items: Vec<Value> = all
                 .iter()
                 .enumerate()
@@ -10411,7 +10501,7 @@ fn flatten_into(src: &Value, depth: f64, out: &mut Vec<Value>) -> Result<(), Str
         return Err(host::stack_overflow_error());
     }
     let items = array_items(src);
-    let holes = hole_set(src);
+    let holes = absent_set(src);
     for (i, it) in items.into_iter().enumerate() {
         if holes.contains(&i) {
             continue;
@@ -13034,6 +13124,12 @@ fn has_property_ordinary(obj: &Value, key: &str) -> bool {
     if with_host(|h| host::lookup_accessor(h, obj, key)).is_some() {
         return true;
     }
+    // A member patched onto the receiver's intrinsic prototype. The READ
+    // resolves it, so without this `Array.prototype.at = f` made `[].at` a
+    // function while `'at' in []` stayed false.
+    if !key.starts_with('#') && inherited_builtin_static(obj, key).is_some() {
+        return true;
+    }
     if with_host(|h| match h.get(obj) {
         Some(JsObj::Object(p)) => p.contains_key(key),
         Some(JsObj::Array(items)) => {
@@ -13115,8 +13211,14 @@ fn has_own_for_shadow(recv: &Value, key: &str) -> bool {
         }
         match h.get(recv) {
             Some(JsObj::Object(p)) => p.contains_key(key),
+            // An ELIDED index owns nothing — the whole point of a hole is that
+            // the lookup continues up the chain — so it must not count as a
+            // shadow here or an inherited value at that index stays invisible.
             Some(JsObj::Array(items)) => {
-                key == "length" || key.parse::<usize>().is_ok_and(|i| i < items.len())
+                key == "length" || {
+                    key.parse::<usize>()
+                        .is_ok_and(|i| i < items.len() && !h.is_hole(recv, i))
+                }
             }
             _ => false,
         }

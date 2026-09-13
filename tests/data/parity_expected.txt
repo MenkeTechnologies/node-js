@@ -1022,6 +1022,29 @@ raw-shape true true
 request   PUT|sent|true|true|true|sent
 status    200 OK
 closed    yes
+==== inheritedholes.js ====
+hole-read     ["q",true,false]
+past-end      ["v",true]
+named         ["s",true]
+own-wins      [1,3]
+accessor      "acc"
+intrinsic     ["p",true,false]
+intrinsic-end ["p",true]
+not-own       [["0","2"],["0","2","length"],3]
+for-in        ["0","2","1"]
+for-in-dense  ["0","1"]
+map           [1,"p",3]
+forEach       [[0,1],[1,"p"],[2,3]]
+filter        [1,"p",3]
+flat          [1,"p",3]
+spread        [1,"p",3]
+json          "[1,\"p\",3]"
+join          "1,p,3"
+indexOf       [1,true,1]
+sort          [1,3,"p"]
+reduce        "1p3"
+concat-slice  [[0,1,"p",3],["p",3]]
+plain-hole    [null,false,[1,null,3],"[1,null,3]",[1,3],["0","2"]]
 ==== inoperator.js ====
 object    [true,true,true,true,false]
 array     [true,true,true,false]
