@@ -2568,11 +2568,17 @@ Still divergent, and why:
   but it means no record may assert a comparison count or an
   observed argument pair. `examples/sortmutation.js` guards every mutation to
   fire exactly once for that reason.
-- **Replacing an array's prototype does not detach the intrinsic methods.**
-  `Object.setPrototypeOf(a, {1: "q"})` leaves `a.join()` working where node
-  throws `a.join is not a function` — the `Array.prototype` methods are
-  synthesized from the receiver's KIND rather than found on its chain, so a
-  re-linked prototype cannot take them away. The same holds for every exotic.
-  `examples/monkeypatch.js` pins what a patched prototype ADDS, and
-  `examples/inheritedholes.js` what it supplies at an elided index — both are
-  the half that does work.
+- **A plain object does not GAIN a builtin's methods from its prototype.** The
+  mirror of the detachment case, and the half still open:
+  `Object.create(Array.prototype).push` is `undefined` where node gives a
+  function, because the methods are synthesized from the receiver's kind and an
+  ordinary object's kind is `Object`. `examples/protodetach.js` pins the
+  direction that works — the chain no longer REACHING an intrinsic takes its
+  methods away, and a subclass chain still finds them.
+- **A not-iterable TypeError names the VALUE, not the source expression.** Node
+  reports `a is not iterable`; this reports `[ 1, 2 ] is not iterable`. The
+  machinery exists — `host::name_call_site` rewrites `is not a function` and
+  `is not a constructor` from the compile-time `call_sites` table — but it
+  handles only those two suffixes, and the `GETITER` op records no source text.
+  `examples/protodetach.js` therefore pins `e.constructor.name` and not the
+  message.

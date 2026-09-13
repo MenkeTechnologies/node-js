@@ -1280,6 +1280,13 @@ impl JsHost {
             self.proto_class.insert(*i, class_val);
         }
     }
+    /// The class whose `prototype` object IS `v`, if `v` is one.
+    pub fn class_owning_proto(&self, v: &Value) -> Option<Value> {
+        match v {
+            Value::Obj(i) => self.proto_class.get(i).cloned(),
+            _ => None,
+        }
+    }
     /// The class constructor value nearest in `obj`'s prototype chain, if any.
     pub fn class_of(&self, obj: &Value) -> Option<Value> {
         let mut cur = self.proto_of(obj);
@@ -7727,7 +7734,14 @@ pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
         return Ok(out);
     }
     // Arrays, strings, Map/Set: already materialized, and their built-in
-    // iterators carry no `return`, so there is nothing to close.
+    // iterators carry no `return`, so there is nothing to close. The same
+    // reachability rule as `iter_all` applies — this is the DESTRUCTURING
+    // entry point, and `const [x] = a` bound 1 from an array whose prototype no
+    // longer carried `Symbol.iterator`.
+    if !crate::builtins::own_intrinsic_reachable_pub(v) {
+        let shown = with_host(|h| h.inspect(v));
+        return Err(type_error(&format!("{shown} is not iterable")));
+    }
     with_host(|h| h.iter_vec(v)).map(|items| items.into_iter().take(n).collect())
 }
 
@@ -7745,17 +7759,28 @@ pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
         }
         return Ok(out);
     }
+    // Object with a user-defined Symbol.iterator: drive its iterator protocol.
+    // Checked BEFORE the reachability guard below, since an own `Symbol
+    // .iterator` makes a value iterable no matter what its prototype is.
+    if let Some(iter_fn) = user_iterator_fn(v) {
+        let iterator = invoke(&iter_fn, Vec::new(), Some(v.clone()))?;
+        return drain_iterator(&iterator);
+    }
+    // The fast paths below read a builtin's backing storage directly, which is
+    // only legitimate while that builtin's `Symbol.iterator` is still
+    // reachable: replacing the prototype takes it away, and node then reports
+    // the value as not iterable. Spread, destructuring and `Array.from`'s
+    // iterable branch all funnel through here.
+    if !crate::builtins::own_intrinsic_reachable_pub(v) {
+        let shown = with_host(|h| h.inspect(v));
+        return Err(type_error(&format!("{shown} is not iterable")));
+    }
     // A String wrapper iterates its code POINTS, exactly as the primitive does
     // (22.1.3.34) — `[...new String("ab")]` is `["a","b"]`, not a TypeError.
     if let Some(prim) = crate::builtins::wrapped_primitive(v) {
         if with_host(|h| matches!(h.get(&prim), Some(JsObj::Str(_)))) {
             return iter_all(&prim);
         }
-    }
-    // Object with a user-defined Symbol.iterator: drive its iterator protocol.
-    if let Some(iter_fn) = user_iterator_fn(v) {
-        let iterator = invoke(&iter_fn, Vec::new(), Some(v.clone()))?;
-        return drain_iterator(&iterator);
     }
     // An array's index ACCESSORS are not in its backing vector, so iterating one
     // (spread, `for-of`, `Array.from`) has to resolve them the way the

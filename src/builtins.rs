@@ -1132,7 +1132,8 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         return Ok(prototype_of(recv));
     }
     let kind = with_host(|h| h.kind_of(recv));
-    let out = match kind {
+    #[allow(unused_mut)]
+    let mut out = match kind {
         Some(ObjKind::Object) => {
             let numeric = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
             // A view over a DETACHED buffer reports zero extent. Its own
@@ -1451,6 +1452,29 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         return Err(host::type_error(
             "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
         ));
+    }
+    // A method SYNTHESIZED from the receiver's kind is only reachable while the
+    // receiver's intrinsic prototype is still on its chain. `Object
+    // .setPrototypeOf(a, {})` must make `a.join` `undefined`; the kind arm
+    // above answers from the kind alone and cannot know the link changed. Only
+    // a synthesized value is dropped — the two shapes a method read produces —
+    // and only when the receiver does not own the name itself.
+    if matches!(
+        with_host(|h| h.get(&out).cloned()),
+        Some(JsObj::BoundMethod { .. })
+    ) || matches!(
+        with_host(|h| h.get(&out).cloned()),
+        Some(JsObj::Builtin(ns)) if ns.starts_with("@proto:")
+    ) {
+        // The kind arms synthesize their OWN kind's methods, so that is the
+        // prototype whose reachability decides. Clearing the value here lets
+        // the `inherited_method_owner` fallback below re-supply the
+        // `Object.prototype` form where one exists — which is why
+        // `a.toString` stays a function after the link is replaced while
+        // `a.join` does not.
+        if !own_intrinsic_reachable(recv) && !has_own_for_shadow(recv, name) {
+            out = Value::Undef;
+        }
     }
     // A key the receiver does not OWN is looked up on its prototype chain. The
     // exotic arms above answer from their own storage and stop, so an array
@@ -4617,6 +4641,19 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
         with_host(|h| h.kind_of(&v)),
         Some(ObjKind::Array) | Some(ObjKind::Str)
     );
+    // …but only while their `Symbol.iterator` is still reachable. It comes from
+    // the intrinsic prototype, so replacing the link takes it away: node reports
+    // `a is not iterable` for an array whose prototype is a plain object, where
+    // the fast path below iterated the backing vector regardless.
+    if !own_intrinsic_reachable(&v)
+        && !matches!(
+            get_property(&v, "@@iterator"),
+            Ok(ref f) if with_host(|h| host::is_callable(h, f))
+        )
+    {
+        let shown = with_host(|h| h.inspect(&v));
+        return abort(vm, host::type_error(&format!("{shown} is not iterable")));
+    }
     // Anything else with a `Symbol.iterator`: call it for the iterator object.
     //
     // Resolved as a full property READ, not a stored-property lookup. A
@@ -8999,6 +9036,20 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
             return host::invoke(&f, args, Some(recv.clone()));
         }
     }
+    // A method synthesized from the receiver's KIND is unreachable once its
+    // intrinsic prototype is off the chain. The read already answers
+    // `undefined` for one; dispatch has its own table and would still have
+    // called it, so `Object.setPrototypeOf(a, {}); a.join()` returned "1,2"
+    // while `a.join` was `undefined` — the read and the call disagreeing again,
+    // in the opposite direction from the monkey-patch case below.
+    if !own_intrinsic_reachable(recv)
+        && inherited_method_owner(recv, name).is_none()
+        && !has_own_for_shadow(recv, name)
+        && inherited_builtin_static(recv, name).is_none()
+        && with_host(|h| host::lookup_chain(h, recv, name)).is_none()
+    {
+        return Err(host::type_error(&format!("{name} is not a function")));
+    }
     // A method monkey-patched onto the receiver's intrinsic prototype. The READ
     // path resolves these, but dispatch goes straight to the builtin table and
     // never consults it, so `Array.prototype.last = f; [1].last()` threw "is not
@@ -13237,6 +13288,77 @@ fn inherited_builtin_method(obj: &Value, key: &str) -> bool {
     inherited_method_owner(obj, key).is_some()
 }
 
+/// Whether `recv`'s intrinsic prototype is still on its chain — that is,
+/// whether `Array.prototype`'s methods are still reachable from an array.
+///
+/// A builtin's methods are synthesized from the receiver's KIND rather than
+/// found on a chain, so replacing the prototype could not take them away:
+/// `Object.setPrototypeOf(a, {})` left `a.join` a function where node reports
+/// `undefined`, and `Object.setPrototypeOf(a, null)` did too. The exotic
+/// storage is unaffected either way — `Array.isArray`, `a.length` and `a[0]`
+/// all still answer, as they do in node.
+///
+/// The overwhelmingly common case is the DEFAULT link, which is recorded as no
+/// link at all, so this answers true after one map probe and allocates nothing.
+pub(crate) fn own_intrinsic_reachable_pub(recv: &Value) -> bool {
+    own_intrinsic_reachable(recv)
+}
+
+fn own_intrinsic_reachable(recv: &Value) -> bool {
+    // A BOXED primitive needs no special case here: its methods resolve through
+    // `inherited_method_owner`, which applies the wrapper rule itself.
+    with_host(|h| default_ctor_name(h, recv)).map_or(true, |c| intrinsic_reachable(recv, c))
+}
+
+/// Whether the intrinsic prototype for `ctor` is still on `recv`'s chain.
+fn intrinsic_reachable(recv: &Value, ctor: &str) -> bool {
+    let own = Some(ctor);
+    let mut cur = recv.clone();
+    for _ in 0..100 {
+        let explicit = with_host(|h| h.proto_of(&cur));
+        let Some(p) = explicit else {
+            // No explicit link: the implicit prototype is this object's own
+            // kind's, which is what `recv` is asking about only while `cur` is
+            // still `recv` itself.
+            if with_host(|h| h.has_null_proto(&cur)) {
+                return false;
+            }
+            let implicit = with_host(|h| default_ctor_name(h, &cur));
+            // Every implicit prototype chain ends at `Object.prototype`, so a
+            // question about `Object` is answered yes by any of them.
+            return implicit == own || ctor == "Object";
+        };
+        if with_host(|h| h.is_null(&p)) {
+            return false;
+        }
+        let hit = with_host(|h| {
+            own.is_some_and(|c| {
+                matches!(h.get(&p), Some(JsObj::Builtin(ns)) if *ns == format!("{c}.prototype"))
+                    || h.intrinsic_proto_ctor(&p) == Some(c)
+                    || (c == "Object" && h.object_proto() == p)
+            })
+        });
+        if hit {
+            return true;
+        }
+        // A CLASS prototype object is not linked to the builtin its class
+        // extends — the `extends` relationship is recorded on the class value —
+        // so the walk has to cross over there or `class D extends Array {}` ends
+        // it, and every inherited method of every subclass instance vanishes.
+        if let Some(builtin) = with_host(|h| {
+            h.class_owning_proto(&p)
+                .and_then(|c| h.class_builtin_ancestor(&c))
+                .map(|b| h.callable_name(&b))
+        }) {
+            if own == Some(builtin.as_str()) || ctor == "Object" {
+                return true;
+            }
+        }
+        cur = p;
+    }
+    false
+}
+
 /// The constructor whose prototype defines `key` for `obj` — its own if that
 /// prototype has it, otherwise `Object` — or `None` when neither does.
 ///
@@ -13274,10 +13396,14 @@ fn inherited_method_owner(obj: &Value, key: &str) -> Option<&'static str> {
                     .any(|m| m.strip_prefix('+').unwrap_or(m) == key)
             })
     };
+    // Each candidate is only an answer while ITS prototype is still on the
+    // receiver's chain. The two are asked separately: replacing an array's
+    // prototype with a plain object takes `Array.prototype`'s methods away and
+    // leaves `Object.prototype`'s, since the replacement inherits from it.
     match ctor {
-        Some(c) if on_proto(c) => Some(c),
+        Some(c) if on_proto(c) && intrinsic_reachable(obj, c) => Some(c),
         // Everything else inherits `Object.prototype`'s.
-        _ if on_proto("Object") => Some("Object"),
+        _ if on_proto("Object") && intrinsic_reachable(obj, "Object") => Some("Object"),
         _ => None,
     }
 }

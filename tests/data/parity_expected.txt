@@ -1711,6 +1711,31 @@ index    TypeError: Cannot read properties of null (reading '0')
 absent   TypeError: {}.nope is not a function
 absent2  TypeError: [].nope is not a function
 optional undefined undefined undefined
+==== protodetach.js ====
+array-read    ["undefined","undefined","function","function"]
+array-in      [false,true,true]
+array-call    "TypeError"
+array-string  ["[object Array]","[object Array]"]
+still-array   [true,2,1,"[1,2]"]
+map           ["undefined","undefined","function"]
+regexp        ["undefined","undefined"]
+promise       "undefined"
+function      ["undefined","undefined",1]
+boxed-string  "undefined"
+null-proto    ["undefined","undefined"]
+bare-proto    ["undefined","undefined","undefined",false]
+bare-plain    ["undefined","undefined"]
+spread        "TypeError"
+for-of        "TypeError"
+destructure   "TypeError"
+param-pattern "TypeError"
+map-iterate   "TypeError"
+array-from    [1,2]
+replacement   "C"
+restore       ["1-2",[1,2]]
+subclass      ["function","1-2",true,[1,2]]
+subclass-map  ["function",2]
+deep-subclass ["function","3"]
 ==== protomembers.js ====
 Map      clear,constructor,delete,entries,forEach,get,getOrInsert,getOrInsertComputed,has,keys,set,size,values
 Set      add,clear,constructor,delete,difference,entries,forEach,has,intersection,isDisjointFrom,isSubsetOf,isSupersetOf,keys,size,symmetricDifference,union,values
