@@ -436,13 +436,42 @@ fn new_module(id: &str, dir: &str, filename: &str) -> Value {
         props.insert("exports".to_string(), exports);
         props.insert("filename".to_string(), h.new_str(filename.to_string()));
         props.insert("loaded".to_string(), Value::Bool(false));
+        // `module.parent` is long deprecated but PRESENT: node reports `null`
+        // for a file the loader reached directly, and code still tests
+        // `if (!module.parent)` to detect "run as the entry point". The key was
+        // missing entirely, so `'parent' in module` was false.
+        let null = h.null();
+        props.insert("parent".to_string(), null);
         let children = h.new_array(Vec::new());
         props.insert("children".to_string(), children);
         let paths: Vec<Value> = node_modules.into_iter().map(|p| h.new_str(p)).collect();
         let paths = h.new_array(paths);
         props.insert("paths".to_string(), paths);
-        h.new_object(props)
+        let obj = h.new_object(props);
+        // `parent` is present but NOT enumerable: `Object.keys(module)` does not
+        // list it, while `'parent' in module` is true. Adding it as an ordinary
+        // property changed the key order the es_parity module tests pin.
+        h.hide_prop(&obj, "parent");
+        obj
     })
+}
+
+/// The directories `require.resolve` would search for `spec`, in order.
+///
+/// A RELATIVE specifier resolves against one directory — the requiring one — so
+/// node reports just that. A bare package name walks the `node_modules` chain
+/// up to the root.
+pub fn resolve_paths(spec: &str, from_dir: &std::path::Path) -> Vec<String> {
+    if spec.starts_with('.') || spec.starts_with('/') {
+        return vec![from_dir.to_string_lossy().into_owned()];
+    }
+    let mut out = Vec::new();
+    let mut cur = Some(from_dir);
+    while let Some(d) = cur {
+        out.push(d.join("node_modules").to_string_lossy().into_owned());
+        cur = d.parent();
+    }
+    out
 }
 
 /// Flip `module.loaded` once the body has run, as Node's loader does.

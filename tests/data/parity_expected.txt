@@ -1092,6 +1092,19 @@ array    arr
 root     ""|object|1
 order    b,a,c,
 dropped  {"b":2}
+==== modulesurface.js ====
+parent   true null false
+keys     ["id","path","exports","filename","loaded","children","paths"]
+shape    string string string true true boolean
+main     true object
+ext      object [".js",".json",".node"] function
+paths    null null
+relative true 1
+package  true true
+resolve  fs object function
+builtin  true,false,true,function
+dirs     string string true
+prefix   true
 ==== nodesurface.js ====
 signals  9 2 15 6 3
 errno    1 2 4 9 13

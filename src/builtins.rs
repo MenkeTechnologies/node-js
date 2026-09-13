@@ -1977,6 +1977,26 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     }
     // The ENTRY script's `require` is this builtin rather than the per-module
     // closure, so its `cache` has to be handed out here too.
+    // `require.extensions` — the legacy loader map. Deprecated but still read
+    // (and sometimes written) by tooling that hooks module loading, and it was
+    // absent entirely. The three keys node ships are present; installing a
+    // custom loader through them is NOT honoured by this runtime's loader, so
+    // the map reports what it can serve rather than pretending otherwise.
+    if ns == "require" && name == "extensions" {
+        return with_host(|h| {
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            for ext in [".js", ".json", ".node"] {
+                let f = h.alloc(JsObj::Builtin(format!("@@extension:{ext}")));
+                m.insert(ext.to_string(), f);
+            }
+            h.new_object(m)
+        });
+    }
+    // `require.resolve.paths(spec)` — the directories a lookup would search:
+    // `null` for a core module, the `node_modules` chain otherwise.
+    if ns == "require.resolve" && name == "paths" {
+        return with_host(|h| h.alloc(JsObj::Builtin("require.resolve.paths".to_string())));
+    }
     if ns == "require" && name == "cache" {
         return with_host(|h| h.alloc(JsObj::Builtin(REQUIRE_CACHE.to_string())));
     }
@@ -4574,6 +4594,7 @@ const NS_METHODS: &[&str] = &[
     "process.nextTick",
     "Error.captureStackTrace",
     "require.resolve",
+    "require.resolve.paths",
 ];
 
 /// The `name` and `length` a builtin function reports, from the generated
@@ -4725,6 +4746,25 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         let spec = with_host(|h| h.str_of(&arg0(&args)));
         let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
         return crate::module::require(&spec, std::path::Path::new(&from));
+    }
+    if name == "require.resolve.paths" {
+        let spec = with_host(|h| h.str_of(&arg0(&args)));
+        // A core module is not looked up on disk at all.
+        if crate::stdlib::is_core(&spec) {
+            return Ok(with_host(|h| h.null()));
+        }
+        let dirs = crate::module::resolve_paths(&spec, &crate::module::entry_dir());
+        return Ok(with_host(|h| {
+            let items: Vec<Value> = dirs.into_iter().map(|d| h.new_str(d)).collect();
+            h.new_array(items)
+        }));
+    }
+    // A `require.extensions` entry. This runtime's loader does not dispatch
+    // through the map, so calling one is the loader's own behaviour for that
+    // extension rather than a hook point.
+    if let Some(ext) = name.strip_prefix("@@extension:") {
+        let _ = ext;
+        return Ok(Value::Undef);
     }
     // `require.resolve(spec)` at the ENTRY level: resolve from the entry dir.
     if name == "require.resolve" {
