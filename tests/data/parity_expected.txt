@@ -1119,6 +1119,57 @@ array    arr
 root     ""|object|1
 order    b,a,c,
 dropped  {"b":2}
+==== methodidentity.js ====
+arr.push      true
+arr.map       true
+str.slice     true
+num.toFixed   true
+map.get       true
+set.add       true
+promise.then  true
+regexp.test   true
+date.getTime  true
+obj.hasOwn    true
+fn.call       true
+instances    true true
+meta         push 1 slice
+call/apply   2 bc [object Number]
+accepts       [object Object]
+Array.push            TypeError: Cannot convert undefined or null to object
+Array.map             TypeError: Array.prototype.map called on null or undefined
+Array.join            TypeError: Cannot convert undefined or null to object
+String.slice          TypeError: String.prototype.slice called on null or undefined
+String.toUpperCase    TypeError: String.prototype.toUpperCase called on null or undefined
+String.trimStart      TypeError: String.prototype.trimLeft called on null or undefined
+String.valueOf        TypeError: String.prototype.valueOf requires that 'this' be a String
+Object.hasOwnProperty TypeError: Cannot convert undefined or null to object
+Object.valueOf        TypeError: Cannot convert undefined or null to object
+Object.toLocaleString TypeError: Object.prototype.toLocaleString called on null or undefined
+Number.toFixed        TypeError: Number.prototype.toFixed requires that 'this' be a Number
+Boolean.valueOf       TypeError: Boolean.prototype.valueOf requires that 'this' be a Boolean
+Symbol.valueOf        TypeError: Symbol.prototype.valueOf requires that 'this' be a Symbol
+Function.call         TypeError: Function.prototype.call was called on undefined, which is undefined and not a function
+Function.bind         TypeError: Bind must be called on a function
+Map.get               TypeError: Method Map.prototype.get called on incompatible receiver undefined
+Set.keys              TypeError: Method Set.prototype.values called on incompatible receiver undefined
+WeakMap.get           TypeError: Method WeakMap.prototype.get called on incompatible receiver undefined
+WeakRef.deref         TypeError: Method WeakRef.prototype.deref called on incompatible receiver undefined
+RegExp.test           TypeError: Method RegExp.prototype.test called on incompatible receiver undefined
+Promise.then          TypeError: Method Promise.prototype.then called on incompatible receiver undefined
+Promise.catch         TypeError: Cannot read properties of undefined (reading 'then')
+Promise.finally       TypeError: Promise.prototype.finally called on non-object
+Date.getTime          TypeError: this is not a Date object.
+Date.toISOString      TypeError: Method Date.prototype.toISOString called on incompatible receiver undefined
+Date.toGMTString      TypeError: Method Date.prototype.toUTCString called on incompatible receiver undefined
+Date.toJSON           TypeError: Cannot convert undefined or null to object
+ArrayBuffer.slice     TypeError: Method ArrayBuffer.prototype.slice called on incompatible receiver undefined
+DataView.getInt8      TypeError: Method DataView.prototype.getInt8 called on incompatible receiver undefined
+URLSearchParams.get   TypeError: Value of "this" must be of type URLSearchParams
+null Array.push       Cannot convert undefined or null to object
+null Array.map        Array.prototype.map called on null or undefined
+null Array.join       Cannot convert undefined or null to object
+null String.slice     String.prototype.slice called on null or undefined
+null Map.get          Method Map.prototype.get called on incompatible receiver null
 ==== modulesurface.js ====
 parent   true null false
 keys     ["id","path","exports","filename","loaded","children","paths"]

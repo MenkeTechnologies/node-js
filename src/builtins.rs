@@ -1494,6 +1494,17 @@ fn bound_method_property(recv: &Value, name: &str) -> Value {
 }
 
 fn bound_method(recv: &Value, name: &str) -> Value {
+    // An ECMAScript intrinsic is ONE function object shared by every instance:
+    // `[1].push === Array.prototype.push` and `[1].push === [2].push` are both
+    // true. Reading one off an instance used to mint a fresh thunk bound to that
+    // instance, so every such comparison answered false — and a detached method
+    // kept working on the receiver it was read off, where node throws because it
+    // has no `this` at all.
+    if let Some(key) = bound_method_key(recv, name) {
+        if builtin_meta(&key).is_some() {
+            return with_host(|h| h.alloc(JsObj::Builtin(key)));
+        }
+    }
     with_host(|h| {
         h.alloc(JsObj::BoundMethod {
             recv: recv.clone(),
@@ -2242,8 +2253,119 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
 /// `this`). `Object.prototype.toString` yields the `[object Tag]` brand string
 /// libraries type-check on; every other method routes through normal method
 /// dispatch on `recv`.
+/// The TypeError a `<Ctor>.prototype.<method>` thunk throws when it is invoked
+/// with NO receiver — `const f = [].push; f(1)`.
+///
+/// Reading a method off an instance used to mint a thunk bound to that
+/// instance, so a detached method silently kept working on the object it came
+/// from. Now that it is the shared intrinsic, a bare call has no `this` and has
+/// to say so. Node words it four ways, and which one a method gets is not
+/// something that can be derived — the split was measured across every method
+/// of each prototype:
+///
+/// ```text
+/// ToObject(this)         "Cannot convert undefined or null to object"
+/// RequireObjectCoercible "<Ctor>.prototype.<m> called on null or undefined"
+/// brand check            "<Ctor>.prototype.<m> requires that 'this' be a <X>"
+/// everything else        the generic incompatible-receiver message
+/// ```
+fn nullish_receiver_error(ctor: &str, method: &str, recv: &str) -> Option<String> {
+    // `Array.prototype` splits: the CALLBACK-taking methods plus `concat` and
+    // the two `indexOf` family members name themselves, the rest go through
+    // `ToObject` and report its message.
+    const ARRAY_NAMED: &[&str] = &[
+        "concat",
+        "every",
+        "filter",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "forEach",
+        "indexOf",
+        "map",
+        "reduce",
+        "reduceRight",
+        "some",
+    ];
+    const TO_OBJECT: &str = "Cannot convert undefined or null to object";
+    let named = |c: &str| format!("{c}.prototype.{method} called on null or undefined");
+    let branded =
+        |c: &str, want: &str| format!("{c}.prototype.{method} requires that 'this' be a {want}");
+    // The generic form names the receiver, so a `null` one must not be reported
+    // as `undefined`.
+    let generic = |c: &str, m: &str| {
+        format!("Method {c}.prototype.{m} called on incompatible receiver {recv}")
+    };
+    Some(match ctor {
+        "Array" if ARRAY_NAMED.contains(&method) => named("Array"),
+        "Array" => TO_OBJECT.to_string(),
+        // `Object.prototype.toString` is the one method that ACCEPTS a nullish
+        // receiver — it answers `[object Undefined]`.
+        "Object" if method == "toString" => return None,
+        "Object" if method == "toLocaleString" => named("Object"),
+        "Object" => TO_OBJECT.to_string(),
+        // Both aliases report the LEGACY name in the message, which is the one
+        // place `name` and the message disagree.
+        "String" if method == "trimStart" => named("String").replace("trimStart", "trimLeft"),
+        "String" if method == "trimEnd" => named("String").replace("trimEnd", "trimRight"),
+        "String" if matches!(method, "toString" | "valueOf") => branded("String", "String"),
+        "String" => named("String"),
+        "Number" => branded("Number", "Number"),
+        "Boolean" => branded("Boolean", "Boolean"),
+        "Symbol" => branded("Symbol", "Symbol"),
+        "Function" if method == "bind" => "Bind must be called on a function".to_string(),
+        "Function" if matches!(method, "call" | "apply") => format!(
+            "Function.prototype.{method} was called on undefined, which is undefined and not a function"
+        ),
+        "Function" => branded("Function", "Function"),
+        // `Promise.prototype.catch`/`finally` are written in terms of `then`, so
+        // a nullish receiver fails inside them and reports that instead.
+        "Promise" if method == "catch" => {
+            "Cannot read properties of undefined (reading 'then')".to_string()
+        }
+        "Promise" if method == "finally" => {
+            "Promise.prototype.finally called on non-object".to_string()
+        }
+        "Date" if method == "toJSON" => TO_OBJECT.to_string(),
+        // The plain GETTERS and `valueOf` read `[[DateValue]]` directly and
+        // report that slot check; every setter, every `to*String` and the two
+        // legacy year methods go through the generic receiver check first.
+        "Date"
+            if method == "valueOf"
+                || (method.starts_with("get") && method != "getYear") =>
+        {
+            "this is not a Date object.".to_string()
+        }
+        // An ALIAS reports the method it aliases: `toGMTString` IS `toUTCString`
+        // and `Set.prototype.keys` IS `values`, one function object each.
+        "Date" if method == "toGMTString" => generic("Date", "toUTCString"),
+        "Set" if method == "keys" => generic("Set", "values"),
+        // Everything else that is brand-checked names itself. Node reaches this
+        // wording from a `[[GetOwnProperty]]`-style slot check; here the check
+        // is the receiver's kind, and only the message has to agree.
+        "ArrayBuffer" | "DataView" | "RegExp" | "WeakRef" | "Map" | "Set" | "WeakMap"
+        | "WeakSet" | "Promise" | "Date" => generic(ctor, method),
+        "URLSearchParams" => "Value of \"this\" must be of type URLSearchParams".to_string(),
+        // Node's `URL` methods fail while reaching for their internal state, and
+        // report the read that failed rather than the method.
+        "URL" => "Cannot read properties of undefined (reading 'URL')".to_string(),
+        _ => return None,
+    })
+}
+
 pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result<Value, String> {
     let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
+    if with_host(|h| h.is_nullish(recv)) {
+        let shown = if with_host(|h| h.is_null(recv)) {
+            "null"
+        } else {
+            "undefined"
+        };
+        if let Some(msg) = nullish_receiver_error(ctor, method, shown) {
+            return Err(format!("TypeError: {msg}"));
+        }
+    }
     // `Error.prototype.toString` (20.5.3.4): `name`, `message`, or `name:
     // message`, read off the chain so a subclass's `this.name = 'E'` is honored.
     if ctor == "Error" && method == "toString" {

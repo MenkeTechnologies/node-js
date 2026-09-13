@@ -2502,3 +2502,10 @@ Still divergent, and why:
   called on incompatible receiver`; here the name resolves to no thunk and the
   read yields `undefined`. `Object.values(URL.prototype)` throws in node for
   the same reason and returns an array here.
+- **A method read off a NON-intrinsic instance is still bound to it.** Reading
+  an ECMAScript intrinsic off an instance now gives the one shared function
+  node gives (`[1].push === Array.prototype.push`, pinned in
+  `examples/methodidentity.js`), but a method of a node-implemented class —
+  `EventEmitter`, `Buffer`, a stream, a `Timeout` — is still a thunk bound to
+  the receiver it was read off. So `const on = emitter.on; on('x', f)` works
+  here and throws in node, and `emitter.on !== EventEmitter.prototype.on`.
