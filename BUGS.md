@@ -2521,3 +2521,8 @@ Still divergent, and why:
   '{(intermediate value)}'`; here it reports that the value is not iterable.
   Neither rendering is reproducible without inventing text for an expression
   that has none.
+- **A function PARAMETER has no temporal dead zone.** Block, function-body,
+  `for`-head, `switch` and module-top-level dead zones are in place
+  (`examples/deadzone.js`), but parameters are initialized into one scope with
+  no per-parameter hoist, so `function f(a = b, b = 2) {}` reads `b` as
+  `undefined` where node throws `Cannot access 'b' before initialization`.

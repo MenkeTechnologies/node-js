@@ -35,6 +35,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::FORITER, b_foriter);
     vm.register_builtin(ops::FORIN_KEYS, b_forin_keys);
     vm.register_builtin(ops::FORIN_ALIVE, b_forin_alive);
+    vm.register_builtin(ops::HOIST_TDZ, b_hoist_tdz);
     vm.register_builtin(ops::CONTAINS, b_contains);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
     vm.register_builtin(ops::BINOP, b_binop);
@@ -630,10 +631,28 @@ pub(crate) fn global_binding(name: &str) -> Option<Value> {
 
 fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     let name = sname(&vm.pop());
+    // A module-top-level dead zone is tracked by NAME rather than by a parked
+    // marker, so that the marker is never reachable as `globalThis.<name>`. It
+    // only applies when nothing on the scope chain SHADOWS the name — a class's
+    // own inner binding for its name does exactly that while its static
+    // initializers run.
+    if with_host(|h| h.is_tdz_global(&name) && h.read_name(&name).is_none()) {
+        return abort(vm, host::tdz_error(&name));
+    }
     match global_binding(&name) {
+        // The binding EXISTS but has not reached its declaration yet.
+        Some(v) if with_host(|h| h.is_tdz(&v)) => abort(vm, host::tdz_error(&name)),
         Some(v) => v,
         None => abort(vm, host::ref_error(&name)),
     }
+}
+
+/// `HOIST_TDZ` — declare one `let`/`const`/`class` name as uninitialized at the
+/// top of the scope that declares it.
+fn b_hoist_tdz(vm: &mut VM, _: u8) -> Value {
+    let name = sname(&vm.pop());
+    with_host(|h| h.hoist_tdz(&name));
+    Value::Undef
 }
 
 /// The three global VALUE properties that are `{writable: false}` (19.1.1-19.1.3).
@@ -655,6 +674,14 @@ fn b_setlocal(vm: &mut VM, _: u8) -> Value {
     // read back as `1`.
     if READONLY_GLOBALS.contains(&name.as_str()) && !with_host(|h| h.has_name(&name)) {
         return val;
+    }
+    // Assigning to a binding still in its temporal dead zone throws too —
+    // `{ x = 1; let x }` is a ReferenceError, not an initialization.
+    if with_host(|h| match h.read_name(&name) {
+        Some(v) => h.is_tdz(&v),
+        None => h.is_tdz_global(&name),
+    }) {
+        return abort(vm, host::tdz_error(&name));
     }
     // An assignment to a `const` binding throws (8.5.2 SetMutableBinding on an
     // immutable binding). This used to succeed silently.
@@ -3651,6 +3678,17 @@ fn b_typeof(vm: &mut VM, _: u8) -> Value {
 /// (never a ReferenceError) when the name is unbound — JS `typeof` semantics.
 fn b_typeof_name(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
+    // `typeof` does NOT excuse the temporal dead zone: it answers "undefined"
+    // for an UNBOUND name, but a `let` above its declaration is bound and
+    // throws. Reading the marker's type answered "function".
+    if with_host(|h| h.is_tdz_global(&name) && h.read_name(&name).is_none()) {
+        return abort(vm, host::tdz_error(&name));
+    }
+    if let Some(v) = with_host(|h| h.read_name(&name)) {
+        if with_host(|h| h.is_tdz(&v)) {
+            return abort(vm, host::tdz_error(&name));
+        }
+    }
     // Bound name (user variable) → typeof its value.
     if let Some(v) = with_host(|h| h.read_name(&name)) {
         return with_host(|h| {

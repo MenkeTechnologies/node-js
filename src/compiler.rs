@@ -313,6 +313,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     let mut b = ChunkBuilder::new();
     // Hoist function declarations to the top (JS function hoisting).
     c.hoist_vars(&mut b, stmts)?;
+    c.hoist_lexical(&mut b, stmts);
     c.hoist_funcs(&mut b, stmts)?;
     c.compile_stmts(&mut b, stmts)?;
     Ok(Program {
@@ -531,6 +532,42 @@ impl Compiler {
         Ok(())
     }
 
+    /// Declare every `let`/`const`/`class` named DIRECTLY in `stmts` as
+    /// uninitialized, at the top of the scope those statements form.
+    ///
+    /// Without it a lexical binding simply did not exist until its declaration
+    /// ran, so a read above it either found an OUTER binding of the same name —
+    /// `let x = 1; { x; let x = 2 }` read `1` where node throws — or reported
+    /// the name as undefined, which is the message for a typo rather than for
+    /// the temporal dead zone. Nested blocks are NOT walked: each opens its own
+    /// scope and hoists its own.
+    fn hoist_lexical(&mut self, b: &mut ChunkBuilder, stmts: &[Stmt]) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Decl {
+                    kind: DeclKind::Let | DeclKind::Const,
+                    decls,
+                } => {
+                    for d in decls {
+                        for name in binding_names(&d.target) {
+                            self.name_const(b, &name);
+                            b.emit(Op::CallBuiltin(ops::HOIST_TDZ, 1), 0);
+                            b.emit(Op::Pop, 0);
+                        }
+                    }
+                }
+                StmtKind::ClassDecl(c) => {
+                    if let Some(name) = &c.name {
+                        self.name_const(b, name);
+                        b.emit(Op::CallBuiltin(ops::HOIST_TDZ, 1), 0);
+                        b.emit(Op::Pop, 0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn hoist_funcs(&mut self, b: &mut ChunkBuilder, stmts: &[Stmt]) -> Result<(), String> {
         for s in stmts {
             if let StmtKind::FuncDecl {
@@ -602,7 +639,7 @@ impl Compiler {
                             b.emit(Op::LoadUndef, line);
                         }
                     }
-                    self.destructure_src = d.init.as_ref().and_then(|v| destructure_source_text(v));
+                    self.destructure_src = d.init.as_ref().and_then(destructure_source_text);
                     let r = self.compile_bind(b, &d.target, mode);
                     self.destructure_src = None;
                     r?;
@@ -617,6 +654,7 @@ impl Compiler {
                 if scoped {
                     self.emit_push_scope(b);
                 }
+                self.hoist_lexical(b, body);
                 self.hoist_funcs(b, body)?;
                 self.compile_stmts(b, body)?;
                 if scoped {
@@ -1270,6 +1308,11 @@ impl Compiler {
                 || update.as_ref().is_some_and(crate::capture::expr_captures));
         if per_iteration {
             self.emit_push_scope(b);
+            // The head's own bindings are in scope — and in their dead zone —
+            // for the head itself: `for (let i = i; …)` is a ReferenceError.
+            if let Some(init) = init.as_deref() {
+                self.hoist_lexical(b, std::slice::from_ref(init));
+            }
         }
         if let Some(init) = init {
             self.compile_stmt(b, init)?;
@@ -1571,6 +1614,11 @@ impl Compiler {
         // later cases but dies with the switch. It opens BEFORE the test chain
         // because each case test jumps straight into its body.
         self.emit_push_scope(b);
+        // …and every case's lexical names are hoisted into that one scope, so a
+        // read from an EARLIER case is a dead-zone error rather than a lookup
+        // that escapes to an outer binding.
+        let all: Vec<Stmt> = cases.iter().flat_map(|c| c.body.iter().cloned()).collect();
+        self.hoist_lexical(b, &all);
         // Emit the test chain: `if (disc === caseTest) goto bodyN`.
         let mut body_jumps: Vec<Option<usize>> = Vec::new();
         let mut default_idx: Option<usize> = None;
@@ -1709,6 +1757,7 @@ impl Compiler {
         let yields = std::mem::take(&mut self.yield_sites);
         let r = (|| {
             prelude(self, &mut cb)?;
+            self.hoist_lexical(&mut cb, stmts);
             self.hoist_funcs(&mut cb, stmts)?;
             self.compile_stmts(&mut cb, stmts)
         })();
@@ -1786,6 +1835,7 @@ impl Compiler {
             // `hoist_var_name` leaves an existing binding alone.
             self.hoist_vars(&mut fb, body)?;
             self.hoist_funcs(&mut fb, &prologue)?;
+            self.hoist_lexical(&mut fb, body);
             self.hoist_funcs(&mut fb, body)?;
             self.compile_stmts(&mut fb, &prologue)?;
             self.compile_stmts(&mut fb, body)
@@ -3965,4 +4015,30 @@ fn destructure_source_text(e: &Expr) -> Option<String> {
         } => format!("{}.{property}", destructure_source_text(object)?),
         _ => return None,
     })
+}
+
+/// Every name a binding pattern introduces, in source order — one for a plain
+/// identifier, and the leaves of an object or array pattern otherwise.
+fn binding_names(target: &Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Ident(n) => out.push(n.clone()),
+            Expr::Assign { target, .. } => walk(target, out),
+            Expr::Spread(inner) => walk(inner, out),
+            Expr::Array(items) => items.iter().for_each(|i| walk(i, out)),
+            Expr::Object(props) => {
+                for p in props {
+                    match p {
+                        Prop::KeyValue { value, .. } => walk(value, out),
+                        Prop::Spread(inner) => walk(inner, out),
+                        Prop::Accessor { .. } => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(target, &mut out);
+    out
 }

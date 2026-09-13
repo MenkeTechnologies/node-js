@@ -697,6 +697,26 @@ Expected values to be strictly deep-equal:
 -   when: 1970-01-01T00:00:00.001Z
   }
 
+==== deadzone.js ====
+shadowed   ReferenceError: Cannot access 'x' before initialization
+const      ReferenceError: Cannot access 'c' before initialization
+class      ReferenceError: Cannot access 'K' before initialization
+typeof     ReferenceError: Cannot access 'y' before initialization
+typeof-un  value "undefined"
+assign     ReferenceError: Cannot access 'w' before initialization
+destr-obj  ReferenceError: Cannot access 'dz' before initialization
+destr-arr  ReferenceError: Cannot access 'da' before initialization
+for-head   ReferenceError: Cannot access 'i' before initialization
+switch     ReferenceError: Cannot access 's' before initialization
+var        value "undefined"
+late-const 7
+closure    value 3
+loop-body  value [0,2]
+siblings   value [1,2]
+class-ok   value 1
+switch-ok  value 5
+class-self 5 Inner
+no-leak    object function
 ==== deepequal.js ====
 string ne => false
 date ne => false

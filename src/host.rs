@@ -108,6 +108,7 @@ pub mod ops {
     pub const SETLOCAL_STRICT: u16 = 73; // [name, value] -> value; like SETLOCAL but an UNRESOLVABLE name throws ReferenceError instead of creating a global (strict-mode PutValue)
     pub const HOIST_VAR: u16 = 74; // [name] -> create the `var` binding as undefined IF ABSENT (hoisting)
     pub const FORIN_ALIVE: u16 = 75; // [obj, key] -> Bool; is `key` STILL an enumerable property of `obj`? (a `for-in` body may have deleted it)
+    pub const HOIST_TDZ: u16 = 76; // [name] -> declare `name` in the CURRENT scope as UNINITIALIZED (the `let`/`const`/`class` temporal dead zone)
 }
 
 /// Per-call-site callee SOURCE TEXT, for the `TypeError` a failed call raises.
@@ -797,6 +798,12 @@ pub struct JsHost {
     pub tries: Vec<TryDef>,
     /// Module-level (global) names.
     globals: VarMap,
+    /// The one uninitialized-binding marker, allocated on first use. See
+    /// [`JsHost::tdz_marker`].
+    tdz: Option<Value>,
+    /// Module-top-level names still in their temporal dead zone. Kept out of
+    /// `globals` so the marker is never reachable as `globalThis.<name>`.
+    tdz_globals: rustc_hash::FxHashSet<String>,
     /// Top-level `const` names (a module frame declares into `globals`), so an
     /// assignment to one throws the same way a block-scoped `const` does.
     global_consts: rustc_hash::FxHashSet<String>,
@@ -1136,6 +1143,8 @@ impl JsHost {
         let global_env = new_env(None);
         let (io_tx, io_rx) = std::sync::mpsc::channel();
         let mut h = JsHost {
+            tdz: None,
+            tdz_globals: Default::default(),
             heap: Vec::new(),
             funcs: Vec::new(),
             tries: Vec::new(),
@@ -2366,6 +2375,13 @@ impl JsHost {
     }
 
     /// Scope-chain read: local + enclosing chain, then globals.
+    /// Whether `name` is a module-top-level binding that has not reached its
+    /// declaration yet. Separate from [`JsHost::is_tdz`], which answers for a
+    /// block-scoped one by inspecting the value it holds.
+    pub fn is_tdz_global(&self, name: &str) -> bool {
+        self.tdz_globals.contains(name)
+    }
+
     pub fn read_name(&self, name: &str) -> Option<Value> {
         let mut env = Some(self.cur_env());
         while let Some(e) = env {
@@ -2451,12 +2467,58 @@ impl JsHost {
         }
     }
 
+    /// The value a lexical binding holds between entering its scope and reaching
+    /// its declaration — its TEMPORAL DEAD ZONE. One heap object for the whole
+    /// process, so the check is a heap-index comparison and the marker cannot be
+    /// produced by any JavaScript expression. It never escapes: every path that
+    /// could read it throws first.
+    pub fn tdz_marker(&mut self) -> Value {
+        if let Some(v) = &self.tdz {
+            return v.clone();
+        }
+        let v = self.alloc(JsObj::Builtin("@@tdz".into()));
+        self.tdz = Some(v.clone());
+        v
+    }
+
+    /// Whether `v` is the uninitialized-binding marker.
+    pub fn is_tdz(&self, v: &Value) -> bool {
+        matches!((&self.tdz, v), (Some(Value::Obj(a)), Value::Obj(b)) if a == b)
+    }
+
+    /// Declare `name` in the CURRENT scope as uninitialized, unless that scope
+    /// already binds it. Emitted at the top of every scope for each `let`,
+    /// `const` and `class` declared directly in it, so a read before the
+    /// declaration throws instead of finding an OUTER binding of the same name —
+    /// `let x = 1; { x; let x = 2 }` used to read the outer `1`.
+    pub fn hoist_tdz(&mut self, name: &str) {
+        let marker = self.tdz_marker();
+        let f = self.frame();
+        // At module top level a lexical binding lives in `globals`, which is ALSO
+        // what backs `globalThis.<name>` — so parking the marker there exposes it
+        // to JavaScript, and `const crypto = …` made `globalThis.crypto` read
+        // back as the marker. Top-level dead zones are tracked in a separate set
+        // that only the name-read path consults.
+        if f.is_module && Rc::ptr_eq(&f.env, &f.base_env) {
+            if !self.globals.contains_key(name) {
+                self.tdz_globals.insert(name.to_string());
+            }
+            return;
+        }
+        let env = self.cur_env();
+        let mut e = env.borrow_mut();
+        if !e.vars.contains_key(name) {
+            e.vars.insert(name.to_string(), marker);
+        }
+    }
+
     /// Declare a new binding in the current scope (`let`/`const`). At the top of
     /// the module frame there is no local env, so those names become globals; once
     /// a block scope is open the binding belongs to that block.
     pub fn declare_name(&mut self, name: &str, val: Value) {
         let f = self.frame();
         if f.is_module && Rc::ptr_eq(&f.env, &f.base_env) {
+            self.tdz_globals.remove(name);
             self.globals.insert(name.to_string(), val);
         } else {
             self.cur_env()
@@ -2776,6 +2838,14 @@ pub fn type_error(msg: &str) -> String {
 }
 pub fn ref_error(name: &str) -> String {
     format!("ReferenceError: {name} is not defined")
+}
+
+/// The error a read of a lexical binding still in its TEMPORAL DEAD ZONE
+/// raises. Distinct from [`ref_error`] on purpose: node says which of the two
+/// happened, and the difference is how a reader tells a misspelled name from a
+/// `let` used above its declaration.
+pub fn tdz_error(name: &str) -> String {
+    format!("ReferenceError: Cannot access '{name}' before initialization")
 }
 pub fn range_error(msg: &str) -> String {
     format!("RangeError: {msg}")
