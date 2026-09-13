@@ -840,6 +840,21 @@ cb-b64   null "aGVsbG8="
 cb-buf   null true
 prom-hex "68656c6c6f"
 cleanup  false
+==== forin.js ====
+deleted  x,y
+proto    a
+added    a
+current  p,q,r
+flip     a,b,c
+traps    ownKeys gopd:a visit:a gopd:b visit:b
+pxflip   a,b
+indexed  0,1,2 0,1,2
+nullish  ok
+shadow   a=9,b=2
+nonenum  shown
+labels   a
+nested   xx,xy,yx,yy
+order    1,2,b,a
 ==== formatdirectives.js ====
 plain => "{ a: 1 }"
 nested => "{ a: [Object] }"

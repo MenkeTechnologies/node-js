@@ -490,6 +490,21 @@ pub fn own_enum_string_keys(v: &Value) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Is `key` an own ENUMERABLE property of this proxy right now? One
+/// `getOwnPropertyDescriptor` trap call, which is what `for-in` runs per key at
+/// the moment it visits it (14.7.5.10) — `own_enum_string_keys` answers the same
+/// question for every key at once, which is the wrong shape when the body
+/// between two visits can delete a key or flip its enumerability.
+pub fn own_enumerable(v: &Value, key: &str) -> Result<bool, String> {
+    let Some(d) = get_own_descriptor(v, key)? else {
+        return Ok(false);
+    };
+    Ok(with_host(|h| match h.get(&d) {
+        Some(JsObj::Object(p)) => p.get("enumerable").map(|e| h.truthy(e)).unwrap_or(false),
+        _ => false,
+    }))
+}
+
 /// `(key, value)` for every own enumerable string key — spread / `Object.assign`
 /// / `Object.entries` / `JSON.stringify`. Each value is read through the `get`
 /// trap, as the spec's `CreateDataPropertyOrThrow(…, Get(from, key))` requires.

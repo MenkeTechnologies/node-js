@@ -34,6 +34,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETITER, b_getiter);
     vm.register_builtin(ops::FORITER, b_foriter);
     vm.register_builtin(ops::FORIN_KEYS, b_forin_keys);
+    vm.register_builtin(ops::FORIN_ALIVE, b_forin_alive);
     vm.register_builtin(ops::CONTAINS, b_contains);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
     vm.register_builtin(ops::BINOP, b_binop);
@@ -4069,9 +4070,18 @@ fn b_forin_keys(vm: &mut VM, _: u8) -> Value {
     // `ownKeys` trap filtered by `[[GetOwnProperty]]`'s `enumerable`. Both traps
     // are user code, so this cannot run inside `enum_keys`'s `&mut` host borrow.
     if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Proxy) {
-        return match crate::proxy::own_enum_string_keys(&v) {
+        // `ownKeys` ONLY. The `enumerable` filter is 14.7.5.10's per-key
+        // `[[GetOwnProperty]]`, which `FORIN_ALIVE` runs at the moment each key
+        // is visited — so the `getOwnPropertyDescriptor` traps interleave with
+        // the body the way node's do, instead of all firing up front.
+        return match crate::proxy::own_keys(&v) {
             Ok(keys) => with_host(|h| {
-                let out: Vec<Value> = keys.into_iter().map(|k| h.new_str(k)).collect();
+                let out: Vec<Value> = keys
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|k| !host::is_symbol_key(k))
+                    .map(|k| h.new_str(k))
+                    .collect();
                 h.new_array(out)
             }),
             Err(e) => abort(vm, e),
@@ -4079,6 +4089,45 @@ fn b_forin_keys(vm: &mut VM, _: u8) -> Value {
     }
     let keys = with_host(|h| h.enum_keys(&v));
     with_host(|h| h.new_array(keys))
+}
+
+/// `FORIN_ALIVE` — is `key` STILL an enumerable property of `obj`?
+///
+/// `for-in` takes its key list once (14.7.5.10 builds it lazily, but a snapshot
+/// of the enumerable keys is observationally the same for everything except
+/// this), and the body can delete a key before the loop reaches it. Node does
+/// not visit a key deleted that way; without this check `delete d.z` inside the
+/// loop still produced `x,y,z`.
+///
+/// The check is `[[GetOwnProperty]]`-shaped rather than `in`: on a Proxy it runs
+/// the `getOwnPropertyDescriptor` trap, which is what node runs, and NOT the
+/// `has` trap, which node never fires for `for-in`. That also puts each trap
+/// call immediately before its visit, matching node's interleaving — the trap
+/// log used to show every `gopd` up front because the key list was filtered
+/// eagerly.
+fn b_forin_alive(vm: &mut VM, _: u8) -> Value {
+    let key = vm.pop();
+    let obj = vm.pop();
+    let name = with_host(|h| h.str_of(&key));
+    if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
+        return match crate::proxy::own_enumerable(&obj, &name) {
+            Ok(b) => Value::Bool(b),
+            Err(e) => abort(vm, e),
+        };
+    }
+    // A STRING's keys are its character indices. `in` is not defined on a string
+    // primitive at all, so the ordinary path below has no answer for one and
+    // `for (const i in 'abc')` came back empty.
+    if let Some(s) = with_host(|h| h.as_str(&obj)) {
+        let len = crate::utf16::len(&s);
+        return Value::Bool(name.parse::<usize>().is_ok_and(|i| i < len));
+    }
+    // Any other receiver: EXISTENCE only. Node re-checks that the key is still
+    // there and does NOT re-check enumerability — making one non-enumerable
+    // mid-loop still visits it, where re-filtering on `enumerable` dropped it.
+    // (The Proxy branch above does re-check, because there the answer comes from
+    // the trap node itself calls.)
+    Value::Bool(has_property_ordinary(&obj, &name))
 }
 
 fn b_foriter(vm: &mut VM, _: u8) -> Value {

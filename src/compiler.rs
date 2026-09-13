@@ -1294,11 +1294,20 @@ impl Compiler {
         object: &Expr,
         body: &Stmt,
     ) -> Result<(), String> {
+        // The object is kept in a temp for the whole loop: each key is re-checked
+        // against it just before it is visited, because the body can delete one
+        // (14.7.5.10 enumerates lazily, so a key deleted before its turn is never
+        // visited). Without that, `for (const k in d) delete d.z` still visited
+        // `z`.
+        let obj_tmp = self.tmp_name("forin");
         self.compile_expr(b, object)?;
+        self.name_const(b, &obj_tmp);
+        b.emit(Op::Swap, 0);
+        b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0); // [obj]
         b.emit(Op::CallBuiltin(ops::FORIN_KEYS, 1), 0); // [keys_array]
         b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
         self.iter_depth += 1;
-        let r = self.loop_over(b, declare, target, body);
+        let r = self.loop_over_inner(b, declare, target, body, Some(obj_tmp));
         self.iter_depth -= 1;
         r
     }
@@ -1394,12 +1403,36 @@ impl Compiler {
         target: &Expr,
         body: &Stmt,
     ) -> Result<(), String> {
+        self.loop_over_inner(b, declare, target, body, None)
+    }
+
+    /// `alive_in` names the local holding a `for-in`'s object. When it is set,
+    /// each key is re-checked against that object before it is bound, and a key
+    /// the body already deleted is skipped rather than visited.
+    fn loop_over_inner(
+        &mut self,
+        b: &mut ChunkBuilder,
+        declare: BindMode,
+        target: &Expr,
+        body: &Stmt,
+        alive_in: Option<String>,
+    ) -> Result<(), String> {
         // `for (const v of …)` binds a FRESH `v` each pass, so a closure made in one
         // pass keeps that pass's element.
         let per_iteration = matches!(declare, BindMode::Lexical | BindMode::Const);
         let start = b.current_pos();
         b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next]
         let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next
+        if let Some(obj_tmp) = &alive_in {
+            b.emit(Op::Dup, 0); // [iterator, key, key]
+            self.load_local(b, obj_tmp); // [iterator, key, key, obj]
+            b.emit(Op::Swap, 0); // [iterator, key, obj, key]
+            b.emit(Op::CallBuiltin(ops::FORIN_ALIVE, 2), 0); // [iterator, key, alive]
+            let jalive = b.emit(Op::JumpIfTrue(0), 0);
+            b.emit(Op::Pop, 0); // drop the dead key -> [iterator]
+            b.emit(Op::Jump(start), 0);
+            b.patch_jump(jalive, b.current_pos());
+        }
         if per_iteration {
             self.emit_push_scope(b);
         }

@@ -107,6 +107,7 @@ pub mod ops {
     pub const MARK_HOLE: u16 = 72; // [arr, index] -> arr; record an ELIDED array-literal element
     pub const SETLOCAL_STRICT: u16 = 73; // [name, value] -> value; like SETLOCAL but an UNRESOLVABLE name throws ReferenceError instead of creating a global (strict-mode PutValue)
     pub const HOIST_VAR: u16 = 74; // [name] -> create the `var` binding as undefined IF ABSENT (hoisting)
+    pub const FORIN_ALIVE: u16 = 75; // [obj, key] -> Bool; is `key` STILL an enumerable property of `obj`? (a `for-in` body may have deleted it)
 }
 
 /// Per-call-site callee SOURCE TEXT, for the `TypeError` a failed call raises.
