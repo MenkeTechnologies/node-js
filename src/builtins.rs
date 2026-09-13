@@ -8087,8 +8087,15 @@ fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String
     // `constructor` is the `Array` builtin, whose species is `Array`.
     // A chain lookup, not `get_property`: an Array receiver resolves its
     // properties through the stdlib funnel, which has no `constructor` entry,
-    // so the read alone reports `undefined` for every subclass instance.
-    let ctor = with_host(|h| host::lookup_chain(h, recv, "constructor")).unwrap_or(Value::Undef);
+    // so the read alone reports `undefined` for every subclass instance. A
+    // Proxy is the exception — it has no property map to walk, and its
+    // `constructor` comes from the `get` trap, so a proxied subclass array
+    // produced plain arrays.
+    let ctor = if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy) {
+        get_property(recv, "constructor").unwrap_or(Value::Undef)
+    } else {
+        with_host(|h| host::lookup_chain(h, recv, "constructor")).unwrap_or(Value::Undef)
+    };
     if !matches!(
         with_host(|h| h.kind_of(&ctor)),
         Some(ObjKind::Class) | Some(ObjKind::Func)
@@ -8338,7 +8345,7 @@ fn array_method_on(
         "slice" => {
             let items = array_items(recv);
             let (lo, hi) = slice_bounds(&args, items.len());
-            let out = array_species_create(recv, items[lo..hi].to_vec())?;
+            let out = array_species_create(this_value, items[lo..hi].to_vec())?;
             with_host(|h| h.copy_holes(recv, &out, |i| (i >= lo && i < hi).then(|| i - lo)));
             Ok(out)
         }
@@ -8393,7 +8400,7 @@ fn array_method_on(
                         .map(|i| i + base),
                 );
             }
-            let arr = array_species_create(recv, out)?;
+            let arr = array_species_create(this_value, out)?;
             with_host(|h| h.install_holes(&arr, holes));
             Ok(arr)
         }
@@ -8511,7 +8518,7 @@ fn array_method_on(
                     this_arg(&args, 1),
                 )?);
             }
-            let arr = array_species_create(recv, out)?;
+            let arr = array_species_create(this_value, out)?;
             with_host(|h| h.install_holes(&arr, holes));
             Ok(arr)
         }
@@ -8534,7 +8541,7 @@ fn array_method_on(
                     _ => out.push(r),
                 }
             }
-            array_species_create(recv, out)
+            array_species_create(this_value, out)
         }
         "filter" => {
             let items = array_items(recv);
@@ -8554,7 +8561,7 @@ fn array_method_on(
                     out.push(it.clone());
                 }
             }
-            array_species_create(recv, out)
+            array_species_create(this_value, out)
         }
         "forEach" => {
             let items = array_items(recv);
@@ -8829,7 +8836,7 @@ fn array_method_on(
             };
             let mut out = Vec::new();
             flatten_into(recv, depth, &mut out)?;
-            array_species_create(recv, out)
+            array_species_create(this_value, out)
         }
         "keys" => {
             let n = array_len(recv);

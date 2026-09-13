@@ -63,3 +63,26 @@ tracked.then((v) => console.log("value   ", v));
 console.log("plain   ", [1, 2].map((x) => x) instanceof Array,
   Object.getPrototypeOf([1, 2].map((x) => x)) === Array.prototype,
   Promise.resolve(1) instanceof Promise);
+
+// Through a PROXY. An array method on a proxy takes the array-LIKE path: the
+// elements are read into a temporary plain array and the method runs on that,
+// so the species was computed from the temporary and every proxied subclass
+// produced a plain `Array`. It has to come from the original receiver.
+class Wrapped extends Array {}
+const target = Wrapped.from([1, 2, 3]);
+const proxied = new Proxy(target, {});
+console.log("px-basic", Array.isArray(proxied), proxied.length, [...proxied].join(","));
+console.log("px-spec ", proxied.map((x) => x) instanceof Wrapped,
+  proxied.filter((x) => x > 1) instanceof Wrapped, proxied.slice(1) instanceof Wrapped);
+// A proxy over a plain array still yields plain arrays.
+const plainProxy = new Proxy([1, 2], {});
+console.log("px-plain", plainProxy.map((x) => x) instanceof Array,
+  Object.getPrototypeOf(plainProxy.map((x) => x)) === Array.prototype,
+  [0].concat(plainProxy).join(","));
+// The `constructor` a proxy reports comes from its `get` trap, which is what
+// the species read has to go through.
+let asked = 0;
+const traced = new Proxy(target, {
+  get(t, k, r) { if (k === "constructor") { asked++; } return Reflect.get(t, k, r); },
+});
+console.log("px-trap ", traced.map((x) => x) instanceof Wrapped, asked > 0);

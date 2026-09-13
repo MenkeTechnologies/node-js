@@ -1338,6 +1338,10 @@ reject   true
 then     true true
 track    true 1 true
 plain    true true true
+px-basic true 3 1,2,3
+px-spec  true true true
+px-plain true true 0,1,2
+px-trap  true true
 value    7
 ==== streams.js ====
 transform A,B,C
