@@ -1421,6 +1421,30 @@ true false false
 -1 0 1024 1024
 3.5 1 -1 5
 Infinity -Infinity NaN true false
+==== objectrest.js ====
+getter        [1,1]
+getter-desc   {"value":1,"writable":true,"enumerable":true,"configurable":true}
+order         [["a","b"],["a","b"]]
+excluded      [1,1,["b"]]
+throwing      TypeError: x
+symbol        [1,["a"]]
+computed-excl [1,{"b":2}]
+non-enumerable ["a"]
+inherited     ["own"]
+proxy         [{"a":1,"b":2},["ownKeys","gopd:a","get:a","gopd:b","get:b"]]
+array-source  {"0":1,"1":2}
+string-source {"0":"a","1":"b"}
+map-source    {"x":3}
+class-inst    ["a"]
+frozen-source [{"a":1},false]
+nested        [1,{"c":2},{"d":3}]
+array-rest    [1,[2,3]]
+string-rest   ["a",["b","c"]]
+param-rest    [1,[2,3]]
+spread-getter [7,1,true]
+spread-order  ["b","a","c","d"]
+spread-proto  [null,true,["__proto__"]]
+spread-prims  [{"0":"a","1":"b"},{},{},{},{}]
 ==== objects.js ====
 Ada { age: 36, roles: [ 'admin', 'dev' ] }
 [ 'name', 'age', 'roles', 'active' ] [ 36, [ 'admin', 'dev' ] ]

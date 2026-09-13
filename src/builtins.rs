@@ -527,36 +527,75 @@ fn b_obj_rest(vm: &mut VM, _: u8) -> Value {
         .iter()
         .filter_map(|v| host::to_property_key(v).ok())
         .collect();
-    with_host(|h| {
-        // CopyDataProperties (ECMA-262 7.3.25) copies the own ENUMERABLE keys,
-        // symbol-keyed ones included. The filter used to be `!excl.contains(k)`
-        // alone, which also copied every non-enumerable own property —
-        // `Object.defineProperty(o, 'hidden', { enumerable: false })` then
-        // showed up in the rest object, where node omits it.
-        let keys: Vec<String> = match h.get(&obj) {
-            Some(JsObj::Object(m)) => m.keys().cloned().collect(),
-            _ => Vec::new(),
+    // CopyDataProperties (ECMA-262 7.3.25) copies the own ENUMERABLE keys,
+    // symbol-keyed ones included. `own_enum_key_names` is what `Object.keys`
+    // uses, so an ACCESSOR is in the list — reading the property map directly
+    // missed one entirely, and `const { ...r } = { get g() {…} }` produced an
+    // object with no `g` and never ran the getter.
+    // A PROXY answers from its traps — `ownKeys`, then a
+    // `getOwnPropertyDescriptor` per key to test enumerability — which
+    // `own_enum_key_names` cannot see. Rest over one produced an empty object
+    // and ran no traps at all.
+    if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
+        let keys = match crate::proxy::own_keys(&obj) {
+            Ok(k) => k.unwrap_or_default(),
+            Err(e) => return abort(vm, e),
         };
-        let mut props: IndexMap<String, Value> = IndexMap::new();
+        let mut pairs: Vec<(String, Value)> = Vec::new();
         for k in keys {
             if excl.contains(&k) {
                 continue;
             }
-            // An internal slot (`@@native`, `@@bytes`, …) or a private class
-            // field is not a property; a SYMBOL key shares the `@@` prefix but
-            // is one, so the two cases cannot be told apart by the prefix.
-            if !host::is_symbol_key(&k) && (k.starts_with("@@") || k.starts_with('#')) {
-                continue;
+            // The enumerability test and the READ interleave per key, as node's
+            // trap log shows — testing every key first and then reading them
+            // all produced the right object through the wrong trap sequence.
+            match crate::proxy::own_enumerable(&obj, &k) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) => return abort(vm, e),
             }
-            if !h.prop_attrs(&obj, &k).enumerable {
-                continue;
+            match get_property(&obj, &k) {
+                Ok(v) => pairs.push((k, v)),
+                Err(e) => return abort(vm, e),
             }
-            if let Some(JsObj::Object(m)) = h.get(&obj) {
-                if let Some(v) = m.get(&k) {
-                    props.insert(k, v.clone());
+        }
+        return with_host(|h| h.new_object(pairs.into_iter().collect()));
+    }
+    let keys: Vec<String> = with_host(|h| {
+        // `own_enum_key_names` is the STRING half — the same list `Object.keys`
+        // gives, so an accessor is in it. The symbol-keyed half lives in the
+        // property map under the internal `@@sym:` spelling and has to be
+        // collected separately, since `Object.keys` deliberately omits it.
+        let mut ks = h.own_enum_key_names(&obj);
+        if let Some(JsObj::Object(m)) = h.get(&obj) {
+            for k in m.keys() {
+                if host::is_symbol_key(k) && h.prop_attrs(&obj, k).enumerable {
+                    ks.push(k.clone());
                 }
             }
         }
+        ks
+    })
+    .into_iter()
+    .filter(|k| {
+        // An internal slot (`@@native`, `@@bytes`, …) or a private class field
+        // is not a property; a SYMBOL key shares the `@@` prefix but is one, so
+        // the two cases cannot be told apart by the prefix alone.
+        !excl.contains(k)
+            && (host::is_symbol_key(k) || !(k.starts_with("@@") || k.starts_with('#')))
+    })
+    .collect();
+    // Each value is read through `[[Get]]`, OUTSIDE the host borrow: a getter is
+    // user code and re-entering the VM under the borrow aborts the process.
+    let mut pairs: Vec<(String, Value)> = Vec::with_capacity(keys.len());
+    for k in keys {
+        match get_property(&obj, &k) {
+            Ok(v) => pairs.push((k, v)),
+            Err(e) => return abort(vm, e),
+        }
+    }
+    with_host(|h| {
+        let props: IndexMap<String, Value> = pairs.into_iter().collect();
         h.new_object(props)
     })
 }
