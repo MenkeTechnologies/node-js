@@ -29,6 +29,7 @@ pub const METHODS: &[&str] = &[
     "styleText",
     "parseArgs",
     "promisify",
+    "aborted",
     "callbackify",
     "parseEnv",
     "debug",
@@ -220,6 +221,13 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "parseArgs" => return Some(parse_args(args)),
         "debuglog" => return Some(debuglog(args)),
         "promisify" => return Some(promisify(args)),
+        // `util.aborted(signal, resource)` — a promise that settles when the
+        // signal aborts. It did not exist, so the documented way to await an
+        // abort threw.
+        "aborted" => {
+            let signal = args.first().cloned().unwrap_or(Value::Undef);
+            return Some(aborted(&signal));
+        }
         "callbackify" => return Some(callbackify(args)),
         // `util.parseEnv(content)` → an object of the parsed dotenv assignments.
         "parseEnv" => Ok(parse_env(&super::arg_str(args, 0))),
@@ -537,6 +545,27 @@ const CALLBACKIFY_SRC: &str = "(function(original){\n\
 
 /// `util.promisify(fn)` → a function returning a Promise that resolves with the
 /// callback's value (rejecting on its error argument).
+/// `util.aborted(signal, resource)`.
+///
+/// Resolves when `signal` aborts — immediately if it already has. The
+/// `resource` argument only ties the promise to an async resource for tracking,
+/// which this runtime does not model, so it is accepted and ignored.
+fn aborted(signal: &Value) -> Result<Value, String> {
+    let already = crate::builtins::get_property(signal, "aborted").unwrap_or(Value::Undef);
+    if with_host(|h| h.truthy(&already)) {
+        return crate::builtins::promise_resolve_pub(Value::Undef);
+    }
+    let (promise, resolve) = crate::builtins::pending_promise_with_resolver();
+    // The listener is an ordinary `abort` handler, so it goes through the same
+    // path a script's own `signal.addEventListener('abort', …)` would.
+    crate::host::call_method(
+        signal,
+        "addEventListener",
+        vec![with_host(|h| h.new_str("abort")), resolve],
+    )?;
+    Ok(promise)
+}
+
 fn promisify(args: &[Value]) -> Result<Value, String> {
     let orig = args.first().cloned().unwrap_or(Value::Undef);
     if !with_host(|h| crate::host::is_callable(h, &orig)) {

@@ -6424,7 +6424,17 @@ fn bind_params(env: &Env, params: &[ParamSlot], args: Vec<Value>, is_arrow: bool
     // enclosing function's. Binding an empty one here made
     // `function f(){ const g = () => [...arguments]; }` see zero args.
     if !is_arrow {
-        let args_arr = with_host(|h| h.new_array(args));
+        let args_arr = with_host(|h| {
+            let a = h.new_array(args);
+            // Marked so it can be told apart from an ordinary array: node's
+            // `arguments` is an exotic, and without the mark
+            // `Array.isArray(arguments)` was true, the brand was
+            // `[object Array]` and `util.types.isArgumentsObject` was false.
+            // The backing representation stays an Array, which is what keeps
+            // indices, `length`, spread and `for-of` working.
+            h.set_fn_prop(&a, "@@arguments", Value::Bool(true));
+            a
+        });
         vars.entry("arguments".to_string()).or_insert(args_arr);
     }
     env.borrow_mut().vars = vars;

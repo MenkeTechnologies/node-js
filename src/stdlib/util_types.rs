@@ -13,10 +13,7 @@
 //!   - `isNativeError` defers to the real `host::instance_of` against `Error`.
 //!
 //! Deviations from V8, kept honest (node-js is not V8):
-//!   - `isProxy` is always `false` — there is no `Proxy` in node-js.
-//!   - No boxed primitives exist (`Number(x)` yields a primitive, never an
-//!     object wrapper), so `isBoxedPrimitive` and the `is{Number,String,…}Object`
-//!     family are all `false`.
+//!   - `isExternal` is `false`: there are no N-API external objects.
 //!   - `isArgumentsObject` is `false`: `arguments` is materialised as a plain
 //!     array (see `host.rs`), indistinguishable from any other array here.
 //!   - No `SharedArrayBuffer`/`DataView`/`BigInt64Array`, module-namespace, or
@@ -98,7 +95,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "isArrayBuffer" => b(super::native_tag(&v).as_deref() == Some("ArrayBuffer")),
         "isSharedArrayBuffer" => b(false),
         "isAnyArrayBuffer" => b(super::native_tag(&v).as_deref() == Some("ArrayBuffer")),
-        "isDataView" => b(false),
+        "isDataView" => b(super::native_tag(&v).as_deref() == Some("DataView")),
 
         // Typed arrays carry `@@native = "TypedArray"` + a `@@kind`; a Node
         // `Buffer` is a `Uint8Array` subclass, so it answers to both `isTypedArray`
@@ -113,9 +110,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "isInt32Array" => b(ta_kind(&v).as_deref() == Some("Int32Array")),
         "isFloat32Array" => b(ta_kind(&v).as_deref() == Some("Float32Array")),
         "isFloat64Array" => b(ta_kind(&v).as_deref() == Some("Float64Array")),
-        // No BigInt-backed typed arrays in node-js.
-        "isBigInt64Array" => b(false),
-        "isBigUint64Array" => b(false),
+        "isBigInt64Array" => b(ta_kind(&v).as_deref() == Some("BigInt64Array")),
+        "isBigUint64Array" => b(ta_kind(&v).as_deref() == Some("BigUint64Array")),
 
         "isAsyncFunction" => b(func_flag(&v, FuncFlag::Async)),
         "isGeneratorFunction" => b(func_flag(&v, FuncFlag::Generator)),
@@ -123,25 +119,27 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             matches!(h.get(&v), Some(JsObj::Generator { .. }))
         })),
 
-        // No Proxy in node-js; there is nothing that could report `true`.
-        "isProxy" => b(false),
+        "isProxy" => b(with_host(|h| h.kind_of(&v)) == Some(crate::host::ObjKind::Proxy)),
         // Reuse the vetted prototype-chain walk: any instance whose chain reaches
         // `Error.prototype` is a native error.
         "isNativeError" => b(is_native_error(&v)),
 
-        // node-js never boxes primitives, so every wrapper-object predicate is
-        // structurally `false`.
-        "isBoxedPrimitive" | "isNumberObject" | "isStringObject" | "isBooleanObject"
-        | "isSymbolObject" | "isBigIntObject" => b(false),
+        // A wrapper object carries the primitive it boxes in a hidden slot.
+        "isBoxedPrimitive" => b(boxed_kind(&v).is_some()),
+        "isNumberObject" => b(boxed_kind(&v) == Some(Boxed::Number)),
+        "isStringObject" => b(boxed_kind(&v) == Some(Boxed::String)),
+        "isBooleanObject" => b(boxed_kind(&v) == Some(Boxed::Boolean)),
+        "isSymbolObject" => b(boxed_kind(&v) == Some(Boxed::Symbol)),
+        "isBigIntObject" => b(boxed_kind(&v) == Some(Boxed::BigInt)),
 
-        // `arguments` is a plain array here (indistinguishable from any array),
-        // and there are no module-namespace / external (N-API) objects.
-        "isArgumentsObject" | "isModuleNamespaceObject" | "isExternal" => b(false),
+        // There are no module-namespace / external (N-API) objects.
+        "isArgumentsObject" => b(crate::builtins::is_arguments(&v)),
+        "isModuleNamespaceObject" | "isExternal" => b(false),
 
-        // A "view" over an `ArrayBuffer`: any typed array (a `Buffer` counts, being
-        // a `Uint8Array` subclass). node-js has no `DataView`, so views == typed
-        // arrays exactly.
-        "isArrayBufferView" => b(ta_kind(&v).is_some()),
+        // A "view" over an `ArrayBuffer`: any typed array (a `Buffer` counts,
+        // being a `Uint8Array` subclass) or a `DataView`.
+        "isArrayBufferView" => b(ta_kind(&v).is_some()
+            || super::native_tag(&v).as_deref() == Some("DataView")),
         // node-js has no `Float16Array` kind (no `@@kind` ever reports it).
         "isFloat16Array" => b(ta_kind(&v).as_deref() == Some("Float16Array")),
         // No WebCrypto `CryptoKey` / `KeyObject` heap kinds exist here.
@@ -154,6 +152,33 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 
         _ => None,
     }
+}
+
+/// Which primitive a wrapper object boxes.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Boxed {
+    Number,
+    String,
+    Boolean,
+    Symbol,
+    BigInt,
+}
+
+/// The primitive `v` boxes, or `None` when it is not a wrapper object.
+///
+/// Wrapper objects keep the boxed value in a hidden `@@primitive` slot, so the
+/// predicate reads that rather than the object's shape.
+fn boxed_kind(v: &Value) -> Option<Boxed> {
+    let prim = crate::builtins::wrapped_primitive(v)?;
+    Some(with_host(|h| match h.get(&prim) {
+        Some(JsObj::Str(_)) => Boxed::String,
+        Some(JsObj::Symbol { .. }) => Boxed::Symbol,
+        Some(JsObj::BigInt(_)) => Boxed::BigInt,
+        _ => match prim {
+            Value::Bool(_) => Boxed::Boolean,
+            _ => Boxed::Number,
+        },
+    }))
 }
 
 /// The typed-array kind of `v` (`"Uint8Array"`/…/`"Float64Array"`), or `None` if

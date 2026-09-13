@@ -301,6 +301,9 @@ builtins object object
 more     object object object
 custom   called
 other    idx str cat num
+aborted  object true false
+settled  true AbortError
+already  true
 forawait tick,tick,tick 3
 next     m false
 return   undefined true
@@ -1557,6 +1560,18 @@ usp-forof a=1,b=2 2
 hdr-forof x-one:1,x-two:2
 usp-views a,b 1,2 2
 others   a,b,104,105,7,g
+==== utiltypes.js ====
+proxy    true true false
+boxed    true true false false
+boxkind  true true true true
+boxneg   false false false false
+views    true false true true
+bufview  true true false false
+unchanged true true true true true
+args     [object Arguments]|false|true|undefined|undefined
+usable   2|7|7,8|7,8|7,8|0,1
+iterate  9 false false
+custom   symbol true Symbol(nodejs.util.promisify.custom)
 ==== wordcount.js ====
 the: 3
 fox: 2

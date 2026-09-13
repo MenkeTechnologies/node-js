@@ -45,3 +45,23 @@ console.log("other   ", [() => "idx"][0](), ({ k: () => "str" })["k"](), ({ ab: 
   console.log("novalue ", String((await bare.next()).value));
   await bare.return();
 })();
+
+{
+// `util.aborted(signal, resource)` — a promise that settles when the signal
+// aborts, and immediately if it already has. It did not exist, so the
+// documented way to await an abort threw.
+const util = require("util");
+(async () => {
+  const controller = new AbortController();
+  const pending = util.aborted(controller.signal, {});
+  console.log("aborted ", typeof pending, pending instanceof Promise, controller.signal.aborted);
+  controller.abort();
+  await pending;
+  console.log("settled ", controller.signal.aborted, controller.signal.reason.name);
+  // Already-aborted resolves without waiting for another event.
+  const done = new AbortController();
+  done.abort();
+  await util.aborted(done.signal, {});
+  console.log("already ", done.signal.aborted);
+})();
+}

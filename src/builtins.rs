@@ -1250,7 +1250,14 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                     _ => None,
                 })
                 .unwrap_or(Value::Undef)
-            } else if name == "@@iterator" || is_array_method(name) || is_object_method(name) {
+            } else if name == "@@iterator"
+                || is_object_method(name)
+                // An `arguments` object is array-BACKED here but is not an
+                // Array: node's exposes no `Array.prototype` method, which is
+                // exactly why the idiom is `Array.prototype.slice.call(args)`.
+                // Exposing them made `arguments.map` a function.
+                || (is_array_method(name) && !is_arguments(recv))
+            {
                 bound_method(recv, name)
             } else if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
                 // Extra own props attached to an array (e.g. `RegExp.exec` result's
@@ -1982,6 +1989,12 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // absent entirely. The three keys node ships are present; installing a
     // custom loader through them is NOT honoured by this runtime's loader, so
     // the map reports what it can serve rather than pretending otherwise.
+    // `util.promisify.custom` — the registered symbol a module attaches to a
+    // callback function to supply its own promisified form. It was `undefined`,
+    // so the lookup that decides whether to use one always missed.
+    if ns == "util.promisify" && name == "custom" {
+        return with_host(|h| h.symbol_for("nodejs.util.promisify.custom"));
+    }
     // `process.memoryUsage.rss()` — node's fast path for the one figure that
     // does not need the whole object built.
     if ns == "process.memoryUsage" && name == "rss" {
@@ -2600,6 +2613,21 @@ fn object_tag(h: &host::JsHost, v: &Value) -> String {
 /// The bare brand name behind `Object.prototype.toString` (`Array`, `Uint8Array`
 /// …), without the `[object …]` wrapper. Split out so the brand and the
 /// `Symbol.toStringTag` property read cannot disagree about what a value is.
+/// Whether `v` is a function's `arguments` object.
+///
+/// Backed by an Array so indices, `length`, spread and `for-of` all work, but
+/// marked so it does not pass for one: node's is an exotic, and `isArray`, the
+/// brand and `util.types.isArgumentsObject` all have to tell them apart.
+pub fn is_arguments(v: &Value) -> bool {
+    with_host(|h| is_arguments_h(h, v))
+}
+
+/// `is_arguments` for a caller that already holds the host borrow — `object_brand`
+/// runs under one, and re-entering through `with_host` aborts the process.
+pub fn is_arguments_h(h: &host::JsHost, v: &Value) -> bool {
+    h.fn_prop(v, "@@arguments").is_some()
+}
+
 fn object_brand(h: &host::JsHost, v: &Value) -> String {
     // A `<C>.prototype` this host built as a real object is an ORDINARY object:
     // it holds no instance slot, so only the branded few report anything but
@@ -2622,6 +2650,7 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
         Value::Obj(_) => match h.get(v) {
             Some(JsObj::Null) => "Null".into(),
             Some(JsObj::Str(_)) => "String".into(),
+            Some(JsObj::Array(_)) if is_arguments_h(h, v) => "Arguments".into(),
             Some(JsObj::Array(_)) => "Array".into(),
             // A lazy iterator helper brands as node does.
             Some(JsObj::Object(p))
@@ -4993,10 +5022,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Array.isArray" => {
             let v = arg0(&args);
             let subject = crate::proxy::ultimate_target(&v).unwrap_or(v);
-            Ok(Value::Bool(matches!(
-                with_host(|h| h.get(&subject).cloned()),
-                Some(JsObj::Array(_))
-            )))
+            Ok(Value::Bool(
+                matches!(
+                    with_host(|h| h.get(&subject).cloned()),
+                    Some(JsObj::Array(_))
+                ) && !is_arguments(&subject),
+            ))
         }
         "Array.from" => array_from(args),
         "Array.fromAsync" => array_from_async(args),
@@ -12079,6 +12110,15 @@ fn promise_reject(v: Value) -> Result<Value, String> {
 /// `Promise.withResolvers()` — a fresh pending promise paired with its own
 /// resolve/reject continuations (the same `@@presolve`/`@@preject` thunks the
 /// executor receives), returned as a plain `{ promise, resolve, reject }` object.
+/// A fresh pending promise paired with the thunk that resolves it, for stdlib
+/// callers that hand the resolver to an event listener.
+pub fn pending_promise_with_resolver() -> (Value, Value) {
+    let p = with_host(|h| h.new_promise());
+    let id = with_host(|h| h.promise_id(&p).unwrap());
+    let resolve = make_builtin(format!("@@presolve:{id}"));
+    (p, resolve)
+}
+
 fn promise_with_resolvers() -> Result<Value, String> {
     let p = with_host(|h| h.new_promise());
     let id = with_host(|h| h.promise_id(&p).unwrap());
