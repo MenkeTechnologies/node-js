@@ -138,8 +138,9 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 
         // A "view" over an `ArrayBuffer`: any typed array (a `Buffer` counts,
         // being a `Uint8Array` subclass) or a `DataView`.
-        "isArrayBufferView" => b(ta_kind(&v).is_some()
-            || super::native_tag(&v).as_deref() == Some("DataView")),
+        "isArrayBufferView" => {
+            b(ta_kind(&v).is_some() || super::native_tag(&v).as_deref() == Some("DataView"))
+        }
         // node-js has no `Float16Array` kind (no `@@kind` ever reports it).
         "isFloat16Array" => b(ta_kind(&v).as_deref() == Some("Float16Array")),
         // No WebCrypto `CryptoKey` / `KeyObject` heap kinds exist here.
