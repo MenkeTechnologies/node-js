@@ -540,7 +540,7 @@ pub fn body_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, St
         }
         "clone" => {
             let bytes = body_bytes(recv);
-            let clone = crate::builtins::deep_clone(recv);
+            let clone = crate::builtins::deep_clone(recv)?;
             set_prop(&clone, "@@body", store_body(&bytes));
             set_prop(&clone, "bodyUsed", Value::Bool(false));
             Ok(clone)

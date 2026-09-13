@@ -1634,6 +1634,34 @@ cb-args  x["1","1",1,"x1",{"d":"1"}]
 cb-str   a3c
 nonglobal TypeError String.prototype.replaceAll called with a non-global RegExp argument
 global   bb ba
+==== structuredclone.js ====
+throw  symbol DOMException DataCloneError 25 Symbol(s) could not be cloned.
+throw  symbol-nodesc DOMException DataCloneError 25 Symbol() could not be cloned.
+throw  weakmap DOMException DataCloneError 25 #<WeakMap> could not be cloned.
+throw  weakset DOMException DataCloneError 25 #<WeakSet> could not be cloned.
+throw  weakref DOMException DataCloneError 25 #<WeakRef> could not be cloned.
+throw  promise DOMException DataCloneError 25 #<Promise> could not be cloned.
+throw  generator DOMException DataCloneError 25 [object Generator] could not be cloned.
+throw  proxy DOMException DataCloneError 25 #<Object> could not be cloned.
+throw  function DOMException DataCloneError true
+throw  nested DOMException DataCloneError true
+getter 7 1 {"value":7,"writable":true,"enumerable":true,"configurable":true}
+dropped 0 []
+user-class  [object Object] Object false
+array-sub   [object Array] Array
+error-sub   [object Error] Error
+error       [object Error] TypeError true
+date        [object Date] Date 0
+regexp      [object RegExp] RegExp
+boxed       [object Number] Number [object Boolean] Boolean [object String] String
+views       [object Uint8Array] Uint8Array [object DataView] DataView [object ArrayBuffer] ArrayBuffer
+buffer      Uint8Array false [object Uint8Array] 2 1
+error-props undefined t
+regexp-ind  5 0 a g
+view-ind    1 9
+buffer-ind  1 9 2
+graph       false true true
+values      1 a true null true bigint 2 12 2
 ==== subprocess.js ====
 cwd       /tmp /
 exec-cwd  /tmp

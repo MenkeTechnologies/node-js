@@ -5510,7 +5510,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "JSON.parse" => json_parse(args),
         "JSON.rawJSON" => json_raw(args),
         "JSON.isRawJSON" => json_is_raw(args),
-        "structuredClone" => Ok(deep_clone(&arg0(&args))),
+        "structuredClone" => deep_clone(&arg0(&args)),
         // The deferred drain a `Readable.from` schedules; the suffix is the
         // stream's heap index.
         _ if name.starts_with("@@transformCb:") => {
@@ -12189,25 +12189,93 @@ fn has_property_ordinary(obj: &Value, key: &str) -> bool {
 /// object clone to two properties pointing at the same clone, and a cycle clones
 /// to a cycle instead of recursing forever. `seen` maps each source heap index
 /// to its clone, which is what buys both.
-pub(crate) fn deep_clone(v: &Value) -> Value {
+/// The rendering node puts in a `DataCloneError` for a value the structured
+/// clone algorithm refuses, or `None` when the value IS cloneable.
+///
+/// Refusing at all is the point: these used to be copied through by reference,
+/// so `structuredClone({f: () => 1})` handed back an object sharing the
+/// original's function and `structuredClone(new WeakMap())` returned the very
+/// same WeakMap. Node throws on every one of them.
+fn clone_refusal(v: &Value) -> Option<String> {
+    let kind = with_host(|h| h.kind_of(v))?;
+    let render = |ctor: &str| Some(format!("#<{ctor}>"));
+    match kind {
+        // A function renders as its SOURCE TEXT here. This frontend does not
+        // retain function source (`FuncDef` holds a compiled chunk), so the
+        // message says `function f() { [code] }` where node quotes the original
+        // — the error, its name and its code are right, the text is not.
+        ObjKind::Func | ObjKind::Class | ObjKind::BoundFunc | ObjKind::BoundMethod => {
+            Some(with_host(|h| h.str_of(v)))
+        }
+        ObjKind::Builtin if with_host(|h| host::is_callable(h, v)) => {
+            Some(with_host(|h| h.str_of(v)))
+        }
+        ObjKind::Symbol => Some(with_host(|h| h.str_of(v))),
+        ObjKind::Promise => render("Promise"),
+        ObjKind::Generator => Some("[object Generator]".to_string()),
+        // A proxy is refused by its TARGET's shape: a callable one renders like
+        // the function it wraps, everything else as a plain object.
+        ObjKind::Proxy => Some(if with_host(|h| host::is_callable(h, v)) {
+            with_host(|h| h.str_of(v))
+        } else {
+            "#<Object>".to_string()
+        }),
+        ObjKind::Map if with_host(|h| matches!(h.get(v), Some(JsObj::Map { weak: true, .. }))) => {
+            render("WeakMap")
+        }
+        ObjKind::Set if with_host(|h| matches!(h.get(v), Some(JsObj::Set { weak: true, .. }))) => {
+            render("WeakSet")
+        }
+        _ => match crate::stdlib::native_tag(v).as_deref() {
+            Some(t @ ("WeakRef" | "FinalizationRegistry")) => render(t),
+            _ => None,
+        },
+    }
+}
+
+pub(crate) fn deep_clone(v: &Value) -> Result<Value, String> {
     deep_clone_seen(v, &mut std::collections::HashMap::new())
 }
 
-fn deep_clone_seen(v: &Value, seen: &mut std::collections::HashMap<u32, Value>) -> Value {
+fn deep_clone_seen(
+    v: &Value,
+    seen: &mut std::collections::HashMap<u32, Value>,
+) -> Result<Value, String> {
     let idx = match v {
         Value::Obj(i) => *i,
-        _ => return v.clone(),
+        _ => return Ok(v.clone()),
     };
     if let Some(done) = seen.get(&idx) {
-        return done.clone();
+        return Ok(done.clone());
     }
-    match with_host(|h| h.get(v).cloned()) {
+    if let Some(render) = clone_refusal(v) {
+        return Err(host::dom_error(
+            "DataCloneError",
+            &format!("{render} could not be cloned."),
+        ));
+    }
+    // A REGEXP is cloned, not shared: it carries a mutable `lastIndex`, so
+    // handing back the same object let a write through the clone move the
+    // original's match cursor.
+    if let Some((src, flags)) = with_host(|h| match h.get(v) {
+        Some(JsObj::RegExp(r)) => Some((r.source.clone(), r.flags.clone())),
+        _ => None,
+    }) {
+        let args = with_host(|h| vec![h.new_str(src), h.new_str(flags)]);
+        let out = regexp_ctor(&args)?;
+        seen.insert(idx, out.clone());
+        return Ok(out);
+    }
+    Ok(match with_host(|h| h.get(v).cloned()) {
         Some(JsObj::Array(items)) => {
             // Register the (empty) clone BEFORE recursing so a self-reference
             // resolves to it.
             let out = with_host(|h| h.new_array(Vec::new()));
             seen.insert(idx, out.clone());
-            let cloned: Vec<Value> = items.iter().map(|x| deep_clone_seen(x, seen)).collect();
+            let mut cloned: Vec<Value> = Vec::with_capacity(items.len());
+            for x in &items {
+                cloned.push(deep_clone_seen(x, seen)?);
+            }
             with_host(|h| {
                 if let Some(JsObj::Array(a)) = h.get_mut(&out) {
                     *a = cloned;
@@ -12218,21 +12286,97 @@ fn deep_clone_seen(v: &Value, seen: &mut std::collections::HashMap<u32, Value>) 
             });
             out
         }
-        Some(JsObj::Object(props)) => {
+        Some(JsObj::Object(_)) => {
             let out = with_host(|h| h.new_object(IndexMap::new()));
             seen.insert(idx, out.clone());
-            let cloned: IndexMap<String, Value> = props
-                .iter()
-                .map(|(k, val)| (k.clone(), deep_clone_seen(val, seen)))
-                .collect();
+            // Own ENUMERABLE string keys, read THROUGH any accessor: the clone
+            // walked the property map, where an accessor stores nothing, so
+            // `structuredClone({get p(){return 1}})` silently lost `p`. A symbol
+            // key and a non-enumerable one are dropped, as node drops them.
+            let is_error = with_host(|h| h.error_to_string(v)).is_some();
+            let proto = clone_proto(v);
+            let keeps_proto = !matches!(proto, CloneProto::Plain);
+            // An ERROR clones its name, message and stack and NOTHING else —
+            // node drops any other own property, even an enumerable one.
+            let keys: Vec<String> = if is_error {
+                // An ERROR clones its name, message and stack and NOTHING else —
+                // node drops any other own property, even an enumerable one.
+                ["name", "message", "stack"]
+                    .iter()
+                    .filter(|k| has_property(v, k).unwrap_or(false))
+                    .map(|k| (*k).to_string())
+                    .collect()
+            } else if keeps_proto {
+                // A preserved exotic keeps EVERY own property, including the
+                // non-enumerable ones and the internal slots — a Date's time
+                // value, an ArrayBuffer's `byteLength` and byte store, a typed
+                // array's view. The enumerable-only walk dropped all of those,
+                // so a cloned Date read `Invalid Date` and a cloned
+                // ArrayBuffer had no `byteLength`.
+                with_host(|h| match h.get(v) {
+                    Some(JsObj::Object(p)) => p.keys().cloned().collect(),
+                    _ => Vec::new(),
+                })
+            } else {
+                with_host(|h| h.own_enum_key_names(v))
+            };
+            let mut cloned: IndexMap<String, Value> = IndexMap::new();
+            for k in keys {
+                // An internal slot is read straight out of the map: it is not a
+                // property, so a `[[Get]]` would not find it.
+                let val = if k.starts_with("@@") {
+                    match with_host(|h| match h.get(v) {
+                        Some(JsObj::Object(p)) => p.get(&k).cloned(),
+                        _ => None,
+                    }) {
+                        Some(val) => val,
+                        None => continue,
+                    }
+                } else {
+                    get_property(v, &k)?
+                };
+                cloned.insert(k, deep_clone_seen(&val, seen)?);
+            }
+            // The prototype survives only for the exotics the algorithm knows —
+            // a Date, an Error, a typed array, a boxed primitive. A USER class
+            // instance becomes a plain object, which is what node produces;
+            // keeping every prototype made `structuredClone(new K())
+            // instanceof K` true.
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get_mut(&out) {
                     *p = cloned;
                 }
-                // A native exotic (Buffer, typed array, …) keeps its prototype so
-                // the clone passes the same brand checks as the source.
-                if let Some(p) = h.proto_of(v) {
-                    h.set_proto(&out, p);
+                match &proto {
+                    CloneProto::Same => {
+                        if let Some(p) = h.proto_of(v) {
+                            h.set_proto(&out, p);
+                        }
+                    }
+                    CloneProto::Ctor(c) => {
+                        h.ensure_error_protos();
+                        let p = h.error_proto(c).or_else(|| h.ensure_ctor_proto(c));
+                        if let Some(p) = p {
+                            h.set_proto(&out, p);
+                        }
+                        // A Buffer clones to a plain `Uint8Array`, so the native
+                        // tag has to change with the prototype — left alone,
+                        // `Buffer.isBuffer` still answered true for the clone.
+                        // A Buffer clones to a plain `Uint8Array`, so the native
+                        // tag has to change with the prototype — left alone,
+                        // `Buffer.isBuffer` answered true for the clone and the
+                        // brand stayed `[object Object]`. A typed array is
+                        // tagged `TypedArray` and names its element type in
+                        // `@@kind`; `@@native = "Uint8Array"` matches no arm.
+                        if c == "Uint8Array" {
+                            let tag = h.new_str("TypedArray");
+                            let kind = h.new_str("Uint8Array");
+                            if let Some(JsObj::Object(p)) = h.get_mut(&out) {
+                                p.insert("@@native".into(), tag);
+                                p.insert("@@kind".into(), kind);
+                            }
+                        }
+                    }
+                    CloneProto::Plain => {}
                 }
                 h.copy_prop_attrs(v, &out);
             });
@@ -12249,8 +12393,8 @@ fn deep_clone_seen(v: &Value, seen: &mut std::collections::HashMap<u32, Value>) 
             seen.insert(idx, out.clone());
             let pairs: Vec<(Value, Value)> = entries.values().cloned().collect();
             for (k, val) in pairs {
-                let ck = deep_clone_seen(&k, seen);
-                let cv = deep_clone_seen(&val, seen);
+                let ck = deep_clone_seen(&k, seen)?;
+                let cv = deep_clone_seen(&val, seen)?;
                 let _ = map_method(&out, "set", vec![ck, cv]);
             }
             out
@@ -12265,16 +12409,54 @@ fn deep_clone_seen(v: &Value, seen: &mut std::collections::HashMap<u32, Value>) 
             seen.insert(idx, out.clone());
             let vals: Vec<Value> = entries.values().cloned().collect();
             for x in vals {
-                let cx = deep_clone_seen(&x, seen);
+                let cx = deep_clone_seen(&x, seen)?;
                 let _ = set_method(&out, "add", vec![cx]);
             }
             out
         }
-        // Strings/BigInts/RegExps/dates are immutable-enough to share, and a
-        // function is not cloneable at all (Node throws DataCloneError; node-js
-        // passes it through rather than inventing that error class).
+        // A string, a BigInt and a boxed primitive are immutable enough to
+        // share; anything left is a value type.
         _ => v.clone(),
+    })
+}
+
+/// Whether a cloned object keeps the source's prototype.
+///
+/// The structured clone algorithm reproduces the exotics it knows and turns
+/// everything else into a plain object — so a `Date` clones to a `Date` and a
+/// user class instance clones to an `Object`.
+fn clone_proto(v: &Value) -> CloneProto {
+    // An ERROR clones to the BUILT-IN class its `name` selects, so a subclass
+    // flattens: `structuredClone(new (class E extends Error{})('m'))` reports
+    // `Error`, not `E`.
+    if with_host(|h| h.error_to_string(v)).is_some() {
+        let name = get_property(v, "name")
+            .map(|n| with_host(|h| h.str_of(&n)))
+            .unwrap_or_else(|_| "Error".into());
+        let class = if host::ERROR_NAMES.contains(&name.as_str()) {
+            name
+        } else {
+            "Error".to_string()
+        };
+        return CloneProto::Ctor(class);
     }
+    match crate::stdlib::native_tag(v).as_deref() {
+        // A Buffer is not reproduced as a Buffer: node hands back a plain
+        // `Uint8Array` over the same bytes.
+        Some("Buffer") => CloneProto::Ctor("Uint8Array".into()),
+        Some(_) => CloneProto::Same,
+        // A boxed primitive keeps its wrapper; anything else — a user class
+        // instance included — becomes a plain object.
+        None if wrapped_primitive(v).is_some() => CloneProto::Same,
+        None => CloneProto::Plain,
+    }
+}
+
+/// Which prototype a clone gets: the source's, a named builtin's, or none.
+enum CloneProto {
+    Same,
+    Ctor(String),
+    Plain,
 }
 
 // ══ Promises, timers, microtasks (event-loop-driven) ═════════════════════════

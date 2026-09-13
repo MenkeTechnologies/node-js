@@ -8567,6 +8567,13 @@ impl JsHost {
         Some(proto)
     }
 
+    /// `<ErrorClass>.prototype`, once [`JsHost::ensure_error_protos`] has run.
+    /// The error prototypes live in their own table, so `ensure_ctor_proto` —
+    /// which answers from `native_protos` — does not find them.
+    pub fn error_proto(&self, name: &str) -> Option<Value> {
+        self.error_protos.get(name).cloned()
+    }
+
     pub fn ensure_error_protos(&mut self) {
         if !self.error_protos.is_empty() {
             return;
