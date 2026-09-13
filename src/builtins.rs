@@ -1694,6 +1694,12 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             if let Some(hit) = crate::stdlib::typedarray::has_index(recv, &k) {
                 return Ok(Value::Bool(hit));
             }
+            // A function's `length`/`name`/`prototype` and a RegExp's
+            // `lastIndex` are SYNTHESIZED own properties: they read back but
+            // own no map entry, so this answered false where node says true.
+            if synthesized_own_descriptor(recv, &k).is_some() {
+                return Ok(Value::Bool(true));
+            }
             if uses_side_table(recv) {
                 return Ok(Value::Bool(with_host(|h| h.fn_prop(recv, &k).is_some())));
             }
@@ -11911,6 +11917,20 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) -> Result<(), String> 
         }
     }
 
+    // The other exotics whose own properties are SYNTHESIZED rather than stored
+    // in a property map: a typed array's elements and a RegExp's `lastIndex`.
+    // The ordinary path below writes a shadowing map entry the read never
+    // consults, so `Object.defineProperty(u8, '0', {value: 9})` left `u8[0]`
+    // unchanged.
+    let exotic_own = (crate::stdlib::native_tag(obj).as_deref() == Some("TypedArray")
+        && key.parse::<usize>().is_ok())
+        || (key == "lastIndex" && with_host(|h| matches!(h.get(obj), Some(JsObj::RegExp(_)))));
+    if exotic_own {
+        if let Some(v) = req.value.clone() {
+            return set_property_pub(obj, key, v);
+        }
+    }
+
     // 10.1.6.3 step 2: a NEW property cannot be added to a non-extensible
     // object. Only an existing property's attributes were being validated, so
     // `defineProperty(Object.freeze({}), 'z', …)` silently added one.
@@ -12069,6 +12089,70 @@ fn object_define_properties(args: Vec<Value>) -> Result<Value, String> {
     Ok(obj)
 }
 
+/// The descriptor of an own property a function, a typed array or a RegExp
+/// SYNTHESIZES rather than keeping in a property map.
+///
+/// These read back through the ordinary path but owned no descriptor and did
+/// not appear under `hasOwnProperty` or `getOwnPropertyNames`, so the five
+/// views of "does this property exist" disagreed — a read said yes while
+/// `Object.getOwnPropertyDescriptor(f, 'name')` said no such property, which is
+/// what a shim checks before patching.
+fn synthesized_own_descriptor(obj: &Value, key: &str) -> Option<(Value, host::PropAttrs)> {
+    let ro_configurable = host::PropAttrs {
+        writable: false,
+        enumerable: false,
+        configurable: true,
+    };
+    // A callable's `length`/`name` are read-only but configurable; its
+    // `prototype` is writable and NOT configurable, and a class's is neither.
+    // An arrow, a method and a bound function own no `prototype` at all.
+    if with_host(|h| host::is_callable(h, obj)) && !matches!(key, "length" | "name" | "prototype") {
+        return None;
+    }
+    if with_host(|h| host::is_callable(h, obj)) {
+        if key == "prototype" {
+            let p = get_property(obj, "prototype").ok()?;
+            if matches!(p, Value::Undef) {
+                return None;
+            }
+            return Some((
+                p,
+                host::PropAttrs {
+                    writable: with_host(|h| h.kind_of(obj)) != Some(ObjKind::Class),
+                    enumerable: false,
+                    configurable: false,
+                },
+            ));
+        }
+        return Some((get_property(obj, key).ok()?, ro_configurable));
+    }
+    // A typed array's elements are own, enumerable, writable, configurable
+    // properties; an index past the end owns nothing.
+    if crate::stdlib::native_tag(obj).as_deref() == Some("TypedArray") {
+        let v = crate::stdlib::typedarray::elem_get(obj, key)?;
+        return Some((
+            v,
+            host::PropAttrs {
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        ));
+    }
+    // A RegExp's `lastIndex` is its own, writable, non-configurable cursor.
+    if with_host(|h| matches!(h.get(obj), Some(JsObj::RegExp(_)))) && key == "lastIndex" {
+        return Some((
+            get_property(obj, "lastIndex").ok()?,
+            host::PropAttrs {
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        ));
+    }
+    None
+}
+
 fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
     require_object_coercible(&obj)?;
@@ -12161,6 +12245,16 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
         if !matches!(value, Value::Undef) {
             return Ok(builtin_member_descriptor(&ns, &key, value));
         }
+    }
+    if let Some((value, attrs)) = synthesized_own_descriptor(&obj, &key) {
+        return Ok(with_host(|h| {
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("value".into(), value);
+            m.insert("writable".into(), Value::Bool(attrs.writable));
+            m.insert("enumerable".into(), Value::Bool(attrs.enumerable));
+            m.insert("configurable".into(), Value::Bool(attrs.configurable));
+            h.new_object(m)
+        }));
     }
     // Accessor descriptor?
     if let Some((get, set)) = with_host(|h| h.own_accessor(&obj, &key)) {

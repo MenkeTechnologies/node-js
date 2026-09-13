@@ -5653,6 +5653,12 @@ impl JsHost {
     /// (`getOwnPropertyNames`/`Reflect.ownKeys`).
     pub fn own_key_names(&self, v: &Value, enum_only: bool) -> Vec<String> {
         let mut keys = self.own_enum_data_keys(v, enum_only);
+        // A RegExp's `lastIndex` is a SYNTHESIZED own property — it lives in the
+        // `RegExpObj` struct, not a property map — so nothing above can list it.
+        // Non-enumerable, so only `getOwnPropertyNames` sees it.
+        if !enum_only && matches!(self.get(v), Some(JsObj::RegExp(_))) {
+            keys.push("lastIndex".to_string());
+        }
         // An accessor defined before its object had any ordering marker (a class
         // prototype accessor, say) still has to appear.
         for k in self.own_accessor_keys(v) {
