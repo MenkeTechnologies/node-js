@@ -10082,12 +10082,26 @@ fn array_method_on(
                 .collect();
             sort_values(&mut items, args.first())?;
             let present = items.len();
-            items.resize(all.len(), Value::Undef);
+            // 23.1.3.30 steps 4-5 write back only the indices BELOW the length
+            // captured at step 1: `Set` for each sorted element, then `Delete`
+            // for the holes that followed them. Replacing the whole backing
+            // vector instead discarded anything the COMPARATOR appended —
+            // `a.sort((x, y) => { a.push(0); return x - y })` came back at its
+            // original length with every pushed element gone.
             with_host(|h| {
+                let len = all.len();
                 if let Some(JsObj::Array(a)) = h.get_mut(recv) {
-                    *a = items;
+                    if a.len() < len {
+                        a.resize(len, Value::Undef);
+                    }
+                    for (i, v) in items.into_iter().enumerate() {
+                        a[i] = v;
+                    }
+                    for slot in a[present..len].iter_mut() {
+                        *slot = Value::Undef;
+                    }
                 }
-                h.install_holes(recv, (present..all.len()).collect());
+                h.install_holes(recv, (present..len).collect());
             });
             Ok(this_value.clone())
         }
@@ -10278,7 +10292,10 @@ pub(crate) fn sort_values(items: &mut [Value], cmp: Option<&Value>) -> Result<()
     let cmp = match cmp {
         Some(Value::Undef) => None,
         Some(v) if !with_host(|h| host::is_callable(h, v)) => {
-            let shown = with_host(|h| h.inspect(v));
+            // V8 renders the offending value with `NoSideEffectsToString`, not
+            // with `util.inspect`: a string appears bare (`: x`) rather than
+            // quoted, and an array is `[object Array]` rather than `[ 1, 2 ]`.
+            let shown = no_side_effects_string(v);
             return Err(host::type_error(&format!(
                 "The comparison function must be either a function or undefined: {shown}"
             )));

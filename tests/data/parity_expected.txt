@@ -1927,6 +1927,23 @@ tag-get  [object D] [object D]
 exotics  [object Map] [object Math] [object Object]
 proxy    TypeError: Cannot convert object to primitive value
 proxy-t  [object Map]
+==== sortmutation.js ====
+append-once   [5,[1,2,3,7,8]]
+shrink-once   [5,[1,2,3,4,5]]
+holes         [5,[1,2,3,null,null],true,false]
+holes-cmp     [5,true,false]
+undef-nocall  [false,[1,2,3,null,null]]
+stable        [1,3,0,2]
+nan-compare   [3,1,2]
+default       [1,10,2,9,null,null]
+throws        "boom"
+reject-string "The comparison function must be either a function or undefined: x"
+reject-null   "The comparison function must be either a function or undefined: null"
+reject-array  "The comparison function must be either a function or undefined: [object Array]"
+reject-object "The comparison function must be either a function or undefined: #<Object>"
+reject-regexp "The comparison function must be either a function or undefined: [object RegExp]"
+reject-symbol "The comparison function must be either a function or undefined: Symbol(s)"
+toSorted      [[1,2,3],4,9]
 ==== species.js ====
 symbols  true 15
 builtins true true true true

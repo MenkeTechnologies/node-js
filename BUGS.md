@@ -2560,14 +2560,14 @@ Still divergent, and why:
   does not: the iterator is parked on the VM stack and the unwind walks past
   it. Closing it needs the loop body wrapped in an implicit `finally`, which
   changes the bytecode shape of every `for-of`.
-- **`sort` still folds over a SNAPSHOT.** Every other array method now reads
-  each element live at its index (`examples/livearray.js`,
-  `examples/livearray2.js`), but a comparator that mutates the array it is
-  sorting is not observed: `const a = [3,1,2]; a.sort((x,y) => { a.push(0);
-  return x - y })` leaves `a.length` 3 where node's is 6. `sort` is the one
-  method whose element order is not a simple ascending walk, so `array_walk`
-  does not fit it — it needs the spec's SortIndexedProperties/`length` re-read
-  around the comparator instead.
+- **The comparator CALL COUNT differs from V8's**, and so does the argument
+  order within a comparison. `[5,4,3,2,1].sort(cmp)` calls `cmp` 5 times here
+  and 8 times on node; `toSorted` on the same input is 5 here and 4 there —
+  node's own two methods disagree with each other. The number of comparisons a
+  sort performs is not specified, so this is a divergence rather than a defect,
+  but it means no record may assert a comparison count or an
+  observed argument pair. `examples/sortmutation.js` guards every mutation to
+  fire exactly once for that reason.
 - **A HOLE does not fall through to the prototype.** `[[Get]]` on an elided
   index answers `undefined` directly rather than walking the chain, so with
   `Array.prototype[1] = "p"` set, `[1,,3][1]` is `undefined` where node reads
