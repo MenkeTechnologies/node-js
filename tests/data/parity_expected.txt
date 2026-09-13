@@ -1209,6 +1209,30 @@ null
   configurable: false
 }
 [Object: null prototype] {}
+==== iterclose.js ====
+from-throws   ["m",["next","return"]]
+from-maps     [10,21]
+from-order    ["map0","map1"]
+map-bad-entry ["Iterator value 0 is not an entry object",["next","return"]]
+weakmap-bad   "Iterator value 1 is not an entry object"
+map-string    "Iterator value ab is not an entry object"
+map-pairs     [["k","v"]]
+map-arraylike [["k","v"]]
+map-short     [[null,null]]
+set-values    [1,2]
+break         ["next","return"]
+return        ["next","return"]
+destructure   [1,["next","return"]]
+spread-finite [[0,1],["next","next","next"]]
+generator     ["finally"]
+no-return     "ok"
+return-throws "TypeError"
+reject-all         TypeError
+reject-allSettled  TypeError
+reject-race        TypeError
+reject-any         TypeError
+reject-non-iterable TypeError
+all-ok         [1,2]
 ==== iterhelpers.js ====
 global   function function function
 lazy     1,2 3,4 2,4,6,8 2,4

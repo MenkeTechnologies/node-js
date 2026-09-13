@@ -2553,3 +2553,10 @@ Still divergent, and why:
   that pins a syntax error's TEXT cannot match. `examples/earlyerrors.js` pins
   the errors this frontend raises deliberately (which do match); this is about
   the ordinary parse failures.
+- **`for-of` does not close its iterator when the body THROWS.** `break`,
+  `return` and a labeled break all call `return()` (pinned in
+  `examples/iterclose.js`), and so does an abrupt callback in the consumers
+  that step an iterator themselves. A throw propagating out of the loop body
+  does not: the iterator is parked on the VM stack and the unwind walks past
+  it. Closing it needs the loop body wrapped in an implicit `finally`, which
+  changes the bytecode shape of every `for-of`.

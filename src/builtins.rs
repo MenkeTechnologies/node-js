@@ -6376,13 +6376,31 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
                 .first()
                 .filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a)))
             {
-                let pairs = host::iter_all(init)?;
-                for p in pairs {
-                    let kv = host::iter_all(&p)?;
-                    let k = kv.first().cloned().unwrap_or(Value::Undef);
-                    let v = kv.get(1).cloned().unwrap_or(Value::Undef);
+                // Stepped, not drained: an entry that is not a pair has to
+                // stop the construction at that element and CLOSE the iterator
+                // (24.1.1.2 step 8). Materializing first meant a bad entry in an
+                // infinite source was never reached and the constructor HUNG.
+                host::iter_for_each(init, |p, _| {
+                    // 24.1.1.2 step 8.d: each entry must be an OBJECT. A string
+                    // is iterable, so without this check `new Map(["ab"])`
+                    // happily stored `'a' => 'b'` instead of throwing — and over
+                    // an infinite source it never stopped.
+                    if !with_host(|h| is_object_like(h, &p)) {
+                        let shown = with_host(|h| h.str_of(&p));
+                        return Err(host::type_error(&format!(
+                            "Iterator value {shown} is not an entry object"
+                        )));
+                    }
+                    // The entry is read by INDEX with `[[Get]]` (step 8.e), not
+                    // iterated: an object with a `Symbol.iterator` but no `0`/`1`
+                    // gives `undefined => undefined`, and an array-LIKE entry
+                    // works. Iterating it instead accepted a string as a pair
+                    // and rejected the array-like.
+                    let k = get_property(&p, "0")?;
+                    let v = get_property(&p, "1")?;
                     map_method(&m, "set", vec![k, v])?;
-                }
+                    Ok(())
+                })?;
             }
             Ok(m)
         }
@@ -6398,10 +6416,10 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
                 .first()
                 .filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a)))
             {
-                let vals = host::iter_all(init)?;
-                for v in vals {
+                host::iter_for_each(init, |v, _| {
                     set_method(&s, "add", vec![v])?;
-                }
+                    Ok(())
+                })?;
             }
             Ok(s)
         }
@@ -7545,21 +7563,42 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
     // `Array.from` accepts generators and user iterables, plus array-likes with a
     // numeric `.length`.
     let src = arg0(&args);
+    if let Some(cb) = args.get(1).cloned() {
+        // Stepped, not drained: the mapper runs per element as the iterator
+        // yields it (23.1.2.1 step 6.e). Materializing the whole sequence first
+        // meant `Array.from(infiniteIterator, fn)` never reached the mapper at
+        // all and HUNG, and a throwing mapper could not close the iterator.
+        let this = this_arg(&args, 2);
+        let mut out = Vec::new();
+        let mapped = host::iter_for_each(&src, |v, i| {
+            out.push(host::invoke(
+                &cb,
+                vec![v, Value::Float(i as f64)],
+                this.clone(),
+            )?);
+            Ok(())
+        });
+        match mapped {
+            Ok(()) => {}
+            // An array-LIKE has no iterator; fall back to its indexed items.
+            Err(e) if host::user_iterator_fn(&src).is_none() && e.ends_with(" is not iterable") => {
+                out.clear();
+                for (i, it) in array_like_items(&src).into_iter().enumerate() {
+                    out.push(host::invoke(
+                        &cb,
+                        vec![it, Value::Float(i as f64)],
+                        this.clone(),
+                    )?);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        return construct_array_like(host::current_static_this(), out);
+    }
     let items = match host::iter_all(&src) {
         Ok(v) => v,
         Err(_) => array_like_items(&src),
     };
-    if let Some(cb) = args.get(1).cloned() {
-        let mut out = Vec::with_capacity(items.len());
-        for (i, it) in items.into_iter().enumerate() {
-            out.push(host::invoke(
-                &cb,
-                vec![it, Value::Float(i as f64)],
-                this_arg(&args, 2),
-            )?);
-        }
-        return construct_array_like(host::current_static_this(), out);
-    }
     // 23.1.2.1 step 5: `Array.from` builds through `this`, so on a subclass the
     // result is an instance of it. It always allocated a plain array, which is
     // also why `A.from([1]).map(f) instanceof A` was false — the species chain
@@ -13532,6 +13571,26 @@ fn promise_with_resolvers() -> Result<Value, String> {
     Ok(with_host(|h| h.new_object(props)))
 }
 
+/// A promise already rejected with `e` — what every combinator hands back when
+/// the ITERABLE misbehaves.
+///
+/// 27.2.4.1 step 4 catches an abrupt completion from the iteration and rejects
+/// rather than letting it propagate, so `Promise.all(badIterable)` returns a
+/// rejected promise. Throwing synchronously meant a `.catch()` never attached
+/// and the caller saw the error at the call site instead.
+fn rejected_promise(e: String) -> Value {
+    let p = with_host(|h| h.new_promise());
+    let id = with_host(|h| h.promise_id(&p).unwrap());
+    let reject = make_builtin(format!("@@preject:{id}"));
+    let err = with_host(|h| h.exc.clone()).unwrap_or_else(|| with_host(|h| synth_error(h, &e)));
+    with_host(|h| {
+        h.error = None;
+        h.exc = None;
+    });
+    let _ = host::invoke(&reject, vec![err], None);
+    p
+}
+
 #[derive(Clone, Copy)]
 enum AllMode {
     All,
@@ -13540,7 +13599,10 @@ enum AllMode {
 
 /// `Promise.all` / `Promise.allSettled`.
 fn promise_all(args: Vec<Value>, mode: AllMode) -> Result<Value, String> {
-    let items = host::iter_all(&arg0(&args))?;
+    let items = match host::iter_all(&arg0(&args)) {
+        Ok(v) => v,
+        Err(e) => return Ok(rejected_promise(e)),
+    };
     // 27.2.4.1 step 3: the combinator builds its result with `this`, so on a
     // subclass the promise it hands back is an instance of that subclass.
     let result = match promise_species_create()? {
@@ -13601,7 +13663,10 @@ fn promise_all(args: Vec<Value>, mode: AllMode) -> Result<Value, String> {
 
 /// `Promise.race` (first to settle wins) / `Promise.any` (first to fulfill wins).
 fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
-    let items = host::iter_all(&arg0(&args))?;
+    let items = match host::iter_all(&arg0(&args)) {
+        Ok(v) => v,
+        Err(e) => return Ok(rejected_promise(e)),
+    };
     // Built with `this`, as every combinator is (27.2.4.5 / 27.2.4.3).
     let result = match promise_species_create()? {
         Some(p) => p,

@@ -7845,7 +7845,7 @@ pub fn async_step(iterator: &Value) -> Result<Value, String> {
 
 /// If `v` has an own/inherited `Symbol.iterator` method (internal key
 /// `@@iterator`), return it. Arrays/strings use the native fast path instead.
-fn user_iterator_fn(v: &Value) -> Option<Value> {
+pub fn user_iterator_fn(v: &Value) -> Option<Value> {
     let is_plain = with_host(|h| matches!(h.get(v), Some(JsObj::Object(_))));
     if !is_plain {
         return None;
@@ -7861,6 +7861,52 @@ fn user_iterator_fn(v: &Value) -> Option<Value> {
 
 /// Drive an iterator object (one with a `.next()` returning `{value, done}`) to
 /// exhaustion.
+/// Step `src`'s iterator, handing each value to `f`, and CLOSE the iterator if
+/// `f` exits abruptly (7.4.9 IteratorClose).
+///
+/// The difference from `iter_all` + a loop is that this never materializes the
+/// whole sequence: `Array.from(infinite, mapFn)` where `mapFn` throws has to
+/// stop at the first call, and draining first means it never gets there at all.
+pub fn iter_for_each(
+    src: &Value,
+    mut f: impl FnMut(Value, usize) -> Result<(), String>,
+) -> Result<(), String> {
+    // Only a USER iterator can be infinite or observe its own close; every
+    // other shape is already a finite materialized sequence.
+    let Some(iter_fn) = user_iterator_fn(src) else {
+        for (i, v) in iter_all(src)?.into_iter().enumerate() {
+            f(v, i)?;
+        }
+        return Ok(());
+    };
+    let iterator = invoke(&iter_fn, Vec::new(), Some(src.clone()))?;
+    let mut i = 0usize;
+    loop {
+        let step = call_method(&iterator, "next", Vec::new())?;
+        let done = get_prop_chain(&step, "done")?;
+        if with_host(|h| h.truthy(&done)) {
+            return Ok(());
+        }
+        let value = get_prop_chain(&step, "value")?;
+        if let Err(e) = f(value, i) {
+            // The callback's error wins over anything `return()` raises, so a
+            // throwing `return` is swallowed here (7.4.9 step 6).
+            let _ = close_iterator(&iterator);
+            return Err(e);
+        }
+        i += 1;
+    }
+}
+
+/// Call `iterator.return()` if it has one, as IteratorClose does.
+pub fn close_iterator(iterator: &Value) -> Result<(), String> {
+    let has = crate::builtins::get_property(iterator, "return")?;
+    if with_host(|h| is_callable(h, &has)) {
+        call_method(iterator, "return", Vec::new())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn drain_iterator(iterator: &Value) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     loop {
