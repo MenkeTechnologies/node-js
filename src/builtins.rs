@@ -3379,6 +3379,9 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
                 // NON-EXTENSIBLE object refuses — and unlike an ordinary
                 // refused write, the setter throws in sloppy code too. It was
                 // rewriting the link of a frozen object.
+                if would_cycle(recv, &val) {
+                    return Err(host::type_error("Cyclic __proto__ value"));
+                }
                 if !with_host(|h| h.is_extensible(recv)) && !same_prototype(recv, &val) {
                     return Err(host::type_error(&format!(
                         "{} is not extensible",
@@ -5749,6 +5752,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 // `prototype_of`, not `proto_of`: an object with no EXPLICIT
                 // link still has `Object.prototype`, and comparing against the
                 // absent link would call that a change.
+                if would_cycle(&obj, &proto) {
+                    return Err(host::type_error("Cyclic __proto__ value"));
+                }
                 if !same_prototype(&obj, &proto) && !with_host(|h| h.is_extensible(&obj)) {
                     // The receiver is named by its brand, as every other
                     // refusal names it — a NULL-PROTOTYPE object is
@@ -5845,6 +5851,11 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             // 10.1.2.1: a NON-EXTENSIBLE object refuses a prototype change —
             // unless the new one is what it already has, which is a no-op. It
             // reported success and rewrote the link.
+            // `Reflect` reports a refusal rather than throwing, for a cycle as
+            // for a non-extensible receiver.
+            if would_cycle(&obj, &p) {
+                return Ok(Value::Bool(false));
+            }
             if !with_host(|h| h.is_extensible(&obj)) {
                 return Ok(Value::Bool(same_prototype(&obj, &p)));
             }
@@ -9101,6 +9112,34 @@ fn this_arg(args: &[Value], idx: usize) -> Option<Value> {
 /// An array with no accessors pays one lookup returning an empty list, so the
 /// ordinary case is unchanged. The getters are invoked OUTSIDE the host borrow,
 /// since calling one re-enters.
+/// Walk `recv` the way an `Array.prototype` iteration method does: the LENGTH
+/// is captured once at entry (LengthOfArrayLike, step 3), but each element is
+/// read LIVE at its index, and an index that no longer exists is skipped.
+///
+/// Snapshotting the whole array instead meant a callback that mutated it was
+/// not observed: `[1,2,3].forEach(v => a.shift())` visited 1, 2, 3 where node
+/// visits 1 and 3, and `filter` kept elements the callback had already removed.
+///
+/// `f` returns `Some(x)` to stop early with `x`.
+fn array_walk<T>(
+    recv: &Value,
+    mut f: impl FnMut(usize, Value) -> Result<Option<T>, String>,
+) -> Result<Option<T>, String> {
+    let len = array_len(recv);
+    for i in 0..len {
+        // A HOLE — and an index a shrinking mutation has dropped — is skipped
+        // without calling the callback.
+        if with_host(|h| h.is_hole(recv, i)) || i >= array_len(recv) {
+            continue;
+        }
+        let v = get_property(recv, &i.to_string())?;
+        if let Some(out) = f(i, v)? {
+            return Ok(Some(out));
+        }
+    }
+    Ok(None)
+}
+
 fn array_items(recv: &Value) -> Vec<Value> {
     let mut items = with_host(|h| match h.get(recv) {
         Some(JsObj::Array(items)) => items.clone(),
@@ -9644,21 +9683,22 @@ fn array_method_on(
         // result array is created with the SAME holes — `[1,,3].map(f)` calls `f`
         // twice and yields `[2, <1 empty item>, 6]`.
         "map" => {
-            let items = array_items(recv);
             let holes = hole_set(recv);
             let cb = arg0(&args);
-            let mut out = Vec::with_capacity(items.len());
-            for (i, it) in items.iter().enumerate() {
-                if holes.contains(&i) {
-                    out.push(Value::Undef);
-                    continue;
-                }
-                out.push(host::invoke(
+            // The result keeps the source's LENGTH, so a skipped index still
+            // occupies a slot; `array_walk` only tells us which ones ran.
+            let mut out = vec![Value::Undef; array_len(recv)];
+            array_walk(recv, |i, it| {
+                let v = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
+                    vec![it, Value::Float(i as f64), this_value.clone()],
                     this_arg(&args, 1),
-                )?);
-            }
+                )?;
+                if i < out.len() {
+                    out[i] = v;
+                }
+                Ok(None::<()>)
+            })?;
             let arr = array_species_create(this_value, out)?;
             with_host(|h| h.install_holes(&arr, holes));
             Ok(arr)
@@ -9685,39 +9725,31 @@ fn array_method_on(
             array_species_create(this_value, out)
         }
         "filter" => {
-            let items = array_items(recv);
-            let holes = hole_set(recv);
             let cb = arg0(&args);
             let mut out = Vec::new();
-            for (i, it) in items.iter().enumerate() {
-                if holes.contains(&i) {
-                    continue;
-                }
+            array_walk(recv, |i, it| {
                 let keep = host::invoke(
                     &cb,
                     vec![it.clone(), Value::Float(i as f64), this_value.clone()],
                     this_arg(&args, 1),
                 )?;
                 if with_host(|h| h.truthy(&keep)) {
-                    out.push(it.clone());
+                    out.push(it);
                 }
-            }
+                Ok(None::<()>)
+            })?;
             array_species_create(this_value, out)
         }
         "forEach" => {
-            let items = array_items(recv);
-            let holes = hole_set(recv);
             let cb = arg0(&args);
-            for (i, it) in items.iter().enumerate() {
-                if holes.contains(&i) {
-                    continue;
-                }
+            array_walk(recv, |i, it| {
                 host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
+                    vec![it, Value::Float(i as f64), this_value.clone()],
                     this_arg(&args, 1),
                 )?;
-            }
+                Ok(None::<()>)
+            })?;
             Ok(Value::Undef)
         }
         "find" => {
@@ -9770,29 +9802,22 @@ fn array_method_on(
             Ok(Value::Bool(false))
         }
         "every" => {
-            let items = array_items(recv);
-            let holes = hole_set(recv);
             let cb = arg0(&args);
-            for (i, it) in items.iter().enumerate() {
-                if holes.contains(&i) {
-                    continue;
-                }
+            let failed = array_walk(recv, |i, it| {
                 let m = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
+                    vec![it, Value::Float(i as f64), this_value.clone()],
                     this_arg(&args, 1),
                 )?;
-                if !with_host(|h| h.truthy(&m)) {
-                    return Ok(Value::Bool(false));
-                }
-            }
-            Ok(Value::Bool(true))
+                Ok((!with_host(|h| h.truthy(&m))).then_some(()))
+            })?;
+            Ok(Value::Bool(failed.is_none()))
         }
         "reduce" => {
             let items = array_items(recv);
             let holes = hole_set(recv);
             let cb = arg0(&args);
-            let mut acc;
+            let acc;
             let mut start = 0;
             if args.len() >= 2 {
                 acc = args[1].clone();
@@ -9811,17 +9836,27 @@ fn array_method_on(
                     }
                 }
             }
-            for (i, it) in items.iter().enumerate().skip(start) {
-                if holes.contains(&i) {
-                    continue;
+            // Each element is read LIVE at its index, so a callback that
+            // shrinks the array is observed — the tail is skipped rather than
+            // folded from a stale snapshot.
+            let mut cur = acc;
+            array_walk(recv, |i, it| {
+                if i < start {
+                    return Ok(None::<()>);
                 }
-                acc = host::invoke(
+                cur = host::invoke(
                     &cb,
-                    vec![acc, it.clone(), Value::Float(i as f64), this_value.clone()],
+                    vec![
+                        std::mem::replace(&mut cur, Value::Undef),
+                        it,
+                        Value::Float(i as f64),
+                        this_value.clone(),
+                    ],
                     this_arg(&args, 1),
                 )?;
-            }
-            Ok(acc)
+                Ok(None::<()>)
+            })?;
+            Ok(cur)
         }
         "reduceRight" => {
             let items = array_items(recv);
@@ -12126,6 +12161,30 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
 /// The observable prototype, not the stored link: an ordinary object has no
 /// explicit link and inherits `Object.prototype`, so comparing the raw slot
 /// reported "different" for `setPrototypeOf(frozen, Object.prototype)`.
+/// Whether making `p` the prototype of `obj` would create a CYCLE — 10.1.2.1
+/// step 8 walks up from `p` looking for `obj`.
+///
+/// Without the check `Object.setPrototypeOf(a, b)` followed by the reverse
+/// built a ring. Nothing hung, because every chain walk in this host carries a
+/// hop limit, but a lookup then silently gave up instead of finding a property
+/// that really was there.
+fn would_cycle(obj: &Value, p: &Value) -> bool {
+    let mut cur = Some(p.clone());
+    for _ in 0..1000 {
+        let Some(c) = cur else { return false };
+        if with_host(|h| h.strict_eq(&c, obj)) {
+            return true;
+        }
+        // A PROXY's prototype is its handler's business; the spec skips the
+        // walk entirely when one is in the chain.
+        if with_host(|h| h.kind_of(&c)) == Some(ObjKind::Proxy) {
+            return false;
+        }
+        cur = with_host(|h| h.proto_of(&c));
+    }
+    false
+}
+
 fn same_prototype(obj: &Value, p: &Value) -> bool {
     let cur = prototype_of(obj);
     with_host(|h| h.strict_eq(&cur, p) || (h.is_null(&cur) && h.is_null(p)))

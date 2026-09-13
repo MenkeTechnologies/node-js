@@ -2560,3 +2560,8 @@ Still divergent, and why:
   does not: the iterator is parked on the VM stack and the unwind walks past
   it. Closing it needs the loop body wrapped in an implicit `finally`, which
   changes the bytecode shape of every `for-of`.
+- **Two array methods still iterate a SNAPSHOT.** The callback-taking methods
+  read each element live at its index (`examples/livearray.js`), but `sort`
+  with a comparator that mutates the array folds over a stale copy, and
+  `indexOf` with a length-shrinking index accessor searches past the new end.
+  Both need the same `array_walk` treatment the others got.

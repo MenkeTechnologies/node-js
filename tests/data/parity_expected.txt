@@ -1303,6 +1303,28 @@ array    arr
 root     ""|object|1
 order    b,a,c,
 dropped  {"b":2}
+==== livearray.js ====
+shift-forEach [[1,3],[3]]
+pop-forEach   [[1,2],[1]]
+push-forEach  [[1],2]
+splice-map    [[1,3,null],[1,3]]
+filter-shrink [[1],[1]]
+reduce-shrink 1
+every-shrink  [true,1]
+holes         [[0,2],[2,null,6],false]
+map-length    [[1,null,null],3]
+ordinary      [[2,4,6],[2,3],6,true,true]
+index-arg     [["a",0,2],["b",1,2]]
+thisArg       ["T"]
+cycle-two     TypeError: Cyclic __proto__ value
+cycle-self    TypeError: Cyclic __proto__ value
+cycle-three   TypeError: Cyclic __proto__ value
+cycle-setter  TypeError: Cyclic __proto__ value
+cycle-reflect false
+chain-ok      [true,1]
+null-ok       null
+relink-ok     2
+deep-ok       1
 ==== methodidentity.js ====
 arr.push      true
 arr.map       true
