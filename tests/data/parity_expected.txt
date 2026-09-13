@@ -1421,6 +1421,56 @@ webidl   append,delete,entries,forEach,get,getAll,has,keys,set,size,sort,toStrin
 url      hash,host,hostname,href,origin,password,pathname,port,protocol,search,searchParams,toJSON,toString,username
 encoder  encode,encodeInto,encoding
 callable function get 1 true
+==== rawjson.js ====
+shape     object [object Object] ["rawJSON"] 12345678901234567890
+frozen    null true {"value":"12345678901234567890","writable":false,"enumerable":true,"configurable":false}
+emitted   {"big":12345678901234567890} [12345678901234567890] 12345678901234567890
+roundtrip 12345678901234567890
+brand     true false false false false
+replacer  {"a":99}
+filter    {"a":12345678901234567890}
+nested    {"o":{"p":[12345678901234567890,12345678901234567890]}}
+indent    {|  "a": 12345678901234567890|}
+kinds     1e400 {"a":null} "s"
+throw     "" -> SyntaxError: Invalid value for JSON.rawJSON
+throw     " " -> SyntaxError: Unexpected token ' ', " " is not valid JSON
+throw     " 1" -> SyntaxError: Unexpected token ' ', " 1" is not valid JSON
+throw     "1 " -> SyntaxError: Invalid value for JSON.rawJSON
+throw     "\t1" -> SyntaxError: Unexpected token '	', "	1" is not valid JSON
+throw     "1\n" -> SyntaxError: Invalid value for JSON.rawJSON
+throw     " 1 " -> SyntaxError: Unexpected token ' ', " 1 " is not valid JSON
+ok        "1" -> "1"
+ok        "-1.5e3" -> "-1.5e3"
+ok        "true" -> "true"
+ok        "false" -> "false"
+ok        "null" -> "null"
+ok        "\"a\"" -> "\"a\""
+throw     "\"a\" " -> SyntaxError: Invalid value for JSON.rawJSON
+throw     "1,2" -> SyntaxError: Invalid value for JSON.rawJSON
+throw     "1 2" -> SyntaxError: Invalid value for JSON.rawJSON
+throw     "nul" -> SyntaxError: Unexpected end of JSON input
+throw     "NaN" -> SyntaxError: "NaN" is not valid JSON
+throw     "Infinity" -> SyntaxError: "Infinity" is not valid JSON
+throw     "+1" -> SyntaxError: Unexpected token '+', "+1" is not valid JSON
+throw     ".5" -> SyntaxError: Unexpected token '.', ".5" is not valid JSON
+throw     "01" -> SyntaxError: Unexpected number in JSON at position 1 (line 1 column 2)
+throw     "0x1" -> SyntaxError: Invalid value for JSON.rawJSON
+throw     "{}" -> SyntaxError: Unexpected token '{', "{}" is not valid JSON
+throw     "[1]" -> SyntaxError: Unexpected token '[', "[1]" is not valid JSON
+coerced   1 true
+arity     1 rawJSON 1
+"0" number keys=["source"] src="1"
+"1" string keys=["source"] src="\"s\""
+"2" boolean keys=["source"] src="true"
+"3" object keys=["source"] src="null"
+"4" number keys=["source"] src="2.5e3"
+"a" [array] keys=[] src=undefined
+"c" number keys=["source"] src="-0.5"
+"b" object keys=[] src=undefined
+"" object keys=[] src=undefined
+argc      3
+escapes   "\u0041"
+drop      {"a":{},"b":3}
 ==== reflection.js ====
 set-data 1 9
 set-accs undefined 5

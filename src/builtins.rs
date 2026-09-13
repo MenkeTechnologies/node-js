@@ -4782,6 +4782,8 @@ const NS_METHODS: &[&str] = &[
     "Math.trunc",
     "JSON.stringify",
     "JSON.parse",
+    "JSON.rawJSON",
+    "JSON.isRawJSON",
     "Object.keys",
     "Object.values",
     "Object.entries",
@@ -5506,6 +5508,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "JSON.stringify" => json_stringify(args),
         "JSON.parse" => json_parse(args),
+        "JSON.rawJSON" => json_raw(args),
+        "JSON.isRawJSON" => json_is_raw(args),
         "structuredClone" => Ok(deep_clone(&arg0(&args))),
         // The deferred drain a `Readable.from` schedules; the suffix is the
         // stream's heap index.
@@ -7408,6 +7412,13 @@ fn json_str(
         Value::Obj(_) => match h.get(v) {
             Some(JsObj::Str(s)) => Some(json_quote(s)),
             Some(JsObj::Null) => Some("null".into()),
+            // A `JSON.rawJSON` marker contributes its text VERBATIM — that is the
+            // whole point of it, and it is why a number wider than a `double`
+            // can survive a round trip.
+            _ if h.fn_prop(v, "@@rawJSON").is_some() => match h.get(v) {
+                Some(JsObj::Object(p)) => p.get("rawJSON").map(|r| h.str_of(r)),
+                _ => None,
+            },
             // A Map/Set has no ENTRIES to serialize (they are internal slots),
             // but any own property a script attached is serialized like an
             // ordinary object's: `JSON.stringify(Object.assign(new Map(), {a:1}))`
@@ -7547,6 +7558,10 @@ fn json_parse(args: Vec<Value>) -> Result<Value, String> {
     let mut p = JsonParser {
         chars: s.chars().collect(),
         pos: 0,
+        prims: Vec::new(),
+        record: args
+            .get(1)
+            .is_some_and(|r| with_host(|h| host::is_callable(h, r))),
     };
     p.skip_ws();
     if p.peek().is_none() {
@@ -7587,7 +7602,7 @@ fn json_parse(args: Vec<Value>) -> Result<Value, String> {
             m.insert(String::new(), v.clone());
             h.new_object(m)
         });
-        return json_revive("", v, &reviver, &root);
+        return json_revive("", v, &reviver, &root, &p.prims, &mut 0);
     }
     Ok(v)
 }
@@ -7599,7 +7614,98 @@ fn json_parse(args: Vec<Value>) -> Result<Value, String> {
 /// InternalizeJSONProperty) — the object or array the key lives in, and at the
 /// top level a wrapper `{ "": value }`. It was being called with no receiver,
 /// so `this` was undefined and a reviver could not reach its siblings.
-fn json_revive(key: &str, val: Value, reviver: &Value, holder: &Value) -> Result<Value, String> {
+/// `JSON.rawJSON(text)` — a marker object whose text `JSON.stringify` emits
+/// VERBATIM, so a number too large for a `double` survives a round trip
+/// (`JSON.stringify({n: JSON.rawJSON("12345678901234567890")})`).
+///
+/// The validation is not "does `JSON.parse` accept it": node's rule, measured
+/// across the whole matrix, is
+///
+/// ```text
+/// ""                 -> SyntaxError: Invalid value for JSON.rawJSON
+/// leading whitespace -> the parse error for that first character
+/// a complete literal -> ok
+/// anything left over -> SyntaxError: Invalid value for JSON.rawJSON
+/// a broken literal   -> the parse error the scanner raised
+/// ```
+///
+/// so `" 1"` reports an unexpected token while `"1 "` and `"1,2"` report the
+/// invalid-value message even though `JSON.parse` accepts the former and gives
+/// a token error for the latter.
+fn json_raw(args: Vec<Value>) -> Result<Value, String> {
+    const INVALID: &str = "SyntaxError: Invalid value for JSON.rawJSON";
+    let s = with_host(|h| h.str_of(&arg0(&args)));
+    if s.is_empty() {
+        return Err(INVALID.into());
+    }
+    let mut p = JsonParser {
+        chars: s.chars().collect(),
+        pos: 0,
+        prims: Vec::new(),
+        record: false,
+    };
+    // An object or an array is rejected where it starts, as leading whitespace
+    // is — both are "not a primitive", but node reports the token.
+    if matches!(p.peek(), Some('{') | Some('[')) || p.peek().is_some_and(|c| c.is_whitespace()) {
+        return Err(p.err_token(0));
+    }
+    p.parse_value()?;
+    if p.pos != p.chars.len() {
+        // A digit butted against a completed number is still in the number
+        // scanner, so `"01"` reports the scanner's error rather than leftover
+        // input — the same distinction `json_parse` draws for trailing text.
+        if p.chars[p.pos - 1].is_ascii_digit() && p.chars[p.pos].is_ascii_digit() {
+            return Err(p.err_at("Unexpected number", p.pos));
+        }
+        return Err(INVALID.into());
+    }
+    // A null prototype and one own `rawJSON` property, frozen — the brand is a
+    // hidden slot so `Object.keys` stays `["rawJSON"]`.
+    Ok(with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        let text = h.new_str(s);
+        m.insert("rawJSON".into(), text);
+        let o = h.new_object(m);
+        let null = h.null();
+        h.set_proto(&o, null);
+        h.set_fn_prop(&o, "@@rawJSON", Value::Bool(true));
+        h.seal_object(&o, true);
+        o
+    }))
+}
+
+/// `JSON.isRawJSON(v)` — the brand check. A hand-built `{ rawJSON: "1" }` is
+/// NOT one, which is why the marker is a hidden slot rather than the property.
+fn json_is_raw(args: Vec<Value>) -> Result<Value, String> {
+    Ok(Value::Bool(is_raw_json(&arg0(&args))))
+}
+
+fn is_raw_json(v: &Value) -> bool {
+    with_host(|h| h.fn_prop(v, "@@rawJSON")).is_some()
+}
+
+fn json_revive(
+    key: &str,
+    val: Value,
+    reviver: &Value,
+    holder: &Value,
+    prims: &[String],
+    next: &mut usize,
+) -> Result<Value, String> {
+    // A PRIMITIVE claims the next recorded source slice before its children
+    // would — it has none — and a container claims nothing. The walk descends in
+    // the same order the parse produced them, so one cursor lines the two up.
+    let is_container =
+        with_host(|h| matches!(h.get(&val), Some(JsObj::Array(_)) | Some(JsObj::Object(_))));
+    let source = if !is_container {
+        let s = prims.get(*next).cloned();
+        if s.is_some() {
+            *next += 1;
+        }
+        s
+    } else {
+        None
+    };
     match with_host(|h| h.get(&val).cloned()) {
         Some(JsObj::Array(items)) => {
             for i in 0..items.len() {
@@ -7607,7 +7713,7 @@ fn json_revive(key: &str, val: Value, reviver: &Value, holder: &Value) -> Result
                     Some(JsObj::Array(it)) => it[i].clone(),
                     _ => Value::Undef,
                 });
-                let nv = json_revive(&i.to_string(), elem, reviver, &val)?;
+                let nv = json_revive(&i.to_string(), elem, reviver, &val, prims, next)?;
                 with_host(|h| {
                     if let Some(JsObj::Array(it)) = h.get_mut(&val) {
                         it[i] = nv;
@@ -7626,7 +7732,7 @@ fn json_revive(key: &str, val: Value, reviver: &Value, holder: &Value) -> Result
                     Some(JsObj::Object(p)) => p.get(&k).cloned().unwrap_or(Value::Undef),
                     _ => Value::Undef,
                 });
-                let nv = json_revive(&k, elem, reviver, &val)?;
+                let nv = json_revive(&k, elem, reviver, &val, prims, next)?;
                 with_host(|h| {
                     if let Some(JsObj::Object(p)) = h.get_mut(&val) {
                         if matches!(nv, Value::Undef) {
@@ -7641,12 +7747,33 @@ fn json_revive(key: &str, val: Value, reviver: &Value, holder: &Value) -> Result
         _ => {}
     }
     let kv = with_host(|h| h.new_str(key.to_string()));
-    host::invoke(reviver, vec![kv, val], Some(holder.clone()))
+    // 25.5.1.1 step 2.b: the reviver's THIRD argument. `{ source }` for a
+    // primitive, an empty object for an array or an object — node passes it
+    // either way, and code reading `ctx.source` used to die on `undefined`
+    // because only two arguments were passed.
+    let ctx = with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        if let Some(s) = source {
+            let sv = h.new_str(s);
+            m.insert("source".into(), sv);
+        }
+        h.new_object(m)
+    });
+    host::invoke(reviver, vec![kv, val, ctx], Some(holder.clone()))
 }
 
 struct JsonParser {
     chars: Vec<char>,
     pos: usize,
+    /// Source text of each PRIMITIVE value, in parse order — what the reviver's
+    /// third argument reports as `context.source` (25.5.1.1). Only collected
+    /// when a reviver was supplied.
+    ///
+    /// A flat list rather than a parallel tree because the reviver walk visits
+    /// primitives in the same depth-first order the parse produced them, so an
+    /// index into this is enough to line them up.
+    prims: Vec<String>,
+    record: bool,
 }
 impl JsonParser {
     fn peek(&self) -> Option<char> {
@@ -7726,7 +7853,9 @@ impl JsonParser {
     }
     fn parse_value(&mut self) -> Result<Value, String> {
         self.skip_ws();
-        match self.peek() {
+        let start = self.pos;
+        let prim = matches!(self.peek(), Some(c) if c != '{' && c != '[');
+        let v = match self.peek() {
             Some('{') => self.parse_object(),
             Some('[') => self.parse_array(),
             Some('"') => {
@@ -7741,7 +7870,12 @@ impl JsonParser {
             Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
             None => Err("SyntaxError: Unexpected end of JSON input".into()),
             _ => Err(self.err_token(self.pos)),
+        }?;
+        if prim && self.record {
+            self.prims
+                .push(self.chars[start..self.pos].iter().collect());
         }
+        Ok(v)
     }
     fn expect_lit(&mut self, lit: &str) -> Result<(), String> {
         for ch in lit.chars() {
