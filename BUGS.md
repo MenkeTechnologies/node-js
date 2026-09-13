@@ -2560,8 +2560,26 @@ Still divergent, and why:
   does not: the iterator is parked on the VM stack and the unwind walks past
   it. Closing it needs the loop body wrapped in an implicit `finally`, which
   changes the bytecode shape of every `for-of`.
-- **Two array methods still iterate a SNAPSHOT.** The callback-taking methods
-  read each element live at its index (`examples/livearray.js`), but `sort`
-  with a comparator that mutates the array folds over a stale copy, and
-  `indexOf` with a length-shrinking index accessor searches past the new end.
-  Both need the same `array_walk` treatment the others got.
+- **`sort` still folds over a SNAPSHOT.** Every other array method now reads
+  each element live at its index (`examples/livearray.js`,
+  `examples/livearray2.js`), but a comparator that mutates the array it is
+  sorting is not observed: `const a = [3,1,2]; a.sort((x,y) => { a.push(0);
+  return x - y })` leaves `a.length` 3 where node's is 6. `sort` is the one
+  method whose element order is not a simple ascending walk, so `array_walk`
+  does not fit it — it needs the spec's SortIndexedProperties/`length` re-read
+  around the comparator instead.
+- **A HOLE does not fall through to the prototype.** `[[Get]]` on an elided
+  index answers `undefined` directly rather than walking the chain, so with
+  `Array.prototype[1] = "p"` set, `[1,,3][1]` is `undefined` where node reads
+  `"p"`, `1 in [1,,3]` is false where node says true, and `join`/`map`/`for-of`
+  all render the hole rather than the inherited value. The elision record is
+  consulted before the chain walk in the index read path; fixing it means
+  `is_hole` deciding only whether the array OWNS the index, with the lookup
+  continuing either way.
+- **Replacing an array's prototype does not detach the intrinsic methods.**
+  `Object.setPrototypeOf(a, {1: "q"})` leaves `a.join()` working where node
+  throws `a.join is not a function` — the `Array.prototype` methods are
+  synthesized from the receiver's KIND rather than found on its chain, so a
+  re-linked prototype cannot take them away. The same holds for every exotic.
+  `examples/monkeypatch.js` pins what a patched prototype ADDS, which is the
+  half that does work.

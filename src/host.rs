@@ -1425,6 +1425,23 @@ impl JsHost {
             .or_default()
             .insert(name.to_string(), val);
     }
+    /// `delete <ns>.<name>` for a script-assigned static. Reports whether the
+    /// key was there — without this, `delete Array.prototype.patch` answered
+    /// true and left the entry in place, so the patch outlived its own removal.
+    pub fn remove_builtin_static(&mut self, ns: &str, name: &str) -> bool {
+        self.builtin_statics
+            .get_mut(ns)
+            .is_some_and(|m| m.shift_remove(name).is_some())
+    }
+    /// Every namespace a script has assigned a static onto, with that
+    /// namespace's assigned keys — the source of the user-added half of
+    /// `Object.getOwnPropertyNames(Array.prototype)`.
+    pub fn builtin_static_keys(&self, ns: &str) -> Vec<String> {
+        self.builtin_statics
+            .get(ns)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
     /// Drop an own property from the side table (`delete arr.foo`,
     /// `delete fn.tag`). Reports whether the key was there.
     pub fn remove_fn_prop(&mut self, v: &Value, name: &str) -> bool {
@@ -6207,6 +6224,16 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
                 return invoke(&f, args, Some(recv.clone()));
             }
             return Err(type_error(&format!("{name} is not a function")));
+        }
+        // A method patched onto `Object.prototype`. `lookup_chain` cannot find
+        // it: a plain object is not LINKED to the intrinsic prototype object,
+        // its `Object.prototype` members are synthesized instead. So
+        // `Object.prototype.tap = f; ({}).tap()` reported "is not a function"
+        // while `({}).tap` already read back as `f`.
+        if let Some(f) = crate::builtins::inherited_builtin_static(recv, name) {
+            if with_host(|h| is_callable(h, &f)) {
+                return invoke(&f, args, Some(recv.clone()));
+            }
         }
         if crate::builtins::is_object_builtin_method(name) {
             return crate::builtins::object_builtin_method(recv, name, args);

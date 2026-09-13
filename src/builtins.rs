@@ -1452,6 +1452,14 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
         ));
     }
+    // A monkey-patched intrinsic prototype member shadows the synthesized one:
+    // after `Array.prototype.join = f`, `[1, 2].join` must BE `f`. An own
+    // property on the receiver still wins, as it does on any chain.
+    if !name.starts_with('#') && !name.starts_with("@@") && !has_own_for_shadow(recv, name) {
+        if let Some(v) = inherited_builtin_static(recv, name) {
+            return Ok(v);
+        }
+    }
     if matches!(out, Value::Undef) && !name.starts_with('#') {
         if let Some(owner) = inherited_method_owner(recv, name) {
             let key = format!("@proto:{owner}:{name}");
@@ -2214,14 +2222,24 @@ fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
         || key == "prototype"
         || (ns == "Symbol" && host::WELL_KNOWN_SYMBOLS.contains(&key));
     let own_fn_meta = matches!(key, "name" | "length") && host::builtin_is_callable(ns);
-    let enumerable =
-        !frozen && !own_fn_meta && crate::stdlib::namespace_keys(ns).iter().any(|k| k == key);
+    // A key a SCRIPT assigned is an ordinary writable/enumerable/configurable
+    // data property, whatever the namespace's built-in members look like — the
+    // synthesized answer reported it non-enumerable, so a monkey-patched member
+    // described itself as one of the intrinsics.
+    let assigned = !intrinsic_proto_member(ns, key)
+        && !crate::stdlib::namespace_keys(ns).iter().any(|k| k == key)
+        && with_host(|h| h.builtin_static(ns, key).is_some());
+    let enumerable = assigned
+        || (!frozen && !own_fn_meta && crate::stdlib::namespace_keys(ns).iter().any(|k| k == key));
     with_host(|h| {
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("value".into(), value);
-        m.insert("writable".into(), Value::Bool(!frozen && !own_fn_meta));
+        m.insert(
+            "writable".into(),
+            Value::Bool(assigned || (!frozen && !own_fn_meta)),
+        );
         m.insert("enumerable".into(), Value::Bool(enumerable));
-        m.insert("configurable".into(), Value::Bool(!frozen));
+        m.insert("configurable".into(), Value::Bool(assigned || !frozen));
         h.new_object(m)
     })
 }
@@ -2229,6 +2247,17 @@ fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
 /// Whether `<ns>.<key>` may be deleted — the `configurable` half of
 /// [`builtin_member_descriptor`], split out so `delete` can ask without
 /// building a descriptor object.
+/// Whether `key` is one of the members the intrinsic prototype namespace `ns`
+/// really defines — as opposed to a name a script added. An assignment over one
+/// of these is a `[[Set]]` and leaves its attributes alone.
+fn intrinsic_proto_member(ns: &str, key: &str) -> bool {
+    intrinsic_proto_members(ns).is_some_and(|members| {
+        members
+            .iter()
+            .any(|m| m.strip_prefix('+').unwrap_or(m) == key)
+    })
+}
+
 fn builtin_member_configurable(ns: &str, key: &str) -> bool {
     !(namespace_constants(ns).iter().any(|(k, _)| *k == key)
         || key == "prototype"
@@ -2251,6 +2280,18 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // actually invalidates.
     if ns == REQUIRE_CACHE {
         return crate::module::cache_get(name).unwrap_or(Value::Undef);
+    }
+    // A property a SCRIPT assigned onto this namespace wins over everything
+    // synthesized below, including a member the namespace really has. That is
+    // what monkey-patching an intrinsic is: `Array.prototype.join = f` must make
+    // `[1, 2].join()` call `f`, and a polyfill's `Array.prototype.at = impl` has
+    // to read back at all. Only the two `Error` hooks consulted this table, so
+    // every other assignment onto a builtin — the whole polyfill idiom — was
+    // stored by `set_property` and then never read: the write appeared to
+    // succeed, `Object.isExtensible` said true, and the value came back
+    // `undefined`.
+    if let Some(v) = with_host(|h| h.builtin_static(ns, name)) {
+        return v;
     }
     // The ENTRY script's `require` is this builtin rather than the per-module
     // closure, so its `cache` has to be handed out here too.
@@ -3488,6 +3529,20 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         with_host(|h| h.set_builtin_static(&ns, name, val));
         return Ok(());
     }
+    // A write onto a REAL intrinsic prototype object (`Object.prototype`,
+    // `String.prototype`, `TypeError.prototype`) is mirrored into the
+    // per-namespace side table as well as the object's own map. Instances are
+    // not linked to these objects by `proto_of` — the chain walk never reaches
+    // them — so the mirror is what makes `String.prototype.pad = f` visible as
+    // `"x".pad`. The own-map write below still happens, so reading the
+    // prototype itself and enumerating it keep working unchanged.
+    if let Some(ns) = with_host(|h| {
+        h.intrinsic_proto_ctor(recv)
+            .map(str::to_string)
+            .or_else(|| (h.object_proto() == *recv).then(|| "Object".to_string()))
+    }) {
+        with_host(|h| h.set_builtin_static(&format!("{ns}.prototype"), name, val.clone()));
+    }
     // Assigning a `URL` component rewrites the DERIVED fields (`href`, `host`,
     // `origin`) alongside it. They are stored rather than computed on read, so
     // without this `u.pathname = '/p'` read back as `/p` while `u.href` still
@@ -3688,10 +3743,28 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
     // removing anything. There is no property map behind a namespace, so the
     // ordinary attribute lookup below cannot tell — it reported success for
     // every one of them.
+    // A REAL intrinsic prototype object carries the write in its own map AND in
+    // the side table the instance read consults, so the delete has to clear
+    // both. Clearing only the map left `Object.prototype.patch` deleted as far
+    // as the prototype was concerned and still inherited by every object.
+    if let Some(ns) = with_host(|h| {
+        h.intrinsic_proto_ctor(recv)
+            .map(str::to_string)
+            .or_else(|| (h.object_proto() == *recv).then(|| "Object".to_string()))
+    }) {
+        with_host(|h| h.remove_builtin_static(&format!("{ns}.prototype"), key));
+    }
     if let Some(ns) = peek(recv, |o| match o {
         JsObj::Builtin(ns) => Some(ns.clone()),
         _ => None,
     }) {
+        // A script-assigned static is an ordinary configurable property and is
+        // removed from the side table the assignment landed in. Falling through
+        // to the attribute check below answered true and deleted nothing, so a
+        // patch survived its own `delete`.
+        if with_host(|h| h.remove_builtin_static(&ns, key)) {
+            return Ok(true);
+        }
         if ns != REQUIRE_CACHE && !builtin_member_configurable(&ns, key) {
             return Ok(false);
         }
@@ -7250,11 +7323,24 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
         // interface, which the table records per name.
         if let Some(members) = intrinsic_proto_members(&ns) {
             let ctor = ns.trim_end_matches(".prototype");
-            let names: Vec<&str> = members
+            let mut names: Vec<String> = members
                 .iter()
                 .filter(|m| mode == 3 || m.starts_with('+'))
-                .map(|m| m.strip_prefix('+').unwrap_or(m))
+                .map(|m| m.strip_prefix('+').unwrap_or(m).to_string())
                 .collect();
+            // Plus whatever a script patched onto this prototype under a NEW
+            // name — an ordinary enumerable own property, so it lists in every
+            // mode. Without it `Object.keys(Array.prototype)` stayed `[]` after
+            // an assignment that `Array.prototype.patch` read back happily.
+            //
+            // Assigning over an EXISTING member is a `[[Set]]`, which leaves
+            // that member's attributes alone: restoring a saved `join` must not
+            // turn it into an enumerable key.
+            for k in with_host(|h| h.builtin_static_keys(&ns)) {
+                if !intrinsic_proto_member(&ns, &k) && !names.contains(&k) {
+                    names.push(k);
+                }
+            }
             return Ok(with_host(|h| {
                 let out: Vec<Value> = names
                     .iter()
@@ -7263,6 +7349,9 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
                         // is not a function — so a VALUE read of one answers
                         // undefined rather than synthesizing a callable.
                         let val = |h: &mut host::JsHost| {
+                            if let Some(v) = h.builtin_static(&ns, name) {
+                                return v;
+                            }
                             let key = format!("@proto:{ctor}:{name}");
                             if builtin_meta(&key).is_some() {
                                 h.alloc(JsObj::Builtin(key))
@@ -7273,11 +7362,11 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
                         match mode {
                             1 => val(h),
                             2 => {
-                                let ks = h.new_str(*name);
+                                let ks = h.new_str(name.clone());
                                 let v = val(h);
                                 h.new_array(vec![ks, v])
                             }
-                            _ => h.new_str(*name),
+                            _ => h.new_str(name.clone()),
                         }
                     })
                     .collect();
@@ -7349,6 +7438,16 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
                 names.push("length".to_string());
             }
             names.push("name".to_string());
+        }
+        // Whatever a script assigned onto the namespace, in assignment order and
+        // after the built-in members — an ordinary enumerable own property, so
+        // it surfaces under `Object.keys` too and not only `ownKeys`. These were
+        // missing from every listing, which made a patched prototype read as
+        // unpatched to any code that enumerates rather than reads.
+        for k in with_host(|h| h.builtin_static_keys(&ns)) {
+            if !names.contains(&k) {
+                names.push(k);
+            }
         }
         if !names.is_empty() {
             let entries: Vec<(String, Value)> = names
@@ -8852,6 +8951,18 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
             return host::invoke(&f, args, Some(recv.clone()));
         }
     }
+    // A method monkey-patched onto the receiver's intrinsic prototype. The READ
+    // path resolves these, but dispatch goes straight to the builtin table and
+    // never consults it, so `Array.prototype.last = f; [1].last()` threw "is not
+    // a function" while `[1].last` WAS `f` — the read and the call disagreeing
+    // about the same name, on the one path a polyfill actually uses.
+    if !name.starts_with("@@") && !has_own_for_shadow(recv, name) {
+        if let Some(f) = inherited_builtin_static(recv, name) {
+            if with_host(|h| host::is_callable(h, &f)) {
+                return host::invoke(&f, args, Some(recv.clone()));
+            }
+        }
+    }
     // Every object INHERITS the `Object.prototype` methods, and an exotic that
     // does not define its own reaches them the same way. Each kind's dispatch
     // table below only knows its own methods, so `new Map().toString()`,
@@ -9138,6 +9249,36 @@ fn array_walk<T>(
         }
     }
     Ok(None)
+}
+
+/// `array_walk`'s descending twin, for `reduceRight`/`findLast*`: the same
+/// capture-length-once, read-each-element-live rule walked from the end. A
+/// callback that SHRINKS the array is observed by every later step, so the
+/// indices it drops are skipped rather than served from a stale copy.
+fn array_walk_rev<T>(
+    recv: &Value,
+    from: usize,
+    mut f: impl FnMut(usize, Value) -> Result<Option<T>, String>,
+) -> Result<Option<T>, String> {
+    for i in (0..from).rev() {
+        if with_host(|h| h.is_hole(recv, i)) || i >= array_len(recv) {
+            continue;
+        }
+        let v = get_property(recv, &i.to_string())?;
+        if let Some(out) = f(i, v)? {
+            return Ok(Some(out));
+        }
+    }
+    Ok(None)
+}
+
+/// The live read behind `indexOf`/`includes`/`join`: the element at `i`, or
+/// `undefined` once a mutation has shrunk the array past it.
+fn array_elem_live(recv: &Value, i: usize) -> Result<Value, String> {
+    if i >= array_len(recv) {
+        return Ok(Value::Undef);
+    }
+    get_property(recv, &i.to_string())
 }
 
 fn array_items(recv: &Value) -> Vec<Value> {
@@ -9478,18 +9619,22 @@ fn array_method_on(
         // never a match: `[1,,3].indexOf(undefined)` is `-1`, while the
         // `Get`-based `includes` reports `true` for the same array.
         "indexOf" => {
-            let items = array_items(recv);
-            let holes = hole_set(recv);
             let target = arg0(&args);
-            let start = search_start(arg_num(&args, 1), items.len());
-            let idx = with_host(|h| {
-                items
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .find(|(i, x)| !holes.contains(i) && h.strict_eq(x, &target))
-                    .map(|(i, _)| i)
-            });
+            let len = array_len(recv);
+            let start = search_start(arg_num(&args, 1), len);
+            let mut idx = None;
+            for i in start..len {
+                // 23.1.3.17 steps 8a-8b: HasProperty first, so a hole — and an
+                // index a mutation has since dropped — is skipped, not compared.
+                if with_host(|h| h.is_hole(recv, i)) || i >= array_len(recv) {
+                    continue;
+                }
+                let x = get_property(recv, &i.to_string())?;
+                if with_host(|h| h.strict_eq(&x, &target)) {
+                    idx = Some(i);
+                    break;
+                }
+            }
             Ok(Value::Float(idx.map(|i| i as f64).unwrap_or(-1.0)))
         }
         "lastIndexOf" => {
@@ -9512,15 +9657,23 @@ fn array_method_on(
         }
         "includes" => {
             // Array.includes uses SameValueZero: unlike `===`, NaN matches NaN.
-            let items = array_items(recv);
+            // Unlike `indexOf` it has no HasProperty step (23.1.3.16 step 5b), so
+            // a hole reads as `undefined` and `[,].includes(undefined)` is true.
             let target = arg0(&args);
             let tnan = matches!(target, Value::Float(f) if f.is_nan());
-            let start = search_start(arg_num(&args, 1), items.len());
-            Ok(Value::Bool(with_host(|h| {
-                items.iter().skip(start).any(|x| {
-                    (tnan && matches!(x, Value::Float(f) if f.is_nan())) || h.strict_eq(x, &target)
-                })
-            })))
+            let len = array_len(recv);
+            let start = search_start(arg_num(&args, 1), len);
+            let mut found = false;
+            for i in start..len {
+                let x = array_elem_live(recv, i)?;
+                if (tnan && matches!(x, Value::Float(f) if f.is_nan()))
+                    || with_host(|h| h.strict_eq(&x, &target))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Bool(found))
         }
         "slice" => {
             let items = array_items(recv);
@@ -9704,24 +9857,21 @@ fn array_method_on(
             Ok(arr)
         }
         "flatMap" => {
-            let items = array_items(recv);
             let cb = arg0(&args);
-            let holes = hole_set(recv);
+            let thisarg = this_arg(&args, 1);
             let mut out = Vec::new();
-            for (i, it) in items.iter().enumerate() {
-                if holes.contains(&i) {
-                    continue;
-                }
+            array_walk(recv, |i, v| {
                 let r = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    this_arg(&args, 1),
+                    vec![v, Value::Float(i as f64), this_value.clone()],
+                    thisarg.clone(),
                 )?;
                 match with_host(|h| h.get(&r).cloned()) {
                     Some(JsObj::Array(inner)) => out.extend(inner),
                     _ => out.push(r),
                 }
-            }
+                Ok(None::<()>)
+            })?;
             array_species_create(this_value, out)
         }
         "filter" => {
@@ -9783,23 +9933,17 @@ fn array_method_on(
             Ok(Value::Float(-1.0))
         }
         "some" => {
-            let items = array_items(recv);
-            let holes = hole_set(recv);
             let cb = arg0(&args);
-            for (i, it) in items.iter().enumerate() {
-                if holes.contains(&i) {
-                    continue;
-                }
+            let thisarg = this_arg(&args, 1);
+            let hit = array_walk(recv, |i, v| {
                 let m = host::invoke(
                     &cb,
-                    vec![it.clone(), Value::Float(i as f64), this_value.clone()],
-                    this_arg(&args, 1),
+                    vec![v, Value::Float(i as f64), this_value.clone()],
+                    thisarg.clone(),
                 )?;
-                if with_host(|h| h.truthy(&m)) {
-                    return Ok(Value::Bool(true));
-                }
-            }
-            Ok(Value::Bool(false))
+                Ok(with_host(|h| h.truthy(&m)).then_some(()))
+            })?;
+            Ok(Value::Bool(hit.is_some()))
         }
         "every" => {
             let cb = arg0(&args);
@@ -9859,19 +10003,18 @@ fn array_method_on(
             Ok(cur)
         }
         "reduceRight" => {
-            let items = array_items(recv);
-            let holes = hole_set(recv);
             let cb = arg0(&args);
-            let n = items.len();
+            let n = array_len(recv);
             let mut acc;
-            let mut i = n; // one past the next index to process (walking down)
+            let mut from = n; // one past the next index to process (walking down)
             if args.len() >= 2 {
                 acc = args[1].clone();
             } else {
+                let holes = hole_set(recv);
                 match (0..n).rev().find(|i| !holes.contains(i)) {
                     Some(k) => {
-                        acc = items[k].clone();
-                        i = k;
+                        acc = get_property(recv, &k.to_string())?;
+                        from = k;
                     }
                     None => {
                         return Err(host::type_error(
@@ -9880,22 +10023,19 @@ fn array_method_on(
                     }
                 }
             }
-            while i > 0 {
-                i -= 1;
-                if holes.contains(&i) {
-                    continue;
-                }
-                acc = host::invoke(
+            // `acc` moves into the closure and back out on every step, so it
+            // lives in an Option the closure can take from and refill.
+            let mut slot = Some(acc);
+            array_walk_rev(recv, from, |i, v| {
+                let prev = slot.take().expect("accumulator is refilled each step");
+                slot = Some(host::invoke(
                     &cb,
-                    vec![
-                        acc,
-                        items[i].clone(),
-                        Value::Float(i as f64),
-                        this_value.clone(),
-                    ],
+                    vec![prev, v, Value::Float(i as f64), this_value.clone()],
                     None,
-                )?;
-            }
+                )?);
+                Ok(None::<()>)
+            })?;
+            acc = slot.expect("accumulator is refilled each step");
             Ok(acc)
         }
         "findLast" => {
@@ -10062,7 +10202,19 @@ fn join_array(recv: &Value, sep: &str) -> Result<Value, String> {
     if !host::join_stack_push(recv) {
         return Ok(with_host(|h| h.new_str(String::new())));
     }
-    let parts = join_parts(&array_items(recv));
+    // 23.1.3.18 step 6: the length is captured once, then each element is read
+    // and STRINGIFIED before the next is read. Both halves are observable —
+    // a getter or a `toString` that shrinks the array is seen by every later
+    // element, which a read-all-then-convert pass misses.
+    let parts = (|| -> Result<Vec<String>, String> {
+        let len = array_len(recv);
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let v = array_elem_live(recv, i)?;
+            out.push(join_parts(std::slice::from_ref(&v))?.remove(0));
+        }
+        Ok(out)
+    })();
     host::join_stack_pop();
     let s = parts?.join(sep);
     Ok(with_host(|h| h.new_str(s)))
@@ -12411,6 +12563,16 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) -> Result<(), String> 
     // The ordinary path below writes a shadowing map entry the read never
     // consults, so `Object.defineProperty(u8, '0', {value: 9})` left `u8[0]`
     // unchanged.
+    // A builtin namespace/prototype has no property map either, so a data
+    // descriptor has to reach the same side table an assignment does.
+    // `Object.defineProperty(Array.prototype, 'at', {value: impl})` — how a
+    // careful polyfill installs itself, precisely to avoid the enumerable
+    // property a bare assignment creates — wrote a map entry nothing read.
+    if with_host(|h| h.kind_of(obj)) == Some(ObjKind::Builtin) {
+        if let Some(v) = req.value.clone() {
+            return set_property_pub(obj, key, v);
+        }
+    }
     let exotic_own = (crate::stdlib::native_tag(obj).as_deref() == Some("TypedArray")
         && key.parse::<usize>().is_ok())
         || (key == "lastIndex" && with_host(|h| matches!(h.get(obj), Some(JsObj::RegExp(_)))));
@@ -12889,6 +13051,61 @@ fn has_property_ordinary(obj: &Value, key: &str) -> bool {
 /// Whether a READ of `key` on `obj` would resolve to an inherited builtin
 /// prototype method. Asked by `in` and `hasOwnProperty`'s negative case; it
 /// performs no read, so a getter cannot fire.
+/// A property a script MONKEY-PATCHED onto the intrinsic prototype `obj`
+/// inherits from (`Array.prototype.at = impl`, `Object.prototype.foo = 1`), or
+/// `None`.
+///
+/// The intrinsic prototypes are namespace handles rather than real objects on
+/// the chain, so an assignment onto one lands in `builtin_statics` and no
+/// ordinary chain walk can see it. This is the read side: the receiver's own
+/// constructor's prototype first, then `Object.prototype`, mirroring
+/// `inherited_method_owner`'s two-step.
+pub(crate) fn inherited_builtin_static(obj: &Value, key: &str) -> Option<Value> {
+    if with_host(|h| h.has_null_proto(obj)) {
+        return None;
+    }
+    let ctor = match wrapped_primitive(obj).as_ref().and_then(wrapper_ctor_of) {
+        Some(c) => Some(c),
+        None if is_arguments(obj) => Some("Object"),
+        None => with_host(|h| default_ctor_name(h, obj)),
+    };
+    // Only the side table is consulted, never the real prototype OBJECT's map:
+    // `String.prototype` and friends are materialized with their intrinsic
+    // members present, so reading their maps here would re-route every ordinary
+    // `"a".toString()` through this path — which recursed until the stack blew.
+    // `set_property` mirrors a write onto a real intrinsic prototype INTO this
+    // table precisely so the read side can stay this narrow.
+    let on = |c: &str| with_host(|h| h.builtin_static(&format!("{c}.prototype"), key));
+    let found = ctor.and_then(on).or_else(|| on("Object"))?;
+    // Restoring a saved intrinsic (`const orig = Array.prototype.join; …;
+    // Array.prototype.join = orig`) stores the SYNTHESIZED thunk for this very
+    // name back into the table. Dispatching to it would re-enter this lookup
+    // and recurse until the stack blew, so a thunk that is already this key's
+    // own intrinsic reports nothing and the ordinary builtin path answers.
+    let self_thunk = with_host(
+        |h| matches!(h.get(&found), Some(JsObj::Builtin(s)) if s.starts_with("@proto:") && s.ends_with(&format!(":{key}"))),
+    );
+    (!self_thunk).then_some(found)
+}
+
+/// Whether `recv` carries `key` as an OWN property — the guard on
+/// [`inherited_builtin_static`], since an own property shadows anything
+/// patched onto a prototype.
+fn has_own_for_shadow(recv: &Value, key: &str) -> bool {
+    with_host(|h| {
+        if h.fn_prop(recv, key).is_some() || h.own_accessor(recv, key).is_some() {
+            return true;
+        }
+        match h.get(recv) {
+            Some(JsObj::Object(p)) => p.contains_key(key),
+            Some(JsObj::Array(items)) => {
+                key == "length" || key.parse::<usize>().is_ok_and(|i| i < items.len())
+            }
+            _ => false,
+        }
+    })
+}
+
 fn inherited_builtin_method(obj: &Value, key: &str) -> bool {
     if with_host(|h| h.has_null_proto(obj)) {
         return false;
