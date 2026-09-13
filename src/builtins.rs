@@ -4845,6 +4845,9 @@ const NS_METHODS: &[&str] = &[
     "Promise.race",
     "Promise.any",
     "Promise.withResolvers",
+    "Promise.try",
+    "RegExp.escape",
+    "Error.isError",
     "Map.groupBy",
     "Response.json",
     "Response.error",
@@ -5563,6 +5566,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `Promise.withResolvers()` (ES2024): a new pending promise plus its own
         // resolve/reject functions, returned as `{ promise, resolve, reject }`.
         "Promise.withResolvers" => promise_with_resolvers(),
+        "Promise.try" => promise_try(args),
+        "RegExp.escape" => regexp_escape(args),
+        "Error.isError" => error_is_error(args),
         // `Map.groupBy(items, cb)` (ES2024): group into a `Map` keyed by the raw
         // `cb(item, i)` result (SameValueZero), each value an array of members.
         "Map.groupBy" => map_group_by(args),
@@ -12714,6 +12720,149 @@ pub fn pending_promise_with_resolver() -> (Value, Value) {
     let id = with_host(|h| h.promise_id(&p).unwrap());
     let resolve = make_builtin(format!("@@presolve:{id}"));
     (p, resolve)
+}
+
+/// `RegExp.escape(s)` (22.2.4.2) — a string that matches `s` literally.
+///
+/// The rule is not "backslash the syntax characters": it also escapes a LEADING
+/// ASCII alphanumeric, so the result can be concatenated after a `\` or a `{`
+/// without the two running together, and it escapes the punctuation that is
+/// meaningful inside a character class or a group name.
+fn regexp_escape(args: Vec<Value>) -> Result<Value, String> {
+    let v = arg0(&args);
+    if !matches!(v, Value::Str(_)) && !with_host(|h| matches!(h.get(&v), Some(JsObj::Str(_)))) {
+        return Err(host::type_error("input argument must be a string"));
+    }
+    let s = with_host(|h| h.str_of(&v));
+    // Punctuation that is escaped by CODE POINT rather than with a backslash.
+    // Measured against node over the whole ASCII range, not taken from a list:
+    // `-` and `=` are here, `$` and `*` are syntax characters and are not.
+    const OTHER_PUNCTUATORS: &str = " !\"#%&',-:;<=>@`~";
+    const SYNTAX: &str = "^$\\.*+?()[]{}|/";
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        // A leading ASCII alphanumeric, and only a leading one.
+        if i == 0 && c.is_ascii_alphanumeric() {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+            continue;
+        }
+        if SYNTAX.contains(c) {
+            out.push('\\');
+            out.push(c);
+            continue;
+        }
+        match c {
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{b}' => out.push_str("\\v"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            _ if OTHER_PUNCTUATORS.contains(c) || is_regex_escape_space(c) => {
+                let n = c as u32;
+                if n <= 0xff {
+                    out.push_str(&format!("\\x{n:02x}"));
+                } else {
+                    out.push_str(&format!("\\u{n:04x}"));
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    Ok(with_host(|h| h.new_str(out)))
+}
+
+/// The WhiteSpace and LineTerminator code points `RegExp.escape` spells out.
+/// Deliberately NOT `char::is_whitespace`: U+180E and U+200B are whitespace to
+/// Unicode but not to ECMAScript, and node leaves both alone.
+fn is_regex_escape_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
+}
+
+/// `Error.isError(v)` (20.5.2.1) — a brand check for `[[ErrorData]]`, so an
+/// object that merely INHERITS from `Error.prototype` is not one.
+fn error_is_error(args: Vec<Value>) -> Result<Value, String> {
+    let v = arg0(&args);
+    Ok(Value::Bool(with_host(|h| {
+        // The brand here is the own `stack` an error is built with (a
+        // `DOMException` carries `@@domName` instead); a plain
+        // `Object.create(Error.prototype)` has neither.
+        match h.get(&v) {
+            Some(JsObj::Object(p)) => {
+                p.contains_key("stack")
+                    || p.contains_key("@@stackRaw")
+                    || p.contains_key("@@domName")
+            }
+            _ => false,
+        }
+    })))
+}
+
+/// `Promise.try(fn, ...args)` (27.2.4.6) — call `fn` and settle the promise with
+/// what it does, so a SYNCHRONOUS throw becomes a rejection instead of
+/// propagating. `Promise.resolve().then(fn)` is the shape it replaces, and it
+/// costs a tick that this does not.
+fn promise_try(args: Vec<Value>) -> Result<Value, String> {
+    let f = arg0(&args);
+    // A non-callable argument REJECTS, it does not throw: `Promise.try(5)`
+    // returns a rejected promise, so the surrounding `try` never sees it.
+    if !with_host(|h| host::is_callable(h, &f)) {
+        // Node names the TYPE alongside the value — `number 5 is not a
+        // function` — which the ordinary call-site message does not. A plain
+        // object and a symbol name only the type; `null` names both.
+        let shown = with_host(|h| {
+            let kind = h.type_of(&f);
+            match kind {
+                "undefined" => "undefined".to_string(),
+                "symbol" | "bigint" => kind.to_string(),
+                "object" if h.is_null(&f) => "object null".to_string(),
+                "object" => "object".to_string(),
+                "string" => format!("string \"{}\"", h.str_of(&f)),
+                _ => format!("{kind} {}", h.str_of(&f)),
+            }
+        });
+        let p = with_host(|h| h.new_promise());
+        let id = with_host(|h| h.promise_id(&p).unwrap());
+        let reject = make_builtin(format!("@@preject:{id}"));
+        let err =
+            with_host(|h| synth_error(h, &host::type_error(&format!("{shown} is not a function"))));
+        host::invoke(&reject, vec![err], None)?;
+        return Ok(p);
+    }
+    let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+    let p = with_host(|h| h.new_promise());
+    let id = with_host(|h| h.promise_id(&p).unwrap());
+    let resolve = make_builtin(format!("@@presolve:{id}"));
+    let reject = make_builtin(format!("@@preject:{id}"));
+    let promise = p;
+    match host::invoke(&f, rest, None) {
+        Ok(v) => {
+            host::invoke(&resolve, vec![v], None)?;
+        }
+        Err(e) => {
+            // The thrown VALUE, not a re-synthesis of its rendering: a callback
+            // that throws a `TypeError` must reject with that object, and
+            // rebuilding it from the message string flattened it to a plain
+            // `Error` whose message was the rendered `Uncaught TypeError: t`.
+            let err =
+                with_host(|h| h.exc.clone()).unwrap_or_else(|| with_host(|h| synth_error(h, &e)));
+            with_host(|h| {
+                h.error = None;
+                h.exc = None;
+            });
+            host::invoke(&reject, vec![err], None)?;
+        }
+    }
+    Ok(promise)
 }
 
 fn promise_with_resolvers() -> Result<Value, String> {

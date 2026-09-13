@@ -2542,3 +2542,9 @@ Still divergent, and why:
   (`examples/structuredclone.js` therefore pins the error and not the text).
   `FuncDef` holds a compiled chunk; fixing this means carrying source spans
   from the parser through the compiler.
+- **The `Uint8Array` base64/hex methods do not exist.** `Uint8Array.fromBase64`,
+  `fromHex`, and the instance `toBase64`, `toHex`, `setFromBase64`, `setFromHex`
+  are all absent, so the conversions that no longer need a `Buffer` still need
+  one here. They carry an options object (`alphabet: "base64url"`,
+  `omitPadding`, `lastChunkHandling`) and their own SyntaxError messages, which
+  is why they are not a thin wrapper over the existing `Buffer` codec.

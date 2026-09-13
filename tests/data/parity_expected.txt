@@ -1234,6 +1234,51 @@ resolve  fs object function
 builtin  true,false,true,function
 dirs     string string true
 prefix   true
+==== newstatics.js ====
+try-meta   function 1 try
+esc-meta   function 1 escape
+esc "a" -> "\\x61"
+esc "a.b" -> "\\x61\\.b"
+esc "^$\\.*+?()[]{}|/" -> "\\^\\$\\\\\\.\\*\\+\\?\\(\\)\\[\\]\\{\\}\\|\\/"
+esc "0abc" -> "\\x30abc"
+esc "_x" -> "_x"
+esc " sp" -> "\\x20sp"
+esc "\n\t" -> "\\n\\t"
+esc "" -> ""
+esc "ab-cd" -> "\\x61b\\x2dcd"
+esc "Ω" -> "Ω"
+esc "😀" -> "😀"
+esc "a😀" -> "\\x61😀"
+esc "x y" -> "\\x78\\x20y"
+esc "Z　" -> "\\x5a\\u3000"
+esc " " -> "\\xa0"
+esc " " -> "\\u2028"
+esc "​" -> "​"
+esc "᠎" -> "᠎"
+esc "" -> ""
+esc " " -> "\\u2009"
+esc "" -> ""
+esc "\u001c" -> "\u001c"
+roundtrip  true false
+esc-bad    TypeError input argument must be a string
+esc-noarg  input argument must be a string
+isError    function 1 isError
+isError-y  true true true true
+isError-n  false false false false false
+try-value  1
+try-args   3
+try-throw  TypeError t
+try-async  2
+try-reject RangeError r
+try-bad    TypeError: number 5 is not a function
+try-bad    TypeError: string "s" is not a function
+try-bad    TypeError: undefined is not a function
+try-bad    TypeError: object null is not a function
+try-bad    TypeError: object is not a function
+try-bad    TypeError: boolean true is not a function
+try-bad    TypeError: symbol is not a function
+try-bad    TypeError: bigint is not a function
+try-bad    TypeError: object is not a function
 ==== nodesurface.js ====
 signals  9 2 15 6 3
 errno    1 2 4 9 13
