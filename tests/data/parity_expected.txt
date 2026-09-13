@@ -1591,6 +1591,23 @@ webidl   append,delete,entries,forEach,get,getAll,has,keys,set,size,sort,toStrin
 url      hash,host,hostname,href,origin,password,pathname,port,protocol,search,searchParams,toJSON,toString,username
 encoder  encode,encodeInto,encoding
 callable function get 1 true
+==== proxyintegrity.js ====
+freeze-traps  ["preventExtensions","ownKeys","getOwnPropertyDescriptor","defineProperty"]
+seal-traps    ["preventExtensions","ownKeys","defineProperty"]
+isFrozen      [true,["isExtensible","ownKeys","getOwnPropertyDescriptor"]]
+levels        [true,true,false]
+sealed-only   [false,true]
+target        [true,false]
+accessor      [false,false]
+extensible    [false,false]
+set           TypeError: 'set' on proxy: trap returned falsish for property 'x'
+delete        TypeError: 'deleteProperty' on proxy: trap returned falsish for property 'a'
+define        TypeError: 'defineProperty' on proxy: trap returned falsish for property 'x'
+reflect       [false,false,false]
+accepted      [5,true]
+in-traps      [[true,true,false],["has","has","has"]]
+fn-proxy      ["function","function","f",["length","name","prototype"]]
+revoked       TypeError: Cannot perform 'has' on a proxy that has been revoked
 ==== rawjson.js ====
 shape     object [object Object] ["rawJSON"] 12345678901234567890
 frozen    null true {"value":"12345678901234567890","writable":false,"enumerable":true,"configurable":false}

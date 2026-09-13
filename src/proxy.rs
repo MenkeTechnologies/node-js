@@ -163,11 +163,19 @@ pub fn get(v: &Value, key: &str, receiver: &Value) -> Result<Option<Value>, Stri
 pub fn set(v: &Value, key: &str, val: &Value, receiver: &Value) -> Result<bool, String> {
     if let Some((t, target, handler)) = trap(v, "set")? {
         let k = key_value(key);
-        call(
+        let r = call(
             &t,
             &handler,
             vec![target.clone(), k, val.clone(), receiver.clone()],
         )?;
+        // A FALSISH return means the trap refused the write. That is silent in
+        // sloppy code and a TypeError in strict — the same split an ordinary
+        // refused write has, and `Reflect.set` reports it as `false` either way.
+        // The return value was discarded, so a refusing trap looked like a
+        // successful write.
+        if !with_host(|h| h.truthy(&r)) {
+            return Ok(false);
+        }
         // Reporting success for a write the target pins is a lie.
         if let Some((cur, writable, configurable, is_accessor)) =
             crate::builtins::own_prop_facts(&target, key)
@@ -343,7 +351,15 @@ pub fn get_own_descriptor(v: &Value, key: &str) -> Result<Option<Value>, String>
 pub fn define_property(v: &Value, key: &str, desc: &Value) -> Result<bool, String> {
     if let Some((t, target, handler)) = trap(v, "defineProperty")? {
         let k = key_value(key);
-        call(&t, &handler, vec![target.clone(), k, desc.clone()])?;
+        let r = call(&t, &handler, vec![target.clone(), k, desc.clone()])?;
+        // A FALSISH return means the trap refused. Unlike `set` and
+        // `deleteProperty`, this one throws from `Object.defineProperty` in
+        // SLOPPY code too — only `Reflect.defineProperty` reports it as
+        // `false`. The return value was discarded, so a refusing trap looked
+        // like a successful define.
+        if !with_host(|h| h.truthy(&r)) {
+            return Ok(false);
+        }
         // A new property cannot be added to a non-extensible target.
         if crate::builtins::own_prop_facts(&target, key).is_none()
             && !with_host(|h| h.is_extensible(&target))

@@ -1637,6 +1637,87 @@ pub const OBJECT_PROTO_METHODS: &[&str] = &[
 /// non-configurable by construction, so making them non-writable would violate
 /// the invariant, and node refuses outright rather than half-applying it. An
 /// EMPTY view and a `DataView` are both fine.
+/// `TestIntegrityLevel` (7.3.16) — `Object.isFrozen` / `Object.isSealed`.
+///
+/// Over a PROXY it is a sequence of traps (`isExtensible`, `ownKeys`, then a
+/// `getOwnPropertyDescriptor` per key), not a question for the host: the proxy
+/// OBJECT was being inspected, so a frozen proxy answered false and the handler
+/// never saw the query.
+fn integrity_level(v: &Value, freeze: bool) -> Result<Value, String> {
+    if with_host(|h| h.kind_of(v)) != Some(ObjKind::Proxy) {
+        return Ok(Value::Bool(with_host(|h| h.is_sealed(v, freeze))));
+    }
+    // An EXTENSIBLE object is neither sealed nor frozen, whatever its keys say.
+    if crate::proxy::is_extensible(v)?.unwrap_or(true) {
+        return Ok(Value::Bool(false));
+    }
+    for key in crate::proxy::own_keys(v)?.unwrap_or_default() {
+        let Some(d) = crate::proxy::get_own_descriptor(v, &key)? else {
+            continue;
+        };
+        let flag = |name: &str| {
+            with_host(|h| match h.get(&d) {
+                Some(JsObj::Object(p)) => p.get(name).map(|x| h.truthy(x)).unwrap_or(false),
+                _ => false,
+            })
+        };
+        let is_data = with_host(
+            |h| matches!(h.get(&d), Some(JsObj::Object(p)) if !p.contains_key("get") && !p.contains_key("set")),
+        );
+        if flag("configurable") || (freeze && is_data && flag("writable")) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+/// `SetIntegrityLevel` (7.3.15) over a PROXY, which is a sequence of TRAPS —
+/// `preventExtensions`, then `ownKeys`, then a `getOwnPropertyDescriptor` and a
+/// `defineProperty` per key. It ran none of them: the host sealed the proxy
+/// OBJECT, so the handler never saw the operation and the target was untouched.
+///
+/// Returns false for a non-proxy, which takes the ordinary path.
+fn seal_proxy(v: &Value, freeze: bool) -> Result<bool, String> {
+    if with_host(|h| h.kind_of(v)) != Some(ObjKind::Proxy) {
+        return Ok(false);
+    }
+    if !crate::proxy::prevent_extensions(v)? {
+        return Err(host::type_error("Object.freeze called on non-object"));
+    }
+    let keys = crate::proxy::own_keys(v)?.unwrap_or_default();
+    for key in keys {
+        // SEALING asks for no descriptor at all — it only strips
+        // `configurable`, which is the same for a data property and an
+        // accessor. FREEZING has to know which it is, because only a data
+        // property has a `writable` to strip, and that is the one extra trap
+        // call node makes.
+        let accessor = if freeze {
+            let Some(cur) = crate::proxy::get_own_descriptor(v, &key)? else {
+                continue;
+            };
+            with_host(
+                |h| matches!(h.get(&cur), Some(JsObj::Object(p)) if p.contains_key("get") || p.contains_key("set")),
+            )
+        } else {
+            false
+        };
+        let desc = with_host(|h| {
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("configurable".into(), Value::Bool(false));
+            if freeze && !accessor {
+                m.insert("writable".into(), Value::Bool(false));
+            }
+            h.new_object(m)
+        });
+        if !crate::proxy::define_property(v, &key, &desc)? {
+            return Err(host::type_error(&format!(
+                "'defineProperty' on proxy: trap returned falsish for property '{key}'"
+            )));
+        }
+    }
+    Ok(true)
+}
+
 fn reject_sealing_a_view(v: &Value, verb: &str) -> Result<(), String> {
     let has_elements = matches!(
         crate::stdlib::native_tag(v).as_deref(),
@@ -3197,7 +3278,17 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         return Err(private_brand_message(name, true));
     }
     // `[[Set]]` on a Proxy: the handler's `set` trap, or a forward to the target.
-    if crate::proxy::set(recv, name, &val, recv)? {
+    if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy) {
+        // A `set` trap that returns falsish REFUSED the write: silent in sloppy
+        // code, a TypeError in strict, exactly as an ordinary refused write is.
+        if crate::proxy::set(recv, name, &val, recv)? {
+            return Ok(());
+        }
+        if with_host(|h| h.current_strict()) {
+            return Err(host::type_error(&format!(
+                "'set' on proxy: trap returned falsish for property '{name}'"
+            )));
+        }
         return Ok(());
     }
     // `globalThis.x = 1` creates a real global binding, so the bare `x` reads it
@@ -3601,6 +3692,14 @@ fn b_delprop_name(vm: &mut VM, _: u8) -> Value {
 /// The TypeError a STRICT `delete` of a non-configurable property raises. The
 /// receiver renders the way every other brand-check message renders one.
 fn refused_delete_error(recv: &Value, key: &str) -> String {
+    // A PROXY names the trap that refused. Only the `delete` OPERATOR reports
+    // it; `Reflect.deleteProperty` answers `false`, which is why this lives
+    // here rather than in the shared `[[Delete]]`.
+    if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy) {
+        return host::type_error(&format!(
+            "'deleteProperty' on proxy: trap returned falsish for property '{key}'"
+        ));
+    }
     // A non-callable builtin NAMESPACE renders as a plain object here — node
     // reports `#<Object>` for `Math`, not its `[object Math]` brand.
     let shown = match peek(recv, |o| match o {
@@ -5438,12 +5537,18 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.freeze" => {
             let v = arg0(&args);
             reject_sealing_a_view(&v, "freeze")?;
+            if seal_proxy(&v, true)? {
+                return Ok(v);
+            }
             with_host(|h| h.seal_object(&v, true));
             Ok(v)
         }
         "Object.seal" => {
             let v = arg0(&args);
             reject_sealing_a_view(&v, "seal")?;
+            if seal_proxy(&v, false)? {
+                return Ok(v);
+            }
             with_host(|h| h.seal_object(&v, false));
             Ok(v)
         }
@@ -5455,8 +5560,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             with_host(|h| h.prevent_extensions(&v));
             Ok(v)
         }
-        "Object.isFrozen" => Ok(Value::Bool(with_host(|h| h.is_sealed(&arg0(&args), true)))),
-        "Object.isSealed" => Ok(Value::Bool(with_host(|h| h.is_sealed(&arg0(&args), false)))),
+        "Object.isFrozen" => integrity_level(&arg0(&args), true),
+        "Object.isSealed" => integrity_level(&arg0(&args), false),
         "Object.isExtensible" => {
             let v = arg0(&args);
             match crate::proxy::is_extensible(&v)? {
@@ -11764,7 +11869,13 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
                 with_host(|h| h.str_of(&desc))
             )));
         }
-        crate::proxy::define_property(&obj, &key, &desc)?;
+        // `Object.defineProperty` THROWS on a refusing trap — in sloppy code
+        // too. `Reflect.defineProperty` is the form that reports `false`.
+        if !crate::proxy::define_property(&obj, &key, &desc)? {
+            return Err(host::type_error(&format!(
+                "'defineProperty' on proxy: trap returned falsish for property '{key}'"
+            )));
+        }
         return Ok(obj);
     }
     // 20.1.2.4 steps 1-3, both of which node-js skipped entirely: a non-object
