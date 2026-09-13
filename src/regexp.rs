@@ -349,6 +349,14 @@ pub fn regexp_property(r: &RegExpObj, name: &str) -> Option<Value> {
 
 pub fn is_regexp_method(name: &str) -> bool {
     matches!(name, "test" | "exec" | "toString" | "compile")
+        // The five symbol-keyed methods a RegExp exposes so the string methods
+        // can delegate to it (22.2.6.x). They were absent, so
+        // `/a/[Symbol.match]("x")` was not a function and a subclass could not
+        // override the protocol by calling `super[Symbol.match]`.
+        || matches!(
+            name,
+            "@@match" | "@@matchAll" | "@@search" | "@@split" | "@@replace"
+        )
 }
 
 /// Dispatch a `RegExp.prototype` method.
@@ -368,6 +376,30 @@ pub fn regexp_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value
         })),
         // `compile` is a legacy no-op here (the pattern is already compiled).
         "compile" => Ok(recv.clone()),
+        // The symbol-keyed forms ARE the string methods' implementations, so
+        // each forwards to the same routine with the arguments swapped: the
+        // subject is the argument here and the receiver there.
+        "@@match" | "@@matchAll" | "@@search" | "@@split" | "@@replace" => {
+            let s = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
+            match name {
+                "@@match" => str_match(&s, recv),
+                "@@matchAll" => str_match_all(&s, recv),
+                "@@search" => str_search(&s, recv),
+                "@@split" => {
+                    let limit = args.get(1).and_then(|v| {
+                        let n = with_host(|h| h.to_number(v));
+                        n.is_finite().then_some(n.max(0.0) as usize)
+                    });
+                    str_split_regex(&s, recv, limit)
+                }
+                _ => str_replace_regex(
+                    &s,
+                    recv,
+                    &args.get(1).cloned().unwrap_or(Value::Undef),
+                    false,
+                ),
+            }
+        }
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
 }

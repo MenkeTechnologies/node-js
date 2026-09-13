@@ -1323,6 +1323,22 @@ tag-get  [object D] [object D]
 exotics  [object Map] [object Math] [object Object]
 proxy    TypeError: Cannot convert object to primitive value
 proxy-t  [object Map]
+==== species.js ====
+symbols  true 15
+builtins true true true true
+subclass true MyArray 0
+own      Sized 2 1
+from     true true 1,2,3
+methods  true true true true
+more     true true true
+ctor     true 2 2,4
+opt-out  false true
+promise  true true true true true
+reject   true
+then     true true
+track    true 1 true
+plain    true true true
+value    7
 ==== streams.js ====
 transform A,B,C
 filter    keep,last
@@ -1381,6 +1397,24 @@ throw     true|9||number|out
 throw-enc 4,string
 status    3 0
 input     piped
+==== symbolprotocols.js ====
+match    matched:abc
+search   42
+split    A|B
+replace  R:x
+matchAll 1,2
+args     abc/Z
+regexp   a 1 x|x| aXc
+re-syms  a 1 x|x| aXc
+spread   1,a,b
+no-spread 2 [1,2]
+default  1,2,3 2
+reject   TypeError TypeError TypeError
+claims   TypeError
+disowns  false false
+plain    true true true
+replAll  TypeError bb
+unscope  object null 16 true undefined
 ==== symbols.js ====
 iterator 1,2,3 1,2,3
 toPrim   42 str:string str:default

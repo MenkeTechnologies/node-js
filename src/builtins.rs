@@ -1117,10 +1117,18 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             });
             match r {
                 Some(r) => crate::regexp::regexp_property(&r, name).unwrap_or_else(|| {
+                    // An OWN property beats the prototype method of the same
+                    // name, which is ordinary resolution order. It mattered once
+                    // the symbol-keyed methods existed: `re[Symbol.match] =
+                    // false` disowns the regexp label (7.2.8), and the method
+                    // was shadowing the assignment so the value never took.
+                    if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
+                        return v;
+                    }
                     if crate::regexp::is_regexp_method(name) {
                         bound_method(recv, name)
                     } else {
-                        with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef)
+                        Value::Undef
                     }
                 }),
                 None => Value::Undef,
@@ -2015,6 +2023,40 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // has no own `toString`, and the inherited one is the generic tag reader,
     // not a Map method that rejects a non-Map `this`.
     if let Some(ctor) = ns.strip_suffix(".prototype") {
+        // `Array.prototype[Symbol.unscopables]` (23.1.3.38) is a DATA property,
+        // not an intrinsic function, so it is not in the arity table the lookup
+        // above consults. It lists the methods a `with` block must NOT bring
+        // into scope — the ones added after `with` existed, so old code using a
+        // variable of the same name keeps working.
+        if name == "@@unscopables" && ctor == "Array" {
+            return with_host(|h| {
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                for k in [
+                    "at",
+                    "copyWithin",
+                    "entries",
+                    "fill",
+                    "find",
+                    "findIndex",
+                    "findLast",
+                    "findLastIndex",
+                    "flat",
+                    "flatMap",
+                    "includes",
+                    "keys",
+                    "toReversed",
+                    "toSorted",
+                    "toSpliced",
+                    "values",
+                ] {
+                    m.insert(k.to_string(), Value::Bool(true));
+                }
+                let o = h.new_object(m);
+                let null = h.null();
+                h.set_proto(&o, null);
+                o
+            });
+        }
         if builtin_meta(&format!("@proto:{ctor}:{name}")).is_some() {
             return with_host(|h| h.alloc(JsObj::Builtin(format!("@proto:{ctor}:{name}"))));
         }
@@ -7573,6 +7615,15 @@ fn symbol_protocol(arg: &Value, sym: &str) -> Option<Value> {
 }
 
 fn is_regexp_arg(v: &Value) -> bool {
+    // 7.2.8 `IsRegExp` asks `Symbol.match` FIRST, so an object can declare
+    // itself a regexp — or a real one can disown the label. Only the heap kind
+    // was checked, so `"a".startsWith({[Symbol.match]: true})` did not throw
+    // the TypeError the spec requires.
+    if let Ok(m) = get_property(v, "@@match") {
+        if !matches!(m, Value::Undef) {
+            return with_host(|h| h.truthy(&m));
+        }
+    }
     with_host(|h| h.kind_of(v)) == Some(ObjKind::RegExp)
 }
 
@@ -8298,14 +8349,43 @@ fn array_method_on(
             let mut holes = hole_set(recv);
             let mut sources: Vec<(Value, usize)> = Vec::new();
             for a in &args {
+                // `Symbol.isConcatSpreadable` (23.1.3.1) decides whether an
+                // argument is spread, overriding `IsArray` in BOTH directions:
+                // a plain array-like opts IN, and an array opts OUT. It was
+                // never consulted, so an array was always spread and an
+                // array-like never was.
+                let flag = get_property(a, "@@isConcatSpreadable").unwrap_or(Value::Undef);
+                let spread = if matches!(flag, Value::Undef) {
+                    matches!(with_host(|h| h.get(a).cloned()), Some(JsObj::Array(_)))
+                } else {
+                    with_host(|h| h.truthy(&flag))
+                };
+                if !spread {
+                    out.push(a.clone());
+                    continue;
+                }
                 match with_host(|h| h.get(a).cloned()) {
                     Some(JsObj::Array(items)) => {
                         sources.push((a.clone(), out.len()));
                         out.extend(items);
                     }
-                    _ => out.push(a.clone()),
+                    // An opted-in array-LIKE spreads by its `length` and index
+                    // properties rather than by a backing vector it has none of.
+                    _ => {
+                        let len = get_property(a, "length").unwrap_or(Value::Undef);
+                        let n = with_host(|h| h.to_number(&len));
+                        let n = if n.is_finite() {
+                            n.max(0.0) as usize
+                        } else {
+                            0
+                        };
+                        for i in 0..n {
+                            out.push(get_property(a, &i.to_string()).unwrap_or(Value::Undef));
+                        }
+                    }
                 }
             }
+
             for (src, base) in sources {
                 holes.extend(
                     with_host(|h| h.hole_indices(&src))
@@ -9240,6 +9320,14 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                     .unwrap_or(-1.0),
             ))
         }
+        // 22.1.3.7/22.1.3.23/22.1.3.14 step 2: these three reject a REGEXP
+        // argument outright, and `IsRegExp` is what decides — so an object
+        // advertising `Symbol.match` is rejected too. None of them checked.
+        "startsWith" | "endsWith" | "includes" if is_regexp_arg(&arg0(&args)) => {
+            Err(host::type_error(&format!(
+                "First argument to String.prototype.{name} must not be a regular expression"
+            )))
+        }
         "includes" => {
             let needle = needle_units(&args);
             let from = clamp_pos(arg_num(&args, 1), u.len());
@@ -9329,6 +9417,20 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         "padEnd" => Ok(new_s(pad(s, &args, false)?)),
         // Regex-taking string methods: dispatch to the regexp module when the
         // argument is a RegExp; otherwise keep the plain-string behavior.
+        // 22.1.3.20 step 2.a: `replaceAll` validates the `g` flag BEFORE it
+        // consults `Symbol.replace`, so a non-global regexp is a TypeError even
+        // though a RegExp does define that method. Delegating first skipped the
+        // check and silently did a single replacement.
+        "replaceAll"
+            if is_regexp_arg(&arg0(&args))
+                && !with_host(
+                    |h| matches!(h.get(&arg0(&args)), Some(JsObj::RegExp(r)) if r.global),
+                ) =>
+        {
+            Err(host::type_error(
+                "String.prototype.replaceAll called with a non-global RegExp argument",
+            ))
+        }
         "match" | "matchAll" | "search" | "split" | "replace" | "replaceAll"
             if symbol_protocol(
                 &arg0(&args),
@@ -11634,7 +11736,7 @@ pub fn prototype_of(v: &Value) -> Value {
 /// executor is a no-op: the result is settled through its promise id, which is
 /// what the ordinary path does too.
 fn promise_species_create() -> Result<Option<Value>, String> {
-    let Some(ctor) = None::<Value> else {
+    let Some(ctor) = host::current_static_this() else {
         return Ok(None);
     };
     if !matches!(
