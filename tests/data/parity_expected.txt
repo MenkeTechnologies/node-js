@@ -719,6 +719,37 @@ nested set => false
 nested date => false
 typed kind => false
 threw: 15
+==== destructurefail.js ====
+catch-obj   E m
+catch-arr   1 2
+catch-deep  1
+catch-dflt  9
+catch-rest  1 {"b":2}
+catch-nest  RangeError from 1
+literal     TypeError: Cannot destructure property 'w' of 'null' as it is null.
+undefined   TypeError: Cannot destructure property 'w' of 'undefined' as it is undefined.
+variable    TypeError: Cannot destructure property 'w' of 'v' as it is null.
+undef-var   TypeError: Cannot destructure property 'w' of 'u' as it is undefined.
+member      TypeError: Cannot destructure property 'w' of 'holder.p' as it is null.
+two-keys    TypeError: Cannot destructure property 'a' of 'null' as it is null.
+renamed     TypeError: Cannot destructure property 'a' of 'null' as it is null.
+nested-1st  TypeError: Cannot destructure property 'a' of 'null' as it is null.
+assign      TypeError: Cannot destructure property 'w' of 'null' as it is null.
+rest-only   TypeError: Cannot destructure 'null' as it is null.
+computed    TypeError: Cannot destructure 'null' as it is null.
+comp-dflt   TypeError: Cannot destructure 'null' as it is null.
+empty       TypeError: Cannot destructure 'null' as it is null.
+first-dflt  TypeError: Cannot read properties of null (reading 'a')
+later-dflt  TypeError: Cannot destructure property 'a' of 'null' as it is null.
+arr-null    TypeError: null is not iterable
+arr-number  TypeError: 5 is not iterable
+arr-object  TypeError: {} is not iterable
+defaults    1 2 {"d":4,"e":5}
+null-keeps  null null
+eval-order  9 k,d
+members     {"x":1,"y":7,"z":8}
+params      1,2,3 1,10,11 1,10,99
+misc        0 1 1 2
 ==== destructuring.js ====
 1 2 dflt { c: 3, d: 4 }
 10 99 [ 40, 50 ]

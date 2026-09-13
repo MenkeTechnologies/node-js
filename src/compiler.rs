@@ -126,6 +126,11 @@ pub struct Compiler {
     /// A label seen immediately before a loop, consumed by that loop's `LoopCtx`
     /// (`outer: for (…)`); `None` once claimed.
     pending_label: Option<String>,
+    /// Source text of the expression an object pattern is being destructured
+    /// FROM, set by the declaration or assignment site. Node names it in the
+    /// error a nullish source raises — `Cannot destructure property 'w' of 'v'
+    /// as it is null` — and the pattern compiler only has the VALUE.
+    destructure_src: Option<String>,
     /// Emit per-statement `DBG_LINE` markers for the DAP debugger (`node --dap`).
     debug: bool,
     /// Index into `loops` of the first loop opened by the chunk being emitted.
@@ -597,7 +602,10 @@ impl Compiler {
                             b.emit(Op::LoadUndef, line);
                         }
                     }
-                    self.compile_bind(b, &d.target, mode)?;
+                    self.destructure_src = d.init.as_ref().and_then(|v| destructure_source_text(v));
+                    let r = self.compile_bind(b, &d.target, mode);
+                    self.destructure_src = None;
+                    r?;
                 }
             }
             StmtKind::Block(body) => {
@@ -900,6 +908,71 @@ impl Compiler {
     }
 
     fn destructure_object(
+        &mut self,
+        b: &mut ChunkBuilder,
+        props: &[Prop],
+        declare: BindMode,
+    ) -> Result<(), String> {
+        // A NULLISH source: node names the pattern's first property and the
+        // source expression rather than reporting the property read that failed.
+        // Which of the two wordings it uses is decided by that first element —
+        // a plain property names itself, a rest / computed key / empty pattern
+        // does not, and one carrying a DEFAULT falls through to the ordinary
+        // read error because the default is what reads it.
+        // A leading `.` marks a compiler-generated name (a parameter slot), which
+        // is not something the user wrote and must not be quoted back at them.
+        if let Some(src) = self.destructure_src.take().filter(|s| !s.starts_with('.')) {
+            let first = match props.first() {
+                Some(Prop::KeyValue {
+                    key: Expr::Str(k),
+                    value,
+                    computed: false,
+                }) if !matches!(value, Expr::Assign { .. }) => Some(k.clone()),
+                // A COMPUTED first key names nothing — evaluating it is what
+                // would fail — and neither does a rest or an empty pattern.
+                None | Some(Prop::Spread(_)) | Some(Prop::KeyValue { computed: true, .. }) => None,
+                // A first property carrying a DEFAULT falls through: the default
+                // is what performs the read, so node reports the read.
+                _ => return self.destructure_object_body(b, props, declare),
+            };
+            self.emit_destructure_guard(b, &src, first.as_deref());
+        }
+        self.destructure_object_body(b, props, declare)
+    }
+
+    /// `throw new TypeError(…)` when TOS is nullish, leaving TOS untouched
+    /// otherwise.
+    fn emit_destructure_guard(&mut self, b: &mut ChunkBuilder, src: &str, first: Option<&str>) {
+        for (is_null, word) in [(true, "null"), (false, "undefined")] {
+            b.emit(Op::Dup, 0);
+            if is_null {
+                b.emit(Op::CallBuiltin(ops::LOAD_NULL, 0), 0);
+            } else {
+                b.emit(Op::LoadUndef, 0);
+            }
+            b.emit(Op::CallBuiltin(ops::STRICT_EQ, 2), 0);
+            let ok = b.emit(Op::JumpIfFalse(0), 0);
+            let msg = match first {
+                Some(k) => {
+                    format!("Cannot destructure property '{k}' of '{src}' as it is {word}.")
+                }
+                None => format!("Cannot destructure '{src}' as it is {word}."),
+            };
+            // A real `TypeError` instance, not a bare string — the handler
+            // reads `e.constructor.name` and `e.stack`.
+            let e = Expr::New {
+                callee: Box::new(Expr::Ident("TypeError".into())),
+                args: vec![Expr::Str(msg)],
+            };
+            if self.compile_expr(b, &e).is_ok() {
+                b.emit(Op::CallBuiltin(ops::THROW, 1), 0);
+            }
+            let end = b.current_pos();
+            b.patch_jump(ok, end);
+        }
+    }
+
+    fn destructure_object_body(
         &mut self,
         b: &mut ChunkBuilder,
         props: &[Prop],
@@ -1561,14 +1634,31 @@ impl Compiler {
     ) -> Result<(), String> {
         let block_chunk = self.compile_block_chunk(block)?;
         let handler_def = match handler {
-            Some((param, body)) => {
-                let param_name = match param {
-                    Some(Expr::Ident(n)) => Some(n.clone()),
-                    _ => None,
-                };
-                let hbody = self.compile_block_chunk(body)?;
-                Some((param_name, hbody))
-            }
+            Some((param, body)) => match param {
+                Some(Expr::Ident(n)) => {
+                    let hbody = self.compile_block_chunk(body)?;
+                    Some((Some(n.clone()), hbody))
+                }
+                // `catch ({ code })` / `catch ([a, b])`. The handler receives
+                // ONE value under a name, so a pattern binds a temp and is
+                // destructured out of it before the body runs. Only a bare
+                // identifier was handled, so the pattern bound nothing at all
+                // and the body saw a ReferenceError for every name in it.
+                Some(pattern) => {
+                    let tmp = self.tmp_name("catch");
+                    let pattern = pattern.clone();
+                    let name = tmp.clone();
+                    let hbody = self.compile_chunk_with(body, move |s, cb| {
+                        s.load_local(cb, &name);
+                        s.compile_bind(cb, &pattern, BindMode::Lexical)
+                    })?;
+                    Some((Some(tmp), hbody))
+                }
+                None => {
+                    let hbody = self.compile_block_chunk(body)?;
+                    Some((None, hbody))
+                }
+            },
             None => None,
         };
         let final_chunk = match finalizer {
@@ -1594,6 +1684,17 @@ impl Compiler {
     /// opened outside it are unreachable by a plain jump, so `chunk_loop_base`
     /// moves up for the duration.
     fn compile_block_chunk(&mut self, stmts: &[Stmt]) -> Result<Chunk, String> {
+        self.compile_chunk_with(stmts, |_, _| Ok(()))
+    }
+
+    /// A try/catch/finally body chunk, with `prelude` emitted ahead of the
+    /// statements. Used to destructure a `catch ({ code })` parameter, which has
+    /// to bind before the handler's first statement runs.
+    fn compile_chunk_with(
+        &mut self,
+        stmts: &[Stmt],
+        prelude: impl FnOnce(&mut Self, &mut ChunkBuilder) -> Result<(), String>,
+    ) -> Result<Chunk, String> {
         let mut cb = ChunkBuilder::new();
         // A nested chunk runs on its OWN VM frame, so the enclosing chunk's
         // slots are not reachable from it — everything here goes by name. (The
@@ -1607,6 +1708,7 @@ impl Compiler {
         let sites = std::mem::take(&mut self.call_sites);
         let yields = std::mem::take(&mut self.yield_sites);
         let r = (|| {
+            prelude(self, &mut cb)?;
             self.hoist_funcs(&mut cb, stmts)?;
             self.compile_stmts(&mut cb, stmts)
         })();
@@ -2299,7 +2401,10 @@ impl Compiler {
                         self.infer_name(b, value, n);
                     }
                     b.emit(Op::Dup, 0); // assignment yields the value
-                    self.compile_bind(b, target, BindMode::Assign)?;
+                    self.destructure_src = destructure_source_text(value);
+                    let r = self.compile_bind(b, target, BindMode::Assign);
+                    self.destructure_src = None;
+                    r?;
                 }
             },
             Expr::Update { op, prefix, target } => self.compile_update(b, *op, *prefix, target)?,
@@ -3842,4 +3947,22 @@ fn pattern_names(target: &Expr, out: &mut Vec<String>) {
         // A member target (`[obj.x] = …`) assigns a property, binding nothing.
         _ => {}
     }
+}
+
+/// How node renders the SOURCE of a failed object destructuring: `const {w} =
+/// v` names `v`. Only the forms whose text can be reproduced exactly are
+/// rendered; anything else answers `None` and the caller falls back to the
+/// ordinary property-read error rather than inventing a rendering.
+fn destructure_source_text(e: &Expr) -> Option<String> {
+    Some(match e {
+        Expr::Null => "null".into(),
+        Expr::Undefined => "undefined".into(),
+        Expr::Ident(n) => n.clone(),
+        Expr::Member {
+            object,
+            property,
+            optional: false,
+        } => format!("{}.{property}", destructure_source_text(object)?),
+        _ => return None,
+    })
 }

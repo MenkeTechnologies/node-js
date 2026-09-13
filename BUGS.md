@@ -2509,3 +2509,15 @@ Still divergent, and why:
   `EventEmitter`, `Buffer`, a stream, a `Timeout` — is still a thunk bound to
   the receiver it was read off. So `const on = emitter.on; on('x', f)` works
   here and throws in node, and `emitter.on !== EventEmitter.prototype.on`.
+- **Two destructuring errors report a V8-internal rendering of their source.**
+  A nullish source now names the pattern's first property and the source
+  expression the way node does (`examples/destructurefail.js`), but two forms
+  are reached through a name the user never wrote. In PARAMETER position node
+  says `Cannot destructure property 'w' of 'object null' as it is null`; here
+  the source is a compiler-generated parameter slot, so the guard is skipped
+  and the ordinary property-read error stands. A nested ARRAY pattern under an
+  object key (`const { a: [b] } = { a: null }`) reports
+  `Cannot destructure property 'Symbol(Symbol.iterator)' of
+  '{(intermediate value)}'`; here it reports that the value is not iterable.
+  Neither rendering is reproducible without inventing text for an expression
+  that has none.
