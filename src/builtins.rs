@@ -1982,6 +1982,11 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // absent entirely. The three keys node ships are present; installing a
     // custom loader through them is NOT honoured by this runtime's loader, so
     // the map reports what it can serve rather than pretending otherwise.
+    // `process.memoryUsage.rss()` — node's fast path for the one figure that
+    // does not need the whole object built.
+    if ns == "process.memoryUsage" && name == "rss" {
+        return with_host(|h| h.alloc(JsObj::Builtin("process.memoryUsage.rss".to_string())));
+    }
     if ns == "require" && name == "extensions" {
         return with_host(|h| {
             let mut m: IndexMap<String, Value> = IndexMap::new();
@@ -4595,6 +4600,7 @@ const NS_METHODS: &[&str] = &[
     "Error.captureStackTrace",
     "require.resolve",
     "require.resolve.paths",
+    "process.memoryUsage.rss",
 ];
 
 /// The `name` and `length` a builtin function reports, from the generated
@@ -4746,6 +4752,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         let spec = with_host(|h| h.str_of(&arg0(&args)));
         let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
         return crate::module::require(&spec, std::path::Path::new(&from));
+    }
+    if name == "process.memoryUsage.rss" {
+        return Ok(crate::stdlib::process::memory_usage_rss());
     }
     if name == "require.resolve.paths" {
         let spec = with_host(|h| h.str_of(&arg0(&args)));

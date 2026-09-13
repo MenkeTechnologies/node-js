@@ -879,14 +879,60 @@ fn hrtime(args: &[Value]) -> Value {
     with_host(|h| h.new_array(vec![Value::Float(secs), Value::Float(nanos)]))
 }
 
+/// The process's resident set size in bytes, or `None` where it cannot be read.
+///
+/// `process.memoryUsage()` reported a flat zero for every field, which is not a
+/// measurement — a caller comparing it against a threshold got a wrong answer
+/// rather than an honest refusal. RSS is the one figure both platforms expose
+/// cheaply; the V8 heap figures below stay zero because this runtime has no V8
+/// heap to report, and saying zero there is the truthful answer.
+#[cfg(target_os = "macos")]
+fn resident_bytes() -> Option<u64> {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info.pti_resident_size)
+}
+
+#[cfg(target_os = "linux")]
+fn resident_bytes() -> Option<u64> {
+    // `/proc/self/statm` field 2 is the resident page count.
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (page > 0).then(|| pages * page as u64)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn resident_bytes() -> Option<u64> {
+    None
+}
+
 fn memory_usage() -> Value {
+    let rss = resident_bytes().unwrap_or(0) as f64;
     with_host(|h| {
         let mut m = IndexMap::new();
-        for k in ["rss", "heapTotal", "heapUsed", "external", "arrayBuffers"] {
+        m.insert("rss".into(), Value::Float(rss));
+        // The V8 heap figures have no counterpart here, so they stay zero
+        // rather than being invented.
+        for k in ["heapTotal", "heapUsed", "external", "arrayBuffers"] {
             m.insert(k.into(), Value::Float(0.0));
         }
         h.new_object(m)
     })
+}
+
+/// `process.memoryUsage.rss()` — the same figure without building the object.
+pub fn memory_usage_rss() -> Value {
+    Value::Float(resident_bytes().unwrap_or(0) as f64)
 }
 
 /// Emit `process.on('exit', code)` exactly once per process, the way Node's

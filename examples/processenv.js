@@ -33,3 +33,30 @@ console.log("release ", typeof process.release, process.release.name, process.re
 // The rest of the surface these probes lean on, by shape rather than value.
 console.log("shapes  ", Array.isArray(process.argv), typeof process.env, typeof process.pid, typeof process.cwd());
 console.log("fns     ", typeof process.nextTick, typeof process.exit, typeof process.hrtime.bigint, typeof process.memoryUsage);
+
+{
+// `process.memoryUsage()` reported a flat zero for every field. That is not a
+// measurement — a caller comparing it against a threshold got a wrong answer
+// rather than an honest refusal. RSS is the one figure both platforms expose
+// cheaply (`proc_pidinfo` on macOS, `/proc/self/statm` on Linux), so it is real
+// now; the V8 heap fields have no counterpart in this runtime and stay zero,
+// which IS the truthful answer for them.
+const mem = process.memoryUsage();
+console.log("shape   ", Object.keys(mem).join(","));
+console.log("rss     ", typeof mem.rss, mem.rss > 0, Number.isFinite(mem.rss));
+// `process.memoryUsage.rss()` is node's fast path for that one figure, and it
+// was missing entirely.
+console.log("fast    ", typeof process.memoryUsage.rss, typeof process.memoryUsage.rss(),
+  process.memoryUsage.rss() > 0);
+// The two agree on the same process.
+console.log("agree   ", Math.abs(process.memoryUsage.rss() - process.memoryUsage().rss)
+  < 64 * 1024 * 1024);
+
+// The rest of the measurement surface, for shape.
+console.log("hrtime  ", Array.isArray(process.hrtime()), process.hrtime().length,
+  typeof process.hrtime.bigint());
+console.log("cpu     ", typeof process.cpuUsage().user, typeof process.cpuUsage().system);
+console.log("uptime  ", typeof process.uptime(), process.uptime() >= 0);
+console.log("os      ", Array.isArray(require("os").loadavg()),
+  typeof require("os").availableParallelism());
+}

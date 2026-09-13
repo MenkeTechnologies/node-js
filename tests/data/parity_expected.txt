@@ -1200,6 +1200,14 @@ tty      undefined undefined number
 release  object node true
 shapes   true object number string
 fns      function function function function
+shape    rss,heapTotal,heapUsed,external,arrayBuffers
+rss      number true true
+fast     function number true
+agree    true
+hrtime   true 2 bigint
+cpu      number number
+uptime   number true
+os       true number
 ==== properties.js ====
 order    1,2,b,a,01
 reflect  6
