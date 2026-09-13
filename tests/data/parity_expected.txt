@@ -1958,6 +1958,29 @@ throw     true|9||number|out
 throw-enc 4,string
 status    3 0
 input     piped
+==== superspread.js ====
+super         [1,2,null]
+super-mixed   [0,1,2]
+super-trailing [1,9,null]
+super-iterable [7,8,null]
+super-empty   [null,null,null]
+super-method  [3,4]
+super-m-mixed [0,5]
+super-native  "h"
+super-array   3
+super-this    [1,"field",true]
+new-opt-call   SyntaxError: Invalid optional chain from new expression
+new-opt-member SyntaxError: Invalid optional chain from new expression
+tagged-opt     SyntaxError: Invalid tagged template on optional chain
+new-parens     ok
+new-then-opt   ok
+plain-opt      ok
+plain-tagged   ok
+tagged        ["a|b|c",[1,2]]
+tagged-frozen [true,true]
+tagged-cached true
+tagged-this   [true,"q"]
+tagged-raw    ["a\nb","a\\nb"]
 ==== symbolprotocols.js ====
 match    matched:abc
 search   42

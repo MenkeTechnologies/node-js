@@ -1121,6 +1121,16 @@ impl Parser {
                 Expr::NewTarget
             } else {
                 let callee = self.parse_call_member_no_call()?;
+                // An optional chain cannot be the callee of `new` (13.3.5.1):
+                // `new a?.b()` and `new C?.()` are early errors. Parenthesising
+                // the chain ends it, so `new (a?.b)()` is legal — which is why
+                // the check is on the callee's own spine, and the parenthesised
+                // form records a chain boundary that clears `optional`.
+                if Self::has_optional_link(&callee) || self.is_punct("?.") {
+                    return Err(
+                        "SyntaxError: Invalid optional chain from new expression".to_string()
+                    );
+                }
                 let args = if self.is_punct("(") {
                     self.parse_args()?
                 } else {
@@ -1187,6 +1197,14 @@ impl Parser {
             } else if matches!(self.tok(), Tok::Template { .. }) {
                 // A template literal immediately after a callee is a *tagged*
                 // template: `` tag`...` `` → `tag(strings, ...values)`.
+                // A tagged template cannot sit on an optional chain (13.3.11.1):
+                // `a?.b`t`` is an early error, because the tag would have to be
+                // called even when the chain short-circuited.
+                if Self::has_optional_link(&e) {
+                    return Err(
+                        "SyntaxError: Invalid tagged template on optional chain".to_string()
+                    );
+                }
                 e = self.parse_tagged_template(e)?;
             } else {
                 break;

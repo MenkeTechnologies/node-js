@@ -37,6 +37,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::FORIN_ALIVE, b_forin_alive);
     vm.register_builtin(ops::HOIST_TDZ, b_hoist_tdz);
     vm.register_builtin(ops::NEW_SPREAD, b_new_spread);
+    vm.register_builtin(ops::SUPER_CALL_SPREAD, b_super_call_spread);
     vm.register_builtin(ops::CONTAINS, b_contains);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
     vm.register_builtin(ops::BINOP, b_binop);
@@ -346,8 +347,21 @@ fn b_def_field(vm: &mut VM, _: u8) -> Value {
 
 /// `super(...args)` in a derived constructor: run the parent constructor on the
 /// current `this`, then this class's field initializers.
+/// `SUPER_CALL_SPREAD` — `super(...xs)`, where the argument list is built at
+/// run time. Shares everything below with the fixed-arity form; only where the
+/// arguments come from differs.
+fn b_super_call_spread(vm: &mut VM, _: u8) -> Value {
+    let arr = vm.pop();
+    let args = host::iter_all(&arr).unwrap_or_default();
+    super_call_with(vm, args)
+}
+
 fn b_super_call(vm: &mut VM, argc: u8) -> Value {
     let args = pop_n(vm, argc as usize);
+    super_call_with(vm, args)
+}
+
+fn super_call_with(vm: &mut VM, args: Vec<Value>) -> Value {
     let this = with_host(|h| h.current_this());
     let this = match this {
         Some(t) => t,

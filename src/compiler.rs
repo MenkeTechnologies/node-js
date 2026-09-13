@@ -3793,6 +3793,15 @@ impl Compiler {
             // `super(...args)` — invoke the parent constructor on the current
             // `this` (SUPER_CALL runs the parent ctor + this class's field inits).
             Expr::Super => {
+                // A `...spread` has to be EXPANDED here as it is at every other
+                // call site: compiling it as an ordinary expression passed the
+                // spread OBJECT as one argument, so `super(...[1, 2])` gave the
+                // parent the array and left its second parameter undefined.
+                if has_spread {
+                    self.compile_spread_args(b, args)?;
+                    b.emit(Op::CallBuiltin(ops::SUPER_CALL_SPREAD, 1), 0);
+                    return Ok(());
+                }
                 for a in args {
                     self.compile_expr(b, a)?;
                 }
@@ -3806,10 +3815,21 @@ impl Compiler {
             } if matches!(**object, Expr::Super) => {
                 self.name_const(b, property);
                 b.emit(Op::CallBuiltin(ops::SUPER_GET, 1), 0); // [method]
+                                                               // With a spread the argument count is not static, so the call
+                                                               // goes through `apply` with a run-time array rather than `call`
+                                                               // with a fixed run. Compiling the spread as an ordinary
+                                                               // argument handed the parent method the array itself.
+                if has_spread {
+                    self.name_const(b, "apply"); // [method, "apply"]
+                    b.emit(Op::CallBuiltin(ops::THIS, 0), 0); // [method, "apply", this]
+                    self.compile_spread_args(b, args)?; // [..., argsArray]
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, 4), 0);
+                    return Ok(());
+                }
                 self.name_const(b, "call"); // [method, "call"]
                 b.emit(Op::CallBuiltin(ops::THIS, 0), 0); // [method, "call", this]
-                                                          // `method.call(this, ...args)`: compile args (spread expands into
-                                                          // the flat run) and dispatch as a method call named "call".
+                                                          // `method.call(this, ...args)`: compile args and dispatch as a
+                                                          // method call named "call".
                 for a in args {
                     self.compile_expr(b, a)?;
                 }
