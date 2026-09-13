@@ -3311,6 +3311,16 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             let assignable =
                 with_host(|h| h.is_null(&val) || matches!(h.kind_of(&val), Some(ObjKind::Object)));
             if assignable {
+                // The `__proto__` setter runs `[[SetPrototypeOf]]`, which a
+                // NON-EXTENSIBLE object refuses — and unlike an ordinary
+                // refused write, the setter throws in sloppy code too. It was
+                // rewriting the link of a frozen object.
+                if !with_host(|h| h.is_extensible(recv)) && !same_prototype(recv, &val) {
+                    return Err(host::type_error(&format!(
+                        "{} is not extensible",
+                        no_side_effects_string(recv)
+                    )));
+                }
                 with_host(|h| h.set_proto(recv, val));
             }
             return Ok(());
@@ -5634,10 +5644,15 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 // `prototype_of`, not `proto_of`: an object with no EXPLICIT
                 // link still has `Object.prototype`, and comparing against the
                 // absent link would call that a change.
-                let cur = prototype_of(&obj);
-                let same = with_host(|h| h.strict_eq(&cur, &proto));
-                if !same && !with_host(|h| h.is_extensible(&obj)) {
-                    return Err(host::type_error("#<Object> is not extensible"));
+                if !same_prototype(&obj, &proto) && !with_host(|h| h.is_extensible(&obj)) {
+                    // The receiver is named by its brand, as every other
+                    // refusal names it — a NULL-PROTOTYPE object is
+                    // `[object Object]`, not `#<Object>`, because it has no
+                    // constructor to name.
+                    return Err(host::type_error(&format!(
+                        "{} is not extensible",
+                        no_side_effects_string(&obj)
+                    )));
                 }
                 with_host(|h| h.set_proto(&obj, proto));
             }
@@ -5722,6 +5737,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 crate::proxy::set_prototype_of(&obj, &p)?;
                 return Ok(Value::Bool(true));
             }
+            // 10.1.2.1: a NON-EXTENSIBLE object refuses a prototype change —
+            // unless the new one is what it already has, which is a no-op. It
+            // reported success and rewrote the link.
+            if !with_host(|h| h.is_extensible(&obj)) {
+                return Ok(Value::Bool(same_prototype(&obj, &p)));
+            }
             with_host(|h| h.set_proto(&obj, p));
             Ok(Value::Bool(true))
         }
@@ -5744,8 +5765,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.apply" => {
             let f = arg0(&args);
             let this = args.get(1).cloned();
-            let list = with_host(|h| h.iter_vec(&args.get(2).cloned().unwrap_or(Value::Undef)))
-                .unwrap_or_default();
+            let list = create_list_from_array_like(&args.get(2).cloned().unwrap_or(Value::Undef))?;
             host::invoke(&f, list, this.filter(|t| !with_host(|h| h.is_nullish(t))))
         }
         // `Reflect.construct(target, args, newTarget)` — the optional third
@@ -5754,8 +5774,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `target` and `instanceof newTarget` was false.
         "Reflect.construct" => {
             let f = arg0(&args);
-            let list = with_host(|h| h.iter_vec(&args.get(1).cloned().unwrap_or(Value::Undef)))
-                .unwrap_or_default();
+            let list = create_list_from_array_like(&args.get(1).cloned().unwrap_or(Value::Undef))?;
             let new_target = args.get(2).cloned().unwrap_or_else(|| f.clone());
             host::construct_nt(&f, list, new_target)
         }
@@ -11900,6 +11919,39 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
 /// Every `Reflect` method requires an OBJECT target and reports a `TypeError`
 /// for anything else (28.1). A primitive was being accepted and silently
 /// producing nothing.
+/// `CreateListFromArrayLike` (7.3.18) — the argument list `Reflect.apply` and
+/// `Reflect.construct` take.
+///
+/// An ARRAY-LIKE counts: `{length: 2, 0: 1, 1: 5}` is a two-element list. The
+/// iterator was being used instead, so an array-like produced nothing and a
+/// primitive produced nothing rather than the TypeError node raises.
+/// Whether `p` is ALREADY `obj`'s prototype — the one case a non-extensible
+/// object still accepts, because it changes nothing.
+///
+/// The observable prototype, not the stored link: an ordinary object has no
+/// explicit link and inherits `Object.prototype`, so comparing the raw slot
+/// reported "different" for `setPrototypeOf(frozen, Object.prototype)`.
+fn same_prototype(obj: &Value, p: &Value) -> bool {
+    let cur = prototype_of(obj);
+    with_host(|h| h.strict_eq(&cur, p) || (h.is_null(&cur) && h.is_null(p)))
+}
+
+fn create_list_from_array_like(v: &Value) -> Result<Vec<Value>, String> {
+    if !with_host(|h| is_object_like(h, v)) {
+        return Err(host::type_error(
+            "CreateListFromArrayLike called on non-object",
+        ));
+    }
+    let len = get_property(v, "length")?;
+    let n = with_host(|h| h.to_number(&len));
+    let n = if n.is_finite() && n > 0.0 {
+        n as usize
+    } else {
+        0
+    };
+    (0..n).map(|i| get_property(v, &i.to_string())).collect()
+}
+
 fn reflect_require_object(v: &Value, method: &str) -> Result<(), String> {
     if with_host(|h| is_object_like(h, v)) {
         return Ok(());

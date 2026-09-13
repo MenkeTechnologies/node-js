@@ -1687,6 +1687,37 @@ receiver true 0 9 true
 setter   5 false
 refused  false 1 false
 no-setter false false
+==== reflection2.js ====
+array-like   5
+arguments    9
+array        3
+construct    3
+holes        "1,2"
+non-object 1             TypeError: CreateListFromArrayLike called on non-object
+non-object "s"           TypeError: CreateListFromArrayLike called on non-object
+non-object null          TypeError: CreateListFromArrayLike called on non-object
+non-object undefined     TypeError: CreateListFromArrayLike called on non-object
+non-object true          TypeError: CreateListFromArrayLike called on non-object
+this         [7,false]
+reflect-diff false
+reflect-same true
+reflect-arr  true
+reflect-prev false
+object-diff  TypeError: #<Object> is not extensible
+object-same  true
+null-same    true
+null-diff    TypeError: [object Object] is not extensible
+setter-frozen TypeError: #<Object> is not extensible
+setter-same   "no throw"
+setter-ok     2
+extensible    1
+members      ["apply","construct","defineProperty","deleteProperty","get","getOwnPropertyDescriptor","getPrototypeOf","has","isExtensible","ownKeys","preventExtensions","set","setPrototypeOf"]
+get-receiver 9
+set-receiver [5,null]
+ownKeys      ["1","b","Symbol(s)"]
+newTarget    [true,true]
+refusals     [false,false,false]
+non-object   TypeError: Reflect.get called on non-object
 ==== regexp.js ====
 true true false
 a b
