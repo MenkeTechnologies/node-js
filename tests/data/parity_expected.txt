@@ -1022,6 +1022,34 @@ raw-shape true true
 request   PUT|sent|true|true|true|sent
 status    200 OK
 closed    yes
+==== inoperator.js ====
+object    [true,true,true,true,false]
+array     [true,true,true,false]
+function  [true,true,true]
+promise   [true,true]
+map       [true,true]
+date      [true,true]
+regexp    [true,true,true]
+error     [true,true,true]
+wrapper   [true,true,true,true]
+accessors [true,true,true]
+subclass  [true,true]
+chain     [true,true]
+nullproto [false,true]
+delete-ns [false,false,false,true]
+delete-own [false,true]
+delete-ok [true,true,false]
+strict    ["Cannot delete property 'f' of #<Object>","Cannot delete property 'f' of #<Object>","Cannot delete property 'PI' of #<Object>","Cannot delete property 'length' of [object Array]","Cannot delete property 'a' of #<Object>",true,true]
+strict-eval "undefined"
+strict-fn   "undefined"
+strict-let  "undefined"
+by-source   "undefined"
+nested      "undefined"
+sloppy      "number"
+sloppy-fn   "function"
+reads       7
+writes      2
+value       3
 ==== inspection.js ====
 d1       "{ a: 1 }"
 d3       "{ a: { b: { c: 1 } } }"

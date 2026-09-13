@@ -2053,7 +2053,8 @@ impl Compiler {
                     // [class] -> delete C[slot] -> discard the Bool
                     b.emit(Op::Dup, 0);
                     self.name_const(b, &slot);
-                    b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 2), 0);
+                    self.emit_bool(b, false);
+                    b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 3), 0);
                     b.emit(Op::Pop, 0);
                 }
                 MemberKind::Method | MemberKind::Get | MemberKind::Set => {
@@ -3058,18 +3059,25 @@ impl Compiler {
                 b.emit(Op::Pop, 0);
                 b.emit(Op::LoadUndef, 0);
             }
+            // STRICT mode turns a refused delete into a TypeError (13.5.1.2
+            // step 5.b). Strictness is static, so it rides along as a third
+            // operand rather than being looked up at run time — and the error
+            // is raised where the key and the receiver are both still in hand,
+            // which a compiler-side check after the Bool could not manage.
             UnOp::Delete => match e {
                 Expr::Member {
                     object, property, ..
                 } => {
                     self.compile_expr(b, object)?;
                     self.name_const(b, property);
-                    b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 2), 0);
+                    self.emit_bool(b, self.strict);
+                    b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 3), 0);
                 }
                 Expr::Index { object, index, .. } => {
                     self.compile_expr(b, object)?;
                     self.compile_expr(b, index)?;
-                    b.emit(Op::CallBuiltin(ops::DELITEM, 2), 0);
+                    self.emit_bool(b, self.strict);
+                    b.emit(Op::CallBuiltin(ops::DELITEM, 3), 0);
                 }
                 _ => {
                     b.emit(Op::LoadTrue, 0);
@@ -3316,6 +3324,11 @@ impl Compiler {
     // ── block scopes ─────────────────────────────────────────────────────
     /// Enter a block scope: `let`/`const` declared after this point die at the
     /// matching [`Self::emit_pop_scope`].
+    /// Push a literal boolean.
+    fn emit_bool(&self, b: &mut ChunkBuilder, v: bool) {
+        b.emit(if v { Op::LoadTrue } else { Op::LoadFalse }, 0);
+    }
+
     fn emit_push_scope(&mut self, b: &mut ChunkBuilder) {
         b.emit(Op::CallBuiltin(ops::PUSH_SCOPE, 0), 0);
         b.emit(Op::Pop, 0);

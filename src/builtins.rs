@@ -2027,6 +2027,15 @@ fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
     })
 }
 
+/// Whether `<ns>.<key>` may be deleted — the `configurable` half of
+/// [`builtin_member_descriptor`], split out so `delete` can ask without
+/// building a descriptor object.
+fn builtin_member_configurable(ns: &str, key: &str) -> bool {
+    !(namespace_constants(ns).iter().any(|(k, _)| *k == key)
+        || key == "prototype"
+        || (ns == "Symbol" && host::WELL_KNOWN_SYMBOLS.contains(&key)))
+}
+
 /// The value of `<ns>.<name>` when it is one of those constants.
 fn namespace_constant(ns: &str, name: &str) -> Option<f64> {
     namespace_constants(ns)
@@ -3436,6 +3445,20 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
     {
         std::env::remove_var(key);
     }
+    // A member of a builtin NAMESPACE (`Math.PI`, `Number.MAX_VALUE`,
+    // `Object.prototype`) is non-configurable when it is a constant or a
+    // constructor's `prototype`, and `delete` of one answers false without
+    // removing anything. There is no property map behind a namespace, so the
+    // ordinary attribute lookup below cannot tell — it reported success for
+    // every one of them.
+    if let Some(ns) = peek(recv, |o| match o {
+        JsObj::Builtin(ns) => Some(ns.clone()),
+        _ => None,
+    }) {
+        if ns != REQUIRE_CACHE && !builtin_member_configurable(&ns, key) {
+            return Ok(false);
+        }
+    }
     if !with_host(|h| h.prop_attrs(recv, key).configurable) {
         return Ok(false);
     }
@@ -3474,6 +3497,7 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
 }
 
 fn b_delitem(vm: &mut VM, _: u8) -> Value {
+    let strict = vm.pop();
     let idx = vm.pop();
     let recv = vm.pop();
     // `delete o[k]` keys through ToPropertyKey (7.1.19), exactly as the read and
@@ -3484,18 +3508,40 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
         Err(e) => return abort(vm, e),
     };
     match delete_property(&recv, &key) {
+        Ok(false) if with_host(|h| h.truthy(&strict)) => {
+            abort(vm, refused_delete_error(&recv, &key))
+        }
         Ok(b) => Value::Bool(b),
         Err(e) => abort(vm, e),
     }
 }
 
 fn b_delprop_name(vm: &mut VM, _: u8) -> Value {
+    let strict = vm.pop();
     let name = sval(&vm.pop());
     let recv = vm.pop();
     match delete_property(&recv, &name) {
+        Ok(false) if with_host(|h| h.truthy(&strict)) => {
+            abort(vm, refused_delete_error(&recv, &name))
+        }
         Ok(b) => Value::Bool(b),
         Err(e) => abort(vm, e),
     }
+}
+
+/// The TypeError a STRICT `delete` of a non-configurable property raises. The
+/// receiver renders the way every other brand-check message renders one.
+fn refused_delete_error(recv: &Value, key: &str) -> String {
+    // A non-callable builtin NAMESPACE renders as a plain object here — node
+    // reports `#<Object>` for `Math`, not its `[object Math]` brand.
+    let shown = match peek(recv, |o| match o {
+        JsObj::Builtin(ns) => Some(ns.clone()),
+        _ => None,
+    }) {
+        Some(ns) if !host::builtin_is_callable(&ns) => "#<Object>".to_string(),
+        _ => no_side_effects_string(recv),
+    };
+    host::type_error(&format!("Cannot delete property '{key}' of {shown}"))
 }
 
 // ── constructors ──────────────────────────────────────────────────────────────
@@ -5027,11 +5073,27 @@ pub fn eval_source(arg: Option<&Value>, direct: bool) -> Result<Value, String> {
     }
     let src = with_host(|h| h.str_of(&v));
     let chunk = crate::load_merged(crate::compile_completion(&src)?);
-    if direct {
-        host::run_chunk_on(chunk)
-    } else {
-        host::run_chunk_in_global_scope(chunk)
+    if !direct {
+        return host::run_chunk_in_global_scope(chunk);
     }
+    // A STRICT direct eval gets its OWN variable environment (19.2.1.1 step 12),
+    // so its `var`s and function declarations die with it. Only a SLOPPY one
+    // shares the caller's, which is the form that can inject a binding — and
+    // sharing it unconditionally meant `eval('var x=1')` inside strict code
+    // left `x` behind.
+    //
+    // Strict either because the CALLER is (the frame knows) or because the
+    // source says so itself.
+    let strict = with_host(|h| h.current_strict())
+        || src.trim_start().starts_with("'use strict'")
+        || src.trim_start().starts_with("\"use strict\"");
+    if !strict {
+        return host::run_chunk_on(chunk);
+    }
+    let prev = with_host(|h| h.push_var_scope());
+    let out = host::run_chunk_on(chunk);
+    with_host(|h| h.pop_var_scope(prev));
+    out
 }
 
 /// Call a resolved builtin function (global or `namespace.method`).
@@ -12210,7 +12272,7 @@ fn has_property_ordinary(obj: &Value, key: &str) -> bool {
     if with_host(|h| host::lookup_accessor(h, obj, key)).is_some() {
         return true;
     }
-    with_host(|h| match h.get(obj) {
+    if with_host(|h| match h.get(obj) {
         Some(JsObj::Object(p)) => p.contains_key(key),
         Some(JsObj::Array(items)) => {
             key == "length"
@@ -12223,8 +12285,65 @@ fn has_property_ordinary(obj: &Value, key: &str) -> bool {
                 || h.fn_prop(obj, key).is_some()
         }
         Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => h.fn_prop(obj, key).is_some(),
+        // A RegExp's `lastIndex` is an OWN property in node. Here it lives in
+        // the `RegExpObj` struct rather than a property map, so nothing above
+        // can see it.
+        Some(JsObj::RegExp(_)) => key == "lastIndex" || h.fn_prop(obj, key).is_some(),
         _ => false,
-    })
+    }) {
+        return true;
+    }
+    // An INHERITED builtin prototype method. These are not objects on the
+    // prototype chain — they are synthesized by the read path from the
+    // intrinsic table — so neither `lookup_chain` nor the property map above
+    // can see them, and `'toString' in {}`, `'push' in []` and `'then' in
+    // Promise.resolve()` all answered false. That last one is the standard
+    // thenable test, so the `in` operator disagreed with what a read gives for
+    // every builtin method of every builtin kind.
+    inherited_builtin_method(obj, key)
+}
+
+/// Whether a READ of `key` on `obj` would resolve to an inherited builtin
+/// prototype method. Asked by `in` and `hasOwnProperty`'s negative case; it
+/// performs no read, so a getter cannot fire.
+fn inherited_builtin_method(obj: &Value, key: &str) -> bool {
+    // A null-prototype object inherits NOTHING — `'toString' in
+    // Object.create(null)` is false.
+    if with_host(|h| h.has_null_proto(obj)) {
+        return false;
+    }
+    if let Some(tag) = crate::stdlib::native_tag(obj) {
+        if crate::stdlib::instance_has_method(&tag, key) {
+            return true;
+        }
+    }
+    // The generated prototype-member table, which unlike the arity table knows
+    // about the ACCESSORS — `size` on a Map, `source` on a RegExp, `description`
+    // on a Symbol are members but not functions — and about `constructor`.
+    // A BOXED primitive reports its wrapper's constructor, not `Object` —
+    // `'description' in Object(Symbol())` is true. The box is an ordinary
+    // object carrying the primitive in a slot, so the ctor comes from what it
+    // holds rather than from the box itself.
+    let ctor = match wrapped_primitive(obj).as_ref().and_then(wrapper_ctor_of) {
+        Some(c) => Some(c),
+        None => with_host(|h| default_ctor_name(h, obj)),
+    };
+    let on_proto = |c: &str| {
+        crate::arity::PROTO_MEMBERS
+            .binary_search_by(|(k, _)| (*k).cmp(c))
+            .ok()
+            .is_some_and(|i| {
+                crate::arity::PROTO_MEMBERS[i]
+                    .1
+                    .iter()
+                    .any(|m| m.strip_prefix('+').unwrap_or(m) == key)
+            })
+    };
+    if ctor.is_some_and(on_proto) {
+        return true;
+    }
+    // Everything else inherits `Object.prototype`'s.
+    on_proto("Object")
 }
 
 /// `structuredClone` — a deep copy of plain data (objects/arrays/primitives).

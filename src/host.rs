@@ -2566,6 +2566,28 @@ impl JsHost {
         self.frames.last_mut().unwrap().env = child_env(env);
     }
 
+    /// Open a scope that is also the activation's VARIABLE environment, and
+    /// return the previous one so the caller can restore it.
+    ///
+    /// A block scope is not enough for a strict direct `eval`: `var` and a
+    /// hoisted function declaration bind to `base_env`, so they walked straight
+    /// past a plain `push_scope` and still landed in the caller's function
+    /// scope. Only `let`/`const` were contained.
+    pub fn push_var_scope(&mut self) -> Env {
+        let env = child_env(self.cur_env());
+        let f = self.frames.last_mut().unwrap();
+        let prev = std::mem::replace(&mut f.base_env, env.clone());
+        f.env = env;
+        prev
+    }
+
+    /// Restore the variable environment a `push_var_scope` replaced.
+    pub fn pop_var_scope(&mut self, prev: Env) {
+        let f = self.frames.last_mut().unwrap();
+        f.env = prev.clone();
+        f.base_env = prev;
+    }
+
     /// Leave the innermost block scope (never pops past the activation's base).
     pub fn pop_scope(&mut self) {
         let cur = self.cur_env();

@@ -2533,3 +2533,12 @@ Still divergent, and why:
   (`examples/structuredclone.js` therefore pins the error and not the text).
   `FuncDef` holds a compiled chunk; fixing this means carrying source spans
   from the parser through the compiler.
+- **The `with` statement does not parse.** A sloppy-mode-only form, and the
+  one statement that makes a scope lookup dynamic, so nothing in this frontend
+  is shaped for it — `eval("with({a:1}){ a }")` is a SyntaxError here.
+- **Parser SyntaxError messages are this parser's, not node's.** A syntax error
+  reports the token that broke the parse in its own vocabulary — `expected ';'
+  but found Punct(")")` where node says `Unexpected token ')'` — so any record
+  that pins a syntax error's TEXT cannot match. `examples/earlyerrors.js` pins
+  the errors this frontend raises deliberately (which do match); this is about
+  the ordinary parse failures.
