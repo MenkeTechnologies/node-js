@@ -44,3 +44,56 @@ console.log(assigned.stack);
 // The slots stay own-but-non-enumerable, so keys/JSON see none of them.
 const plain = new Error("x");
 console.log(Object.keys(plain).length, JSON.stringify(plain), Object.prototype.hasOwnProperty.call(plain, "stack"));
+
+{
+// V8's two stack-capture knobs. Both were absent: `Error.stackTraceLimit` read
+// `undefined` (so the common save-and-restore idiom installed `undefined` and
+// disabled the limit permanently) and `Error.prepareStackTrace` read
+// `undefined` too, sending every `if (Error.prepareStackTrace)` probe down the
+// wrong branch.
+console.log("defaults", typeof Error.stackTraceLimit, Error.stackTraceLimit,
+  typeof Error.prepareStackTrace, Error.prepareStackTrace.name);
+
+// The limit is honoured, not merely reported: it caps the frames a stack keeps,
+// and 0 is the documented way to make error construction cheap.
+function outer() { return middle(); }
+function middle() { return inner(); }
+function inner() { return new Error("deep"); }
+const withLimit = (n, f) => {
+  const saved = Error.stackTraceLimit;
+  Error.stackTraceLimit = n;
+  try { return f(); } finally { Error.stackTraceLimit = saved; }
+};
+console.log("limits  ", withLimit(0, () => outer().stack.split("\n").length),
+  withLimit(1, () => outer().stack.split("\n").length),
+  withLimit(2, () => new Error("m").stack.split("\n").length));
+console.log("settable", withLimit(5, () => Error.stackTraceLimit), Error.stackTraceLimit);
+
+// A custom `prepareStackTrace` replaces `.stack` entirely — the hook every
+// source-map library installs. It was honoured only by `captureStackTrace`, so
+// an ordinary `err.stack` read bypassed it.
+const withHook = (hook, f) => {
+  const saved = Error.prepareStackTrace;
+  Error.prepareStackTrace = hook;
+  try { return f(); } finally { Error.prepareStackTrace = saved; }
+};
+console.log("hook    ", withHook(() => "CUSTOM", () => new Error("x").stack));
+console.log("hookArgs", withHook((e, sites) => `${e.message}/${Array.isArray(sites)}`,
+  () => new Error("y").stack));
+// Restoring it puts the default back.
+console.log("restored", new Error("z").stack.split("\n")[0]);
+
+// The default hook is a real function and renders the header plus one line per
+// call site, so a library may call it directly on a stack it captured.
+const dflt = Error.prepareStackTrace;
+console.log("default ", dflt(new Error("m"), []), JSON.stringify(dflt(new Error(), [])));
+// `captureStackTrace` still works, and goes through whatever hook is installed.
+const captured = {};
+Error.captureStackTrace(captured);
+console.log("capture ", typeof captured.stack,
+  withHook(() => "VIA-HOOK", () => { const o = {}; Error.captureStackTrace(o); return o.stack; }));
+
+// The ordinary stack is unchanged: header, then indented frames.
+const plain = new Error("boom");
+console.log("plain   ", plain.stack.split("\n")[0], plain.stack.includes("    at "));
+}

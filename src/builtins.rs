@@ -889,6 +889,11 @@ pub fn private_brand_message(name: &str, writing: bool) -> String {
 /// not change what later reads return. `@@stackRaw` is the not-yet-formatted
 /// marker and is dropped here; an explicit `e.stack = …` drops it too, so an
 /// assignment is never clobbered by a later read.
+/// The key of node's DEFAULT `Error.prepareStackTrace`. Recognised by name so
+/// the ordinary stack path can skip the hook round-trip when nothing custom is
+/// installed.
+pub const DEFAULT_PREPARE: &str = "ErrorPrepareStackTrace";
+
 pub fn materialize_stack(recv: &Value) {
     let Some(frames) = with_host(|h| match h.get(recv) {
         Some(JsObj::Object(p)) => p.get("@@stackRaw").cloned(),
@@ -896,6 +901,41 @@ pub fn materialize_stack(recv: &Value) {
     }) else {
         return;
     };
+    // A custom `Error.prepareStackTrace` replaces the string entirely (V8's
+    // stack-introspection hook, which every source-map library installs). It was
+    // honoured only by `Error.captureStackTrace`, so an ordinary `err.stack`
+    // read bypassed it and handed back the default text.
+    let prep = with_host(|h| h.builtin_static("Error", "prepareStackTrace"));
+    if let Some(f) = prep.filter(|f| {
+        // The default hook produces exactly what the fast path below produces,
+        // so it is skipped rather than called.
+        !matches!(
+            with_host(|h| h.get(f).cloned()),
+            Some(JsObj::Builtin(ref n)) if n == DEFAULT_PREPARE
+        ) && matches!(
+            with_host(|h| h.get(f).cloned()),
+            Some(JsObj::Func(_)) | Some(JsObj::Builtin(_)) | Some(JsObj::BoundFunc { .. })
+        )
+    }) {
+        // Clear the raw marker FIRST: the hook may read `.stack` itself, and a
+        // second materialization would re-enter this path forever.
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                p.shift_remove("@@stackRaw");
+            }
+        });
+        let limit = with_host(|h| h.stack_trace_limit());
+        if let Ok(sites) = crate::module::callsite_stack(limit) {
+            if let Ok(out) = host::invoke(&f, vec![recv.clone(), sites], None) {
+                with_host(|h| {
+                    if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                        p.insert("stack".into(), out);
+                    }
+                });
+                return;
+            }
+        }
+    }
     with_host(|h| {
         let frames = h.str_of(&frames);
         let name = host::lookup_chain(h, recv, "name")
@@ -1971,6 +2011,26 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
             h.ensure_native_protos();
             h.native_proto(ns).unwrap_or(Value::Undef)
         });
+    }
+    // `Error.prepareStackTrace` has a DEFAULT hook in node
+    // (`ErrorPrepareStackTrace`), so a library probing `if
+    // (Error.prepareStackTrace)` finds one. Reading `undefined` sent that probe
+    // down the wrong branch. The default renders the header plus the frames,
+    // which is what the fast path in `materialize_stack` already produces — it
+    // recognises this exact builtin and skips the round trip.
+    if ns == "Error" && name == "prepareStackTrace" {
+        return with_host(|h| h.builtin_static("Error", "prepareStackTrace")).unwrap_or_else(
+            || with_host(|h| h.alloc(JsObj::Builtin(DEFAULT_PREPARE.to_string()))),
+        );
+    }
+    // `Error.stackTraceLimit` defaults to 10 and is settable; an assignment
+    // lands in the builtin-static side table, which the read below consults
+    // first. Without a default the READ was `undefined`, so a library doing
+    // `const old = Error.stackTraceLimit` and restoring it later installed
+    // `undefined` and disabled the limit permanently.
+    if ns == "Error" && name == "stackTraceLimit" {
+        return with_host(|h| h.builtin_static("Error", "stackTraceLimit"))
+            .unwrap_or(Value::Float(10.0));
     }
     // `Ctor[Symbol.species]` is an accessor returning `this` on every builtin
     // that has one (23.1.2.5, 27.2.4.7, …). It was absent, so the species
@@ -4725,6 +4785,40 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         return r;
     }
     match name {
+        // Node's DEFAULT `Error.prepareStackTrace`: the `Name: message` header
+        // followed by one `    at <site>` line per call site. Reachable because
+        // the read hands the hook out, and a library may call it directly to
+        // render a stack it captured.
+        DEFAULT_PREPARE => {
+            let err = arg0(&args);
+            let header = with_host(|h| {
+                let name = host::lookup_chain(h, &err, "name")
+                    .map(|v| h.str_of(&v))
+                    .unwrap_or_else(|| "Error".to_string());
+                let msg = host::lookup_chain(h, &err, "message")
+                    .map(|v| h.str_of(&v))
+                    .unwrap_or_default();
+                if msg.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {msg}")
+                }
+            });
+            let sites = args.get(1).cloned().unwrap_or(Value::Undef);
+            let lines = with_host(|h| match h.get(&sites) {
+                Some(JsObj::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            });
+            let mut out = header;
+            for s in lines {
+                let rendered = host::to_string_value(&s)
+                    .map(|v| with_host(|h| h.str_of(&v)))
+                    .unwrap_or_default();
+                out.push_str("\n    at ");
+                out.push_str(&rendered);
+            }
+            Ok(with_host(|h| h.new_str(out)))
+        }
         "console.log" | "console.info" | "console.debug" => {
             print_line(&args, false)?;
             Ok(Value::Undef)

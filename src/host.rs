@@ -2292,9 +2292,34 @@ impl JsHost {
     /// module-loader frames, so `.stack` names the call chain but can never be
     /// byte-identical to V8's. The names are what makes a thrown error
     /// diagnosable; the missing positions are documented in BUGS.md.
+    /// V8's `Error.stackTraceLimit` — how many frames a captured stack keeps.
+    ///
+    /// The default is 10, it is settable, and setting it to 0 is the documented
+    /// way to make error construction cheap. It did not exist, so the read was
+    /// `undefined` and every stack carried every frame regardless.
+    pub fn stack_trace_limit(&self) -> usize {
+        match self.builtin_static("Error", "stackTraceLimit") {
+            Some(v) => {
+                let n = self.to_number(&v);
+                if n.is_finite() && n > 0.0 {
+                    n as usize
+                } else if n.is_nan() || n <= 0.0 {
+                    0
+                } else {
+                    usize::MAX
+                }
+            }
+            None => 10,
+        }
+    }
+
     pub fn stack_frames(&self) -> String {
+        let limit = self.stack_trace_limit();
+        if limit == 0 {
+            return String::new();
+        }
         let mut out = String::new();
-        for (i, f) in self.frames.iter().enumerate().rev() {
+        for (i, f) in self.frames.iter().enumerate().rev().take(limit) {
             let name = match (&f.owner, i) {
                 (Some(n), _) => n.clone(),
                 (None, 0) => "Object.<anonymous>".to_string(),
@@ -2303,7 +2328,7 @@ impl JsHost {
             out.push_str("\n    at ");
             out.push_str(&name);
         }
-        if out.is_empty() {
+        if out.is_empty() && limit > 0 {
             out.push_str("\n    at <anonymous>");
         }
         out

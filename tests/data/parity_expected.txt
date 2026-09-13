@@ -787,6 +787,15 @@ ProtoNamed: boom
 Error: boom Error: boom
 CUSTOM
 0 {} true
+defaults number 10 function ErrorPrepareStackTrace
+limits   1 2 3
+settable 5 10
+hook     CUSTOM
+hookArgs y/true
+restored Error: z
+default  Error: m "Error"
+capture  string VIA-HOOK
+plain    Error: boom true
 ==== events.js ====
 order    on1:1,on2:1,once:1,on1:2,on2:2
 counts   2 2 a
