@@ -69,6 +69,11 @@ pub const INSTANCE_METHODS: &[&str] = &[
     "setUTCMilliseconds",
     "getYear",
     "setYear",
+    // 21.4.4.45. A Date is the one builtin whose DEFAULT hint is `"string"`,
+    // which is why `date + 1` concatenates while `date - 1` subtracts. The
+    // coercion path already knew that, but the method itself was not exposed,
+    // so `date[Symbol.toPrimitive]` was not a function.
+    "@@toPrimitive",
 ];
 
 const MS_PER_DAY: f64 = 86_400_000.0;
@@ -185,6 +190,17 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
     let f = |ms: f64| ms; // readability alias for numeric returns
     Ok(match method {
         "getTime" | "valueOf" => Value::Float(f(ms)),
+        // Only an explicit `"number"` hint yields the timestamp; `"string"` and
+        // `"default"` both render the date, which is the rule that makes the
+        // default hint behave as `"string"`.
+        "@@toPrimitive" => {
+            let hint = with_host(|h| h.str_of(&_args.first().cloned().unwrap_or(Value::Undef)));
+            if hint == "number" {
+                Value::Float(f(ms))
+            } else {
+                return instance_call(recv, "toString", _args);
+            }
+        }
         "toISOString" | "toJSON" => {
             if ms.is_nan() {
                 if method == "toJSON" {

@@ -49,3 +49,24 @@ console.log("nullproto", caught(() => Object.create(null) + ""));
 // The exotics still get their brand rather than a TypeError.
 console.log("exotics ", String(new Map()), String(new Set()), String(Promise.resolve()));
 console.log("ordinary", String({}), String([1, 2]), String(/a/g), typeof (new Date(0) - 1));
+
+{
+// 21.4.4.45: a `Date` is the one builtin whose DEFAULT hint is `"string"`,
+// which is why `date + 1` concatenates while `date - 1` subtracts. The coercion
+// path already knew that, but `Date.prototype[Symbol.toPrimitive]` itself was
+// not exposed, so calling it was a TypeError — and a library that reaches for
+// the method rather than relying on implicit coercion got nothing.
+const epoch = new Date(0);
+console.log("exists  ", typeof Date.prototype[Symbol.toPrimitive], typeof epoch[Symbol.toPrimitive]);
+// Only an explicit `"number"` hint yields the timestamp.
+console.log("hints   ", epoch[Symbol.toPrimitive]("number"),
+  epoch[Symbol.toPrimitive]("string") === epoch.toString(),
+  epoch[Symbol.toPrimitive]("default") === epoch.toString());
+// Which is what makes the operators behave the way they do.
+console.log("operators", typeof (epoch + 1), typeof (epoch - 1), epoch - 0, epoch * 1);
+console.log("concat  ", (epoch + "") === epoch.toString(), `${epoch}` === epoch.toString());
+// An invalid date still answers both hints.
+const bad = new Date("not a date");
+console.log("invalid ", typeof bad[Symbol.toPrimitive]("string"),
+  Number.isNaN(bad[Symbol.toPrimitive]("number")));
+}

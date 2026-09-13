@@ -636,6 +636,11 @@ halfprim V V
 nullproto TypeError
 exotics  [object Map] [object Set] [object Promise]
 ordinary [object Object] 1,2 /a/g number
+exists   function function
+hints    0 true true
+operators string number 0 0
+concat   true true
+invalid  string true
 ==== collections.js ====
 size 3
 get bob 75
