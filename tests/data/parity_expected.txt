@@ -1287,6 +1287,23 @@ index    TypeError: Cannot read properties of null (reading '0')
 absent   TypeError: {}.nope is not a function
 absent2  TypeError: [].nope is not a function
 optional undefined undefined undefined
+==== protomembers.js ====
+Map      clear,constructor,delete,entries,forEach,get,getOrInsert,getOrInsertComputed,has,keys,set,size,values
+Set      add,clear,constructor,delete,difference,entries,forEach,has,intersection,isDisjointFrom,isSubsetOf,isSupersetOf,keys,size,symmetricDifference,union,values
+Promise  catch,constructor,finally,then
+WeakMap  constructor,delete,get,getOrInsert,getOrInsertComputed,has,set
+WeakRef  constructor,deref
+Date     563 constructor,getDate,getDay,getFullYear,getHours,getMilliseco
+Array    306 at,concat,constructor,copyWithin,entries,every,fill,filter,f
+accessor true true true
+RegExp   compile,constructor,dotAll,exec,flags,global,hasIndices,ignoreCase,multiline,source,sticky,test,toString,unicode,unicodeSets
+ArrayBuf byteLength,constructor,detached,maxByteLength,resizable,resize,slice,transfer,transferToFixedLength
+DataView 266
+nonenum  [] [] []
+webidl   append,delete,entries,forEach,get,getAll,has,keys,set,size,sort,toString,values
+url      hash,host,hostname,href,origin,password,pathname,port,protocol,search,searchParams,toJSON,toString,username
+encoder  encode,encodeInto,encoding
+callable function get 1 true
 ==== reflection.js ====
 set-data 1 9
 set-accs undefined 5
@@ -1528,6 +1545,19 @@ callback global global
 receiver object object
 strict   undefined
 arrow    object
+==== urlmutation.js ====
+pathname /p https://h.com/p
+all      https://h.com:99/p?a=1#z h.com:99 https://h.com:99
+delims   http: #z http://h.com/p?a=1#z
+cleared  "" http://h.com/p#z 0
+identity true 9 1
+append   https://h.com/?x=9&y=2
+delete   https://h.com/?y=2 ?y=2 1
+set      https://h.com/?y=3 y=3
+detached z=1&y=2 2
+statics  function function
+canParse true false true
+parse    https://a.com/x null https://a.com/p
 ==== urls.js ====
 encode   /a%20b ?c=d%20e #f%20g
 href     https://a.b/a%20b?c=d%20e#f%20g

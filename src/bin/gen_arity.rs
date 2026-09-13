@@ -66,7 +66,30 @@ for (const c of ctors) {
 // The shared %TypedArray% intrinsic, which this frontend names "TypedArray".
 members(Object.getPrototypeOf(Uint8Array), 'TypedArray.');
 members(Object.getPrototypeOf(Uint8Array.prototype), '@proto:TypedArray:');
+// The own property NAMES of each prototype, in the engine's own order and with
+// each one's enumerability. This is a different question from the arity table
+// above, which only knows about FUNCTIONS: `Map.prototype.size`,
+// `RegExp.prototype.source` and the twelve `URL.prototype` components are
+// accessors, so `Object.getOwnPropertyNames(Map.prototype)` cannot be derived
+// from the function list. Order is V8's insertion order, not alphabetical, and
+// is preserved here rather than sorted because that is what a script observing
+// it sees.
+const protos = [];
+const protoRow = (label, holder) => {
+  const names = Object.getOwnPropertyNames(holder).map((k) => {
+    let d; try { d = Object.getOwnPropertyDescriptor(holder, k); } catch { return k; }
+    return d && d.enumerable ? '+' + k : k;
+  });
+  protos.push(label + '\t' + names.join(','));
+};
+for (const c of ctors) {
+  const C = globalThis[c];
+  if (C && C.prototype) protoRow(c, C.prototype);
+}
+protoRow('TypedArray', Object.getPrototypeOf(Uint8Array.prototype));
 console.log(rows.join('\n'));
+console.log('===PROTOS===');
+console.log(protos.join('\n'));
 "#;
 
 fn main() {
@@ -91,7 +114,25 @@ fn main() {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    let mut rows: Vec<(String, String, String)> = String::from_utf8_lossy(&out.stdout)
+    let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (arity_text, proto_text) = stdout_text
+        .split_once("===PROTOS===\n")
+        .expect("enumerator emitted no prototype section");
+    // (constructor, member names) — kept in the engine's order, not sorted.
+    let protos: Vec<(String, Vec<String>)> = proto_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (ctor, names) = l.split_once('\t').unwrap_or((l, ""));
+            let names = names
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect();
+            (ctor.to_string(), names)
+        })
+        .collect();
+    let mut rows: Vec<(String, String, String)> = arity_text
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
@@ -140,6 +181,33 @@ fn main() {
     .unwrap();
     for (key, name, len) in &rows {
         writeln!(w, "    ({key:?}, {name:?}, {len}),").unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    writeln!(w).unwrap();
+    writeln!(
+        w,
+        "/// The own property names of each intrinsic prototype, in the engine's own\n\
+         /// order. A name prefixed `+` is ENUMERABLE — true only for the WebIDL\n\
+         /// interfaces (`URL`, `URLSearchParams`), whose members are plain assigned\n\
+         /// properties, never for an ECMAScript builtin's.\n\
+         ///\n\
+         /// Separate from [`BUILTIN_ARITY`] because that table holds FUNCTIONS only:\n\
+         /// `Map.prototype.size`, `RegExp.prototype.source` and the twelve\n\
+         /// `URL.prototype` components are accessors, so the answer to\n\
+         /// `Object.getOwnPropertyNames(Map.prototype)` is not derivable from it.\n\
+         /// Sorted by constructor for lookup; the NAMES within a row are not sorted.\n\
+         pub const PROTO_MEMBERS: &[(&str, &[&str])] = &["
+    )
+    .unwrap();
+    let mut protos = protos;
+    protos.sort();
+    for (ctor, names) in &protos {
+        let list = names
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(w, "    ({ctor:?}, &[{list}]),").unwrap();
     }
     writeln!(w, "];").unwrap();
 }

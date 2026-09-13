@@ -3063,6 +3063,21 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         with_host(|h| h.set_builtin_static(&ns, name, val));
         return Ok(());
     }
+    // Assigning a `URL` component rewrites the DERIVED fields (`href`, `host`,
+    // `origin`) alongside it. They are stored rather than computed on read, so
+    // without this `u.pathname = '/p'` read back as `/p` while `u.href` still
+    // showed the old path — the object disagreed with itself.
+    if crate::stdlib::url::is_component(name)
+        && crate::stdlib::native_tag(recv).as_deref() == Some("URL")
+    {
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                p.insert(name.to_string(), val.clone());
+            }
+        });
+        crate::stdlib::url::refresh(recv);
+        return Ok(());
+    }
     // `re.lastIndex = n` on a RegExp advances/resets its match cursor.
     if name == "lastIndex" {
         if let Some(n) = with_host(|h| match h.get(recv) {
@@ -6581,6 +6596,45 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
     // A builtin prototype namespace that exposes enumerable methods for copying
     // (`Object.getOwnPropertyNames(EventEmitter.prototype)` — express's mixin).
     if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(&v).cloned()) {
+        // An INTRINSIC prototype (`Map.prototype`, `URL.prototype`). Members are
+        // non-enumerable on an ECMAScript builtin and enumerable on a WebIDL
+        // interface, which the table records per name.
+        if let Some(members) = intrinsic_proto_members(&ns) {
+            let ctor = ns.trim_end_matches(".prototype");
+            let names: Vec<&str> = members
+                .iter()
+                .filter(|m| mode == 3 || m.starts_with('+'))
+                .map(|m| m.strip_prefix('+').unwrap_or(m))
+                .collect();
+            return Ok(with_host(|h| {
+                let out: Vec<Value> = names
+                    .iter()
+                    .map(|name| {
+                        // An accessor member has no thunk — `Map.prototype.size`
+                        // is not a function — so a VALUE read of one answers
+                        // undefined rather than synthesizing a callable.
+                        let val = |h: &mut host::JsHost| {
+                            let key = format!("@proto:{ctor}:{name}");
+                            if builtin_meta(&key).is_some() {
+                                h.alloc(JsObj::Builtin(key))
+                            } else {
+                                Value::Undef
+                            }
+                        };
+                        match mode {
+                            1 => val(h),
+                            2 => {
+                                let ks = h.new_str(*name);
+                                let v = val(h);
+                                h.new_array(vec![ks, v])
+                            }
+                            _ => h.new_str(*name),
+                        }
+                    })
+                    .collect();
+                h.new_array(out)
+            }));
+        }
         if let Some(names) = builtin_proto_method_names(&ns) {
             return Ok(with_host(|h| {
                 let out: Vec<Value> = names
@@ -11121,6 +11175,24 @@ fn object_create(args: Vec<Value>) -> Result<Value, String> {
 /// The enumerable method names of a builtin `<Ctor>.prototype` namespace that
 /// supports being copied via `mixin`/`getOwnPropertyNames`. Currently only
 /// `EventEmitter.prototype` (the one express mixes onto its app function).
+/// The own property names of `<Ctor>.prototype`, and whether each is
+/// enumerable, from the generated [`crate::arity::PROTO_MEMBERS`] table.
+///
+/// `Object.getOwnPropertyNames(Map.prototype)` answered `[]` for every
+/// intrinsic — the members are reachable by NAME through the `@proto:` thunks
+/// but were not enumerable, so feature detection that walks a prototype found
+/// nothing there. The table is read from the reference engine rather than
+/// derived from the arity table because the arity table holds functions only:
+/// `Map.prototype.size`, `RegExp.prototype.source` and the twelve
+/// `URL.prototype` components are accessors.
+fn intrinsic_proto_members(ns: &str) -> Option<&'static [&'static str]> {
+    let ctor = ns.strip_suffix(".prototype")?;
+    crate::arity::PROTO_MEMBERS
+        .binary_search_by(|(k, _)| (*k).cmp(ctor))
+        .ok()
+        .map(|i| crate::arity::PROTO_MEMBERS[i].1)
+}
+
 fn builtin_proto_method_names(ns: &str) -> Option<&'static [&'static str]> {
     match ns {
         "EventEmitter.prototype" => Some(crate::stdlib::events::METHODS),

@@ -1,7 +1,14 @@
 //! Node `url` module: the WHATWG `URL` class (global + `require('url').URL`) and
 //! the legacy `url.parse`. A `URL` instance stores its components as data
 //! properties (so `u.hostname` reads directly) plus a `@@native = "URL"` tag for
-//! `toString`.
+//! `toString`. Assigning one of those components goes through [`refresh`], which
+//! rewrites the DERIVED fields (`href`, `host`, `origin`) so the object cannot
+//! disagree with itself; the `searchParams` it carries holds an `@@ownerUrl`
+//! back-reference so its own mutations rewrite the query in the other direction.
+//!
+//! They remain OWN properties of the instance, where node has them as accessors
+//! on `URL.prototype` — so `Object.keys(url)` lists twelve names here and none
+//! in node.
 
 use super::arg_str;
 use crate::host::{with_host, JsObj};
@@ -22,6 +29,95 @@ pub const MODULE_METHODS: &[&str] = &[
 ];
 
 /// Parsed URL components.
+/// The component names a `URL` exposes as writable data properties.
+///
+/// Assigning one has to rewrite the DERIVED fields — `href`, `host` and
+/// `origin` — which are stored alongside rather than computed on read. Without
+/// that, `u.pathname = '/p'` read back as `/p` while `u.href` still showed the
+/// old path, so the object disagreed with itself.
+pub const COMPONENTS: &[&str] = &[
+    "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
+];
+
+/// Whether `name` is a `URL` component whose assignment must refresh the
+/// derived fields.
+pub fn is_component(name: &str) -> bool {
+    COMPONENTS.contains(&name)
+}
+
+/// Recompute `href`, `host` and `origin` from the component properties now on
+/// `url`, and normalise the two components that carry a leading delimiter.
+///
+/// `sync_params` rewrites the attached `searchParams` from the new query. It is
+/// false when the caller IS that `searchParams` object pushing its own edit
+/// back, which would otherwise recurse.
+fn recompute(url: &Value, sync_params: bool) {
+    let read = |k: &str| {
+        with_host(|h| match h.get(url) {
+            Some(JsObj::Object(p)) => p.get(k).map(|v| h.str_of(v)).unwrap_or_default(),
+            _ => String::new(),
+        })
+    };
+    let mut protocol = read("protocol");
+    if !protocol.is_empty() && !protocol.ends_with(':') {
+        protocol.push(':');
+    }
+    // A search or hash assigned without its delimiter gains one; assigning the
+    // empty string clears it, as the WHATWG setters do.
+    let delimited = |s: String, lead: char| {
+        if s.is_empty() || s.starts_with(lead) {
+            s
+        } else {
+            format!("{lead}{s}")
+        }
+    };
+    let parts = Parts {
+        protocol,
+        username: read("username"),
+        password: read("password"),
+        hostname: read("hostname"),
+        port: read("port"),
+        pathname: read("pathname"),
+        search: delimited(read("search"), '?'),
+        hash: delimited(read("hash"), '#'),
+    };
+    let (href, host, origin) = (parts.href(), parts.host(), parts.origin());
+    let search = parts.search.clone();
+    if sync_params {
+        // The attached `searchParams` is updated IN PLACE: node hands out one
+        // object per URL for the life of the URL, so `u.searchParams` before and
+        // after `u.search = …` is the same object.
+        let query = search.strip_prefix('?').unwrap_or(&search).to_string();
+        let params = with_host(|h| match h.get(url) {
+            Some(JsObj::Object(p)) => p.get("searchParams").cloned(),
+            _ => None,
+        });
+        if let Some(params) = params {
+            write_pairs(&params, &parse_query(&query));
+        }
+    }
+    with_host(|h| {
+        let vals = [
+            ("href", h.new_str(href)),
+            ("host", h.new_str(host)),
+            ("origin", h.new_str(origin)),
+            ("protocol", h.new_str(parts.protocol.clone())),
+            ("search", h.new_str(search)),
+            ("hash", h.new_str(parts.hash.clone())),
+        ];
+        if let Some(JsObj::Object(p)) = h.get_mut(url) {
+            for (k, v) in vals {
+                p.insert(k.to_string(), v);
+            }
+        }
+    });
+}
+
+/// Refresh a `URL` after one of its components was assigned.
+pub fn refresh(url: &Value) {
+    recompute(url, true);
+}
+
 struct Parts {
     protocol: String,
     username: String,
@@ -327,10 +423,11 @@ fn build(p: &Parts) -> Value {
         search: percent_encode(&p.search, QUERY_SET),
         hash: percent_encode(&p.hash, FRAGMENT_SET),
     };
-    // Build the `URLSearchParams` snapshot BEFORE the allocating `with_host` below
-    // (never nest `with_host`); it is stored as the `searchParams` data property so
-    // `url.searchParams.get(...)` reads it directly. It is a static snapshot of the
-    // query at construction — mutating it does not rewrite `url.href`.
+    // Build the `URLSearchParams` BEFORE the allocating `with_host` below (never
+    // nest `with_host`); it is stored as the `searchParams` data property so
+    // `url.searchParams.get(...)` reads it directly. It is LIVE, not a snapshot:
+    // it gets an `@@ownerUrl` back-reference below so that mutating it rewrites
+    // this URL's `search` and `href`.
     let query = p.search.strip_prefix('?').unwrap_or(&p.search);
     let search_params = make_search_params(&parse_query(query));
     with_host(|h| {
@@ -346,9 +443,35 @@ fn build(p: &Parts) -> Value {
         m.insert("port".into(), h.new_str(p.port.clone()));
         m.insert("pathname".into(), h.new_str(p.pathname.clone()));
         m.insert("search".into(), h.new_str(p.search.clone()));
-        m.insert("searchParams".into(), search_params);
+        m.insert("searchParams".into(), search_params.clone());
         m.insert("hash".into(), h.new_str(p.hash.clone()));
-        h.new_object(m)
+        let obj = h.new_object(m);
+        // Hidden, and set after the URL exists so the two can point at each other.
+        if let Some(JsObj::Object(sp)) = h.get_mut(&search_params) {
+            sp.insert("@@ownerUrl".into(), obj.clone());
+        }
+        obj
+    })
+}
+
+/// Statics on the `URL` CLASS — distinct from [`MODULE_METHODS`], which are the
+/// legacy `require('url')` functions.
+///
+/// `createObjectURL`/`revokeObjectURL` are absent because `Blob` is not
+/// implemented; they would have nothing to register.
+pub const STATIC_METHODS: &[&str] = &["canParse", "parse"];
+
+/// `URL.canParse(input[, base])` / `URL.parse(input[, base])`.
+///
+/// Both are the non-throwing form of the constructor: `canParse` reports
+/// whether parsing succeeds, `parse` returns the `URL` or `null`. Neither
+/// existed, so `URL.canParse` was a TypeError rather than a boolean.
+pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let parsed = construct(args);
+    Some(match method {
+        "canParse" => Ok(Value::Bool(parsed.is_ok())),
+        "parse" => Ok(parsed.unwrap_or_else(|_| with_host(|h| h.null()))),
+        _ => return None,
     })
 }
 
@@ -833,6 +956,16 @@ fn make_search_params(pairs: &[(String, String)]) -> Value {
     })
 }
 
+/// Serialize ordered pairs back into an `application/x-www-form-urlencoded`
+/// query string — the inverse of [`parse_query`].
+fn encode_query(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", form_encode(k), form_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// Read the ordered `(key, value)` pairs out of a `URLSearchParams`.
 fn pairs_of(recv: &Value) -> Vec<(String, String)> {
     with_host(|h| {
@@ -858,8 +991,36 @@ fn pairs_of(recv: &Value) -> Vec<(String, String)> {
     })
 }
 
-/// Overwrite a `URLSearchParams`' backing `@@pairs` array.
+/// Overwrite a `URLSearchParams`' backing `@@pairs` array, and push the new
+/// query back to the `URL` that owns it if there is one.
+///
+/// A `URLSearchParams` reached through `url.searchParams` is LIVE in both
+/// directions: `u.searchParams.set('b', '2')` has to rewrite `u.search` and
+/// `u.href`. It was previously a detached snapshot, so the edit went nowhere.
 fn set_pairs(recv: &Value, pairs: &[(String, String)]) {
+    write_pairs(recv, pairs);
+    let owner = with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) => p.get("@@ownerUrl").cloned(),
+        _ => None,
+    });
+    if let Some(owner) = owner {
+        let query = encode_query(pairs);
+        with_host(|h| {
+            let s = h.new_str(if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
+            });
+            if let Some(JsObj::Object(p)) = h.get_mut(&owner) {
+                p.insert("search".into(), s);
+            }
+        });
+        recompute(&owner, false);
+    }
+}
+
+/// Write `pairs` into a `URLSearchParams` without notifying an owning `URL`.
+fn write_pairs(recv: &Value, pairs: &[(String, String)]) {
     with_host(|h| {
         let items: Vec<Value> = pairs
             .iter()
@@ -1016,11 +1177,7 @@ pub fn search_params_call(recv: &Value, method: &str, args: &[Value]) -> Result<
             Ok(Value::Undef)
         }
         "toString" => {
-            let s = pairs_of(recv)
-                .iter()
-                .map(|(k, v)| format!("{}={}", form_encode(k), form_encode(v)))
-                .collect::<Vec<_>>()
-                .join("&");
+            let s = encode_query(&pairs_of(recv));
             Ok(with_host(|h| h.new_str(s)))
         }
         "keys" => {

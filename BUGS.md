@@ -2478,3 +2478,27 @@ Still divergent, and why:
   pool allocator — `[byteOffset]: 144`, a `[buffer]` of `[byteLength]: 65599`,
   and `parent`/`offset` getters — none of which exist here, where a Buffer owns
   its bytes. The values are allocator state, not observable semantics.
+- **A `URL`'s components are own properties of the instance, where node has
+  them as accessors on `URL.prototype`.** They read and write correctly and the
+  derived fields stay in step (`examples/urlmutation.js`), but the shape is
+  visible: `Object.keys(new URL(u))` lists twelve names and node lists none,
+  `Object.getOwnPropertyNames` likewise, and `u.hasOwnProperty('href')` answers
+  true where node answers false. Fixing it means moving the twelve to the
+  prototype as real accessors and giving `util.inspect` the `URL { … }` form it
+  would then no longer get from enumerating own properties.
+- **`Object.getOwnPropertyNames(X.prototype)` is right for the intrinsics whose
+  prototype is a builtin namespace, and still wrong for the six whose prototype
+  is a real object.** `Map`, `Set`, `Promise`, `Date`, `Array`, `RegExp`,
+  `ArrayBuffer`, `DataView`, `WeakMap`/`WeakSet`/`WeakRef`,
+  `FinalizationRegistry`, `URL`, `URLSearchParams`, `TextEncoder`/`TextDecoder`
+  answer from the generated `arity::PROTO_MEMBERS` table and match node
+  (`examples/protomembers.js`). `String`, `Number`, `Boolean`, `Symbol`,
+  `Error` and the typed arrays have a wrapper object as their prototype, so the
+  answer comes from that object's property map and lists the methods this
+  frontend implements rather than node's set.
+- **Reading an accessor member off a prototype answers `undefined` instead of
+  throwing.** `Map.prototype.size` and `URL.prototype.href` are brand-checked
+  getters in node, which throws `TypeError: Method get Map.prototype.size
+  called on incompatible receiver`; here the name resolves to no thunk and the
+  read yields `undefined`. `Object.values(URL.prototype)` throws in node for
+  the same reason and returns an array here.
