@@ -80,8 +80,17 @@ pub fn compile(src: &str) -> Result<compiler::Program, String> {
 /// Compile leaving the final top-level expression as the program's completion
 /// value (for `vm.runInThisContext` / `eval`).
 pub fn compile_completion(src: &str) -> Result<compiler::Program, String> {
+    compile_completion_strict(src, false)
+}
+
+/// As [`compile_completion`], with the caller's strictness folded in — what a
+/// direct `eval` inherits.
+pub fn compile_completion_strict(
+    src: &str,
+    caller_strict: bool,
+) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile_completion(&stmts, false)
+    compiler::compile_completion_strict(&stmts, false, caller_strict)
 }
 
 /// Compile with per-statement DAP line markers enabled (`node --dap`).

@@ -198,6 +198,15 @@ pub struct Compiler {
 /// name that a `var` in the same subtree hoists onto, and a lexical name
 /// colliding with a function declaration beside it. Repeated `var`s, and the
 /// same name in nested scopes, stay legal.
+/// The names strict code may not BIND or ASSIGN to (13.1.1, 14.3.1.1).
+const RESERVED_IN_STRICT: [&str; 2] = ["eval", "arguments"];
+
+/// `SyntaxError: Unexpected eval or arguments in strict mode` — raised for a
+/// binding, a parameter, an assignment target and an update target alike.
+fn strict_reserved_error() -> String {
+    "SyntaxError: Unexpected eval or arguments in strict mode".to_string()
+}
+
 pub fn check_early_errors(stmts: &[Stmt]) -> Result<(), String> {
     let mut lexical: Vec<String> = Vec::new();
     let mut functions: Vec<String> = Vec::new();
@@ -334,10 +343,23 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
 /// stack (the program's completion value), for `eval`/`vm.runInThisContext`. A
 /// non-expression final statement leaves nothing (→ `undefined`).
 pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
+    compile_completion_strict(stmts, debug, false)
+}
+
+/// As [`compile_completion`], but with the CALLER's strictness folded in.
+///
+/// A direct `eval` inherits it (19.2.1.1 step 10), which decides every strict
+/// early error inside the evaluated source: `eval('delete x')` in strict code
+/// is a SyntaxError, and compiling the source on its own could not see that.
+pub fn compile_completion_strict(
+    stmts: &[Stmt],
+    debug: bool,
+    caller_strict: bool,
+) -> Result<Program, String> {
     let mut c = Compiler {
         opt_chain: Vec::new(),
         debug,
-        strict: has_use_strict(stmts),
+        strict: caller_strict || has_use_strict(stmts),
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
@@ -647,6 +669,15 @@ impl Compiler {
                             b.emit(Op::LoadUndef, line);
                         }
                     }
+                    // 13.3.1.1: a `var`/`let`/`const` may not BIND `eval` or
+                    // `arguments` in strict code.
+                    if self.strict {
+                        for n in binding_names(&d.target) {
+                            if RESERVED_IN_STRICT.contains(&n.as_str()) {
+                                return Err(strict_reserved_error());
+                            }
+                        }
+                    }
                     self.destructure_src = d.init.as_ref().and_then(destructure_source_text);
                     let r = self.compile_bind(b, &d.target, mode);
                     self.destructure_src = None;
@@ -791,6 +822,16 @@ impl Compiler {
         target: &Expr,
         declare: BindMode,
     ) -> Result<(), String> {
+        // A DESTRUCTURING target named `eval` or `arguments` is refused in
+        // strict code too, with its own wording — `({ a: eval } = {})` slipped
+        // past the assignment check because it never builds an `Expr::Assign`.
+        if self.strict {
+            if let Expr::Ident(n) = target {
+                if declare == BindMode::Assign && RESERVED_IN_STRICT.contains(&n.as_str()) {
+                    return Err("SyntaxError: Invalid destructuring assignment target".to_string());
+                }
+            }
+        }
         match target {
             Expr::Ident(_) => {
                 if declare == BindMode::Assign {
@@ -2302,6 +2343,27 @@ impl Compiler {
     /// Lower a formal-parameter list into simple slots plus prologue statements
     /// (defaults + destructuring), executed at the top of the body.
     fn lower_params(&mut self, params: &[Param]) -> Result<(Vec<ParamSlot>, Vec<Stmt>), String> {
+        // Strict code refuses a DUPLICATE parameter name, and refuses `eval` or
+        // `arguments` as one. Both are early errors, so they fire before the
+        // body runs — sloppy code still allows the duplicate, where the LAST
+        // one wins.
+        if self.strict {
+            let mut seen: Vec<String> = Vec::new();
+            for p in params {
+                for n in binding_names(&p.pattern) {
+                    if RESERVED_IN_STRICT.contains(&n.as_str()) {
+                        return Err(strict_reserved_error());
+                    }
+                    if seen.contains(&n) {
+                        return Err(
+                            "SyntaxError: Duplicate parameter name not allowed in this context"
+                                .to_string(),
+                        );
+                    }
+                    seen.push(n);
+                }
+            }
+        }
         let mut slots = Vec::new();
         let mut prologue: Vec<Stmt> = Vec::new();
         for (i, p) in params.iter().enumerate() {
@@ -2427,6 +2489,15 @@ impl Compiler {
                 op: Some(aop),
                 value,
             } => self.compile_compound_assign(b, target, *aop, value)?,
+            // 13.15.1 / 13.4.1: strict code may not assign to, or update,
+            // `eval` or `arguments`. Both are early errors.
+            Expr::Assign { target, .. } | Expr::Update { target, .. }
+                if self.strict
+                    && matches!(&**target, Expr::Ident(n)
+                        if RESERVED_IN_STRICT.contains(&n.as_str())) =>
+            {
+                return Err(strict_reserved_error());
+            }
             Expr::Assign { target, value, .. } => match &**target {
                 // 13.15.2 steps 1.a-1.f: for a PROPERTY target the reference is
                 // evaluated first — the object, then the key — and only then the
@@ -3072,6 +3143,13 @@ impl Compiler {
             // operand rather than being looked up at run time — and the error
             // is raised where the key and the receiver are both still in hand,
             // which a compiler-side check after the Bool could not manage.
+            UnOp::Delete if self.strict && matches!(e, Expr::Ident(_)) => {
+                // 13.5.1.1: `delete x` on a plain name is an early error in
+                // strict code, whatever `x` is bound to.
+                return Err(
+                    "SyntaxError: Delete of an unqualified identifier in strict mode.".to_string(),
+                );
+            }
             UnOp::Delete => match e {
                 Expr::Member {
                     object, property, ..

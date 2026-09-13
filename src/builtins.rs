@@ -1380,6 +1380,24 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
     // Which prototype owns the name is decided by the same helper the `in`
     // operator uses, so the two cannot drift, and the result is the SHARED
     // intrinsic rather than a per-read thunk.
+    // `arguments.callee` (and `.caller`) is a POISON PILL in strict code — the
+    // accessor throws rather than answering, which is how a strict function
+    // keeps its caller unreachable. It read back as `undefined` here, which a
+    // feature probe reads as "not supported" rather than "forbidden".
+    // Measured: on an ARGUMENTS object only `callee` is poisoned (`caller` is
+    // simply absent and reads `undefined`); on a strict FUNCTION both `caller`
+    // and `arguments` are.
+    let poisoned = (name == "callee" && is_arguments(recv))
+        || (matches!(name, "caller" | "arguments")
+            && matches!(
+                with_host(|h| h.kind_of(recv)),
+                Some(ObjKind::Func) | Some(ObjKind::Class)
+            ));
+    if poisoned && with_host(|h| h.current_strict()) {
+        return Err(host::type_error(
+            "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+        ));
+    }
     if matches!(out, Value::Undef) && !name.starts_with('#') {
         if let Some(owner) = inherited_method_owner(recv, name) {
             let key = format!("@proto:{owner}:{name}");
@@ -5123,7 +5141,11 @@ pub fn eval_source(arg: Option<&Value>, direct: bool) -> Result<Value, String> {
         return Ok(v);
     }
     let src = with_host(|h| h.str_of(&v));
-    let chunk = crate::load_merged(crate::compile_completion(&src)?);
+    // A DIRECT eval inherits the caller's strictness (19.2.1.1 step 10), which
+    // decides both the early errors the COMPILE raises and the variable
+    // environment below. An INDIRECT one is global-scope sloppy code.
+    let caller_strict = direct && with_host(|h| h.current_strict());
+    let chunk = crate::load_merged(crate::compile_completion_strict(&src, caller_strict)?);
     if !direct {
         return host::run_chunk_in_global_scope(chunk);
     }
@@ -5132,10 +5154,7 @@ pub fn eval_source(arg: Option<&Value>, direct: bool) -> Result<Value, String> {
     // shares the caller's, which is the form that can inject a binding — and
     // sharing it unconditionally meant `eval('var x=1')` inside strict code
     // left `x` behind.
-    //
-    // Strict either because the CALLER is (the frame knows) or because the
-    // source says so itself.
-    let strict = with_host(|h| h.current_strict())
+    let strict = caller_strict
         || src.trim_start().starts_with("'use strict'")
         || src.trim_start().starts_with("\"use strict\"");
     if !strict {

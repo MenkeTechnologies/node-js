@@ -509,18 +509,29 @@ v26.7.0; every row marked **agrees** is now pinned by a test.
 | `require.main === module` | `true` | `false` | `false` | **`require.main` absent** |
 | top-level `this` | `module.exports` | `globalThis` | `globalThis` | agrees |
 | top-level `arguments` | the wrapper's 5 | *undefined* | *undefined* | **undefined at all three** |
-| `arguments.callee` in a function | the function | same | same | **`undefined`** |
+| `arguments.callee` in a SLOPPY function | the function | same | same | **`undefined`** (in strict code it throws, as node does) |
 | stack frame file | `file:L:C` | `[eval]:L:C` | `[stdin]:L:C` | **no `file:line:col`** |
 
 A row that used to sit in this table said node-js was **strict at all three**
-entry points. That was never true and is removed: by every testable strict-mode
-restriction node-js is SLOPPY, exactly as Node is. An implicit global assignment
-succeeds, `01` is a legal octal literal, duplicate parameter names are accepted,
-and a write to a frozen object is silently discarded — all four matching node.
-The one strict-SHAPED behavior was `this === undefined` in a plain call, which
-is its own gap (see the sloppy-mode section above) rather than a mode. `with`
-is rejected, but with a generic parse error, which is a parser gap and not a
-strict-mode rejection.
+entry points. That was never true and is removed: with no `'use strict'` the
+entry points are SLOPPY, exactly as Node is — an implicit global assignment
+succeeds, `012` is a legal octal literal worth 10, duplicate parameter names
+are accepted, and a write to a frozen object is silently discarded.
+
+A file that DOES say `'use strict'` is now strict (`examples/strictmode.js`):
+the early errors — `delete` of a plain name, a duplicate parameter, binding or
+assigning `eval`/`arguments` — and the runtime restrictions — a refused write
+throwing, `this` undefined in a plain call, `arguments.callee` and a strict
+function's `caller`/`arguments` throwing — all apply, and a DIRECT `eval`
+inherits them. The one strict-SHAPED behavior with no directive is
+`this === undefined` in a plain call, which is its own gap (see the sloppy-mode
+section above) rather than a mode. `with` is rejected, but with a generic parse
+error, which is a parser gap and not a strict-mode rejection.
+
+A legacy OCTAL literal is still accepted in strict code, where node raises
+`SyntaxError: Octal literals are not allowed in strict mode.` — the lexer runs
+over the whole file before anything knows whether the directive prologue makes
+it strict, so the rejection has nowhere to live yet.
 
 The remaining rows follow from one thing: node-js runs the entry
 source directly rather than through the CommonJS wrapper function.

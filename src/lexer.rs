@@ -468,6 +468,27 @@ impl Lexer {
                 }
             }
         }
+        // A LEGACY OCTAL literal: `0` followed by digit-run that is all 0-7 is
+        // base 8 (`012` is 10, not 12). A run containing an 8 or a 9 is the
+        // legacy DECIMAL form and stays base 10 (`08` is 8). Both are
+        // SyntaxErrors in strict code, which this lexer cannot see — recorded in
+        // BUGS.md. The value was simply read as decimal, so `012` was 12.
+        if self.peek() == Some('0') {
+            let mut n = 1;
+            while self.peek_at(n).is_some_and(|c| c.is_ascii_digit()) {
+                n += 1;
+            }
+            let run: String = (0..n).filter_map(|i| self.peek_at(i)).collect();
+            let terminated = !self
+                .peek_at(n)
+                .is_some_and(|c| matches!(c, '.' | 'e' | 'E' | 'n'));
+            if n > 1 && terminated && run.chars().all(|c| ('0'..='7').contains(&c)) {
+                self.pos += n;
+                let v = u64::from_str_radix(&run, 8).unwrap_or(0);
+                self.push(Tok::Num(v as f64));
+                return Ok(());
+            }
+        }
         let mut s = String::new();
         while let Some(c) = self.peek() {
             match c {

@@ -1781,6 +1781,36 @@ from      arr:1,arr:2,str:ab,set:s,gen:g1,gen:g2
 statics   function function function
 in-finish false
 ended     false
+==== strictmode.js ====
+delete-name   SyntaxError: Delete of an unqualified identifier in strict mode.
+delete-param  SyntaxError: Delete of an unqualified identifier in strict mode.
+delete-prop   [true,true]
+dup-param     SyntaxError: Duplicate parameter name not allowed in this context
+dup-arrow     SyntaxError: Duplicate parameter name not allowed in this context
+dup-pattern   SyntaxError: Duplicate parameter name not allowed in this context
+reserved "eval = 1"                SyntaxError: Unexpected eval or arguments in strict mode
+reserved "arguments = 1"           SyntaxError: Unexpected eval or arguments in strict mode
+reserved "var eval = 1"            SyntaxError: Unexpected eval or arguments in strict mode
+reserved "let arguments = 1"       SyntaxError: Unexpected eval or arguments in strict mode
+reserved "function f(eval) {}"     SyntaxError: Unexpected eval or arguments in strict mode
+reserved "eval++"                  SyntaxError: Unexpected eval or arguments in strict mode
+reserved "--arguments"             SyntaxError: Unexpected eval or arguments in strict mode
+reserved "({ a: eval } = {})"      SyntaxError: Invalid destructuring assignment target
+as-property   [1,2]
+read          ["function","object"]
+callee        TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them
+args-caller   undefined
+fn-caller     TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them
+fn-arguments  TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them
+indices       [7,1]
+this          true
+detached      [true,true]
+frozen        TypeError: Cannot assign to read only property 'a' of object '#<Object>'
+readonly-prot TypeError: Cannot assign to read only property 'a' of object '#<Object>'
+getter-only   TypeError: Cannot set property g of #<Object> which has only a getter
+non-extensibl TypeError: Cannot add property x, object is not extensible
+undeclared    ReferenceError: undeclaredNameHere is not defined
+octal         [10,10,8,9,888,0,7,511,0.5,0,3]
 ==== strings.js ====
 HELLO, WORLD hello, world 12
 World World Hello d
