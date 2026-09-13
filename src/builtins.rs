@@ -7464,14 +7464,18 @@ fn object_from_entries(args: Vec<Value>) -> Result<Value, String> {
 /// object. Keys are `ToPropertyKey(cb(item, index))`; values are arrays of the
 /// members mapped to that key, in first-seen key order.
 fn object_group_by(args: Vec<Value>) -> Result<Value, String> {
-    let items = host::iter_all(&arg0(&args))?;
+    group_by_check_iterable(&arg0(&args), "Object.groupBy")?;
     let cb = args.get(1).cloned().unwrap_or(Value::Undef);
     let mut groups: IndexMap<String, Vec<Value>> = IndexMap::new();
-    for (i, item) in items.into_iter().enumerate() {
+    // Stepped, not drained: the callback runs per element, so a throwing one
+    // stops at the first. Draining first meant an infinite source never reached
+    // the callback at all and the call HUNG.
+    host::iter_for_each(&arg0(&args), |item, i| {
         let key_v = host::invoke(&cb, vec![item.clone(), Value::Float(i as f64)], None)?;
         let key = with_host(|h| h.property_key(&key_v));
         groups.entry(key).or_default().push(item);
-    }
+        Ok(())
+    })?;
     let props: IndexMap<String, Value> = with_host(|h| {
         groups
             .into_iter()
@@ -7487,10 +7491,47 @@ fn object_group_by(args: Vec<Value>) -> Result<Value, String> {
     Ok(obj)
 }
 
+/// The `groupBy` family words a non-iterable argument its OWN way — a third
+/// vocabulary, alongside the array-literal spread's and the call spread's:
+///
+/// ```text
+/// null / undefined   "<Name> called on null or undefined"
+/// anything else      "<typeof> [value ]is not iterable (cannot read property
+///                     Symbol(Symbol.iterator))"
+/// ```
+///
+/// A plain object, a symbol and a bigint name only their TYPE; a number, a
+/// string and a boolean name the value too.
+fn group_by_check_iterable(v: &Value, name: &str) -> Result<(), String> {
+    if with_host(|h| h.is_nullish(v)) {
+        return Err(host::type_error(&format!(
+            "{name} called on null or undefined"
+        )));
+    }
+    // Asked WITHOUT consuming anything: `iter_all` would drain the iterator
+    // here, so the stepping loop below then saw an exhausted one — the finite
+    // case returned an empty group and the infinite case was back to hanging.
+    let iter_fn = get_property(v, "@@iterator").unwrap_or(Value::Undef);
+    if with_host(|h| host::is_callable(h, &iter_fn)) {
+        return Ok(());
+    }
+    let shown = with_host(|h| {
+        let kind = h.type_of(v);
+        match kind {
+            "object" | "symbol" | "bigint" => kind.to_string(),
+            "string" => format!("string \"{}\"", h.str_of(v)),
+            _ => format!("{kind} {}", h.str_of(v)),
+        }
+    });
+    Err(host::type_error(&format!(
+        "{shown} is not iterable (cannot read property Symbol(Symbol.iterator))"
+    )))
+}
+
 /// `Map.groupBy(items, cb)` — like `Object.groupBy` but returns a `Map` keyed by
 /// the raw `cb(item, index)` value under SameValueZero (so object/any keys work).
 fn map_group_by(args: Vec<Value>) -> Result<Value, String> {
-    let items = host::iter_all(&arg0(&args))?;
+    group_by_check_iterable(&arg0(&args), "Map.groupBy")?;
     let cb = args.get(1).cloned().unwrap_or(Value::Undef);
     let m = with_host(|h| {
         h.alloc(JsObj::Map {
@@ -7498,7 +7539,8 @@ fn map_group_by(args: Vec<Value>) -> Result<Value, String> {
             weak: false,
         })
     });
-    for (i, item) in items.into_iter().enumerate() {
+    // Stepped for the same reason `Object.groupBy` is.
+    host::iter_for_each(&arg0(&args), |item, i| {
         let key_v = host::invoke(&cb, vec![item.clone(), Value::Float(i as f64)], None)?;
         let existing = map_method(&m, "get", vec![key_v.clone()])?;
         if matches!(existing, Value::Undef) {
@@ -7511,7 +7553,8 @@ fn map_group_by(args: Vec<Value>) -> Result<Value, String> {
                 }
             });
         }
-    }
+        Ok(())
+    })?;
     Ok(m)
 }
 

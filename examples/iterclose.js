@@ -42,6 +42,21 @@ for (const [name, make] of [["all", () => Promise.all(badIterable)],
 }
 Promise.all([Promise.resolve(1), 2]).then((v) => console.log("all-ok        ", JSON.stringify(v)));
 
+// `Object.groupBy` / `Map.groupBy` drained too, so a throwing callback over an
+// infinite source hung the same way. They also word a NON-ITERABLE argument
+// their own way — a third vocabulary alongside the two spread forms.
+show("group-close  ", () => { const { it, log } = endless(); try { Object.groupBy(it, () => { throw new Error("g"); }); } catch (e) { return [e.message, log]; } });
+show("group-mclose ", () => { const { it, log } = endless(); try { Map.groupBy(it, () => { throw new Error("g"); }); } catch (e) { return [e.message, log]; } });
+show("group-normal ", () => Object.groupBy([1, 2, 3, 4], (v) => (v % 2 ? "odd" : "even")));
+show("group-map    ", () => [...Map.groupBy([1, 2, 3], (v) => v % 2)]);
+show("group-proto  ", () => Object.getPrototypeOf(Object.groupBy([1], () => "k")));
+show("group-index  ", () => Object.groupBy(["a", "b"], (v, i) => i));
+show("group-string ", () => Object.groupBy("ab", () => "k"));
+for (const [name, bad] of [["object", {}], ["number", 5], ["null", null],
+  ["undefined", undefined], ["boolean", true], ["symbol", Symbol("s")], ["bigint", 1n]]) {
+  show(("group-" + name).padEnd(14), () => Object.groupBy(bad, () => "k"));
+}
+
 // IteratorClose on the paths that already had it, pinned so they stay.
 const closing = () => { const log = []; return { log, it: { [Symbol.iterator]() { return this; }, next() { log.push("next"); return { value: 1, done: false }; }, return() { log.push("return"); return { done: true }; } } }; };
 show("break        ", () => { const { it, log } = closing(); for (const v of it) break; return log; });

@@ -1220,6 +1220,20 @@ map-pairs     [["k","v"]]
 map-arraylike [["k","v"]]
 map-short     [[null,null]]
 set-values    [1,2]
+group-close   ["g",["next","return"]]
+group-mclose  ["g",["next","return"]]
+group-normal  {"odd":[1,3],"even":[2,4]}
+group-map     [[1,[1,3]],[0,[2]]]
+group-proto   null
+group-index   {"0":["a"],"1":["b"]}
+group-string  {"k":["a","b"]}
+group-object   TypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))
+group-number   TypeError: number 5 is not iterable (cannot read property Symbol(Symbol.iterator))
+group-null     TypeError: Object.groupBy called on null or undefined
+group-undefined TypeError: Object.groupBy called on null or undefined
+group-boolean  TypeError: boolean true is not iterable (cannot read property Symbol(Symbol.iterator))
+group-symbol   TypeError: symbol is not iterable (cannot read property Symbol(Symbol.iterator))
+group-bigint   TypeError: bigint is not iterable (cannot read property Symbol(Symbol.iterator))
 break         ["next","return"]
 return        ["next","return"]
 destructure   [1,["next","return"]]
