@@ -3266,7 +3266,12 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
             // hidden `@@…` slots (copying `@@native` used to turn `{...buf}`
             // into something that still claimed to be a Buffer) and never a
             // property a descriptor marked non-enumerable.
-            let entries = host::own_enum_entries_deep(&src);
+            // A getter that throws during spread propagates as a thrown value,
+            // which in the VM means aborting the frame.
+            let entries = match host::own_enum_entries_deep(&src) {
+                Ok(e) => e,
+                Err(e) => return abort(vm, e),
+            };
             for (k, v) in entries {
                 props.insert(k, v);
             }
@@ -6522,7 +6527,7 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
             .into_iter()
             .map(|k| (k, Value::Undef))
             .collect(),
-        _ => host::own_enum_entries_deep(&v),
+        _ => host::own_enum_entries_deep(&v)?,
     };
     Ok(with_host(|h| {
         let out: Vec<Value> = entries
@@ -6548,7 +6553,7 @@ fn object_assign(args: Vec<Value>) -> Result<Value, String> {
     for src in args.iter().skip(1) {
         // `Object.assign` copies own *enumerable* properties, running any getter
         // — symbol-keyed ones included (7.3.25).
-        let entries = host::own_enum_entries_deep(src);
+        let entries = host::own_enum_entries_deep(src)?;
         let syms = with_host(|h| h.own_symbol_entries(src));
         // A plain object target is filled in place (one borrow, then a single
         // re-canonicalization of the integer-index keys).
@@ -6892,7 +6897,7 @@ fn json_walk_children(
             });
             if has_accessor {
                 let mut next: IndexMap<String, Value> = IndexMap::new();
-                for (k, val) in host::own_enum_entries_deep(v) {
+                for (k, val) in host::own_enum_entries_deep(v)? {
                     let nv = if json_visible_key(&k) {
                         apply_to_json(v, &k, &val, path, rep)?
                     } else {
@@ -8243,6 +8248,25 @@ fn array_method_on(
 ) -> Result<Value, String> {
     match name {
         "push" => {
+            // 23.1.3.23 step 4 defines each new element through
+            // `CreateDataPropertyOrThrow`, so a NON-EXTENSIBLE array refuses it:
+            // `Object.seal(a)` / `preventExtensions(a)` then `a.push(x)` is a
+            // TypeError. The elements were appended to the backing vector
+            // regardless, so sealing an array did not seal it.
+            if !args.is_empty() && !with_host(|h| h.is_extensible(recv)) {
+                let at = array_len(recv);
+                return Err(host::type_error(&format!(
+                    "Cannot add property {at}, object is not extensible"
+                )));
+            }
+            // Step 5 then SETS `length`, so a non-writable one refuses the push
+            // too — `defineProperty(a, 'length', {writable: false})` makes an
+            // array append-proof without sealing it.
+            if !args.is_empty() && !with_host(|h| h.prop_attrs(recv, "length").writable) {
+                return Err(host::type_error(
+                    "Cannot assign to read only property 'length' of object '[object Array]'",
+                ));
+            }
             // `push` returns the new length; take it from the same mutable
             // borrow rather than copying the array back out to count it.
             let len = with_host(|h| {
@@ -11238,6 +11262,27 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) -> Result<(), String> 
             .set
             .clone()
             .unwrap_or_else(|| cur.as_ref().and_then(|c| c.set.clone()));
+        // An ACCESSOR at an index past the end still extends the array
+        // (10.4.2.1): `Object.defineProperty([1], '4', {get})` gives
+        // `length === 5` with holes between. Only the DATA path grew it, so
+        // the accessor landed in the side table while `length` stayed put —
+        // and with it out of range, `Object.keys` and `JSON.stringify` never
+        // saw the index at all.
+        if let (Some(ObjKind::Array), Ok(i)) = (with_host(|h| h.kind_of(obj)), key.parse::<usize>())
+        {
+            with_host(|h| {
+                let old_len = match h.get(obj) {
+                    Some(JsObj::Array(items)) => items.len(),
+                    _ => 0,
+                };
+                if i >= old_len {
+                    if let Some(JsObj::Array(items)) = h.get_mut(obj) {
+                        items.resize(i + 1, Value::Undef);
+                    }
+                    h.mark_hole_range(obj, old_len..i + 1);
+                }
+            });
+        }
         with_host(|h| h.set_accessor(obj, key, get, set));
         return Ok(());
     }

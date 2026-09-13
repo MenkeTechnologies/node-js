@@ -164,3 +164,55 @@ console.log("sloppy  ", tryWrite(() => { iced.a = 2; }), tryWrite(() => { iced.z
   class Priv { get #p() { return 3; } set #p(x) { this.seen = x; } write(x) { this.#p = x; return this.seen; } }
   console.log("setters ", sink.got, sink.v, new Priv().write(4));
 })();
+
+{
+// A getter that THROWS has to propagate. Five paths read properties through one
+// infallible helper, and every one of them swallowed the exception and reported
+// the property as absent — `JSON.stringify` produced `{}` for an object whose
+// only getter threw, which silently loses data rather than failing.
+const boom = () => ({ get a() { throw new Error("boom"); } });
+const caught = (f) => { try { f(); return "no-throw"; } catch (e) { return e.message; } };
+console.log("entries ", caught(() => Object.entries(boom())), caught(() => Object.values(boom())));
+console.log("copy    ", caught(() => Object.assign({}, boom())), caught(() => ({ ...boom() })));
+console.log("json    ", caught(() => JSON.stringify(boom())));
+// `Object.keys` does NOT read values, so it still succeeds.
+console.log("keys    ", Object.keys(boom()).join(","));
+// A getter that returns normally is still run exactly once, in declaration order.
+const order = [];
+const probed = { get a() { order.push("a"); return 1; }, get b() { order.push("b"); return 2; } };
+console.log("runs    ", JSON.stringify(probed), order.join(","));
+
+// 10.4.2.1: defining an ACCESSOR at an index past the end extends the array,
+// exactly as defining a data property there does. Only the data path grew it,
+// so the accessor sat in the side table with `length` unchanged — and being out
+// of range, `Object.keys` and `JSON.stringify` never saw the index.
+const grown = [1];
+Object.defineProperty(grown, "1", { get() { return 9; }, enumerable: true, configurable: true });
+console.log("grow    ", grown.length, grown[1], JSON.stringify(grown), Object.keys(grown).join(","));
+const sparse = [1];
+Object.defineProperty(sparse, "4", { get() { return 9; }, enumerable: true, configurable: true });
+console.log("sparse  ", sparse.length, JSON.stringify(sparse));
+// An in-range index is replaced rather than appended.
+const replaced = [1, 2];
+Object.defineProperty(replaced, "1", { get() { return 9; }, enumerable: true, configurable: true });
+console.log("replace ", replaced.length, replaced[1], JSON.stringify(replaced));
+
+// 23.1.3.23: `push` defines each element through `CreateDataPropertyOrThrow` and
+// then SETS `length`, so a non-extensible array refuses it and so does one whose
+// `length` is non-writable. Both appended to the backing vector regardless, so
+// sealing an array did not seal it.
+const sealed = [1];
+Object.seal(sealed);
+console.log("sealed  ", caught(() => sealed.push(2)) !== "no-throw", sealed.length,
+  Object.isSealed(sealed), Object.isExtensible(sealed));
+const prevented = [1];
+Object.preventExtensions(prevented);
+console.log("prevent ", caught(() => prevented.push(2)) !== "no-throw", prevented.length);
+const pinned = [1, 2];
+Object.defineProperty(pinned, "length", { writable: false });
+console.log("pinned  ", caught(() => pinned.push(3)) !== "no-throw", pinned.length);
+// Writing an EXISTING index of a sealed array still works — sealing forbids
+// adding and removing, not assigning.
+sealed[0] = 9;
+console.log("write   ", sealed[0], [1, 2].push(3));
+}

@@ -1215,6 +1215,18 @@ strict   TypeError TypeError TypeError TypeError
 strict2  TypeError TypeError
 sealed   silent 2 TypeError
 setters  written G 4
+entries  boom boom
+copy     boom boom
+json     boom
+keys     a
+runs     {"a":1,"b":2} a,b
+grow     2 9 [1,9] 0,1
+sparse   5 [1,null,null,null,9]
+replace  2 9 [1,9]
+sealed   true 1 true false
+prevent  true 1
+pinned   true 2
+write    9 3
 ==== protoborrow.js ====
 string   x b
 string2  AB bc

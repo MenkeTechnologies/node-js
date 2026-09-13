@@ -5722,14 +5722,14 @@ impl JsHost {
 /// accessor's getter invoked — the observable shape `Object.values`,
 /// `Object.entries`, object spread and `JSON.stringify` all need. Must be called
 /// outside a `with_host` borrow because a getter re-enters the host.
-pub fn own_enum_entries_deep(v: &Value) -> Vec<(String, Value)> {
+pub fn own_enum_entries_deep(v: &Value) -> Result<Vec<(String, Value)>, String> {
     // A Proxy has no property map at all: its own enumerable entries come from
     // the `ownKeys` + `getOwnPropertyDescriptor` + `get` traps. A trap that
     // throws surfaces as an empty result here because this signature is
     // infallible; the callers that MUST propagate a trap throw (`Object.keys`
     // and friends) go through `builtins::object_keys`, which does.
     if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
-        return crate::proxy::own_enum_entries(v).unwrap_or_default();
+        return crate::proxy::own_enum_entries(v);
     }
     // A builtin namespace (`require('path')`, `Buffer`) has no property map at
     // all: its members are resolved on demand by `namespace_property`, which
@@ -5744,13 +5744,13 @@ pub fn own_enum_entries_deep(v: &Value) -> Vec<(String, Value)> {
         Some(JsObj::Builtin(ns)) => Some(ns.clone()),
         _ => None,
     }) {
-        return with_host(|h| h.own_enum_key_names(v))
+        return Ok(with_host(|h| h.own_enum_key_names(v))
             .into_iter()
             .map(|k| {
                 let val = crate::builtins::namespace_property(&ns, &k);
                 (k, val)
             })
-            .collect();
+            .collect());
     }
     // A string primitive's own entries are its code units. `own_enum_entries`
     // cannot build them: allocating the one-character string for each index
@@ -5760,11 +5760,11 @@ pub fn own_enum_entries_deep(v: &Value) -> Vec<(String, Value)> {
         _ => None,
     }) {
         let units = crate::utf16::Units::of(&sv);
-        return with_host(|h| {
+        return Ok(with_host(|h| {
             (0..units.len())
                 .filter_map(|i| units.unit_str(i).map(|c| (i.to_string(), h.new_str(c))))
                 .collect()
-        });
+        }));
     }
     let accessor_keys: Vec<String> = with_host(|h| {
         h.own_accessor_keys(v)
@@ -5773,17 +5773,19 @@ pub fn own_enum_entries_deep(v: &Value) -> Vec<(String, Value)> {
             .collect()
     });
     let entries = with_host(|h| h.own_enum_entries(v));
-    entries
-        .into_iter()
-        .map(|(k, val)| {
-            if accessor_keys.contains(&k) {
-                let got = get_prop_chain(v, &k).unwrap_or(Value::Undef);
-                (k, got)
-            } else {
-                (k, val)
-            }
-        })
-        .collect()
+    // A getter that THROWS propagates: `Object.entries`, `Object.assign`,
+    // object spread and `JSON.stringify` all read through here, and every one
+    // of them swallowed the exception and reported the property as absent (or
+    // as `null`) instead.
+    let mut out = Vec::with_capacity(entries.len());
+    for (k, val) in entries {
+        if accessor_keys.contains(&k) {
+            out.push((k.clone(), get_prop_chain(v, &k)?));
+        } else {
+            out.push((k, val));
+        }
+    }
+    Ok(out)
 }
 
 // ── function invocation ──────────────────────────────────────────────────────
