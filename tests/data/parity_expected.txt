@@ -1785,6 +1785,57 @@ callback global global
 receiver object object
 strict   undefined
 arrow    object
+==== uint8base64.js ====
+shape      function function function function function function
+arities    1 1 0 0 1 1
+uint8-only undefined undefined undefined
+own-names  ["constructor","BYTES_PER_ELEMENT","toBase64","setFromBase64","toHex","setFromHex"]
+toBase64   "SGVsbG//AA==" "SGVsbG__AA=="
+omitPad    "AQ" "AQI" "AQID"
+toHex      "48656c6c6fff00" "" ""
+from       72,101,108,108,111 72,101,108,108,111,255,0 72,101,108,108,111
+setFrom    {"read":4,"written":3} 72,101,108,0
+setFrom-big {"read":8,"written":5} 72,101,108,108,111,0,0,0,0
+setFromHex {"read":4,"written":2} 72,101,0
+b64 "!!" SyntaxError: Found a character that cannot be part of a valid base64 string.
+b64 "SGVsbG8" 72,101,108,108,111
+b64 "S" SyntaxError: The base64 input terminates with a single character, excluding padding (=).
+b64 "SGV=sbG8=" SyntaxError: Found a character that cannot be part of a valid base64 string.
+b64 "" 
+b64 "=" SyntaxError: Found a character that cannot be part of a valid base64 string.
+b64 "AA===" SyntaxError: Found a character that cannot be part of a valid base64 string.
+b64 "A===" SyntaxError: Found a character that cannot be part of a valid base64 string.
+b64 "SGVsbG8=x" SyntaxError: Found a character that cannot be part of a valid base64 string.
+b64 "SG Vs" 72,101,108
+b64 "SGVsbG8==" SyntaxError: Found a character that cannot be part of a valid base64 string.
+b64 "QQ==" 65
+b64 "QQ=" SyntaxError: Found a character that cannot be part of a valid base64 string.
+b64 "__8=" SyntaxError: Found a character that cannot be part of a valid base64 string.
+lch loose unpadded 72,101,108,108,111
+lch loose padded   65
+lch strict unpadded SyntaxError: The base64 input terminates with a single character, excluding padding (=).
+lch strict padded   65
+lch stop-before-partial unpadded 72,101,108
+lch stop-before-partial padded   65
+lch bogus unpadded TypeError: invalid option bogus
+lch bogus padded   TypeError: invalid option bogus
+hex "0" SyntaxError: Input string must contain hex characters in even length
+hex "zz" SyntaxError: Input string must contain hex characters in even length
+hex "gg" SyntaxError: Input string must contain hex characters in even length
+hex "" 
+hex "0011" 0,17
+hex "0x11" SyntaxError: Input string must contain hex characters in even length
+hex " 00" SyntaxError: Input string must contain hex characters in even length
+hex "00 " SyntaxError: Input string must contain hex characters in even length
+nonstring  TypeError: input argument must be a string
+nonstring2 TypeError: input argument must be a string
+nonstring3 TypeError: input argument must be a string
+badAlpha   TypeError: invalid option x
+nullOpts   TypeError: invalid_argument
+wrongView  TypeError: Method Uint8Array.prototype.toBase64 called on incompatible receiver undefined
+array      TypeError: Method Uint8Array.prototype.toHex called on incompatible receiver [object Array]
+object     TypeError: Method Uint8Array.prototype.toHex called on incompatible receiver #<Object>
+roundtrip  true true
 ==== urlmutation.js ====
 pathname /p https://h.com/p
 all      https://h.com:99/p?a=1#z h.com:99 https://h.com:99

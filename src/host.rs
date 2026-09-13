@@ -8308,9 +8308,13 @@ impl JsHost {
             let methods: &[&str] = match ctor {
                 "Buffer" => crate::stdlib::buffer::INSTANCE_METHODS,
                 "TypedArray" => crate::stdlib::typedarray::PROTOTYPE_METHODS,
-                // A kind's prototype owns no methods; it inherits them from the
-                // intermediate above. It does own `BYTES_PER_ELEMENT`, which is
-                // per-kind and which Node really keeps there (measured:
+                // `Uint8Array` alone owns the base64/hex pair — no other view
+                // has them, which is the whole reason they cannot live on the
+                // shared `%TypedArray%` prototype above.
+                "Uint8Array" => crate::stdlib::typedarray::UINT8_PROTOTYPE_METHODS,
+                // Every other kind's prototype owns no methods; it inherits them
+                // from the intermediate above. It does own `BYTES_PER_ELEMENT`,
+                // which is per-kind and which Node really keeps there (measured:
                 // `Uint8Array.prototype.hasOwnProperty('BYTES_PER_ELEMENT')`).
                 _ => &[],
             };

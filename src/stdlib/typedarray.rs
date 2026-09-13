@@ -19,6 +19,23 @@ use indexmap::IndexMap;
 
 pub const STATIC_METHODS: &[&str] = &["from", "of", "isView"];
 
+/// `Uint8Array`'s statics — the shared three plus the base64/hex pair, which no
+/// other view has.
+pub const UINT8_STATIC_METHODS: &[&str] = &["from", "of", "isView", "fromBase64", "fromHex"];
+
+/// The four base64/hex methods `Uint8Array.prototype` owns on its own.
+/// In the engine's own order, which `Object.getOwnPropertyNames` reports.
+pub const UINT8_PROTOTYPE_METHODS: &[&str] = &["toBase64", "setFromBase64", "toHex", "setFromHex"];
+
+/// The statics `<kind>` advertises.
+pub fn static_methods(kind: &str) -> &'static [&'static str] {
+    if kind == "Uint8Array" {
+        UINT8_STATIC_METHODS
+    } else {
+        STATIC_METHODS
+    }
+}
+
 /// The methods installed on the real `Uint8Array.prototype` object (as
 /// `@proto:Uint8Array:<m>` thunks), so `Uint8Array.prototype.slice.call(x)`
 /// keeps working now that the prototype is an object rather than a `Builtin`
@@ -635,8 +652,191 @@ fn build_elems(kind: &str, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-/// `Uint8Array.from(iterable[, mapFn])` / `Uint8Array.of(...items)`.
+// ── Uint8Array base64/hex (the "Uint8Array to/from base64" proposal) ──────────
+
+/// How much of a trailing partial base64 chunk `fromBase64`/`setFromBase64`
+/// accept. The default is `loose`, which is why an UNPADDED string decodes.
+#[derive(Clone, Copy, PartialEq)]
+enum LastChunk {
+    Loose,
+    Strict,
+    StopBeforePartial,
+}
+
+/// Read the `{ alphabet, lastChunkHandling }` options object. Both reject an
+/// unknown value with node's `invalid option <v>`, and a non-object that is not
+/// `undefined` is `invalid_argument` — not the usual "must be an object".
+fn base64_options(opt: Option<&Value>) -> Result<(bool, LastChunk), String> {
+    let Some(o) = opt.filter(|v| !matches!(v, Value::Undef)) else {
+        return Ok((false, LastChunk::Loose));
+    };
+    if !with_host(|h| matches!(h.get(o), Some(JsObj::Object(_)))) {
+        return Err(crate::host::type_error("invalid_argument"));
+    }
+    let read = |k: &str| {
+        with_host(|h| match h.get(o) {
+            Some(JsObj::Object(p)) => p.get(k).filter(|v| !matches!(v, Value::Undef)).cloned(),
+            _ => None,
+        })
+    };
+    let url = match read("alphabet") {
+        None => false,
+        Some(v) => match with_host(|h| h.str_of(&v)).as_str() {
+            "base64" => false,
+            "base64url" => true,
+            other => return Err(crate::host::type_error(&format!("invalid option {other}"))),
+        },
+    };
+    let last = match read("lastChunkHandling") {
+        None => LastChunk::Loose,
+        Some(v) => match with_host(|h| h.str_of(&v)).as_str() {
+            "loose" => LastChunk::Loose,
+            "strict" => LastChunk::Strict,
+            "stop-before-partial" => LastChunk::StopBeforePartial,
+            other => return Err(crate::host::type_error(&format!("invalid option {other}"))),
+        },
+    };
+    Ok((url, last))
+}
+
+const B64_BAD: &str =
+    "SyntaxError: Found a character that cannot be part of a valid base64 string.";
+const B64_SINGLE: &str =
+    "SyntaxError: The base64 input terminates with a single character, excluding padding (=).";
+
+/// Decode base64 STRICTLY, reporting how many characters were consumed.
+///
+/// The lenient decoder behind `atob` cannot serve here: this has to reject a
+/// stray `=`, a wrong pad count and a character outside the selected alphabet,
+/// and `stop-before-partial` needs the consumed count rather than just the
+/// bytes. ASCII whitespace is skipped, which node also allows.
+fn decode_base64_strict(s: &str, url: bool, last: LastChunk) -> Result<(Vec<u8>, usize), String> {
+    let value = |c: char| -> Option<u32> {
+        let table = if url {
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        } else {
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        };
+        table.find(c).map(|i| i as u32)
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut chunk: Vec<u32> = Vec::new();
+    let mut consumed = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '=' {
+            // Padding closes the chunk, and only a 2- or 3-character chunk may
+            // be padded: `QQ=` and `AA===` are both errors.
+            let pads = chars[i..].iter().filter(|c| **c == '=').count();
+            let rest_ok = chars[i..]
+                .iter()
+                .all(|c| *c == '=' || c.is_ascii_whitespace());
+            let want = 4 - chunk.len();
+            if !rest_ok || chunk.len() < 2 || pads != want {
+                return Err(B64_BAD.into());
+            }
+            out.extend(flush_base64_chunk(&chunk));
+            return Ok((out, chars.len()));
+        }
+        let Some(v) = value(c) else {
+            return Err(B64_BAD.into());
+        };
+        chunk.push(v);
+        i += 1;
+        if chunk.len() == 4 {
+            out.extend(flush_base64_chunk(&chunk));
+            chunk.clear();
+            consumed = i;
+        }
+    }
+    match chunk.len() {
+        0 => Ok((out, consumed)),
+        // A single leftover character encodes nothing at all.
+        1 if last != LastChunk::StopBeforePartial => Err(B64_SINGLE.into()),
+        _ if last == LastChunk::StopBeforePartial => Ok((out, consumed)),
+        1 => Ok((out, consumed)),
+        _ if last == LastChunk::Strict => Err(B64_SINGLE.into()),
+        _ => {
+            out.extend(flush_base64_chunk(&chunk));
+            Ok((out, chars.len()))
+        }
+    }
+}
+
+/// The 1-3 bytes a base64 chunk of 2, 3 or 4 sextets encodes.
+fn flush_base64_chunk(chunk: &[u32]) -> Vec<u8> {
+    let mut acc = 0u32;
+    for v in chunk {
+        acc = (acc << 6) | v;
+    }
+    let bytes = chunk.len() - 1;
+    acc <<= 6 * (4 - chunk.len());
+    let all = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
+    all[..bytes].to_vec()
+}
+
+const HEX_BAD: &str = "SyntaxError: Input string must contain hex characters in even length";
+
+/// Decode hex STRICTLY. Node reports the same message for an odd length and for
+/// a non-hex character, so `"gg"` and `"0"` fail identically.
+fn decode_hex_strict(s: &str) -> Result<Vec<u8>, String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() % 2 != 0 || !chars.iter().all(|c| c.is_ascii_hexdigit()) {
+        return Err(HEX_BAD.into());
+    }
+    Ok(chars
+        .chunks(2)
+        .map(|p| {
+            let hi = p[0].to_digit(16).expect("checked");
+            let lo = p[1].to_digit(16).expect("checked");
+            (hi * 16 + lo) as u8
+        })
+        .collect())
+}
+
+/// The string argument these six all take, rejecting anything else the way node
+/// does rather than coercing it.
+fn base64_input(args: &[Value]) -> Result<String, String> {
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    let is_str = matches!(v, Value::Str(_))
+        || with_host(|h| matches!(h.get(&v), Some(crate::host::JsObj::Str(_))));
+    if !is_str {
+        return Err(crate::host::type_error("input argument must be a string"));
+    }
+    Ok(with_host(|h| h.str_of(&v)))
+}
+
+/// `Uint8Array.fromBase64` / `Uint8Array.fromHex`.
+fn from_base64_static(method: &str, args: &[Value]) -> Result<Value, String> {
+    let s = base64_input(args)?;
+    let bytes = if method == "fromHex" {
+        decode_hex_strict(&s)?
+    } else {
+        let (url, last) = base64_options(args.get(1))?;
+        decode_base64_strict(&s, url, last)?.0
+    };
+    Ok(make(
+        "Uint8Array",
+        bytes.iter().map(|b| Value::Float(*b as f64)).collect(),
+    ))
+}
+
+/// `Uint8Array.from(iterable[, mapFn])` / `Uint8Array.of(...items)`, and the
+/// base64/hex statics.
 pub fn static_call(kind: &str, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    // The base64/hex statics are on `Uint8Array` ONLY — no other view has them.
+    if matches!(method, "fromBase64" | "fromHex") {
+        if kind != "Uint8Array" {
+            return None;
+        }
+        return Some(from_base64_static(method, args));
+    }
     Some(match method {
         "of" => args
             .iter()
@@ -1125,7 +1325,96 @@ fn rel_index(args: &[Value], idx: usize, len: usize, default: usize) -> usize {
 }
 
 /// Typed-array instance methods.
+/// `toBase64` / `toHex` / `setFromBase64` / `setFromHex` — the `Uint8Array`
+/// half of the base64/hex proposal. All four are brand-checked to `Uint8Array`:
+/// every other view, and an ordinary array, is an incompatible receiver.
+fn base64_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    let kind = kind_of(recv);
+    if kind != "Uint8Array" {
+        // Node renders a non-view receiver by its brand and a WRONG view as
+        // `undefined`, which reads oddly but is what it prints.
+        // A typed array of the WRONG element kind renders as `undefined` here,
+        // which reads oddly but is what node prints; every other receiver is
+        // rendered the way the other brand checks render one, and never reaches
+        // this arm — the dispatcher's guard catches it first.
+        return Err(crate::host::type_error(&format!(
+            "Method Uint8Array.prototype.{method} called on incompatible receiver undefined"
+        )));
+    }
+    let bytes: Vec<u8> = elem_values(recv)
+        .iter()
+        .map(|v| with_host(|h| h.to_number(v)) as u8)
+        .collect();
+    match method {
+        "toBase64" => {
+            let (url, _) = base64_options(args.first())?;
+            let omit = args
+                .first()
+                .filter(|v| !matches!(v, Value::Undef))
+                .map(|o| {
+                    with_host(|h| match h.get(o) {
+                        Some(JsObj::Object(p)) => {
+                            p.get("omitPadding").map(|v| h.truthy(v)).unwrap_or(false)
+                        }
+                        _ => false,
+                    })
+                })
+                .unwrap_or(false);
+            // The url alphabet only swaps the two characters — it does NOT drop
+            // the padding, which `to_base64url` does for the `atob` callers.
+            let mut s = super::to_base64(&bytes);
+            if url {
+                s = s.replace('+', "-").replace('/', "_");
+            }
+            if omit {
+                s = s.trim_end_matches('=').to_string();
+            }
+            Ok(with_host(|h| h.new_str(s)))
+        }
+        "toHex" => Ok(with_host(|h| h.new_str(super::to_hex(&bytes)))),
+        // `setFrom*` writes as much as FITS and reports how far it got, so a
+        // short target is not an error — it stops at the last whole chunk.
+        "setFromBase64" | "setFromHex" => {
+            let s = base64_input(args)?;
+            let (decoded, read) = if method == "setFromHex" {
+                let d = decode_hex_strict(&s)?;
+                let fits = d.len().min(bytes.len());
+                (d[..fits].to_vec(), fits * 2)
+            } else {
+                let (url, last) = base64_options(args.get(1))?;
+                // Decode only as much as the target can hold: whole 4-character
+                // chunks, plus the final partial one when it still fits.
+                let whole = (bytes.len() / 3) * 4;
+                let head: String = s.chars().take(whole).collect();
+                let (mut d, mut consumed) = decode_base64_strict(&head, url, last)?;
+                if d.len() < bytes.len() {
+                    let (full, full_read) = decode_base64_strict(&s, url, last)?;
+                    if full.len() <= bytes.len() {
+                        d = full;
+                        consumed = full_read;
+                    }
+                }
+                (d, consumed)
+            };
+            write_view_bytes(recv, 0, &decoded);
+            Ok(with_host(|h| {
+                let mut m = IndexMap::new();
+                m.insert("read".to_string(), Value::Float(read as f64));
+                m.insert("written".to_string(), Value::Float(decoded.len() as f64));
+                h.new_object(m)
+            }))
+        }
+        _ => unreachable!("caller gates the method name"),
+    }
+}
+
 pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    if matches!(
+        method,
+        "toBase64" | "toHex" | "setFromBase64" | "setFromHex"
+    ) {
+        return base64_instance_call(recv, method, args);
+    }
     let kind = kind_of(recv);
     // Elements travel as `Value`, not `f64`: a 64-bit view's are BigInts, and
     // rounding them through a double is exactly the loss those views exist to

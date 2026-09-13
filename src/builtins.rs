@@ -2588,6 +2588,15 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
                 no_side_effects_string(recv)
             )));
         }
+        // The four base64/hex methods brand themselves against `Uint8Array`
+        // specifically — a WRONG view is as incompatible as a plain object, and
+        // the generic guard here cannot tell those apart.
+        if crate::stdlib::typedarray::UINT8_PROTOTYPE_METHODS.contains(&method) {
+            return Err(host::type_error(&format!(
+                "Method Uint8Array.prototype.{method} called on incompatible receiver {}",
+                no_side_effects_string(recv)
+            )));
+        }
         if method != "toString" {
             return Err(host::type_error("this is not a typed array."));
         }
@@ -2756,7 +2765,7 @@ pub(crate) fn well_known_tag(h: &host::JsHost, v: &Value) -> Option<String> {
 /// type-test values they did not construct (`toString.call(x) ===
 /// '[object Uint8Array]'`). A `Buffer` reports `Uint8Array` because in Node it
 /// IS a `Uint8Array` subclass and inherits that `Symbol.toStringTag`.
-fn object_tag(h: &host::JsHost, v: &Value) -> String {
+pub(crate) fn object_tag(h: &host::JsHost, v: &Value) -> String {
     format!("[object {}]", object_brand(h, v))
 }
 

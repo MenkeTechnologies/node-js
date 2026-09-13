@@ -203,7 +203,7 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "Response" => fetch::RESPONSE_STATICS,
         "AbortSignal" => fetch::ABORT_SIGNAL_STATICS,
         "Iterator" => iterator::STATIC_METHODS,
-        n if typedarray::is_ctor(n) => typedarray::STATIC_METHODS,
+        n if typedarray::is_ctor(n) => typedarray::static_methods(n),
         "URL" => url::STATIC_METHODS,
         "url" => url::MODULE_METHODS,
         "net" => net::MODULE_METHODS,
