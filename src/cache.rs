@@ -109,6 +109,11 @@ struct CProg {
     /// [`crate::host::SiteTables`] for what silently degrades without them.
     #[serde(default)]
     sites: crate::host::SiteTables,
+    /// Whether the program's top level is strict. `#[serde(default)]` so a
+    /// shard written before this field existed still decodes — as sloppy,
+    /// which is what those entries were compiled as anyway.
+    #[serde(default)]
+    strict: bool,
 }
 
 /// The release this binary was built as, hashed into every cache key so a shard
@@ -351,6 +356,7 @@ pub fn load(src: &str) -> Option<Program> {
         main: cp.main,
         functions: cp.functions,
         tries: cp.tries,
+        strict: cp.strict,
     };
     // `Chunk::op_hash` is `#[serde(skip)]` in fusevm — it is a CACHE of the
     // hash of ops+constants, computed by `ChunkBuilder::build`, so every chunk
@@ -407,6 +413,7 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
         // Taken after the compile that produced `prog`, so the entry carries
         // what that compile registered.
         sites: crate::host::site_tables(),
+        strict: prog.strict,
     };
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
     let key = key_for(src);

@@ -1133,6 +1133,45 @@ Uint8Array(2) [
   [buffer]: ArrayBuffer { [byteLength]: 2 }
 ]
 /ab+c/gi { [lastIndex]: 0 }
+==== integrity.js ====
+reads-function   ["function","function","function","function","function","function"]
+reads-arrow      ["function","function","function","function","function","function"]
+reads-class      ["function","function","function","function","function","function"]
+reads-regexp     ["function","function","function","function","function","function"]
+reads-uint8      ["function","function","function","function","function","function"]
+reads-map        ["function","function","function","function","function","function"]
+reads-date       ["function","function","function","function","function","function"]
+reads-promise    ["function","function","function","function","function","function"]
+reads-error      ["function","function","function","function","function","function"]
+reads-symbol     ["function","function","function","function","function","function"]
+calls            true false [object Map] true false
+frozen-regexp   0
+frozen-static   1
+frozen-map-prop 1
+frozen-entries  2
+prevented       4
+sealed-add      undefined
+sealed-modify   2
+levels-object    [true,true,false]
+levels-array     [true,true,false]
+levels-function  [true,true,false]
+levels-regexp    [true,true,false]
+levels-map       [true,true,false]
+levels-promise   [true,true,false]
+levels-error     [true,true,false]
+levels-empty-view [true,true,false]
+levels-dataview  [true,true,false]
+view-freeze     TypeError: Cannot freeze array buffer views with elements
+buffer-freeze   TypeError: Cannot freeze array buffer views with elements
+view-seal       TypeError: Cannot seal array buffer views with elements
+Cannot assign to read only property 'a' of object '#<Object>'
+Cannot assign to read only property '0' of object '[object Array]'
+Cannot assign to read only property 'lastIndex' of object '[object RegExp]'
+Cannot add property x, object is not extensible
+Cannot add property x, object is not extensible
+Cannot assign to read only property 'message' of object 'Error: m'
+Cannot assign to read only property 'a' of object '#<Map>'
+Cannot assign to read only property 'a' of object '#<C>'
 ==== intrinsicprotos.js ====
 Object                [object Object] undefined
 Array                 [object Array] undefined

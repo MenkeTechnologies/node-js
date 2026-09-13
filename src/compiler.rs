@@ -23,6 +23,12 @@ pub struct Program {
     pub main: Chunk,
     pub functions: Vec<(String, FuncDef)>,
     pub tries: Vec<TryDef>,
+    /// Whether the program's own top level is strict (`'use strict'` as its
+    /// first statement). A FUNCTION carries its strictness in its `FuncDef`;
+    /// the top level had nowhere to put it, so the module frame stayed sloppy
+    /// and a refused write never threw there even though the compiler had
+    /// already emitted the strict ASSIGNMENT opcodes.
+    pub strict: bool,
 }
 
 /// Rebase every func-id and try-id reference so its ids sit above those already
@@ -320,6 +326,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
         main: c.finish_chunk(b),
         functions: c.functions,
         tries: c.tries,
+        strict: c.strict,
     })
 }
 
@@ -349,6 +356,7 @@ pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String
         main: c.finish_chunk(b),
         functions: c.functions,
         tries: c.tries,
+        strict: c.strict,
     })
 }
 

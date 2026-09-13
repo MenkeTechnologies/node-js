@@ -100,9 +100,19 @@ pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
         main,
         functions,
         tries,
+        strict,
     } = prog;
     let funcs: Vec<host::FuncDef> = functions.into_iter().map(|(_, f)| f).collect();
-    host::with_host(|h| h.load_program(funcs, tries));
+    host::with_host(|h| {
+        h.load_program(funcs, tries);
+        // A strict top level marks the frame it is about to run on, so a
+        // refused write throws there the way it does inside a strict function.
+        // A function's strictness rides in its `FuncDef`; the top level had
+        // nowhere to put it, so the module frame stayed sloppy.
+        if strict {
+            h.set_current_strict();
+        }
+    });
     main
 }
 

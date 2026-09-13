@@ -1745,7 +1745,15 @@ impl JsHost {
                         .unwrap_or(false)
                     || self.fn_prop(owner, key).is_some()
             }
-            _ => true,
+            // A RegExp's `lastIndex` is an own property, so a merely
+            // NON-EXTENSIBLE regexp still accepts a write to it.
+            Some(JsObj::RegExp(_)) => key == "lastIndex" || self.fn_prop(owner, key).is_some(),
+            // Every other shape keeps its own properties in the fn-prop side
+            // table (a function's statics, a Map's assigned properties), so
+            // "does it already own this key" is that table's question. Answering
+            // a blanket `true` let a NEW key land on a frozen function and a
+            // frozen Map.
+            _ => self.fn_prop(owner, key).is_some(),
         }
     }
 
@@ -1786,8 +1794,29 @@ impl JsHost {
     /// key list. `length` is an own property as well, and freezing it is what
     /// stops a `push` from extending a frozen array.
     fn integrity_keys(&self, v: &Value) -> Vec<String> {
+        let side_table_keys = |v: &Value| -> Vec<String> {
+            match v {
+                Value::Obj(i) => self
+                    .fn_props
+                    .get(i)
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        };
         match self.get(v) {
             Some(JsObj::Object(p)) => p.keys().cloned().collect(),
+            // A RegExp's only own property is its `lastIndex` cursor, which
+            // lives in the `RegExpObj` struct. Without it here `Object.freeze`
+            // sealed nothing and a frozen regexp's cursor still moved.
+            Some(JsObj::RegExp(_)) => vec!["lastIndex".to_string()],
+            // A function's statics and a Map's assigned properties live in the
+            // fn-prop side table, and freezing has to reach them too.
+            Some(JsObj::Func(_))
+            | Some(JsObj::Class(_))
+            | Some(JsObj::Map { .. })
+            | Some(JsObj::Set { .. })
+            | Some(JsObj::Promise { .. }) => side_table_keys(v),
             Some(JsObj::Array(items)) => (0..items.len())
                 .map(|i| i.to_string())
                 .chain(std::iter::once("length".to_string()))
@@ -2051,6 +2080,14 @@ impl JsHost {
     /// Whether the activation now running is strict code.
     pub fn current_strict(&self) -> bool {
         self.frame().strict
+    }
+
+    /// Mark the frame about to run as STRICT — used for a program whose own top
+    /// level says `'use strict'`, which has no `FuncDef` to carry the flag.
+    pub fn set_current_strict(&mut self) {
+        if let Some(f) = self.frames.last_mut() {
+            f.strict = true;
+        }
     }
 
     pub fn current_home(&self) -> (Option<String>, bool, Option<Value>) {

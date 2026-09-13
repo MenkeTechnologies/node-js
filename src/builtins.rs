@@ -1078,7 +1078,7 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         return Ok(prototype_of(recv));
     }
     let kind = with_host(|h| h.kind_of(recv));
-    Ok(match kind {
+    let out = match kind {
         Some(ObjKind::Object) => {
             let numeric = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
             // A view over a DETACHED buffer reports zero extent. Its own
@@ -1370,7 +1370,25 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                 Value::Undef
             }
         }
-    })
+    };
+    // Every object INHERITS the `Object.prototype` methods, and each kind's
+    // read arm above knows only its OWN. So `typeof new Map().toString`,
+    // `typeof f.hasOwnProperty` and `typeof /a/.propertyIsEnumerable` all
+    // answered `undefined` — for Map the CALL already worked, which is the
+    // read and the dispatch disagreeing about the same method.
+    //
+    // Which prototype owns the name is decided by the same helper the `in`
+    // operator uses, so the two cannot drift, and the result is the SHARED
+    // intrinsic rather than a per-read thunk.
+    if matches!(out, Value::Undef) && !name.starts_with('#') {
+        if let Some(owner) = inherited_method_owner(recv, name) {
+            let key = format!("@proto:{owner}:{name}");
+            if builtin_meta(&key).is_some() {
+                return Ok(with_host(|h| h.alloc(JsObj::Builtin(key))));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The namespace name of the `require.cache` view. A `Builtin` rather than an
@@ -1596,6 +1614,23 @@ pub const OBJECT_PROTO_METHODS: &[&str] = &[
     "__lookupGetter__",
     "__lookupSetter__",
 ];
+
+/// A typed array with elements cannot be frozen or sealed: its indices are
+/// non-configurable by construction, so making them non-writable would violate
+/// the invariant, and node refuses outright rather than half-applying it. An
+/// EMPTY view and a `DataView` are both fine.
+fn reject_sealing_a_view(v: &Value, verb: &str) -> Result<(), String> {
+    let has_elements = matches!(
+        crate::stdlib::native_tag(v).as_deref(),
+        Some("TypedArray") | Some("Buffer")
+    ) && !crate::stdlib::typedarray::elem_values(v).is_empty();
+    if has_elements {
+        return Err(host::type_error(&format!(
+            "Cannot {verb} array buffer views with elements"
+        )));
+    }
+    Ok(())
+}
 
 pub fn is_object_builtin_method(name: &str) -> bool {
     matches!(
@@ -3106,26 +3141,33 @@ pub fn set_with_receiver(
 /// plain object, `[object Array]` for an array.
 fn write_refused(recv: &Value, name: &str) -> String {
     let extensible = with_host(|h| h.is_extensible(recv));
+    // Which of the two messages applies turns on whether the key already
+    // EXISTS. Every shape that keeps its own properties in the fn-prop side
+    // table answered a blanket `true` here, so adding a key to a frozen
+    // function reported "read only" where node reports "not extensible".
     let has_own = with_host(|h| match h.get(recv) {
         Some(JsObj::Object(p)) => p.contains_key(name),
-        Some(JsObj::Array(items)) => name
-            .parse::<usize>()
-            .map(|i| i < items.len())
-            .unwrap_or(false),
-        _ => true,
+        Some(JsObj::Array(items)) => {
+            name.parse::<usize>()
+                .map(|i| i < items.len())
+                .unwrap_or(false)
+                || h.fn_prop(recv, name).is_some()
+        }
+        Some(JsObj::RegExp(_)) => name == "lastIndex" || h.fn_prop(recv, name).is_some(),
+        _ => h.fn_prop(recv, name).is_some(),
     });
     if !extensible && !has_own {
         return host::type_error(&format!(
             "Cannot add property {name}, object is not extensible"
         ));
     }
-    let brand = if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Array) {
-        "[object Array]".to_string()
-    } else {
-        "#<Object>".to_string()
-    };
+    // The receiver renders the way every other brand-check message renders one
+    // — `#<Object>`, `[object Array]`, `[object RegExp]`, `#<Map>`, `#<C>` for a
+    // class instance, `Error: m` for an error. Only Array was special-cased, so
+    // every other exotic reported `#<Object>`.
     host::type_error(&format!(
-        "Cannot assign to read only property '{name}' of object '{brand}'"
+        "Cannot assign to read only property '{name}' of object '{}'",
+        no_side_effects_string(recv)
     ))
 }
 
@@ -3275,7 +3317,10 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         crate::stdlib::url::refresh(recv);
         return Ok(());
     }
-    // `re.lastIndex = n` on a RegExp advances/resets its match cursor.
+    // `re.lastIndex = n` on a RegExp advances/resets its match cursor. The
+    // writability check above already refused it on a FROZEN regexp, which it
+    // could only do once `integrity_keys` learned that `lastIndex` is an own
+    // property.
     if name == "lastIndex" {
         if let Some(n) = with_host(|h| match h.get(recv) {
             Some(JsObj::RegExp(_)) => Some(h.to_number(&val)),
@@ -5373,11 +5418,13 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Object.assign" => object_assign(args),
         "Object.freeze" => {
             let v = arg0(&args);
+            reject_sealing_a_view(&v, "freeze")?;
             with_host(|h| h.seal_object(&v, true));
             Ok(v)
         }
         "Object.seal" => {
             let v = arg0(&args);
+            reject_sealing_a_view(&v, "seal")?;
             with_host(|h| h.seal_object(&v, false));
             Ok(v)
         }
@@ -8462,9 +8509,15 @@ pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
     // `promise.hasOwnProperty(k)` and `sym.toLocaleString()` all reported "is
     // not a function" — `Object.prototype.toString.call(m)` worked while
     // `m.toString()` did not.
-    if inherits_object_methods(recv)
-        && is_object_builtin_method(name)
-        && !overrides_object_method(recv, name)
+    // The allowlist is the kinds whose own dispatch table below would otherwise
+    // claim the name. Every OTHER receiver reaches an `Object.prototype` method
+    // the same way — a function, a class and a bound function included, where
+    // `f.hasOwnProperty(k)` reported "is not a function" even though the READ
+    // resolved it. `inherited_method_owner` decides which prototype owns the
+    // name, so a kind that defines its own still gets its own.
+    if is_object_builtin_method(name)
+        && (inherited_method_owner(recv, name) == Some("Object")
+            || (inherits_object_methods(recv) && !overrides_object_method(recv, name)))
     {
         // `toString` goes through the branded form (20.1.3.6), which reads
         // `Symbol.toStringTag` and falls back to the receiver's own brand —
@@ -12401,8 +12454,6 @@ fn has_property_ordinary(obj: &Value, key: &str) -> bool {
 /// prototype method. Asked by `in` and `hasOwnProperty`'s negative case; it
 /// performs no read, so a getter cannot fire.
 fn inherited_builtin_method(obj: &Value, key: &str) -> bool {
-    // A null-prototype object inherits NOTHING — `'toString' in
-    // Object.create(null)` is false.
     if with_host(|h| h.has_null_proto(obj)) {
         return false;
     }
@@ -12410,6 +12461,19 @@ fn inherited_builtin_method(obj: &Value, key: &str) -> bool {
         if crate::stdlib::instance_has_method(&tag, key) {
             return true;
         }
+    }
+    inherited_method_owner(obj, key).is_some()
+}
+
+/// The constructor whose prototype defines `key` for `obj` — its own if that
+/// prototype has it, otherwise `Object` — or `None` when neither does.
+///
+/// Used both by `in` and by the READ, so the two cannot disagree about which
+/// prototype a name comes from. `new Map().toString` is `Map.prototype`'s and
+/// `new Map().hasOwnProperty` is `Object.prototype`'s.
+fn inherited_method_owner(obj: &Value, key: &str) -> Option<&'static str> {
+    if with_host(|h| h.has_null_proto(obj)) {
+        return None;
     }
     // The generated prototype-member table, which unlike the arity table knows
     // about the ACCESSORS — `size` on a Map, `source` on a RegExp, `description`
@@ -12420,6 +12484,11 @@ fn inherited_builtin_method(obj: &Value, key: &str) -> bool {
     // holds rather than from the box itself.
     let ctor = match wrapped_primitive(obj).as_ref().and_then(wrapper_ctor_of) {
         Some(c) => Some(c),
+        // An `arguments` object is ARRAY-BACKED here so that indices, `length`,
+        // spread and `for-of` work, but node's is an exotic that inherits from
+        // `Object.prototype` — `typeof arguments.map` is `undefined`. Reporting
+        // its backing kind would hand it the whole `Array.prototype`.
+        None if is_arguments(obj) => Some("Object"),
         None => with_host(|h| default_ctor_name(h, obj)),
     };
     let on_proto = |c: &str| {
@@ -12433,11 +12502,12 @@ fn inherited_builtin_method(obj: &Value, key: &str) -> bool {
                     .any(|m| m.strip_prefix('+').unwrap_or(m) == key)
             })
     };
-    if ctor.is_some_and(on_proto) {
-        return true;
+    match ctor {
+        Some(c) if on_proto(c) => Some(c),
+        // Everything else inherits `Object.prototype`'s.
+        _ if on_proto("Object") => Some("Object"),
+        _ => None,
     }
-    // Everything else inherits `Object.prototype`'s.
-    on_proto("Object")
 }
 
 /// `structuredClone` — a deep copy of plain data (objects/arrays/primitives).
