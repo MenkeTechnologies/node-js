@@ -1632,6 +1632,30 @@ accepted      [5,true]
 in-traps      [[true,true,false],["has","has","has"]]
 fn-proxy      ["function","function","f",["length","name","prototype"]]
 revoked       TypeError: Cannot perform 'has' on a proxy that has been revoked
+==== proxyprotocols.js ====
+toJSON        "\"REPLACED\""
+toJSON-nested "{\"v\":42}"
+toPrimitive   "PRIM"
+hasInstance   true
+toStringTag   "[object TAG]"
+iterator      [5]
+toString      "STR"
+valueOf       18
+error-name    "PROXYERR: m"
+trap-order    ["get","ownKeys","getOwnPropertyDescriptor","get"]
+plain         ["{\"a\":1}","[1,2]"]
+own-toJSON    "\"P\""
+own-primitive "OWN"
+own-instance  true
+own-error     "OWNERR: m"
+copies-assign  [{"g":7,"plain":1},1]
+copies-values  [[7,1],1]
+copies-entries [[["g",7],["plain",1]],1]
+copies-stringify [{"g":7,"plain":1},1]
+copies-spread  [{"g":7,"plain":1},1]
+copies-rest    [{"g":7,"plain":1},1]
+then          "THENABLE"
+asyncIterator [3]
 ==== rawjson.js ====
 shape     object [object Object] ["rawJSON"] 12345678901234567890
 frozen    null true {"value":"12345678901234567890","writable":false,"enumerable":true,"configurable":false}

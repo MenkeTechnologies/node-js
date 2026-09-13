@@ -2641,21 +2641,26 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
             };
             return Ok(with_host(|h| h.new_str(s)));
         }
-        let s = with_host(|h| h.error_to_string(recv)).unwrap_or_else(|| {
-            with_host(|h| {
-                let name = host::lookup_chain(h, recv, "name")
-                    .map(|n| h.str_of(&n))
-                    .unwrap_or_else(|| "Error".into());
-                let msg = host::lookup_chain(h, recv, "message")
-                    .map(|m| h.str_of(&m))
-                    .unwrap_or_default();
+        // `name` and `message` are read with `[[Get]]` (20.5.3.4 steps 3 and 5),
+        // so a PROXY supplies them through its `get` trap. Reading the stored
+        // ones first made `String(new Proxy(err, handler))` ignore the handler.
+        let via_proxy = with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy);
+        let stored = (!via_proxy).then(|| with_host(|h| h.error_to_string(recv)));
+        let s = match stored.flatten() {
+            Some(s) => s,
+            None => {
+                let read = |k: &str| -> Result<Option<String>, String> {
+                    Ok(host::protocol_lookup(recv, k)?.map(|v| with_host(|h| h.str_of(&v))))
+                };
+                let name = read("name")?.unwrap_or_else(|| "Error".into());
+                let msg = read("message")?.unwrap_or_default();
                 if msg.is_empty() {
                     name
                 } else {
                     format!("{name}: {msg}")
                 }
-            })
-        });
+            }
+        };
         return Ok(with_host(|h| h.new_str(s)));
     }
     // A primitive wrapper's `toString`/`valueOf`/`toLocaleString`: unwrap and
@@ -7650,13 +7655,21 @@ fn apply_to_json(
     let mut v = v.clone();
     if matches!(v, Value::Obj(_)) {
         let tag = crate::stdlib::native_tag(&v);
-        let has_to_json = with_host(|h| match host::lookup_chain(h, &v, "toJSON") {
-            Some(f) => host::is_callable(h, &f),
-            None => false,
-        }) || tag
-            .as_deref()
-            .map(crate::stdlib::has_to_json)
-            .unwrap_or(false);
+        // 25.5.2.1 step 2: `toJSON` is looked up with `[[Get]]`, so a PROXY
+        // supplies one through its `get` trap. `lookup_chain` walks the
+        // property map and never asks the handler, so a proxy carrying a
+        // `toJSON` was serialized as a plain object instead of by its own
+        // method — and node's trap log starts with that `get`.
+        let to_json = if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Proxy) {
+            get_property(&v, "toJSON")?
+        } else {
+            with_host(|h| host::lookup_chain(h, &v, "toJSON")).unwrap_or(Value::Undef)
+        };
+        let has_to_json = with_host(|h| host::is_callable(h, &to_json))
+            || tag
+                .as_deref()
+                .map(crate::stdlib::has_to_json)
+                .unwrap_or(false);
         if has_to_json {
             let k = with_host(|h| h.new_str(key.to_string()));
             v = host::call_method(&v, "toJSON", vec![k])?;

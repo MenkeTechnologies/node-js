@@ -7180,10 +7180,10 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
         // `class_static` reads, following the `extends` chain), NOT in an object
         // property map — so consulting only `lookup_chain` would find the object
         // literal form and silently miss the two forms V8 users actually write.
-        let handler = with_host(|h| {
-            h.class_static(ctor, "@@hasInstance")
-                .or_else(|| lookup_chain(h, ctor, "@@hasInstance"))
-        });
+        let handler = match with_host(|h| h.class_static(ctor, "@@hasInstance")) {
+            Some(f) => Some(f),
+            None => protocol_lookup(ctor, "@@hasInstance")?,
+        };
         // GetMethod (7.3.11) treats only `undefined`/`null` as "absent"; anything
         // else that is not callable is a TypeError, so a data property here does
         // NOT fall back to the prototype walk.
@@ -7764,6 +7764,14 @@ pub fn get_async_iterator(src: &Value) -> Result<Value, String> {
 
 /// If `v` has an own/inherited `Symbol.asyncIterator` method, return it.
 fn user_async_iterator_fn(v: &Value) -> Option<Value> {
+    // A PROXY supplies the protocol through its `get` trap and is not a plain
+    // object, so the shape test below rejects it outright.
+    if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
+        return protocol_lookup(v, "@@asyncIterator")
+            .ok()
+            .flatten()
+            .filter(|f| with_host(|h| is_callable(h, f)));
+    }
     let is_plain = with_host(|h| matches!(h.get(v), Some(JsObj::Object(_))));
     if !is_plain {
         return None;
@@ -7987,7 +7995,7 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
     if with_host(|h| is_primitive(h, v)) {
         return Ok(v.clone());
     }
-    if let Some(f) = with_host(|h| lookup_chain(h, v, "@@toPrimitive")) {
+    if let Some(f) = protocol_lookup(v, "@@toPrimitive")? {
         if with_host(|h| is_callable(h, &f)) {
             let hv = with_host(|h| h.new_str(hint.to_string()));
             let r = invoke(&f, vec![hv], Some(v.clone()))?;
@@ -8148,6 +8156,21 @@ pub fn is_callable(h: &JsHost, v: &Value) -> bool {
 
 /// Walk `recv`'s own props then its prototype chain for `key`, returning the
 /// stored value (methods, inherited data props). Does NOT invoke accessors.
+/// A PROTOCOL lookup — `Symbol.toPrimitive`, `Symbol.hasInstance`, `toJSON`,
+/// `then` and the rest — which the spec performs with `[[Get]]`.
+///
+/// That distinction only shows on a PROXY: `lookup_chain` walks the property
+/// map and never asks the handler, so a proxy supplying a protocol method
+/// through its `get` trap was invisible and the operation fell back to the
+/// default. Everything else takes the cheap chain walk.
+pub fn protocol_lookup(v: &Value, key: &str) -> Result<Option<Value>, String> {
+    if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
+        let got = crate::builtins::get_property(v, key)?;
+        return Ok((!matches!(got, Value::Undef)).then_some(got));
+    }
+    Ok(with_host(|h| lookup_chain(h, v, key)))
+}
+
 pub fn lookup_chain(h: &JsHost, recv: &Value, key: &str) -> Option<Value> {
     if let Some(JsObj::Object(p)) = h.get(recv) {
         if let Some(v) = p.get(key) {
@@ -9433,6 +9456,15 @@ pub fn resolve_promise_val(id: u32, value: Value) {
 /// `value.then` if `value` is an object with a callable `then` — the test that
 /// makes a value a *thenable*. Primitives (and objects without one) are `None`.
 fn thenable_then(value: &Value) -> Option<Value> {
+    // A PROXY is not a plain object and supplies `then` through its `get` trap,
+    // so both tests below missed it: `Promise.resolve(proxyThenable)` fulfilled
+    // WITH the proxy instead of adopting it.
+    if with_host(|h| h.kind_of(value)) == Some(ObjKind::Proxy) {
+        return protocol_lookup(value, "then")
+            .ok()
+            .flatten()
+            .filter(|f| with_host(|h| is_callable(h, f)));
+    }
     if !with_host(|h| matches!(h.get(value), Some(JsObj::Object(_)))) {
         return None;
     }
