@@ -1163,8 +1163,18 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             }
         }
         Some(ObjKind::Generator) => {
-            // Every iterator carries the `Iterator.prototype` helpers.
-            if is_generator_method(name) || crate::stdlib::iterator::is_helper(name) {
+            // A generator IS its own iterator, so it answers for the matching
+            // symbol — `@@asyncIterator` for an async one, `@@iterator` for a
+            // sync one. Neither was advertised, so `ag()[Symbol.asyncIterator]`
+            // was `undefined` even though `for await` over it worked through a
+            // different path.
+            let want = if with_host(|h| h.is_async_gen_val(recv)) {
+                "@@asyncIterator"
+            } else {
+                "@@iterator"
+            };
+            if name == want || is_generator_method(name) || crate::stdlib::iterator::is_helper(name)
+            {
                 bound_method(recv, name)
             } else {
                 with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef)
@@ -1307,9 +1317,20 @@ fn default_ctor_name(h: &host::JsHost, recv: &Value) -> Option<&'static str> {
         Some(JsObj::BigInt(_)) => Some("BigInt"),
         Some(JsObj::RegExp(_)) => Some("RegExp"),
         Some(JsObj::Iter { .. }) => Some("Iterator"),
-        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => {
-            Some("Function")
+        Some(JsObj::Func(f)) => {
+            // A generator or async function is NOT an ordinary function: its
+            // `[[Prototype]]` is `GeneratorFunction.prototype` (or the async
+            // variants'), and so is its `constructor`. All three reported plain
+            // `Function`, so `g.constructor.name` was `Function` where node
+            // says `GeneratorFunction`.
+            Some(match h.funcs.get(f.def_id) {
+                Some(d) if d.is_generator && d.is_async => "AsyncGeneratorFunction",
+                Some(d) if d.is_generator => "GeneratorFunction",
+                Some(d) if d.is_async => "AsyncFunction",
+                _ => "Function",
+            })
         }
+        Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => Some("Function"),
         _ => match recv {
             Value::Float(_) | Value::Int(_) => Some("Number"),
             Value::Bool(_) => Some("Boolean"),
@@ -1936,6 +1957,21 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // `Ctor.name` on a builtin constructor is the constructor name (`Array.name`
     // === "Array"); non-callable namespaces (`Math`/`JSON`) fall through to
     // `undefined`.
+    // `GeneratorFunction.prototype` and the two async variants are REAL objects
+    // in `native_protos`, not `Builtin("X.prototype")` namespace handles — they
+    // sit on the prototype chain of every generator/async function, which a
+    // handle cannot do. Without this the read fell through to `undefined`.
+    if name == "prototype"
+        && matches!(
+            ns,
+            "GeneratorFunction" | "AsyncFunction" | "AsyncGeneratorFunction"
+        )
+    {
+        return with_host(|h| {
+            h.ensure_native_protos();
+            h.native_proto(ns).unwrap_or(Value::Undef)
+        });
+    }
     // `Ctor[Symbol.species]` is an accessor returning `this` on every builtin
     // that has one (23.1.2.5, 27.2.4.7, …). It was absent, so the species
     // protocol had nothing to read and every derived result came back a plain
@@ -10724,6 +10760,10 @@ fn set_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Strin
 }
 
 fn generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // A generator IS its own iterator: both symbol forms return the receiver.
+    if matches!(name, "@@iterator" | "@@asyncIterator") {
+        return Ok(recv.clone());
+    }
     // An `async function*` object's methods return PROMISES of the record, and
     // its body has to be driven through the await-aware stepper (a plain
     // `gen_resume` would surface an internal `await` suspension as a bogus yield).

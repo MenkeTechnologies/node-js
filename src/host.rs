@@ -8125,6 +8125,7 @@ impl JsHost {
         // The wrapper prototypes share this registry and this guard would skip
         // them, so they are built through their own.
         self.ensure_wrapper_protos();
+        self.ensure_function_kind_protos();
         if self.native_protos.contains_key("Buffer") {
             return;
         }
@@ -8228,6 +8229,42 @@ impl JsHost {
     /// String.prototype` and `w instanceof String` both read false while the
     /// wrapper's methods still resolved through the string funnel. Registering
     /// them here puts them on the same footing as `Buffer.prototype`.
+    /// `GeneratorFunction.prototype`, `AsyncFunction.prototype` and
+    /// `AsyncGeneratorFunction.prototype` — the intrinsics a generator or async
+    /// function's `[[Prototype]]` really points at.
+    ///
+    /// None are globals (node exposes them only through
+    /// `Object.getPrototypeOf(function*(){}).constructor`), so they live here
+    /// rather than among the wrapper constructors. Each hangs off
+    /// `Function.prototype` and carries the `Symbol.toStringTag` that names it.
+    pub fn ensure_function_kind_protos(&mut self) {
+        if self.native_protos.contains_key("GeneratorFunction") {
+            return;
+        }
+        let base = self
+            .native_protos
+            .get("Function")
+            .cloned()
+            .unwrap_or_else(|| self.object_proto());
+        for ctor in [
+            "GeneratorFunction",
+            "AsyncFunction",
+            "AsyncGeneratorFunction",
+        ] {
+            let proto = self.new_object(IndexMap::new());
+            self.set_proto(&proto, base.clone());
+            let ctor_val = self.alloc(JsObj::Builtin(ctor.to_string()));
+            let tag = self.new_str(ctor);
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert("constructor".into(), ctor_val);
+                p.insert("@@toStringTag".into(), tag);
+            }
+            self.hide_prop(&proto, "constructor");
+            self.hide_prop(&proto, "@@toStringTag");
+            self.native_protos.insert(ctor.to_string(), proto);
+        }
+    }
+
     pub fn ensure_wrapper_protos(&mut self) {
         if self.native_protos.contains_key("String") {
             return;

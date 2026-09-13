@@ -858,6 +858,16 @@ sum of fib(8) 33
 max via spread 8
 echo: a
 echo: b
+kinds    GeneratorFunction AsyncFunction AsyncGeneratorFunction Function
+ctor     GeneratorFunction AsyncFunction AsyncGeneratorFunction true
+chain    true false object
+tags     GeneratorFunction AsyncFunction AsyncGeneratorFunction
+protos   object object true
+brands   [object GeneratorFunction] [object AsyncFunction] [object AsyncGeneratorFunction] [object Function]
+asyncSym function true
+syncSym  function true
+instTag  [object Generator] [object AsyncGenerator]
+forawait 1,2
 ==== hello.js ====
 hello, world
 7 256 2.5 2
