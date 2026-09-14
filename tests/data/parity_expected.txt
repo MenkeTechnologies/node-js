@@ -1039,6 +1039,27 @@ parseInt array => 12
 parseInt object => 42
 parseInt symbol in array THREW TypeError: Cannot convert a Symbol value to a string
 parseFloat object => 1.5
+==== fsasync.js ====
+stat        [false,"ENOENT","stat",true,"ENOENT: no such file or directory, stat '<dir>/nope'",null]
+access      [false,"ENOENT","access",true,"ENOENT: no such file or directory, access '<dir>/nope'",null]
+unlink      [false,"ENOENT","unlink",true,"ENOENT: no such file or directory, unlink '<dir>/nope'",null]
+rmdir       [false,"ENOENT","rmdir",true,"ENOENT: no such file or directory, rmdir '<dir>/nope'",null]
+readdir     [false,"ENOENT","scandir",true,"ENOENT: no such file or directory, scandir '<dir>/nope'",null]
+readFile    [false,"ENOENT","open",true,"ENOENT: no such file or directory, open '<dir>/nope'",null]
+open        [false,"ENOENT","open",true,"ENOENT: no such file or directory, open '<dir>/nope'",null]
+mkdir       [false,"EEXIST","mkdir",true,"EEXIST: file already exists, mkdir '<dir>'",null]
+rename      [false,"ENOENT","rename",true,"ENOENT: no such file or directory, rename '<dir>/nope' -> '<dir>/x'",null]
+copyFile    [false,"ENOENT","copyfile",true,"ENOENT: no such file or directory, copyfile '<dir>/nope' -> '<dir>/x'",null]
+read-dir    [false,"EISDIR","read",true,"EISDIR: illegal operation on a directory, read '<dir>'",null]
+ok-stat     [true,null,null,false,null,[2,true]]
+ok-readFile [true,null,null,false,null,"hi"]
+ok-hex      [true,null,null,false,null,"6869"]
+ok-readdir  [true,null,null,false,null,["x"]]
+ok-write    [true,null,null,false,null,"z"]
+p-stat      [false,"ENOENT","stat",true,"ENOENT: no such file or directory, stat '<dir>/nope'",null]
+p-readFile  [false,"ENOENT","open",true,"ENOENT: no such file or directory, open '<dir>/nope'",null]
+p-rename    [false,"ENOENT","rename",true,"ENOENT: no such file or directory, rename '<dir>/nope' -> '<dir>/x'",null]
+p-ok        "hi"
 ==== fserrors.js ====
 stat          ["ENOENT","stat","<dir>/nope","ENOENT: no such file or directory, stat '<dir>/nope'"]
 lstat         ["ENOENT","lstat","<dir>/nope","ENOENT: no such file or directory, lstat '<dir>/nope'"]

@@ -269,8 +269,14 @@ fn async_cb(args: &[Value], result: Result<Value, String>) -> Result<Value, Stri
             let n = h.null();
             h.queue_micro(cb, vec![n, v]);
         }),
+        // An error-first callback is handed an ERROR OBJECT, not the message:
+        // `fs.stat(missing, (err) => …)` gives an `err` carrying `code`,
+        // `syscall`, `path` and `errno`, and `err.code === 'ENOENT'` is the most
+        // common check in node code. A bare string made every one of those
+        // `undefined` — and `err.message` too, so even printing it said
+        // `undefined`. The promise forms already built the object.
         Err(e) => with_host(|h| {
-            let ev = h.new_str(e);
+            let ev = crate::builtins::synth_error(h, &e);
             h.queue_micro(cb, vec![ev]);
         }),
     }
@@ -289,7 +295,7 @@ fn read_write_async(args: &[Value], result: Result<usize, String>) -> Result<Val
             h.queue_micro(cb, vec![nul, Value::Float(n as f64), buffer]);
         }),
         Err(e) => with_host(|h| {
-            let ev = h.new_str(e);
+            let ev = crate::builtins::synth_error(h, &e);
             h.queue_micro(cb, vec![ev]);
         }),
     }
@@ -392,7 +398,20 @@ fn read_file_async(args: &[Value]) -> Result<Value, String> {
             },
         ),
         Err(e) => (
-            with_host(|h| h.new_str(err_str("readFile", &path, &e))),
+            // An ERROR OBJECT, as every error-first callback receives — see
+            // `async_cb`; this path built its own and handed over a string.
+            with_host(|h| {
+                // The ASYNC form names the path where the sync one does not:
+                // node's `fs.readFile(dir, cb)` reports `read '<dir>'` and
+                // `fs.readFileSync(dir)` reports a bare `read`. Measured, not
+                // assumed — the two really do differ.
+                let msg = if e.raw_os_error() == Some(libc::EISDIR) {
+                    err_str("read", &path, &e)
+                } else {
+                    err_str("readFile", &path, &e)
+                };
+                crate::builtins::synth_error(h, &msg)
+            }),
             Value::Undef,
         ),
     };
