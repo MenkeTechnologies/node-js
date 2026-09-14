@@ -1052,7 +1052,7 @@ open          ["ENOENT","open","<dir>/nope","ENOENT: no such file or directory, 
 truncate      ["ENOENT","open","<dir>/nope","ENOENT: no such file or directory, open '<dir>/nope'"]
 copyFile      ["ENOENT","copyfile","<dir>/nope","ENOENT: no such file or directory, copyfile '<dir>/nope' -> '<dir>/x'"]
 mkdir-eexist  ["EEXIST","mkdir","<dir>","EEXIST: file already exists, mkdir '<dir>'"]
-realpath      ["ENOENT","lstat","<dir>/nope","ENOENT: no such file or directory, lstat '/private<dir>/nope'"]
+realpath      ["ENOENT","lstat","<dir>/nope","ENOENT: no such file or directory, lstat '<dir>/nope'"]
 rename        ["ENOENT","rename","<dir>/nope","ENOENT: no such file or directory, rename '<dir>/nope' -> '<dir>/x'"]
 read-dir      ["EISDIR","read","undefined","EISDIR: illegal operation on a directory, read"]
 write-dir     ["EISDIR","open","<dir>","EISDIR: illegal operation on a directory, open '<dir>'"]

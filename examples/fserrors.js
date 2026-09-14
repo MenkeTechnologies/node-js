@@ -11,7 +11,11 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "njfs-"));
 const file = path.join(dir, "x");
 fs.writeFileSync(file, "hi");
 const gone = path.join(dir, "nope");
-const scrub = (s) => String(s).split(dir).join("<dir>").replace(/^\/private/, "");
+// macOS resolves `/var` to `/private/var`, so a path node has canonicalized
+// carries a `/private` prefix that Linux never produces. Both are scrubbed, or
+// the frozen transcript would be the one taken on whichever platform blessed
+// it — the same mistake as pinning a timezone.
+const scrub = (s) => String(s).split(`/private${dir}`).join("<dir>").split(dir).join("<dir>");
 const show = (label, f) => {
   try { console.log(label, JSON.stringify(f())); }
   catch (e) { console.log(label, JSON.stringify([e.code, e.syscall, scrub(e.path), scrub(e.message)])); }
