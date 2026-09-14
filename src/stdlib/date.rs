@@ -123,6 +123,14 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
             } else if super::native_tag(a).as_deref() == Some("Date") {
                 ms_of(a)
             } else {
+                // 21.4.2.1 step 3.d is `ToNumber(v)` after `ToPrimitive`, and a
+                // SYMBOL refuses it — `new Date(sym)` produced an Invalid Date
+                // instead of throwing.
+                if with_host(|h| matches!(h.get(a), Some(crate::host::JsObj::Symbol { .. }))) {
+                    return Err(crate::host::type_error(
+                        "Cannot convert a Symbol value to a number",
+                    ));
+                }
                 with_host(|h| h.to_number(a))
             }
         }

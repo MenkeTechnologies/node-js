@@ -6156,10 +6156,10 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "parseFloat" | "Number.parseFloat" => Ok(Value::Float(parse_float(&args)?)),
         "isNaN" => Ok(Value::Bool(arg_num(&args, 0).is_nan())),
         "isFinite" => Ok(Value::Bool(arg_num(&args, 0).is_finite())),
-        "encodeURIComponent" => uri_encode(&with_host(|h| h.str_of(&arg0(&args))), false),
-        "encodeURI" => uri_encode(&with_host(|h| h.str_of(&arg0(&args))), true),
-        "decodeURIComponent" => uri_decode(&with_host(|h| h.str_of(&arg0(&args))), false),
-        "decodeURI" => uri_decode(&with_host(|h| h.str_of(&arg0(&args))), true),
+        "encodeURIComponent" => uri_encode(&arg_to_string(&args, 0)?, false),
+        "encodeURI" => uri_encode(&arg_to_string(&args, 0)?, true),
+        "decodeURIComponent" => uri_decode(&arg_to_string(&args, 0)?, false),
+        "decodeURI" => uri_decode(&arg_to_string(&args, 0)?, true),
         "escape" => legacy_escape(&with_host(|h| h.str_of(&arg0(&args)))),
         "unescape" => legacy_unescape(&with_host(|h| h.str_of(&arg0(&args)))),
         // Reaching `eval` through this table means the eval FUNCTION VALUE was
@@ -6622,7 +6622,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `Map.groupBy(items, cb)` (ES2024): group into a `Map` keyed by the raw
         // `cb(item, i)` result (SameValueZero), each value an array of members.
         "Map.groupBy" => map_group_by(args),
-        n if host::ERROR_NAMES.contains(&n) => Ok(make_error(name, &args)),
+        n if host::ERROR_NAMES.contains(&n) => make_error_checked(name, &args),
         _ if name.starts_with("Math.") => math_fn(&name[5..], &args),
         // Internal continuations (Promise resolve/reject fns, `.finally` wrappers).
         // The executor a species-constructed promise is built with: it does
@@ -6777,16 +6777,19 @@ fn regexp_ctor(args: &[Value]) -> Result<Value, String> {
         Some(JsObj::RegExp(r)) => (r.source.clone(), Some(r.flags.clone())),
         _ => {
             let a0 = arg0(args);
+            // 22.2.4.1 step 9 is `ToString(pattern)`, which a SYMBOL refuses —
+            // `new RegExp(sym)` was compiling the text `Symbol(d)` into a
+            // pattern instead of throwing.
             let src = if matches!(a0, Value::Undef) {
                 String::new()
             } else {
-                with_host(|h| h.str_of(&a0))
+                arg_to_string(args, 0)?
             };
             (src, None)
         }
     };
     let flags = match args.get(1) {
-        Some(v) if !matches!(v, Value::Undef) => with_host(|h| h.str_of(v)),
+        Some(v) if !matches!(v, Value::Undef) => arg_to_string(args, 1)?,
         _ => existing_flags.unwrap_or_default(),
     };
     // An empty source compiles as the JS canonical `(?:)`.
@@ -7081,11 +7084,11 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
         "Function" => function_ctor(&args),
         "RegExp" => regexp_ctor(&args),
         "BigInt" => Err(host::type_error("BigInt is not a constructor")),
-        "Error" => Ok(make_error(name, &args)),
+        "Error" => make_error_checked(name, &args),
         // `new DOMException(message, name)` — the name is an ARGUMENT, and the
         // legacy numeric `code` follows from it.
         "DOMException" => Ok(dom_exception(&args)),
-        n if host::ERROR_NAMES.contains(&n) => Ok(make_error(name, &args)),
+        n if host::ERROR_NAMES.contains(&n) => make_error_checked(name, &args),
         _ => Err(host::type_error(&format!("{name} is not a constructor"))),
     }
 }
@@ -7210,10 +7213,26 @@ pub fn dom_exception_slot(recv: &Value, name: &str) -> Option<Value> {
 /// throw a value with extra own properties on it.
 pub(crate) fn make_error_pub(name: &str, msg: &str) -> Value {
     let m = with_host(|h| h.new_str(msg.to_string()));
-    make_error(name, &[m])
+    make_error_inner(name, &[m])
 }
 
-fn make_error(name: &str, args: &[Value]) -> Value {
+/// [`make_error`] with the message's `ToString` allowed to FAIL. A symbol
+/// refuses it (20.5.1.1 step 3), so `new Error(sym)` is a TypeError where this
+/// rendered `Symbol(desc)` into `.message`.
+fn make_error_checked(name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some(m) = args.first().filter(|m| !matches!(m, Value::Undef)) {
+        // AggregateError's message is its SECOND argument.
+        let idx = usize::from(name == "AggregateError");
+        if idx == 0 {
+            host::to_string_value(m)?;
+        } else if let Some(m2) = args.get(idx).filter(|m| !matches!(m, Value::Undef)) {
+            host::to_string_value(m2)?;
+        }
+    }
+    Ok(make_error_inner(name, args))
+}
+
+fn make_error_inner(name: &str, args: &[Value]) -> Value {
     // `new AggregateError(errors, message)` takes the causes FIRST; every other
     // error constructor takes the message first.
     let agg = name == "AggregateError";
@@ -7299,6 +7318,15 @@ fn print_line(args: &[Value], stderr: bool) -> Result<(), String> {
 fn arg0(args: &[Value]) -> Value {
     args.first().cloned().unwrap_or(Value::Undef)
 }
+/// `ToString(arg)` for a builtin's argument — fallible, because a SYMBOL
+/// refuses the conversion (7.1.17). Every site that reached for `str_of`
+/// instead rendered `Symbol(desc)` into its result and reported nothing.
+fn arg_to_string(args: &[Value], i: usize) -> Result<String, String> {
+    let v = args.get(i).cloned().unwrap_or(Value::Undef);
+    let sv = host::to_string_value(&v)?;
+    Ok(with_host(|h| h.str_of(&sv)))
+}
+
 fn arg_num(args: &[Value], i: usize) -> f64 {
     with_host(|h| h.to_number(&args.get(i).cloned().unwrap_or(Value::Undef)))
 }
@@ -10220,10 +10248,10 @@ fn array_method_on(
             Ok(Value::Float(array_len(recv) as f64))
         }
         "join" => {
-            let sep = if args.is_empty() {
+            let sep = if args.is_empty() || matches!(args[0], Value::Undef) {
                 ",".to_string()
             } else {
-                with_host(|h| h.str_of(&args[0]))
+                arg_to_string(&args, 0)?
             };
             join_array(recv, &sep)
         }
@@ -11159,7 +11187,60 @@ fn slice_bounds(args: &[Value], len: usize) -> (usize, usize) {
     (lo, hi.max(lo))
 }
 
+/// The argument positions each `String.prototype` method coerces with
+/// `ToNumber` rather than `ToString`. Everything not listed is a string
+/// position — which matters only for a SYMBOL argument, the one value both
+/// conversions refuse, and refuse with different wording.
+///
+/// Measured per method and per position: `'x'.indexOf(sym)` reports the STRING
+/// message and `'x'.indexOf('a', sym)` the NUMBER one, and `padStart` is the
+/// pair the other way round (a length then a pad string).
+const STRING_METHOD_NUMERIC_ARGS: &[(&str, &[usize])] = &[
+    ("at", &[0]),
+    ("charAt", &[0]),
+    ("charCodeAt", &[0]),
+    ("codePointAt", &[0]),
+    ("endsWith", &[1]),
+    ("includes", &[1]),
+    ("indexOf", &[1]),
+    ("lastIndexOf", &[1]),
+    ("padEnd", &[0]),
+    ("padStart", &[0]),
+    ("repeat", &[0]),
+    ("slice", &[0, 1]),
+    ("split", &[1]),
+    ("startsWith", &[1]),
+    ("substr", &[0, 1]),
+    ("substring", &[0, 1]),
+];
+
+/// Reject a SYMBOL argument before any string method coerces it. 7.1.17 and
+/// 7.1.4 both refuse one, so `'x'.padStart(3, sym)` is a TypeError where this
+/// rendered `Symbol(d)` into the result — silently, which is the shape of
+/// mistake that makes a symbol key leak into text.
+fn reject_symbol_args(name: &str, args: &[Value]) -> Result<(), String> {
+    let numeric = STRING_METHOD_NUMERIC_ARGS
+        .iter()
+        .find(|(m, _)| *m == name)
+        .map(|(_, ps)| *ps)
+        .unwrap_or(&[]);
+    for (i, a) in args.iter().enumerate() {
+        if with_host(|h| matches!(h.get(a), Some(JsObj::Symbol { .. }))) {
+            let kind = if numeric.contains(&i) {
+                "number"
+            } else {
+                "string"
+            };
+            return Err(host::type_error(&format!(
+                "Cannot convert a Symbol value to a {kind}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    reject_symbol_args(name, &args)?;
     // Every index-bearing method below counts UTF-16 code units, so they all
     // work off this one decoding rather than off `s.chars()` (code points),
     // which agrees only on the BMP. `@@iterator` is the deliberate exception.
@@ -14911,7 +14992,7 @@ fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
                             // All rejected → AggregateError carrying every reason.
                             let reasons = with_host(|h| h.new_array(errors.borrow().clone()));
                             let msg = with_host(|h| h.new_str("All promises were rejected"));
-                            let agg = make_error("AggregateError", &[reasons, msg]);
+                            let agg = make_error_inner("AggregateError", &[reasons, msg]);
                             host::reject_promise_val(rid, agg);
                         }
                     }

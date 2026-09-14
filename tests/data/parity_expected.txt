@@ -2405,6 +2405,51 @@ tagged-frozen [true,true]
 tagged-cached true
 tagged-this   [true,"q"]
 tagged-raw    ["a\nb","a\\nb"]
+==== symbolcoercion.js ====
+padStart-str  TypeError: Cannot convert a Symbol value to a string
+padEnd-str    TypeError: Cannot convert a Symbol value to a string
+concat        TypeError: Cannot convert a Symbol value to a string
+startsWith    TypeError: Cannot convert a Symbol value to a string
+endsWith      TypeError: Cannot convert a Symbol value to a string
+includes      TypeError: Cannot convert a Symbol value to a string
+indexOf       TypeError: Cannot convert a Symbol value to a string
+lastIndexOf   TypeError: Cannot convert a Symbol value to a string
+split         TypeError: Cannot convert a Symbol value to a string
+replace       TypeError: Cannot convert a Symbol value to a string
+replaceAll    TypeError: Cannot convert a Symbol value to a string
+localeCompare TypeError: Cannot convert a Symbol value to a string
+normalize     TypeError: Cannot convert a Symbol value to a string
+match         TypeError: Cannot convert a Symbol value to a string
+search        TypeError: Cannot convert a Symbol value to a string
+padStart-num  TypeError: Cannot convert a Symbol value to a number
+indexOf-2nd   TypeError: Cannot convert a Symbol value to a number
+includes-2nd  TypeError: Cannot convert a Symbol value to a number
+split-limit   TypeError: Cannot convert a Symbol value to a number
+substring-2nd TypeError: Cannot convert a Symbol value to a number
+at            TypeError: Cannot convert a Symbol value to a number
+charAt        TypeError: Cannot convert a Symbol value to a number
+charCodeAt    TypeError: Cannot convert a Symbol value to a number
+codePointAt   TypeError: Cannot convert a Symbol value to a number
+repeat        TypeError: Cannot convert a Symbol value to a number
+slice         TypeError: Cannot convert a Symbol value to a number
+array-join    TypeError: Cannot convert a Symbol value to a string
+error-message TypeError: Cannot convert a Symbol value to a string
+typeerror     TypeError: Cannot convert a Symbol value to a string
+regexp-source TypeError: Cannot convert a Symbol value to a string
+regexp-flags  TypeError: Cannot convert a Symbol value to a string
+date          TypeError: Cannot convert a Symbol value to a number
+encodeURI     TypeError: Cannot convert a Symbol value to a string
+decodeURI     TypeError: Cannot convert a Symbol value to a string
+encodeURIComp TypeError: Cannot convert a Symbol value to a string
+String()      "Symbol(d)"
+toString      "Symbol(d)"
+description   "d"
+property-key  1
+Boolean       true
+typeof        "symbol"
+json-value    [null,"{}"]
+join-default  "1,2"
+join-undef    "1,2"
 ==== symbolprotocols.js ====
 match    matched:abc
 search   42
