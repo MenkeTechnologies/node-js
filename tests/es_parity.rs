@@ -3198,7 +3198,12 @@ fn json_stringify_uses_every_short_escape() {
 /// from the current time value, normalizes overflow, and returns the new time
 /// value. The NaN split is the spec's: `setFullYear` on an Invalid Date starts
 /// from the epoch and so REVIVES it (21.4.4.21 step 2), every other setter
-/// leaves it invalid. Expected values from node v26.7.0 under TZ=UTC.
+/// leaves it invalid. Expected values from node v26.7.0.
+///
+/// Every setter here is a `setUTC*` one, so the transcript does not depend on
+/// the machine's zone: the four LOCAL forms this used to call render through
+/// the zone offset, which made the test pass on a UTC CI runner and fail on a
+/// developer's laptop.
 #[test]
 fn date_component_setters_match_node() {
     let src = r#"
@@ -3211,11 +3216,13 @@ fn date_component_setters_match_node() {
         const j = new Date(0);  console.log(j.setUTCFullYear(2000,5,15), j.toISOString());
         const l = new Date(0);  console.log(l.setUTCMilliseconds(1.9), l.toISOString());
         const n = new Date(0);  console.log(n.setUTCFullYear(NaN), String(n));
-        const o = new Date(0);  console.log(o.setMinutes(30,15), o.toISOString());
-        const p = new Date(0);  console.log(p.setSeconds(61), p.toISOString());
-        const q = new Date(0);  console.log(q.setDate(0), q.toISOString());
+        const o = new Date(0);  console.log(o.setUTCMinutes(30,15), o.toISOString());
+        const p = new Date(0);  console.log(p.setUTCSeconds(61), p.toISOString());
+        const q = new Date(0);  console.log(q.setUTCDate(0), q.toISOString());
         const r = new Date(0);  console.log(r.setUTCFullYear(2020,1,29), r.toISOString());
-        const m = new Date(0);  console.log(m.getYear(), m.setYear(99), m.toISOString());
+        // The LOCAL setters are the same code path with the zone applied, and
+        // their values depend on it; `examples/datelocal.js` covers those.
+        const m = new Date(0);  console.log(m.setUTCFullYear(1999), m.toISOString());
     "#;
     assert_eq!(
         run(src),
@@ -3232,7 +3239,7 @@ fn date_component_setters_match_node() {
          61000 1970-01-01T00:01:01.000Z\n\
          -86400000 1969-12-31T00:00:00.000Z\n\
          1582934400000 2020-02-29T00:00:00.000Z\n\
-         70 915148800000 1999-01-01T00:00:00.000Z"
+         915148800000 1999-01-01T00:00:00.000Z"
     );
 }
 
@@ -3269,27 +3276,36 @@ fn date_clips_out_of_range_time_values() {
 /// half, a space, then the `toTimeString` half. It used to answer the RFC-7231
 /// header form, which is what `toUTCString` is for, so `String(date)` and any
 /// template interpolation printed `Thu, 01 Jan 1970 00:00:00 GMT` instead of
-/// node's form. `toTimeString` was missing outright. Expected from node v26.7.0
-/// under TZ=UTC.
+/// node's form. `toTimeString` was missing outright.
+///
+/// Asserted by SHAPE rather than against a transcript. The rendering is LOCAL
+/// time, so a fixed expected string pins the machine's zone: this test carried
+/// node's `TZ=UTC` output in a comment while running under whatever zone the
+/// developer had, which passes on a UTC CI runner and fails on a laptop. The
+/// property it exists to check — the form, and that it is not `toUTCString`'s —
+/// holds in every zone. `examples/datelocal.js` pins the values.
 #[test]
 fn date_to_string_is_not_the_utc_header_form() {
     let src = r#"
         const d = new Date(0);
-        console.log(d.toString());
-        console.log(String(d));
-        console.log(`${d}`);
-        console.log(d.toTimeString());
-        console.log(d.toDateString());
+        const s = d.toString();
+        // ToDateString: the date half, a space, then the time half.
+        console.log(s === d.toDateString() + " " + d.toTimeString());
+        console.log(String(d) === s, `${d}` === s);
+        // …which is NOT the RFC-7231 header form `toUTCString` answers.
+        console.log(s !== d.toUTCString());
+        console.log(/^[A-Z][a-z]{2} [A-Z][a-z]{2} \d\d \d{4}$/.test(d.toDateString()));
+        console.log(/^\d\d:\d\d:\d\d GMT[+-]\d{4} \(.+\)$/.test(d.toTimeString()));
         console.log(d.toUTCString());          // the RFC form, unchanged
         console.log(String(new Date(NaN)), new Date(NaN).toTimeString());
     "#;
     assert_eq!(
         run(src),
-        "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)\n\
-         Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)\n\
-         Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)\n\
-         00:00:00 GMT+0000 (Coordinated Universal Time)\n\
-         Thu Jan 01 1970\n\
+        "true\n\
+         true true\n\
+         true\n\
+         true\n\
+         true\n\
          Thu, 01 Jan 1970 00:00:00 GMT\n\
          Invalid Date Invalid Date"
     );
