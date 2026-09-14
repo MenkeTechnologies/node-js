@@ -933,10 +933,13 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             })
         }
         // Iteration helpers: a Buffer is an index/byte collection.
-        "values" | "keys" | "entries" => {
+        // A Buffer's `Symbol.iterator` IS `values`, inherited from
+        // `%TypedArray%.prototype`, so it dispatches here rather than reporting
+        // itself missing.
+        "values" | "keys" | "entries" | "@@iterator" => {
             let items: Vec<Value> = with_host(|h| match method {
                 "keys" => (0..bytes.len()).map(|i| Value::Float(i as f64)).collect(),
-                "values" => bytes.iter().map(|b| Value::Float(*b as f64)).collect(),
+                "values" | "@@iterator" => bytes.iter().map(|b| Value::Float(*b as f64)).collect(),
                 _ => bytes
                     .iter()
                     .enumerate()

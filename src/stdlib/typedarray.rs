@@ -1115,6 +1115,15 @@ pub fn detached_error(label: &str, method: &str, buffer_only: bool) -> String {
     } else {
         "a detached or out-of-bounds ArrayBuffer"
     };
+    // A symbol-keyed member reports the name of the function it ALIASES, the way
+    // node does everywhere else (`Set.prototype.keys` reports `values`):
+    // `[...detachedView]` says `%TypedArray%.prototype.values`, never
+    // `.@@iterator`, which is this frontend's internal spelling for
+    // `Symbol.iterator` and not a name any script wrote.
+    let method = match method {
+        "@@iterator" => "values",
+        other => other,
+    };
     crate::host::type_error(&format!("Cannot perform {label}.{method} on {tail}"))
 }
 
@@ -1750,10 +1759,14 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             });
             Ok(Value::Float(found.map(|p| p as f64).unwrap_or(-1.0)))
         }
-        "keys" | "values" | "entries" => {
+        // `%TypedArray%.prototype[Symbol.iterator]` IS `values` (23.2.3.35), so
+        // it dispatches here rather than reporting itself missing:
+        // `Uint8Array.prototype[Symbol.iterator].call(ta)` threw
+        // `@@iterator is not a function`.
+        "keys" | "values" | "entries" | "@@iterator" => {
             let items: Vec<Value> = with_host(|h| match method {
                 "keys" => (0..elems.len()).map(|i| Value::Float(i as f64)).collect(),
-                "values" => elems.clone(),
+                "values" | "@@iterator" => elems.clone(),
                 _ => elems
                     .iter()
                     .enumerate()

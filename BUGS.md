@@ -2568,16 +2568,6 @@ Still divergent, and why:
   but it means no record may assert a comparison count or an
   observed argument pair. `examples/sortmutation.js` guards every mutation to
   fire exactly once for that reason.
-- **A well-known symbol member is invisible to `in` and to the own-key
-  listings.** `Symbol.iterator in []` is false while `[][Symbol.iterator]` reads
-  back a function, and `Object.getOwnPropertySymbols(Array.prototype)` is `[]`
-  where node reports `Symbol.iterator` and `Symbol.unscopables`. `PROTO_MEMBERS`
-  is generated from the prototypes' STRING keys only. `gen-arity` would have to
-  emit the symbol-keyed members as a third column; consulting the intrinsic
-  table instead is not a substitute — tried, and it mints a thunk for every
-  receiver the table names, including ones whose dispatch has no implementation
-  (`[...buffer]` then fails with `@@iterator is not a function`), which is why
-  `examples/protoborrowchain.js` narrows that fallback to ordinary objects.
 - **A not-iterable TypeError names the VALUE, not the source expression.** Node
   reports `a is not iterable`; this reports `[ 1, 2 ] is not iterable`. The
   machinery exists — `host::name_call_site` rewrites `is not a function` and

@@ -76,10 +76,22 @@ members(Object.getPrototypeOf(Uint8Array.prototype), '@proto:TypedArray:');
 // it sees.
 const protos = [];
 const protoRow = (label, holder) => {
-  const names = Object.getOwnPropertyNames(holder).map((k) => {
-    let d; try { d = Object.getOwnPropertyDescriptor(holder, k); } catch { return k; }
-    return d && d.enumerable ? '+' + k : k;
-  });
+  const mark = (holder, k, spelling) => {
+    let d; try { d = Object.getOwnPropertyDescriptor(holder, k); } catch { return spelling; }
+    return d && d.enumerable ? '+' + spelling : spelling;
+  };
+  const names = Object.getOwnPropertyNames(holder).map((k) => mark(holder, k, k));
+  // SYMBOL-keyed members, under this frontend's internal spelling: a
+  // well-known symbol is `@@` plus its description minus the `Symbol.` prefix,
+  // so `Symbol(Symbol.iterator)` is `@@iterator`. They are members like any
+  // other — `Symbol.iterator in []` is true — and a table built from
+  // `getOwnPropertyNames` alone cannot say so. A symbol that is not well-known
+  // has no such spelling and is skipped rather than guessed at.
+  for (const s of Object.getOwnPropertySymbols(holder)) {
+    const d = String(s).slice('Symbol(Symbol.'.length, -1);
+    if (!d || String(s) !== 'Symbol(Symbol.' + d + ')') continue;
+    names.push(mark(holder, s, '@@' + d));
+  }
   protos.push(label + '\t' + names.join(','));
 };
 for (const c of ctors) {

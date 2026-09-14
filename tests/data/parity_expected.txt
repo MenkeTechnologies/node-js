@@ -1770,6 +1770,24 @@ webidl   append,delete,entries,forEach,get,getAll,has,keys,set,size,sort,toStrin
 url      hash,host,hostname,href,origin,password,pathname,port,protocol,search,searchParams,toJSON,toString,username
 encoder  encode,encodeInto,encoding
 callable function get 1 true
+==== protosymbols.js ====
+array         [true,true,"function"]
+map-set       [true,true,true]
+regexp        [true,true,true,true,true]
+string-box    [true,"function"]
+function      [true,"function"]
+date          [true,"function"]
+promise       [true,"Promise"]
+typed-array   [true,true]
+symbols-array ["Symbol(Symbol.iterator)","Symbol(Symbol.unscopables)"]
+symbols-regex ["Symbol(Symbol.match)","Symbol(Symbol.matchAll)","Symbol(Symbol.replace)","Symbol(Symbol.search)","Symbol(Symbol.split)"]
+symbols-map   ["Symbol(Symbol.toStringTag)","Symbol(Symbol.iterator)"]
+names-split   [[],true]
+descriptor    ["function",true,false,true]
+borrow-array  [1,2]
+borrow-typed  [3,4]
+borrow-buffer [5,6]
+detached      "Cannot perform %TypedArray%.prototype.values on a detached or out-of-bounds ArrayBuffer"
 ==== proxyintegrity.js ====
 freeze-traps  ["preventExtensions","ownKeys","getOwnPropertyDescriptor","defineProperty"]
 seal-traps    ["preventExtensions","ownKeys","defineProperty"]

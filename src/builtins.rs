@@ -7412,6 +7412,10 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
                 .iter()
                 .filter(|m| mode == 3 || m.starts_with('+'))
                 .map(|m| m.strip_prefix('+').unwrap_or(m).to_string())
+                // `getOwnPropertyNames` reports STRING keys only; the table's
+                // `@@` entries are symbol-keyed members and belong to
+                // `getOwnPropertySymbols` instead.
+                .filter(|m| !m.starts_with("@@"))
                 .collect();
             // Plus whatever a script patched onto this prototype under a NEW
             // name — an ordinary enumerable own property, so it lists in every
@@ -12401,6 +12405,24 @@ fn proxy_or_own_symbol_keys(v: &Value) -> Result<Vec<Value>, String> {
             .filter(|k| host::is_symbol_key(k))
             .map(|k| crate::proxy::key_value(k))
             .collect());
+    }
+    // An intrinsic prototype's symbol-keyed members come from the generated
+    // table, which is the only record of them: they own no map entry, so
+    // `Object.getOwnPropertySymbols(Array.prototype)` was `[]` where node
+    // reports `Symbol.iterator` and `Symbol.unscopables`.
+    if let Some(ns) = with_host(|h| match h.get(v) {
+        Some(JsObj::Builtin(ns)) => Some(ns.clone()),
+        _ => None,
+    }) {
+        if let Some(members) = intrinsic_proto_members(&ns) {
+            return Ok(with_host(|h| {
+                members
+                    .iter()
+                    .filter_map(|m| m.strip_prefix('+').unwrap_or(m).strip_prefix("@@"))
+                    .map(|name| h.well_known_symbol(name))
+                    .collect()
+            }));
+        }
     }
     Ok(with_host(|h| h.own_symbol_keys(v)))
 }

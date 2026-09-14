@@ -222,8 +222,12 @@ diffs `node -e` against the reference `node -e`, delta-debugging every divergenc
 to a minimal repro. It is subprocess-only (never links the lib), std-only (no
 `rand`), and needs `node` on `PATH`, so CI never runs it.
 
-**`gen-arity`** regenerates `src/arity.rs`, the `name` and `length` of every
-ECMAScript intrinsic function keyed the way this frontend names its builtins.
+**`gen-arity`** regenerates `src/arity.rs`, which holds two tables: the `name`
+and `length` of every ECMAScript intrinsic function, keyed the way this
+frontend names its builtins, and the own members of every intrinsic prototype —
+string-keyed and symbol-keyed alike, the latter under the same internal `@@name`
+spelling, since `Map.prototype.size` and `Array.prototype[Symbol.iterator]` are
+not derivable from a list of functions.
 Those values are normative — ECMA-262 gives each intrinsic a `length` — so the
 reference engine is a transcription source here rather than an oracle to agree
 with, and the generated table is checked in (`cargo run --bin gen-arity >
