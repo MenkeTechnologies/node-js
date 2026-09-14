@@ -75,6 +75,18 @@ members(Object.getPrototypeOf(Uint8Array.prototype), '@proto:TypedArray:');
 // is preserved here rather than sorted because that is what a script observing
 // it sees.
 const protos = [];
+// Which of those members are ACCESSORS, and so answer a `get` descriptor and
+// run a brand check rather than reading a slot. Neither existing table records
+// it: `BUILTIN_ARITY` holds functions, and a name in `PROTO_MEMBERS` says
+// nothing about its descriptor kind.
+const accessors = [];
+const accessorRow = (label, holder) => {
+  const names = Object.getOwnPropertyNames(holder).filter((k) => {
+    let d; try { d = Object.getOwnPropertyDescriptor(holder, k); } catch { return false; }
+    return !!(d && d.get);
+  });
+  if (names.length) accessors.push(label + '\t' + names.join(','));
+};
 const protoRow = (label, holder) => {
   const mark = (holder, k, spelling) => {
     let d; try { d = Object.getOwnPropertyDescriptor(holder, k); } catch { return spelling; }
@@ -99,9 +111,16 @@ for (const c of ctors) {
   if (C && C.prototype) protoRow(c, C.prototype);
 }
 protoRow('TypedArray', Object.getPrototypeOf(Uint8Array.prototype));
+for (const c of ctors) {
+  const C = globalThis[c];
+  if (C && C.prototype) accessorRow(c, C.prototype);
+}
+accessorRow('TypedArray', Object.getPrototypeOf(Uint8Array.prototype));
 console.log(rows.join('\n'));
 console.log('===PROTOS===');
 console.log(protos.join('\n'));
+console.log('===ACCESSORS===');
+console.log(accessors.join('\n'));
 "#;
 
 fn main() {
@@ -127,10 +146,26 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
-    let (arity_text, proto_text) = stdout_text
+    let (arity_text, rest) = stdout_text
         .split_once("===PROTOS===\n")
         .expect("enumerator emitted no prototype section");
+    let (proto_text, accessor_text) = rest
+        .split_once("===ACCESSORS===\n")
+        .expect("enumerator emitted no accessor section");
     // (constructor, member names) — kept in the engine's order, not sorted.
+    let accessors: Vec<(String, Vec<String>)> = accessor_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (ctor, names) = l.split_once('\t').unwrap_or((l, ""));
+            let names = names
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect();
+            (ctor.to_string(), names)
+        })
+        .collect();
     let protos: Vec<(String, Vec<String>)> = proto_text
         .lines()
         .filter(|l| !l.is_empty())
@@ -214,6 +249,30 @@ fn main() {
     let mut protos = protos;
     protos.sort();
     for (ctor, names) in &protos {
+        let list = names
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(w, "    ({ctor:?}, &[{list}]),").unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    writeln!(
+        w,
+        "\n/// The ACCESSOR members of each intrinsic prototype — the subset of\n\
+         /// [`PROTO_MEMBERS`] whose descriptor carries a `get` rather than a value.\n\
+         ///\n\
+         /// Needed because the two are not interchangeable on the PROTOTYPE itself:\n\
+         /// `Map.prototype.size` runs a brand check against `%Map.prototype%` and\n\
+         /// throws, where a data member reads back its value. Neither existing table\n\
+         /// records the descriptor kind.\n\
+         /// Sorted by constructor; the NAMES within a row are not sorted.\n\
+         pub const PROTO_ACCESSORS: &[(&str, &[&str])] = &["
+    )
+    .unwrap();
+    let mut accessors = accessors;
+    accessors.sort();
+    for (ctor, names) in &accessors {
         let list = names
             .iter()
             .map(|n| format!("{n:?}"))

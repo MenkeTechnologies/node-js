@@ -2104,6 +2104,18 @@ impl JsHost {
     /// method. An ARROW captures all three at creation, the way it captures
     /// `this` — `super` inside an arrow means the enclosing METHOD's `super`.
     /// Whether the activation now running is strict code.
+    /// Whether `v` is a function whose own body is SLOPPY — not an arrow, and
+    /// with no `'use strict'` of its own or inherited from its script. This is
+    /// the receiver test the `arguments`/`caller` poison pill keys on: node
+    /// decides by the FUNCTION, never by the code doing the reading.
+    pub fn fn_is_sloppy(&self, v: &Value) -> bool {
+        match self.get(v) {
+            Some(JsObj::Func(fv)) => {
+                !fv.is_arrow && !self.funcs.get(fv.def_id).is_some_and(|d| d.strict)
+            }
+            _ => false,
+        }
+    }
     pub fn current_strict(&self) -> bool {
         self.frame().strict
     }
@@ -3755,6 +3767,11 @@ impl JsHost {
                     // is `log`. Measured on v26.8.1.
                     if n.starts_with("console.") {
                         "function () { [native code] }".into()
+                    } else if let Some(accessor) = crate::builtins::proto_getter_name(n) {
+                        // An accessor half names itself `get size` / `set
+                        // arguments`, which `builtin_name` cannot build because
+                        // it returns a borrowed `&str`.
+                        format!("function {accessor}() {{ [native code] }}")
                     } else {
                         format!(
                             "function {}() {{ [native code] }}",
@@ -6359,6 +6376,30 @@ pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result
         Some(JsObj::Builtin(name)) if name.starts_with("@proto:") => {
             let recv = this.unwrap_or(Value::Undef);
             crate::builtins::proto_method(&recv, &name["@proto:".len()..], args)
+        }
+        // An intrinsic prototype's GETTER, borrowed off its descriptor — the
+        // form a library uses to read a slot from an arbitrary receiver
+        // (`Object.getOwnPropertyDescriptor(Map.prototype, 'size').get
+        // .call(m)`). It brand-checks `this` and reads, or throws naming
+        // itself.
+        // The setter half of the `arguments`/`caller` poison pill — the only
+        // intrinsic accessor here that has one, and it throws like its getter.
+        Some(JsObj::Builtin(name)) if name.starts_with("@protoset:") => {
+            let _ = &name;
+            let recv = this.unwrap_or(Value::Undef);
+            // The setter half accepts silently for the same receivers the
+            // getter answers for, and throws for the rest.
+            if with_host(|h| h.fn_is_sloppy(&recv)) {
+                Ok(Value::Undef)
+            } else {
+                Err(type_error(crate::builtins::POISON_PILL))
+            }
+        }
+        Some(JsObj::Builtin(name)) if name.starts_with("@protoget:") => {
+            let recv = this.unwrap_or(Value::Undef);
+            let rest = &name["@protoget:".len()..];
+            let (ctor, key) = rest.split_once(':').unwrap_or((rest, ""));
+            crate::builtins::proto_getter_call(ctor, key, &recv)
         }
         // `NativeCtor.call(obj, …)` — ES5 "constructor stealing", still shipped by
         // libraries that predate `class`. `iconv-lite`'s internal codec is exactly

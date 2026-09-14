@@ -1693,6 +1693,34 @@ sealed   true 1 true false
 prevent  true 1
 pinned   true 2
 write    9 3
+==== protoaccessors.js ====
+descriptor    ["function",null,false,false,true]
+getter-shape  ["function","get size",0,"function get size() { [native code] }"]
+regexp-descr  ["function","get source",false]
+symbol-descr  ["function","get description"]
+borrow-ok     [1,3]
+borrow-buffer 8
+borrow-view   [3,1]
+borrow-symbol "d"
+created       "Method get Map.prototype.size called on incompatible receiver #<Map>"
+wrong-plain   "Method get Map.prototype.size called on incompatible receiver #<Object>"
+wrong-number  "Method get Map.prototype.size called on incompatible receiver 5"
+wrong-array   "Method get Map.prototype.size called on incompatible receiver [object Array]"
+wrong-null    "Method get Map.prototype.size called on incompatible receiver null"
+cross-brand   "Method get ArrayBuffer.prototype.byteLength called on incompatible receiver #<DataView>"
+on-prototype  "Method get Map.prototype.size called on incompatible receiver #<Map>"
+proto-recv    "Method get Set.prototype.size called on incompatible receiver #<Set>"
+regexp-proto  ["(?:)","",null,null]
+regexp-real   ["ab+","gi",true,false]
+regexp-wrong  "RegExp.prototype.global getter called on non-RegExp object"
+flags-generic ["","gi","duy"]
+flags-nonobj  "RegExp.prototype.flags getter called on non-object 5"
+symbol-wrong  "Symbol.prototype.description requires that 'this' be a Symbol"
+poison-get    null
+poison-set    ["function","set caller"]
+poison-call   undefined
+instances     [1,1,"z",4]
+in-operator   TypeError: Cannot use 'in' operator to search for 'description' in Symbol(x)
 ==== protoborrow.js ====
 string   x b
 string2  AB bc

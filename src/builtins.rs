@@ -1112,6 +1112,17 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         }) {
             return Ok(v);
         }
+        // An intrinsic prototype the receiver's CHAIN reaches owns a
+        // `constructor` too, and it wins over the receiver's own kind:
+        // `Object.create(Map.prototype).constructor` is `Map`, not `Object`.
+        // Deciding from the kind alone also mis-named the receiver in every
+        // message that renders one — the brand-check errors say `#<Map>`.
+        if let Some(c) = chain_intrinsic_ctors(recv)
+            .into_iter()
+            .find(|c| is_builtin_ctor(c))
+        {
+            return Ok(with_host(|h| h.alloc(JsObj::Builtin(c.to_string()))));
+        }
         if let Some(cn) = with_host(|h| default_ctor_name(h, recv)) {
             return Ok(with_host(|h| h.alloc(JsObj::Builtin(cn.to_string()))));
         }
@@ -1130,6 +1141,17 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         }) != Some(true)
     {
         return Ok(prototype_of(recv));
+    }
+    // An ACCESSOR member read off the intrinsic prototype ITSELF is not a
+    // method: it RUNS the getter with that prototype as `this`, and all but two
+    // of `RegExp.prototype`'s then fail their brand check and throw. Every one
+    // answered `undefined`, so both the value and the failure were invisible.
+    // Both representations of a prototype reach here — the namespace handles
+    // and the real objects (`Symbol.prototype`, `String.prototype`).
+    if let Some(ctor) = intrinsic_proto_of(recv) {
+        if is_proto_accessor(&ctor, name) {
+            return proto_getter_call(&ctor, name, recv);
+        }
     }
     let kind = with_host(|h| h.kind_of(recv));
     #[allow(unused_mut)]
@@ -1442,16 +1464,16 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
     // Measured: on an ARGUMENTS object only `callee` is poisoned (`caller` is
     // simply absent and reads `undefined`); on a strict FUNCTION both `caller`
     // and `arguments` are.
-    let poisoned = (name == "callee" && is_arguments(recv))
-        || (matches!(name, "caller" | "arguments")
-            && matches!(
-                with_host(|h| h.kind_of(recv)),
-                Some(ObjKind::Func) | Some(ObjKind::Class)
-            ));
-    if poisoned && with_host(|h| h.current_strict()) {
-        return Err(host::type_error(
-            "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
-        ));
+    if name == "callee" && is_arguments(recv) && with_host(|h| h.current_strict()) {
+        return Err(host::type_error(POISON_PILL));
+    }
+    if matches!(name, "caller" | "arguments")
+        && matches!(
+            with_host(|h| h.kind_of(recv)),
+            Some(ObjKind::Func) | Some(ObjKind::Class)
+        )
+    {
+        return poison_pill_read(recv);
     }
     // A method SYNTHESIZED from the receiver's kind is only reachable while the
     // receiver's intrinsic prototype is still on its chain. `Object
@@ -1502,6 +1524,15 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
     }
     if matches!(out, Value::Undef) && !name.starts_with('#') {
         if let Some(owner) = inherited_method_owner(recv, name) {
+            // An INHERITED accessor runs, it does not hand back a thunk, and
+            // its brand check is about the receiver's internal slot rather than
+            // its chain — `Object.create(Map.prototype).size` throws in node
+            // even though `Map.prototype` is right there above it. This
+            // answered `undefined`, which is the value a real Map would never
+            // give and a plain object should never reach.
+            if is_proto_accessor(owner, name) {
+                return proto_getter_call(owner, name, recv);
+            }
             let key = format!("@proto:{owner}:{name}");
             if builtin_meta(&key).is_some() {
                 return Ok(with_host(|h| h.alloc(JsObj::Builtin(key))));
@@ -2312,6 +2343,190 @@ fn namespace_constant(ns: &str, name: &str) -> Option<f64> {
         .map(|(_, v)| *v)
 }
 
+/// Whether `ctor` is a WebIDL interface, whose prototype members are plain
+/// assigned — and so ENUMERABLE — rather than the non-enumerable ones an
+/// ECMAScript builtin defines. The generated member table records the same
+/// distinction with its `+` prefix.
+fn is_webidl_proto(ctor: &str) -> bool {
+    intrinsic_proto_members(&format!("{ctor}.prototype"))
+        .is_some_and(|ms| ms.iter().any(|m| m.starts_with('+')))
+}
+
+/// Whether `ctor.prototype` defines `key` as an ACCESSOR rather than a data
+/// property or a method.
+pub(crate) fn is_proto_accessor(ctor: &str, key: &str) -> bool {
+    crate::arity::PROTO_ACCESSORS
+        .binary_search_by(|(k, _)| (*k).cmp(ctor))
+        .ok()
+        .is_some_and(|i| crate::arity::PROTO_ACCESSORS[i].1.contains(&key))
+}
+
+/// The constructor whose `.prototype` IS `recv`, whichever of the two
+/// representations it uses — a `Builtin` namespace handle or a real object.
+pub(crate) fn intrinsic_proto_of(recv: &Value) -> Option<String> {
+    with_host(|h| match h.get(recv) {
+        Some(JsObj::Builtin(ns)) => ns.strip_suffix(".prototype").map(str::to_string),
+        _ => h.intrinsic_proto_ctor(recv).map(str::to_string),
+    })
+}
+
+/// The getter function of an intrinsic prototype accessor, as a first-class
+/// value — what `Object.getOwnPropertyDescriptor(Map.prototype, 'size').get`
+/// hands back, and the form a library uses to borrow one.
+fn proto_getter(ctor: &str, key: &str) -> Value {
+    with_host(|h| h.alloc(JsObj::Builtin(format!("@protoget:{ctor}:{key}"))))
+}
+
+/// Whether `recv` carries the internal slot `ctor`'s accessor demands. This is
+/// a BRAND check, not a chain walk: `Object.create(Map.prototype).size` throws
+/// in node even though `Map.prototype` is right there on the chain.
+fn brand_matches(recv: &Value, ctor: &str) -> bool {
+    if let Some(tag) = crate::stdlib::native_tag(recv) {
+        if tag == ctor || (ctor == "TypedArray" && tag == "TypedArray") {
+            return true;
+        }
+    }
+    match ctor {
+        "TypedArray" => crate::stdlib::native_tag(recv).as_deref() == Some("TypedArray"),
+        "ArrayBuffer" => with_host(
+            |h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key("@@bytes")),
+        ),
+        _ => {
+            let own = match wrapped_primitive(recv).as_ref().and_then(wrapper_ctor_of) {
+                Some(c) => Some(c),
+                None => with_host(|h| default_ctor_name(h, recv)),
+            };
+            own == Some(ctor)
+        }
+    }
+}
+
+/// Invoke an intrinsic prototype's getter against `recv` — the body behind the
+/// `@protoget:` thunks.
+///
+/// Reading one OFF THE PROTOTYPE (`Map.prototype.size`) is the case that was
+/// wrong: it answered `undefined` where node runs the getter, fails the brand
+/// check and throws. `RegExp.prototype` is the documented exception — 22.2.6.10
+/// and .13 return `"(?:)"` and `""` for it specifically, so the one receiver
+/// that would otherwise throw for every flag reads two of them back.
+pub(crate) fn proto_getter_call(ctor: &str, key: &str, recv: &Value) -> Result<Value, String> {
+    let is_the_prototype = with_host(
+        |h| matches!(h.get(recv), Some(JsObj::Builtin(ns)) if *ns == format!("{ctor}.prototype")),
+    );
+    if is_the_prototype && ctor == "RegExp" {
+        // 22.2.6.x each carry the same step: when `this` IS `%RegExp.prototype%`
+        // the getter returns rather than throwing. `source` and `flags` have
+        // their own values there; every flag getter answers `undefined`.
+        return Ok(match key {
+            "source" => with_host(|h| h.new_str("(?:)".to_string())),
+            "flags" => with_host(|h| h.new_str(String::new())),
+            _ => Value::Undef,
+        });
+    }
+    // `RegExp.prototype.flags` (22.2.6.5) is the one that is GENERIC: it reads
+    // the individual flag properties off whatever object it is handed and
+    // concatenates their letters, so a plain object answers `""` rather than
+    // throwing, and one carrying `global`/`ignoreCase` answers `"gi"`.
+    if ctor == "RegExp" && key == "flags" && !brand_matches(recv, ctor) {
+        if !with_host(|h| is_object_like(h, recv)) {
+            return Err(regexp_brand_error(key, recv));
+        }
+        let mut out = String::new();
+        for (prop, letter) in REGEXP_FLAG_LETTERS {
+            let v = get_property(recv, prop)?;
+            if with_host(|h| h.truthy(&v)) {
+                out.push(*letter);
+            }
+        }
+        return Ok(with_host(|h| h.new_str(out)));
+    }
+    // `Function.prototype.arguments`/`caller` are POISON PILLS (10.2.4.1): both
+    // the getter and the setter throw for every receiver, which is how a strict
+    // function keeps its caller unreachable. They are not brand checks and do
+    // not name the receiver.
+    if ctor == "Function" && matches!(key, "arguments" | "caller") {
+        return poison_pill_read(recv);
+    }
+    if !brand_matches(recv, ctor) {
+        return Err(match ctor {
+            "RegExp" => regexp_brand_error(key, recv),
+            "Symbol" => {
+                host::type_error("Symbol.prototype.description requires that 'this' be a Symbol")
+            }
+            _ => host::type_error(&format!(
+                "Method get {ctor}.prototype.{key} called on incompatible receiver {}",
+                brand_receiver_string(recv)
+            )),
+        });
+    }
+    get_property(recv, key)
+}
+
+/// `Function.prototype.arguments`/`caller` read against `recv`.
+///
+/// The pill is conditional and the condition is the RECEIVER, not the reading
+/// code: a sloppy non-arrow function answers `null` (node stopped populating
+/// these long ago but kept them readable), and everything else — an arrow, a
+/// strict function, a non-function — throws. Keying it on the READER's
+/// strictness, which is what this did, made `strictFn.arguments` answer
+/// `undefined` from sloppy code and a sloppy function throw from strict code:
+/// wrong in both directions.
+pub(crate) fn poison_pill_read(recv: &Value) -> Result<Value, String> {
+    if with_host(|h| h.fn_is_sloppy(recv)) {
+        return Ok(with_host(|h| h.null()));
+    }
+    Err(host::type_error(POISON_PILL))
+}
+
+/// The message both halves of the `arguments`/`caller` poison pill throw.
+pub(crate) const POISON_PILL: &str = "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them";
+
+/// How a REJECTED receiver is rendered in a brand-check message.
+///
+/// `no_side_effects_string` answers for most of them, but two kinds differ:
+/// an intrinsic PROTOTYPE renders `#<Map>` rather than `[object Map]`, and so
+/// does an `ArrayBuffer`/`DataView` instance, which this host tags natively and
+/// that function therefore brands. Node draws the line at whether the value is
+/// one of the ES5-era classes (`Array`, `Date`, `RegExp` are `[object X]`); the
+/// two cases here are the ones that fall on the other side of it.
+fn brand_receiver_string(recv: &Value) -> String {
+    if let Some(ctor) = intrinsic_proto_of(recv) {
+        return format!("#<{ctor}>");
+    }
+    match crate::stdlib::native_tag(recv).as_deref() {
+        Some(tag @ ("ArrayBuffer" | "DataView")) => format!("#<{tag}>"),
+        _ => no_side_effects_string(recv),
+    }
+}
+
+/// The flag properties `RegExp.prototype.flags` reads, in the order 22.2.6.5
+/// concatenates their letters.
+const REGEXP_FLAG_LETTERS: &[(&str, char)] = &[
+    ("hasIndices", 'd'),
+    ("global", 'g'),
+    ("ignoreCase", 'i'),
+    ("multiline", 'm'),
+    ("dotAll", 's'),
+    ("unicode", 'u'),
+    ("unicodeSets", 'v'),
+    ("sticky", 'y'),
+];
+
+/// `RegExp.prototype`'s flag getters word their brand failure their own way,
+/// and `flags` distinguishes a non-object receiver from a non-RegExp one
+/// because 22.2.6.5 reads the individual flags off any object it is given.
+fn regexp_brand_error(key: &str, recv: &Value) -> String {
+    if key == "flags" && !with_host(|h| matches!(recv, Value::Obj(_)) && !h.is_null(recv)) {
+        return host::type_error(&format!(
+            "RegExp.prototype.flags getter called on non-object {}",
+            no_side_effects_string(recv)
+        ));
+    }
+    host::type_error(&format!(
+        "RegExp.prototype.{key} getter called on non-RegExp object"
+    ))
+}
+
 /// A property on a builtin namespace object (`Math.PI`, `Number.MAX_SAFE_INTEGER`,
 /// `console.log`).
 pub fn namespace_property(ns: &str, name: &str) -> Value {
@@ -2572,11 +2787,22 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     // fall through: `Math.name` and `require('fs').length` really are undefined.
     if host::builtin_is_callable(ns) {
         match name {
-            "name" => return with_host(|h| h.new_str(builtin_name(ns).to_string())),
+            "name" => {
+                if let Some(n) = proto_getter_name(ns) {
+                    return with_host(|h| h.new_str(n));
+                }
+                return with_host(|h| h.new_str(builtin_name(ns).to_string()));
+            }
             // Only the intrinsics have a specified arity; a core-module
             // function's is a property of node's own JS source, so it stays
             // `undefined` rather than being invented here.
             "length" => {
+                // A getter takes no argument (10.2.9 / the accessor grammar),
+                // so its `length` is 0 — it is not in the intrinsic table,
+                // which holds only named functions.
+                if proto_getter_name(ns).is_some() {
+                    return Value::Float(0.0);
+                }
                 if let Some((_, len)) = builtin_meta(ns) {
                     return Value::Float(len as f64);
                 }
@@ -4255,7 +4481,12 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
     let key = vm.pop();
     // `x in y` requires y to be an object. V8 names both operands:
     // `Cannot use 'in' operator to search for 'a' in 5`.
-    if !matches!(container, Value::Obj(_)) {
+    // A heap-backed PRIMITIVE — a string, a symbol, a bigint — is a
+    // `Value::Obj` in this host but is not an object, so the shape test alone
+    // let `'length' in 'ab'` and `'description' in Symbol('x')` answer `true`
+    // where node throws. `is_primitive` is the same predicate `ToObject` and
+    // `typeof` use, so the three cannot disagree about what an object is.
+    if !matches!(container, Value::Obj(_)) || with_host(|h| host::is_primitive(h, &container)) {
         let (k, c) = with_host(|h| (h.property_key(&key), h.str_of(&container)));
         return abort(
             vm,
@@ -5414,8 +5645,23 @@ pub fn builtin_name(key: &str) -> &str {
     }
     match key.strip_prefix("@proto:") {
         Some(rest) => rest.rsplit(':').next().unwrap_or(rest),
+        // An accessor's getter is named `get <member>` (10.2.9 SetFunctionName
+        // with a `get` prefix), which is what `util.inspect` prints for it and
+        // what a library reads to identify one.
         None => key.rsplit('.').next().unwrap_or(key),
     }
+}
+
+/// The `name` of an intrinsic accessor's getter thunk, or `None` for anything
+/// else. Kept out of `builtin_name`'s `&str` return, which cannot own the
+/// `"get size"` it has to build.
+pub fn proto_getter_name(key: &str) -> Option<String> {
+    let (verb, rest) = match key.strip_prefix("@protoget:") {
+        Some(rest) => ("get", rest),
+        None => ("set", key.strip_prefix("@protoset:")?),
+    };
+    let (_, member) = rest.split_once(':')?;
+    Some(format!("{verb} {member}"))
 }
 
 pub fn is_known_builtin(name: &str) -> bool {
@@ -13068,6 +13314,32 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     // `Object.getOwnPropertyDescriptor(Math, 'PI')` was `undefined`, which reads
     // as "no such property" to the shim/polyfill family that probes a namespace
     // before patching it.
+    // An ACCESSOR member describes itself with a `get`, never a `value` — and
+    // it must do so without READING the property, since running the getter
+    // against the prototype is exactly what throws. Both prototype
+    // representations are covered, so `Symbol.prototype.description` and
+    // `Map.prototype.size` answer alike; both were `undefined`, which reads as
+    // "no such property" to anything that probes before patching.
+    if let Some(ctor) = intrinsic_proto_of(&obj) {
+        if is_proto_accessor(&ctor, &key) {
+            let getter = proto_getter(&ctor, &key);
+            // The poison pair is the only accessor here with a SETTER; every
+            // other intrinsic accessor is read-only.
+            let setter = (ctor == "Function" && matches!(key.as_str(), "arguments" | "caller"))
+                .then(|| with_host(|h| h.alloc(JsObj::Builtin(format!("@protoset:{ctor}:{key}")))));
+            return Ok(with_host(|h| {
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("get".into(), getter);
+                // `undefined`, not null: a read-only accessor has no setter at
+                // all, and `JSON.stringify` of the descriptor must drop the key
+                // rather than report `"set": null`.
+                m.insert("set".into(), setter.unwrap_or(Value::Undef));
+                m.insert("enumerable".into(), Value::Bool(is_webidl_proto(&ctor)));
+                m.insert("configurable".into(), Value::Bool(true));
+                h.new_object(m)
+            }));
+        }
+    }
     if let Some(ns) = with_host(|h| match h.get(&obj) {
         Some(JsObj::Builtin(ns)) => Some(ns.clone()),
         _ => None,

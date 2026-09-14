@@ -1052,3 +1052,64 @@ pub const PROTO_MEMBERS: &[(&str, &[&str])] = &[
         &["constructor", "delete", "has", "add", "@@toStringTag"],
     ),
 ];
+
+/// The ACCESSOR members of each intrinsic prototype — the subset of
+/// [`PROTO_MEMBERS`] whose descriptor carries a `get` rather than a value.
+///
+/// Needed because the two are not interchangeable on the PROTOTYPE itself:
+/// `Map.prototype.size` runs a brand check against `%Map.prototype%` and
+/// throws, where a data member reads back its value. Neither existing table
+/// records the descriptor kind.
+/// Sorted by constructor; the NAMES within a row are not sorted.
+pub const PROTO_ACCESSORS: &[(&str, &[&str])] = &[
+    (
+        "ArrayBuffer",
+        &["byteLength", "maxByteLength", "resizable", "detached"],
+    ),
+    ("DataView", &["buffer", "byteLength", "byteOffset"]),
+    ("Function", &["arguments", "caller"]),
+    ("Iterator", &["constructor"]),
+    ("Map", &["size"]),
+    ("Object", &["__proto__"]),
+    (
+        "RegExp",
+        &[
+            "dotAll",
+            "flags",
+            "global",
+            "hasIndices",
+            "ignoreCase",
+            "multiline",
+            "source",
+            "sticky",
+            "unicode",
+            "unicodeSets",
+        ],
+    ),
+    ("Set", &["size"]),
+    ("Symbol", &["description"]),
+    ("TextDecoder", &["encoding", "fatal", "ignoreBOM"]),
+    ("TextEncoder", &["encoding"]),
+    (
+        "TypedArray",
+        &["buffer", "byteLength", "byteOffset", "length"],
+    ),
+    (
+        "URL",
+        &[
+            "href",
+            "origin",
+            "protocol",
+            "username",
+            "password",
+            "host",
+            "hostname",
+            "port",
+            "pathname",
+            "search",
+            "searchParams",
+            "hash",
+        ],
+    ),
+    ("URLSearchParams", &["size"]),
+];

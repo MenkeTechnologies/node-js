@@ -2575,3 +2575,23 @@ Still divergent, and why:
   handles only those two suffixes, and the `GETITER` op records no source text.
   `examples/protodetach.js` therefore pins `e.constructor.name` and not the
   message.
+- **A REAL-object prototype's own-name listing is wrong.** The intrinsic
+  prototypes this host builds as namespace handles answer
+  `getOwnPropertyNames` from the generated table
+  (`examples/protomembers.js`); the ones it builds as real objects —
+  `Symbol.prototype`, `String.prototype`, `Number.prototype`, the error
+  hierarchy — answer from their own property maps, which carry neither the
+  right names nor V8's order: `Symbol.prototype` reports
+  `constructor,toString,valueOf,toLocaleString` where node reports
+  `constructor,toString,valueOf,description`, and `String.prototype` omits the
+  Annex B HTML methods and `length` entirely. The accessors themselves now
+  read and describe correctly (`examples/protoaccessors.js`); it is only the
+  LISTING that is wrong. Routing those prototypes' own keys through
+  `PROTO_MEMBERS` the way the handles already are is the fix.
+- **An object does not borrow its BRAND from the chain.**
+  `Object.prototype.toString.call(Object.create(Map.prototype))` is
+  `[object Object]` where node reports `[object Map]`, because the tag is
+  decided by the receiver's kind rather than by the `Symbol.toStringTag` its
+  chain reaches. `constructor` and the prototype's methods and accessors are
+  all borrowed correctly now (`examples/protoborrowchain.js`,
+  `examples/protoaccessors.js`); the brand is the last one that is not.
