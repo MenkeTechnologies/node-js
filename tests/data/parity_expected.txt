@@ -1725,6 +1725,25 @@ define    9 5 0
 redefine  z {"value":"z","writable":false,"enumerable":false,"configurable":true}
 descs     ["length","name","prototype"] ["0","1"]
 copies    {} {} [["0",5],["1",6]] {"0":5,"1":6}
+==== primitivereceivers.js ====
+reflect-set   [false,false,false,false,false]
+reflect-null  false
+reflect-ok    [true,1]
+reflect-recv  [true,null,1]
+instanceof-s  "Right-hand side of 'instanceof' is not an object"
+instanceof-y  "Right-hand side of 'instanceof' is not an object"
+instanceof-b  "Right-hand side of 'instanceof' is not an object"
+instanceof-n  "Right-hand side of 'instanceof' is not an object"
+instanceof-o  "Right-hand side of 'instanceof' is not callable"
+instanceof-ok [true,false]
+integrity-str [false,true,true]
+integrity-sym [false,true,true]
+integrity-big [false,true,true]
+integrity-num [false,true,true]
+boxed         [true,false,false]
+plain-object  [true,false,false]
+frozen-object [false,true,true]
+seal-freeze   [true,true,true]
 ==== processenv.js ====
 num      5 string 51
 coerced  true undefined null

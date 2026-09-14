@@ -7433,7 +7433,7 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
         // right-hand side is "not an object", an object that is merely not
         // callable is "not callable". Only the second was implemented, so
         // `1 instanceof 3` reported nothing at all.
-        return Err(type_error(if matches!(ctor, Value::Obj(_)) {
+        return Err(type_error(if with_host(|h| !is_primitive(h, ctor)) {
             "Right-hand side of 'instanceof' is not callable"
         } else {
             "Right-hand side of 'instanceof' is not an object"

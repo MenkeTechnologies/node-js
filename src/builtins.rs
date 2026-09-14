@@ -3706,7 +3706,12 @@ pub fn set_with_receiver(
     // Steps 3.b-3.d: only an object can receive the property, and its OWN
     // property decides — an accessor or a read-only slot refuses, and every
     // other case defines a plain data property.
-    if !matches!(receiver, Value::Obj(_)) {
+    //
+    // `is_object_like`, not a shape test: a string, a symbol and a bigint are
+    // PRIMITIVES that ride as `Value::Obj` handles here, so the shape check
+    // passed them through to `defineProperty`, which then threw `called on
+    // non-object` where 10.1.9.2 step 3.b simply reports `false`.
+    if !with_host(|h| is_object_like(h, receiver)) {
         return Ok(false);
     }
     if let Some((_, writable, _, is_accessor)) = own_prop_facts(receiver, key) {
@@ -3731,6 +3736,13 @@ pub fn set_with_receiver(
     let k = with_host(|h| h.new_str(key.to_string()));
     define_property_pub(receiver, k, desc)?;
     Ok(true)
+}
+
+/// Whether the first argument is a PRIMITIVE — including the three that ride as
+/// heap handles, which a shape test misses.
+fn is_primitive_arg(args: &[Value]) -> bool {
+    let v = arg0(args);
+    with_host(|h| host::is_primitive(h, &v))
 }
 
 /// The `TypeError` a refused write raises in strict code, worded as V8 does.
@@ -6297,6 +6309,13 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             with_host(|h| h.prevent_extensions(&v));
             Ok(v)
         }
+        // A PRIMITIVE has no integrity to speak of and 7.3.15/16 answer for it
+        // without coercion: it is not extensible, and vacuously frozen and
+        // sealed. Reporting it extensible and unfrozen was the opposite of
+        // every one of the three.
+        "Object.isFrozen" if is_primitive_arg(&args) => Ok(Value::Bool(true)),
+        "Object.isSealed" if is_primitive_arg(&args) => Ok(Value::Bool(true)),
+        "Object.isExtensible" if is_primitive_arg(&args) => Ok(Value::Bool(false)),
         "Object.isFrozen" => integrity_level(&arg0(&args), true),
         "Object.isSealed" => integrity_level(&arg0(&args), false),
         "Object.isExtensible" => {
