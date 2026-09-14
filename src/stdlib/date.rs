@@ -194,6 +194,22 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
 
 /// Date instance methods (all treated as UTC — see the module note).
 pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
+    // Every `set*` argument is `ToNumber`d (21.4.4.x), which runs a user
+    // `valueOf` and can throw from it. The reads below are infallible and do no
+    // `ToPrimitive`, so `d.setFullYear({valueOf: () => 2020})` produced an
+    // Invalid Date.
+    let coerced: Vec<Value>;
+    let _args: &[Value] = if method.starts_with("set") {
+        let mut out = Vec::with_capacity(_args.len());
+        for a in _args {
+            let p = crate::host::to_primitive(a, "number")?;
+            out.push(Value::Float(with_host(|h| h.to_number(&p))));
+        }
+        coerced = out;
+        &coerced
+    } else {
+        _args
+    };
     let ms = ms_of(recv);
     let f = |ms: f64| ms; // readability alias for numeric returns
     Ok(match method {

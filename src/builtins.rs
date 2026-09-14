@@ -1970,7 +1970,7 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
                     "Object.prototype.{name}: Expecting function"
                 )));
             }
-            let key = with_host(|h| h.property_key(&arg0(&args)));
+            let key = host::to_property_key(&arg0(&args))?;
             let desc = with_host(|h| {
                 let mut m: IndexMap<String, Value> = IndexMap::new();
                 m.insert(if getter { "get" } else { "set" }.into(), f);
@@ -1983,7 +1983,7 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
         }
         "__lookupGetter__" | "__lookupSetter__" => {
             let want_get = name == "__lookupGetter__";
-            let key = with_host(|h| h.property_key(&arg0(&args)));
+            let key = host::to_property_key(&arg0(&args))?;
             // Walks the prototype chain, unlike `getOwnPropertyDescriptor`.
             let found = with_host(|h| host::lookup_accessor(h, recv, &key));
             Ok(match found {
@@ -1995,7 +1995,7 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             })
         }
         "hasOwnProperty" => {
-            let k = with_host(|h| h.property_key(&arg0(&args)));
+            let k = host::to_property_key(&arg0(&args))?;
             // The global object OWNS its lazily-bound builtins and every global
             // a script created; neither lives in its property map.
             if with_host(|h| h.is_global_object(recv))
@@ -4683,7 +4683,10 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
             )),
         );
     }
-    let k = with_host(|h| h.property_key(&key));
+    let k = match host::to_property_key(&key) {
+        Ok(k) => k,
+        Err(e) => return abort(vm, e),
+    };
     match has_property(&container, &k) {
         Ok(b) => Value::Bool(b),
         Err(e) => abort(vm, e),
@@ -6477,7 +6480,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.deleteProperty" => {
             let obj = arg0(&args);
             reflect_require_object(&obj, "deleteProperty")?;
-            let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let k = host::to_property_key(&args.get(1).cloned().unwrap_or(Value::Undef))?;
             Ok(Value::Bool(delete_property(&obj, &k)?))
         }
         "Reflect.setPrototypeOf" => {
@@ -6536,7 +6539,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.has" => {
             let obj = arg0(&args);
             reflect_require_object(&obj, "has")?;
-            let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let k = host::to_property_key(&args.get(1).cloned().unwrap_or(Value::Undef))?;
             Ok(Value::Bool(has_property(&obj, &k)?))
         }
         // `Reflect.get(target, key, receiver)` — the optional third argument is
@@ -6544,7 +6547,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.get" => {
             let obj = arg0(&args);
             reflect_require_object(&obj, "get")?;
-            let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let k = host::to_property_key(&args.get(1).cloned().unwrap_or(Value::Undef))?;
             let receiver = args.get(2).cloned().unwrap_or_else(|| obj.clone());
             get_property_recv(&obj, &k, &receiver)
         }
@@ -6555,7 +6558,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.set" => {
             let obj = arg0(&args);
             reflect_require_object(&obj, "set")?;
-            let k = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let k = host::to_property_key(&args.get(1).cloned().unwrap_or(Value::Undef))?;
             let v = args.get(2).cloned().unwrap_or(Value::Undef);
             let receiver = args.get(3).cloned().unwrap_or_else(|| obj.clone());
             Ok(Value::Bool(set_with_receiver(&obj, &k, v, &receiver)?))
@@ -8406,8 +8409,14 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
 
 /// Items of an array-like `{ length, 0, 1, … }` object (for `Array.from`).
 fn array_like_items(src: &Value) -> Vec<Value> {
+    // `LengthOfArrayLike` is `ToLength(Get(O, "length"))`, and `ToNumber` runs a
+    // user `valueOf` — `Array.from({length: {valueOf: () => 1}})` was empty
+    // because the infallible read does no `ToPrimitive`. A throw from it is
+    // swallowed here for the same reason the `length` read is: this helper has
+    // no way to report one, and every caller treats an unreadable length as 0.
     let len = get_property(src, "length")
         .ok()
+        .and_then(|l| host::to_primitive(&l, "number").ok())
         .map(|l| with_host(|h| h.to_number(&l)))
         .unwrap_or(0.0);
     if !len.is_finite() || len <= 0.0 {
@@ -13208,7 +13217,7 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
     // A Proxy defines through its `defineProperty` trap; the target it forwards
     // to is where the ordinary path below finally runs.
     if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
-        let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+        let key = host::to_property_key(&args.get(1).cloned().unwrap_or(Value::Undef))?;
         let desc = args.get(2).cloned().unwrap_or(Value::Undef);
         if !with_host(|h| is_object_like(h, &desc)) {
             return Err(host::type_error(&format!(
@@ -13239,7 +13248,7 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
             with_host(|h| h.str_of(&desc))
         )));
     }
-    let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+    let key = host::to_property_key(&args.get(1).cloned().unwrap_or(Value::Undef))?;
     apply_descriptor(&obj, &key, &desc)?;
     Ok(obj)
 }
@@ -13753,7 +13762,7 @@ fn synthesized_own_descriptor(obj: &Value, key: &str) -> Option<(Value, host::Pr
 fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
     require_object_coercible(&obj)?;
-    let key = with_host(|h| h.property_key(&args.get(1).cloned().unwrap_or(Value::Undef)));
+    let key = host::to_property_key(&args.get(1).cloned().unwrap_or(Value::Undef))?;
     // A string primitive's boxed own properties: each code-unit index is an
     // enumerable, non-writable, non-configurable data property, and `length` is
     // the same minus enumerable.

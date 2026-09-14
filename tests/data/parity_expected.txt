@@ -1426,6 +1426,26 @@ array    arr
 root     ""|object|1
 order    b,a,c,
 dropped  {"b":2}
+==== keycoercion.js ====
+read          [["a:toString"],7]
+write         [["a:toString"],["k"]]
+delete        [["a:toString"],[]]
+in            [["a:toString"],true]
+hasOwnProperty [["a:toString"],true]
+Object.hasOwn [["a:toString"],true]
+defineProperty [["a:toString"],["k"]]
+getOwnPropDesc [["a:toString"],{"value":1,"writable":true,"enumerable":true,"configurable":true}]
+Reflect.get   [["a:toString"],7]
+Reflect.has   [["a:toString"],true]
+Reflect.delete [["a:toString"],[]]
+symbol-key    [1,true,true,1]
+throws        "K"
+setUTCFullYr  [["a:valueOf"],1]
+setUTCMonth   [["a:valueOf"],1]
+setTime       [["a:valueOf"],1]
+date-throws   "D"
+Array.from    [["a:valueOf"],1]
+array-like-0  0
 ==== livearray.js ====
 shift-forEach [[1,3],[3]]
 pop-forEach   [[1,2],[1]]
