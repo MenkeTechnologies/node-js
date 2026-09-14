@@ -1691,7 +1691,11 @@ impl JsHost {
             return PropAttrs {
                 writable,
                 enumerable: false,
-                configurable: false,
+                // An ARGUMENTS object's `length` is an ordinary data property
+                // (10.4.4.6), so it is configurable where a real array's is
+                // not. The two share a backing representation here, so the
+                // exotic's attributes have to be told apart explicitly.
+                configurable: crate::builtins::is_arguments_h(self, owner),
             };
         }
         match owner {
@@ -6447,7 +6451,7 @@ pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result
             Ok(Value::Undef)
         }
         Some(JsObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args),
-        Some(JsObj::Func(fv)) => run_user_func(&fv, args, this),
+        Some(JsObj::Func(fv)) => run_user_func_of(&fv, args, this, Some(callable.clone())),
         // A method read off an object is modelled as a thunk BOUND to it, but an
         // explicit `.call`/`.apply` receiver still wins — `Function.prototype.call`
         // rebinds `this`, and every `Array.prototype` method is generic over it, so
@@ -6539,7 +6543,18 @@ fn adopt_native_slots(target: &Value, built: &Value) {
 
 /// Execute a user function/closure body on a fresh frame.
 pub fn run_user_func(fv: &FuncVal, args: Vec<Value>, this: Option<Value>) -> Result<Value, String> {
-    run_user_func_nt(fv, args, this, None)
+    run_user_func_of(fv, args, this, None)
+}
+
+/// [`run_user_func`] with the function VALUE the call came through, which the
+/// `arguments` object needs for its `callee`.
+pub fn run_user_func_of(
+    fv: &FuncVal,
+    args: Vec<Value>,
+    this: Option<Value>,
+    callee: Option<Value>,
+) -> Result<Value, String> {
+    run_user_func_full(fv, args, this, None, callee)
 }
 
 /// As `run_user_func`, but with an explicit `new.target` (set by `new`).
@@ -6548,6 +6563,16 @@ pub fn run_user_func_nt(
     args: Vec<Value>,
     this: Option<Value>,
     new_target: Option<Value>,
+) -> Result<Value, String> {
+    run_user_func_full(fv, args, this, new_target, None)
+}
+
+fn run_user_func_full(
+    fv: &FuncVal,
+    args: Vec<Value>,
+    this: Option<Value>,
+    new_target: Option<Value>,
+    callee: Option<Value>,
 ) -> Result<Value, String> {
     // Only the light fields: cloning the whole `FuncDef` cloned its `Chunk` —
     // the entire compiled body, `sub_chunks` and all — on every single call.
@@ -6565,7 +6590,15 @@ pub fn run_user_func_nt(
     let env = new_env(fv.env.clone());
     // Bind the simple/rest arg slots; destructuring + defaults run in the body
     // prologue (compiled ahead of the user statements).
-    bind_params(&env, &params, args, is_arrow_def);
+    let fn_is_sloppy = with_host(|h| !h.funcs.get(fv.def_id).is_some_and(|d| d.strict));
+    bind_params(
+        &env,
+        &params,
+        args,
+        is_arrow_def,
+        callee.as_ref(),
+        fn_is_sloppy && !is_arrow_def,
+    );
     // Arrow functions capture `this` lexically; regular functions receive it.
     let mut this_val = if fv.is_arrow { fv.this.clone() } else { this };
     // 10.2.1.2 OrdinaryCallBindThis: in SLOPPY mode an absent or nullish `this`
@@ -6665,7 +6698,14 @@ pub fn run_user_func_nt(
 
 /// Bind positional args into a fresh call environment. The compiler emits the
 /// param names in `def.params`; a `...rest` slot collects the tail as an array.
-fn bind_params(env: &Env, params: &[ParamSlot], args: Vec<Value>, is_arrow: bool) {
+fn bind_params(
+    env: &Env,
+    params: &[ParamSlot],
+    args: Vec<Value>,
+    is_arrow: bool,
+    callee: Option<&Value>,
+    sloppy: bool,
+) {
     let mut vars = VarMap::default();
     let mut i = 0;
     for slot in params {
@@ -6695,6 +6735,15 @@ fn bind_params(env: &Env, params: &[ParamSlot], args: Vec<Value>, is_arrow: bool
             // The backing representation stays an Array, which is what keeps
             // indices, `length`, spread and `for-of` working.
             h.set_fn_prop(&a, "@@arguments", Value::Bool(true));
+            // `callee` is the function itself in SLOPPY code (it is a poison
+            // pill only in strict, which the read path handles). It read back
+            // `undefined`, so the pre-`class` self-reference idiom
+            // `(function(){ arguments.callee })` found nothing.
+            if let Some(f) = callee {
+                if sloppy {
+                    h.set_fn_prop(&a, "@@callee", f.clone());
+                }
+            }
             a
         });
         vars.entry("arguments".to_string()).or_insert(args_arr);

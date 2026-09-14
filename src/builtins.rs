@@ -1377,6 +1377,11 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                     JsObj::Array(items) => items.get(i).cloned(),
                     _ => None,
                 })
+                // An index PAST an `arguments` object's length is an ordinary
+                // own property in the side table, since adding one must not
+                // move `length`. The array read alone could not see it, so the
+                // write was invisible to every later read.
+                .or_else(|| with_host(|h| h.fn_prop(recv, name)))
                 .unwrap_or(Value::Undef)
             } else if name == "@@iterator"
                 || is_object_method(name)
@@ -1474,6 +1479,13 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         )
     {
         return poison_pill_read(recv);
+    }
+    // `arguments.callee` in SLOPPY code is the running function — the
+    // pre-`class` self-reference idiom. It read back `undefined`.
+    if name == "callee" && is_arguments(recv) {
+        if let Some(f) = with_host(|h| h.fn_prop(recv, "@@callee")) {
+            return Ok(f);
+        }
     }
     // A method SYNTHESIZED from the receiver's kind is only reachable while the
     // receiver's intrinsic prototype is still on its chain. `Object
@@ -3917,6 +3929,16 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
                     };
                 }
             });
+            return Ok(());
+        }
+    }
+    // An `arguments` object is an ORDINARY object with a `length` data property,
+    // not an array: a write PAST the end adds an index and leaves `length`
+    // alone. The array backing grew it instead, so `f(1)` followed by
+    // `arguments[1] = 9` reported `arguments.length` as 2.
+    if let Ok(i) = name.parse::<usize>() {
+        if is_arguments(recv) && i >= array_len(recv) {
+            with_host(|h| h.set_fn_prop(recv, name, val));
             return Ok(());
         }
     }

@@ -509,7 +509,7 @@ v26.7.0; every row marked **agrees** is now pinned by a test.
 | `require.main === module` | `true` | `false` | `false` | **`require.main` absent** |
 | top-level `this` | `module.exports` | `globalThis` | `globalThis` | agrees |
 | top-level `arguments` | the wrapper's 5 | *undefined* | *undefined* | **undefined at all three** |
-| `arguments.callee` in a SLOPPY function | the function | same | same | **`undefined`** (in strict code it throws, as node does) |
+| `arguments.callee` in a SLOPPY function | the function | same | same | agrees |
 | stack frame file | `file:L:C` | `[eval]:L:C` | `[stdin]:L:C` | **no `file:line:col`** |
 
 A row that used to sit in this table said node-js was **strict at all three**
@@ -2596,3 +2596,21 @@ Still divergent, and why:
   Regenerating against a different node version rewrites all four at once, so
   the diff is large and every row of it is a claim about that engine. Check the
   version before blessing one in.
+- **A sloppy `arguments` object is not MAPPED to its parameters.** 10.4.4 makes
+  `arguments[i]` and the i-th parameter one storage location when the function
+  is sloppy and its parameter list is simple: `function f(a) { a = 99; return
+  arguments[0] }` is 99 in node and 1 here, and the reverse assignment is the
+  same. `Object.defineProperty(arguments, '0', {value: 42})` likewise does not
+  reach `a`. Everything that makes the object UNmapped — a default, a rest, a
+  destructured parameter, `'use strict'` — already agrees, because this is
+  always the unmapped form.
+
+  The blocker is not the `arguments` object: it is that the compiler resolves a
+  parameter to a VM SLOT (`Op::SetSlot`, `slot_of`), so the call environment's
+  `vars` map is a stale copy and an env-backed alias sees nothing. Measured
+  while attempting it — the map was built correctly and `read_name` still
+  reported the pre-assignment value. A faithful mapping has to alias the slot,
+  which outlives nothing: the arguments object can escape the call. That is the
+  same representation problem as the note above about it being a real Array.
+  `examples/argumentsobject.js` pins everything else and deliberately omits the
+  three lines that would show the mapping.

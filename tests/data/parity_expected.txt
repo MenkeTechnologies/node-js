@@ -28,6 +28,22 @@ spellings true true false false
 nonconf  false true 1
 readd    plain {"x":"plain"}
 shadow   base false
+==== argumentsobject.js ====
+callee        [true,"self1"]
+callee-expr   [true,"named"]
+callee-strict "TypeError"
+past-end      [1,null,1,9]
+far-past      [1,7,["0","5"]]
+descriptors   [{"value":1,"writable":true,"enumerable":false,"configurable":true},{"value":1,"writable":true,"enumerable":true,"configurable":true}]
+not-an-array  [false,"[object Arguments]","undefined","function"]
+iterable      ["function",[1,2],[1,2],["0","1"]]
+empty         [0,[]]
+arrow-lexical [1,2]
+delete        [1,null,false,1]
+default       [5,99]
+rest          [5,99]
+destructured  ["{\"a\":1}",1]
+strict        [1,99]
 ==== arrays.js ====
 [ 25, 9, 1, 81 ]
 28
