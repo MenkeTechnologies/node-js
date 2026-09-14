@@ -2387,7 +2387,20 @@ impl JsHost {
         // Integer-index keys enumerate ascending-first regardless of the order
         // they were supplied in (object literal, spread, Object.assign result).
         canonicalize_own_keys(&mut props);
-        self.alloc(JsObj::Object(props))
+        // A map carrying the hidden `@@native` tag IS an instance of that native
+        // class, so it hangs off the class prototype rather than
+        // `Object.prototype`. Eleven classes — `Hash`, `Cipheriv`,
+        // `StringDecoder`, `Script`, `URLSearchParams`, `Console`,
+        // `AbortController` among them — built plain objects instead, so
+        // `x.constructor.name` read `"Object"` and a chain walk found none of
+        // the class's methods. Linking HERE means a construction site cannot
+        // forget it; the tag is already in the map at every one of them.
+        let tag = props.get("@@native").and_then(|v| self.as_str(v));
+        let obj = self.alloc(JsObj::Object(props));
+        if let Some(proto) = tag.and_then(|t| self.ensure_ctor_proto(&t)) {
+            self.set_proto(&obj, proto);
+        }
+        obj
     }
     pub fn as_str(&self, v: &Value) -> Option<String> {
         match v {

@@ -713,7 +713,9 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         // `ensure_ctor_proto("Hash")` found nothing and `crypto.Hash.prototype`
         // read `undefined` — the ES5-subclassing hole this table exists to
         // close, still open for one of the two constructors it documents.
-        "Hash" | "Hmac" => &["update", "digest"],
+        // `copy` is Hash-only — an Hmac cannot be forked.
+        "Hash" => &["update", "digest", "copy"],
+        "Hmac" => &["update", "digest"],
         "StringDecoder" => string_decoder::INSTANCE_METHODS,
         "Interface" => readline::INTERFACE_METHODS,
         "Script" => vm::SCRIPT_METHODS,

@@ -727,6 +727,44 @@ total 12
 negative zero positive
 caught: failure
 done
+==== cryptostate.js ====
+update-num   THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (5)"]
+update-null  THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received null"]
+update-none  THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received undefined"]
+update-view  "0cc175b9c0f1b6a831c399e269772661"
+update-str   "0cc175b9c0f1b6a831c399e269772661"
+update-hex   "0cc175b9c0f1b6a831c399e269772661"
+digest-twice THROW Error ["ERR_CRYPTO_HASH_FINALIZED","Digest already called"]
+update-after THROW Error ["ERR_CRYPTO_HASH_FINALIZED","Digest already called"]
+hmac-twice   [64,true,0,""]
+hmac-after   THROW Error ["ERR_CRYPTO_HASH_FINALIZED","Digest already called"]
+copy         ["187ef4436122d1cc2f40dc2b92f0eba0","0cc175b9c0f1b6a831c399e269772661"]
+copy-empty   "d41d8cd98f00b204e9800998ecf8427e"
+copy-after   THROW Error ["ERR_CRYPTO_HASH_FINALIZED","Digest already called"]
+hmac-copy    "undefined"
+members      [true,false]
+encrypt      "aaf7a0b1c5d4d4b8c8abeaa891ec2755"
+roundtrip    "hello"
+cipher-view  "14800698decaba545a967d27b4a353c5"
+cipher-num   THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (5)"]
+final-twice  THROW Error ["ERR_CRYPTO_INVALID_STATE","Invalid state"]
+cipher-after THROW Error [null,"Trying to add data in unsupported state"]
+bad-keylen   THROW RangeError ["ERR_CRYPTO_INVALID_KEYLEN","Invalid key length"]
+bad-iv       THROW TypeError ["ERR_CRYPTO_INVALID_IV","Invalid initialization vector"]
+bad-cipher   THROW Error ["ERR_CRYPTO_UNKNOWN_CIPHER","Unknown cipher"]
+bad-decrypt  THROW Error ["ERR_OSSL_BAD_DECRYPT","error:1C800064:Provider routines::bad decrypt"]
+pbkdf2       "1d6f1f7051b420b93e23f010e486cfea"
+pbkdf2-num   THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"password\" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5)"]
+pbkdf2-salt  THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"salt\" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5)"]
+scrypt-num   THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"password\" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5)"]
+hkdf-ikm     THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"ikm\" argument must be of type string or an instance of SecretKeyObject, ArrayBuffer, TypedArray, DataView, or Buffer. Received type number (5)"]
+hkdf-salt    THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"salt\" argument must be of type string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer. Received type number (5)"]
+hkdf-key-obj "aaa8ed35d933b443"
+pbkdf2-cb    THROW TypeError ["ERR_CRYPTO_INVALID_DIGEST","Invalid digest: nope"]
+scrypt-cb    THROW RangeError ["ERR_CRYPTO_INVALID_SCRYPT_PARAMS","Invalid scrypt params"]
+hkdf-sync    THROW TypeError ["ERR_CRYPTO_INVALID_DIGEST","Invalid digest: nope"]
+scrypt-badN  THROW RangeError ["ERR_CRYPTO_INVALID_SCRYPT_PARAMS","Invalid scrypt params"]
+pbkdf2-async [null,"1d6f1f7051b420b93e23f010e486cfea"]
 ==== datelocal.js ====
 offset-shape  ["number",true,true]
 local-vs-utc  [true,true,true,true,true,true]

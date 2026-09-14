@@ -2640,3 +2640,16 @@ Still divergent, and why:
   (`examples/callbackerrors.js`, which chains its steps so the order is the
   call order on both). Fixing it means real async children, which the
   `child_process` module header already records as its limitation.
+- **`crypto.getHashes()` answers this runtime's four supported digests, not
+  OpenSSL's list.** Node reports what its OpenSSL build carries —
+  `RSA-MD5`, `RSA-RIPEMD160`, `RSA-SHA1`, … — which varies with the OpenSSL
+  version linked into the binary, so it is neither reproducible across machines
+  nor implementable without those digests. `createHash` supports md5, sha1,
+  sha256 and sha512, and the list says so.
+- **`perf_hooks.performance` is a builtin NAMESPACE, not a `Performance`
+  instance.** Its methods all answer correctly and `timeOrigin` is a number, but
+  `performance.constructor.name` reads `Object` where node reads `Performance`,
+  because the value is a `JsObj::Builtin` rather than a tagged instance object
+  with a prototype. Every other native class now links to its class prototype at
+  construction (`examples/cryptostate.js` pins the `Hash` case); this one has no
+  instance object to link.

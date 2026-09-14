@@ -260,76 +260,12 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             }
         }
         // ── Key derivation ──────────────────────────────────────────────
-        "pbkdf2Sync" => {
-            let digest = arg_str(args, 4).to_ascii_lowercase();
-            match pbkdf2_derive(
-                &digest,
-                &val_bytes_at(args, 0),
-                &val_bytes_at(args, 1),
-                super::arg_num(args, 2) as u32,
-                super::arg_num(args, 3).max(0.0) as usize,
-            ) {
-                Ok(out) => Ok(super::buffer::from_bytes(&out)),
-                Err(e) => Err(e),
-            }
-        }
-        "pbkdf2" => {
-            let digest = arg_str(args, 4).to_ascii_lowercase();
-            let res = pbkdf2_derive(
-                &digest,
-                &val_bytes_at(args, 0),
-                &val_bytes_at(args, 1),
-                super::arg_num(args, 2) as u32,
-                super::arg_num(args, 3).max(0.0) as usize,
-            );
-            deliver_async(args.get(5).cloned(), res)
-        }
-        "scryptSync" => {
-            let keylen = super::arg_num(args, 2).max(0.0) as usize;
-            match scrypt_derive(
-                &val_bytes_at(args, 0),
-                &val_bytes_at(args, 1),
-                keylen,
-                opts_object(args, 3),
-            ) {
-                Ok(out) => Ok(super::buffer::from_bytes(&out)),
-                Err(e) => Err(e),
-            }
-        }
-        "scrypt" => {
-            let keylen = super::arg_num(args, 2).max(0.0) as usize;
-            let res = scrypt_derive(
-                &val_bytes_at(args, 0),
-                &val_bytes_at(args, 1),
-                keylen,
-                opts_object(args, 3),
-            );
-            deliver_async(trailing_cb(args), res)
-        }
-        "hkdfSync" => {
-            let digest = arg_str(args, 0).to_ascii_lowercase();
-            match hkdf_derive(
-                &digest,
-                &val_bytes_at(args, 1),
-                &val_bytes_at(args, 2),
-                &val_bytes_at(args, 3),
-                super::arg_num(args, 4).max(0.0) as usize,
-            ) {
-                Ok(out) => Ok(super::buffer::from_bytes(&out)),
-                Err(e) => Err(e),
-            }
-        }
-        "hkdf" => {
-            let digest = arg_str(args, 0).to_ascii_lowercase();
-            let res = hkdf_derive(
-                &digest,
-                &val_bytes_at(args, 1),
-                &val_bytes_at(args, 2),
-                &val_bytes_at(args, 3),
-                super::arg_num(args, 4).max(0.0) as usize,
-            );
-            deliver_async(args.get(5).cloned(), res)
-        }
+        "pbkdf2Sync" => pbkdf2(args, None),
+        "pbkdf2" => pbkdf2(args, args.get(5).cloned()),
+        "scryptSync" => scrypt(args, None),
+        "scrypt" => scrypt(args, trailing_cb(args)),
+        "hkdfSync" => hkdf(args, None),
+        "hkdf" => hkdf(args, args.get(5).cloned()),
         // ── Symmetric ciphers ───────────────────────────────────────────
         "createCipheriv" => make_cipher("Cipheriv", args),
         "createDecipheriv" => make_cipher("Decipheriv", args),
@@ -574,7 +510,20 @@ pub fn cipher_instance_call(
 ) -> Result<Value, String> {
     match method {
         "update" => {
-            let bytes = cipher_input_bytes(args);
+            // Input after `final` is rejected — this accepted it and answered
+            // with an empty string, so the data silently went nowhere.
+            if finalized(recv) {
+                return Err("Error: Trying to add data in unsupported state".into());
+            }
+            // Shared with `Hash`/`Hmac`: any byte VIEW contributes its bytes,
+            // only a string is decoded, and anything else is rejected. Only a
+            // Buffer was recognised here, so a Uint8Array was stringified.
+            let enc = if args.len() > 1 {
+                arg_str(args, 1)
+            } else {
+                "utf8".into()
+            };
+            let bytes = update_bytes(args, &enc)?;
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get(recv).cloned() {
                     if let Some(arr) = p.get("@@data").cloned() {
@@ -592,6 +541,17 @@ pub fn cipher_instance_call(
             Ok(encode_out(&[], out_enc.as_deref()))
         }
         "final" => {
+            // A cipher finalizes ONCE. Running the transform again returned a
+            // second, valid-looking ciphertext for input that was already
+            // consumed.
+            if finalized(recv) {
+                return Err(crate::host::coded_error(
+                    "Error",
+                    "ERR_CRYPTO_INVALID_STATE",
+                    "Invalid state",
+                ));
+            }
+            mark_finalized(recv);
             let (algo, key, iv, data) = with_host(|h| {
                 let (mut algo, mut key, mut iv, mut data) =
                     (String::new(), Vec::new(), Vec::new(), Vec::new());
@@ -630,6 +590,12 @@ pub fn cipher_instance_call(
 fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         "update" => {
+            // A finalized digest cannot take more input. This accepted it
+            // silently and folded it into a hash nobody would read, so the
+            // mistake produced no symptom at all.
+            if finalized(recv) {
+                return Err(hash_finalized());
+            }
             let enc = if args.len() > 1 {
                 arg_str(args, 1)
             } else {
@@ -641,11 +607,7 @@ fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Resu
             // `"[object Object]"`, and a Buffer only worked because
             // stringifying it happened to yield its utf8 text — which is wrong
             // the moment the bytes are not valid utf8.
-            let first = args.first().cloned().unwrap_or(Value::Undef);
-            let bytes = match super::buffer::view_bytes(&first) {
-                Some(b) => b,
-                None => decode(&arg_str(args, 0), &enc),
-            };
+            let bytes = update_bytes(args, &enc)?;
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get(recv).cloned() {
                     if let Some(arr) = p.get("@@data").cloned() {
@@ -657,7 +619,44 @@ fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Resu
             });
             Ok(recv.clone())
         }
+        // `Hash.copy()` forks the running state, so the two go on to hash
+        // different tails. Without it the only way to hash a common prefix twice
+        // was to replay the prefix. An Hmac has no `copy`.
+        "copy" if kind == "Hash" => {
+            if finalized(recv) {
+                return Err(hash_finalized());
+            }
+            let (algo, data) = with_host(|h| {
+                let (mut algo, mut data) = (String::new(), Vec::new());
+                if let Some(JsObj::Object(p)) = h.get(recv) {
+                    algo = p.get("@@algo").map(|v| h.str_of(v)).unwrap_or_default();
+                    if let Some(JsObj::Array(items)) = p.get("@@data").and_then(|v| h.get(v)) {
+                        data = items.clone();
+                    }
+                }
+                (algo, data)
+            });
+            Ok(with_host(|h| {
+                let data = h.new_array(data);
+                let mut m = IndexMap::new();
+                m.insert("@@native".into(), h.new_str("Hash"));
+                m.insert("@@algo".into(), h.new_str(algo));
+                m.insert("@@data".into(), data);
+                h.new_object(m)
+            }))
+        }
         "digest" => {
+            // A second `digest` on a Hash throws; on an Hmac node answers with
+            // an EMPTY buffer instead. Re-running the digest — what this did —
+            // hands back a value that looks valid and is not what node returns.
+            if finalized(recv) {
+                if kind == "Hash" {
+                    return Err(hash_finalized());
+                }
+                let enc = args.first().map(|_| arg_str(args, 0));
+                return Ok(encode_digest(&[], enc.as_deref()));
+            }
+            mark_finalized(recv);
             let (algo, key, data) = with_host(|h| {
                 let (mut algo, mut key, mut data) = (String::new(), Vec::new(), Vec::new());
                 if let Some(JsObj::Object(p)) = h.get(recv) {
@@ -681,20 +680,68 @@ fn hashlike_call(kind: &str, recv: &Value, method: &str, args: &[Value]) -> Resu
             } else {
                 Some(arg_str(args, 0))
             };
-            Ok(match enc.as_deref() {
-                Some("hex") => with_host(|h| h.new_str(to_hex(&out))),
-                Some("base64") | Some("base64url") => with_host(|h| h.new_str(to_base64(&out))),
-                Some("latin1") | Some("binary") => {
-                    with_host(|h| h.new_str(out.iter().map(|b| *b as char).collect::<String>()))
-                }
-                _ => super::buffer::from_bytes(&out),
-            })
+            Ok(encode_digest(&out, enc.as_deref()))
         }
         _ => Err(crate::host::type_error(&format!(
             "{}.{method} is not a function",
             kind.to_ascii_lowercase()
         ))),
     }
+}
+
+/// The bytes an `update(data[, encoding])` contributes.
+///
+/// A byte-like VIEW contributes its bytes; only a STRING goes through the
+/// encoding. Anything else is REJECTED rather than stringified: `update(5)`
+/// hashing the text "5" is a silent corruption, since the caller believes a
+/// number went in and gets a digest of something else.
+fn update_bytes(args: &[Value], enc: &str) -> Result<Vec<u8>, String> {
+    let first = args.first().cloned().unwrap_or(Value::Undef);
+    if let Some(b) = super::buffer::view_bytes(&first) {
+        return Ok(b);
+    }
+    if with_host(|h| h.as_str(&first)).is_none() {
+        return Err(crate::host::invalid_arg_type(
+            "data",
+            "argument",
+            "string or an instance of Buffer, TypedArray, or DataView",
+            &first,
+        ));
+    }
+    Ok(decode(&arg_str(args, 0), enc))
+}
+
+/// Render a finished digest in the requested encoding (a Buffer with none).
+fn encode_digest(out: &[u8], enc: Option<&str>) -> Value {
+    match enc {
+        Some("hex") => with_host(|h| h.new_str(to_hex(out))),
+        Some("base64") | Some("base64url") => with_host(|h| h.new_str(to_base64(out))),
+        Some("latin1") | Some("binary") => {
+            with_host(|h| h.new_str(out.iter().map(|b| *b as char).collect::<String>()))
+        }
+        _ => super::buffer::from_bytes(out),
+    }
+}
+
+/// Whether `digest` has already run on this `Hash`/`Hmac`.
+fn finalized(recv: &Value) -> bool {
+    with_host(|h| matches!(h.get(recv), Some(JsObj::Object(p)) if p.contains_key("@@done")))
+}
+
+fn mark_finalized(recv: &Value) {
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+            p.insert("@@done".into(), Value::Bool(true));
+        }
+    });
+}
+
+fn hash_finalized() -> String {
+    crate::host::coded_error(
+        "Error",
+        "ERR_CRYPTO_HASH_FINALIZED",
+        "Digest already called",
+    )
 }
 
 fn supported(algo: &str) -> bool {
@@ -768,7 +815,51 @@ fn val_bytes(v: &Value) -> Vec<u8> {
     if let Some(bytes) = super::buffer::view_bytes(v) {
         return bytes;
     }
+    // A `KeyObject` carries its bytes in a hidden slot. Stringifying it yielded
+    // the text of an object, so `hkdf(digest, secretKey, …)` derived from that
+    // text — a plausible key for input the caller never supplied.
+    if super::native_tag(v).as_deref() == Some("KeyObject") {
+        return with_host(|h| {
+            match h.get(v) {
+                Some(JsObj::Object(p)) => p.get("@@secret").cloned(),
+                _ => None,
+            }
+            .and_then(|arr| match h.get(&arr) {
+                Some(JsObj::Array(items)) => {
+                    Some(items.iter().map(|b| h.to_number(b) as u8).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+        });
+    }
     with_host(|h| h.str_of(v)).into_bytes()
+}
+
+/// The byte-like argument forms each KDF position accepts, spelled the way node
+/// spells them in its `ERR_INVALID_ARG_TYPE` message. They differ per position,
+/// so the text cannot be shared: `hkdf`'s `ikm` takes a `SecretKeyObject` and
+/// `pbkdf2`'s `password` does not.
+const KDF_BYTES: &str = "string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView";
+const HKDF_IKM: &str =
+    "string or an instance of SecretKeyObject, ArrayBuffer, TypedArray, DataView, or Buffer";
+const HKDF_BYTES: &str = "string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer";
+
+/// `val_bytes_at` that REJECTS a value which is neither a string nor byte-like,
+/// as node does. `pbkdf2Sync(5, …)` deriving a key from the text "5" is the
+/// worst kind of silent pass-through: the result is a plausible key for the
+/// wrong input.
+fn bytes_arg(args: &[Value], i: usize, name: &str, expected: &str) -> Result<Vec<u8>, String> {
+    let v = args.get(i).cloned().unwrap_or(Value::Undef);
+    if super::buffer::view_bytes(&v).is_none()
+        && with_host(|h| h.as_str(&v)).is_none()
+        && !(expected == HKDF_IKM && super::native_tag(&v).as_deref() == Some("KeyObject"))
+    {
+        return Err(crate::host::invalid_arg_type(
+            name, "argument", expected, &v,
+        ));
+    }
+    Ok(val_bytes_at(args, i))
 }
 
 /// `val_bytes` for the arg at index `i` (`Value::Undef` → empty).
@@ -793,8 +884,13 @@ fn opts_object(args: &[Value], i: usize) -> Option<Value> {
 /// Queue a derived-key result to an async callback as `(null, buf)` / `(err)`;
 /// if there is no callback, return the value/error synchronously.
 fn deliver_async(cb: Option<Value>, res: Result<Vec<u8>, String>) -> Result<Value, String> {
-    match (cb.filter(|v| with_host(|h| is_callable(h, v))), res) {
-        (Some(cb), Ok(out)) => {
+    // A KDF's arguments are validated SYNCHRONOUSLY, so a bad digest or bad
+    // scrypt parameter throws out of the call in BOTH forms. This queued the
+    // failure as a callback argument instead — and as a bare string, so the
+    // handler's `err.code` was undefined and `err instanceof Error` false.
+    let out = res?;
+    match cb.filter(|v| with_host(|h| is_callable(h, v))) {
+        Some(cb) => {
             let bufv = super::buffer::from_bytes(&out);
             with_host(|h| {
                 let nullv = h.null();
@@ -802,14 +898,47 @@ fn deliver_async(cb: Option<Value>, res: Result<Vec<u8>, String>) -> Result<Valu
             });
             Ok(Value::Undef)
         }
-        (Some(cb), Err(e)) => {
-            let errv = with_host(|h| h.new_str(e));
-            with_host(|h| h.queue_micro(cb, vec![errv]));
-            Ok(Value::Undef)
-        }
-        (None, Ok(out)) => Ok(super::buffer::from_bytes(&out)),
-        (None, Err(e)) => Err(e),
+        None => Ok(super::buffer::from_bytes(&out)),
     }
+}
+
+/// `pbkdf2Sync(password, salt, iterations, keylen, digest)` and its callback
+/// form, which differ only in how the finished bytes are delivered.
+fn pbkdf2(args: &[Value], cb: Option<Value>) -> Result<Value, String> {
+    let digest = arg_str(args, 4).to_ascii_lowercase();
+    let res = pbkdf2_derive(
+        &digest,
+        &bytes_arg(args, 0, "password", KDF_BYTES)?,
+        &bytes_arg(args, 1, "salt", KDF_BYTES)?,
+        super::arg_num(args, 2) as u32,
+        super::arg_num(args, 3).max(0.0) as usize,
+    );
+    deliver_async(cb, res)
+}
+
+/// `scryptSync(password, salt, keylen[, options])` and its callback form.
+fn scrypt(args: &[Value], cb: Option<Value>) -> Result<Value, String> {
+    let keylen = super::arg_num(args, 2).max(0.0) as usize;
+    let res = scrypt_derive(
+        &bytes_arg(args, 0, "password", KDF_BYTES)?,
+        &bytes_arg(args, 1, "salt", KDF_BYTES)?,
+        keylen,
+        opts_object(args, 3),
+    );
+    deliver_async(cb, res)
+}
+
+/// `hkdfSync(digest, ikm, salt, info, keylen)` and its callback form.
+fn hkdf(args: &[Value], cb: Option<Value>) -> Result<Value, String> {
+    let digest = arg_str(args, 0).to_ascii_lowercase();
+    let res = hkdf_derive(
+        &digest,
+        &bytes_arg(args, 1, "ikm", HKDF_IKM)?,
+        &bytes_arg(args, 2, "salt", HKDF_BYTES)?,
+        &bytes_arg(args, 3, "info", HKDF_BYTES)?,
+        super::arg_num(args, 4).max(0.0) as usize,
+    );
+    deliver_async(cb, res)
 }
 
 /// PBKDF2-HMAC derivation over a supported digest.
@@ -826,7 +955,13 @@ fn pbkdf2_derive(
         "sha256" => pbkdf2::pbkdf2_hmac::<Sha256>(pass, salt, iters, &mut out),
         "sha512" => pbkdf2::pbkdf2_hmac::<Sha512>(pass, salt, iters, &mut out),
         "md5" => pbkdf2::pbkdf2_hmac::<Md5>(pass, salt, iters, &mut out),
-        _ => return Err(format!("Error: Invalid digest: {digest}")),
+        _ => {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_CRYPTO_INVALID_DIGEST",
+                &format!("Invalid digest: {digest}"),
+            ))
+        }
     }
     Ok(out)
 }
@@ -847,7 +982,12 @@ fn scrypt_derive(
     }
     let n = n as u64;
     if n < 2 || (n & (n - 1)) != 0 {
-        return Err("Error: Invalid scrypt param: N must be a power of two > 1".into());
+        // Node names no parameter and the class is a RangeError.
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_CRYPTO_INVALID_SCRYPT_PARAMS",
+            "Invalid scrypt params",
+        ));
     }
     let params = scrypt::Params::new(n.trailing_zeros() as u8, r as u32, p as u32, keylen)
         .map_err(|e| format!("Error: {e}"))?;
@@ -870,7 +1010,13 @@ fn hkdf_derive(
         "sha256" => Hkdf::<Sha256>::new(Some(salt), ikm).expand(info, &mut out),
         "sha512" => Hkdf::<Sha512>::new(Some(salt), ikm).expand(info, &mut out),
         "md5" => Hkdf::<Md5>::new(Some(salt), ikm).expand(info, &mut out),
-        _ => return Err(format!("Error: Invalid digest: {digest}")),
+        _ => {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_CRYPTO_INVALID_DIGEST",
+                &format!("Invalid digest: {digest}"),
+            ))
+        }
     };
     ok.map_err(|_| "Error: Invalid key length".to_string())?;
     Ok(out)
@@ -898,16 +1044,32 @@ fn opt_num(obj: &Value, keys: &[&str], default: f64) -> f64 {
 fn make_cipher(tag: &str, args: &[Value]) -> Result<Value, String> {
     let algo = arg_str(args, 0).to_ascii_lowercase();
     if !CIPHERS.contains(&algo.as_str()) {
-        return Err(format!("Error: Unknown cipher: {algo}"));
+        // Node names no algorithm here and the code is what callers branch on.
+        // This appended the name and carried no code at all.
+        return Err(crate::host::coded_error(
+            "Error",
+            "ERR_CRYPTO_UNKNOWN_CIPHER",
+            "Unknown cipher",
+        ));
     }
     let key = val_bytes_at(args, 1);
     let iv = val_bytes_at(args, 2);
     let want_key = key_len(&algo);
+    // A wrong key length is a RangeError and a wrong IV a TypeError — the class
+    // is part of what `catch` dispatches on, and both were plain `Error`s.
     if key.len() != want_key {
-        return Err("Error: Invalid key length".into());
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_CRYPTO_INVALID_KEYLEN",
+            "Invalid key length",
+        ));
     }
     if iv.len() != 16 {
-        return Err("Error: Invalid initialization vector".into());
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_CRYPTO_INVALID_IV",
+            "Invalid initialization vector",
+        ));
     }
     Ok(with_host(|h| {
         let keyv = h.new_array(key.iter().map(|b| Value::Float(*b as f64)).collect());
@@ -925,18 +1087,6 @@ fn make_cipher(tag: &str, args: &[Value]) -> Result<Value, String> {
 
 /// Cipher `update` input: a Buffer's bytes, else the string decoded by the input
 /// encoding (arg 1, default utf8).
-fn cipher_input_bytes(args: &[Value]) -> Vec<u8> {
-    if super::native_tag(args.first().unwrap_or(&Value::Undef)).as_deref() == Some("Buffer") {
-        return val_bytes_at(args, 0);
-    }
-    let enc = if args.len() > 1 {
-        arg_str(args, 1)
-    } else {
-        "utf8".into()
-    };
-    decode(&arg_str(args, 0), &enc)
-}
-
 /// AES-CBC (Pkcs7) / AES-CTR transform. `encrypt` selects direction (CTR is
 /// symmetric so the flag is unused there).
 fn cipher_crypt(
@@ -946,48 +1096,61 @@ fn cipher_crypt(
     data: &[u8],
     encrypt: bool,
 ) -> Result<Vec<u8>, String> {
-    const KEYERR: &str = "Error: Invalid key length";
-    const DECERR: &str = "Error: error:1C800064:Provider routines::bad decrypt";
+    let keyerr = || {
+        crate::host::coded_error(
+            "RangeError",
+            "ERR_CRYPTO_INVALID_KEYLEN",
+            "Invalid key length",
+        )
+    };
+    // OpenSSL's own message, under the code node reports for it.
+    let decerr = || {
+        crate::host::coded_error(
+            "Error",
+            "ERR_OSSL_BAD_DECRYPT",
+            "error:1C800064:Provider routines::bad decrypt",
+        )
+    };
     match (algo, encrypt) {
         ("aes-128-cbc", true) => Ok(cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv)
-            .map_err(|_| KEYERR.to_string())?
+            .map_err(|_| keyerr())?
             .encrypt_padded_vec_mut::<Pkcs7>(data)),
         ("aes-192-cbc", true) => Ok(cbc::Encryptor::<aes::Aes192>::new_from_slices(key, iv)
-            .map_err(|_| KEYERR.to_string())?
+            .map_err(|_| keyerr())?
             .encrypt_padded_vec_mut::<Pkcs7>(data)),
         ("aes-256-cbc", true) => Ok(cbc::Encryptor::<aes::Aes256>::new_from_slices(key, iv)
-            .map_err(|_| KEYERR.to_string())?
+            .map_err(|_| keyerr())?
             .encrypt_padded_vec_mut::<Pkcs7>(data)),
         ("aes-128-cbc", false) => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv)
-            .map_err(|_| KEYERR.to_string())?
+            .map_err(|_| keyerr())?
             .decrypt_padded_vec_mut::<Pkcs7>(data)
-            .map_err(|_| DECERR.to_string()),
+            .map_err(|_| decerr()),
         ("aes-192-cbc", false) => cbc::Decryptor::<aes::Aes192>::new_from_slices(key, iv)
-            .map_err(|_| KEYERR.to_string())?
+            .map_err(|_| keyerr())?
             .decrypt_padded_vec_mut::<Pkcs7>(data)
-            .map_err(|_| DECERR.to_string()),
+            .map_err(|_| decerr()),
         ("aes-256-cbc", false) => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv)
-            .map_err(|_| KEYERR.to_string())?
+            .map_err(|_| keyerr())?
             .decrypt_padded_vec_mut::<Pkcs7>(data)
-            .map_err(|_| DECERR.to_string()),
+            .map_err(|_| decerr()),
         ("aes-128-ctr", _) => {
             let mut buf = data.to_vec();
             ctr::Ctr128BE::<aes::Aes128>::new_from_slices(key, iv)
-                .map_err(|_| KEYERR.to_string())?
+                .map_err(|_| keyerr())?
                 .apply_keystream(&mut buf);
             Ok(buf)
         }
         ("aes-192-ctr", _) => {
             let mut buf = data.to_vec();
             ctr::Ctr128BE::<aes::Aes192>::new_from_slices(key, iv)
-                .map_err(|_| KEYERR.to_string())?
+                .map_err(|_| keyerr())?
                 .apply_keystream(&mut buf);
             Ok(buf)
         }
         ("aes-256-ctr", _) => {
             let mut buf = data.to_vec();
             ctr::Ctr128BE::<aes::Aes256>::new_from_slices(key, iv)
-                .map_err(|_| KEYERR.to_string())?
+                .map_err(|_| keyerr())?
                 .apply_keystream(&mut buf);
             Ok(buf)
         }
@@ -1683,11 +1846,7 @@ pub fn sign_verify_instance_call(
             // `hash.update(new TextEncoder().encode(s))` — the standard way to
             // hash bytes — stringified the view and hashed
             // `"[object Object]"`.
-            let first = args.first().cloned().unwrap_or(Value::Undef);
-            let bytes = match super::buffer::view_bytes(&first) {
-                Some(b) => b,
-                None => decode(&arg_str(args, 0), &enc),
-            };
+            let bytes = update_bytes(args, &enc)?;
             with_host(|h| {
                 if let Some(JsObj::Object(p)) = h.get(recv).cloned() {
                     if let Some(arr) = p.get("@@data").cloned() {
