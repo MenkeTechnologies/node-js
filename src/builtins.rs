@@ -11239,8 +11239,93 @@ fn reject_symbol_args(name: &str, args: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+/// Coerce a string method's arguments the way 22.1.3.x does, BEFORE any arm
+/// reads them: a numeric position through `ToNumber`, every other through
+/// `ToString`. Both run a user `valueOf`/`toString`, and none of them ran —
+/// `'x'.padStart({valueOf: () => 3})` produced `"x"` and
+/// `'x'.concat({toString: () => 'y'})` produced `"x[object Object]"`.
+///
+/// The positions that must NOT be coerced are the ones with their own protocol:
+/// a RegExp or a `Symbol.replace`/`split`/`match`/`search` carrier at position
+/// 0 of the method that honours it, and a callable REPLACEMENT at position 1 of
+/// `replace`/`replaceAll`. Each of those already has a path that handles the
+/// value as an object, and stringifying it first would take that path away.
+/// `RegExpCreate(v, flags)` — the regexp a string method builds from a
+/// non-RegExp argument. An empty/absent argument makes the empty pattern, which
+/// matches at position 0.
+fn regexp_from_arg(v: &Value, flags: &str) -> Result<Value, String> {
+    let src = if matches!(v, Value::Undef) {
+        String::new()
+    } else {
+        with_host(|h| h.str_of(v))
+    };
+    let fv = with_host(|h| h.new_str(flags.to_string()));
+    let sv = with_host(|h| h.new_str(src));
+    regexp_ctor(&[sv, fv])
+}
+
+fn coerce_string_args(name: &str, args: Vec<Value>) -> Result<Vec<Value>, String> {
+    let numeric = STRING_METHOD_NUMERIC_ARGS
+        .iter()
+        .find(|(m, _)| *m == name)
+        .map(|(_, ps)| *ps)
+        .unwrap_or(&[]);
+    let protocol = match name {
+        "replace" | "replaceAll" => Some("@@replace"),
+        "split" => Some("@@split"),
+        "match" => Some("@@match"),
+        "matchAll" => Some("@@matchAll"),
+        "search" => Some("@@search"),
+        // These three do not CONSUME `Symbol.match`, they reject a value that
+        // carries it (22.1.3.7/23/24 step 3 — `IsRegExp`). Exempting it keeps
+        // the object intact so that check still sees one; stringifying first
+        // turned the TypeError into an ordinary search.
+        "startsWith" | "endsWith" | "includes" => Some("@@match"),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(args.len());
+    for (i, a) in args.into_iter().enumerate() {
+        if matches!(a, Value::Undef) {
+            out.push(a);
+            continue;
+        }
+        if numeric.contains(&i) {
+            let p = host::to_primitive(&a, "number")?;
+            out.push(Value::Float(with_host(|h| h.to_number(&p))));
+            continue;
+        }
+        // The IsRegExp trio tests `Symbol.match` for TRUTHINESS (7.2.8 step 2),
+        // not for presence: an object carrying `[Symbol.match]: false` is NOT a
+        // regexp and coerces like anything else. The consuming protocols use
+        // `GetMethod`, which additionally requires a callable.
+        let is_regexp_like = matches!(name, "startsWith" | "endsWith" | "includes");
+        let carries = |p: &str| match host::protocol_lookup(&a, p) {
+            Ok(Some(m)) => {
+                if is_regexp_like {
+                    with_host(|h| h.truthy(&m))
+                } else {
+                    with_host(|h| host::is_callable(h, &m))
+                }
+            }
+            _ => false,
+        };
+        let exempt = with_host(|h| matches!(h.get(&a), Some(JsObj::RegExp(_))))
+            || (i == 0 && protocol.is_some_and(carries))
+            || (i == 1
+                && matches!(name, "replace" | "replaceAll")
+                && with_host(|h| host::is_callable(h, &a)));
+        if exempt {
+            out.push(a);
+            continue;
+        }
+        out.push(host::to_string_value(&a)?);
+    }
+    Ok(out)
+}
+
 fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String> {
     reject_symbol_args(name, &args)?;
+    let args = coerce_string_args(name, args)?;
     // Every index-bearing method below counts UTF-16 code units, so they all
     // work off this one decoding rather than off `s.chars()` (code points),
     // which agrees only on the BMP. `@@iterator` is the deliberate exception.
@@ -11537,17 +11622,40 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
             rest.extend(args.iter().skip(1).cloned());
             host::invoke(&f, rest, Some(arg0(&args)))
         }
-        "match" => crate::regexp::str_match(s, &arg0(&args)),
-        "matchAll" => crate::regexp::str_match_all(s, &arg0(&args)),
+        // 22.1.3.13/14: a non-RegExp argument is turned INTO one
+        // (`RegExpCreate(regexp, …)`), so `'abc'.match('b')` matches. It
+        // answered `null` for every string argument, which reads as "no match"
+        // — the one answer a caller cannot tell from a real failure.
+        // `matchAll` builds its with `g`, which 22.1.3.14 requires.
+        "match" => {
+            let a = arg0(&args);
+            let re = if is_regexp_arg(&a) {
+                a
+            } else {
+                regexp_from_arg(&a, "")?
+            };
+            crate::regexp::str_match(s, &re)
+        }
+        "matchAll" => {
+            let a = arg0(&args);
+            let re = if is_regexp_arg(&a) {
+                a
+            } else {
+                regexp_from_arg(&a, "g")?
+            };
+            crate::regexp::str_match_all(s, &re)
+        }
         "search" => {
             if is_regexp_arg(&arg0(&args)) {
                 crate::regexp::str_search(s, &arg0(&args))
             } else {
-                // A string arg is coerced to a (literal) regex; we approximate with
-                // a plain substring search, which agrees for non-metacharacter
-                // needles.
-                let needle = with_host(|h| h.str_of(&arg0(&args)));
-                Ok(Value::Float(byte_to_unit_index(s, s.find(&needle))))
+                // 22.1.3.17 builds a RegExp from the argument, so a
+                // METACHARACTER matches as one: `'a.c'.search('.')` is 0, not
+                // 1. The substring approximation this replaces agreed only for
+                // a literal needle, and answered -1 for an absent argument
+                // where the empty pattern matches at 0.
+                let re = regexp_from_arg(&arg0(&args), "")?;
+                crate::regexp::str_search(s, &re)
             }
         }
         "replace" => {
@@ -11824,15 +11932,6 @@ fn search_last(hay: &[u16], needle: &[u16], upto: usize) -> Option<usize> {
     (0..=upto.min(last))
         .rev()
         .find(|&i| &hay[i..i + needle.len()] == needle)
-}
-
-/// A UTF-8 byte offset reported back to JS as a string position — a UTF-16
-/// code-unit index — or `-1` for "not found".
-fn byte_to_unit_index(s: &str, byte: Option<usize>) -> f64 {
-    match byte {
-        Some(b) => crate::utf16::index_of_byte(s, b).get() as f64,
-        None => -1.0,
-    }
 }
 
 fn pad(s: &str, args: &[Value], start: bool) -> Result<String, String> {
