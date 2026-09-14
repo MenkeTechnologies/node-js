@@ -1711,6 +1711,23 @@ index    TypeError: Cannot read properties of null (reading '0')
 absent   TypeError: {}.nope is not a function
 absent2  TypeError: [].nope is not a function
 optional undefined undefined undefined
+==== protoborrowchain.js ====
+explicit-call [2,1,2]
+explicit-join "a-b"
+read          ["function","function","function","function"]
+in            [true,true,true]
+call          [2,1,2,"1-2"]
+not-an-array  [false,"[object Object]",["0","length"]]
+instanceof    [true,true]
+es5-subclass  [2,1,"1-2",true,true,false]
+iterate       ["a","b"]
+map-proto     ["function","function","function"]
+regexp-proto  ["function","function"]
+promise-proto "function"
+error-proto   ["function","E: m"]
+own-shadows   "own"
+mid-chain     ["z",1,true]
+deep-create   "function"
 ==== protodetach.js ====
 array-read    ["undefined","undefined","function","function"]
 array-in      [false,true,true]

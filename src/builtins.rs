@@ -13359,12 +13359,61 @@ fn intrinsic_reachable(recv: &Value, ctor: &str) -> bool {
     false
 }
 
+/// The intrinsic prototypes actually ON `recv`'s explicit chain, nearest first
+/// — the complement of [`intrinsic_reachable`], which asks about one known
+/// constructor.
+///
+/// `Object.create(Array.prototype)` is an ordinary object whose chain reaches
+/// `Array.prototype`, and node resolves the whole of `Array.prototype` through
+/// it: `o.push(1)` works, because those methods are generic over their receiver
+/// (which is also why `Array.prototype.push.call({length: 0}, 1)` already
+/// worked here). Deciding the owner from the receiver's KIND alone made every
+/// one of them `undefined` — the same "methods come from the kind, not the
+/// chain" mistake as the detachment case, in the opposite direction.
+pub(crate) fn chain_intrinsic_ctors_pub(recv: &Value) -> Vec<&'static str> {
+    chain_intrinsic_ctors(recv)
+}
+
+fn chain_intrinsic_ctors(recv: &Value) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut cur = recv.clone();
+    for _ in 0..100 {
+        let Some(p) = with_host(|h| h.proto_of(&cur)) else {
+            break;
+        };
+        if with_host(|h| h.is_null(&p)) {
+            break;
+        }
+        let name = with_host(|h| match h.get(&p) {
+            Some(JsObj::Builtin(ns)) => ns.strip_suffix(".prototype").map(str::to_string),
+            _ => h.intrinsic_proto_ctor(&p).map(str::to_string),
+        });
+        if let Some(n) = name {
+            if let Some(c) = crate::arity::PROTO_MEMBERS
+                .iter()
+                .map(|(k, _)| *k)
+                .find(|k| *k == n)
+            {
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+        cur = p;
+    }
+    out
+}
+
 /// The constructor whose prototype defines `key` for `obj` — its own if that
 /// prototype has it, otherwise `Object` — or `None` when neither does.
 ///
 /// Used both by `in` and by the READ, so the two cannot disagree about which
 /// prototype a name comes from. `new Map().toString` is `Map.prototype`'s and
 /// `new Map().hasOwnProperty` is `Object.prototype`'s.
+pub(crate) fn inherited_method_owner_pub(obj: &Value, key: &str) -> Option<&'static str> {
+    inherited_method_owner(obj, key)
+}
+
 fn inherited_method_owner(obj: &Value, key: &str) -> Option<&'static str> {
     if with_host(|h| h.has_null_proto(obj)) {
         return None;
@@ -13396,16 +13445,44 @@ fn inherited_method_owner(obj: &Value, key: &str) -> Option<&'static str> {
                     .any(|m| m.strip_prefix('+').unwrap_or(m) == key)
             })
     };
+    // `PROTO_MEMBERS` is generated from the prototypes' STRING keys, so a
+    // well-known symbol member is absent from it. For an object whose CHAIN
+    // reaches an intrinsic prototype the intrinsic table has to be consulted as
+    // well, or `[...Object.create(Array.prototype)]` finds no `Symbol.iterator`
+    // at all. It is deliberately NOT consulted for the receiver's own kind:
+    // there a thunk would be minted for every `@@` member the table names,
+    // including ones whose dispatch has no implementation for that receiver,
+    // and `[...buffer]` then failed with `@@iterator is not a function`.
+    //
+    // It is narrowed further to an ORDINARY object: a natively-tagged receiver
+    // (a typed array, a Buffer) is linked to a real intrinsic prototype too,
+    // and minting a thunk there produced `@@iterator is not a function` for
+    // `[...new Uint8Array(ab)]` — those kinds reach their iterator by their own
+    // fast path, which the table entry would shadow.
+    let plain = with_host(|h| h.kind_of(obj)) == Some(ObjKind::Object)
+        && crate::stdlib::native_tag(obj).is_none();
+    let on_proto_or_symbol =
+        |c: &str| on_proto(c) || (plain && builtin_meta(&format!("@proto:{c}:{key}")).is_some());
     // Each candidate is only an answer while ITS prototype is still on the
     // receiver's chain. The two are asked separately: replacing an array's
     // prototype with a plain object takes `Array.prototype`'s methods away and
     // leaves `Object.prototype`'s, since the replacement inherits from it.
-    match ctor {
-        Some(c) if on_proto(c) && intrinsic_reachable(obj, c) => Some(c),
-        // Everything else inherits `Object.prototype`'s.
-        _ if on_proto("Object") && intrinsic_reachable(obj, "Object") => Some("Object"),
-        _ => None,
+    if let Some(c) = ctor.filter(|c| on_proto(c) && intrinsic_reachable(obj, c)) {
+        return Some(c);
     }
+    // An intrinsic prototype the receiver's chain passes THROUGH, which its own
+    // kind does not account for.
+    if let Some(c) = chain_intrinsic_ctors(obj)
+        .into_iter()
+        .find(|c| on_proto_or_symbol(c))
+    {
+        return Some(c);
+    }
+    // Everything else inherits `Object.prototype`'s.
+    if on_proto("Object") && intrinsic_reachable(obj, "Object") {
+        return Some("Object");
+    }
+    None
 }
 
 /// `structuredClone` — a deep copy of plain data (objects/arrays/primitives).

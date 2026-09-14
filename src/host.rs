@@ -6242,6 +6242,15 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
                 return invoke(&f, args, Some(recv.clone()));
             }
         }
+        // A method from an intrinsic prototype this object's CHAIN passes
+        // through — `Object.create(Array.prototype).push(1)`. The read already
+        // resolves it through the same owner oracle; dispatch reported "is not
+        // a function", the read and the call disagreeing once more.
+        if let Some(owner) = crate::builtins::inherited_method_owner_pub(recv, name) {
+            if owner != "Object" {
+                return crate::builtins::proto_method(recv, &format!("{owner}:{name}"), args);
+            }
+        }
         if crate::builtins::is_object_builtin_method(name) {
             return crate::builtins::object_builtin_method(recv, name, args);
         }
@@ -7290,6 +7299,14 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
     // Builtin constructors whose instances aren't prototype-linked in our model
     // (arrays/plain objects/functions) get a structural instanceof.
     if let Some(JsObj::Builtin(name)) = with_host(|h| h.get(ctor).cloned()) {
+        // …but an object whose chain PASSES THROUGH the intrinsic prototype is
+        // an instance regardless of its own kind, which is the whole of the ES5
+        // subclassing pattern: `F.prototype = Object.create(Array.prototype)`
+        // makes `new F() instanceof Array` true. A structural test alone said
+        // false.
+        if crate::builtins::chain_intrinsic_ctors_pub(obj).contains(&name.as_str()) {
+            return Ok(true);
+        }
         let kind = with_host(|h| h.get(obj).cloned());
         match name.as_str() {
             "Array" => return Ok(matches!(kind, Some(JsObj::Array(_)))),
