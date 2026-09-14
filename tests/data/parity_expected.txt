@@ -1803,6 +1803,23 @@ restore       ["1-2",[1,2]]
 subclass      ["function","1-2",true,[1,2]]
 subclass-map  ["function",2]
 deep-subclass ["function","3"]
+==== protolistings.js ====
+symbol        [["constructor","toString","valueOf","description"],["Symbol(Symbol.toStringTag)","Symbol(Symbol.toPrimitive)"]]
+number        ["constructor","toExponential","toFixed","toPrecision","toString","valueOf","toLocaleString"]
+boolean       ["constructor","toString","valueOf"]
+bigint        [["constructor","toLocaleString","toString","valueOf"],["Symbol(Symbol.toStringTag)"]]
+string-count  [52,"length",true,true,["Symbol(Symbol.iterator)"]]
+string-annexb true
+error         ["constructor","name","message","toString"]
+typeerror     [["constructor","name","message"],["constructor","name","message"],["constructor","name","message"]]
+map-set       [["constructor","get","set","has","delete","clear","entries","forEach","keys","size","values","getOrInsert","getOrInsertComputed"],["constructor","has","add","delete","difference","clear","entries","forEach","intersection","isSubsetOf","isSupersetOf","isDisjointFrom","size","symmetricDifference","union","values","keys"]]
+regexp        [["constructor","exec","dotAll","flags","global","hasIndices","ignoreCase","multiline","source","sticky","unicode","unicodeSets","compile","toString","test"],["Symbol(Symbol.match)","Symbol(Symbol.matchAll)","Symbol(Symbol.replace)","Symbol(Symbol.search)","Symbol(Symbol.split)"]]
+promise       [["constructor","then","catch","finally"],["Symbol(Symbol.toStringTag)"]]
+array-syms    ["Symbol(Symbol.iterator)","Symbol(Symbol.unscopables)"]
+date          [47,"constructor",["Symbol(Symbol.toPrimitive)"]]
+no-at-names   true
+enumerable    [[],[],[]]
+descriptors   [["function",null,false,true],["function",true,false,true],["function",true,false,true],["function",null,false,true],["function",true,false,true]]
 ==== protomembers.js ====
 Map      clear,constructor,delete,entries,forEach,get,getOrInsert,getOrInsertComputed,has,keys,set,size,values
 Set      add,clear,constructor,delete,difference,entries,forEach,has,intersection,isDisjointFrom,isSubsetOf,isSupersetOf,keys,size,symmetricDifference,union,values

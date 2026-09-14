@@ -2575,19 +2575,21 @@ Still divergent, and why:
   handles only those two suffixes, and the `GETITER` op records no source text.
   `examples/protodetach.js` therefore pins `e.constructor.name` and not the
   message.
-- **A REAL-object prototype's own-name listing is wrong.** The intrinsic
-  prototypes this host builds as namespace handles answer
-  `getOwnPropertyNames` from the generated table
-  (`examples/protomembers.js`); the ones it builds as real objects —
-  `Symbol.prototype`, `String.prototype`, `Number.prototype`, the error
-  hierarchy — answer from their own property maps, which carry neither the
-  right names nor V8's order: `Symbol.prototype` reports
-  `constructor,toString,valueOf,toLocaleString` where node reports
-  `constructor,toString,valueOf,description`, and `String.prototype` omits the
-  Annex B HTML methods and `length` entirely. The accessors themselves now
-  read and describe correctly (`examples/protoaccessors.js`); it is only the
-  LISTING that is wrong. Routing those prototypes' own keys through
-  `PROTO_MEMBERS` the way the handles already are is the fix.
+- **A node-specific symbol member is absent from every listing.**
+  `Object.getOwnPropertySymbols(URL.prototype)` omits
+  `Symbol(nodejs.util.inspect.custom)`, which node puts on the four WebIDL
+  prototypes and on `Buffer.prototype`. `gen-arity` emits only WELL-KNOWN
+  symbols, since those are the ones with an `@@name` spelling this frontend can
+  round-trip; a registered symbol would need its full description carried
+  through the table. The ECMAScript prototypes' listings all match
+  (`examples/protolistings.js`).
+- **`Buffer.prototype`'s member list is node's own JavaScript.** It reports 63
+  names here against node's 96, in a different order, and omits the
+  `*Slice`/`*Write` internals and the `readUint*`/`writeUint*` aliases. The
+  core-module surface is deliberately outside `gen-arity` (README says so):
+  those names are properties of node's implementation, not of any
+  specification, so transcribing them would pin this frontend to one node
+  build.
 - **`gen-arity` must run against the same node the corpus does.** `src/arity.rs`
   now carries four tables, all transcribed from the reference binary:
   `BUILTIN_ARITY`, `PROTO_MEMBERS`, `PROTO_ACCESSORS`, `PROTO_READONLY`.

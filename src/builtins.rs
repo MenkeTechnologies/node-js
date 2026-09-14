@@ -7721,9 +7721,25 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
             h.new_array(out)
         }));
     }
+    // An intrinsic prototype this host built as a REAL OBJECT — `Symbol
+    // .prototype`, `String.prototype`, the error hierarchy — answers from the
+    // generated table too. It was answering from its own property map instead,
+    // which carries neither the right names nor V8's order: `Symbol.prototype`
+    // reported `toLocaleString` and omitted `description`, and
+    // `String.prototype` omitted `length` and every Annex B HTML method.
+    //
+    // `ns` is the namespace SPELLING, so the arm below is shared verbatim —
+    // the two representations of a prototype cannot answer differently.
+    let real_proto_ns = with_host(|h| h.intrinsic_proto_ctor(&v).map(|c| format!("{c}.prototype")))
+        .filter(|ns| intrinsic_proto_members(ns).is_some());
     // A builtin prototype namespace that exposes enumerable methods for copying
     // (`Object.getOwnPropertyNames(EventEmitter.prototype)` — express's mixin).
-    if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(&v).cloned()) {
+    if let Some(ns) = real_proto_ns.or_else(|| {
+        with_host(|h| match h.get(&v) {
+            Some(JsObj::Builtin(ns)) => Some(ns.clone()),
+            _ => None,
+        })
+    }) {
         // An INTRINSIC prototype (`Map.prototype`, `URL.prototype`). Members are
         // non-enumerable on an ECMAScript builtin and enumerable on a WebIDL
         // interface, which the table records per name.
@@ -12731,10 +12747,7 @@ fn proxy_or_own_symbol_keys(v: &Value) -> Result<Vec<Value>, String> {
     // table, which is the only record of them: they own no map entry, so
     // `Object.getOwnPropertySymbols(Array.prototype)` was `[]` where node
     // reports `Symbol.iterator` and `Symbol.unscopables`.
-    if let Some(ns) = with_host(|h| match h.get(v) {
-        Some(JsObj::Builtin(ns)) => Some(ns.clone()),
-        _ => None,
-    }) {
+    if let Some(ns) = intrinsic_proto_of(v).map(|c| format!("{c}.prototype")) {
         if let Some(members) = intrinsic_proto_members(&ns) {
             return Ok(with_host(|h| {
                 members
