@@ -1770,6 +1770,20 @@ tag      [object Custom] [object Custom]
 valueOf  true true true
 own      1,2,3 /a+/g ff 1.5 true s
 locale   1,2 1234.5
+==== osruntime.js ====
+cpu-count     [true,true,true]
+cpu-keys      [["model","speed","times"],["idle","irq","nice","sys","user"]]
+cpu-model     ["string",true,"number",true]
+memory        [true,true,true,true,true]
+uptime        ["number",true,true]
+net-nonempty  ["object",true,true]
+net-keys      ["address","cidr","family","internal","mac","netmask"]
+net-families  true
+net-loopback  ["127.0.0.1","255.0.0.0",true,"127.0.0.1/8"]
+net-mac       true
+net-cidr      true
+net-internal  [true,true]
+neighbours    ["string",true,true,"string",true]
 ==== ownproperties.js ====
                    read  in    own   keys  desc  gopn
 fn.length          number true true false true true
