@@ -144,6 +144,11 @@ pub struct Compiler {
     /// error a nullish source raises — `Cannot destructure property 'w' of 'v'
     /// as it is null` — and the pattern compiler only has the VALUE.
     destructure_src: Option<String>,
+    /// Whether `destructure_src` came from a DECLARATION's initializer rather
+    /// than from an assignment target. Node names the source in a
+    /// not-iterable error only for a declaration: `const [x] = o` is `o is not
+    /// iterable`, while `[y] = o` reports the TYPE.
+    destructure_is_decl: bool,
     /// Emit per-statement `DBG_LINE` markers for the DAP debugger (`node --dap`).
     debug: bool,
     /// Index into `loops` of the first loop opened by the chunk being emitted.
@@ -453,6 +458,12 @@ fn callee_text(e: &Expr) -> Option<String> {
         Expr::Undefined => "undefined".into(),
         Expr::Array(items) if items.is_empty() => "[]".into(),
         Expr::Object(props) if props.is_empty() => "{}".into(),
+        // A non-empty OBJECT literal is the one shape V8 will not render from
+        // source: `({a: 1})()` is `{(intermediate value)} is not a function`,
+        // where an array literal or a template is printed as written. Without
+        // this the message fell back to the VALUE, which renders
+        // `[object Object]` — a spelling node never produces here.
+        Expr::Object(_) => "{(intermediate value)}".into(),
         Expr::Member {
             object,
             property,
@@ -738,8 +749,10 @@ impl Compiler {
                         }
                     }
                     self.destructure_src = d.init.as_ref().and_then(destructure_source_text);
+                    self.destructure_is_decl = true;
                     let r = self.compile_bind(b, &d.target, mode);
                     self.destructure_src = None;
+                    self.destructure_is_decl = false;
                     r?;
                 }
             }
@@ -1058,7 +1071,29 @@ impl Compiler {
             .unwrap_or(-1);
         b.emit(Op::LoadInt(items.len() as i64), 0);
         b.emit(Op::LoadInt(star_idx), 0);
+        let at = b.current_pos();
         b.emit(Op::CallBuiltin(ops::UNPACK, 3), 0); // pushes items[0]..items[n-1], items[0] on top
+                                                    // Destructuring a non-iterable names the SOURCE the same way `for-of`
+                                                    // does: `const [x] = a` reports `a is not iterable`. The text is the one
+                                                    // the object-pattern error already carries; a synthesized `.param<n>`
+                                                    // slot has no source spelling and is skipped.
+                                                    // …and only for a plain IDENTIFIER source. Node reports the TYPE for
+                                                    // every other shape — a member, an index, a call, a nested pattern —
+                                                    // even though the text exists, so recording one there would name an
+                                                    // expression node never names.
+        if let Some(src) = self
+            .destructure_src
+            .clone()
+            .filter(|_| self.destructure_is_decl)
+            .filter(|t| !t.starts_with('.'))
+            .filter(|t| {
+                t.starts_with('{')
+                    || t.chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            })
+        {
+            self.call_sites.push((at, src));
+        }
         for it in items {
             match it {
                 // An elided target position (`const [a, , b] = xs`) still
@@ -1523,7 +1558,24 @@ impl Compiler {
         body: &Stmt,
     ) -> Result<(), String> {
         self.compile_expr(b, iter)?;
+        let at = b.current_pos();
         b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
+                                                     // A `for-of` over a non-iterable names the SOURCE expression:
+                                                     // `for (const x of a)` reports `a is not iterable`, not the rendering
+                                                     // of whatever `a` held. Same table the callee-naming uses.
+                                                     //
+                                                     // A CALL source gets V8's combined wording, since either half could be
+                                                     // at fault: `for (const x of f())` is `f is not a function or its
+                                                     // return value is not iterable`. Recording the whole subject rather
+                                                     // than a marker keeps the runtime side one string substitution.
+        match iter {
+            Expr::Call { func, .. } => {
+                let name = callee_text(func).unwrap_or_else(|| "(intermediate value)".into());
+                self.call_sites
+                    .push((at, format!("{name} is not a function or its return value")));
+            }
+            _ => self.note_call_site(at, iter),
+        }
         self.iter_depth += 1;
         let r = self.loop_over(b, declare, target, body);
         self.iter_depth -= 1;
@@ -1569,7 +1621,13 @@ impl Compiler {
     ) -> Result<(), String> {
         let iter_tmp = self.tmp_name("aiter");
         self.compile_expr(b, iter)?;
+        let at = b.current_pos();
         b.emit(Op::CallBuiltin(ops::GET_ASYNC_ITER, 1), 0); // [iterator]
+                                                            // `for await` over a non-iterable names the source AND says ASYNC:
+                                                            // `for await (const x of o)` is `o is not async iterable`. Recording
+                                                            // the whole subject keeps the runtime side one substitution, as the
+                                                            // call-source wording above does.
+        self.note_call_site(at, iter);
         self.name_const(b, &iter_tmp);
         b.emit(Op::Swap, 0);
         b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
@@ -2812,7 +2870,30 @@ impl Compiler {
                     }
                 }
             }
+            let at = b.current_pos();
             b.emit(Op::CallBuiltin(ops::BUILD_ARGS, argc(items.len() * 2)?), 0);
+            // A spread over a non-iterable names the SOURCE: `[...o]` reports
+            // `o is not iterable`. One op covers the whole literal, so the text
+            // is recorded only when a SINGLE spread could have raised it —
+            // with two, this cannot say which one did, and naming the wrong
+            // expression is worse than rendering the value.
+            let texts: Vec<Option<String>> = items
+                .iter()
+                .filter_map(|e| match e {
+                    Expr::Spread(inner) => Some(callee_text(inner)),
+                    _ => None,
+                })
+                .collect();
+            // One op covers the whole literal, so a name can be recorded only
+            // when every spread would produce the SAME one — with one spread
+            // trivially, and with `[...o, ...o]` because either is the answer.
+            // Two DIFFERENT sources cannot be told apart here, and naming the
+            // wrong expression is worse than rendering the value.
+            if let Some(first) = texts.first().cloned().flatten() {
+                if texts.iter().all(|t| t.as_deref() == Some(first.as_str())) {
+                    self.call_sites.push((at, first));
+                }
+            }
         } else if items.len() <= u8::MAX as usize {
             for it in items {
                 self.compile_expr(b, it)?;
@@ -4235,6 +4316,15 @@ fn destructure_source_text(e: &Expr) -> Option<String> {
         Expr::Null => "null".into(),
         Expr::Undefined => "undefined".into(),
         Expr::Ident(n) => n.clone(),
+        // A LITERAL names itself: `const [x] = 5` is `5 is not iterable`. An
+        // OBJECT literal is named too, but by shape rather than by text — empty
+        // renders `{}` and anything else `{(intermediate value)}`, which is
+        // what V8 calls a value with no source name.
+        Expr::Number(n) => crate::host::fmt_number(*n),
+        Expr::True => "true".into(),
+        Expr::False => "false".into(),
+        Expr::Object(props) if props.is_empty() => "{}".into(),
+        Expr::Object(_) => "{(intermediate value)}".into(),
         Expr::Member {
             object,
             property,

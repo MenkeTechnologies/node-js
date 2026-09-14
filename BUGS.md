@@ -2569,13 +2569,19 @@ Still divergent, and why:
   but it means no record may assert a comparison count or an
   observed argument pair. `examples/sortmutation.js` guards every mutation to
   fire exactly once for that reason.
-- **A not-iterable TypeError names the VALUE, not the source expression.** Node
-  reports `a is not iterable`; this reports `[ 1, 2 ] is not iterable`. The
-  machinery exists — `host::name_call_site` rewrites `is not a function` and
-  `is not a constructor` from the compile-time `call_sites` table — but it
-  handles only those two suffixes, and the `GETITER` op records no source text.
-  `examples/protodetach.js` therefore pins `e.constructor.name` and not the
-  message.
+- **An ARRAY-literal callee renders as its VALUE, not its source.** `[1,2]()`
+  reports `1,2 is not a function` where node says `[1,2] is not a function`;
+  node prints the literal as written. Only the EMPTY array has a fixed
+  spelling, which `callee_text` already has — printing a general one means
+  reconstructing source text from the AST, the same gap as
+  `Function.prototype.toString` above. A non-empty OBJECT literal does not have
+  this problem: V8 renders it `{(intermediate value)}`, which is a fixed
+  spelling (`examples/iterableerrors.js`).
+- **A spread whose literal holds two DIFFERENT sources renders the value.**
+  `[...a, ...b]` compiles to one `BUILD_ARGS` op, so the compile-time text
+  table cannot say which of the two failed; naming the wrong one is worse, so
+  the value rendering stands there. One spread, or several with the same
+  source text, are named.
 - **A node-specific symbol member is absent from every listing.**
   `Object.getOwnPropertySymbols(URL.prototype)` omits
   `Symbol(nodejs.util.inspect.custom)`, which node puts on the four WebIDL

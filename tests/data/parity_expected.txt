@@ -1304,6 +1304,34 @@ null
   configurable: false
 }
 [Object: null prototype] {}
+==== iterableerrors.js ====
+forof-ident   TypeError: o is not iterable
+forof-number  TypeError: n is not iterable
+forof-member  TypeError: o.a is not iterable
+forof-index    TypeError: o.a is not iterable
+forof-literal TypeError: 5 is not iterable
+forof-object  TypeError: {} is not iterable
+forof-call    TypeError: f is not a function or its return value is not iterable
+forof-anon    TypeError: (intermediate value) is not a function or its return value is not iterable
+forawait      no throw
+destr-ident   TypeError: o is not iterable
+destr-number  TypeError: n is not iterable
+destr-literal TypeError: 5 is not iterable
+destr-object  TypeError: {} is not iterable
+destr-objfull TypeError: {(intermediate value)} is not iterable
+destr-member  TypeError: number 1 is not iterable (cannot read property Symbol(Symbol.iterator))
+destr-call    TypeError: number 5 is not iterable (cannot read property Symbol(Symbol.iterator))
+destr-nested  TypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))
+destr-assign  TypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))
+destr-param   TypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))
+spread-ident  TypeError: o is not iterable
+spread-repeat TypeError: o is not iterable
+spread-object TypeError: {} is not iterable
+spread-objful TypeError: {(intermediate value)} is not iterable
+call-object   TypeError: {(intermediate value)} is not a function
+call-empty    TypeError: {} is not a function
+new-object    TypeError: {(intermediate value)} is not a constructor
+forawait      TypeError: o is not async iterable
 ==== iterclose.js ====
 from-throws   ["m",["next","return"]]
 from-maps     [10,21]

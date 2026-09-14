@@ -253,7 +253,17 @@ fn b_tag_tmpl(vm: &mut VM, argc: u8) -> Value {
 /// iterator (each yielded value is awaited). Returns the iterator object/handle.
 fn b_get_async_iter(vm: &mut VM, _: u8) -> Value {
     let src = vm.pop();
-    let r = host::get_async_iterator(&src);
+    let r = host::get_async_iterator(&src).map_err(|e| {
+        // `for await` names the source AND says ASYNC: `for await (const x of
+        // o)` is `o is not async iterable`. Built here rather than through
+        // `name_call_site`, whose suffix table has no entry that composes.
+        match host::call_site_text(vm) {
+            Some(t) if e.ends_with(" is not iterable") => {
+                host::type_error(&format!("{t} is not async iterable"))
+            }
+            _ => e,
+        }
+    });
     finish(vm, r)
 }
 
@@ -5018,7 +5028,8 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
         )
     {
         let shown = with_host(|h| h.inspect(&v));
-        return abort(vm, host::type_error(&format!("{shown} is not iterable")));
+        let msg = host::type_error(&format!("{shown} is not iterable"));
+        return abort(vm, host::name_call_site(vm, &shown, msg));
     }
     // Anything else with a `Symbol.iterator`: call it for the iterator object.
     //
@@ -5041,7 +5052,13 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
     }
     match with_host(|h| h.iter_vec(&v)) {
         Ok(items) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })),
-        Err(e) => abort(vm, e),
+        // V8 names the SOURCE EXPRESSION, not the value: `for (const x of a)`
+        // reports `a is not iterable`. The text was recorded for this op.
+        Err(e) => {
+            let shown = with_host(|h| h.inspect(&v));
+            let named = host::name_call_site(vm, &shown, e);
+            abort(vm, named)
+        }
     }
 }
 
@@ -5220,7 +5237,24 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
         host::iter_all(&iterable)
     } {
         Ok(v) => v,
-        Err(e) => return abort(vm, e),
+        // Destructuring a non-iterable names the SOURCE EXPRESSION, the way
+        // `for-of` does: `const [x] = o` reports `o is not iterable`. The text
+        // was recorded for this op at compile time.
+        Err(e) => {
+            // Node names the source only when the pattern's right-hand side is
+            // a plain IDENTIFIER — `const [x] = o` is `o is not iterable`.
+            // Anything else (a member, a call, a nested pattern, a parameter)
+            // reports the TYPE instead, with the property note. Measured across
+            // twelve shapes rather than guessed.
+            let msg = match host::call_site_text(vm) {
+                Some(text) => host::type_error(&format!("{text} is not iterable")),
+                None if e.ends_with(" is not iterable") => {
+                    host::type_error(&not_iterable_typed(&iterable))
+                }
+                None => e,
+            };
+            return abort(vm, msg);
+        }
     };
     let ordered: Vec<Value> = if star < 0 {
         (0..count)
@@ -5269,7 +5303,10 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
             // Tag 1 is an ARRAY-LITERAL spread, tag 3 a CALL-ARGUMENT one. They
             // report a non-iterable differently, which is the only reason the
             // two are told apart here.
-            Value::Int(1) => match host::iter_all(&val) {
+            Value::Int(1) => match host::iter_all(&val).map_err(|e| {
+                let shown = with_host(|h| h.inspect(&val));
+                host::name_call_site(vm, &shown, e)
+            }) {
                 Ok(items) => out.extend(items),
                 Err(e) => return abort(vm, e),
             },
@@ -8123,6 +8160,14 @@ fn group_by_check_iterable(v: &Value, name: &str) -> Result<(), String> {
     if with_host(|h| host::is_callable(h, &iter_fn)) {
         return Ok(());
     }
+    Err(host::type_error(&not_iterable_typed(v)))
+}
+
+/// The `<type> <value> is not iterable (cannot read property
+/// Symbol(Symbol.iterator))` wording, which node uses wherever the source has
+/// no name to report: a plain object, a symbol and a bigint name only their
+/// TYPE; a number, a string and a boolean name the value too.
+pub(crate) fn not_iterable_typed(v: &Value) -> String {
     let shown = with_host(|h| {
         let kind = h.type_of(v);
         match kind {
@@ -8131,9 +8176,7 @@ fn group_by_check_iterable(v: &Value, name: &str) -> Result<(), String> {
             _ => format!("{kind} {}", h.str_of(v)),
         }
     });
-    Err(host::type_error(&format!(
-        "{shown} is not iterable (cannot read property Symbol(Symbol.iterator))"
-    )))
+    format!("{shown} is not iterable (cannot read property Symbol(Symbol.iterator))")
 }
 
 /// `Map.groupBy(items, cb)` — like `Object.groupBy` but returns a `Map` keyed by

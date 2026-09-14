@@ -255,13 +255,26 @@ pub fn parked_iters(vm: &fusevm::VM) -> usize {
 ///
 /// Returns the message unchanged when no site was recorded, so a shape the
 /// printer declines to print keeps the old wording rather than an invented one.
+/// The source text recorded for the op currently executing, if any. `vm.ip` has
+/// already advanced past it.
+pub fn call_site_text(vm: &fusevm::VM) -> Option<String> {
+    call_sites::text(vm.chunk.op_hash, vm.ip.saturating_sub(1))
+}
+
 pub fn name_call_site(vm: &fusevm::VM, subject: &str, msg: String) -> String {
-    for tail in [" is not a function", " is not a constructor"] {
+    for tail in [
+        " is not a function",
+        " is not a constructor",
+        " is not iterable",
+    ] {
         let Some(head) = msg.strip_suffix(tail) else {
             continue;
         };
         // The prefix is the error class (`TypeError: `); the rest is the subject.
-        let (prefix, found) = match head.rfind(": ") {
+        // The FIRST separator, not the last: a rendered VALUE can contain one —
+        // `{ a: 1 } is not iterable` split at the last `": "` left the subject
+        // as `1 }`, which matched nothing and silently skipped the rename.
+        let (prefix, found) = match head.find(": ") {
             Some(i) => (&head[..i + 2], &head[i + 2..]),
             None => ("", head),
         };
