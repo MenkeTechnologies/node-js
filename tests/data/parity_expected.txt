@@ -1038,6 +1038,23 @@ asyncSym function true
 syncSym  function true
 instTag  [object Generator] [object AsyncGenerator]
 forawait 1,2
+==== globalscope.js ====
+locals        ["undefined","undefined","undefined",false]
+distinctive   ["undefined",true]
+top-level     ["undefined","undefined",false]
+still-bound   [4,4]
+hoisting      ["undefined","function"]
+implicit      ["number",9,true]
+explicit      [10,"number"]
+own-property  [true,true,true,"{\"value\":11,\"writable\":true,\"enumerable\":true,\"configurable\":true}"]
+delete        [true,"undefined",false]
+builtin-own   [true,true,false,false]
+absent        [false,false,null]
+builtins      ["object",true,"object",true]
+cjs-locals    ["function","undefined","object","undefined"]
+direct-eval   ["number","undefined"]
+indirect-eval ["number",11]
+eval-top      [12,"undefined"]
 ==== hello.js ====
 hello, world
 7 256 2.5 2

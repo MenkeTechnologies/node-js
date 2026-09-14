@@ -890,6 +890,9 @@ pub struct JsHost {
     array_holes: HashMap<u32, rustc_hash::FxHashSet<usize>>,
     /// See `take_super_replacement`.
     super_replacement: Option<Value>,
+    /// Whether the entry script's top-level `var`s bind to its own scope rather
+    /// than to the globals map — the CommonJS wrapper Node puts every file in.
+    module_scope: bool,
     /// User-assigned static properties on a builtin namespace/constructor, keyed
     /// by namespace name then property (`Error` → `prepareStackTrace`,
     /// `stackTraceLimit`). Each bare `Error` reference allocates a fresh
@@ -1181,6 +1184,7 @@ impl JsHost {
             private_methods: HashSet::new(),
             array_holes: HashMap::new(),
             super_replacement: None,
+            module_scope: false,
             builtin_statics: HashMap::new(),
             object_proto: Value::Undef,
             proto_class: HashMap::new(),
@@ -2643,7 +2647,13 @@ impl JsHost {
     /// and must not be reset, which is also why a bare `var x;` emits nothing at
     /// its own position.
     pub fn hoist_var_name(&mut self, name: &str) {
-        if self.frame().is_module {
+        // The ENTRY script's top level is a CommonJS module body, not global
+        // scope: node wraps every file in a function, so a top-level `var` is a
+        // local of that wrapper. Binding it into the globals map made
+        // `var x = 3` at the top of the entry readable as `globalThis.x`, where
+        // node says `undefined` — a REQUIRED module already ran inside a real
+        // frame and behaved correctly, so only the entry file differed.
+        if self.frame().is_module && !self.module_scope {
             self.globals.entry(name.to_string()).or_insert(Value::Undef);
             return;
         }
@@ -2655,7 +2665,7 @@ impl JsHost {
     }
 
     pub fn declare_var_name(&mut self, name: &str, val: Value) {
-        if self.frame().is_module {
+        if self.frame().is_module && !self.module_scope {
             self.globals.insert(name.to_string(), val);
             return;
         }
@@ -3433,6 +3443,18 @@ fn finish_run(key: u64, mut vm: VM) -> Result<Value, String> {
 /// A `var` the chunk itself declares lands in the top-level scope and persists,
 /// so successive `vm.runInThisContext` calls share it.
 pub fn run_chunk_in_global_scope(chunk: Chunk) -> Result<Value, String> {
+    // An INDIRECT eval really is global code (19.2.1.1 step 6): its `var`s bind
+    // to the global object, not to the entry module's wrapper scope. The flag
+    // that keeps the entry script's own `var`s out of the globals map has to be
+    // lifted for the duration, or `(0, eval)('var g = 1')` stopped reaching
+    // `globalThis.g`.
+    let prev_scope = with_host(|h| std::mem::take(&mut h.module_scope));
+    let out = run_chunk_in_global_scope_inner(chunk);
+    with_host(|h| h.module_scope = prev_scope);
+    out
+}
+
+fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
     let global_env = with_host(|h| h.global_env.clone());
     with_host(|h| {
         h.frames.push(Frame {
@@ -3460,6 +3482,7 @@ pub fn run_chunk_in_global_scope(chunk: Chunk) -> Result<Value, String> {
 /// timers) until quiescent — matching Node, which keeps the process alive while
 /// pending async work remains.
 pub fn run_main(chunk: Chunk) -> Result<Value, String> {
+    with_host(|h| h.module_scope = true);
     let r = run_chunk_on(chunk);
     with_host(|h| h.signal = None);
     if r.is_ok() {
@@ -5761,6 +5784,17 @@ impl JsHost {
     /// (`getOwnPropertyNames`/`Reflect.ownKeys`).
     pub fn own_key_names(&self, v: &Value, enum_only: bool) -> Vec<String> {
         let mut keys = self.own_enum_data_keys(v, enum_only);
+        // A global a SCRIPT created (`x = 1` with no declaration) is an own
+        // ENUMERABLE property of the global object, but lives in the globals map
+        // rather than in its property map — so no listing saw it, while
+        // `globalThis.x` read it back and its descriptor called it enumerable.
+        if self.is_global_object(v) {
+            for k in self.globals.keys() {
+                if !keys.contains(k) {
+                    keys.push(k.clone());
+                }
+            }
+        }
         // A RegExp's `lastIndex` is a SYNTHESIZED own property — it lives in the
         // `RegExpObj` struct, not a property map — so nothing above can list it.
         // Non-enumerable, so only `getOwnPropertyNames` sees it.
@@ -5779,6 +5813,17 @@ impl JsHost {
 
     /// The keys that own a slot in the object's property map, in insertion
     /// order, resolving accessor ordering markers back to their real key.
+    /// Every global a SCRIPT created, in creation order — the own enumerable
+    /// keys of the global object that live in the globals map rather than in
+    /// its property map. `x = 1` with no declaration makes one, and
+    /// `Object.keys(globalThis)` reports it in node.
+    pub fn script_global_names(&self) -> Vec<String> {
+        self.globals.keys().cloned().collect()
+    }
+    /// Drop a global a script created. Reports whether it was there.
+    pub fn remove_global(&mut self, name: &str) -> bool {
+        self.globals.shift_remove(name).is_some()
+    }
     fn own_enum_data_keys(&self, v: &Value, enum_only: bool) -> Vec<String> {
         match self.get(v) {
             // A `Buffer` is an index-keyed exotic: its own enumerable keys are

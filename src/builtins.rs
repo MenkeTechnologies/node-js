@@ -658,7 +658,31 @@ fn finish(vm: &mut VM, r: Result<Value, String>) -> Value {
 /// which must agree: a name reachable one way and not the other is exactly the
 /// discrepancy that left `globalThis.process` undefined while `process` worked.
 pub(crate) fn global_binding(name: &str) -> Option<Value> {
-    if let Some(v) = with_host(|h| h.read_name(name)) {
+    global_binding_from(name, false)
+}
+
+/// [`global_binding`] restricted to what the GLOBAL OBJECT really holds.
+///
+/// A `globalThis.x` read falls back to the same lazy binding a bare `x` gets,
+/// which is what makes `globalThis.Math` and `globalThis.process` work — but
+/// the bare-identifier lookup walks the SCOPE CHAIN, so while any function was
+/// running its locals were readable off `globalThis`: `function f() { let zzq =
+/// 2; return typeof globalThis.zzq }` answered for a name the global object has
+/// never heard of. Only the globals map and the lazy builtins below may answer
+/// here.
+pub(crate) fn global_object_binding(name: &str) -> Option<Value> {
+    global_binding_from(name, true)
+}
+
+fn global_binding_from(name: &str, object_only: bool) -> Option<Value> {
+    let bound = with_host(|h| {
+        if object_only {
+            h.read_global(name)
+        } else {
+            h.read_name(name)
+        }
+    });
+    if let Some(v) = bound {
         return Some(v);
     }
     // Globals bound lazily: numeric sentinels + builtin namespaces.
@@ -1074,7 +1098,7 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         // global-object properties: `typeof globalThis.require` is `undefined`
         // there even though the bare `require` works.
         if !own && !CJS_WRAPPER_LOCALS.contains(&name) {
-            if let Some(v) = global_binding(name) {
+            if let Some(v) = global_object_binding(name) {
                 return Ok(v);
             }
         }
@@ -1962,6 +1986,14 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
         }
         "hasOwnProperty" => {
             let k = with_host(|h| h.property_key(&arg0(&args)));
+            // The global object OWNS its lazily-bound builtins and every global
+            // a script created; neither lives in its property map.
+            if with_host(|h| h.is_global_object(recv))
+                && !CJS_WRAPPER_LOCALS.contains(&k.as_str())
+                && global_object_binding(&k).is_some()
+            {
+                return Ok(Value::Bool(true));
+            }
             // A builtin namespace/prototype receiver (`Map.prototype`) reports
             // ownership via `has_property` (its methods resolve as thunks).
             if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Builtin) {
@@ -4081,6 +4113,12 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
     // throw — the reason this reports a `Result` rather than a bare `bool`.
     if let Some(b) = crate::proxy::delete(recv, key)? {
         return Ok(b);
+    }
+    // `delete globalThis.x` removes a global a script created. It lives in the
+    // globals map, not the object's property map, so the ordinary path reported
+    // success and removed nothing — the binding stayed readable afterwards.
+    if with_host(|h| h.is_global_object(recv)) && with_host(|h| h.remove_global(key)) {
+        return Ok(true);
     }
     // `delete require.cache[id]` drops the module so the next `require` of that
     // file runs it again — the whole point of exposing the cache.
@@ -13414,7 +13452,10 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
             _ => false,
         });
         if !owned && !CJS_WRAPPER_LOCALS.contains(&key.as_str()) {
-            if let Some(v) = global_binding(&key) {
+            // A global a SCRIPT created — `x = 1` with no declaration — is an
+            // ordinary enumerable property, unlike the builtins.
+            let script_made = with_host(|h| h.read_global(&key).is_some());
+            if let Some(v) = global_object_binding(&key) {
                 let frozen = matches!(key.as_str(), "undefined" | "NaN" | "Infinity");
                 return Ok(with_host(|h| {
                     let mut m: IndexMap<String, Value> = IndexMap::new();
@@ -13422,7 +13463,7 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
                     m.insert("writable".into(), Value::Bool(!frozen));
                     m.insert(
                         "enumerable".into(),
-                        Value::Bool(ENUMERABLE_GLOBALS.contains(&key.as_str())),
+                        Value::Bool(script_made || ENUMERABLE_GLOBALS.contains(&key.as_str())),
                     );
                     m.insert("configurable".into(), Value::Bool(!frozen));
                     h.new_object(m)
@@ -13569,6 +13610,17 @@ pub fn has_property(obj: &Value, key: &str) -> Result<bool, String> {
 
 /// `[[HasProperty]]` for every non-Proxy receiver.
 fn has_property_ordinary(obj: &Value, key: &str) -> bool {
+    // `key in globalThis`: membership matches what the READ answers, which for
+    // the global object includes every lazily-bound builtin and every global a
+    // script created. `'Math' in globalThis` and `'x' in globalThis` after
+    // `x = 1` both answered FALSE while `globalThis.Math` and `globalThis.x`
+    // read back fine.
+    if with_host(|h| h.is_global_object(obj))
+        && !CJS_WRAPPER_LOCALS.contains(&key)
+        && global_object_binding(key).is_some()
+    {
+        return true;
+    }
     // `key in <builtin namespace/prototype>`: membership matches what a property
     // read would yield. `String.prototype.indexOf` (and the rest of the builtin
     // prototype methods) resolve as callable thunks via `namespace_property`, so

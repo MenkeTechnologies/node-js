@@ -509,6 +509,7 @@ v26.7.0; every row marked **agrees** is now pinned by a test.
 | `require.main === module` | `true` | `false` | `false` | **`require.main` absent** |
 | top-level `this` | `module.exports` | `globalThis` | `globalThis` | agrees |
 | top-level `arguments` | the wrapper's 5 | *undefined* | *undefined* | **undefined at all three** |
+| top-level `var x` on `globalThis` | *undefined* (a wrapper local) | *undefined* | `globalThis.x` | agrees |
 | `arguments.callee` in a SLOPPY function | the function | same | same | agrees |
 | stack frame file | `file:L:C` | `[eval]:L:C` | `[stdin]:L:C` | **no `file:line:col`** |
 
