@@ -1039,6 +1039,30 @@ parseInt array => 12
 parseInt object => 42
 parseInt symbol in array THREW TypeError: Cannot convert a Symbol value to a string
 parseFloat object => 1.5
+==== fserrors.js ====
+stat          ["ENOENT","stat","<dir>/nope","ENOENT: no such file or directory, stat '<dir>/nope'"]
+lstat         ["ENOENT","lstat","<dir>/nope","ENOENT: no such file or directory, lstat '<dir>/nope'"]
+unlink        ["ENOENT","unlink","<dir>/nope","ENOENT: no such file or directory, unlink '<dir>/nope'"]
+rmdir         ["ENOENT","rmdir","<dir>/nope","ENOENT: no such file or directory, rmdir '<dir>/nope'"]
+chmod         ["ENOENT","chmod","<dir>/nope","ENOENT: no such file or directory, chmod '<dir>/nope'"]
+access        ["ENOENT","access","<dir>/nope","ENOENT: no such file or directory, access '<dir>/nope'"]
+readdir       ["ENOENT","scandir","<dir>/nope","ENOENT: no such file or directory, scandir '<dir>/nope'"]
+readFile      ["ENOENT","open","<dir>/nope","ENOENT: no such file or directory, open '<dir>/nope'"]
+open          ["ENOENT","open","<dir>/nope","ENOENT: no such file or directory, open '<dir>/nope'"]
+truncate      ["ENOENT","open","<dir>/nope","ENOENT: no such file or directory, open '<dir>/nope'"]
+copyFile      ["ENOENT","copyfile","<dir>/nope","ENOENT: no such file or directory, copyfile '<dir>/nope' -> '<dir>/x'"]
+mkdir-eexist  ["EEXIST","mkdir","<dir>","EEXIST: file already exists, mkdir '<dir>'"]
+realpath      ["ENOENT","lstat","<dir>/nope","ENOENT: no such file or directory, lstat '/private<dir>/nope'"]
+rename        ["ENOENT","rename","<dir>/nope","ENOENT: no such file or directory, rename '<dir>/nope' -> '<dir>/x'"]
+read-dir      ["EISDIR","read","undefined","EISDIR: illegal operation on a directory, read"]
+write-dir     ["EISDIR","open","<dir>","EISDIR: illegal operation on a directory, open '<dir>'"]
+readlink      ["EINVAL","readlink","<dir>/x","EINVAL: invalid argument, readlink '<dir>/x'"]
+stat-keys     ["dev","mode","nlink","uid","gid","rdev","blksize","ino","size","blocks","atimeMs","mtimeMs","ctimeMs","birthtimeMs"]
+stat-spread   [14,14]
+stat-dates    [true,true,true,true]
+stat-methods  [true,false,false,2]
+stat-dir      [false,true]
+roundtrip     ["abc!",false]
 ==== generators.js ====
 range [ 2, 3, 4, 5, 6 ]
 fib [ 0, 1, 1, 2, 3, 5 ]

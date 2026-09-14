@@ -314,6 +314,13 @@ fn read_file_sync(args: &[Value]) -> Result<Value, String> {
             Some(e) => with_host(|h| h.new_str(super::buffer::encode_bytes(&bytes, &e))),
             None => super::buffer::from_bytes(&bytes),
         }),
+        // A DIRECTORY opens fine and fails at the `read`, which is the syscall
+        // node names — and it names no path there, because the descriptor no
+        // longer carries one. This reported `open '<dir>'`, an operation that
+        // had in fact succeeded.
+        // The raw errno rather than `ErrorKind::IsADirectory`, which is stable
+        // only since 1.83 and this crate's MSRV is 1.80.
+        Err(e) if e.raw_os_error() == Some(libc::EISDIR) => Err(err_str("read", "", &e)),
         Err(e) => Err(err_str("readFileSync", &path, &e)),
     }
 }
@@ -585,7 +592,7 @@ fn copy_file_impl(args: &[Value]) -> Result<Value, String> {
     }
     match std::fs::copy(&src, &dest) {
         Ok(_) => Ok(Value::Undef),
-        Err(e) => Err(err_str("copyFile", &src, &e)),
+        Err(e) => Err(err_str2("copyFile", &src, &dest, &e)),
     }
 }
 
@@ -650,7 +657,36 @@ fn realpath_impl(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
     match std::fs::canonicalize(&path) {
         Ok(p) => Ok(with_host(|h| h.new_str(p.to_string_lossy().into_owned()))),
-        Err(e) => Err(err_str("realpath", &path, &e)),
+        // The message names the path as far as it was RESOLVED before the walk
+        // failed — on macOS `/var` is a symlink, so node reports
+        // `/private/var/…` where the caller wrote `/var/…`. Reporting the
+        // argument verbatim names a path the failing `lstat` never saw.
+        Err(e) => Err(err_str("realpath", &resolved_prefix(&path), &e)),
+    }
+}
+
+/// `path` with its deepest EXISTING ancestor canonicalized and the rest of the
+/// components appended — what `realpath(3)` has resolved at the point it gives
+/// up.
+fn resolved_prefix(path: &str) -> String {
+    let p = Path::new(path);
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(base) = std::fs::canonicalize(cur) {
+            let mut out = base;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out.to_string_lossy().into_owned();
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) if !parent.as_os_str().is_empty() => {
+                rest.push(name);
+                cur = parent;
+            }
+            _ => return path.to_string(),
+        }
     }
 }
 
@@ -659,7 +695,7 @@ fn rename_impl(args: &[Value]) -> Result<Value, String> {
     let to = arg_str(args, 1);
     match std::fs::rename(&from, &to) {
         Ok(_) => Ok(Value::Undef),
-        Err(e) => Err(err_str("rename", &from, &e)),
+        Err(e) => Err(err_str2("rename", &from, &to, &e)),
     }
 }
 
@@ -673,7 +709,9 @@ fn truncate_impl(args: &[Value]) -> Result<Value, String> {
         .and_then(|f| f.set_len(len));
     match r {
         Ok(_) => Ok(Value::Undef),
-        Err(e) => Err(err_str("truncate", &path, &e)),
+        // The failure is in the `open` this does first, which is the syscall
+        // node names — `truncate` only appears once a descriptor exists.
+        Err(e) => Err(err_str("open", &path, &e)),
     }
 }
 
@@ -1052,7 +1090,16 @@ fn build_stats(h: &mut crate::host::JsHost, md: &std::fs::Metadata) -> Value {
     m.insert("ctime".into(), ctime);
     let birthtime = date(h, birth_ms);
     m.insert("birthtime".into(), birthtime);
-    h.new_object(m)
+    let obj = h.new_object(m);
+    // The four Date fields are ACCESSORS on `Stats.prototype` in node, so they
+    // are not own enumerable keys: `Object.keys(statSync(f))` is the fourteen
+    // numeric fields and nothing else. They are stored here rather than
+    // computed, so the equivalent is to hide them — a `JSON.stringify(stat)`
+    // or an `{...stat}` carried four extra entries node does not.
+    for k in ["atime", "mtime", "ctime", "birthtime"] {
+        h.hide_prop(&obj, k);
+    }
+    obj
 }
 
 // ── watchFile / unwatchFile ──────────────────────────────────────────────────
@@ -1848,8 +1895,22 @@ fn syscall_name(op: &str) -> &str {
         "readFileSync" | "readFile" | "writeFile" | "writeFileSync" | "appendFile"
         | "appendFileSync" | "createReadStream" | "createWriteStream" => "open",
         "readdir" | "readdirSync" | "opendir" => "scandir",
-        other => other,
+        // The rest name the C call, which for most of these is the JS name
+        // minus its `Sync` suffix — `fs.statSync('/nope')` reports `stat`. Only
+        // the ones whose spelling ALSO changes need an entry: libuv writes
+        // `copyfile` in one word, and `realpath` fails inside the `lstat` it
+        // walks the path with.
+        "copyFile" | "copyFileSync" => "copyfile",
+        "realpath" | "realpathSync" => "lstat",
+        other => other.strip_suffix("Sync").unwrap_or(other),
     }
+}
+
+/// The second path a two-argument call names in its message: node renders
+/// `rename '/a' -> '/b'`, and a message with only the source reads as though
+/// the destination were never part of the operation.
+fn err_str2(op: &str, from: &str, to: &str, e: &std::io::Error) -> String {
+    format!("{} -> '{to}'", err_str(op, from, e))
 }
 
 /// The `CODE: reason` half of a libuv error message (`ENOENT: no such file or

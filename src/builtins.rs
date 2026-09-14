@@ -5010,7 +5010,11 @@ fn syscall_error_fields(message: &str) -> Vec<(&'static str, SysField)> {
     // `reason, syscall 'path'` — the path is optional (`EPIPE: …, write`).
     if let Some((_, tail)) = rest.split_once(", ") {
         let (syscall, path) = match tail.split_once(" '") {
-            Some((s, p)) => (s, p.strip_suffix('\'')),
+            // A two-path message ends `'from' -> 'to'`; `err.path` is the FIRST
+            // one, so the scan stops at its closing quote rather than at the
+            // end of the line — which had been swallowing `' -> 'dest` into the
+            // path for every `rename` and `copyFile` failure.
+            Some((s, p)) => (s, p.split_once('\'').map(|(first, _)| first)),
             None => (tail, None),
         };
         out.push(("syscall", SysField::Str(syscall.to_string())));
