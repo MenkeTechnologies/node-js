@@ -6154,8 +6154,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "parseInt" | "Number.parseInt" => Ok(Value::Float(parse_int(&args)?)),
         "parseFloat" | "Number.parseFloat" => Ok(Value::Float(parse_float(&args)?)),
-        "isNaN" => Ok(Value::Bool(arg_num(&args, 0).is_nan())),
-        "isFinite" => Ok(Value::Bool(arg_num(&args, 0).is_finite())),
+        // `isNaN`/`isFinite` are `ToNumber(x)` too (19.2.3/4).
+        "isNaN" => Ok(Value::Bool(to_number_arg(&args, 0)?.is_nan())),
+        "isFinite" => Ok(Value::Bool(to_number_arg(&args, 0)?.is_finite())),
         "encodeURIComponent" => uri_encode(&arg_to_string(&args, 0)?, false),
         "encodeURI" => uri_encode(&arg_to_string(&args, 0)?, true),
         "decodeURIComponent" => uri_decode(&arg_to_string(&args, 0)?, false),
@@ -7499,7 +7500,16 @@ fn legacy_unescape(s: &str) -> Result<Value, String> {
 fn parse_int(args: &[Value]) -> Result<f64, String> {
     // Converted BEFORE the host borrow: `to_string_value` can call back into JS.
     let sv = host::to_string_value(&arg0(args))?;
-    Ok(parse_int_str(&with_host(|h| h.str_of(&sv)), args))
+    // 19.2.5 step 2 is `ToInt32(radix)`, which runs a user `valueOf` — the
+    // infallible read below does no `ToPrimitive`, so an object radix came out
+    // as NaN and the parse silently fell back to auto-detection.
+    let radix = match args.get(1) {
+        Some(r) if !matches!(r, Value::Undef) => {
+            vec![arg0(args), Value::Float(to_number_arg(args, 1)?)]
+        }
+        _ => args.to_vec(),
+    };
+    Ok(parse_int_str(&with_host(|h| h.str_of(&sv)), &radix))
 }
 
 fn parse_int_str(s: &str, args: &[Value]) -> f64 {
@@ -7669,6 +7679,22 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
             "Cannot convert a BigInt value to a number",
         ));
     }
+    // Every argument is `ToNumber`d (21.3.2.x), which runs a user `valueOf` and
+    // can throw from it. `arg_num` does no `ToPrimitive` at all, so
+    // `Math.max({valueOf: () => 1}, 0)` answered NaN.
+    // EVERY argument, not a fixed prefix: `Math.max`/`min`/`hypot` are
+    // variadic, and coercing only the first few silently DROPPED the rest —
+    // `Math.max(...gen)` over five values answered for four of them.
+    let mut coerced = Vec::with_capacity(args.len());
+    for a in args {
+        if matches!(a, Value::Undef) {
+            coerced.push(a.clone());
+            continue;
+        }
+        let p = host::to_primitive(a, "number")?;
+        coerced.push(Value::Float(with_host(|h| h.to_number(&p))));
+    }
+    let args: &[Value] = &coerced;
     let x = arg_num(args, 0);
     let r = match fname {
         "floor" => x.floor(),
@@ -10176,6 +10202,7 @@ fn array_method_on(
     name: &str,
     args: Vec<Value>,
 ) -> Result<Value, String> {
+    let args = coerce_numeric_args(ARRAY_METHOD_NUMERIC_ARGS, name, args)?;
     match name {
         "push" => {
             // 23.1.3.23 step 4 defines each new element through
@@ -11250,6 +11277,65 @@ fn reject_symbol_args(name: &str, args: &[Value]) -> Result<(), String> {
 /// 0 of the method that honours it, and a callable REPLACEMENT at position 1 of
 /// `replace`/`replaceAll`. Each of those already has a path that handles the
 /// value as an object, and stringifying it first would take that path away.
+/// The argument positions each `Array.prototype` method coerces with
+/// `ToNumber` (23.1.3.x). Everything not listed is a VALUE position and must be
+/// left alone: `fill`'s first argument, `with`'s second and `splice`'s items
+/// are stored as given, and `indexOf`/`includes` compare their first argument
+/// without converting it.
+const ARRAY_METHOD_NUMERIC_ARGS: &[(&str, &[usize])] = &[
+    ("at", &[0]),
+    ("copyWithin", &[0, 1, 2]),
+    ("fill", &[1, 2]),
+    ("flat", &[0]),
+    ("includes", &[1]),
+    ("indexOf", &[1]),
+    ("lastIndexOf", &[1]),
+    ("slice", &[0, 1]),
+    ("splice", &[0, 1]),
+    ("toSpliced", &[0, 1]),
+    ("with", &[0]),
+];
+
+/// The same for `Number.prototype`. `toLocaleString` takes a LOCALE, not a
+/// number, and is deliberately absent.
+const NUMBER_METHOD_NUMERIC_ARGS: &[(&str, &[usize])] = &[
+    ("toExponential", &[0]),
+    ("toFixed", &[0]),
+    ("toPrecision", &[0]),
+    ("toString", &[0]),
+];
+
+/// Replace the listed argument positions with their `ToNumber` value, running a
+/// user `valueOf` and propagating a throw from it. Every one of these read the
+/// argument with an INFALLIBLE conversion that does no `ToPrimitive` at all, so
+/// `[1,2,3].slice({valueOf: () => 1})` sliced from 0 and `(1.234).toFixed(obj)`
+/// was a RangeError.
+/// `ToNumber(args[i])`, running a user `valueOf` and propagating its throw.
+fn to_number_arg(args: &[Value], i: usize) -> Result<f64, String> {
+    let v = args.get(i).cloned().unwrap_or(Value::Undef);
+    let p = host::to_primitive(&v, "number")?;
+    Ok(with_host(|h| h.to_number(&p)))
+}
+
+fn coerce_numeric_args(
+    table: &[(&str, &[usize])],
+    name: &str,
+    mut args: Vec<Value>,
+) -> Result<Vec<Value>, String> {
+    let Some((_, positions)) = table.iter().find(|(m, _)| *m == name) else {
+        return Ok(args);
+    };
+    for &i in *positions {
+        let Some(a) = args.get(i) else { continue };
+        if matches!(a, Value::Undef) {
+            continue;
+        }
+        let p = host::to_primitive(a, "number")?;
+        args[i] = Value::Float(with_host(|h| h.to_number(&p)));
+    }
+    Ok(args)
+}
+
 /// `RegExpCreate(v, flags)` — the regexp a string method builds from a
 /// non-RegExp argument. An empty/absent argument makes the empty pattern, which
 /// matches at position 0.
@@ -12019,6 +12105,7 @@ fn bigint_method(b: &num_bigint::BigInt, name: &str, args: Vec<Value>) -> Result
 }
 
 fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    let args = coerce_numeric_args(NUMBER_METHOD_NUMERIC_ARGS, name, args)?;
     match name {
         "toFixed" => {
             let digits = arg_num(&args, 0);

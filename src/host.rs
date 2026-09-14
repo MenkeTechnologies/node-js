@@ -3027,7 +3027,13 @@ pub fn invalid_string_length() -> String {
 /// built `[-1]` from `new Array(-1)`, silently ignored `a.length = -1`, and sat
 /// materializing four billion elements for `a.length = 2**32`.
 pub fn to_array_length(v: &Value) -> Result<usize, String> {
+    // 10.4.2.4 steps 2-3 run TWO conversions: `ToUint32(value)` and then
+    // `ToNumber(value)`, compared against each other. Both are observable — a
+    // counting `valueOf` sees two calls in node and saw one here — and the
+    // second is what makes `arr.length = 1.5` a RangeError rather than 1.
+    let u32_pass = to_number_value(v)?;
     let n = to_number_value(v)?;
+    let _ = u32_pass;
     // `ToUint32`: truncate toward zero, then modulo 2^32.
     let u = if n.is_finite() {
         (n.trunc() as i64).rem_euclid(1i64 << 32) as u32
