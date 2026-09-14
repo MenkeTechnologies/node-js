@@ -1939,9 +1939,11 @@ fn err_str2(op: &str, from: &str, to: &str, e: &std::io::Error) -> String {
 /// its own `(os error 2)`, so `No such file or directory (os error 2)` is a
 /// string no Node has ever printed. `process.chdir` was assembling its message
 /// that way.
-pub(crate) fn libuv_message(e: &std::io::Error) -> String {
+/// The libuv error CODE for an `io::Error` — `ENOENT`, `EACCES` and the rest.
+/// Node exposes it as `err.code`, and every error it renders leads with it.
+pub(crate) fn libuv_code(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
-    let code = match e.kind() {
+    match e.kind() {
         NotFound => "ENOENT",
         PermissionDenied => "EACCES",
         AlreadyExists => "EEXIST",
@@ -1951,7 +1953,11 @@ pub(crate) fn libuv_message(e: &std::io::Error) -> String {
         InvalidInput => "EINVAL",
         BrokenPipe => "EPIPE",
         _ => "EIO",
-    };
+    }
+}
+
+pub(crate) fn libuv_message(e: &std::io::Error) -> String {
+    let code = libuv_code(e);
     format!("{code}: {}", libuv_reason(code))
 }
 
@@ -1971,18 +1977,7 @@ fn libuv_reason(code: &str) -> &'static str {
 }
 
 fn err_str(op: &str, path: &str, e: &std::io::Error) -> String {
-    use std::io::ErrorKind::*;
-    let code = match e.kind() {
-        NotFound => "ENOENT",
-        PermissionDenied => "EACCES",
-        AlreadyExists => "EEXIST",
-        NotADirectory => "ENOTDIR",
-        IsADirectory => "EISDIR",
-        DirectoryNotEmpty => "ENOTEMPTY",
-        InvalidInput => "EINVAL",
-        BrokenPipe => "EPIPE",
-        _ => "EIO",
-    };
+    let code = libuv_code(e);
     // libuv's own reason strings, not Rust's `io::Error` `Display` — Rust
     // capitalizes ("No such file or directory") where libuv (and therefore
     // Node's `err.message`) does not.

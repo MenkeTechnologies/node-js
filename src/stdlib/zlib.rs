@@ -131,7 +131,21 @@ fn run_async(op: &str, args: &[Value]) -> Result<Value, String> {
     let input = input_bytes(args);
     let (err, buf) = match oneshot(op, &input) {
         Ok(bytes) => (with_host(|h| h.null()), buffer::from_bytes(&bytes)),
-        Err(e) => (with_host(|h| h.new_str(e)), Value::Undef),
+        // An error-first callback receives an ERROR OBJECT, not the message:
+        // `zlib.gunzip(garbage, cb)` gives an `err` whose `code` is
+        // `Z_DATA_ERROR`. A bare string made that — and `err.message` — all
+        // `undefined`.
+        // `decode_err` has already built the coded Error and parked it as the
+        // pending exception for the SYNC path; take that rather than rebuilding
+        // one from the message, which carries no `code`/`errno`.
+        Err(e) => (
+            with_host(|h| {
+                h.exc
+                    .take()
+                    .unwrap_or_else(|| crate::builtins::synth_error(h, &e))
+            }),
+            Value::Undef,
+        ),
     };
     with_host(|h| h.queue_micro(cb, vec![err, buf]));
     Ok(Value::Undef)
@@ -173,6 +187,47 @@ fn io_err(e: std::io::Error) -> String {
     format!("Error: {e}")
 }
 
+/// A decode failure, worded and coded as zlib does. Node carries `err.code`
+/// (`Z_DATA_ERROR`) and `err.errno` (-3), which callers branch on; a plain
+/// message left both `undefined` and reported Rust's wording — `corrupt
+/// deflate stream` for a header zlib calls an `incorrect header check`.
+///
+/// The two cases are told apart by looking at the HEADER: a stream whose magic
+/// is wrong never decodes, while one that passes the header and then runs out
+/// is a truncation, which zlib reports as a BUF error instead.
+fn decode_err(truncated: bool) -> String {
+    let (code, errno, msg) = if truncated {
+        ("Z_BUF_ERROR", -5, "unexpected end of file")
+    } else {
+        ("Z_DATA_ERROR", -3, "incorrect header check")
+    };
+    let e = crate::builtins::make_error_pub("Error", msg);
+    for (k, v) in [
+        ("errno", Value::Float(errno as f64)),
+        ("code", with_host(|h| h.new_str(code.to_string()))),
+    ] {
+        let _ = crate::builtins::set_property_pub(&e, k, v);
+    }
+    with_host(|h| h.exc = Some(e));
+    format!("Error: {msg}")
+}
+
+/// Whether `input` carries a well-formed header for `kind`, so a failure after
+/// it is a truncation rather than garbage.
+fn header_ok(kind: &str, input: &[u8]) -> bool {
+    match kind {
+        "gzip" => input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b,
+        // RFC 1950: CM must be 8 and the two header bytes are a multiple of 31.
+        "zlib" => {
+            input.len() >= 2
+                && input[0] & 0x0f == 8
+                && (u16::from(input[0]) * 256 + u16::from(input[1])) % 31 == 0
+        }
+        // A raw deflate stream has no header to check.
+        _ => true,
+    }
+}
+
 fn gzip(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(input).map_err(io_err)?;
@@ -183,7 +238,7 @@ fn gunzip(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     GzDecoder::new(input)
         .read_to_end(&mut out)
-        .map_err(io_err)?;
+        .map_err(|_| decode_err(header_ok("gzip", input)))?;
     Ok(out)
 }
 
@@ -197,7 +252,7 @@ fn inflate(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     ZlibDecoder::new(input)
         .read_to_end(&mut out)
-        .map_err(io_err)?;
+        .map_err(|_| decode_err(header_ok("zlib", input)))?;
     Ok(out)
 }
 

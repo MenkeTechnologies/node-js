@@ -2629,3 +2629,14 @@ Still divergent, and why:
 - **`toLocaleString` ignores its `locales`/`options` arguments**, answering
   node's default en-US shape (`M/D/YYYY`, 12-hour `h:mm:ss AM/PM`) in the local
   zone. Varying it needs ICU too.
+- **Children and `zlib` jobs are run SYNCHRONOUSLY, so two outstanding
+  callbacks interleave in call order.** Node runs a child on the event loop and
+  a `zlib` job on the threadpool, so `zlib.gunzip(bad, cb1); cp.exec(cmd, cb2)`
+  fires `cb1` first — the decode finishes while the fork is still in flight.
+  Here each call runs to completion and queues its callback, so `cb2` fires
+  second only because it was called second; `cp.execFile('missing', cb)` is the
+  sharpest case, since node reports the `ENOENT` before any already-started
+  child has exited. Each callback's own arguments agree exactly
+  (`examples/callbackerrors.js`, which chains its steps so the order is the
+  call order on both). Fixing it means real async children, which the
+  `child_process` module header already records as its limitation.

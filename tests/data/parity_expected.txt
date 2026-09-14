@@ -562,6 +562,21 @@ dvBounds   -1 RangeError Offset is outside the bounds of the DataView
 dvBounds   4 RangeError Offset is outside the bounds of the DataView
 dvBounds   100 RangeError Offset is outside the bounds of the DataView
 dvWrite    190 239 48879 61374
+==== callbackerrors.js ====
+gunzip-sync  [true,"Z_DATA_ERROR",-3,"incorrect header check"]
+inflate-sync [true,"Z_DATA_ERROR",-3,"incorrect header check"]
+unzip-sync   [true,"Z_DATA_ERROR",-3,"incorrect header check"]
+gunzip-trunc [true,"Z_BUF_ERROR",-5,"unexpected end of file"]
+roundtrip    ["hi","yo"]
+gunzip-cb    [true,"Z_DATA_ERROR",-3,"incorrect header check",null]
+gzip-cb      [null,null,"hi"]
+exec-fail    [true,7,false,null,"echo out; echo err 1>&2; exit 7","Command failed: echo out; echo err 1>&2; exit 7\nerr\n","out\n","err\n"]
+exec-ok      [null,"fine\n",""]
+exec-nocmd   [true,127,"",true]
+execFile     [true,5,"sh -c echo e 1>&2; exit 5",false,null,"","e\n"]
+execFile-ok  [null,""]
+returned     ["object",true]
+execFile-eno [true,"ENOENT",-2,"spawn no-such-binary-xyz","no-such-binary-xyz",[],"spawn no-such-binary-xyz ENOENT","",""]
 ==== classes.js ====
 rectangle with area 12
 perimeter 14

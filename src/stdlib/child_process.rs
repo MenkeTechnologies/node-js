@@ -245,6 +245,54 @@ fn command_failed(cmd: &str, r: &Run, enc: Option<&str>) -> String {
     format!("Error: {msg}")
 }
 
+/// The Error `exec`'s callback is handed for a non-zero exit: node's message is
+/// `Command failed: <cmd>\n<stderr>`, and the fields are `cmd`, `code` (the
+/// exit status), `killed` and `signal` — nothing else.
+fn exec_error(cmd: &str, r: &Run) -> Value {
+    let tail = String::from_utf8_lossy(&r.stderr).into_owned();
+    let e = crate::builtins::make_error_pub("Error", &format!("Command failed: {cmd}\n{tail}"));
+    let null = with_host(|h| h.null());
+    let cmd_v = with_host(|h| h.new_str(cmd.to_string()));
+    for (k, v) in [
+        ("killed", Value::Bool(false)),
+        ("code", Value::Float(r.status.unwrap_or(-1) as f64)),
+        ("signal", null),
+        ("cmd", cmd_v),
+    ] {
+        let _ = crate::builtins::set_property_pub(&e, k, v);
+    }
+    e
+}
+
+/// The Error a failed SPAWN is reported with — node never throws here, it hands
+/// the error-first callback an `ENOENT` carrying `errno`, `syscall`, `path` and
+/// `spawnargs`, so `err.code === 'ENOENT'` distinguishes "no such binary" from
+/// "the binary ran and failed".
+fn spawn_error(file: &str, argv: &[String], e: &std::io::Error) -> Value {
+    let code = super::fs::libuv_code(e);
+    let err = crate::builtins::make_error_pub("Error", &format!("spawn {file} {code}"));
+    let errno = -f64::from(e.raw_os_error().unwrap_or(5));
+    let (code_v, syscall, path, spawnargs) = with_host(|h| {
+        let items = argv.iter().map(|a| h.new_str(a.clone())).collect();
+        (
+            h.new_str(code.to_string()),
+            h.new_str(format!("spawn {file}")),
+            h.new_str(file.to_string()),
+            h.new_array(items),
+        )
+    });
+    for (k, v) in [
+        ("errno", Value::Float(errno)),
+        ("code", code_v),
+        ("syscall", syscall),
+        ("path", path),
+        ("spawnargs", spawnargs),
+    ] {
+        let _ = crate::builtins::set_property_pub(&err, k, v);
+    }
+    err
+}
+
 /// `execSync(command[, options])` — run `sh -c <command>`, return stdout, and
 /// throw when the command exits non-zero (matching Node's `execSync`).
 fn exec_sync(args: &[Value]) -> Result<Value, String> {
@@ -336,16 +384,21 @@ fn exec(args: &[Value]) -> Result<Value, String> {
         Ok(r) => {
             let stdout = String::from_utf8_lossy(&r.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&r.stderr).into_owned();
+            // An error-first callback receives an ERROR OBJECT carrying node's
+            // fields — `err.code` is the exit STATUS, and `cmd`, `killed` and
+            // `signal` ride along. This handed over a message string, so
+            // `err.code` was `undefined` and the exit status was unrecoverable;
+            // the message was this module's own wording too, where node appends
+            // the command's STDERR.
             let err = if r.status == Some(0) {
                 with_host(|h| h.null())
             } else {
-                let code = r.status.unwrap_or(-1);
-                with_host(|h| h.new_str(format!("Error: Command failed: {cmd}\nexit code {code}")))
+                exec_error(&cmd, &r)
             };
             (err, stdout, stderr)
         }
         Err(e) => (
-            with_host(|h| h.new_str(format!("Error: {e}"))),
+            with_host(|h| crate::builtins::synth_error(h, &format!("Error: {e}"))),
             String::new(),
             String::new(),
         ),
@@ -404,6 +457,11 @@ fn exec_file(args: &[Value]) -> Result<Value, String> {
         .find(|v| with_host(|h| crate::host::is_callable(h, v)))
         .cloned();
 
+    let full_cmd = std::iter::once(file.clone())
+        .chain(cmd_args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+
     match run(&file, &cmd_args, &spawn_opts(args, 2)) {
         Ok(r) => {
             let stdout_buf = super::buffer::from_bytes(&r.stdout);
@@ -412,13 +470,16 @@ fn exec_file(args: &[Value]) -> Result<Value, String> {
             if let Some(cb) = cb {
                 let so = String::from_utf8_lossy(&r.stdout).into_owned();
                 let se = String::from_utf8_lossy(&r.stderr).into_owned();
+                // As in `exec`, the callback takes an ERROR OBJECT. This built
+                // a STRING, so `err instanceof Error` was false and every field
+                // a caller reads — `code`, `cmd`, `killed`, `signal` — was
+                // `undefined`; the wording was this module's own too. Node's
+                // `cmd` here is the file and its arguments joined, since there
+                // is no shell command line to quote.
                 let err = if r.status == Some(0) {
                     null.clone()
                 } else {
-                    let code = r.status.unwrap_or(-1);
-                    with_host(|h| {
-                        h.new_str(format!("Error: Command failed: {file}\nexit code {code}"))
-                    })
+                    exec_error(&full_cmd, &r)
                 };
                 with_host(|h| {
                     let so = h.new_str(so);
@@ -441,12 +502,24 @@ fn exec_file(args: &[Value]) -> Result<Value, String> {
             m.insert("stderr".into(), stderr_buf);
             Ok(child_object(m))
         }
+        // A missing binary is reported THROUGH the callback — `execFile` is
+        // async, so it does not throw. Throwing here meant the caller's
+        // error-first handler never ran and the whole script died instead.
         Err(e) => {
+            let err = spawn_error(&file, &cmd_args, &e);
             if let Some(cb) = cb {
-                let msg = with_host(|h| h.new_str(format!("Error: spawn {file} {e}")));
-                let empty1 = with_host(|h| h.new_str(""));
-                let empty2 = with_host(|h| h.new_str(""));
-                with_host(|h| h.queue_micro(cb, vec![msg, empty1, empty2]));
+                let (empty1, empty2) = with_host(|h| (h.new_str(""), h.new_str("")));
+                with_host(|h| h.queue_micro(cb, vec![err, empty1, empty2]));
+                let null = with_host(|h| h.null());
+                let mut m = IndexMap::new();
+                m.insert("pid".into(), Value::Undef);
+                m.insert("exitCode".into(), null.clone());
+                m.insert("signalCode".into(), null.clone());
+                m.insert("killed".into(), Value::Bool(false));
+                m.insert("connected".into(), Value::Bool(false));
+                m.insert("stdout".into(), null.clone());
+                m.insert("stderr".into(), null);
+                return Ok(child_object(m));
             }
             Err(format!("Error: spawn {file} {e}"))
         }
