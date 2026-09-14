@@ -247,10 +247,10 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             h.new_str(if ms.is_nan() {
                 "Invalid Date".into()
             } else {
-                format!("{} {}", date_string(ms), time_string(ms))
+                format!("{} {}", date_string(local_ms(ms)), time_string(ms))
             })
         }),
-        "toDateString" => with_host(|h| h.new_str(date_string(ms))),
+        "toDateString" => with_host(|h| h.new_str(date_string(local_ms(ms)))),
         // The three `toLocale*` forms threw `is not a function` — absent
         // entirely, so `new Date(0).toLocaleString()` failed where node prints
         // `1/1/1970, 12:00:00 AM`. Rendered in node's default en-US shape
@@ -262,32 +262,50 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             h.new_str(if ms.is_nan() {
                 "Invalid Date".into()
             } else {
-                format!("{}, {}", locale_date(ms), locale_time(ms))
+                format!(
+                    "{}, {}",
+                    locale_date(local_ms(ms)),
+                    locale_time(local_ms(ms))
+                )
             })
         }),
         "toLocaleDateString" => with_host(|h| {
             h.new_str(if ms.is_nan() {
                 "Invalid Date".into()
             } else {
-                locale_date(ms)
+                locale_date(local_ms(ms))
             })
         }),
         "toLocaleTimeString" => with_host(|h| {
             h.new_str(if ms.is_nan() {
                 "Invalid Date".into()
             } else {
-                locale_time(ms)
+                locale_time(local_ms(ms))
             })
         }),
-        "getFullYear" | "getUTCFullYear" => Value::Float(field(ms, Field::Year)),
-        "getMonth" | "getUTCMonth" => Value::Float(field(ms, Field::Month)),
-        "getDate" | "getUTCDate" => Value::Float(field(ms, Field::Day)),
-        "getDay" | "getUTCDay" => Value::Float(field(ms, Field::Weekday)),
-        "getHours" | "getUTCHours" => Value::Float(field(ms, Field::Hours)),
-        "getMinutes" | "getUTCMinutes" => Value::Float(field(ms, Field::Minutes)),
-        "getSeconds" | "getUTCSeconds" => Value::Float(field(ms, Field::Seconds)),
-        "getMilliseconds" | "getUTCMilliseconds" => Value::Float(field(ms, Field::Millis)),
-        "getTimezoneOffset" => Value::Float(0.0), // node-js runs as UTC
+        "getFullYear" => Value::Float(field(local_ms(ms), Field::Year)),
+        "getUTCFullYear" => Value::Float(field(ms, Field::Year)),
+        "getMonth" => Value::Float(field(local_ms(ms), Field::Month)),
+        "getUTCMonth" => Value::Float(field(ms, Field::Month)),
+        "getDate" => Value::Float(field(local_ms(ms), Field::Day)),
+        "getUTCDate" => Value::Float(field(ms, Field::Day)),
+        "getDay" => Value::Float(field(local_ms(ms), Field::Weekday)),
+        "getUTCDay" => Value::Float(field(ms, Field::Weekday)),
+        "getHours" => Value::Float(field(local_ms(ms), Field::Hours)),
+        "getUTCHours" => Value::Float(field(ms, Field::Hours)),
+        "getMinutes" => Value::Float(field(local_ms(ms), Field::Minutes)),
+        "getUTCMinutes" => Value::Float(field(ms, Field::Minutes)),
+        "getSeconds" => Value::Float(field(local_ms(ms), Field::Seconds)),
+        "getUTCSeconds" => Value::Float(field(ms, Field::Seconds)),
+        "getMilliseconds" => Value::Float(field(local_ms(ms), Field::Millis)),
+        "getUTCMilliseconds" => Value::Float(field(ms, Field::Millis)),
+        // 21.4.4.7: minutes WEST of UTC, so the sign is the opposite of the
+        // offset itself — `TZ=America/Detroit` reports 300, not -300.
+        "getTimezoneOffset" => Value::Float(if ms.is_nan() {
+            f64::NAN
+        } else {
+            -zone_offset_ms(ms) / 60_000.0
+        }),
         "toTimeString" => with_host(|h| h.new_str(time_string(ms))),
         "setTime" => Value::Float(store_ms(recv, time_clip(super::arg_num(_args, 0)))),
         // The component setters (21.4.4.20-21.4.4.28). Each takes its own field
@@ -296,24 +314,30 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
         // friends were absent entirely, so `d.setUTCFullYear(2000)` threw
         // `is not a function` — a Date could be read but never modified except
         // wholesale through `setTime`.
-        "setFullYear" | "setUTCFullYear" => Value::Float(set_fields(recv, ms, 0, _args, false)),
-        "setMonth" | "setUTCMonth" => Value::Float(set_fields(recv, ms, 1, _args, false)),
-        "setDate" | "setUTCDate" => Value::Float(set_fields(recv, ms, 2, _args, false)),
-        "setHours" | "setUTCHours" => Value::Float(set_fields(recv, ms, 3, _args, false)),
-        "setMinutes" | "setUTCMinutes" => Value::Float(set_fields(recv, ms, 4, _args, false)),
-        "setSeconds" | "setUTCSeconds" => Value::Float(set_fields(recv, ms, 5, _args, false)),
-        "setMilliseconds" | "setUTCMilliseconds" => {
-            Value::Float(set_fields(recv, ms, 6, _args, false))
-        }
+        "setFullYear" => Value::Float(set_fields_local(recv, ms, 0, _args, false)),
+        "setUTCFullYear" => Value::Float(set_fields(recv, ms, 0, _args, false)),
+        "setMonth" => Value::Float(set_fields_local(recv, ms, 1, _args, false)),
+        "setUTCMonth" => Value::Float(set_fields(recv, ms, 1, _args, false)),
+        "setDate" => Value::Float(set_fields_local(recv, ms, 2, _args, false)),
+        "setUTCDate" => Value::Float(set_fields(recv, ms, 2, _args, false)),
+        "setHours" => Value::Float(set_fields_local(recv, ms, 3, _args, false)),
+        "setUTCHours" => Value::Float(set_fields(recv, ms, 3, _args, false)),
+        "setMinutes" => Value::Float(set_fields_local(recv, ms, 4, _args, false)),
+        "setUTCMinutes" => Value::Float(set_fields(recv, ms, 4, _args, false)),
+        "setSeconds" => Value::Float(set_fields_local(recv, ms, 5, _args, false)),
+        "setUTCSeconds" => Value::Float(set_fields(recv, ms, 5, _args, false)),
+        "setMilliseconds" => Value::Float(set_fields_local(recv, ms, 6, _args, false)),
+        "setUTCMilliseconds" => Value::Float(set_fields(recv, ms, 6, _args, false)),
         // Annex B B.2.3.3 / B.2.3.4 — offset-from-1900 year accessors kept for
         // legacy code. `setYear` maps 0..99 onto 1900..1999, which is the only
         // way it differs from `setFullYear`.
+        // Annex B's pair is LOCAL, like `getFullYear`/`setFullYear`.
         "getYear" => Value::Float(if ms.is_nan() {
             f64::NAN
         } else {
-            field(ms, Field::Year) - 1900.0
+            field(local_ms(ms), Field::Year) - 1900.0
         }),
-        "setYear" => Value::Float(set_fields(recv, ms, 0, _args, true)),
+        "setYear" => Value::Float(set_fields_local(recv, ms, 0, _args, true)),
         _ => {
             return Err(crate::host::type_error(&format!(
                 "date.{method} is not a function"
@@ -403,6 +427,73 @@ fn utc_from_fields(y: f64, mo: f64, d: f64, h: f64, mi: f64, s: f64, ms: f64) ->
 }
 
 /// `Wed, 21 Oct 2015 07:28:00 GMT` — the RFC-7231 IMF-fixdate HTTP header form.
+/// The zone offset in MILLISECONDS east of UTC that applies at `ms`, from the
+/// C library's `localtime_r` — which reads `TZ` exactly as node does and is
+/// DST-aware per timestamp rather than per zone.
+///
+/// Everything local used to be UTC: `getTimezoneOffset()` answered 0, each
+/// local getter shared its arm with the `getUTC*` one, and `toString` rendered
+/// the UTC wall clock. Under `TZ=America/Detroit` that made
+/// `new Date(0).getMonth()` 0 where node says 11. The parity harness pins
+/// `TZ=UTC` for both sides, which is why no record ever caught it.
+#[cfg(unix)]
+fn zone_offset_ms(ms: f64) -> f64 {
+    if !ms.is_finite() {
+        return 0.0;
+    }
+    // `localtime_r` takes SECONDS; flooring keeps a pre-epoch timestamp in the
+    // right second rather than rounding it toward zero.
+    let secs = (ms / 1000.0).floor() as i64;
+    let t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` writes into the caller's `tm` and reads only `t`.
+    let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
+    if !ok {
+        return 0.0;
+    }
+    tm.tm_gmtoff as f64 * 1000.0
+}
+
+#[cfg(not(unix))]
+fn zone_offset_ms(_ms: f64) -> f64 {
+    0.0
+}
+
+/// The local wall-clock time value for `ms` — what every local getter reads its
+/// fields out of.
+fn local_ms(ms: f64) -> f64 {
+    ms + zone_offset_ms(ms)
+}
+
+/// The inverse: a local wall-clock time value back to a timestamp.
+///
+/// The offset depends on the instant, so one lookup is not enough near a DST
+/// transition. Two candidates are built — using the offset at the naive guess
+/// and at the corrected one — and the one that reads BACK as the requested
+/// local time wins. A spring-forward GAP has no such candidate, because the
+/// wall clock never showed that time; 21.4.1.26 leaves the choice to the
+/// implementation and V8 takes the offset from BEFORE the transition, which
+/// pushes the result past it: local 02:30 on a spring-forward day is 03:30.
+fn utc_from_local(local: f64) -> f64 {
+    if !local.is_finite() {
+        return local;
+    }
+    let off_naive = zone_offset_ms(local);
+    let cand_a = local - off_naive;
+    let off_corrected = zone_offset_ms(cand_a);
+    if off_corrected == off_naive {
+        return cand_a;
+    }
+    let cand_b = local - off_corrected;
+    if local_ms(cand_b) == local {
+        return cand_b;
+    }
+    if local_ms(cand_a) == local {
+        return cand_a;
+    }
+    local - off_naive.min(off_corrected)
+}
+
 fn utc_string(ms: f64) -> String {
     if ms.is_nan() {
         return "Invalid Date".into();
@@ -423,18 +514,56 @@ fn utc_string(ms: f64) -> String {
 }
 
 /// `00:00:00 GMT+0000 (Coordinated Universal Time)` — the `toTimeString` form
-/// (21.4.4.42 TimeString + TimeZoneString). The offset is always `+0000`
-/// because this module runs as if `TZ=UTC`.
+/// (21.4.4.42 TimeString + TimeZoneString). The clock is LOCAL and the offset
+/// is the zone's real one; both were fixed at UTC before.
+///
+/// The parenthetical is the zone's LONG name, which node takes from ICU. There
+/// is none here, so only UTC — the one name that is not data — is spelled out
+/// and every other zone reports the abbreviation `localtime_r` supplies
+/// (`GMT-0500 (EST)` where node writes `(Eastern Standard Time)`). Recorded in
+/// BUGS.md.
 fn time_string(ms: f64) -> String {
     if ms.is_nan() {
         return "Invalid Date".into();
     }
+    let local = local_ms(ms);
+    let off_min = (zone_offset_ms(ms) / 60_000.0) as i64;
+    let sign = if off_min < 0 { '-' } else { '+' };
+    let abs = off_min.abs();
     format!(
-        "{:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
-        field(ms, Field::Hours) as i64,
-        field(ms, Field::Minutes) as i64,
-        field(ms, Field::Seconds) as i64,
+        "{:02}:{:02}:{:02} GMT{}{:02}{:02} ({})",
+        field(local, Field::Hours) as i64,
+        field(local, Field::Minutes) as i64,
+        field(local, Field::Seconds) as i64,
+        sign,
+        abs / 60,
+        abs % 60,
+        zone_name(ms),
     )
+}
+
+/// The zone's display name for `toString`. UTC is spelled out the way node
+/// does; anything else falls back to the abbreviation.
+#[cfg(unix)]
+fn zone_name(ms: f64) -> String {
+    if zone_offset_ms(ms) == 0.0 {
+        return "Coordinated Universal Time".into();
+    }
+    let secs = (ms / 1000.0).floor() as i64;
+    let t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: as in `zone_offset_ms`.
+    if unsafe { libc::localtime_r(&t, &mut tm).is_null() } || tm.tm_zone.is_null() {
+        return "Coordinated Universal Time".into();
+    }
+    // SAFETY: `tm_zone` points at a static zone-name string owned by libc.
+    let z = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
+    z.to_string_lossy().into_owned()
+}
+
+#[cfg(not(unix))]
+fn zone_name(_ms: f64) -> String {
+    "Coordinated Universal Time".into()
 }
 
 /// TimeClip (21.4.1.31): a time value more than 8.64e15 ms from the epoch is not
@@ -473,11 +602,32 @@ fn store_ms(recv: &Value, ms: f64) -> f64 {
 /// NaN handling follows the spec's split: `setFullYear` on an invalid date
 /// treats the time value as +0 and so can REVIVE it (21.4.4.21 step 2), while
 /// every other setter leaves an invalid date invalid.
+/// `set_fields` on the LOCAL wall clock: read the current fields in local time,
+/// replace the ones given, then convert the result back to a timestamp.
+fn set_fields_local(recv: &Value, ms: f64, start: usize, args: &[Value], legacy_year: bool) -> f64 {
+    if ms.is_nan() && start != 0 {
+        return store_ms(recv, f64::NAN);
+    }
+    let local = set_fields_value(local_ms(ms), start, args, legacy_year);
+    store_ms(recv, time_clip(utc_from_local(local)))
+}
+
 fn set_fields(recv: &Value, ms: f64, start: usize, args: &[Value], legacy_year: bool) -> f64 {
+    if ms.is_nan() && start != 0 {
+        return store_ms(recv, f64::NAN);
+    }
+    store_ms(
+        recv,
+        time_clip(set_fields_value(ms, start, args, legacy_year)),
+    )
+}
+
+/// The field replacement itself, on whatever time value it is handed — the
+/// local wall clock for a `setHours`, the timestamp for a `setUTCHours`. Split
+/// out so the two differ only in what they pass in and what they do with the
+/// result.
+fn set_fields_value(ms: f64, start: usize, args: &[Value], legacy_year: bool) -> f64 {
     let base = if ms.is_nan() {
-        if start != 0 {
-            return store_ms(recv, f64::NAN);
-        }
         0.0 // setFullYear/setYear on an Invalid Date starts from the epoch.
     } else {
         ms
@@ -502,8 +652,7 @@ fn set_fields(recv: &Value, ms: f64, start: usize, args: &[Value], legacy_year: 
     if legacy_year && (0.0..=99.0).contains(&f[0]) {
         f[0] += 1900.0;
     }
-    let t = utc_from_fields(f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
-    store_ms(recv, time_clip(t))
+    utc_from_fields(f[0], f[1], f[2], f[3], f[4], f[5], f[6])
 }
 
 /// `Wed Oct 21 2015` — the `toDateString` form.

@@ -2621,13 +2621,11 @@ Still divergent, and why:
   same representation problem as the note above about it being a real Array.
   `examples/argumentsobject.js` pins everything else and deliberately omits the
   three lines that would show the mapping.
-- **Local time IS UTC.** `getTimezoneOffset()` is 0, every local getter equals
-  its UTC counterpart, and `toString` renders the UTC wall clock: with
-  `TZ=America/Detroit`, `new Date(0).getMonth()` is 11 in node and 0 here, and
-  `toString()` is `Wed Dec 31 1969 19:00:00` against `Thu Jan 01 1970
-  00:00:00`. The UTC half is correct throughout — `getUTC*`, `toISOString` and
-  the timestamp all agree — so what is missing is a zone offset, which needs
-  either libc `localtime_r` or a tz database. Note for records: a case using a
-  LOCAL-time Date method pins the machine's zone, so it passes on a UTC CI
-  runner and fails on a developer's laptop. `examples/keycoercion.js` uses the
-  UTC setters deliberately.
+- **A zone's LONG name needs ICU.** `toString` renders `GMT-0500 (EST)` where
+  node writes `GMT-0500 (Eastern Standard Time)`; `localtime_r` supplies the
+  abbreviation and nothing else. UTC is the one name spelled out, since it is
+  not data. The clock and the numeric offset are right in every zone
+  (`examples/datelocal.js`).
+- **`toLocaleString` ignores its `locales`/`options` arguments**, answering
+  node's default en-US shape (`M/D/YYYY`, 12-hour `h:mm:ss AM/PM`) in the local
+  zone. Varying it needs ICU too.
