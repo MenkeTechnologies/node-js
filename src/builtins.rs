@@ -5876,7 +5876,19 @@ pub fn eval_source(arg: Option<&Value>, direct: bool) -> Result<Value, String> {
         || src.trim_start().starts_with("'use strict'")
         || src.trim_start().starts_with("\"use strict\"");
     if !strict {
-        return host::run_chunk_on(chunk);
+        // 19.2.1.1 steps 12-13: a SLOPPY direct eval shares the caller's
+        // VARIABLE environment — which is what lets `eval('var x=1')` inject a
+        // binding — but gets a fresh LEXICAL one of its own. A `let`, `const`
+        // or `class` declared inside therefore dies with the eval; every one of
+        // them was landing in the caller's scope, so `eval('let a=1')` left `a`
+        // behind and `let a=1; eval('let a=2')` overwrote it.
+        //
+        // `push_scope` is exactly that split: `var` and a hoisted function
+        // declaration bind to `base_env`, which this does not touch.
+        with_host(|h| h.push_scope());
+        let out = host::run_chunk_on(chunk);
+        with_host(|h| h.pop_scope());
+        return out;
     }
     let prev = with_host(|h| h.push_var_scope());
     let out = host::run_chunk_on(chunk);

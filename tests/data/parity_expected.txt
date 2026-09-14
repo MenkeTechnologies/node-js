@@ -688,6 +688,25 @@ done     true,undefined
 protocol function,true
 set-view x,y x,y x:x,y:y
 empty    0 0
+==== completionvalues.js ====
+if            [2,null,3]
+block         [4,null,12]
+loops         [2,null,9,11]
+for-of-in     [2,"a"]
+try           [5,7,17]
+switch        [8,12,11]
+labelled      [10,1]
+declarations  [null,null,null,null,null,null]
+reset         [null,null,null,null,null,null]
+no-reset      [1,1,1,1,1,1]
+break         [null,0,null]
+continue      8
+nested-break  7
+function-body [3,8,null]
+body-isolated [7,8]
+expressions   [3,14,0,15]
+finally       "f"
+directive     20
 ==== control.js ====
 total 12
 negative zero positive
@@ -903,6 +922,26 @@ restored Error: z
 default  Error: m "Error"
 capture  string VIA-HOOK
 plain    Error: boom true
+==== evalscope.js ====
+lexical-out   ["undefined","undefined","undefined"]
+var-out       ["number","function"]
+lexical-in    6
+no-shadow     1
+in-function   "undefined"
+not-global    "undefined"
+strict-var    "undefined"
+reads-caller  6
+writes-caller 6
+this          true
+sloppy-block  ["function",5]
+sloppy-cond   "undefined"
+strict-out    "undefined"
+strict-in     1
+strict-hoist  "function"
+strict-two    "undefined"
+strict-top    3
+strict-if     4
+strict-loop   [0,1]
 ==== events.js ====
 order    on1:1,on2:1,once:1,on1:2,on2:2
 counts   2 2 a

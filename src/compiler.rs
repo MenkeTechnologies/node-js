@@ -125,6 +125,13 @@ pub struct Compiler {
     /// patches every one of them to the end. An empty stack means no chain is
     /// open, so a `?.` outside one patches itself as before.
     opt_chain: Vec<Vec<usize>>,
+    /// Compiling a Script whose COMPLETION VALUE is observable — what `eval`
+    /// returns. Every expression statement then stores into `.completion`
+    /// instead of discarding its value, which is how the "last non-empty
+    /// completion" rule (14.x, `UpdateEmpty`) falls out without threading a
+    /// value through each statement form. Cleared inside a nested function
+    /// body, whose statements are not the script's.
+    completion: bool,
     functions: Vec<(String, FuncDef)>,
     tries: Vec<TryDef>,
     loops: Vec<LoopCtx>,
@@ -363,17 +370,20 @@ pub fn compile_completion_strict(
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
+    // The completion register, declared before anything can write it. A name no
+    // source text can spell, like the `.param<n>` slots a destructured
+    // parameter uses.
+    c.name_const(&mut b, COMPLETION_SLOT);
+    b.emit(Op::LoadUndef, 0);
+    b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
+    b.emit(Op::Pop, 0);
+    c.completion = true;
     c.hoist_vars(&mut b, stmts)?;
     c.hoist_funcs(&mut b, stmts)?;
-    if let Some((last, rest)) = stmts.split_last() {
-        c.compile_stmts(&mut b, rest)?;
-        if let StmtKind::Expr(e) = &last.kind {
-            // The final expression's value is NOT popped — it is the completion.
-            c.compile_expr(&mut b, e)?;
-        } else {
-            c.compile_stmt(&mut b, last)?;
-        }
-    }
+    c.compile_stmts(&mut b, stmts)?;
+    c.completion = false;
+    c.name_const(&mut b, COMPLETION_SLOT);
+    b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
     Ok(Program {
         main: c.finish_chunk(b),
         functions: c.functions,
@@ -381,6 +391,28 @@ pub fn compile_completion_strict(
         strict: c.strict,
     })
 }
+
+impl Compiler {
+    /// `UpdateEmpty(result, undefined)` — the step `if`, every loop, `try` and
+    /// `switch` apply to their own completion (14.6.7, 14.7.x, 14.11.x,
+    /// 14.15.3). Each therefore always produces a VALUE: `1; if(0){2}` is
+    /// `undefined`, not 1, and a `break` out of a loop body discards what
+    /// earlier iterations accumulated. A block, a labelled statement, `;` and
+    /// every declaration propagate empty instead and are not reset here.
+    fn reset_completion(&mut self, b: &mut ChunkBuilder, line: u32) {
+        if !self.completion {
+            return;
+        }
+        self.name_const(b, COMPLETION_SLOT);
+        b.emit(Op::LoadUndef, line);
+        b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), line);
+        b.emit(Op::Pop, line);
+    }
+}
+
+/// The hidden binding a completion-valued Script accumulates into. Leading dot:
+/// no source text can name it, so nothing a script declares can collide.
+const COMPLETION_SLOT: &str = ".completion";
 
 /// Does this statement list open with a `"use strict"` directive prologue?
 ///
@@ -599,6 +631,18 @@ impl Compiler {
     }
 
     fn hoist_funcs(&mut self, b: &mut ChunkBuilder, stmts: &[Stmt]) -> Result<(), String> {
+        self.hoist_funcs_in(b, stmts, false)
+    }
+
+    /// `in_block` marks a declaration that is nested in a BLOCK rather than at
+    /// the top of a function body or script. Only that case is affected by
+    /// strictness.
+    fn hoist_funcs_in(
+        &mut self,
+        b: &mut ChunkBuilder,
+        stmts: &[Stmt],
+        in_block: bool,
+    ) -> Result<(), String> {
         for s in stmts {
             if let StmtKind::FuncDecl {
                 name,
@@ -610,8 +654,18 @@ impl Compiler {
             {
                 let def_id = self.build_function(name, params, body, *is_generator, *is_async)?;
                 self.emit_mkfunc(b, def_id);
-                // Function declarations hoist to the enclosing FUNCTION scope.
-                self.declare_as(b, &Expr::Ident(name.clone()), BindMode::Var);
+                // A function declaration in a BLOCK is block-scoped (14.2.x);
+                // only Annex B.3.3's sloppy-mode legacy hoists it to the
+                // enclosing FUNCTION scope as well. Hoisting unconditionally
+                // made `function o() { { function g() {} } return typeof g }`
+                // answer `"function"` under `'use strict'`, where node says
+                // `"undefined"`.
+                let mode = if in_block && self.strict {
+                    BindMode::Lexical
+                } else {
+                    BindMode::Var
+                };
+                self.declare_as(b, &Expr::Ident(name.clone()), mode);
             }
         }
         Ok(())
@@ -634,6 +688,11 @@ impl Compiler {
         match &s.kind {
             StmtKind::Expr(e) => {
                 self.compile_expr(b, e)?;
+                if self.completion {
+                    self.name_const(b, COMPLETION_SLOT);
+                    b.emit(Op::Swap, line);
+                    b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), line);
+                }
                 b.emit(Op::Pop, line);
             }
             StmtKind::Empty => {}
@@ -694,21 +753,33 @@ impl Compiler {
                     self.emit_push_scope(b);
                 }
                 self.hoist_lexical(b, body);
-                self.hoist_funcs(b, body)?;
+                self.hoist_funcs_in(b, body, true)?;
                 self.compile_stmts(b, body)?;
                 if scoped {
                     self.emit_pop_scope(b);
                 }
             }
-            StmtKind::If { test, cons, alt } => self.compile_if(b, test, cons, alt)?,
-            StmtKind::While { test, body } => self.compile_while(b, test, body)?,
-            StmtKind::DoWhile { body, test } => self.compile_do_while(b, body, test)?,
+            StmtKind::If { test, cons, alt } => {
+                self.reset_completion(b, line);
+                self.compile_if(b, test, cons, alt)?
+            }
+            StmtKind::While { test, body } => {
+                self.reset_completion(b, line);
+                self.compile_while(b, test, body)?
+            }
+            StmtKind::DoWhile { body, test } => {
+                self.reset_completion(b, line);
+                self.compile_do_while(b, body, test)?
+            }
             StmtKind::For {
                 init,
                 test,
                 update,
                 body,
-            } => self.compile_for(b, init, test, update, body)?,
+            } => {
+                self.reset_completion(b, line);
+                self.compile_for(b, init, test, update, body)?
+            }
             StmtKind::ForOf {
                 decl_kind,
                 target,
@@ -716,6 +787,7 @@ impl Compiler {
                 body,
                 is_await,
             } => {
+                self.reset_completion(b, line);
                 let mode = decl_kind.map(bind_mode).unwrap_or(BindMode::Assign);
                 if *is_await {
                     self.compile_for_await(b, mode, target, iter, body)?
@@ -729,10 +801,14 @@ impl Compiler {
                 object,
                 body,
             } => {
+                self.reset_completion(b, line);
                 let mode = decl_kind.map(bind_mode).unwrap_or(BindMode::Assign);
                 self.compile_for_in(b, mode, target, object, body)?
             }
-            StmtKind::Switch { disc, cases } => self.compile_switch(b, disc, cases)?,
+            StmtKind::Switch { disc, cases } => {
+                self.reset_completion(b, line);
+                self.compile_switch(b, disc, cases)?
+            }
             StmtKind::Return(e) => {
                 match e {
                     Some(e) => self.compile_expr(b, e)?,
@@ -808,7 +884,10 @@ impl Compiler {
                 block,
                 handler,
                 finalizer,
-            } => self.compile_try(b, block, handler, finalizer)?,
+            } => {
+                self.reset_completion(b, line);
+                self.compile_try(b, block, handler, finalizer)?
+            }
         }
         Ok(())
     }
@@ -1759,7 +1838,17 @@ impl Compiler {
             None => None,
         };
         let final_chunk = match finalizer {
-            Some(f) => Some(self.compile_block_chunk(f)?),
+            Some(f) => {
+                // 14.15.3: a `finally` that completes NORMALLY has its
+                // completion DISCARDED — the try/catch value is what the
+                // statement produces. `eval('try{5}finally{6}')` is 5, and was
+                // 6 while the block updated the completion register like any
+                // other.
+                let saved = std::mem::take(&mut self.completion);
+                let chunk = self.compile_block_chunk(f);
+                self.completion = saved;
+                Some(chunk?)
+            }
             None => None,
         };
         let id = self.tries.len();
@@ -1870,6 +1959,9 @@ impl Compiler {
         // ADDED by a body's own directive prologue — never dropped.
         let saved_strict = self.strict;
         self.strict = self.strict || has_use_strict(body);
+        // A nested function's statements are not the SCRIPT's, so none of them
+        // may touch the completion register.
+        let saved_completion = std::mem::take(&mut self.completion);
         // Captured before the restore below, since the FuncDef is built after
         // `self.strict` has been put back to the enclosing value.
         let body_strict = self.strict;
@@ -1896,6 +1988,7 @@ impl Compiler {
         self.iter_depth = saved_iters;
         self.in_async_generator = saved_agen;
         self.strict = saved_strict;
+        self.completion = saved_completion;
         self.slots = saved_slot_table;
         r?;
         let def = FuncDef {
