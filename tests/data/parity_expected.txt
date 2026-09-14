@@ -2591,3 +2591,28 @@ newObj   object ab true
 boxthis  object,true,5 number,5
 thisArg  object
 extend   2 true true hi [object String]
+==== writeerrors.js ====
+dot-undefined TypeError: Cannot set properties of undefined (setting 'x')
+dot-null      TypeError: Cannot set properties of null (setting 'x')
+index-number  TypeError: Cannot set properties of undefined (setting '0')
+index-string  TypeError: Cannot set properties of undefined (setting 'k')
+computed      TypeError: Cannot set properties of undefined (setting 'z')
+deep          TypeError: Cannot set properties of undefined (setting 'b')
+compound      TypeError: Cannot read properties of undefined (reading 'x')
+increment     TypeError: Cannot read properties of undefined (reading 'x')
+delete-undef  TypeError: Cannot convert undefined or null to object
+delete-null   TypeError: Cannot convert undefined or null to object
+sloppy-number no throw
+strict-number TypeError: Cannot create property 'x' on number '5'
+strict-string TypeError: Cannot create property 'x' on string 'ab'
+strict-bool   TypeError: Cannot create property 'x' on boolean 'true'
+strict-symbol TypeError: Cannot create property 'x' on symbol 'Symbol(s)'
+strict-bigint TypeError: Cannot create property 'x' on bigint '1'
+plain         no throw
+array         no throw
+boxed         no throw
+setter        no throw
+inherited     no throw
+delete-plain  no throw
+delete-prim   no throw
+optional      no throw

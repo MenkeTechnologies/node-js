@@ -3771,6 +3771,30 @@ fn write_refused(recv: &Value, name: &str) -> String {
 }
 
 fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
+    // 6.2.5.6 `PutValue` begins with `RequireObjectCoercible`: writing any
+    // property of `undefined` or `null` throws, naming the key. Every such
+    // write was silently discarded, so `u.x = 1` — the mirror of the single
+    // most common runtime fault in JS, which the READ side already reports —
+    // looked like it had succeeded.
+    if with_host(|h| h.is_nullish(recv)) {
+        return Err(host::type_error(&format!(
+            "Cannot set properties of {} (setting '{name}')",
+            with_host(|h| h.str_of(recv))
+        )));
+    }
+    // A write to a PRIMITIVE receiver has no target — `ToObject` makes a
+    // throwaway wrapper — so it is discarded in sloppy code and throws in
+    // strict (10.1.9.2 / 6.2.5.6 again). The refusal was silent in both.
+    // `is_primitive` rather than a shape test: a string, a symbol and a bigint
+    // ride as `Value::Obj` handles in this host, so a check for a non-`Obj`
+    // value caught only numbers and booleans.
+    if with_host(|h| host::is_primitive(h, recv)) && with_host(|h| h.current_strict()) {
+        return Err(host::type_error(&format!(
+            "Cannot create property '{name}' on {} '{}'",
+            with_host(|h| h.type_of(recv)),
+            with_host(|h| h.str_of(recv))
+        )));
+    }
     // `[[PrivateSet]]` (7.3.32) refuses a receiver that carries no such private
     // element. The class's own field initializers install theirs directly
     // (`host::init_one_field`), so a declaration never reaches this check.
@@ -4119,6 +4143,13 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
 /// (sloppy mode ignores the failure rather than throwing) and `true` otherwise,
 /// which is also what deleting an absent key reports.
 pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
+    // 13.5.1.2 step 5 runs `ToObject` on the base, which a nullish one refuses.
+    // `delete u.x` reported success instead.
+    if with_host(|h| h.is_nullish(recv)) {
+        return Err(host::type_error(
+            "Cannot convert undefined or null to object",
+        ));
+    }
     // `[[Delete]]` on a Proxy runs the handler's `deleteProperty` trap, which may
     // throw — the reason this reports a `Result` rather than a bare `bool`.
     if let Some(b) = crate::proxy::delete(recv, key)? {
