@@ -1113,3 +1113,43 @@ pub const PROTO_ACCESSORS: &[(&str, &[&str])] = &[
     ),
     ("URLSearchParams", &["size"]),
 ];
+
+/// The NON-WRITABLE data members of each intrinsic prototype.
+///
+/// An inherited non-writable property refuses an assignment on every
+/// object below it (10.1.9.2), so `o[Symbol.toStringTag] = 'x'` is silently
+/// dropped when `o` inherits from `Map.prototype`. All but
+/// `String.prototype.length` are symbol-keyed.
+/// Sorted by constructor; the NAMES within a row are not sorted.
+pub const PROTO_READONLY: &[(&str, &[&str])] = &[
+    ("Array", &["@@unscopables"]),
+    ("ArrayBuffer", &["@@toStringTag"]),
+    ("BigInt", &["@@toStringTag"]),
+    ("BigInt64Array", &["BYTES_PER_ELEMENT"]),
+    ("BigUint64Array", &["BYTES_PER_ELEMENT"]),
+    ("DataView", &["@@toStringTag"]),
+    ("Date", &["@@toPrimitive"]),
+    ("FinalizationRegistry", &["@@toStringTag"]),
+    ("Float32Array", &["BYTES_PER_ELEMENT"]),
+    ("Float64Array", &["BYTES_PER_ELEMENT"]),
+    ("Function", &["length", "name", "@@hasInstance"]),
+    ("Int16Array", &["BYTES_PER_ELEMENT"]),
+    ("Int32Array", &["BYTES_PER_ELEMENT"]),
+    ("Int8Array", &["BYTES_PER_ELEMENT"]),
+    ("Map", &["@@toStringTag"]),
+    ("Promise", &["@@toStringTag"]),
+    ("Set", &["@@toStringTag"]),
+    ("String", &["length"]),
+    ("Symbol", &["@@toStringTag", "@@toPrimitive"]),
+    ("TextDecoder", &["@@toStringTag"]),
+    ("TextEncoder", &["@@toStringTag"]),
+    ("URL", &["@@toStringTag"]),
+    ("URLSearchParams", &["@@toStringTag"]),
+    ("Uint16Array", &["BYTES_PER_ELEMENT"]),
+    ("Uint32Array", &["BYTES_PER_ELEMENT"]),
+    ("Uint8Array", &["BYTES_PER_ELEMENT"]),
+    ("Uint8ClampedArray", &["BYTES_PER_ELEMENT"]),
+    ("WeakMap", &["@@toStringTag"]),
+    ("WeakRef", &["@@toStringTag"]),
+    ("WeakSet", &["@@toStringTag"]),
+];

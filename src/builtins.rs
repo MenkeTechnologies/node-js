@@ -1537,6 +1537,14 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             if builtin_meta(&key).is_some() {
                 return Ok(with_host(|h| h.alloc(JsObj::Builtin(key))));
             }
+            // A DATA member of the prototype — `Array.prototype[Symbol
+            // .unscopables]` is an object, not a method, so it is in neither
+            // function table. Read it off the prototype itself rather than
+            // answering `undefined`: an instance inherits it.
+            let v = namespace_property(&format!("{owner}.prototype"), name);
+            if !matches!(v, Value::Undef) {
+                return Ok(v);
+            }
         }
     }
     Ok(out)
@@ -2350,6 +2358,21 @@ fn namespace_constant(ns: &str, name: &str) -> Option<f64> {
 fn is_webidl_proto(ctor: &str) -> bool {
     intrinsic_proto_members(&format!("{ctor}.prototype"))
         .is_some_and(|ms| ms.iter().any(|m| m.starts_with('+')))
+}
+
+/// The intrinsic constructor a value's own kind implies — the prototype it
+/// inherits with no explicit link.
+pub(crate) fn own_ctor_name(h: &host::JsHost, v: &Value) -> Option<&'static str> {
+    default_ctor_name(h, v)
+}
+
+/// Whether `ctor.prototype` defines `key` as a NON-WRITABLE data property, so
+/// an object inheriting it refuses an assignment to that name.
+pub(crate) fn is_proto_readonly(ctor: &str, key: &str) -> bool {
+    crate::arity::PROTO_READONLY
+        .binary_search_by(|(k, _)| (*k).cmp(ctor))
+        .ok()
+        .is_some_and(|i| crate::arity::PROTO_READONLY[i].1.contains(&key))
 }
 
 /// Whether `ctor.prototype` defines `key` as an ACCESSOR rather than a data
@@ -3303,6 +3326,41 @@ pub(crate) fn well_known_tag(h: &host::JsHost, v: &Value) -> Option<String> {
     Some(tag)
 }
 
+/// The constructor name of the nearest intrinsic prototype on `v`'s chain that
+/// carries an own `Symbol.toStringTag`, if any.
+fn chain_tag_ctor(h: &host::JsHost, v: &Value) -> Option<String> {
+    let mut cur = h.proto_of(v);
+    for _ in 0..100 {
+        let p = cur?;
+        if h.is_null(&p) {
+            return None;
+        }
+        let name = match h.get(&p) {
+            Some(JsObj::Builtin(ns)) => ns.strip_suffix(".prototype").map(str::to_string),
+            _ => h.intrinsic_proto_ctor(&p).map(str::to_string),
+        }
+        // A CLASS prototype is not linked to the builtin its class extends —
+        // the relationship lives on the class value — so the walk crosses over
+        // there, or `Object.create(D.prototype)` for `class D extends Map`
+        // finds nothing.
+        .or_else(|| {
+            h.class_owning_proto(&p)
+                .and_then(|c| h.class_builtin_ancestor(&c))
+                .map(|b| h.callable_name(&b))
+                .filter(|n| !n.is_empty())
+        });
+        if let Some(n) = name {
+            if intrinsic_proto_members(&format!("{n}.prototype"))
+                .is_some_and(|ms| ms.contains(&"@@toStringTag"))
+            {
+                return Some(n);
+            }
+        }
+        cur = h.proto_of(&p);
+    }
+    None
+}
+
 /// The `Object.prototype.toString` brand tag for `v` (`[object Array]` etc.).
 /// Every builtin exotic object reports its own brand, which is how packages
 /// type-test values they did not construct (`toString.call(x) ===
@@ -3451,7 +3509,7 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
                     | "URL"
                     | "URLSearchParams"),
                 ) => t.into(),
-                _ if h.error_to_string(v).is_some() => "Error".into(),
+                _ if has_error_data(h, v) => "Error".into(),
                 _ => "Object".into(),
             },
             _ => "Object".into(),
@@ -3460,6 +3518,23 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
         // variants never arise here.
         _ => "Object".into(),
     };
+    // Nothing about the value itself brands it. An ordinary object whose CHAIN
+    // reaches an intrinsic prototype carrying an own `Symbol.toStringTag`
+    // borrows that one: 20.1.3.6 step 15 is a `Get`, which walks.
+    // `Object.prototype.toString.call(Object.create(Map.prototype))` is
+    // `[object Map]` and was `[object Object]`.
+    //
+    // Only as a FALLBACK, and only for the prototypes that REALLY carry the
+    // symbol. A typed array reaches `%TypedArray%.prototype`, whose tag is an
+    // ACCESSOR returning the specific kind, so consulting the chain FIRST
+    // branded every view `[object TypedArray]` instead of `[object Uint8Array]`
+    // — three records caught it. `Error.prototype` carries no tag at all, so
+    // inheriting from it borrows nothing.
+    if tag == "Object" && !has_error_data(h, v) {
+        if let Some(ctor) = chain_tag_ctor(h, v) {
+            return ctor;
+        }
+    }
     tag
 }
 
@@ -13669,19 +13744,26 @@ pub(crate) fn chain_intrinsic_ctors_pub(recv: &Value) -> Vec<&'static str> {
 }
 
 fn chain_intrinsic_ctors(recv: &Value) -> Vec<&'static str> {
+    with_host(|h| chain_intrinsic_ctors_h(h, recv))
+}
+
+/// [`chain_intrinsic_ctors`] against an already-held host borrow, for the
+/// callers that are inside one — `can_write_prop` takes `&JsHost`, so going
+/// back through `with_host` there aborts the process on a double borrow.
+pub(crate) fn chain_intrinsic_ctors_h(h: &host::JsHost, recv: &Value) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     let mut cur = recv.clone();
     for _ in 0..100 {
-        let Some(p) = with_host(|h| h.proto_of(&cur)) else {
+        let Some(p) = h.proto_of(&cur) else {
             break;
         };
-        if with_host(|h| h.is_null(&p)) {
+        if h.is_null(&p) {
             break;
         }
-        let name = with_host(|h| match h.get(&p) {
+        let name = match h.get(&p) {
             Some(JsObj::Builtin(ns)) => ns.strip_suffix(".prototype").map(str::to_string),
             _ => h.intrinsic_proto_ctor(&p).map(str::to_string),
-        });
+        };
         if let Some(n) = name {
             if let Some(c) = crate::arity::PROTO_MEMBERS
                 .iter()
@@ -14421,19 +14503,26 @@ fn is_regex_escape_space(c: char) -> bool {
 /// object that merely INHERITS from `Error.prototype` is not one.
 fn error_is_error(args: Vec<Value>) -> Result<Value, String> {
     let v = arg0(&args);
-    Ok(Value::Bool(with_host(|h| {
-        // The brand here is the own `stack` an error is built with (a
-        // `DOMException` carries `@@domName` instead); a plain
-        // `Object.create(Error.prototype)` has neither.
-        match h.get(&v) {
-            Some(JsObj::Object(p)) => {
-                p.contains_key("stack")
-                    || p.contains_key("@@stackRaw")
-                    || p.contains_key("@@domName")
-            }
-            _ => false,
+    Ok(Value::Bool(with_host(|h| has_error_data(h, &v))))
+}
+
+/// Whether `v` carries `[[ErrorData]]` — the slot `Error.isError` (20.5.2.1)
+/// and `Object.prototype.toString`'s step 9 both test.
+///
+/// The brand is the OWN `stack` an error is built with (a `DOMException`
+/// carries `@@domName` instead); a plain `Object.create(Error.prototype)` has
+/// neither, which is why inheriting from an error prototype does not make a
+/// value an error. Shared so the two cannot disagree — branding by a chain
+/// lookup for `name`/`message` made `Object.create(Error.prototype)` report
+/// `[object Error]` where node says `[object Object]`, while `Error.isError`
+/// on the same value already said false.
+pub(crate) fn has_error_data(h: &host::JsHost, v: &Value) -> bool {
+    match h.get(v) {
+        Some(JsObj::Object(p)) => {
+            p.contains_key("stack") || p.contains_key("@@stackRaw") || p.contains_key("@@domName")
         }
-    })))
+        _ => false,
+    }
 }
 
 /// `Promise.try(fn, ...args)` (27.2.4.6) — call `fn` and settle the promise with

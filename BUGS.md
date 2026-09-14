@@ -2588,10 +2588,9 @@ Still divergent, and why:
   read and describe correctly (`examples/protoaccessors.js`); it is only the
   LISTING that is wrong. Routing those prototypes' own keys through
   `PROTO_MEMBERS` the way the handles already are is the fix.
-- **An object does not borrow its BRAND from the chain.**
-  `Object.prototype.toString.call(Object.create(Map.prototype))` is
-  `[object Object]` where node reports `[object Map]`, because the tag is
-  decided by the receiver's kind rather than by the `Symbol.toStringTag` its
-  chain reaches. `constructor` and the prototype's methods and accessors are
-  all borrowed correctly now (`examples/protoborrowchain.js`,
-  `examples/protoaccessors.js`); the brand is the last one that is not.
+- **`gen-arity` must run against the same node the corpus does.** `src/arity.rs`
+  now carries four tables, all transcribed from the reference binary:
+  `BUILTIN_ARITY`, `PROTO_MEMBERS`, `PROTO_ACCESSORS`, `PROTO_READONLY`.
+  Regenerating against a different node version rewrites all four at once, so
+  the diff is large and every row of it is a claim about that engine. Check the
+  version before blessing one in.

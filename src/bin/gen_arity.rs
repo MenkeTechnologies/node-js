@@ -87,6 +87,25 @@ const accessorRow = (label, holder) => {
   });
   if (names.length) accessors.push(label + '\t' + names.join(','));
 };
+// The members that are NON-WRITABLE data properties. An inherited one refuses
+// an assignment on any object below it (10.1.9.2), so `o[Symbol.toStringTag] =
+// 'x'` on an object inheriting from `Map.prototype` is silently dropped. There
+// are few, and all but one are symbol-keyed.
+const readonly = [];
+const readonlyRow = (label, holder) => {
+  const names = [];
+  for (const k of Reflect.ownKeys(holder)) {
+    let d; try { d = Object.getOwnPropertyDescriptor(holder, k); } catch { continue; }
+    if (!d || d.get || d.writable) continue;
+    if (typeof k === 'symbol') {
+      const desc = String(k).slice('Symbol(Symbol.'.length, -1);
+      if (desc && String(k) === 'Symbol(Symbol.' + desc + ')') names.push('@@' + desc);
+    } else {
+      names.push(k);
+    }
+  }
+  if (names.length) readonly.push(label + '\t' + names.join(','));
+};
 const protoRow = (label, holder) => {
   const mark = (holder, k, spelling) => {
     let d; try { d = Object.getOwnPropertyDescriptor(holder, k); } catch { return spelling; }
@@ -116,11 +135,18 @@ for (const c of ctors) {
   if (C && C.prototype) accessorRow(c, C.prototype);
 }
 accessorRow('TypedArray', Object.getPrototypeOf(Uint8Array.prototype));
+for (const c of ctors) {
+  const C = globalThis[c];
+  if (C && C.prototype) readonlyRow(c, C.prototype);
+}
+readonlyRow('TypedArray', Object.getPrototypeOf(Uint8Array.prototype));
 console.log(rows.join('\n'));
 console.log('===PROTOS===');
 console.log(protos.join('\n'));
 console.log('===ACCESSORS===');
 console.log(accessors.join('\n'));
+console.log('===READONLY===');
+console.log(readonly.join('\n'));
 "#;
 
 fn main() {
@@ -149,10 +175,26 @@ fn main() {
     let (arity_text, rest) = stdout_text
         .split_once("===PROTOS===\n")
         .expect("enumerator emitted no prototype section");
-    let (proto_text, accessor_text) = rest
+    let (proto_text, rest) = rest
         .split_once("===ACCESSORS===\n")
         .expect("enumerator emitted no accessor section");
+    let (accessor_text, readonly_text) = rest
+        .split_once("===READONLY===\n")
+        .expect("enumerator emitted no read-only section");
     // (constructor, member names) — kept in the engine's order, not sorted.
+    let readonly: Vec<(String, Vec<String>)> = readonly_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (ctor, names) = l.split_once('\t').unwrap_or((l, ""));
+            let names = names
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect();
+            (ctor.to_string(), names)
+        })
+        .collect();
     let accessors: Vec<(String, Vec<String>)> = accessor_text
         .lines()
         .filter(|l| !l.is_empty())
@@ -273,6 +315,29 @@ fn main() {
     let mut accessors = accessors;
     accessors.sort();
     for (ctor, names) in &accessors {
+        let list = names
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(w, "    ({ctor:?}, &[{list}]),").unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    writeln!(
+        w,
+        "\n/// The NON-WRITABLE data members of each intrinsic prototype.\n\
+         ///\n\
+         /// An inherited non-writable property refuses an assignment on every\n\
+         /// object below it (10.1.9.2), so `o[Symbol.toStringTag] = 'x'` is silently\n\
+         /// dropped when `o` inherits from `Map.prototype`. All but\n\
+         /// `String.prototype.length` are symbol-keyed.\n\
+         /// Sorted by constructor; the NAMES within a row are not sorted.\n\
+         pub const PROTO_READONLY: &[(&str, &[&str])] = &["
+    )
+    .unwrap();
+    let mut readonly = readonly;
+    readonly.sort();
+    for (ctor, names) in &readonly {
         let list = names
             .iter()
             .map(|n| format!("{n:?}"))

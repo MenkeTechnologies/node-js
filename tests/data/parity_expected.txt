@@ -1756,6 +1756,28 @@ error-proto   ["function","E: m"]
 own-shadows   "own"
 mid-chain     ["z",1,true]
 deep-create   "function"
+==== protobrand.js ====
+created       ["[object Map]","[object Set]","[object Promise]"]
+deep          "[object Set]"
+es5-subclass  "[object Map]"
+class-chain   ["[object Map]","[object Map]"]
+tag-read      ["Map","Promise",null]
+no-tag        ["[object Object]","[object Object]","[object Object]"]
+error-chain   ["[object Object]","[object Object]","[object Error]"]
+is-error      [false,true,true]
+exotics       ["[object Map]","[object Set]","[object Promise]","[object WeakMap]"]
+views         ["[object Uint8Array]","[object Float64Array]","[object DataView]","[object Uint8Array]"]
+null-proto    "[object Object]"
+own-tag       ["[object X]","X"]
+own-getter    "[object G]"
+write-refused ["Map",false,"[object Map]"]
+write-strict  "TypeError"
+real-receiver ["Map","[object Map]"]
+define-ok     ["D","[object D]"]
+unscopables   ["object",false]
+date-toprim   "function"
+writable-ok   [1,true]
+plain-object  ["X","[object X]"]
 ==== protodetach.js ====
 array-read    ["undefined","undefined","function","function"]
 array-in      [false,true,true]

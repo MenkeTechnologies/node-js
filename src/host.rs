@@ -1725,6 +1725,30 @@ impl JsHost {
         if !self.prop_attrs(owner, key).writable {
             return false;
         }
+        // An intrinsic prototype on the chain may define the name NON-WRITABLE,
+        // and those members own no map entry for the walk below to find:
+        // `o[Symbol.toStringTag] = 'x'` where `o` inherits from `Map.prototype`
+        // is refused in node and was creating an own property here, which then
+        // changed the object's brand.
+        // The receiver's OWN kind counts too, not only the prototypes an
+        // explicit link reaches: a plain array inherits `Array.prototype`
+        // implicitly, with no link for the walk to follow, and
+        // `a[Symbol.unscopables] = 'x'` is refused there just the same.
+        //
+        // Restricted to SYMBOL-keyed members. The string-keyed non-writable
+        // ones — `Function.prototype.length`/`name`, `String.prototype.length`
+        // — are also OWN properties of every instance, so the inherited rule
+        // never decides them; applying it anyway blocked `SetFunctionName`
+        // itself, and naming the setter in `Object.defineProperty(o, 'v', {set
+        // (x) {…}})` then threw.
+        if key.starts_with("@@")
+            && crate::builtins::own_ctor_name(self, owner)
+                .into_iter()
+                .chain(crate::builtins::chain_intrinsic_ctors_h(self, owner))
+                .any(|c| crate::builtins::is_proto_readonly(c, key))
+        {
+            return false;
+        }
         // 10.1.9.2: with no OWN property, the inherited one decides. A
         // non-writable data property up the chain blocks the write rather than
         // being shadowed — including one on a frozen prototype. Only own
