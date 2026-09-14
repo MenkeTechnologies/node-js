@@ -1576,7 +1576,7 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             // even though `Map.prototype` is right there above it. This
             // answered `undefined`, which is the value a real Map would never
             // give and a plain object should never reach.
-            if is_proto_accessor(owner, name) {
+            if is_proto_accessor(owner, name) && !getter_in_flight(owner, name) {
                 return proto_getter_call(owner, name, recv);
             }
             let key = format!("@proto:{owner}:{name}");
@@ -2478,6 +2478,24 @@ fn brand_matches(recv: &Value, ctor: &str) -> bool {
     }
 }
 
+thread_local! {
+    /// The `(ctor, key)` prototype accessors whose tail read is in flight.
+    ///
+    /// A getter's last step reads the value off the receiver, and when the
+    /// receiver does not STORE it that read walks the chain, finds the same
+    /// accessor and runs it again: `new TextDecoder().fatal` recursed until the
+    /// stack overflowed and aborted the process. An accessor already in flight
+    /// answers `undefined` for its own key rather than re-entering — the value
+    /// a missing internal slot has, and what node reports for one.
+    static GETTERS_IN_FLIGHT: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether `ctor`'s `key` getter is already running further down the stack.
+fn getter_in_flight(ctor: &str, key: &str) -> bool {
+    GETTERS_IN_FLIGHT.with(|g| g.borrow().iter().any(|(c, k)| c == ctor && k == key))
+}
+
 /// Invoke an intrinsic prototype's getter against `recv` — the body behind the
 /// `@protoget:` thunks.
 ///
@@ -2536,7 +2554,22 @@ pub(crate) fn proto_getter_call(ctor: &str, key: &str, recv: &Value) -> Result<V
             )),
         });
     }
-    get_property(recv, key)
+    // A native instance keeps an accessor's value in the hidden `@@<key>` slot,
+    // so that the public name can be a getter on the prototype rather than an
+    // own enumerable property. Read it straight: the chain walk below would
+    // find this same accessor and run it again.
+    if let Some(v) = with_host(|h| match h.get(recv) {
+        Some(JsObj::Object(p)) => p.get(&format!("@@{key}")).cloned(),
+        _ => None,
+    }) {
+        return Ok(v);
+    }
+    GETTERS_IN_FLIGHT.with(|g| g.borrow_mut().push((ctor.to_string(), key.to_string())));
+    let out = get_property(recv, key);
+    GETTERS_IN_FLIGHT.with(|g| {
+        g.borrow_mut().pop();
+    });
+    out
 }
 
 /// `Function.prototype.arguments`/`caller` read against `recv`.
@@ -2998,6 +3031,31 @@ fn nullish_receiver_error(ctor: &str, method: &str, recv: &str) -> Option<String
 
 pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result<Value, String> {
     let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
+    // A prototype ACCESSOR installed by `ensure_ctor_proto`: it reads or writes
+    // the instance's hidden `@@<name>` slot, which is where the value lives now
+    // that the public name is a getter rather than an own property.
+    if let Some(key) = method.strip_prefix("@get@") {
+        if let Some(v) = with_host(|h| match h.get(recv) {
+            Some(JsObj::Object(p)) => p.get(&format!("@@{key}")).cloned(),
+            _ => None,
+        }) {
+            return Ok(v);
+        }
+        // No stored slot: the value is COMPUTED, so ask the class. `KeyObject`'s
+        // `symmetricKeySize` is the secret's byte length, which nothing stores.
+        let tag = crate::stdlib::native_tag(recv).unwrap_or_default();
+        return crate::stdlib::instance_call(&tag, recv, method, args);
+    }
+    if let Some(key) = method.strip_prefix("@set@") {
+        let v = args.first().cloned().unwrap_or(Value::Undef);
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                p.insert(format!("@@{key}"), v);
+            }
+        });
+        crate::stdlib::instance_accessor_written(ctor, key, recv);
+        return Ok(Value::Undef);
+    }
     if with_host(|h| h.is_nullish(recv)) {
         let shown = if with_host(|h| h.is_null(recv)) {
             "null"
@@ -3129,8 +3187,18 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     // that constructor. Routing back through `call_method` would re-resolve this
     // very thunk off the receiver's own chain and recurse forever, which is why
     // each such prototype needed a hand-written bypass; now they all have one.
-    if crate::stdlib::native_tag(recv).as_deref() == Some(ctor) {
-        return crate::stdlib::instance_call(ctor, recv, method, args);
+    // A SUBCLASS counts: `SecretKeyObject` reaches `KeyObject.prototype.equals`
+    // through its chain, and requiring an exact tag match sent that call back
+    // into `call_method`, which re-resolved this same thunk and recursed until
+    // the stack overflowed.
+    if let Some(tag) = crate::stdlib::native_tag(recv) {
+        let mut c = Some(tag.as_str());
+        while let Some(t) = c {
+            if t == ctor {
+                return crate::stdlib::instance_call(&tag, recv, method, args);
+            }
+            c = crate::stdlib::native_parent(t);
+        }
     }
     // A BRANDED method reached with a receiver that has no such internal slot.
     // Every arm above dispatches a receiver that IS an instance, so arriving
@@ -3973,21 +4041,6 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             .or_else(|| (h.object_proto() == *recv).then(|| "Object".to_string()))
     }) {
         with_host(|h| h.set_builtin_static(&format!("{ns}.prototype"), name, val.clone()));
-    }
-    // Assigning a `URL` component rewrites the DERIVED fields (`href`, `host`,
-    // `origin`) alongside it. They are stored rather than computed on read, so
-    // without this `u.pathname = '/p'` read back as `/p` while `u.href` still
-    // showed the old path — the object disagreed with itself.
-    if crate::stdlib::url::is_component(name)
-        && crate::stdlib::native_tag(recv).as_deref() == Some("URL")
-    {
-        with_host(|h| {
-            if let Some(JsObj::Object(p)) = h.get_mut(recv) {
-                p.insert(name.to_string(), val.clone());
-            }
-        });
-        crate::stdlib::url::refresh(recv);
-        return Ok(());
     }
     // `re.lastIndex = n` on a RegExp advances/resets its match cursor. The
     // writability check above already refused it on a FROZEN regexp, which it
@@ -13859,9 +13912,17 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     if let Some(ctor) = intrinsic_proto_of(&obj) {
         if is_proto_accessor(&ctor, &key) {
             let getter = proto_getter(&ctor, &key);
-            // The poison pair is the only accessor here with a SETTER; every
-            // other intrinsic accessor is read-only.
-            let setter = (ctor == "Function" && matches!(key.as_str(), "arguments" | "caller"))
+            // The poison pair is the only ECMAScript accessor here with a
+            // SETTER, but a WebIDL class has plenty: `URL.prototype.href`,
+            // `hostname` and the rest are all writable, and reporting them as
+            // read-only made `Object.getOwnPropertyDescriptor(URL.prototype,
+            // 'href').set` read `undefined` for a setter that runs.
+            let writable = (ctor == "Function" && matches!(key.as_str(), "arguments" | "caller"))
+                || crate::stdlib::instance_accessors(&ctor)
+                    .0
+                    .iter()
+                    .any(|(k, settable)| *k == key && *settable);
+            let setter = writable
                 .then(|| with_host(|h| h.alloc(JsObj::Builtin(format!("@protoset:{ctor}:{key}")))));
             return Ok(with_host(|h| {
                 let mut m: IndexMap<String, Value> = IndexMap::new();

@@ -611,8 +611,18 @@ pub fn has_to_json(tag: &str) -> bool {
 /// listen path) yields a bound method rather than `undefined` — the method is
 /// still dispatched through `instance_call` when the bound method is invoked.
 pub fn instance_has_method(tag: &str, name: &str) -> bool {
-    let (base, emitter) = instance_method_lists(tag);
-    base.contains(&name) || emitter.contains(&name)
+    // A class INHERITS its parent's methods: `equals` is on `KeyObject` and a
+    // `SecretKeyObject` answers it. Asking only the leaf's own list reported
+    // `false` for a method the prototype chain really carries.
+    let mut ctor = Some(tag);
+    while let Some(t) = ctor {
+        let (base, emitter) = instance_method_lists(t);
+        if base.contains(&name) || emitter.contains(&name) {
+            return true;
+        }
+        ctor = native_parent(t);
+    }
+    false
 }
 
 /// The method names a native instance tagged `tag` carries, as
@@ -635,7 +645,121 @@ pub fn native_parent(ctor: &str) -> Option<&'static str> {
     match ctor {
         "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" => Some("Stream"),
         "Stream" => Some("EventEmitter"),
+        // `crypto.createSecretKey` and `generateKeyPair` hand back the LEAF
+        // classes, not `KeyObject`: node's chain is
+        // `SecretKeyObject → KeyObject` and
+        // `PublicKeyObject → AsymmetricKeyObject → KeyObject`, which is why
+        // `symmetricKeySize` exists on one and `asymmetricKeyType` on the other.
+        // Everything was tagged `KeyObject`, so `key.constructor.name` read
+        // `KeyObject` and neither accessor had a home.
+        "SecretKeyObject" | "AsymmetricKeyObject" => Some("KeyObject"),
+        "PublicKeyObject" | "PrivateKeyObject" => Some("AsymmetricKeyObject"),
         _ => None,
+    }
+}
+
+/// The ACCESSOR properties a native class's prototype carries, as
+/// `(name, has_setter)`, and the `Symbol.toStringTag` it stamps (empty for
+/// none).
+///
+/// Node keeps these OFF the instance: `Object.keys(new AbortController())` is
+/// empty and `JSON.stringify` of one is `{}`, because `signal` is a getter on
+/// `AbortController.prototype`. Storing them as own data properties — what this
+/// did — leaked them into every enumeration, every spread and every
+/// serialization of an object that merely held one.
+///
+/// The getter reads the instance's hidden `@@<name>` slot, so a construction
+/// site stores the value there rather than under the public name.
+/// Run whatever a class has to do after one of its accessor SETTERS stored a
+/// value — for a `URL`, rewriting the fields derived from the one just written.
+///
+/// Without this the setter was a plain slot write: `u.protocol = 'https:'` read
+/// back as `https:` while `u.href` still showed `http://…`, so the object
+/// disagreed with itself.
+/// Whether a class's prototype MEMBERS are enumerable, as node defines them.
+///
+/// Most are: `for (const k in new URL('http://a/'))` walks `href`, `origin` and
+/// the rest, because a WebIDL interface's members are enumerable and node
+/// defines its own classes the same way. The exceptions are the ones written as
+/// ES classes — `vm.Script` and the `KeyObject` family — whose methods are
+/// non-enumerable like any class method's.
+///
+/// `constructor` is never enumerable, in either kind.
+/// Methods a class defines AFTER its accessors.
+///
+/// Prototype members enumerate in definition order, and node defines
+/// `URL.prototype` as `toString`, then every accessor, then `toJSON` — so a
+/// `for-in` over a URL ends with `toJSON` rather than starting with it.
+pub fn instance_late_methods(tag: &str) -> &'static [&'static str] {
+    match tag {
+        "URL" => &["toJSON"],
+        _ => &[],
+    }
+}
+
+pub fn instance_members_enumerable(tag: &str) -> bool {
+    !matches!(
+        tag,
+        "Script"
+            | "KeyObject"
+            | "SecretKeyObject"
+            | "AsymmetricKeyObject"
+            | "PublicKeyObject"
+            | "PrivateKeyObject"
+    )
+}
+
+pub fn instance_accessor_written(tag: &str, key: &str, recv: &Value) {
+    if tag == "URL" {
+        // `href` is the whole URL, not a field of it, and `host` is two fields.
+        match key {
+            "href" => url::reparse(recv),
+            "host" => url::split_host(recv),
+            _ => url::refresh(recv),
+        }
+    }
+}
+
+pub fn instance_accessors(tag: &str) -> (&'static [(&'static str, bool)], &'static str) {
+    match tag {
+        "AbortController" => (&[("signal", false)], "AbortController"),
+        "AbortSignal" => (
+            &[("aborted", false), ("reason", false), ("onabort", true)],
+            "AbortSignal",
+        ),
+        "KeyObject" => (&[("type", false)], "KeyObject"),
+        "SecretKeyObject" => (&[("symmetricKeySize", false)], ""),
+        "AsymmetricKeyObject" => (
+            &[
+                ("asymmetricKeyType", false),
+                ("asymmetricKeyDetails", false),
+            ],
+            "",
+        ),
+        "TextEncoder" => (&[("encoding", false)], "TextEncoder"),
+        // `origin` and `searchParams` are the two a caller cannot assign.
+        "URL" => (
+            &[
+                ("href", true),
+                ("origin", false),
+                ("protocol", true),
+                ("username", true),
+                ("password", true),
+                ("host", true),
+                ("hostname", true),
+                ("port", true),
+                ("pathname", true),
+                ("search", true),
+                ("searchParams", false),
+                ("hash", true),
+            ],
+            "URL",
+        ),
+        "TextDecoder" => (
+            &[("encoding", false), ("fatal", false), ("ignoreBOM", false)],
+            "TextDecoder",
+        ),
+        _ => (&[], ""),
     }
 }
 
@@ -693,7 +817,8 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
             "destroy",
             "push",
         ],
-        "URL" => &["toString", "toJSON"],
+        // `toJSON` comes AFTER the accessors — see `instance_late_methods`.
+        "URL" => &["toString"],
         "AsyncLocalStorage" => async_hooks::ALS_METHODS,
         "AsyncHook" => async_hooks::HOOK_METHODS,
         "AsyncResource" => async_hooks::RESOURCE_METHODS,
@@ -756,7 +881,9 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         "ChildProcess" => child_process::CHILD_PROCESS_METHODS,
         "Sign" => &["update", "sign"],
         "Verify" => &["update", "verify"],
-        "KeyObject" => &["export", "equals"],
+        "KeyObject" => &["equals", "toCryptoKey"],
+        // `export` is on each LEAF, since what it exports differs.
+        "SecretKeyObject" | "PublicKeyObject" | "PrivateKeyObject" => &["export"],
         "DiffieHellman" => &[
             "generateKeys",
             "computeSecret",
@@ -910,7 +1037,11 @@ pub fn instance_call(
         }
         "Cipheriv" | "Decipheriv" => crypto::cipher_instance_call(tag, recv, method, &args),
         "Sign" | "Verify" => crypto::sign_verify_instance_call(tag, recv, method, &args),
-        "KeyObject" => crypto::key_object_instance_call(recv, method, &args),
+        "KeyObject"
+        | "SecretKeyObject"
+        | "AsymmetricKeyObject"
+        | "PublicKeyObject"
+        | "PrivateKeyObject" => crypto::key_object_instance_call(recv, method, &args),
         "DiffieHellman" => crypto::dh_instance_call(recv, method, &args),
         "ECDH" => crypto::ecdh_instance_call(recv, method, &args),
         "X509Certificate" => crypto::x509_instance_call(recv, method, &args),

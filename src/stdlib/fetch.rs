@@ -771,9 +771,9 @@ pub fn new_abort_signal() -> Value {
     with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("AbortSignal"));
-        m.insert("aborted".into(), Value::Bool(false));
-        m.insert("reason".into(), Value::Undef);
-        m.insert("onabort".into(), h.null());
+        m.insert("@@aborted".into(), Value::Bool(false));
+        m.insert("@@reason".into(), Value::Undef);
+        m.insert("@@onabort".into(), h.null());
         h.new_object(m)
     })
 }
@@ -783,7 +783,7 @@ pub fn construct_abort_controller(_args: &[Value]) -> Result<Value, String> {
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("AbortController"));
-        m.insert("signal".into(), signal);
+        m.insert("@@signal".into(), signal);
         h.new_object(m)
     }))
 }
@@ -809,7 +809,7 @@ pub fn fire_timeout_abort(idx: u32) -> Result<Value, String> {
 
 /// Mark a signal aborted and run its `onabort` / `abort` listeners.
 fn abort_signal(signal: &Value, reason: Value) -> Result<(), String> {
-    if matches!(prop(signal, "aborted"), Some(Value::Bool(true))) {
+    if matches!(prop(signal, "@@aborted"), Some(Value::Bool(true))) {
         return Ok(());
     }
     let reason = if matches!(reason, Value::Undef) {
@@ -817,9 +817,9 @@ fn abort_signal(signal: &Value, reason: Value) -> Result<(), String> {
     } else {
         reason
     };
-    set_prop(signal, "aborted", Value::Bool(true));
-    set_prop(signal, "reason", reason);
-    if let Some(cb) = prop(signal, "onabort") {
+    set_prop(signal, "@@aborted", Value::Bool(true));
+    set_prop(signal, "@@reason", reason);
+    if let Some(cb) = prop(signal, "@@onabort") {
         if with_host(|h| crate::host::is_callable(h, &cb)) {
             crate::host::invoke(&cb, vec![Value::Undef], Some(signal.clone()))?;
         }
@@ -835,7 +835,7 @@ fn abort_signal(signal: &Value, reason: Value) -> Result<(), String> {
 pub fn abort_controller_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         "abort" => {
-            let signal = prop(recv, "signal").unwrap_or(Value::Undef);
+            let signal = prop(recv, "@@signal").unwrap_or(Value::Undef);
             abort_signal(&signal, args.first().cloned().unwrap_or(Value::Undef))?;
             Ok(Value::Undef)
         }
@@ -848,8 +848,8 @@ pub fn abort_controller_call(recv: &Value, method: &str, args: &[Value]) -> Resu
 pub fn abort_signal_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         "throwIfAborted" => {
-            if matches!(prop(recv, "aborted"), Some(Value::Bool(true))) {
-                let reason = prop(recv, "reason").unwrap_or(Value::Undef);
+            if matches!(prop(recv, "@@aborted"), Some(Value::Bool(true))) {
+                let reason = prop(recv, "@@reason").unwrap_or(Value::Undef);
                 return Err(throw_js(reason));
             }
             Ok(Value::Undef)
@@ -956,8 +956,8 @@ pub fn fetch(args: &[Value]) -> Result<Value, String> {
 
     // An already-aborted signal rejects before any connection is made.
     if let Some(sig) = prop(&init, "signal") {
-        if matches!(prop(&sig, "aborted"), Some(Value::Bool(true))) {
-            let reason = prop(&sig, "reason")
+        if matches!(prop(&sig, "@@aborted"), Some(Value::Bool(true))) {
+            let reason = prop(&sig, "@@reason")
                 .unwrap_or_else(|| dom_exception("AbortError", "This operation was aborted"));
             crate::host::reject_promise_val(id, reason);
             return Ok(promise);

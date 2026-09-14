@@ -2061,7 +2061,11 @@ pub fn construct_text_encoder() -> Result<Value, String> {
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("TextEncoder"));
-        m.insert("encoding".into(), h.new_str("utf-8"));
+        // `encoding` is a getter on the prototype, so the value lives in the
+        // hidden slot the getter reads. As an own property it enumerated —
+        // `Object.keys(new TextEncoder())` answered `["encoding"]` where node
+        // answers `[]`, and `JSON.stringify` of anything holding one carried it.
+        m.insert("@@encoding".into(), h.new_str("utf-8"));
         h.new_object(m)
     }))
 }
@@ -2085,19 +2089,68 @@ pub fn text_encoder_call(_recv: &Value, method: &str, args: &[Value]) -> Result<
     }
 }
 
+/// The WHATWG encoding a label names, as node reports it through
+/// `decoder.encoding`. The label is NOT the encoding: `latin1`, `ascii` and
+/// `iso-8859-1` all name `windows-1252`, and `ucs-2` names `utf-16le`. This
+/// echoed the label back, so `new TextDecoder("latin1").encoding` read
+/// `"latin1"` — a name node never reports — and an unknown label was accepted
+/// and then decoded as UTF-8.
+fn encoding_for_label(label: &str) -> Option<&'static str> {
+    Some(match label.trim().to_ascii_lowercase().as_str() {
+        "utf-8" | "utf8" | "unicode-1-1-utf-8" | "unicode11utf8" | "unicode20utf8"
+        | "x-unicode20utf8" => "utf-8",
+        "latin1" | "iso-8859-1" | "iso8859-1" | "iso88591" | "ascii" | "us-ascii" | "cp1252"
+        | "cp819" | "ibm819" | "l1" | "windows-1252" | "x-cp1252" => "windows-1252",
+        "utf-16le" | "utf-16" | "ucs-2" | "ucs2" | "unicodefeff" | "unicodefffe"
+        | "iso-10646-ucs-2" | "csunicode" => "utf-16le",
+        _ => return None,
+    })
+}
+
 pub fn construct_text_decoder(args: &[Value]) -> Result<Value, String> {
-    let label = if args.is_empty() {
+    let label = if args.is_empty() || matches!(args[0], Value::Undef) {
         "utf-8".to_string()
     } else {
         super::arg_str(args, 0)
     };
+    let Some(encoding) = encoding_for_label(&label) else {
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_ENCODING_NOT_SUPPORTED",
+            &format!("The \"{label}\" encoding is not supported"),
+        ));
+    };
+    // `fatal` and `ignoreBOM` were not read at all, so a decoder asked to reject
+    // malformed input accepted it and one asked to keep the BOM never saw one —
+    // both options silently did nothing.
+    let flag = |key: &str| {
+        args.get(1)
+            .map(|o| crate::builtins::get_property(o, key).unwrap_or(Value::Undef))
+            .map(|v| with_host(|h| h.truthy(&v)))
+            .unwrap_or(false)
+    };
+    let (fatal, ignore_bom) = (flag("fatal"), flag("ignoreBOM"));
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("TextDecoder"));
-        m.insert("encoding".into(), h.new_str(label.to_ascii_lowercase()));
+        m.insert("@@encoding".into(), h.new_str(encoding.to_string()));
+        m.insert("@@fatal".into(), Value::Bool(fatal));
+        m.insert("@@ignoreBOM".into(), Value::Bool(ignore_bom));
         h.new_object(m)
     }))
 }
+
+/// windows-1252's 0x80..=0x9F range, which is NOT latin1's: those 32 positions
+/// carry the typographic characters (curly quotes, the euro sign, the dashes)
+/// rather than C1 control codes. Decoding them as latin1 — `b as char`, what
+/// this did — turned every smart quote in a Windows-encoded file into a control
+/// character.
+const CP1252_HIGH: [char; 32] = [
+    '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}', '\u{8f}',
+    '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}', '\u{178}',
+];
 
 pub fn text_decoder_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
@@ -2108,16 +2161,51 @@ pub fn text_decoder_call(recv: &Value, method: &str, args: &[Value]) -> Result<V
                 .iter()
                 .map(|n| *n as u8)
                 .collect();
-            let enc = with_host(|h| match h.get(recv) {
-                Some(JsObj::Object(p)) => p
-                    .get("encoding")
-                    .map(|v| h.str_of(v))
-                    .unwrap_or_else(|| "utf-8".into()),
-                _ => "utf-8".into(),
-            });
+            let slot = |key: &str| {
+                with_host(|h| match h.get(recv) {
+                    Some(JsObj::Object(p)) => p.get(key).cloned(),
+                    _ => None,
+                })
+            };
+            let enc = slot("@@encoding")
+                .map(|v| with_host(|h| h.str_of(&v)))
+                .unwrap_or_else(|| "utf-8".into());
+            let flag = |key: &str| matches!(slot(key), Some(Value::Bool(true)));
             let s = match enc.as_str() {
-                "latin1" | "iso-8859-1" | "ascii" => bytes.iter().map(|b| *b as char).collect(),
+                "windows-1252" => bytes
+                    .iter()
+                    .map(|b| match b {
+                        0x80..=0x9f => CP1252_HIGH[(b - 0x80) as usize],
+                        _ => *b as char,
+                    })
+                    .collect(),
+                "utf-16le" => {
+                    let units: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    String::from_utf16_lossy(&units)
+                }
+                // A `fatal` decoder REJECTS malformed input rather than
+                // substituting U+FFFD. Both behaved as the lossy form, so bytes
+                // that are not valid UTF-8 came back as replacement characters
+                // from a decoder built to refuse them.
+                _ if flag("@@fatal") => match std::str::from_utf8(&bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        return Err(crate::host::coded_error(
+                            "TypeError",
+                            "ERR_ENCODING_INVALID_ENCODED_DATA",
+                            &format!("The encoded data was not valid for encoding {enc}"),
+                        ))
+                    }
+                },
                 _ => String::from_utf8_lossy(&bytes).into_owned(),
+            };
+            // A leading BOM is REMOVED unless `ignoreBOM` asked to keep it.
+            let s = match s.strip_prefix('\u{feff}') {
+                Some(rest) if !flag("@@ignoreBOM") => rest.to_string(),
+                _ => s,
             };
             Ok(with_host(|h| h.new_str(s)))
         }

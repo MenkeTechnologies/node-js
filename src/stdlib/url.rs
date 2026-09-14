@@ -29,14 +29,20 @@ pub const MODULE_METHODS: &[&str] = &[
 ];
 
 /// Parsed URL components.
-/// The component names a `URL` exposes as writable data properties.
+/// The component names a `URL` exposes as writable ACCESSORS on its prototype.
 ///
 /// Assigning one has to rewrite the DERIVED fields — `href`, `host` and
 /// `origin` — which are stored alongside rather than computed on read. Without
 /// that, `u.pathname = '/p'` read back as `/p` while `u.href` still showed the
 /// old path, so the object disagreed with itself.
+///
+/// `host` and `href` are here too, and both need more than a write: `host`
+/// carries the port, and assigning `href` REPLACES the whole URL. Neither was
+/// settable, so `u.href = 'http://x/y'` stored a string that every other
+/// property then contradicted.
 pub const COMPONENTS: &[&str] = &[
-    "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
+    "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash",
+    "href",
 ];
 
 /// Whether `name` is a `URL` component whose assignment must refresh the
@@ -58,7 +64,7 @@ fn recompute(url: &Value, sync_params: bool) {
             _ => String::new(),
         })
     };
-    let mut protocol = read("protocol");
+    let mut protocol = read("@@protocol");
     if !protocol.is_empty() && !protocol.ends_with(':') {
         protocol.push(':');
     }
@@ -73,13 +79,13 @@ fn recompute(url: &Value, sync_params: bool) {
     };
     let parts = Parts {
         protocol,
-        username: read("username"),
-        password: read("password"),
-        hostname: read("hostname"),
-        port: read("port"),
-        pathname: read("pathname"),
-        search: delimited(read("search"), '?'),
-        hash: delimited(read("hash"), '#'),
+        username: read("@@username"),
+        password: read("@@password"),
+        hostname: read("@@hostname"),
+        port: read("@@port"),
+        pathname: read("@@pathname"),
+        search: delimited(read("@@search"), '?'),
+        hash: delimited(read("@@hash"), '#'),
     };
     let (href, host, origin) = (parts.href(), parts.host(), parts.origin());
     let search = parts.search.clone();
@@ -89,7 +95,7 @@ fn recompute(url: &Value, sync_params: bool) {
         // after `u.search = …` is the same object.
         let query = search.strip_prefix('?').unwrap_or(&search).to_string();
         let params = with_host(|h| match h.get(url) {
-            Some(JsObj::Object(p)) => p.get("searchParams").cloned(),
+            Some(JsObj::Object(p)) => p.get("@@searchParams").cloned(),
             _ => None,
         });
         if let Some(params) = params {
@@ -98,12 +104,12 @@ fn recompute(url: &Value, sync_params: bool) {
     }
     with_host(|h| {
         let vals = [
-            ("href", h.new_str(href)),
-            ("host", h.new_str(host)),
-            ("origin", h.new_str(origin)),
-            ("protocol", h.new_str(parts.protocol.clone())),
-            ("search", h.new_str(search)),
-            ("hash", h.new_str(parts.hash.clone())),
+            ("@@href", h.new_str(href)),
+            ("@@host", h.new_str(host)),
+            ("@@origin", h.new_str(origin)),
+            ("@@protocol", h.new_str(parts.protocol.clone())),
+            ("@@search", h.new_str(search)),
+            ("@@hash", h.new_str(parts.hash.clone())),
         ];
         if let Some(JsObj::Object(p)) = h.get_mut(url) {
             for (k, v) in vals {
@@ -116,6 +122,67 @@ fn recompute(url: &Value, sync_params: bool) {
 /// Refresh a `URL` after one of its components was assigned.
 pub fn refresh(url: &Value) {
     recompute(url, true);
+}
+
+/// Split the `host` just assigned to `url` into the `hostname` and `port` it
+/// actually carries.
+///
+/// `host` is DERIVED from those two on every refresh, so writing it as one
+/// string was undone immediately: `u.host = 'b:99'` left the URL pointing at
+/// the old host entirely.
+pub fn split_host(url: &Value) {
+    let host = with_host(|h| match h.get(url) {
+        Some(JsObj::Object(p)) => p.get("@@host").map(|v| h.str_of(v)).unwrap_or_default(),
+        _ => String::new(),
+    });
+    // An IPv6 literal keeps its brackets; the port is whatever follows the LAST
+    // colon outside them.
+    let split = match host.rfind(']') {
+        Some(i) => host[i..].find(':').map(|j| i + j),
+        None => host.rfind(':'),
+    };
+    let (hostname, port) = match split {
+        Some(i) => (host[..i].to_string(), host[i + 1..].to_string()),
+        None => (host.clone(), String::new()),
+    };
+    with_host(|h| {
+        let (hn, pt) = (h.new_str(hostname), h.new_str(port));
+        if let Some(JsObj::Object(p)) = h.get_mut(url) {
+            p.insert("@@hostname".into(), hn);
+            p.insert("@@port".into(), pt);
+        }
+    });
+    refresh(url);
+}
+
+/// Re-parse `url` from the `href` just assigned to it.
+///
+/// `href` is not a component: it is the WHOLE URL, so setting it replaces every
+/// other field. Treating it as one more stored string left `u.host` and
+/// `u.pathname` reporting the old URL's values while `u.href` showed the new
+/// one. An unparseable value is ignored, which is what node does — its `href`
+/// setter throws only for a value no parser can accept, and this parser is the
+/// one deciding that.
+pub fn reparse(url: &Value) {
+    let href = with_host(|h| match h.get(url) {
+        Some(JsObj::Object(p)) => p.get("@@href").map(|v| h.str_of(v)).unwrap_or_default(),
+        _ => String::new(),
+    });
+    let Some(parts) = parse_absolute(&href) else {
+        return;
+    };
+    let fresh = build(&parts);
+    let props = with_host(|h| match h.get(&fresh) {
+        Some(JsObj::Object(p)) => p.clone(),
+        _ => IndexMap::new(),
+    });
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(url) {
+            for (k, v) in props {
+                p.insert(k, v);
+            }
+        }
+    });
 }
 
 struct Parts {
@@ -433,18 +500,18 @@ fn build(p: &Parts) -> Value {
     with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("URL"));
-        m.insert("href".into(), h.new_str(p.href()));
-        m.insert("origin".into(), h.new_str(p.origin()));
-        m.insert("protocol".into(), h.new_str(p.protocol.clone()));
-        m.insert("username".into(), h.new_str(p.username.clone()));
-        m.insert("password".into(), h.new_str(p.password.clone()));
-        m.insert("host".into(), h.new_str(p.host()));
-        m.insert("hostname".into(), h.new_str(p.hostname.clone()));
-        m.insert("port".into(), h.new_str(p.port.clone()));
-        m.insert("pathname".into(), h.new_str(p.pathname.clone()));
-        m.insert("search".into(), h.new_str(p.search.clone()));
-        m.insert("searchParams".into(), search_params.clone());
-        m.insert("hash".into(), h.new_str(p.hash.clone()));
+        m.insert("@@href".into(), h.new_str(p.href()));
+        m.insert("@@origin".into(), h.new_str(p.origin()));
+        m.insert("@@protocol".into(), h.new_str(p.protocol.clone()));
+        m.insert("@@username".into(), h.new_str(p.username.clone()));
+        m.insert("@@password".into(), h.new_str(p.password.clone()));
+        m.insert("@@host".into(), h.new_str(p.host()));
+        m.insert("@@hostname".into(), h.new_str(p.hostname.clone()));
+        m.insert("@@port".into(), h.new_str(p.port.clone()));
+        m.insert("@@pathname".into(), h.new_str(p.pathname.clone()));
+        m.insert("@@search".into(), h.new_str(p.search.clone()));
+        m.insert("@@searchParams".into(), search_params.clone());
+        m.insert("@@hash".into(), h.new_str(p.hash.clone()));
         let obj = h.new_object(m);
         // Hidden, and set after the URL exists so the two can point at each other.
         if let Some(JsObj::Object(sp)) = h.get_mut(&search_params) {
@@ -538,7 +605,7 @@ fn legacy_parse(args: &[Value]) -> Result<super::url_legacy::Url, String> {
 pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
     match method {
         "toString" | "toJSON" => Ok(with_host(|h| match h.get(recv) {
-            Some(JsObj::Object(p)) => p.get("href").cloned().unwrap_or(Value::Undef),
+            Some(JsObj::Object(p)) => p.get("@@href").cloned().unwrap_or(Value::Undef),
             _ => Value::Undef,
         })),
         _ => Err(crate::host::type_error(&format!(
@@ -554,7 +621,7 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
 fn url_href(v: &Value) -> String {
     with_host(|h| match h.get(v) {
         Some(JsObj::Object(p)) => match p.get("@@native").map(|x| h.str_of(x)).as_deref() {
-            Some("URL") => p.get("href").map(|x| h.str_of(x)).unwrap_or_default(),
+            Some("URL") => p.get("@@href").map(|x| h.str_of(x)).unwrap_or_default(),
             _ => h.str_of(v),
         },
         _ => h.str_of(v),
@@ -621,18 +688,18 @@ fn url_to_http_options(v: &Value) -> Value {
             _ => String::new(),
         })
     };
-    let protocol = get("protocol");
-    let mut hostname = get("hostname");
+    let protocol = get("@@protocol");
+    let mut hostname = get("@@hostname");
     if hostname.starts_with('[') && hostname.ends_with(']') && hostname.len() >= 2 {
         hostname = hostname[1..hostname.len() - 1].to_string();
     }
-    let hash = get("hash");
-    let search = get("search");
-    let pathname = get("pathname");
-    let href = get("href");
-    let port = get("port");
-    let username = get("username");
-    let password = get("password");
+    let hash = get("@@hash");
+    let search = get("@@search");
+    let pathname = get("@@pathname");
+    let href = get("@@href");
+    let port = get("@@port");
+    let username = get("@@username");
+    let password = get("@@password");
     let path = format!("{pathname}{search}");
     let auth = if username.is_empty() && password.is_empty() {
         None
@@ -1012,7 +1079,7 @@ fn set_pairs(recv: &Value, pairs: &[(String, String)]) {
                 format!("?{query}")
             });
             if let Some(JsObj::Object(p)) = h.get_mut(&owner) {
-                p.insert("search".into(), s);
+                p.insert("@@search".into(), s);
             }
         });
         recompute(&owner, false);

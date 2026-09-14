@@ -818,7 +818,7 @@ fn val_bytes(v: &Value) -> Vec<u8> {
     // A `KeyObject` carries its bytes in a hidden slot. Stringifying it yielded
     // the text of an object, so `hkdf(digest, secretKey, …)` derived from that
     // text — a plausible key for input the caller never supplied.
-    if super::native_tag(v).as_deref() == Some("KeyObject") {
+    if is_key_object(v) {
         return with_host(|h| {
             match h.get(v) {
                 Some(JsObj::Object(p)) => p.get("@@secret").cloned(),
@@ -853,7 +853,7 @@ fn bytes_arg(args: &[Value], i: usize, name: &str, expected: &str) -> Result<Vec
     let v = args.get(i).cloned().unwrap_or(Value::Undef);
     if super::buffer::view_bytes(&v).is_none()
         && with_host(|h| h.as_str(&v)).is_none()
-        && !(expected == HKDF_IKM && super::native_tag(&v).as_deref() == Some("KeyObject"))
+        && !(expected == HKDF_IKM && is_key_object(&v))
     {
         return Err(crate::host::invalid_arg_type(
             name, "argument", expected, &v,
@@ -1310,17 +1310,35 @@ fn decode(s: &str, enc: &str) -> Vec<u8> {
 //  encryption, Diffie-Hellman / ECDH, primes, argon2, X.509.
 // ════════════════════════════════════════════════════════════════════════
 
-/// A `KeyObject` for an asymmetric key: carries `type` (`private`/`public`),
+/// A key object for an asymmetric key: carries `type` (`private`/`public`),
 /// `asymmetricKeyType`, and the PEM material in the hidden `@@pem`.
+///
+/// The class is the LEAF one node hands back — `PublicKeyObject` or
+/// `PrivateKeyObject` — so the chain reaches `asymmetricKeyType` where node
+/// keeps it. Both values are read through prototype getters, which is why they
+/// live in hidden slots rather than as own enumerable properties.
 fn key_object(kind: &str, asym: &str, pem: &str) -> Value {
+    let class = if kind == "private" {
+        "PrivateKeyObject"
+    } else {
+        "PublicKeyObject"
+    };
     with_host(|h| {
         let mut m = IndexMap::new();
-        m.insert("@@native".into(), h.new_str("KeyObject"));
-        m.insert("type".into(), h.new_str(kind));
-        m.insert("asymmetricKeyType".into(), h.new_str(asym));
+        m.insert("@@native".into(), h.new_str(class));
+        m.insert("@@type".into(), h.new_str(kind));
+        m.insert("@@asymmetricKeyType".into(), h.new_str(asym));
         m.insert("@@pem".into(), h.new_str(pem));
         h.new_object(m)
     })
+}
+
+/// Whether `v` is any of the key-object classes.
+fn is_key_object(v: &Value) -> bool {
+    matches!(
+        super::native_tag(v).as_deref(),
+        Some("KeyObject" | "SecretKeyObject" | "PublicKeyObject" | "PrivateKeyObject")
+    )
 }
 
 /// A secret (symmetric) `KeyObject` wrapping raw bytes.
@@ -1328,8 +1346,8 @@ fn secret_key_object(bytes: &[u8]) -> Value {
     with_host(|h| {
         let arr = h.new_array(bytes.iter().map(|b| Value::Float(*b as f64)).collect());
         let mut m = IndexMap::new();
-        m.insert("@@native".into(), h.new_str("KeyObject"));
-        m.insert("type".into(), h.new_str("secret"));
+        m.insert("@@native".into(), h.new_str("SecretKeyObject"));
+        m.insert("@@type".into(), h.new_str("secret"));
         m.insert("@@secret".into(), arr);
         h.new_object(m)
     })
@@ -1665,7 +1683,7 @@ fn public_pem_from_private(bytes: &[u8], asym: &str) -> Result<String, String> {
 /// Raw key material of a key argument: a `KeyObject`'s stored PEM, a `{ key }`
 /// wrapper's inner key, a Buffer's bytes, or a PEM/DER string's bytes.
 fn key_material(v: &Value) -> Vec<u8> {
-    if super::native_tag(v).as_deref() == Some("KeyObject") {
+    if is_key_object(v) {
         return with_host(|h| match h.get(v) {
             Some(JsObj::Object(p)) => p.get("@@pem").map(|s| h.str_of(s)).unwrap_or_default(),
             _ => String::new(),
@@ -2564,9 +2582,35 @@ pub fn key_object_instance_call(
             }
         }
         "equals" => {
-            let other = args.first().map(key_material).unwrap_or_default();
-            let mine = obj_str(recv, "@@pem").into_bytes();
-            Ok(Value::Bool(mine == other))
+            let Some(other) = args.first() else {
+                return Ok(Value::Bool(false));
+            };
+            // A SECRET key has no PEM, so comparing `@@pem` compared two empty
+            // strings and every pair of secret keys was equal — including keys
+            // built from different bytes. The comparison has to be over the same
+            // material the key actually holds, and a key never equals one of a
+            // different `type`.
+            let kind = |v: &Value| obj_str(v, "@@type");
+            if kind(recv) != kind(other) {
+                return Ok(Value::Bool(false));
+            }
+            let mine = obj_bytes(recv, "@@secret");
+            if !mine.is_empty() {
+                return Ok(Value::Bool(mine == obj_bytes(other, "@@secret")));
+            }
+            Ok(Value::Bool(
+                obj_str(recv, "@@pem") == obj_str(other, "@@pem"),
+            ))
+        }
+        // `symmetricKeySize` is the secret's length in BYTES, and `undefined`
+        // for an asymmetric key rather than zero.
+        "@get@symmetricKeySize" => {
+            let secret = obj_bytes(recv, "@@secret");
+            Ok(if obj_str(recv, "@@type") == "secret" {
+                Value::Float(secret.len() as f64)
+            } else {
+                Value::Undef
+            })
         }
         _ => Err(crate::host::type_error(&format!(
             "keyObject.{method} is not a function"

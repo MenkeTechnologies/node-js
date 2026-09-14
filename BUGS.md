@@ -2653,3 +2653,19 @@ Still divergent, and why:
   with a prototype. Every other native class now links to its class prototype at
   construction (`examples/cryptostate.js` pins the `Hash` case); this one has no
   instance object to link.
+- **`Object.keys` of a native instance is missing node's INTERNAL own
+  properties.** Node's own classes carry implementation state as own
+  properties — `_options` on a `Hash`, `_decoder` on a `Cipheriv`, `_events`
+  and `_writableState` on a `Sign` — and `Object.keys` and `JSON.stringify`
+  report them. This runtime has no equivalent state and does not invent any, so
+  those lists are empty where node's are not. The PUBLIC surface agrees:
+  everything node keeps on the prototype is on the prototype here too
+  (`examples/nativeshapes.js`), and no public field leaks into an enumeration.
+- **`vm.Script` has no `sourceURL`/`sourceMapURL` own properties.** Node reads
+  them out of the options object and off the source's trailing
+  `//# sourceURL=` comment; nothing here records either, so both are absent
+  rather than `undefined`.
+- **`crypto` key objects carry no `asymmetricKeyDetails`.** The accessor exists
+  on `AsymmetricKeyObject.prototype` and answers `undefined`; node reports the
+  modulus length, public exponent, curve name and the rest, which needs the key
+  material parsed rather than held as PEM text.

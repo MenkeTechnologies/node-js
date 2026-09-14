@@ -1680,6 +1680,48 @@ override      ["X","1,2"]
 own-shadows   ["own","proto"]
 delete        ["v",true,true,[]]
 null-proto    [true,"v"]
+==== nativeshapes.js ====
+hash       ["Hash",null]
+hmac       ["Hmac",null]
+cipher     ["Cipheriv",null]
+sign       ["Sign",null]
+script     ["Script",null]
+params     ["URLSearchParams","URLSearchParams",[],"{}"]
+decoder-own [["encoding"]]
+decoder    ["StringDecoder",null]
+linked     [true,true,false]
+controller ["AbortController","AbortController",[],"{}"]
+signal     ["AbortSignal","AbortSignal",[],"{}"]
+held       "{\"ctrl\":{}}"
+ac-desc    [true,false,true,true]
+onabort    [1,true,"why",[]]
+abort-dflt [true,"AbortError"]
+url-shape  ["URL","URL",[],"\"https://user:pw@ex.com:8080/a/b?x=1#f\""]
+url-read   ["https:","user","pw","ex.com:8080","ex.com","8080","/a/b","?x=1","#f","https://ex.com:8080"]
+url-forin  ["toString","href","origin","protocol","username","password","host","hostname","port","pathname","search","searchParams","hash","toJSON"]
+url-desc   [[true,true],[true,false],[true,true],[true,false]]
+set-path   ["http://a/z?x=1","/z"]
+set-proto  "https://a/p"
+set-port   ["http://a:70/p","a:70"]
+set-host   ["http://b:99/p","b","99"]
+set-href   ["https:","b:1","1","/q","?r=2","#s","https://b:1","2"]
+set-search ["http://a/p?q=2","2"]
+params-mut ["http://a/p?x=1&y=2","?x=1&y=2"]
+url-ro     ["http://a",true]
+td-default ["utf-8",false,false,[]]
+td-opts    [true,true]
+td-labels  ["utf-8","windows-1252","windows-1252","windows-1252","utf-16le","utf-8"]
+td-unknown THROW RangeError ["ERR_ENCODING_NOT_SUPPORTED","The \"nope-xyz\" encoding is not supported"]
+td-cp1252  "€“™é"
+td-fatal   THROW TypeError ["ERR_ENCODING_INVALID_ENCODED_DATA","The encoded data was not valid for encoding utf-8"]
+td-lax     "���"
+td-bom     ["a",2,65279]
+td-utf16   "hi"
+te         ["utf-8",[],[97,195,169]]
+key-shape  ["SecretKeyObject","KeyObject",[],"{}"]
+key-size   ["secret",2,null]
+key-equals [true,false,false]
+key-chain  ["SecretKeyObject","KeyObject"]
 ==== newstatics.js ====
 try-meta   function 1 try
 esc-meta   function 1 escape

@@ -8950,7 +8950,12 @@ impl JsHost {
             return Some(p.clone());
         }
         let (own, emitter) = crate::stdlib::instance_method_lists(ctor);
-        if own.is_empty() && emitter.is_empty() {
+        // A class can carry accessors and no methods at all
+        // (`AsymmetricKeyObject` is only `asymmetricKeyType` and
+        // `asymmetricKeyDetails`), so an empty method list does not mean there
+        // is no prototype to build.
+        let (accessor_list, _) = crate::stdlib::instance_accessors(ctor);
+        if own.is_empty() && emitter.is_empty() && accessor_list.is_empty() {
             return None;
         }
         // A native class with a real PARENT hangs off that parent's prototype
@@ -8971,13 +8976,48 @@ impl JsHost {
             p.insert("constructor".into(), ctor_val);
         }
         self.hide_prop(&proto, "constructor");
+        // A prototype member is ENUMERABLE in node for every class but the few
+        // written as ES classes, so `for (const k in url)` walks `href` and the
+        // rest. Hiding all of them made that loop find nothing.
+        let visible = crate::stdlib::instance_members_enumerable(ctor);
         let symbols = crate::builtins::proto_symbol_methods(ctor);
         for m in own.iter().chain(emitter.iter()).chain(symbols.iter()) {
             let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
             if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
                 p.insert((*m).to_string(), thunk);
             }
-            self.hide_prop(&proto, m);
+            // A symbol-keyed member never enumerates.
+            if !visible || m.starts_with("@@") {
+                self.hide_prop(&proto, m);
+            }
+        }
+        // Accessors and the class's `Symbol.toStringTag`, both of which live on
+        // the PROTOTYPE in node — an instance owns neither.
+        let (accessors, tag) = crate::stdlib::instance_accessors(ctor);
+        for (key, settable) in accessors {
+            let get = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:@get@{key}")));
+            let set =
+                settable.then(|| self.alloc(JsObj::Builtin(format!("@proto:{ctor}:@set@{key}"))));
+            self.set_accessor(&proto, key, Some(get), set);
+            if !visible {
+                self.hide_prop(&proto, key);
+            }
+        }
+        for m in crate::stdlib::instance_late_methods(ctor) {
+            let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert((*m).to_string(), thunk);
+            }
+            if !visible {
+                self.hide_prop(&proto, m);
+            }
+        }
+        if !tag.is_empty() {
+            let tag = self.new_str(tag.to_string());
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert("@@toStringTag".into(), tag);
+            }
+            self.hide_prop(&proto, "@@toStringTag");
         }
         self.native_protos.insert(ctor.to_string(), proto.clone());
         Some(proto)
