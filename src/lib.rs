@@ -74,7 +74,7 @@ pub fn run_on_js_stack(f: fn() -> std::process::ExitCode) -> std::process::ExitC
 /// Compile a source string to a runnable program.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile(&stmts, false)
+    with_source(compiler::compile(&stmts, false), src)
 }
 
 /// Compile leaving the final top-level expression as the program's completion
@@ -90,13 +90,25 @@ pub fn compile_completion_strict(
     caller_strict: bool,
 ) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile_completion_strict(&stmts, false, caller_strict)
+    with_source(compiler::compile_completion_strict(&stmts, false, caller_strict), src)
 }
 
 /// Compile with per-statement DAP line markers enabled (`node --dap`).
 pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile(&stmts, true)
+    with_source(compiler::compile(&stmts, true), src)
+}
+
+/// Attach the text a program was parsed from, which its functions' spans
+/// index (`Function.prototype.toString`).
+pub fn with_source(
+    prog: Result<compiler::Program, String>,
+    src: &str,
+) -> Result<compiler::Program, String> {
+    prog.map(|mut p| {
+        p.source = Some(src.into());
+        p
+    })
 }
 
 /// Rebase a freshly compiled program's func/try ids above those already loaded
@@ -110,9 +122,19 @@ pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
         functions,
         tries,
         strict,
+        source,
     } = prog;
     let funcs: Vec<host::FuncDef> = functions.into_iter().map(|(_, f)| f).collect();
     host::with_host(|h| {
+        // Each span-carrying function learns which script its span indexes.
+        let mut funcs = funcs;
+        if let Some(text) = source {
+            let script = h.scripts.len() as u32;
+            h.scripts.push(text);
+            for f in funcs.iter_mut().filter(|f| f.span.1 != 0) {
+                f.script = Some(script);
+            }
+        }
         h.load_program(funcs, tries);
         // A strict top level marks the frame it is about to run on, so a
         // refused write throws there the way it does inside a strict function.

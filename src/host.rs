@@ -363,6 +363,13 @@ pub struct FuncDef {
     /// the body can recurse through that name even when the outer binding differs.
     #[serde(default)]
     pub self_name: bool,
+    /// The definition's byte range in its script (`(0, 0)`: none), for
+    /// `Function.prototype.toString` (20.2.3.5).
+    #[serde(default)]
+    pub span: (u32, u32),
+    /// The host `scripts` entry `span` indexes, set when the program loads.
+    #[serde(default)]
+    pub script: Option<u32>,
 }
 
 /// One parameter slot. `name` is the simple bound name; a destructuring pattern
@@ -660,6 +667,8 @@ pub struct ClassVal {
     /// result — it cannot be re-derived at run time (a field initialised from an
     /// already-anonymous function held elsewhere must not be renamed).
     pub fields: Vec<(String, Value, bool)>,
+    /// The FuncDef holding the class's source span (`String(C)`).
+    pub source_def: Option<usize>,
 }
 
 /// The result of resolving `super.name`: a getter to invoke (accessor property)
@@ -835,6 +844,9 @@ pub struct JsHost {
     heap: Vec<JsObj>,
     /// Function templates, indexed by def id.
     pub funcs: Vec<FuncDef>,
+    /// Every script text a loaded program was parsed from; a `FuncDef`'s
+    /// `script` indexes it and its `span` slices it.
+    pub scripts: Vec<std::sync::Arc<str>>,
     /// try/catch/finally block templates, indexed by try id.
     pub tries: Vec<TryDef>,
     /// Module-level (global) names.
@@ -1194,6 +1206,7 @@ impl JsHost {
             tdz_globals: Default::default(),
             heap: Vec::new(),
             funcs: Vec::new(),
+            scripts: Vec::new(),
             tries: Vec::new(),
             globals: VarMap::default(),
             global_consts: rustc_hash::FxHashSet::default(),
@@ -2100,6 +2113,17 @@ impl JsHost {
     pub fn load_program(&mut self, funcs: Vec<FuncDef>, tries: Vec<TryDef>) {
         self.funcs.extend(funcs);
         self.tries.extend(tries);
+    }
+    /// The source text of function `def_id`, when its program kept one.
+    pub fn func_source(&self, def_id: usize) -> Option<&str> {
+        let d = self.funcs.get(def_id)?;
+        let (start, end) = d.span;
+        if end == 0 {
+            return None;
+        }
+        self.scripts
+            .get(d.script? as usize)?
+            .get(start as usize..end as usize)
     }
     pub fn try_def(&self, id: usize) -> Option<TryDef> {
         self.tries.get(id).cloned()
@@ -3942,10 +3966,15 @@ impl JsHost {
                     // A function built from runtime source (`new Function`,
                     // `vm.compileFunction`) retains the exact text V8 synthesizes
                     // for it, so `Function.prototype.toString` reports what Node
-                    // reports. Ordinary functions carry no source here (the
-                    // compiler keeps no spans), so they fall back to a placeholder.
+                    // reports. Every other function slices its span out of the
+                    // script it was parsed from; only one whose program kept no
+                    // text (an AOT image, a `rust { }` desugared file) falls back
+                    // to the placeholder.
                     if let Some(src) = self.fn_prop(v, "@@source") {
                         return self.str_of(&src);
+                    }
+                    if let Some(text) = self.func_source(f.def_id) {
+                        return text.to_string();
                     }
                     let name = self
                         .funcs
@@ -3989,7 +4018,10 @@ impl JsHost {
                 Some(JsObj::Proxy { .. }) if is_callable(self, v) => {
                     "function () { [native code] }".into()
                 }
-                Some(JsObj::Class(c)) => format!("class {} {{ }}", c.name),
+                Some(JsObj::Class(c)) => match c.source_def.and_then(|d| self.func_source(d)) {
+                    Some(text) => text.to_string(),
+                    None => format!("class {} {{ }}", c.name),
+                },
                 Some(JsObj::Symbol { desc, .. }) => {
                     // `String(sym)` is allowed (unlike implicit coercion) and yields
                     // `Symbol(desc)`.
@@ -7374,7 +7406,7 @@ fn adopt_own_props(inst: &Value, built: &Value) {
 /// `MKCLASS`) the evaluated parent (or undefined) and the constructor closure (or
 /// undefined for a default constructor); methods/getters/setters/statics/fields
 /// are installed afterward by `DEF_MEMBER`/`DEF_FIELD`.
-pub fn build_class(name: &str, parent: Value, ctor: Value) -> Value {
+pub fn build_class(name: &str, parent: Value, ctor: Value, source_def: Option<usize>) -> Value {
     // A Proxy parent (`class D extends new Proxy(B, {})`): `D.prototype`'s
     // `[[Prototype]]` is `Get(parent, "prototype")` — a read that runs the `get`
     // trap and so re-enters the host, which the borrow below cannot allow.
@@ -7440,6 +7472,7 @@ pub fn build_class(name: &str, parent: Value, ctor: Value) -> Value {
             proto: proto.clone(),
             statics: IndexMap::new(),
             fields: Vec::new(),
+            source_def,
         };
         let class_val = h.alloc(JsObj::Class(cval));
         h.class_registry.insert(name.to_string(), class_val.clone());

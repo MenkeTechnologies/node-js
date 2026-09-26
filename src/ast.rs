@@ -5,6 +5,12 @@
 //! (blocks of these form a program/function body) from `Expr`. Numbers are all
 //! IEEE-754 `f64`, matching JavaScript's single number type.
 
+/// A source range as UTF-8 byte offsets `(start, end)` into the text the
+/// parser read. `(0, 0)` means none was recorded (a `${…}` template field is
+/// re-parsed from a copy, so its offsets would not point into the script).
+/// `Function.prototype.toString` returns this slice (20.2.3.5).
+pub type Span = (u32, u32);
+
 /// A binary operator (`a <op> b`). `&&`/`||`/`??` are `LogicalOp` because they
 /// short-circuit and yield an operand value, not a coerced boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +238,9 @@ pub enum Expr {
         /// than an ordinary function expression. A non-generator method owns no
         /// `prototype` property (10.2.5 runs only for ordinary functions).
         is_method: bool,
+        /// The definition's source text: from `async`/`function`/`get`/`*`/the
+        /// key or the arrow's parameters, to its last token.
+        span: Span,
     },
 
     /// `,`-sequence expression: evaluate all, yield the last.
@@ -245,6 +254,8 @@ pub struct ClassNode {
     /// The `extends` expression, if any.
     pub parent: Option<Box<Expr>>,
     pub members: Vec<ClassMember>,
+    /// `class` through the closing brace.
+    pub span: Span,
 }
 
 /// One member of a class body: a method, accessor, or field, on the instance or
@@ -264,6 +275,9 @@ pub struct ClassMember {
     pub body: Vec<Stmt>,
     /// Initializer expression for a field (`x = expr;`).
     pub field_init: Option<Expr>,
+    /// A method's source, from its first modifier after `static` (or its
+    /// key) to the closing brace.
+    pub span: Span,
 }
 
 /// The kind of a class member.
@@ -334,6 +348,7 @@ pub enum StmtKind {
         body: Vec<Stmt>,
         is_generator: bool,
         is_async: bool,
+        span: Span,
     },
     /// `class Name … { … }`.
     ClassDecl(ClassNode),

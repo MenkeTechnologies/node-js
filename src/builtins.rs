@@ -323,11 +323,20 @@ fn b_await(vm: &mut VM, _: u8) -> Value {
 
 // ── classes / super / generators / property keys (compiler-emitted ops) ──────
 
-fn b_mkclass(vm: &mut VM, _: u8) -> Value {
+fn b_mkclass(vm: &mut VM, argc: u8) -> Value {
+    // The fourth argument, when present, is the FuncDef carrying the class's
+    // source span.
+    let source_def = match argc {
+        4 => match vm.pop() {
+            Value::Int(n) => Some(n as usize),
+            _ => None,
+        },
+        _ => None,
+    };
     let ctor = vm.pop();
     let parent = vm.pop();
     let name = sval(&vm.pop());
-    host::build_class(&name, parent, ctor)
+    host::build_class(&name, parent, ctor, source_def)
 }
 
 fn b_def_member(vm: &mut VM, _: u8) -> Value {
@@ -14589,10 +14598,8 @@ fn clone_refusal(v: &Value) -> Option<String> {
     let kind = with_host(|h| h.kind_of(v))?;
     let render = |ctor: &str| Some(format!("#<{ctor}>"));
     match kind {
-        // A function renders as its SOURCE TEXT here. This frontend does not
-        // retain function source (`FuncDef` holds a compiled chunk), so the
-        // message says `function f() { [code] }` where node quotes the original
-        // — the error, its name and its code are right, the text is not.
+        // A function renders as its SOURCE TEXT here, which each FuncDef
+        // keeps as a span into its script (`JsHost::func_source`).
         ObjKind::Func | ObjKind::Class | ObjKind::BoundFunc | ObjKind::BoundMethod => {
             Some(with_host(|h| h.str_of(v)))
         }

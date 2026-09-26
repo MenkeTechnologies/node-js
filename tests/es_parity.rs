@@ -6725,3 +6725,39 @@ fn identifiers_and_whitespace_follow_unicode() {
     let src = "\u{FEFF}const\u{A0}x = 1;\u{2028}let Δx = 2, 名前 = 3; class Ü { #é = 4; get() { return this.#é } }\nconsole.log(x, Δx, 名前, new Ü().get(), Ü.name)";
     assert_eq!(run(src), "1 2 3 4 Ü");
 }
+
+#[test]
+fn function_to_string_returns_the_source_text() {
+    // 20.2.3.5: the exact slice of source that defined the function — from
+    // `async`/`function`/`get`/`*`/the key or the arrow's parameters to the
+    // last token. Every ordinary function printed `function f() { [code] }`.
+    let src = r#"
+        class A { static  sm ( x ) { return x } get g() { return 1 } async * ag() {} ['comp' + 1]() {} }
+        const o = { m(a, b) { return a }, f: function (q) { }, ar: (a) => a * 2, ay: async x => x };
+        function   decl ( a , /* c */ b ) {
+          return a + b
+        }
+        console.log(String(A));
+        console.log(String(A.sm), String(Object.getOwnPropertyDescriptor(A.prototype, 'g').get), String(A.prototype.ag), String(A.prototype.comp1));
+        console.log(Object.values(o).map(String));
+        console.log(decl.toString());
+        const é = 'ü'; console.log(`${`${(x) => x + 1}`}`, String(class {}), eval('(function evald(q) { return q })').toString());
+        try { structuredClone(function(){}) } catch (e) { console.log(e.message) }
+    "#;
+    assert_eq!(
+        run(src),
+        "class A { static  sm ( x ) { return x } get g() { return 1 } async * ag() {} ['comp' + 1]() {} }
+sm ( x ) { return x } get g() { return 1 } async * ag() {} ['comp' + 1]() {}
+[
+  'm(a, b) { return a }',
+  'function (q) { }',
+  '(a) => a * 2',
+  'async x => x'
+]
+function   decl ( a , /* c */ b ) {
+          return a + b
+        }
+(x) => x + 1 class {} function evald(q) { return q }
+function(){} could not be cloned."
+    );
+}

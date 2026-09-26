@@ -76,13 +76,19 @@ struct Parser {
     /// error (`SyntaxError`) rather than a runtime `TypeError` if the read ever
     /// happens — a typo in a dead branch used to ship silently.
     class_scopes: Vec<PrivateScope>,
+    /// Whether token offsets point into the script text, so a function's
+    /// [`Span`] can be recorded. Off for a re-parsed template field.
+    spans: bool,
 }
 
 /// Parse a complete JS program into a statement list. Inline `rust { ... }` FFI
 /// blocks are desugared to `__rust_compile(...)` calls before lexing.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
-    let src = crate::rust_ffi::desugar(src);
-    let toks = lex(&src)?;
+    let desugared = crate::rust_ffi::desugar(src);
+    // A `rust { … }` block is rewritten before lexing, so offsets would point
+    // into text the caller never sees; record spans only when nothing moved.
+    let spans = desugared == src;
+    let toks = lex(&desugared)?;
     let mut p = Parser {
         toks,
         pos: 0,
@@ -90,6 +96,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         in_async: false,
         no_in: false,
         class_scopes: Vec::new(),
+        spans,
     };
     let mut out = Vec::new();
     while !p.at_eof() {
@@ -102,6 +109,22 @@ impl Parser {
     // ── token helpers ────────────────────────────────────────────────────
     fn cur(&self) -> &Token {
         &self.toks[self.pos]
+    }
+    /// Parse one `${…}` field of a template token, keeping its spans in this
+    /// script's coordinates.
+    fn parse_field(&self, src: &str, at: u32) -> Result<Expr, String> {
+        parse_expr_source(src, self.spans.then_some(at))
+    }
+    /// Byte offset where token `i` begins.
+    fn start_at(&self, i: usize) -> u32 {
+        self.toks[i].start
+    }
+    /// The source range from `start` to the end of the last consumed token.
+    fn span_from(&self, start: u32) -> Span {
+        if !self.spans || self.pos == 0 {
+            return (0, 0);
+        }
+        (start, self.toks[self.pos - 1].end)
     }
     fn tok(&self) -> &Tok {
         &self.toks[self.pos].tok
@@ -294,6 +317,8 @@ impl Parser {
     /// Parse a `function` declaration (the `function`/`async function` keyword is
     /// current). `is_async` is true when a preceding `async` was consumed.
     fn parse_func_decl(&mut self, is_async: bool) -> Result<StmtKind, String> {
+        // `async` was consumed by the caller and is part of the source text.
+        let start = self.start_at(if is_async { self.pos - 1 } else { self.pos });
         self.advance(); // function
         let is_generator = self.eat_punct("*");
         let name = self.ident_name()?;
@@ -306,6 +331,7 @@ impl Parser {
             body,
             is_generator,
             is_async,
+            span: self.span_from(start),
         })
     }
 
@@ -328,6 +354,7 @@ impl Parser {
     /// Parse a function *expression* (`function`/`async function`, keyword
     /// current). Supports `function*` generators.
     fn parse_function_expr(&mut self, is_async: bool) -> Result<Expr, String> {
+        let start = self.start_at(if is_async { self.pos - 1 } else { self.pos });
         self.advance(); // function
         let is_generator = self.eat_punct("*");
         let name = if let Tok::Ident(n) = self.tok() {
@@ -352,6 +379,7 @@ impl Parser {
             is_generator,
             is_async,
             is_method: false,
+            span: self.span_from(start),
         })
     }
 
@@ -395,6 +423,7 @@ impl Parser {
     }
 
     fn parse_class_inner(&mut self) -> Result<ClassNode, String> {
+        let start = self.start_at(self.pos);
         self.advance(); // class
         let name = if let Tok::Ident(n) = self.tok() {
             if !is_keyword(n) && n != "extends" {
@@ -435,6 +464,7 @@ impl Parser {
             name,
             parent,
             members,
+            span: self.span_from(start),
         })
     }
 
@@ -445,6 +475,7 @@ impl Parser {
             self.advance();
             true
         };
+        let start = self.start_at(self.pos);
         // `static { … }` — a class static initialization block (ES2022). A brace
         // where a member key would be is unambiguous: no member name can start
         // with `{`, so this is checked before the key parse (which otherwise
@@ -464,6 +495,7 @@ impl Parser {
                 params: Vec::new(),
                 body,
                 field_init: None,
+                span: self.span_from(start),
             });
         }
         // Accessor / async / generator prefixes (each contextual: only a prefix
@@ -506,6 +538,7 @@ impl Parser {
                 params: Vec::new(),
                 body: Vec::new(),
                 field_init,
+                span: (0, 0),
             });
         }
         // A method / accessor / constructor.
@@ -530,6 +563,7 @@ impl Parser {
             params,
             body,
             field_init: None,
+            span: self.span_from(start),
         })
     }
 
@@ -1216,18 +1250,19 @@ impl Parser {
     /// Parse `` tag`a${x}b` `` into a `TaggedTemplate` node (the tag expression is
     /// already parsed as `tag`, and the current token is the template).
     fn parse_tagged_template(&mut self, tag: Expr) -> Result<Expr, String> {
-        let (quasis, raws, exprs_src) = match self.tok().clone() {
+        let (quasis, raws, exprs_src, expr_at) = match self.tok().clone() {
             Tok::Template {
                 quasis,
                 raws,
                 exprs,
-            } => (quasis, raws, exprs),
+                expr_at,
+            } => (quasis, raws, exprs, expr_at),
             _ => unreachable!(),
         };
         self.advance();
         let mut exprs = Vec::new();
-        for src in &exprs_src {
-            exprs.push(parse_expr_source(src)?);
+        for (src, at) in exprs_src.iter().zip(expr_at) {
+            exprs.push(self.parse_field(src, at)?);
         }
         Ok(Expr::TaggedTemplate {
             tag: Box::new(tag),
@@ -1310,11 +1345,12 @@ impl Parser {
                 quasis,
                 raws: _,
                 exprs,
+                expr_at,
             } => {
                 self.advance();
                 let mut parsed = Vec::new();
-                for src in &exprs {
-                    parsed.push(parse_expr_source(src)?);
+                for (src, at) in exprs.iter().zip(expr_at) {
+                    parsed.push(self.parse_field(src, at)?);
                 }
                 Ok(Expr::Template {
                     quasis,
@@ -1464,6 +1500,7 @@ impl Parser {
                 && !matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == ":" || p == ",")
             {
                 let is_getter = self.is_kw("get");
+                let start = self.start_at(self.pos);
                 self.advance();
                 let (key, computed) = self.parse_property_key()?;
                 let params = self.parse_params()?;
@@ -1477,6 +1514,7 @@ impl Parser {
                     is_generator: false,
                     is_async: false,
                     is_method: true,
+                    span: self.span_from(start),
                 };
                 props.push(Prop::Accessor {
                     key,
@@ -1492,6 +1530,7 @@ impl Parser {
             // Concise-method modifiers: `async` and/or `*` before the key.
             let mut m_async = false;
             let mut m_gen = false;
+            let start = self.start_at(self.pos);
             if self.is_kw("async")
                 && !self.peek_is_member_punct(1)
                 && !self.peek_newline(1)
@@ -1518,6 +1557,7 @@ impl Parser {
                     is_generator: m_gen,
                     is_async: m_async,
                     is_method: true,
+                    span: self.span_from(start),
                 };
                 props.push(Prop::KeyValue {
                     key,
@@ -1591,6 +1631,7 @@ impl Parser {
     /// Try to parse an arrow function starting at the current position. Returns
     /// `None` (without consuming) if the head is not an arrow.
     fn try_parse_arrow(&mut self) -> Result<Option<Expr>, String> {
+        let start = self.start_at(self.pos);
         // `async` prefix on an arrow (`async x => …` / `async (…) => …`), only
         // when `async` is not itself the parameter and no newline intervenes.
         let mut is_async = false;
@@ -1628,6 +1669,7 @@ impl Parser {
                     is_generator: false,
                     is_async,
                     is_method: false,
+                    span: self.span_from(start),
                 }));
             }
         }
@@ -1651,6 +1693,7 @@ impl Parser {
                         is_generator: false,
                         is_async,
                         is_method: false,
+                        span: self.span_from(start),
                     }));
                 }
             }
@@ -1701,8 +1744,19 @@ impl Parser {
 }
 
 /// Parse a template-literal `${...}` field's raw source into an expression.
-fn parse_expr_source(src: &str) -> Result<Expr, String> {
-    let toks = lex(src)?;
+/// `base` is the field's byte offset in the enclosing script, so the spans
+/// recorded inside it index that script; `None` records none.
+fn parse_expr_source(src: &str, base: Option<u32>) -> Result<Expr, String> {
+    let mut toks = lex(src)?;
+    for t in &mut toks {
+        t.start += base.unwrap_or(0);
+        t.end += base.unwrap_or(0);
+        if let Tok::Template { expr_at, .. } = &mut t.tok {
+            for at in expr_at {
+                *at += base.unwrap_or(0);
+            }
+        }
+    }
     let mut p = Parser {
         toks,
         pos: 0,
@@ -1710,6 +1764,7 @@ fn parse_expr_source(src: &str) -> Result<Expr, String> {
         in_async: false,
         no_in: false,
         class_scopes: Vec::new(),
+        spans: base.is_some(),
     };
     let e = p.parse_expr()?;
     Ok(e)

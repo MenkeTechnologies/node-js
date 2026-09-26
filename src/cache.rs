@@ -70,7 +70,11 @@ use std::path::PathBuf;
 ///     v10 blob still carries that sequence, so every cached script would keep
 ///     running its side effects in the wrong order — the exact bug the change
 ///     fixes, replayed from disk.
-const SCHEMA: u64 = 11;
+/// v12: a `FuncDef` carries its source `span`/`script`, and `MKCLASS` takes a
+///     fourth argument naming the FuncDef that holds the class's span. A v11
+///     blob has neither, so every function would print the `[code]` placeholder
+///     from `Function.prototype.toString`.
+const SCHEMA: u64 = 12;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -357,6 +361,7 @@ pub fn load(src: &str) -> Option<Program> {
         functions: cp.functions,
         tries: cp.tries,
         strict: cp.strict,
+        source: Some(src.into()),
     };
     // `Chunk::op_hash` is `#[serde(skip)]` in fusevm — it is a CACHE of the
     // hash of ops+constants, computed by `ChunkBuilder::build`, so every chunk

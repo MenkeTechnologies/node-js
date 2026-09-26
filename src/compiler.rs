@@ -29,6 +29,9 @@ pub struct Program {
     /// and a refused write never threw there even though the compiler had
     /// already emitted the strict ASSIGNMENT opcodes.
     pub strict: bool,
+    /// The text the program was parsed from, which every function's `span`
+    /// indexes. Installed on the host by `load_merged`.
+    pub source: Option<std::sync::Arc<str>>,
 }
 
 /// Rebase every func-id and try-id reference so its ids sit above those already
@@ -57,6 +60,7 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
     for i in 1..chunk.ops.len() {
         let off = match chunk.ops[i] {
             Op::CallBuiltin(id, _) if id == ops::MKFUNC => func_off,
+            Op::CallBuiltin(id, 4) if id == ops::MKCLASS => func_off,
             Op::CallBuiltin(id, 1) if id == ops::TRY => try_off,
             _ => continue,
         };
@@ -348,6 +352,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
         functions: c.functions,
         tries: c.tries,
         strict: c.strict,
+        source: None,
     })
 }
 
@@ -394,6 +399,7 @@ pub fn compile_completion_strict(
         functions: c.functions,
         tries: c.tries,
         strict: c.strict,
+        source: None,
     })
 }
 
@@ -661,9 +667,11 @@ impl Compiler {
                 body,
                 is_generator,
                 is_async,
+                span,
             } = &s.kind
             {
                 let def_id = self.build_function(name, params, body, *is_generator, *is_async)?;
+                self.functions[def_id].1.span = *span;
                 self.emit_mkfunc(b, def_id);
                 // A function declaration in a BLOCK is block-scoped (14.2.x);
                 // only Annex B.3.3's sloppy-mode legacy hoists it to the
@@ -2059,11 +2067,33 @@ impl Compiler {
             is_method: false,
             self_name: false,
             strict: body_strict,
+            span: (0, 0),
+            script: None,
         };
         self.call_sites = saved_sites;
         self.yield_sites = saved_yields;
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
+    }
+
+    /// A FuncDef that only carries `span`: the source of a `class`, which has
+    /// no function of its own when it declares no constructor.
+    fn source_record(&mut self, name: &str, span: Span) -> usize {
+        let def = FuncDef {
+            name: name.to_string(),
+            params: Vec::new(),
+            chunk: ChunkBuilder::new().build(),
+            is_arrow: false,
+            is_generator: false,
+            is_async: false,
+            is_method: true,
+            self_name: false,
+            strict: true,
+            span,
+            script: None,
+        };
+        self.functions.push((name.to_string(), def));
+        self.functions.len() - 1
     }
 
     fn build_arrow(
@@ -2127,7 +2157,12 @@ impl Compiler {
                 b.emit(Op::LoadUndef, 0);
             }
         }
-        b.emit(Op::CallBuiltin(ops::MKCLASS, 3), 0); // -> [class]
+        // The class's source text (`String(C)`) rides on a FuncDef that is
+        // never called, so its span is script-relative like any function's
+        // and its id is rebased with the rest.
+        let record = self.source_record(&cname, node.span);
+        b.emit(Op::LoadInt(record as i64), 0);
+        b.emit(Op::CallBuiltin(ops::MKCLASS, 4), 0); // -> [class]
 
         // 15.7.14 steps 8-17: the class body runs inside its OWN environment,
         // holding one immutable binding for the class name, initialized to the
@@ -2295,6 +2330,7 @@ impl Compiler {
                     // A class method/accessor is a MethodDefinition: not a
                     // constructor, so it owns no `prototype` property.
                     self.functions[def_id].1.is_method = true;
+                    self.functions[def_id].1.span = m.span;
                     self.emit_mkfunc(b, def_id);
                     b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0);
                 }
@@ -2720,6 +2756,7 @@ impl Compiler {
                 is_generator,
                 is_async,
                 is_method,
+                span,
             } => {
                 let def_id = if *is_arrow {
                     self.build_arrow(params, body, *is_async)?
@@ -2739,6 +2776,7 @@ impl Compiler {
                     self.functions[id].1.is_method = *is_method;
                     id
                 };
+                self.functions[def_id].1.span = *span;
                 self.emit_mkfunc(b, def_id);
             }
             Expr::Class(node) => self.compile_class(b, node)?,

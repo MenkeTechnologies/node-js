@@ -28,6 +28,8 @@ pub enum Tok {
         quasis: Vec<String>,
         raws: Vec<String>,
         exprs: Vec<String>,
+        /// Byte offset of each `exprs` entry in the text handed to [`lex`].
+        expr_at: Vec<u32>,
     },
     Ident(String),
     /// An operator or delimiter, e.g. `+`, `===`, `=>`, `(`, `{`, `.`, `?.`.
@@ -41,11 +43,19 @@ pub struct Token {
     pub tok: Tok,
     pub line: u32,
     pub newline_before: bool,
+    /// UTF-8 byte offsets of the token's first character and one past its
+    /// last, in the text handed to [`lex`].
+    pub start: u32,
+    pub end: u32,
 }
 
 struct Lexer {
     src: Vec<char>,
     pos: usize,
+    /// Byte offset of each char index (`src.len() + 1` entries).
+    byte_at: Vec<u32>,
+    /// Char index where the token being scanned began.
+    tok_start: usize,
     line: u32,
     out: Vec<Token>,
     pending_newline: bool,
@@ -63,9 +73,13 @@ const OPS2: &[&str] = &[
 
 /// Tokenize `src` into a token stream ending in `Eof`.
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+    let mut byte_at: Vec<u32> = src.char_indices().map(|(b, _)| b as u32).collect();
+    byte_at.push(src.len() as u32);
     let mut lx = Lexer {
         src: src.chars().collect(),
         pos: 0,
+        byte_at,
+        tok_start: 0,
         line: 1,
         out: Vec::new(),
         pending_newline: false,
@@ -96,6 +110,8 @@ impl Lexer {
             tok,
             line: self.line,
             newline_before: self.pending_newline,
+            start: self.byte_at[self.tok_start.min(self.pos)],
+            end: self.byte_at[self.pos],
         });
         self.pending_newline = false;
     }
@@ -148,10 +164,17 @@ impl Lexer {
                 }
                 // A `/` in expression-start position is a regex literal, not the
                 // division operator (comments were already ruled out above).
-                Some('/') if self.regex_allowed() => self.scan_regex()?,
-                Some(_) => self.scan_token()?,
+                Some('/') if self.regex_allowed() => {
+                    self.tok_start = self.pos;
+                    self.scan_regex()?
+                }
+                Some(_) => {
+                    self.tok_start = self.pos;
+                    self.scan_token()?
+                }
             }
         }
+        self.tok_start = self.pos;
         self.push(Tok::Eof);
         Ok(())
     }
@@ -344,6 +367,7 @@ impl Lexer {
         let mut quasis = Vec::new();
         let mut raws = Vec::new();
         let mut exprs = Vec::new();
+        let mut expr_at = Vec::new();
         let mut cur = String::new();
         let mut cur_raw = String::new();
         loop {
@@ -377,6 +401,7 @@ impl Lexer {
                     raws.push(std::mem::take(&mut cur_raw));
                     // Capture raw source until the matching `}` (brace-balanced,
                     // skipping strings).
+                    expr_at.push(self.byte_at[self.pos]);
                     let mut depth = 1;
                     let mut src = String::new();
                     loop {
@@ -437,6 +462,7 @@ impl Lexer {
             quasis,
             raws,
             exprs,
+            expr_at,
         });
         Ok(())
     }
