@@ -8730,7 +8730,13 @@ fn circular_json_message(path: &JsonPath, start: usize, closing: &str) -> String
             },
         })
     };
-    let line = |i: usize| format!("\n    |     {} -> object with constructor '{}'", path[i].0, ctor(&path[i].1));
+    let line = |i: usize| {
+        format!(
+            "\n    |     {} -> object with constructor '{}'",
+            path[i].0,
+            ctor(&path[i].1)
+        )
+    };
     let mut msg = format!(
         "Converting circular structure to JSON\n    --> starting at object with constructor '{}'",
         ctor(&path[start].1)

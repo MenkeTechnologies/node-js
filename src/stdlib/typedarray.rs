@@ -736,8 +736,17 @@ pub fn buffer_slice(ab: &Value, args: &[Value]) -> Value {
 fn build_elems(kind: &str, args: &[Value]) -> Result<Vec<Value>, String> {
     match args.first() {
         None | Some(Value::Undef) => Ok(Vec::new()),
-        Some(Value::Int(_)) | Some(Value::Float(_)) => {
-            let n = super::arg_num(args, 0).max(0.0) as usize;
+        // A non-Object first argument is a LENGTH (23.2.5.1 step 6), taken
+        // through ToIndex: `new Uint8Array('2')` is two zeros and a negative
+        // or unsafe length is a RangeError, not an empty array.
+        Some(v) if is_primitive(v) => {
+            let n_raw = super::arg_num(args, 0);
+            let n = to_index(n_raw).ok_or_else(|| {
+                crate::host::range_error(&format!(
+                    "Invalid typed array length: {}",
+                    fmt_number(n_raw)
+                ))
+            })?;
             Ok(vec![zero_of(kind); n])
         }
         Some(v) => {
@@ -966,10 +975,13 @@ fn from(kind: &str, args: &[Value]) -> Result<Value, String> {
         .get(1)
         .cloned()
         .filter(|f| with_host(|h| crate::host::is_callable(h, f)));
+    // A source that is not iterable is read as an array-like (23.2.2.1
+    // step 7): `Int8Array.from({length: 3, 1: 5})` is `[0, 5, 0]`.
     let items = if let Some(e) = elems_of(&src) {
         e.into_iter().map(Value::Float).collect()
     } else {
-        crate::host::iter_all(&src).unwrap_or_default()
+        crate::host::iter_all(&src)
+            .unwrap_or_else(|_| crate::builtins::array_like_items(&src))
     };
     let mut out = Vec::with_capacity(items.len());
     for (i, it) in items.into_iter().enumerate() {
@@ -1974,9 +1986,17 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let arg = args.first().cloned().unwrap_or(Value::Undef);
             let src = match super::native_tag(&arg).as_deref() {
                 Some("TypedArray") | Some("Buffer") => elem_values(&arg),
-                _ => crate::host::iter_all(&arg).unwrap_or_default(),
+                _ => crate::host::iter_all(&arg)
+                    .unwrap_or_else(|_| crate::builtins::array_like_items(&arg)),
             };
-            let off = super::arg_num(args, 1).max(0.0) as usize;
+            // 23.2.3.26: a negative offset, or a source that runs past the
+            // end, is a RangeError. Neither may write a partial prefix.
+            let off = super::arg_num(args, 1);
+            let off = if off.is_nan() { 0.0 } else { off.trunc() };
+            if off < 0.0 || off + src.len() as f64 > view_len(recv) as f64 {
+                return Err(crate::host::range_error("offset is out of bounds"));
+            }
+            let off = off as usize;
             // Coerced outside the host borrow: a 64-bit element allocates.
             let src: Vec<Value> = src
                 .iter()

@@ -6696,3 +6696,24 @@ RangeError: Invalid DataView length 2
 RangeError: Start offset -1 is outside the bounds of the buffer"
     );
 }
+
+#[test]
+fn typed_array_set_and_from_take_array_likes_and_bound_the_offset() {
+    let src = r#"
+        function t(f) { try { console.log(f()) } catch (e) { console.log(e.name + ': ' + e.message) } }
+        t(() => { const a = new Uint8Array(4); a.set({ length: 2, 0: 7, 1: 8 }, 1); return a });
+        t(() => new Uint8Array(4).set([1], -1));
+        t(() => { const a = new Uint8Array(4); try { a.set([9, 9, 9], 2) } catch {} return a });
+        t(() => { const a = new Uint8Array(4); a.set([1, 2], 2.7); return a });
+        t(() => Int8Array.from({ length: 3, 1: 5 })); t(() => Uint8Array.from({ length: 2 }, (_, i) => i * 3));
+    "#;
+    assert_eq!(
+        run(src),
+        "Uint8Array(4) [ 0, 7, 8, 0 ]
+RangeError: offset is out of bounds
+Uint8Array(4) [ 0, 0, 0, 0 ]
+Uint8Array(4) [ 0, 0, 1, 2 ]
+Int8Array(3) [ 0, 5, 0 ]
+Uint8Array(2) [ 0, 3 ]"
+    );
+}
