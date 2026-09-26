@@ -1779,6 +1779,26 @@ in `name_registry.rs` and `opcode_ids.rs` already carried that floor
 could not go vacuous; `embed.rs`, `timers.rs` and `es_parity.rs` have no
 conditional assertion paths at all.
 
+## FIXED in round 8 — verified against node v26.10.0
+
+Each is pinned by a test in `tests/es_parity.rs`.
+
+| was | now |
+| --- | --- |
+| `this` before `super()`, a second `super()`, or no `super()` in a derived constructor ran silently | node's `ReferenceError`s, and `TypeError` for a primitive return |
+| the class body's binding of the class name was assignable | `TypeError: Assignment to constant variable.` |
+| `Number.prototype.valueOf()` aborted on a stack overflow; `Number/String/Boolean/BigInt.prototype` methods took any receiver | `<Ctor>.prototype.<m> requires that 'this' be a <Ctor>` |
+| `pf.call()`, `apply`, `bind`, `toString` on a callable Proxy aborted on a stack overflow | run against the proxy's `apply` trap |
+| `Buffer.alloc(-1)` / `('x')` returned an empty buffer; `Buffer.alloc(2**53)` aborted | `ERR_OUT_OF_RANGE` / `ERR_INVALID_ARG_TYPE` |
+| `path.*` coerced any argument | `ERR_INVALID_ARG_TYPE` naming node's parameter; a function is reported as `function <name>` |
+| `url.resolve` was RFC 3986 resolution | a port of `Url.prototype.resolveObject` (988-pair cross product identical) |
+| RegExp `\0`, octal, `\cX`, a reference to an unset group, `(?i)` | see "Regular expressions" below |
+
+Several rows of the two tables below were already closed by earlier rounds
+(`DataView`, `arguments.callee`, frozen template objects, strict-mode `const`
+and frozen writes, array holes, the `arguments` brand, `normalize`) and were
+removed after being re-run against node v26.10.0.
+
 ## Still open — found in round 7
 
 | gap | node v26.7.0 | node-js |
@@ -1789,12 +1809,7 @@ conditional assertion paths at all.
 | `async function f(){ return f() }; f()` | `RangeError: Maximum call stack size exceeded` | hangs — each call starts a coroutine and returns a promise, so the recursion is an unbounded MICROTASK chain rather than stack growth, and the stack guard never sees it |
 | `new g()` where `g` is a `function*` | message names the callee's SOURCE TEXT (`o.m is not a constructor`) | names it by function NAME (`m is not a constructor`) — the class, `.name` and catchability all match; node-js keeps no spans |
 | `new URL('/x')` error own properties | `["code","input","message","stack"]` | `["code","message","stack"]` — no `input` |
-| `class B extends A { constructor(){ this.x = 1 } }` | `ReferenceError: Must call super constructor in derived class before accessing 'this' …` | no error — `this` is bound before `super()` |
-| `'use strict'; const c = 1; c = 2` | `TypeError: Assignment to constant variable.` | assignment succeeds |
-| `structuredClone(function(){})` | `DOMException` / `DataCloneError`, `code: 25` | no error |
-| `Number.prototype.toFixed.call({})` | `TypeError: Number.prototype.toFixed requires that 'this' be a Number` | `TypeError: toFixed is not a function` — right class, wrong message |
-| `String.prototype.at.call(null)` | `TypeError: String.prototype.at called on null or undefined` | `TypeError: at is not a function` |
-| `const {a} = null` | `TypeError: Cannot destructure property 'a' of 'null' as it is null.` | `TypeError: Cannot read properties of null (reading 'a')` |
+| `structuredClone(function(){})` message | `function(){} could not be cloned.` (the source text) | `function () { [code] } could not be cloned.` — the class, `name` and `code: 25` match; node-js keeps no function source text |
 | `eval('await 1')` | `SyntaxError: await is only valid in async functions …` | `SyntaxError: expected ';' but found Num(1.0) (line 1)` |
 
 ## Still open — found by the round-5 doc audit, not yet fixed
@@ -1804,52 +1819,16 @@ is claimed fixed anywhere in this file.
 
 | gap | node v26.7.0 | node-js |
 | --- | --- | --- |
-| `DataView` | `function` | `undefined` — the constructor does not exist |
-| `arguments.callee` | the running function | `undefined` |
-| a tagged template's object and its `raw` | frozen, elements non-writable | mutable, elements writable (the DESCRIPTOR triple is already correct) |
-| a class body's own binding for the class name | immutable — `class E { static z = (E = 1) }` throws | assignment succeeds |
-| `Buffer.alloc(-1)`, `Buffer.alloc('x')`, `path.join(1)` | throw a coded error | do not throw (the fixed-width `buf.readXxx` reads DO throw as of round 6) |
 | `Buffer.alloc(2**40)` | returns promptly (the allocation is lazy) | hangs — killed at 8s, materialising a 1 TiB byte vector |
-| `url.resolve` with an uppercase scheme, an empty port, or a Unicode host | lowercases / strips / punycodes | leaves the input as-is |
-| `Object.getPrototypeOf(class B extends A {})` | `A` | not `A` (static-method LOOKUP still works) |
 
 ## Partial / simplified semantics (runs, but not byte-identical to node in edge
 cases the fuzzer is scoped away from)
-
-- **Array holes.** A node-js array is a dense `Vec<Value>`, so an elision or a
-  `delete` leaves `undefined` where V8 leaves a HOLE. Everything that
-  distinguishes the two therefore differs: `[1,,3].forEach` runs 3 times
-  (Node: 2), `1 in [1,,3]` is `true` (Node: `false`), and `console.log([1,,3])`
-  prints `[ 1, undefined, 3 ]` (Node: `[ 1, <1 empty item> ]`-style). `a[3]=1`
-  on an empty array materialises three `undefined`s rather than three holes.
-  Representing holes needs a sentinel through every array path (length, index
-  read/write, every iteration method, `inspect`), which is an array-model change
-  rather than an addition, so it is listed rather than half-done.
-
-- **The `arguments` object is a real Array.** `Array.isArray(arguments)` is
-  `true` and `Object.prototype.toString.call(arguments)` is `[object Array]`
-  (Node: `false` / `[object Arguments]`). Those two reads are the whole
-  divergence: `.length`, indexing, `Array.prototype.slice.call(arguments)`,
-  spread, `for…of`, and an arrow's lexical capture of the enclosing function's
-  `arguments` all match, because an Array answers all of it. A real Arguments
-  exotic needs its own `ObjKind` and a `[[ParameterMap]]`.
 
 - **The ENTRY script is not wrapped in the CommonJS wrapper.** A `require`d
   module is (`module.rs:315`), and there `__filename`/`__dirname`/`module`/
   `exports`/`arguments` all match Node down to `arguments.length === 5`. In the
   file passed on the command line they are `undefined`, and top-level
   `arguments` is a `ReferenceError`. Node runs both through the same wrapper.
-
-- **`String.prototype.normalize` is the identity.** `'é'.normalize('NFC')`
-  returns the input unchanged, so a decomposed string keeps its length (2, not
-  1). Real NFC/NFD/NFKC/NFKD needs Unicode normalization tables, which node-js
-  does not vendor.
-
-- **Strict mode is not tracked, so a frozen write never throws.** `'use strict';
-  Object.freeze(o); o.a = 2` silently does nothing here; Node throws
-  `TypeError: Cannot assign to read only property`. The sloppy-mode outcome (the
-  write is ignored, `delete` reports `false`) is correct and is what the `freeze`
-  fuzzer mode pins.
 
 - **`util.inspect` does not see a `Symbol.toStringTag` GETTER.** An inherited
   DATA property renders as the `Ctor [Tag] ` prefix, but
