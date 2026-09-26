@@ -565,18 +565,18 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "urlToHttpOptions" => Ok(url_to_http_options(
             &args.first().cloned().unwrap_or(Value::Undef),
         )),
-        // Legacy `url.resolve(from, to)` — RFC 3986 §5 reference resolution.
-        "resolve" => {
-            let from = arg_str(args, 0);
-            let to = arg_str(args, 1);
-            Ok(with_host(|h| h.new_str(legacy_resolve(&from, &to))))
-        }
-        // Legacy `url.resolveObject(from, to)` — the resolved URL as a parsed object.
+        // Legacy `url.resolve(from, to)` — `urlParse(from, false, true)
+        // .resolve(to)`: both sides parsed with `slashesDenoteHost`, resolved by
+        // the `Url.prototype.resolveObject` port, then formatted.
+        "resolve" => legacy_resolve_object(args)
+            .map(|u| with_host(|h| h.new_str(u.href.unwrap_or_default()))),
+        // Legacy `url.resolveObject(from, to)` — the same resolution, returned
+        // as the parsed object. An empty `from` hands `to` back untouched.
         "resolveObject" => {
-            let from = arg_str(args, 0);
-            let to = arg_str(args, 1);
-            let resolved = legacy_resolve(&from, &to);
-            super::url_legacy::parse(&resolved, false, false).map(|u| super::url_legacy::to_js(&u))
+            if !args.first().is_some_and(|v| with_host(|h| h.truthy(v))) {
+                return Some(Ok(args.get(1).cloned().unwrap_or(Value::Undef)));
+            }
+            legacy_resolve_object(args).map(|u| super::url_legacy::to_js(&u))
         }
         _ => return None,
     })
@@ -586,12 +586,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// Emits the one-shot `DEP0169` deprecation warning, exactly as Node's
 /// `urlParse` does, then delegates to the `Url.prototype.parse` port.
 fn legacy_parse(args: &[Value]) -> Result<super::url_legacy::Url, String> {
-    super::process::emit_deprecation_warning(
-        "DEP0169",
-        "`url.parse()` behavior is not standardized and prone to errors that \
-         have security implications. Use the WHATWG URL API instead. CVEs are \
-         not issued for `url.parse()` vulnerabilities.",
-    );
+    emit_url_parse_deprecation();
     let input = arg_str(args, 0);
     let truthy = |i: usize| {
         args.get(i)
@@ -599,6 +594,26 @@ fn legacy_parse(args: &[Value]) -> Result<super::url_legacy::Url, String> {
             .unwrap_or(false)
     };
     super::url_legacy::parse(&input, truthy(1), truthy(2))
+}
+
+/// `urlParse`'s one-time `DEP0169`, shared by `parse`, `resolve` and
+/// `resolveObject` — all three go through `urlParse` in node.
+fn emit_url_parse_deprecation() {
+    super::process::emit_deprecation_warning(
+        "DEP0169",
+        "`url.parse()` behavior is not standardized and prone to errors that \
+         have security implications. Use the WHATWG URL API instead. CVEs are \
+         not issued for `url.parse()` vulnerabilities.",
+    );
+}
+
+/// `urlParse(args[0], false, true).resolveObject(args[1])`, emitting the
+/// one-shot `DEP0169` that `urlParse` raises.
+fn legacy_resolve_object(args: &[Value]) -> Result<super::url_legacy::Url, String> {
+    emit_url_parse_deprecation();
+    let source = super::url_legacy::parse(&arg_str(args, 0), false, true)?;
+    let relative = super::url_legacy::parse(&arg_str(args, 1), false, true)?;
+    Ok(super::url_legacy::resolve_object(&source, relative))
 }
 
 /// `URL` instance methods (component reads are plain data properties).
@@ -789,189 +804,6 @@ fn encode_path_component(s: &str) -> String {
         }
     }
     out
-}
-
-// ── legacy url.resolve — RFC 3986 §5 reference resolution ─────────────────────
-
-/// A URI split into its five RFC-3986 components.
-struct UriRef {
-    scheme: Option<String>,
-    authority: Option<String>,
-    path: String,
-    query: Option<String>,
-    fragment: Option<String>,
-}
-
-/// Split a URI reference into its components (RFC 3986 Appendix B), by hand.
-fn split_uri(input: &str) -> UriRef {
-    let mut rest = input;
-    // scheme: leading ALPHA *(ALPHA/DIGIT/+/-/.) then ':' — but only if that ':'
-    // precedes the first '/', '?' or '#'.
-    let mut scheme = None;
-    if let Some(colon) = rest.find(':') {
-        let cand = &rest[..colon];
-        let scheme_ok = !cand.is_empty()
-            && cand.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-            && cand
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-            && cand.find(['/', '?', '#']).is_none();
-        if scheme_ok {
-            scheme = Some(cand.to_string());
-            rest = &rest[colon + 1..];
-        }
-    }
-    let mut fragment = None;
-    if let Some(h) = rest.find('#') {
-        fragment = Some(rest[h + 1..].to_string());
-        rest = &rest[..h];
-    }
-    let mut query = None;
-    if let Some(q) = rest.find('?') {
-        query = Some(rest[q + 1..].to_string());
-        rest = &rest[..q];
-    }
-    let mut authority = None;
-    if let Some(r) = rest.strip_prefix("//") {
-        let end = r.find('/').unwrap_or(r.len());
-        authority = Some(r[..end].to_string());
-        rest = &r[end..];
-    }
-    UriRef {
-        scheme,
-        authority,
-        path: rest.to_string(),
-        query,
-        fragment,
-    }
-}
-
-/// Merge a relative path onto a base (RFC 3986 §5.2.3).
-fn merge_paths(base: &UriRef, ref_path: &str) -> String {
-    if base.authority.is_some() && base.path.is_empty() {
-        format!("/{ref_path}")
-    } else {
-        match base.path.rfind('/') {
-            Some(i) => format!("{}{ref_path}", &base.path[..=i]),
-            None => ref_path.to_string(),
-        }
-    }
-}
-
-/// Drop the last path segment of `output` (used by `..` handling).
-fn remove_last_segment(output: &mut String) {
-    match output.rfind('/') {
-        Some(pos) => output.truncate(pos),
-        None => output.clear(),
-    }
-}
-
-/// Remove `.`/`..` dot-segments from a path (RFC 3986 §5.2.4).
-fn remove_dot_segments(path: &str) -> String {
-    let mut input = path.to_string();
-    let mut output = String::new();
-    while !input.is_empty() {
-        if let Some(r) = input.strip_prefix("../") {
-            input = r.to_string();
-        } else if let Some(r) = input.strip_prefix("./") {
-            input = r.to_string();
-        } else if let Some(r) = input.strip_prefix("/./") {
-            input = format!("/{r}");
-        } else if input == "/." {
-            input = "/".to_string();
-        } else if let Some(r) = input.strip_prefix("/../") {
-            input = format!("/{r}");
-            remove_last_segment(&mut output);
-        } else if input == "/.." {
-            input = "/".to_string();
-            remove_last_segment(&mut output);
-        } else if input == "." || input == ".." {
-            input.clear();
-        } else {
-            let start = usize::from(input.starts_with('/'));
-            let end = input[start..]
-                .find('/')
-                .map(|i| start + i)
-                .unwrap_or(input.len());
-            output.push_str(&input[..end]);
-            input.drain(..end);
-        }
-    }
-    output
-}
-
-/// RFC 3986 §5.2.2 transform-references: resolve `r` against `base`.
-fn resolve_ref(base: &UriRef, r: &UriRef) -> UriRef {
-    if r.scheme.is_some() {
-        return UriRef {
-            scheme: r.scheme.clone(),
-            authority: r.authority.clone(),
-            path: remove_dot_segments(&r.path),
-            query: r.query.clone(),
-            fragment: r.fragment.clone(),
-        };
-    }
-    let (authority, path, query) = if r.authority.is_some() {
-        (
-            r.authority.clone(),
-            remove_dot_segments(&r.path),
-            r.query.clone(),
-        )
-    } else if r.path.is_empty() {
-        let q = if r.query.is_some() {
-            r.query.clone()
-        } else {
-            base.query.clone()
-        };
-        (base.authority.clone(), base.path.clone(), q)
-    } else if r.path.starts_with('/') {
-        (
-            base.authority.clone(),
-            remove_dot_segments(&r.path),
-            r.query.clone(),
-        )
-    } else {
-        (
-            base.authority.clone(),
-            remove_dot_segments(&merge_paths(base, &r.path)),
-            r.query.clone(),
-        )
-    };
-    UriRef {
-        scheme: base.scheme.clone(),
-        authority,
-        path,
-        query,
-        fragment: r.fragment.clone(),
-    }
-}
-
-/// Recompose a URI from its components (RFC 3986 §5.3).
-fn recompose(u: &UriRef) -> String {
-    let mut s = String::new();
-    if let Some(sc) = &u.scheme {
-        s.push_str(sc);
-        s.push(':');
-    }
-    if let Some(a) = &u.authority {
-        s.push_str("//");
-        s.push_str(a);
-    }
-    s.push_str(&u.path);
-    if let Some(q) = &u.query {
-        s.push('?');
-        s.push_str(q);
-    }
-    if let Some(f) = &u.fragment {
-        s.push('#');
-        s.push_str(f);
-    }
-    s
-}
-
-/// Legacy `url.resolve(from, to)` — RFC 3986 reference resolution end-to-end.
-fn legacy_resolve(from: &str, to: &str) -> String {
-    recompose(&resolve_ref(&split_uri(from), &split_uri(to)))
 }
 
 // ── URLSearchParams ──────────────────────────────────────────────────────────

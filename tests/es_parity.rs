@@ -379,6 +379,31 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn legacy_url_resolve_follows_url_resolve_object() {
+    // url.resolve is urlParse(from).resolveObject(to).format(), not RFC 3986:
+    // the scheme and host come out lowercased and punycoded, an empty port
+    // disappears, and a non-slashed protocol keeps its auth-in-host quirks.
+    let src = r#"
+        const url = require("url");
+        for (const [b, r] of [["HTTP://a.com/b", "c"], ["http://a.com:/b", "c"], ["http://ünï.com/b", "c"],
+                              ["HTTP://A.COM/b", "../x"], ["http://a.com/b", "HTTPS://B.com/c"],
+                              ["mailto:local1@domain1", "local2@domain2"], ["mailto:a@b.com", "?subject=x"],
+                              ["http://a/b/c/d;p?q", "../../../g"], ["foo/bar", "../../g"], ["http://a/b", "http:g"],
+                              ["file:///a/b", "//h/x"], ["http://a/b#h", ""]])
+            console.log(url.resolve(b, r));
+        const o = url.resolveObject("http://u@a.com/b?q#h", "//v@c.org/d");
+        console.log(o.host, o.auth, o.pathname, o.hash, o.href);
+        console.log(url.resolveObject("", "rel"));
+    "#;
+    assert_eq!(
+        run(src),
+        "http://a.com/c\nhttp://a.com/c\nhttp://xn--n-nga1b.com/c\nhttp://a.com/x\nhttps://b.com/c\n\
+         mailto:local2@domain2\nmailto:a@b.com?subject=x\nhttp://a/g\n../g\nhttp://a/g\nfile://h/x\n\
+         http://a/b\nc.org v /d null http://v@c.org/d\nrel"
+    );
+}
+
+#[test]
 fn class_body_binding_of_the_class_name_is_immutable() {
     // The class body's own binding (15.7.14 step 8) is immutable — from a static
     // initializer, a method, a class expression's inner name, `++`, `+=` and a

@@ -101,7 +101,7 @@ fn is_trim_ws(c: char) -> bool {
 
 /// The parsed legacy URL. Every field is `Option`, mirroring the `null`-initialized
 /// `Url` instance; `slashes` is a tri-state (`None` = `null`).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Url {
     pub protocol: Option<String>,
     pub slashes: Option<bool>,
@@ -794,4 +794,325 @@ pub fn format_value(v: &Value) -> Result<Value, String> {
     let (u, qs) = from_js(v);
     let out = format_url(&u, qs.as_deref());
     Ok(with_host(|h| h.new_str(out)))
+}
+
+// ── Url.prototype.resolveObject ──────────────────────────────────────────────
+
+/// A non-empty `Some` — the JS truthiness of a `string | null` field.
+fn truthy(s: &Option<String>) -> bool {
+    s.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// `pathname.split('/')`, or `[]` for a null/empty pathname.
+fn split_path(pathname: &Option<String>) -> Vec<String> {
+    match pathname.as_deref() {
+        Some(p) if !p.is_empty() => p.split('/').map(str::to_string).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The occasional `user@host` that lands wholly in `host` for a non-slashed
+/// protocol (`url.resolveObject('mailto:local1@domain1', 'local2@domain2')`):
+/// split it back into `auth` and `host`/`hostname`.
+fn split_auth_in_host(result: &mut Url) {
+    let Some(host) = result.host.clone() else {
+        return;
+    };
+    if host.find('@').is_some_and(|i| i > 0) {
+        let mut parts = host.split('@');
+        result.auth = parts.next().map(str::to_string);
+        let rest = parts.next().map(str::to_string);
+        result.host = rest.clone();
+        result.hostname = rest;
+    }
+}
+
+/// `result.path = (pathname || '') + (search || '')` when either is non-null —
+/// the "to support http.request" step that closes several branches.
+fn set_request_path(result: &mut Url) {
+    if result.pathname.is_some() || result.search.is_some() {
+        result.path = Some(format!(
+            "{}{}",
+            result.pathname.clone().unwrap_or_default(),
+            result.search.clone().unwrap_or_default()
+        ));
+    }
+}
+
+/// Finish a branch: `result.href = result.format()`.
+fn with_href(mut result: Url) -> Url {
+    result.href = Some(format_url(&result, None));
+    result
+}
+
+/// Port of `Url.prototype.resolveObject` (lib/url.js): resolve `relative`
+/// (already parsed with `slashesDenoteHost`) against `source`.
+///
+/// This is NOT RFC 3986 resolution and was never meant to be: it carries the
+/// parsed fields across, so the scheme and host come out lowercased and
+/// punycoded by `parse`, an empty port disappears, and a non-slashed protocol
+/// (`mailto:`) lets `..` crawl into the host. Each quirk below is node's.
+pub fn resolve_object(source: &Url, mut relative: Url) -> Url {
+    let mut result = source.clone();
+    // Hash is always overridden, no matter what; even href="" removes it.
+    result.hash = relative.hash.clone();
+    if relative.href.as_deref() == Some("") {
+        return with_href(result);
+    }
+
+    // Hrefs like //foo/bar always cut to the protocol.
+    if relative.slashes == Some(true) && !truthy(&relative.protocol) {
+        let protocol = result.protocol.take();
+        result = Url {
+            protocol,
+            ..relative
+        };
+        if result.protocol.as_deref().is_some_and(is_slashed_protocol)
+            && truthy(&result.hostname)
+            && !truthy(&result.pathname)
+        {
+            result.pathname = Some("/".into());
+            result.path = Some("/".into());
+        }
+        return with_href(result);
+    }
+
+    if truthy(&relative.protocol) && relative.protocol != result.protocol {
+        let rel_proto = relative.protocol.clone().unwrap_or_default();
+        // Changing to a protocol that is not a known slashed one: take the
+        // relative URL wholesale.
+        if !is_slashed_protocol(&rel_proto) {
+            return with_href(relative);
+        }
+        result.protocol = relative.protocol.clone();
+        if !truthy(&relative.host)
+            && rel_proto != "file"
+            && rel_proto != "file:"
+            && !is_hostless_protocol(&rel_proto)
+        {
+            // The first non-empty path segment becomes the host.
+            let mut rel_path = relative
+                .pathname
+                .clone()
+                .unwrap_or_default()
+                .split('/')
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            while !rel_path.is_empty() {
+                let seg = rel_path.remove(0);
+                let found = !seg.is_empty();
+                relative.host = Some(seg);
+                if found {
+                    break;
+                }
+            }
+            if !truthy(&relative.host) {
+                relative.host = Some(String::new());
+            }
+            if !truthy(&relative.hostname) {
+                relative.hostname = Some(String::new());
+            }
+            if rel_path.first().map(String::as_str) != Some("") {
+                rel_path.insert(0, String::new());
+            }
+            if rel_path.len() < 2 {
+                rel_path.insert(0, String::new());
+            }
+            result.pathname = Some(rel_path.join("/"));
+        } else {
+            result.pathname = relative.pathname.clone();
+        }
+        result.search = relative.search.clone();
+        result.query = relative.query.clone();
+        result.host = Some(relative.host.clone().unwrap_or_default());
+        result.auth = relative.auth.clone();
+        result.hostname = if truthy(&relative.hostname) {
+            relative.hostname.clone()
+        } else {
+            relative.host.clone()
+        };
+        result.port = relative.port.clone();
+        if truthy(&result.pathname) || truthy(&result.search) {
+            result.path = Some(format!(
+                "{}{}",
+                result.pathname.clone().unwrap_or_default(),
+                result.search.clone().unwrap_or_default()
+            ));
+        }
+        if result.slashes != Some(true) {
+            result.slashes = relative.slashes;
+        }
+        return with_href(result);
+    }
+
+    let is_source_abs = result
+        .pathname
+        .as_deref()
+        .is_some_and(|p| p.starts_with('/'));
+    let is_rel_abs = truthy(&relative.host)
+        || relative
+            .pathname
+            .as_deref()
+            .is_some_and(|p| p.starts_with('/'));
+    let mut must_end_abs =
+        is_rel_abs || is_source_abs || (truthy(&result.host) && truthy(&relative.pathname));
+    let remove_all_dots = must_end_abs;
+    let mut src_path = split_path(&result.pathname);
+    let mut rel_path = split_path(&relative.pathname);
+    let no_leading_slashes = result
+        .protocol
+        .as_deref()
+        .is_some_and(|p| !p.is_empty() && !is_slashed_protocol(p));
+
+    // A non-slashed URL lets `../..` crawl up into the host, so the host is
+    // folded into the path here and split back out at the end.
+    if no_leading_slashes {
+        result.hostname = Some(String::new());
+        result.port = None;
+        if let Some(host) = result.host.clone().filter(|h| !h.is_empty()) {
+            if src_path.first().map(String::as_str) == Some("") {
+                src_path[0] = host;
+            } else {
+                src_path.insert(0, host);
+            }
+        }
+        result.host = Some(String::new());
+        if truthy(&relative.protocol) {
+            relative.hostname = None;
+            relative.port = None;
+            result.auth = None;
+            if let Some(host) = relative.host.clone().filter(|h| !h.is_empty()) {
+                if rel_path.first().map(String::as_str) == Some("") {
+                    rel_path[0] = host;
+                } else {
+                    rel_path.insert(0, host);
+                }
+            }
+            relative.host = None;
+        }
+        must_end_abs = must_end_abs
+            && (rel_path.first().map(String::as_str) == Some("")
+                || src_path.first().map(String::as_str) == Some(""));
+    }
+
+    if is_rel_abs {
+        if relative.host.is_some() {
+            if result.host != relative.host {
+                result.auth = None;
+            }
+            result.host = relative.host.clone();
+            result.port = relative.port.clone();
+        }
+        if relative.hostname.is_some() {
+            if result.hostname != relative.hostname {
+                result.auth = None;
+            }
+            result.hostname = relative.hostname.clone();
+        }
+        result.search = relative.search.clone();
+        result.query = relative.query.clone();
+        src_path = rel_path;
+    } else if !rel_path.is_empty() {
+        // Relative: throw away the existing file, take the new path instead.
+        src_path.pop();
+        src_path.extend(rel_path);
+        result.search = relative.search.clone();
+        result.query = relative.query.clone();
+    } else if relative.search.is_some() {
+        // Just pull out the search, like href='?foo'.
+        if no_leading_slashes {
+            let host = (!src_path.is_empty()).then(|| src_path.remove(0));
+            result.host = host.clone();
+            result.hostname = host;
+            split_auth_in_host(&mut result);
+        }
+        result.search = relative.search.clone();
+        result.query = relative.query.clone();
+        set_request_path(&mut result);
+        return with_href(result);
+    }
+
+    if src_path.is_empty() {
+        // No path at all; everything else was handled above.
+        result.pathname = None;
+        result.path = result
+            .search
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("/{s}"));
+        return with_href(result);
+    }
+
+    // A URL ending in `.` or `..` gets a trailing slash; anything else
+    // non-slashy must not.
+    let last = src_path.last().cloned().unwrap_or_default();
+    let has_trailing_slash =
+        ((truthy(&result.host) || truthy(&relative.host) || src_path.len() > 1)
+            && (last == "." || last == ".."))
+            || last.is_empty();
+
+    // Strip single dots, resolve double dots; `up` counts climbs past the root.
+    let mut up = 0usize;
+    let mut i = src_path.len();
+    while i > 0 {
+        i -= 1;
+        if src_path[i] == "." {
+            src_path.remove(i);
+        } else if src_path[i] == ".." {
+            src_path.remove(i);
+            up += 1;
+        } else if up > 0 {
+            src_path.remove(i);
+            up -= 1;
+        }
+    }
+    if !must_end_abs && !remove_all_dots {
+        for _ in 0..up {
+            src_path.insert(0, "..".into());
+        }
+    }
+
+    let first_is_rooted = |p: &[String]| {
+        p.first()
+            .is_some_and(|s| s.is_empty() || s.starts_with('/'))
+    };
+    if must_end_abs && !first_is_rooted(&src_path) {
+        src_path.insert(0, String::new());
+    }
+    if has_trailing_slash && !src_path.join("/").ends_with('/') {
+        src_path.push(String::new());
+    }
+    let is_absolute = first_is_rooted(&src_path);
+
+    // Put the host back.
+    if no_leading_slashes {
+        let host = if is_absolute || src_path.is_empty() {
+            String::new()
+        } else {
+            src_path.remove(0)
+        };
+        result.host = Some(host.clone());
+        result.hostname = Some(host);
+        split_auth_in_host(&mut result);
+    }
+
+    must_end_abs = must_end_abs || (truthy(&result.host) && !src_path.is_empty());
+    if must_end_abs && !is_absolute {
+        src_path.insert(0, String::new());
+    }
+
+    if src_path.is_empty() {
+        result.pathname = None;
+        result.path = None;
+    } else {
+        result.pathname = Some(src_path.join("/"));
+    }
+    set_request_path(&mut result);
+    if truthy(&relative.auth) {
+        result.auth = relative.auth.clone();
+    }
+    if result.slashes != Some(true) {
+        result.slashes = relative.slashes;
+    }
+    with_href(result)
 }
