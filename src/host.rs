@@ -683,6 +683,11 @@ pub enum MapKey {
     Str(String),
     /// Heap identity (objects, arrays, functions, symbols).
     Ref(u32),
+    /// A builtin intrinsic, by the name it answers to. Every bare reference
+    /// to `Math` or `parseInt` allocates a fresh handle, so heap identity
+    /// would make `new Set([Math, Math])` two entries; `strict_eq` compares
+    /// these by name too.
+    Intrinsic(String),
 }
 
 // ── environments ─────────────────────────────────────────────────────────────
@@ -5095,7 +5100,7 @@ impl JsHost {
                 if let (Some(JsObj::Builtin(x)), Some(JsObj::Builtin(y))) =
                     (self.get(a), self.get(b))
                 {
-                    return x == y;
+                    return builtin_identity(x) == builtin_identity(y);
                 }
                 // Reference identity for arrays/objects/functions.
                 matches!((a, b), (Value::Obj(x), Value::Obj(y)) if x == y)
@@ -8054,6 +8059,7 @@ pub fn map_key(h: &JsHost, v: &Value) -> MapKey {
             Some(JsObj::Str(s)) => MapKey::Str(s.clone()),
             Some(JsObj::Null) => MapKey::Null,
             Some(JsObj::BigInt(b)) => MapKey::Big(b.to_string()),
+            Some(JsObj::Builtin(n)) => MapKey::Intrinsic(builtin_identity(n).to_string()),
             _ => MapKey::Ref(*i),
         },
         _ => MapKey::Undef,
@@ -10187,4 +10193,16 @@ pub fn promise_then(p: &Value, on_ful: Value, on_rej: Value) -> Value {
 /// `super()` — or returning from one without calling it.
 pub fn this_before_super_error() -> String {
     "ReferenceError: Must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()
+}
+
+/// The intrinsic a builtin name denotes. Two property paths that the spec
+/// defines as the SAME function object compare `===`: `Number.parseInt` is
+/// `%parseInt%` (21.1.2.13) and `Number.parseFloat` is `%parseFloat%`
+/// (21.1.2.12), so `Number.parseInt === parseInt` is `true`.
+fn builtin_identity(name: &str) -> &str {
+    match name {
+        "Number.parseInt" => "parseInt",
+        "Number.parseFloat" => "parseFloat",
+        _ => name,
+    }
 }

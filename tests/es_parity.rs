@@ -6644,3 +6644,62 @@ fn heap_primitive_wrappers_and_arguments_inspect_like_node() {
     );
 }
 
+
+// ── util.inspect labels, verified against node v26.10.0 ─────────────────────
+
+#[test]
+fn a_function_inspects_under_its_kind() {
+    // util.inspect names a function by the same string V8 uses as its
+    // `Symbol.toStringTag`; every kind used to print as `[Function: …]`.
+    let src = r#"
+        console.log([async function af(){}, async () => {}, function* g(){}, async function* ag(){}, async function*(){}]);
+        console.log({ f: async () => 1 });
+    "#;
+    assert_eq!(
+        run(src),
+        "[\n  [AsyncFunction: af],\n  [AsyncFunction (anonymous)],\n  [GeneratorFunction: g],\n  [AsyncGeneratorFunction: ag],\n  [AsyncGeneratorFunction (anonymous)]\n]\n{ f: [AsyncFunction: f] }"
+    );
+}
+
+#[test]
+fn an_array_subclass_instance_inspects_with_its_constructor() {
+    let src = r#"
+        class Bar extends Array {}
+        class Baz extends Bar {}
+        console.log(new Bar(1, 2), new Bar(), [new Baz(3, 4)]);
+        const a = [1]; Object.setPrototypeOf(a, Bar.prototype); console.log(a);
+    "#;
+    assert_eq!(
+        run(src),
+        "Bar(2) [ 1, 2 ] Bar(0) [] [ Baz(2) [ 3, 4 ] ]\nBar(1) [ 1 ]"
+    );
+}
+
+#[test]
+fn heap_primitive_wrappers_and_arguments_inspect_like_node() {
+    let src = r#"
+        console.log(Object(1n), [Object(Symbol('s'))]);
+        (function () { console.log(arguments); })('a', { b: 1 });
+        (function () { console.log(arguments); })();
+        (function () { arguments.x = 1; console.log([arguments]); })(1);
+    "#;
+    assert_eq!(
+        run(src),
+        "[BigInt: 1n] [ [Symbol: Symbol(s)] ]\n[Arguments] { '0': 'a', '1': { b: 1 } }\n[Arguments] {}\n[ [Arguments] { '0': 1, x: 1 } ]"
+    );
+}
+
+// ── Intrinsic identity and Array.prototype.concat's receiver ─────────────────
+
+#[test]
+fn number_parse_functions_are_the_global_intrinsics() {
+    // 21.1.2.12/13: Number.parseFloat and Number.parseInt ARE %parseFloat% and
+    // %parseInt%, so they are `===`, SameValue, and one Set/Map key.
+    let src = r#"
+        console.log(Number.parseInt === parseInt, Number.parseFloat === parseFloat, Number.parseInt === parseFloat);
+        console.log(Object.is(Number.parseInt, parseInt), new Set([parseInt, Number.parseInt]).size);
+        console.log(new Set([Math, Math, Math.max, Math.max]).size, new Map([[parseInt, 1]]).get(Number.parseInt));
+    "#;
+    assert_eq!(run(src), "true true false\ntrue 1\n2 1");
+}
+
