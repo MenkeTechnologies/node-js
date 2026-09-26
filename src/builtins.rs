@@ -3359,6 +3359,44 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
             return Err(host::type_error("this is not a typed array."));
         }
     }
+    // `Function.prototype.call`/`apply`/`bind` with a callable PROXY as `this`
+    // (`pf.call(null, 4, 5)`, reached through the target's chain). Handing
+    // that back to `call_method` read `call` off the proxy again, which
+    // resolved to this same thunk, and recursed until the stack overflowed and
+    // aborted the process. The three are defined on the callee alone, so they
+    // run here: the proxy's `apply` trap (or its target) gets the call.
+    // `toString` recursed the same way.
+    if ctor == "Function"
+        && matches!(method, "call" | "apply" | "bind" | "toString")
+        && with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy)
+    {
+        let mut rest = args.into_iter();
+        let this_arg = rest.next().unwrap_or(Value::Undef);
+        match method {
+            "call" => return host::invoke(recv, rest.collect(), Some(this_arg)),
+            "apply" => {
+                let list = match rest.next() {
+                    None | Some(Value::Undef) => Vec::new(),
+                    Some(v) if with_host(|h| h.is_null(&v)) => Vec::new(),
+                    Some(v) => create_list_from_array_like(&v)?,
+                };
+                return host::invoke(recv, list, Some(this_arg));
+            }
+            "bind" => {
+                let target = recv.clone();
+                let pre: Vec<Value> = rest.collect();
+                return Ok(with_host(|h| {
+                    h.alloc(JsObj::BoundFunc {
+                        target,
+                        this: this_arg,
+                        args: pre,
+                    })
+                }));
+            }
+            // A proxy has no source text; V8 prints the native form for it.
+            _ => return Ok(with_host(|h| h.new_str("function () { [native code] }"))),
+        }
+    }
     // `Symbol.prototype`'s methods are branded, and the receiver that reaches
     // them is very often NOT a symbol: `Symbol.prototype` itself is an ordinary
     // object. Without this check `Symbol.prototype.toString()` re-entered the

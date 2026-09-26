@@ -379,6 +379,23 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn function_prototype_methods_on_a_callable_proxy() {
+    // Each of these overflowed the stack and aborted the process: the method
+    // was re-read off the proxy, which resolved to the same thunk.
+    let src = r#"
+        const pf = new Proxy(function (a, b) { return a + b; }, { apply(t, s, a) { return t(...a) * 2; } });
+        console.log(pf.call(null, 4, 5), Function.prototype.call.call(pf, null, 4, 5));
+        console.log(pf.apply(null, [1, 2]), pf.apply(null), pf.bind(null, 3)(4), typeof pf.bind(null));
+        console.log(Function.prototype.toString.call(pf), String(pf));
+    "#;
+    assert_eq!(
+        run(src),
+        "18 18\n6 NaN 14 function\n\
+         function () { [native code] } function () { [native code] }"
+    );
+}
+
+#[test]
 fn legacy_url_resolve_follows_url_resolve_object() {
     // url.resolve is urlParse(from).resolveObject(to).format(), not RFC 3986:
     // the scheme and host come out lowercased and punycoded, an empty port
