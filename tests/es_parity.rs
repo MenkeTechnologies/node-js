@@ -6568,3 +6568,34 @@ fn a_function_inspects_under_its_kind() {
     );
 }
 
+
+// ── util.inspect labels, verified against node v26.10.0 ─────────────────────
+
+#[test]
+fn a_function_inspects_under_its_kind() {
+    // util.inspect names a function by the same string V8 uses as its
+    // `Symbol.toStringTag`; every kind used to print as `[Function: …]`.
+    let src = r#"
+        console.log([async function af(){}, async () => {}, function* g(){}, async function* ag(){}, async function*(){}]);
+        console.log({ f: async () => 1 });
+    "#;
+    assert_eq!(
+        run(src),
+        "[\n  [AsyncFunction: af],\n  [AsyncFunction (anonymous)],\n  [GeneratorFunction: g],\n  [AsyncGeneratorFunction: ag],\n  [AsyncGeneratorFunction (anonymous)]\n]\n{ f: [AsyncFunction: f] }"
+    );
+}
+
+#[test]
+fn an_array_subclass_instance_inspects_with_its_constructor() {
+    let src = r#"
+        class Bar extends Array {}
+        class Baz extends Bar {}
+        console.log(new Bar(1, 2), new Bar(), [new Baz(3, 4)]);
+        const a = [1]; Object.setPrototypeOf(a, Bar.prototype); console.log(a);
+    "#;
+    assert_eq!(
+        run(src),
+        "Bar(2) [ 1, 2 ] Bar(0) [] [ Baz(2) [ 3, 4 ] ]\nBar(1) [ 1 ]"
+    );
+}
+

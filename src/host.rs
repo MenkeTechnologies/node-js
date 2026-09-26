@@ -4231,6 +4231,18 @@ impl JsHost {
                     // An own enumerable SYMBOL-keyed property renders after the
                     // string keys as `Symbol(desc): value`, as it does on an
                     // object receiver.
+                    // An instance of an Array SUBCLASS leads with its
+                    // constructor and length, `Bar(2) [ 1, 2 ]`, as node's
+                    // `getPrefix` does for any non-`Array` constructor.
+                    let sub = match self.proto_of(v) {
+                        Some(_) => self.ctor_name(v),
+                        None => String::new(),
+                    };
+                    let base = if sub.is_empty() || sub == "Array" {
+                        String::new()
+                    } else {
+                        format!("{sub}({}) ", items.len())
+                    };
                     let sym_entries = self.own_symbol_entries(v);
                     // Under `showHidden` even an empty array has something to
                     // show — node prints `[ [length]: 0 ]`, not `[]`.
@@ -4239,7 +4251,7 @@ impl JsHost {
                         && sym_entries.is_empty()
                         && !inspect_show_hidden()
                     {
-                        return "[]".into();
+                        return format!("{base}[]");
                     }
                     // Node's default inspect depth is 2 (root = depth 0); deeper
                     // nesting collapses to `[Array]`. indent grows by 2 per level.
@@ -4306,7 +4318,7 @@ impl JsHost {
                         ArrayLayout {
                             has_props,
                             has_tail,
-                            base: "",
+                            base: &base,
                         },
                         st,
                     )
