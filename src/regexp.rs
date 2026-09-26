@@ -16,9 +16,13 @@
 //!     never contain a lone surrogate anyway, so those alternatives stay dead
 //!     (correct for all valid input, e.g. encodeurl's unmatched-surrogate scan).
 //!   * `\/` in a literal → a plain `/` (regex rejects the redundant escape).
+//!   * `\N` / `\k<name>` → a conditional, so a reference to an unset group
+//!     matches empty as in JS; the Annex B legacy escapes (`\0`, octal, `\cX`,
+//!     identity `\8`/`\k`) become fixed code points; non-JS group syntax
+//!     (`(?i)`, `(?P<n>`, `(?>`) is rejected with node's reason.
 //!
-//! Everything else — including `(?<name>...)`, `(?=)`/`(?!)`, `(?<=)`/`(?<!)`,
-//! and `\1`/`\k<name>` — passes through verbatim; fancy-regex parses it natively.
+//! Everything else — including `(?<name>...)`, `(?=)`/`(?!)`, `(?<=)`/`(?<!)`
+//! and the `(?ims-ims:...)` modifier groups — passes through verbatim.
 //!
 //! Flags: `i`/`m`/`s` map onto inline flags; `g`/`y` drive iteration and
 //! `lastIndex` here (fancy-regex has no global flag); `u`/`d` are accepted.
@@ -117,7 +121,10 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     let sticky = flags.contains('y');
     let unicode = flags.contains('u');
 
-    let rust_pat = translate(pattern)?;
+    let invalid = |reason: &str| {
+        format!("SyntaxError: Invalid regular expression: /{pattern}/{flags}: {reason}")
+    };
+    let rust_pat = translate(pattern, unicode).map_err(|r| invalid(&r))?;
     // Assemble the inline-flag prefix fancy-regex (via the regex layer) understands.
     let mut prefixed = String::new();
     if ignore_case || multiline || dot_all {
@@ -137,8 +144,7 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
 
     let re = compiled(&prefixed).map_err(|e| {
         // Collapse the multi-line error to one line for a JS-shaped message.
-        let msg = e.lines().collect::<Vec<_>>().join(" ");
-        format!("SyntaxError: Invalid regular expression: /{pattern}/: {msg}")
+        invalid(&e.lines().collect::<Vec<_>>().join(" "))
     })?;
 
     // A `RegExpObj` is unavoidably fresh per evaluation (`lastIndex` is
@@ -199,14 +205,125 @@ fn compiled(prefixed: &str) -> Result<Rc<Regex>, String> {
     Ok(re)
 }
 
-/// Translate a JS regex source into fancy-regex syntax. The rewrites needed are
-/// the `\u`→`\x{}` code-point spelling (with surrogate remapping), the redundant
-/// `\/` escape, and escaping a bare `[` inside a character class — JS treats it
-/// as a literal, but the `regex` layer parses it as a (nested) class open and
-/// errors ("Invalid character class"). lookaround/backrefs/named groups pass
-/// through verbatim.
-fn translate(pat: &str) -> Result<String, String> {
+/// The capturing groups of a JS pattern, in source order: how many there are,
+/// and the index each named one got. A group is capturing when its `(` is not
+/// escaped, not inside a class, and is either bare or `(?<name>`
+/// (`(?<=`/`(?<!` are lookbehinds).
+///
+/// `translate` needs both BEFORE it reaches any escape: a decimal escape `\N` is
+/// a backreference only when `N` does not exceed the pattern's TOTAL group count
+/// (22.2.1.1 — a forward reference such as `/\1(a)/` still counts), and `\k` is
+/// a named reference only when the pattern has a named group at all.
+fn scan_groups(chars: &[char]) -> (usize, Vec<(String, usize)>) {
+    let mut count = 0usize;
+    let mut names = Vec::new();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => {
+                if chars.get(i + 1) != Some(&'?') {
+                    count += 1;
+                } else if chars.get(i + 2) == Some(&'<')
+                    && !matches!(chars.get(i + 3), Some('=') | Some('!'))
+                {
+                    count += 1;
+                    let name: String = chars[i + 3..].iter().take_while(|c| **c != '>').collect();
+                    names.push((name, count));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (count, names)
+}
+
+/// A code point as the fixed `\x{..}` spelling the regex layer accepts both in
+/// and out of a class.
+fn hex_escape(cp: u32) -> String {
+    format!("\\x{{{cp:X}}}")
+}
+
+/// Annex B.1.2 LegacyOctalEscapeSequence starting at `chars[i]` (an octal
+/// digit): the longest of `[0-3][0-7][0-7]`, `[0-7][0-7]`, `[0-7]`, so the value
+/// never exceeds 0o377. Returns the code point and how many digits it took.
+fn legacy_octal(chars: &[char], i: usize) -> (u32, usize) {
+    let oct = |k: usize| chars.get(k).and_then(|c| c.to_digit(8));
+    let first = oct(i).unwrap_or(0);
+    let max = if first <= 3 { 3 } else { 2 };
+    let mut value = first;
+    let mut len = 1;
+    while len < max {
+        match oct(i + len) {
+            Some(d) => {
+                value = value * 8 + d;
+                len += 1;
+            }
+            None => break,
+        }
+    }
+    (value, len)
+}
+
+/// Validate the group opener at `chars[i] == '('` when it is followed by `?`,
+/// returning the reason node's parser gives for a form JS does not have.
+///
+/// JS accepts exactly `(?:`, `(?=`, `(?!`, `(?<=`, `(?<!`, `(?<name>`, and the
+/// ES2025 modifier groups `(?ims-ims:` — never a bare inline flag (`(?i)`), and
+/// none of Perl/PCRE's `(?x)`, `(?P<n>`, `(?#…)`, `(?>…)`, all of which the
+/// regex layer would otherwise accept and silently give a meaning.
+fn check_group(chars: &[char], i: usize) -> Result<(), &'static str> {
+    match chars.get(i + 2) {
+        Some(':') | Some('=') | Some('!') | Some('<') => return Ok(()),
+        _ => {}
+    }
+    let mut seen = String::new();
+    let mut k = i + 2;
+    let mut saw_dash = false;
+    while let Some(&c) = chars.get(k) {
+        match c {
+            'i' | 'm' | 's' => {
+                if seen.contains(c) {
+                    return Err("Repeated flag in flag group");
+                }
+                seen.push(c);
+            }
+            '-' if !saw_dash => saw_dash = true,
+            ':' if seen.is_empty() => return Err("Invalid flag group"),
+            ':' => return Ok(()),
+            _ => return Err("Invalid group"),
+        }
+        k += 1;
+    }
+    Err("Invalid group")
+}
+
+/// Translate a JS regex source into fancy-regex syntax, or the reason node's
+/// parser would reject it (the caller adds the `Invalid regular expression:
+/// /…/flags: ` frame).
+///
+/// Rewrites, each because the regex layer reads the same spelling differently:
+///   * `\uXXXX` / `\u{…}` → `\x{…}`, surrogates remapped (see `remap_surrogate`).
+///   * `\/` → `/`; a bare `[` inside a class → `\[`.
+///   * `\N` that names an existing group → `(?(N)\N|)`. JS matches a reference
+///     to a group that has not participated as the EMPTY string (22.2.2.7.2
+///     BackreferenceMatcher step 7), so `/\1(a)/` and `/(a)?b\1/` both match;
+///     fancy-regex fails such a reference instead, and its conditional is what
+///     restores "empty when unset". `\k<name>` gets the same treatment by index.
+///   * Outside unicode mode, the Annex B.1.2 legacy forms: `\N` past the group
+///     count is an octal escape (`\052` is `*`), or the digit itself for 8/9;
+///     `\0` is NUL; in a class every `\N` is octal; `\cX` is the control
+///     character X % 32 (plus `\c<digit>`/`\c_` in a class), and a `\c` that
+///     forms none of those is a literal backslash followed by `c`; `\k` with no
+///     named group in the pattern is the letter `k`.
+///   * In unicode mode those legacy forms are the SyntaxErrors node raises.
+fn translate(pat: &str, unicode: bool) -> Result<String, String> {
     let chars: Vec<char> = pat.chars().collect();
+    let (group_count, group_names) = scan_groups(&chars);
     let mut out = String::new();
     let mut i = 0;
     // Track whether we're inside a `[...]` class. `class_pos` is how many chars
@@ -246,6 +363,8 @@ fn translate(pat: &str) -> Result<String, String> {
                     i += 1;
                     continue;
                 }
+            } else if c == '(' && chars.get(i + 1) == Some(&'?') {
+                check_group(&chars, i).map_err(str::to_string)?;
             }
         }
         match c {
@@ -271,7 +390,7 @@ fn translate(pat: &str) -> Result<String, String> {
                             i += 4;
                         }
                         match u32::from_str_radix(cp_hex.trim(), 16) {
-                            Ok(cp) => out.push_str(&format!("\\x{{{:X}}}", remap_surrogate(cp))),
+                            Ok(cp) => out.push_str(&hex_escape(remap_surrogate(cp))),
                             // Not valid hex — emit the code point literally so the
                             // engine surfaces its own error rather than us guessing.
                             Err(_) => out.push_str(&format!("\\x{{{cp_hex}}}")),
@@ -284,7 +403,92 @@ fn translate(pat: &str) -> Result<String, String> {
                         i += 2;
                         continue;
                     }
-                    // Everything else (`\d \w \s \b \1 \k \n \. \\` …) passes through.
+                    Some('c') => {
+                        let control = match chars.get(i + 2) {
+                            Some(x) if x.is_ascii_alphabetic() => Some(*x),
+                            Some(x)
+                                if in_class && !unicode && (x.is_ascii_digit() || *x == '_') =>
+                            {
+                                Some(*x)
+                            }
+                            _ => None,
+                        };
+                        match control {
+                            Some(x) => {
+                                out.push_str(&hex_escape(x as u32 % 32));
+                                i += 3;
+                            }
+                            None if unicode => return Err("Invalid Unicode escape".into()),
+                            // Annex B: `\` stands for itself; `c` is read next.
+                            None => {
+                                out.push_str("\\\\");
+                                i += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    Some(d) if d.is_ascii_digit() => {
+                        let lone_zero =
+                            d == '0' && !chars.get(i + 2).is_some_and(|n| n.is_ascii_digit());
+                        if lone_zero {
+                            out.push_str(&hex_escape(0));
+                            i += 2;
+                            continue;
+                        }
+                        if !in_class && d != '0' {
+                            let digits: String = chars[i + 1..]
+                                .iter()
+                                .take_while(|c| c.is_ascii_digit())
+                                .collect();
+                            let n = digits.parse::<usize>().unwrap_or(usize::MAX);
+                            if n <= group_count {
+                                out.push_str(&format!("(?({n})\\{n}|)"));
+                                i += 1 + digits.len();
+                                continue;
+                            }
+                        }
+                        if unicode {
+                            let reason = if in_class || d == '0' {
+                                "Invalid decimal escape"
+                            } else {
+                                "Invalid escape"
+                            };
+                            return Err(reason.into());
+                        }
+                        if d == '8' || d == '9' {
+                            out.push(d);
+                            i += 2;
+                        } else {
+                            let (cp, len) = legacy_octal(&chars, i + 1);
+                            out.push_str(&hex_escape(cp));
+                            i += 1 + len;
+                        }
+                        continue;
+                    }
+                    Some('k') if in_class || (group_names.is_empty() && !unicode) => {
+                        if unicode {
+                            return Err("Invalid class escape".into());
+                        }
+                        out.push('k');
+                        i += 2;
+                        continue;
+                    }
+                    Some('k') => {
+                        if chars.get(i + 2) != Some(&'<') {
+                            return Err("Invalid named reference".into());
+                        }
+                        let Some(close) = chars[i + 3..].iter().position(|c| *c == '>') else {
+                            return Err("Invalid capture group name".into());
+                        };
+                        let name: String = chars[i + 3..i + 3 + close].iter().collect();
+                        let Some((_, index)) = group_names.iter().find(|(n, _)| *n == name) else {
+                            return Err("Invalid named capture referenced".into());
+                        };
+                        out.push_str(&format!("(?({index})\\{index}|)"));
+                        i += 4 + close;
+                        continue;
+                    }
+                    // Everything else (`\d \w \s \b \n \. \\` …) passes through.
                     Some(other) => {
                         out.push('\\');
                         out.push(other);

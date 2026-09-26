@@ -376,6 +376,67 @@ fn regex_backrefs_and_lookaround() {
     assert_eq!(run(src), "true false\ntrue\nfooX\n100\ntrue");
 }
 
+// Expected lines captured from node v26.10.0.
+
+#[test]
+fn regex_reference_to_an_unset_group_matches_empty() {
+    // Forward references, a group skipped by `?`, a group from the other
+    // alternative, and a named forward reference all match the empty string.
+    let src = r#"
+        console.log(/\1(a)/.test("a"), /(a)?b\1/.test("b"), /(a)|\1b/.exec("b")[0]);
+        console.log(/\k<n>(?<n>a)/.test("a"), /(?:(a)|b)\1c/.exec("bc")[0]);
+        console.log("aaa".replace(/(a)\1/g, "X"), /(a)\1/.test("ab"));
+    "#;
+    assert_eq!(run(src), "true true b\ntrue bc\nXa false");
+}
+
+#[test]
+fn regex_annex_b_legacy_escapes() {
+    // \0, octal, \8/\9 identity, \cX control, a literal `\c`, and `\k` with no
+    // named group — all valid outside unicode mode. `(a)\10` has one group, so
+    // `\10` is the octal escape for U+0008, not a reference to group 10.
+    let src = r#"
+        console.log(/\0/.test("\0"), /\052/.test("*"), /\377/.test("\xff"), /\400/.test(" 0"));
+        console.log(/\8/.test("8"), /(a)\2/.test("a\x02"), /(a)\10/.test("a\x08"));
+        console.log(/\cA/.test("\x01"), /\cz/.test("\x1a"), /\c1/.test("\\c1"));
+        console.log(/[\cA]/.test("\x01"), /[\c1]/.test("\x11"), /[\c_]/.test("\x1f"), /[\1]/.test("\x01"));
+        console.log(/\k<n>/.test("k<n>"));
+    "#;
+    assert_eq!(
+        run(src),
+        "true true true true\ntrue true true\ntrue true true\ntrue true true true\ntrue"
+    );
+}
+
+#[test]
+fn regex_rejects_what_node_rejects() {
+    // Non-JS group syntax the regex layer would otherwise accept, the unicode-
+    // mode errors for the Annex B forms, and the flags in the error frame.
+    let src = r#"
+        for (const [p, f] of [["(?i)abc", "g"], ["(?x)a", ""], ["(?P<n>a)", ""], ["(?>a)", ""],
+                              ["(?ii:a)", ""], ["(?-:a)", ""], ["\\8", "u"], ["\\01", "u"],
+                              ["\\c1", "u"], ["\\k<m>(?<n>a)", ""]]) {
+            try { new RegExp(p, f); console.log("accepted", p); }
+            catch (e) { console.log(e.constructor.name, e.message); }
+        }
+        console.log(/(?i:a)b/.test("Ab"), /(?i:a)b/.test("AB"), /(?-i:a)b/i.test("aB"));
+    "#;
+    assert_eq!(
+        run(src),
+        "SyntaxError Invalid regular expression: /(?i)abc/g: Invalid group\n\
+         SyntaxError Invalid regular expression: /(?x)a/: Invalid group\n\
+         SyntaxError Invalid regular expression: /(?P<n>a)/: Invalid group\n\
+         SyntaxError Invalid regular expression: /(?>a)/: Invalid group\n\
+         SyntaxError Invalid regular expression: /(?ii:a)/: Repeated flag in flag group\n\
+         SyntaxError Invalid regular expression: /(?-:a)/: Invalid flag group\n\
+         SyntaxError Invalid regular expression: /\\8/u: Invalid escape\n\
+         SyntaxError Invalid regular expression: /\\01/u: Invalid decimal escape\n\
+         SyntaxError Invalid regular expression: /\\c1/u: Invalid Unicode escape\n\
+         SyntaxError Invalid regular expression: /\\k<m>(?<n>a)/: Invalid named capture referenced\n\
+         true false true"
+    );
+}
+
 // ── Integer-key property ordering (OrdinaryOwnPropertyKeys) ───────────────────
 // Array-index keys enumerate in ascending numeric order BEFORE insertion-ordered
 // string keys, consistently across keys/values/entries, for-in, spread, and

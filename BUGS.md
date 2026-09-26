@@ -858,25 +858,30 @@ dedicated fuzzer modes (`class`, `generator`, `mapset`, `proto`, `async`,
 
 ## Regular expressions — supported subset and known divergences
 
-node-js translates the **overlapping** subset of JS regex that `fancy-regex` can
-represent and rejects most of the rest at RegExp-construction time with a
-`SyntaxError`.
+node-js translates the JS regex grammar onto `fancy-regex` (`src/regexp.rs`
+`translate`) and rejects the rest at RegExp-construction time with the
+`SyntaxError` node raises, including node's reason and the `/source/flags`
+frame (`Invalid regular expression: /(?i)abc/g: Invalid group`).
 
-**"It never silently mis-executes a pattern" is what this section used to say,
-and it is not true.** Two counterexamples, both accepted and both producing the
-wrong answer, measured on node v26.7.0:
+**FIXED — the two patterns that were silently mis-executed, and the Annex B
+escapes that were over-rejected.** Verified byte-identical against node
+v26.10.0:
 
-| pattern | node v26.7.0 | node-js |
+| pattern | node v26.10.0 | node-js before |
 | --- | --- | --- |
-| `new RegExp("(?i)abc")` | `SyntaxError: Invalid regular expression: /(?i)abc/: Invalid group` | compiles; `.test("ABC")` is `true` while `.ignoreCase` reports `false` |
-| `/\1(a)/.test("xa")` | `true` — a JS forward reference matches the empty string | `false` |
+| `new RegExp("(?i)abc")` (also `(?x)`, `(?P<n>`, `(?#…)`, `(?>…)`) | `SyntaxError … Invalid group` | compiled with a Rust meaning |
+| `/\1(a)/.test("a")`, `/(a)?b\1/.test("b")`, `/\k<n>(?<n>a)/` | `true` — a reference to a group that has not participated matches empty | `false` |
+| `/\0/`, `/\052/`, `/\8/`, `/(a)\2/`, `/[\1]/` | valid (NUL, octal, identity) | `SyntaxError` (read as a back reference) |
+| `/\cA/`, `/[\c1]/`, `/\c1/` (a literal `\c`) | valid | `SyntaxError: Invalid escape: \c` |
+| `/\k<n>/` with no named group | matches `k<n>` | `SyntaxError` |
 
-`(?i)` is a Rust INLINE-FLAG group with no meaning in JS, which the reference
-rejects outright; here it reaches the engine and changes matching behind a flag
-reflector that denies it. The forward reference is the opposite shape: valid JS
-that `fancy-regex` fails. The rejection rule below is still the rule for
-everything the translator does not recognise — it is the boundary that is
-imperfect, not the policy.
+A reference is emitted as the conditional `(?(N)\N|)` so an unset group
+matches empty; a decimal escape is a reference only when it does not exceed
+the pattern's total group count, otherwise it is a legacy octal escape. ES2025
+modifier groups (`(?i:…)`, `(?-i:…)`) are accepted, with node's `Repeated flag
+in flag group` / `Invalid flag group` errors. Under the `u` flag the Annex B
+forms are the errors node reports (`Invalid escape`, `Invalid decimal escape`,
+`Invalid Unicode escape`, `Invalid named capture referenced`).
 
 **Supported:** character classes (`[a-z]`, `[^0-9]`), the predefined classes
 `\d \w \s \D \W \S` and word-boundary `\b`/`\B`, quantifiers (`* + ? {n} {n,}
@@ -1803,9 +1808,6 @@ is claimed fixed anywhere in this file.
 | `arguments.callee` | the running function | `undefined` |
 | a tagged template's object and its `raw` | frozen, elements non-writable | mutable, elements writable (the DESCRIPTOR triple is already correct) |
 | a class body's own binding for the class name | immutable — `class E { static z = (E = 1) }` throws | assignment succeeds |
-| `/(?i)abc/` | `SyntaxError: Invalid group` | accepted; matches case-insensitively while `.ignoreCase` reports `false` |
-| `/\1(a)/` (a forward reference) | `true` — matches the empty string | `false` |
-| `/\cA/` (a control escape), `/\052/` (an octal escape) | valid patterns, both match | `SyntaxError` — over-rejected |
 | `Buffer.alloc(-1)`, `Buffer.alloc('x')`, `path.join(1)` | throw a coded error | do not throw (the fixed-width `buf.readXxx` reads DO throw as of round 6) |
 | `Buffer.alloc(2**40)` | returns promptly (the allocation is lazy) | hangs — killed at 8s, materialising a 1 TiB byte vector |
 | `url.resolve` with an uppercase scheme, an empty port, or a Unicode host | lowercases / strips / punycodes | leaves the input as-is |
