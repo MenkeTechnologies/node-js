@@ -395,6 +395,12 @@ fn super_call_with(vm: &mut VM, args: Vec<Value>) -> Value {
         }
         Ok(None) => this,
     };
+    if !with_host(|h| h.bind_super_this()) {
+        return abort(
+            vm,
+            "ReferenceError: Super constructor may only be called once".to_string(),
+        );
+    }
     // Run this (derived) class's own instance-field initializers after super.
     for (name, thunk, name_anon) in fields {
         if let Err(e) = host::init_one_field(&this, &name, &thunk, name_anon) {
@@ -870,7 +876,10 @@ fn b_delname(vm: &mut VM, _: u8) -> Value {
     Value::Bool(true)
 }
 
-fn b_this(_vm: &mut VM, _: u8) -> Value {
+fn b_this(vm: &mut VM, _: u8) -> Value {
+    if with_host(|h| h.this_state()) == host::ThisState::Pending {
+        return abort(vm, host::this_before_super_error());
+    }
     with_host(|h| h.current_this().unwrap_or(Value::Undef))
 }
 

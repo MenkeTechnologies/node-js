@@ -791,6 +791,27 @@ pub struct Frame {
     /// flag every top-level `let`/`var` in such a body declared a GLOBAL, shared
     /// across concurrent activations of the same function.
     pub is_module: bool,
+    /// Whether this activation's `this` is bound yet — see [`ThisState`].
+    pub this_state: ThisState,
+}
+
+/// The `[[ThisBindingStatus]]` of a function environment (9.1.1.3), as far as it
+/// is observable: only a DERIVED class constructor starts with `this`
+/// uninitialized, and only `super()` binds it.
+///
+/// The instance is still allocated up front (`construct_class`), so the
+/// state is what makes it unreachable until then: `this` before `super()`, a
+/// second `super()`, and returning without one are each the error node raises
+/// rather than a silent write to the pre-allocated object.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ThisState {
+    /// Every other activation: `this` is whatever was passed in.
+    #[default]
+    Plain,
+    /// A derived constructor before `super()` has returned.
+    Pending,
+    /// A derived constructor after `super()`.
+    Bound,
 }
 
 /// A non-local control signal. `Break`/`Continue` carry the optional loop label
@@ -903,6 +924,9 @@ pub struct JsHost {
     array_holes: HashMap<u32, rustc_hash::FxHashSet<usize>>,
     /// See `take_super_replacement`.
     super_replacement: Option<Value>,
+    /// Set by `run_class_ctor` for the one call that follows: the next user
+    /// function activation is a derived constructor and starts `Pending`.
+    derived_ctor_next: bool,
     /// Whether the entry script's top-level `var`s bind to its own scope rather
     /// than to the globals map — the CommonJS wrapper Node puts every file in.
     module_scope: bool,
@@ -1180,6 +1204,7 @@ impl JsHost {
                 line: 0,
                 owner: None,
                 is_module: true,
+                this_state: ThisState::Plain,
             }],
             global_env,
             error: None,
@@ -1197,6 +1222,7 @@ impl JsHost {
             private_methods: HashSet::new(),
             array_holes: HashMap::new(),
             super_replacement: None,
+            derived_ctor_next: false,
             module_scope: false,
             builtin_statics: HashMap::new(),
             object_proto: Value::Undef,
@@ -2852,6 +2878,36 @@ impl JsHost {
         self.frame().this_obj.clone()
     }
 
+    /// The running activation's [`ThisState`].
+    pub fn this_state(&self) -> ThisState {
+        self.frame().this_state
+    }
+
+    /// Mark the next user-function activation as a derived constructor.
+    pub fn mark_next_call_derived_ctor(&mut self) {
+        self.derived_ctor_next = true;
+    }
+
+    /// BindThisValue (9.1.1.3.1) for a `super()` that has just returned: the
+    /// nearest derived-constructor activation becomes `Bound`. That is the top
+    /// frame, or — for `super()` inside an arrow — the constructor below the
+    /// arrow's own frame. `false` when it was already bound: the second call.
+    pub fn bind_super_this(&mut self) -> bool {
+        let Some(f) = self
+            .frames
+            .iter_mut()
+            .rev()
+            .find(|f| f.this_state != ThisState::Plain)
+        else {
+            return true;
+        };
+        if f.this_state == ThisState::Bound {
+            return false;
+        }
+        f.this_state = ThisState::Bound;
+        true
+    }
+
     /// The object a `super()` call substituted for the instance, if any.
     ///
     /// `construct_class` allocates the instance up front, so when a base
@@ -3501,6 +3557,7 @@ fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
             line: 0,
             owner: None,
             is_module: true,
+            this_state: ThisState::Plain,
         })
     });
     let r = run_chunk_on(chunk);
@@ -6651,6 +6708,8 @@ fn run_user_func_full(
     new_target: Option<Value>,
     callee: Option<Value>,
 ) -> Result<Value, String> {
+    // Consumed first, before anything here can start another call.
+    let derived_ctor = with_host(|h| std::mem::take(&mut h.derived_ctor_next));
     // Only the light fields: cloning the whole `FuncDef` cloned its `Chunk` —
     // the entire compiled body, `sub_chunks` and all — on every single call.
     // The chunk is now reached once per pooled VM, in the two arms below.
@@ -6755,22 +6814,41 @@ fn run_user_func_full(
             line: 0,
             owner: Some(def_name),
             is_module: false,
+            this_state: if derived_ctor {
+                ThisState::Pending
+            } else {
+                ThisState::Plain
+            },
         })
     });
     let r = run_chunk_keyed(func_key(fv.def_id), || {
         with_host(|h| h.funcs[fv.def_id].chunk.clone())
     });
-    let sig = with_host(|h| {
-        h.frames.pop();
-        h.signal.take()
+    let (sig, this_state) = with_host(|h| {
+        let frame = h.frames.pop();
+        (h.signal.take(), frame.map(|f| f.this_state))
     });
-    match r {
-        Err(e) => Err(e),
-        Ok(_) => Ok(match sig {
+    let ret = match r {
+        Err(e) => return Err(e),
+        Ok(_) => match sig {
             Some(Signal::Return(v)) => v,
             _ => Value::Undef,
-        }),
+        },
+    };
+    // 10.2.2 [[Construct]] steps 10-12 for a derived constructor: an object
+    // return wins; any other non-undefined return is a TypeError; and falling
+    // off the end (or `return;`) needs `this` to have been bound by `super()`.
+    if derived_ctor && !returns_object(&ret) {
+        if !matches!(ret, Value::Undef) {
+            return Err(type_error(
+                "Derived constructors may only return object or undefined",
+            ));
+        }
+        if this_state == Some(ThisState::Pending) {
+            return Err(this_before_super_error());
+        }
     }
+    Ok(ret)
 }
 
 /// Bind positional args into a fresh call environment. The compiler emits the
@@ -6995,6 +7073,9 @@ fn run_class_ctor(
                 Some(JsObj::Func(f)) => f,
                 _ => return Err(type_error("class constructor is not a function")),
             };
+            if cv.parent.is_some() {
+                with_host(|h| h.mark_next_call_derived_ctor());
+            }
             let r = run_user_func_nt(&fv, args, Some(inst.clone()), Some(new_target.clone()))?;
             return Ok(Some(r));
         }
@@ -7644,6 +7725,7 @@ fn make_generator(
         line: 0,
         owner: None,
         is_module: false,
+        this_state: ThisState::Plain,
     };
     let id = with_host(|h| {
         let id = h.generators.len() as u32;
@@ -9980,4 +10062,10 @@ pub fn promise_then(p: &Value, on_ful: Value, on_rej: Value) -> Value {
         }
     }
     result
+}
+
+/// The ReferenceError for touching `this` in a derived constructor before
+/// `super()` — or returning from one without calling it.
+pub fn this_before_super_error() -> String {
+    "ReferenceError: Must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()
 }

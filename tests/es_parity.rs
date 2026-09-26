@@ -379,6 +379,39 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn derived_constructor_this_is_unbound_until_super() {
+    // `this` before super(), falling off the end without super(), a default
+    // parameter reading `this`, a second super(), a primitive return; and the
+    // forms that must keep working — super() from an arrow, an object return,
+    // a try/catch that recovers by calling super().
+    let src = r#"
+        class A { constructor() { this.a = 1; } }
+        const probe = (f) => { try { return JSON.stringify(f()); } catch (e) { return e.constructor.name + ": " + e.message; } };
+        console.log(probe(() => new (class extends A { constructor() { this.x = 1; super(); } })()));
+        console.log(probe(() => new (class extends A { constructor() { } })()));
+        console.log(probe(() => new (class extends A { constructor(v = this) { super(); } })()));
+        console.log(probe(() => new (class extends A { constructor() { super(); super(); } })()));
+        console.log(probe(() => new (class extends A { constructor() { super(); return 1; } })()));
+        console.log(probe(() => new (class extends A { constructor() { const f = () => super(); f(); this.y = 2; } })()));
+        console.log(probe(() => new (class extends A { constructor() { return { o: 1 }; } })()));
+        console.log(probe(() => new (class extends A { constructor() { try { this.q = 1 } catch (e) { super(); this.e = e.name } } })()));
+        console.log(probe(() => new (class extends A { x = 5; constructor() { super(); this.w = this.x; } })()));
+    "#;
+    let unbound = "ReferenceError: Must call super constructor in derived class before \
+                   accessing 'this' or returning from derived constructor";
+    assert_eq!(
+        run(src),
+        format!(
+            "{unbound}\n{unbound}\n{unbound}\n\
+             ReferenceError: Super constructor may only be called once\n\
+             TypeError: Derived constructors may only return object or undefined\n\
+             {{\"a\":1,\"y\":2}}\n{{\"o\":1}}\n{{\"a\":1,\"e\":\"ReferenceError\"}}\n\
+             {{\"a\":1,\"x\":5,\"w\":5}}"
+        )
+    );
+}
+
+#[test]
 fn primitive_prototype_methods_brand_check_their_receiver() {
     // `Number.prototype.valueOf()` used to overflow the stack and abort; the
     // prototypes of Number/String/Boolean are wrappers of +0 / "" / false.
