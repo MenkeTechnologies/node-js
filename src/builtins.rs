@@ -8584,7 +8584,7 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
 }
 
 /// Items of an array-like `{ length, 0, 1, … }` object (for `Array.from`).
-fn array_like_items(src: &Value) -> Vec<Value> {
+pub(crate) fn array_like_items(src: &Value) -> Vec<Value> {
     // `LengthOfArrayLike` is `ToLength(Get(O, "length"))`, and `ToNumber` runs a
     // user `valueOf` — `Array.from({length: {valueOf: () => 1}})` was empty
     // because the infallible read does no `ToPrimitive`. A throw from it is
