@@ -6551,3 +6551,20 @@ fn a_pattern_over_an_endless_source_takes_what_it_names_and_stops() {
     "#;
     assert_eq!(run(src), "0 1\n0\nclosed\nv");
 }
+
+// ── util.inspect labels, verified against node v26.10.0 ─────────────────────
+
+#[test]
+fn a_function_inspects_under_its_kind() {
+    // util.inspect names a function by the same string V8 uses as its
+    // `Symbol.toStringTag`; every kind used to print as `[Function: …]`.
+    let src = r#"
+        console.log([async function af(){}, async () => {}, function* g(){}, async function* ag(){}, async function*(){}]);
+        console.log({ f: async () => 1 });
+    "#;
+    assert_eq!(
+        run(src),
+        "[\n  [AsyncFunction: af],\n  [AsyncFunction (anonymous)],\n  [GeneratorFunction: g],\n  [AsyncGeneratorFunction: ag],\n  [AsyncGeneratorFunction (anonymous)]\n]\n{ f: [AsyncFunction: f] }"
+    );
+}
+

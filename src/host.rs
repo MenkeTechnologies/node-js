@@ -4772,16 +4772,25 @@ impl JsHost {
                     },
                     None => "Promise { <pending> }".into(),
                 },
-                Some(JsObj::Func(_)) => {
+                Some(JsObj::Func(f)) => {
                     // `callable_name`, not the FuncDef name: an anonymous
                     // function expression gets its name by inference from the
                     // binding it initialises (`const f = function(){}`), and
                     // that lands as an own `name` property.
                     let name = self.callable_name(v);
+                    // util.inspect labels a function by its kind, the same
+                    // string V8 gives it as `Symbol.toStringTag`:
+                    // `[AsyncFunction: af]`, `[GeneratorFunction: g]`.
+                    let kind = match self.funcs.get(f.def_id) {
+                        Some(d) if d.is_generator && d.is_async => "AsyncGeneratorFunction",
+                        Some(d) if d.is_generator => "GeneratorFunction",
+                        Some(d) if d.is_async => "AsyncFunction",
+                        _ => "Function",
+                    };
                     let base = if name.is_empty() {
-                        "[Function (anonymous)]".to_string()
+                        format!("[{kind} (anonymous)]")
                     } else {
-                        format!("[Function: {name}]")
+                        format!("[{kind}: {name}]")
                     };
                     self.with_callable_props(v, base, indent, st)
                 }
