@@ -205,7 +205,10 @@ impl Parts {
         }
     }
     fn origin(&self) -> String {
-        if self.hostname.is_empty() {
+        // Only a special scheme with a network host has a tuple origin; every
+        // other URL (`foo://h/`, `redis://h:1/`, `file:///x`) is opaque: `null`.
+        let scheme = self.protocol.strip_suffix(':').unwrap_or(&self.protocol);
+        if self.hostname.is_empty() || special_port(scheme).is_none() {
             "null".into()
         } else {
             format!("{}//{}", self.protocol, self.host())
@@ -273,6 +276,13 @@ fn parse_absolute(input: &str) -> Option<Parts> {
     {
         return None;
     }
+    // A special scheme ignores any further slashes before the authority
+    // ("special authority ignore slashes state"): `http:///a` is `http://a/`.
+    let rest = if special_port(&scheme.to_ascii_lowercase()).is_some() {
+        rest.trim_start_matches('/')
+    } else {
+        rest
+    };
     // authority is up to the first '/', '?' or '#'.
     let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..auth_end];
@@ -286,9 +296,45 @@ fn parse_absolute(input: &str) -> Option<Parts> {
         Some((u, p)) => (u.to_string(), p.to_string()),
         None => (userinfo.to_string(), String::new()),
     };
-    let (hostname, port) = match hostport.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.to_string()),
-        None => (hostport.to_string(), String::new()),
+    // An IPv6 literal carries colons of its own: the port separator is the
+    // first colon AFTER its closing bracket, and nothing else may sit there.
+    let (hostname, port) = if hostport.starts_with('[') {
+        let close = hostport.find(']')?;
+        match &hostport[close + 1..] {
+            "" => (&hostport[..=close], ""),
+            p => (&hostport[..=close], p.strip_prefix(':')?),
+        }
+    } else {
+        hostport.split_once(':').unwrap_or((hostport, ""))
+    };
+    let lower_scheme = scheme.to_ascii_lowercase();
+    let special = special_port(&lower_scheme).is_some();
+    // The host parser: a special scheme's host is a domain (percent-decoded,
+    // mapped to ASCII, and checked for forbidden code points), an IPv4 address
+    // in any of its number forms, or a bracketed IPv6 address, each serialized
+    // canonically — `http://0x7f.1/` is `http://127.0.0.1/`, and `http://a b/`
+    // is no URL at all. Any other scheme's host is opaque and only checked.
+    let hostname = if special {
+        if hostname.is_empty() {
+            return None;
+        }
+        url::Host::parse(hostname).ok()?.to_string()
+    } else if hostname.is_empty() {
+        String::new()
+    } else {
+        url::Host::parse_opaque(hostname).ok()?.to_string()
+    };
+    // A port is digits only and at most 65535, serialized without leading
+    // zeros; an empty port after the colon is the same as none.
+    let port = if port.is_empty() {
+        String::new()
+    } else if port.bytes().all(|b| b.is_ascii_digit()) {
+        port.trim_start_matches('0').parse::<u16>().map_or_else(
+            |_| if port.bytes().all(|b| b == b'0') { Some("0".to_string()) } else { None },
+            |n| Some(n.to_string()),
+        )?
+    } else {
+        return None;
     };
 
     let hash = match tail.find('#') {
@@ -496,13 +542,16 @@ const FRAGMENT_SET: &str = " \"<>`";
 const USERINFO_SET: &str = " \";<=>@[]^`{|}";
 
 fn build(p: &Parts) -> Value {
-    // Percent-encode each component and lower-case the host once, here, so
-    // `href()` and every individual property report the same normalized text.
+    // Percent-encode each component once, here, so `href()` and every
+    // individual property report the same normalized text. The host arrives
+    // already canonical from the host parser in `parse_absolute`; lower-casing
+    // it again here also folded a non-special scheme's opaque host, which
+    // node keeps as written (`foo://Host/`).
     let p = &Parts {
         protocol: p.protocol.clone(),
         username: percent_encode(&p.username, USERINFO_SET),
         password: percent_encode(&p.password, USERINFO_SET),
-        hostname: p.hostname.to_lowercase(),
+        hostname: p.hostname.clone(),
         port: p.port.clone(),
         pathname: percent_encode(&p.pathname, PATH_SET),
         search: percent_encode(&p.search, QUERY_SET),

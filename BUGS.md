@@ -1794,6 +1794,7 @@ Each is pinned by a test in `tests/es_parity.rs`.
 | `url.resolve` was RFC 3986 resolution | a port of `Url.prototype.resolveObject` (988-pair cross product identical) |
 | RegExp `\0`, octal, `\cX`, a reference to an unset group, `(?i)` | see "Regular expressions" below |
 | `new URL(bad)` had no `input` / `base` own properties; an object argument was stringified without its own `toString`; an uncaught one printed its internal marker bytes to stderr | `{"code":"ERR_INVALID_URL","input":…,"base":…}` as in node; both arguments go through ToString; stderr reads `TypeError: Invalid URL` |
+| `new URL` took the host verbatim: no IPv4 number forms, IPv6 compression, IDNA or forbidden-code-point check, any text as a port, `http:///a` kept an empty host, and `foo://h/` reported a tuple origin | the WHATWG host parser (`url::Host`), port range and leading-zero rules, special-scheme slash skipping, and `null` origin for non-special schemes — a 60-input sweep matches node |
 | `Buffer.prototype` lost its `Uint8Array.prototype` parent when a Buffer was built before anything touched `Uint8Array` | the typed-array chain is built whichever is reached first |
 
 Several rows of the two tables below were already closed by earlier rounds

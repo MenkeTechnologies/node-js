@@ -136,6 +136,10 @@ flate2 = "1"
 rustls = "0.23"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
+# WHATWG host parsing for `new URL`: domain-to-ASCII, the IPv4 number forms
+# (`0x7f.1`), IPv6 compression, and the forbidden host code points. Already in
+# the dependency graph through lsp-types.
+url = "2.5"
 # HPACK header compression for a minimal real HTTP/2 server (`http2`).
 hpack = "0.3"
 

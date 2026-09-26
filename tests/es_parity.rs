@@ -379,6 +379,35 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn url_host_parser_canonicalizes_and_rejects_like_node() {
+    // Hosts were taken verbatim: no IPv4 number forms, no IPv6 compression, no
+    // IDNA, no forbidden code points, no port validation, and a non-special
+    // URL reported a tuple origin.
+    let src = r#"
+        for (const s of ['http://0x7f.1:080/', 'http://[1:0:0:2::3:0]:443/', 'http://B\u00fccher.de./',
+                         'http://ex%41mple.com/', 'http:///a', 'foo://Host:12/p', 'wss://h:0443/',
+                         'http://[::1', 'http://a b/', 'http://256.0.0.1/', 'http://a:65536/', 'http://:80/']) {
+            try { const u = new URL(s); console.log(u.href, u.host, u.origin) } catch (e) { console.log('throws', e.code) }
+        }
+    "#;
+    assert_eq!(
+        run(src),
+        "http://127.0.0.1/ 127.0.0.1 http://127.0.0.1\n\
+         http://[1::2:0:0:3:0]:443/ [1::2:0:0:3:0]:443 http://[1::2:0:0:3:0]:443\n\
+         http://xn--bcher-kva.de./ xn--bcher-kva.de. http://xn--bcher-kva.de.\n\
+         http://example.com/ example.com http://example.com\n\
+         http://a/ a http://a\n\
+         foo://Host:12/p Host:12 null\n\
+         wss://h/ h wss://h\n\
+         throws ERR_INVALID_URL\n\
+         throws ERR_INVALID_URL\n\
+         throws ERR_INVALID_URL\n\
+         throws ERR_INVALID_URL\n\
+         throws ERR_INVALID_URL"
+    );
+}
+
+#[test]
 fn url_constructor_error_carries_input_and_base_and_coerces_objects() {
     // The error had no `input`/`base`, and an object argument was stringified
     // without calling its own toString.
