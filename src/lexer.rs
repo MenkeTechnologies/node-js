@@ -117,6 +117,13 @@ impl Lexer {
     }
 
     fn run(&mut self) -> Result<(), String> {
+        // A Hashbang comment (12.5) is legal only as the very first thing in
+        // the source: `#!/usr/bin/env node` runs to the end of its line.
+        if self.peek() == Some('#') && self.peek_at(1) == Some('!') {
+            while !matches!(self.peek(), None | Some('\n')) {
+                self.bump();
+            }
+        }
         loop {
             match self.peek() {
                 None => break,

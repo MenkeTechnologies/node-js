@@ -494,6 +494,13 @@ fn module_exports(module: &Value) -> Value {
 /// Compile `<source>` wrapped in the Node module wrapper and return the wrapper
 /// FUNCTION value.
 fn compile_wrapper(source: &str) -> Result<Value, String> {
+    // A module may open with a hashbang line, which is only a comment at the
+    // start of the TEXT; inside the wrapper it would not be, so it becomes a
+    // `//` comment of the same length.
+    let source = match source.strip_prefix("#!") {
+        Some(rest) => format!("//{rest}"),
+        None => source.to_string(),
+    };
     // A trailing newline before `})` guards a source ending in a `//` comment.
     eval_binding(&format!(
         "(function (exports, require, module, __dirname, __filename) {{\n{source}\n}})"

@@ -6761,3 +6761,14 @@ function   decl ( a , /* c */ b ) {
 function(){} could not be cloned."
     );
 }
+
+#[test]
+fn a_hashbang_line_is_a_comment_in_scripts_and_modules() {
+    let dir = tempfile::Builder::new().prefix("nodejs-hb").tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("m.js"), "#!/usr/bin/env node\nmodule.exports = 5\n").expect("write module");
+    let main = dir.path().join("main.js");
+    std::fs::write(&main, "#!/usr/bin/env node\nconsole.log(require('./m.js'))\n").expect("write main");
+    let (ok, stdout, stderr) = run_bounded(&main);
+    assert!(ok, "stderr: {stderr}");
+    assert_eq!(stdout.trim_end(), "5");
+}
