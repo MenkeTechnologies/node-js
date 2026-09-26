@@ -130,6 +130,12 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
   `switch`, `break`, `continue`, `return`, `throw`, `try` / `catch` / `finally`.
 - `function` declarations and expressions, **arrow functions** (with `=>`
   lookahead detection), closures, recursion, `new`.
+  `Function.prototype.toString` returns each function's and class's own
+  source text, as V8 does: the lexer records token byte ranges and every
+  `FuncDef` keeps the span of its definition.
+- Unicode source: identifiers may start with any letter (`const é`), the BOM,
+  NBSP and the other Unicode spaces are whitespace, and a leading `#!` line is
+  a comment in the entry script and in required modules.
 - Array and object literals, member (`a.b`) and index (`a[i]`) access, spread
   (`...`), **template literals** (`` `${...}` `` re-lexed from source).
 - Builtin objects and methods on the `JsHost` heap: `console` (`log`), `Math`

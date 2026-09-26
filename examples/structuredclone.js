@@ -18,8 +18,8 @@ refuse("promise", Promise.resolve());
 refuse("generator", (function* () {})());
 refuse("proxy", new Proxy({ a: 1 }, {}));
 // A function is refused too, and so is one nested anywhere in the graph. The
-// MESSAGE quotes the function's source, which this frontend does not retain, so
-// only the error itself is pinned here.
+// MESSAGE quotes the function's source text; `tests/es_parity.rs` pins that
+// text, so only the error itself is pinned here.
 for (const [n, v] of [["function", () => {}], ["nested", { a: 1, deep: { f() {} } }]]) {
   try { structuredClone(v); console.log("ok    ", n); }
   catch (e) { console.log("throw ", n, e.constructor.name, e.name, e.message.endsWith("could not be cloned.")); }

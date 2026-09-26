@@ -195,8 +195,12 @@ node v26.7.0, `new Function('a','b','return a+b').toString()` is
 `"function anonymous(a,b\n) {\nreturn a+b\n}"` with `.name === 'anonymous'`,
 while `vm.compileFunction('return a+b', ['a','b']).toString()` is
 `"function (a, b) {\nreturn a+b\n}"` with `.name === ''`. That text is retained
-per function, so `Function.prototype.toString` reports it; ordinary functions
-keep no source (the compiler records no spans) and still render
+per function, so `Function.prototype.toString` reports it. Every other
+function reports its own source text: the lexer records each token's byte
+range, the parser keeps the span of every function, method, accessor, arrow
+and class, and a `FuncDef` slices that span out of the script it was loaded
+from. A program with no retained text (an AOT image, or a file whose
+`rust { }` blocks were desugared before lexing) still renders
 `function <name>() { [code] }`.
 
 `eval` distinguishes the two call forms the spec distinguishes. A DIRECT eval —
@@ -1802,6 +1806,24 @@ Several rows of the two tables below were already closed by earlier rounds
 and frozen writes, array holes, the `arguments` brand, `normalize`) and were
 removed after being re-run against node v26.10.0.
 
+## FIXED in round 9 — verified against node v26.10.0
+
+Each is pinned by a test in `tests/es_parity.rs`.
+
+| was | now |
+| --- | --- |
+| `Function.prototype.toString` gave `function f() { [code] }` for every script function, and `String(C)` gave `class C { }` | the exact source text, including methods, accessors, arrows, classes and functions inside `${}` fields; `structuredClone(fn)` and `Set.prototype.union.call(fn)` quote it as node does |
+| a non-ASCII identifier (`const é`), a BOM, NBSP or other Zs space, and LS/PS were `SyntaxError: unexpected character` | IdentifierStart is any Unicode letter; WhiteSpace and LineTerminator follow 12.2/12.3 |
+| a `#!` hashbang line was a `SyntaxError`, in the entry script and in a required module | a comment at the start of the source |
+| `util.inspect` printed `[Function: af]` for async, generator and async-generator functions | `[AsyncFunction: af]`, `[GeneratorFunction: g]`, `[AsyncGeneratorFunction: ag]` |
+| an Array subclass instance inspected as a bare array | `Bar(2) [ 1, 2 ]` |
+| `Object(1n)` inspected as `[String: 1n]`; `arguments` as a plain array | `[BigInt: 1n]`, `[Symbol: Symbol(s)]`; `[Arguments] { '0': 1 }` |
+| `Number.parseInt !== parseInt`, and every bare reference to a builtin was a new `Set`/`Map` key | one identity per intrinsic |
+| `Array.prototype.concat.call("ab", x)` split the string; array-likes and `arguments` were spread | the receiver is `ToObject(this)` and only a spreadable value is spread |
+| `JSON.stringify` of a cycle threw the bare first line | V8's `--> starting at object with constructor …` / `--- property 'k' closes the circle` path |
+| `new Uint8Array(-1)` was empty, `new Uint8Array('2')` iterated the string, a misaligned buffer view succeeded; `DataView`/`ArrayBuffer` bounds used generic messages | ToIndex with V8's messages (`Invalid typed array length: -1`, `start offset of Uint32Array should be a multiple of 4`, `Start offset 6 is outside the bounds of the buffer`, `Invalid array buffer max length`) |
+| `ta.set(src, off)` wrote a partial prefix past the end and ignored array-likes; `TypedArray.from({length})` was empty | `RangeError: offset is out of bounds` before any write; array-likes are read by `length` |
+
 ## Still open — found in round 7
 
 | gap | node v26.7.0 | node-js |
@@ -1810,8 +1832,7 @@ removed after being re-run against node v26.10.0.
 | `new Array(4294967295)` | `4294967295` (holes are lazy) | killed at 10s — a dense `Vec` cannot hold 2^32-1 elements. The LENGTH is legal, so the spec check above lets it through; this is the documented dense-array model, not a missing validation |
 | `JSON.stringify` of a 20 000-deep object | prints promptly | killed at 60s (5 000 deep completes) |
 | `async function f(){ return f() }; f()` | `RangeError: Maximum call stack size exceeded` | hangs — each call starts a coroutine and returns a promise, so the recursion is an unbounded MICROTASK chain rather than stack growth, and the stack guard never sees it |
-| `new g()` where `g` is a `function*` | message names the callee's SOURCE TEXT (`o.m is not a constructor`) | names it by function NAME (`m is not a constructor`) — the class, `.name` and catchability all match; node-js keeps no spans |
-| `structuredClone(function(){})` message | `function(){} could not be cloned.` (the source text) | `function () { [code] } could not be cloned.` — the class, `name` and `code: 25` match; node-js keeps no function source text |
+| `new o.m()` where `o.m` is a `function*` | message names the callee's SOURCE TEXT (`o.m is not a constructor`) | names it by function NAME (`m is not a constructor`) — the class, `.name` and catchability all match |
 | `eval('await 1')` | `SyntaxError: await is only valid in async functions …` | `SyntaxError: expected ';' but found Num(1.0) (line 1)` |
 
 ## Still open — found by the round-5 doc audit, not yet fixed
@@ -2347,7 +2368,6 @@ Still open in the same area:
 | --- | --- | --- |
 | `console.log(require('util'))` | the module's members | `Object [util] {}` — rendering a member means allocating its value, and inspect runs under the host borrow |
 | `console.log(Object.prototype)` | `[Object: null prototype] {}` | `{}` — the prototype object is ordinary here |
-| `Set.prototype.union.call(function f(){})` | `… incompatible receiver function f(){}` | `… function f() { [code] }` — the compiler keeps no source spans |
 | `Object.getOwnPropertyDescriptor(globalThis, 'process')` | an ACCESSOR (node defines it lazily) | a data descriptor |
 | `Object.getOwnPropertyDescriptor(Set.prototype, 'size')` | an accessor descriptor | `undefined` — a builtin prototype's accessors own no descriptor |
 | `Object.create(Map.prototype).constructor` | `Map` | `Object`, and `instanceof Set` is false for `Object.create(Set.prototype)` — a builtin prototype carries no `constructor` link |
@@ -2522,13 +2542,6 @@ Still divergent, and why:
   (`examples/deadzone.js`), but parameters are initialized into one scope with
   no per-parameter hoist, so `function f(a = b, b = 2) {}` reads `b` as
   `undefined` where node throws `Cannot access 'b' before initialization`.
-- **A function's source text is not retained**, so anything that quotes it
-  differs. `Function.prototype.toString` renders `function f() { [code] }`
-  where node returns the original text, and `structuredClone(() => {})` throws
-  the right `DataCloneError` with the wrong rendering inside its message
-  (`examples/structuredclone.js` therefore pins the error and not the text).
-  `FuncDef` holds a compiled chunk; fixing this means carrying source spans
-  from the parser through the compiler.
 - **The `with` statement does not parse.** A sloppy-mode-only form, and the
   one statement that makes a scope lookup dynamic, so nothing in this frontend
   is shaped for it — `eval("with({a:1}){ a }")` is a SyntaxError here.
