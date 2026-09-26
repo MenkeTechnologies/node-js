@@ -5090,10 +5090,17 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
     // Whether `String(err)`/`err.stack` show `Name [CODE]:` — true for the
     // bracketed head, false for the marker form.
     let mut bracketed = code.is_some();
+    // Extra own properties (`input`, `base`) from `host::plain_coded_error_with`.
+    let mut fields: Vec<(String, String)> = Vec::new();
     if let Some(rest) = message.strip_prefix(host::CODE_MARK) {
         if let Some((c, m)) = rest.split_once('\u{1}') {
             code = Some(c.to_string());
             bracketed = false;
+            let (m, fs) = host::split_error_fields(m);
+            fields = fs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
             message = m.to_string();
         }
     }
@@ -5103,6 +5110,10 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
     if let Some(c) = &code {
         let cv = h.new_str(c.clone());
         props.insert("code".into(), cv);
+        for (k, v) in fields {
+            let fv = h.new_str(v);
+            props.insert(k, fv);
+        }
         if bracketed {
             // Marks this as a Node JS-layer error, whose `toString` brackets the
             // code. A native-layer error has the same `.code` and does not.

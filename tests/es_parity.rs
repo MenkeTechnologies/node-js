@@ -379,6 +379,25 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn url_constructor_error_carries_input_and_base_and_coerces_objects() {
+    // The error had no `input`/`base`, and an object argument was stringified
+    // without calling its own toString.
+    let src = r#"
+        for (const args of [['/x'], ['x', 'nope'], ['/x', undefined]]) {
+            try { new URL(...args) } catch (e) { console.log(JSON.stringify(e), String(e)); }
+        }
+        console.log(new URL('x', { toString() { return 'http://a/' } }).href);
+    "#;
+    assert_eq!(
+        run(src),
+        "{\"code\":\"ERR_INVALID_URL\",\"input\":\"/x\"} TypeError: Invalid URL\n\
+         {\"code\":\"ERR_INVALID_URL\",\"input\":\"x\",\"base\":\"nope\"} TypeError: Invalid URL\n\
+         {\"code\":\"ERR_INVALID_URL\",\"input\":\"/x\"} TypeError: Invalid URL\n\
+         http://a/x"
+    );
+}
+
+#[test]
 fn buffer_prototype_chain_survives_a_buffer_built_first() {
     // Building a Buffer before anything touched Uint8Array registered a
     // Buffer.prototype hung off Object.prototype, and the typed-array chain

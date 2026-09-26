@@ -1793,6 +1793,8 @@ Each is pinned by a test in `tests/es_parity.rs`.
 | `path.*` coerced any argument | `ERR_INVALID_ARG_TYPE` naming node's parameter; a function is reported as `function <name>` |
 | `url.resolve` was RFC 3986 resolution | a port of `Url.prototype.resolveObject` (988-pair cross product identical) |
 | RegExp `\0`, octal, `\cX`, a reference to an unset group, `(?i)` | see "Regular expressions" below |
+| `new URL(bad)` had no `input` / `base` own properties; an object argument was stringified without its own `toString`; an uncaught one printed its internal marker bytes to stderr | `{"code":"ERR_INVALID_URL","input":…,"base":…}` as in node; both arguments go through ToString; stderr reads `TypeError: Invalid URL` |
+| `Buffer.prototype` lost its `Uint8Array.prototype` parent when a Buffer was built before anything touched `Uint8Array` | the typed-array chain is built whichever is reached first |
 
 Several rows of the two tables below were already closed by earlier rounds
 (`DataView`, `arguments.callee`, frozen template objects, strict-mode `const`
@@ -1808,7 +1810,6 @@ removed after being re-run against node v26.10.0.
 | `JSON.stringify` of a 20 000-deep object | prints promptly | killed at 60s (5 000 deep completes) |
 | `async function f(){ return f() }; f()` | `RangeError: Maximum call stack size exceeded` | hangs — each call starts a coroutine and returns a promise, so the recursion is an unbounded MICROTASK chain rather than stack growth, and the stack guard never sees it |
 | `new g()` where `g` is a `function*` | message names the callee's SOURCE TEXT (`o.m is not a constructor`) | names it by function NAME (`m is not a constructor`) — the class, `.name` and catchability all match; node-js keeps no spans |
-| `new URL('/x')` error own properties | `["code","input","message","stack"]` | `["code","message","stack"]` — no `input` |
 | `structuredClone(function(){})` message | `function(){} could not be cloned.` (the source text) | `function () { [code] } could not be cloned.` — the class, `name` and `code: 25` match; node-js keeps no function source text |
 | `eval('await 1')` | `SyntaxError: await is only valid in async functions …` | `SyntaxError: expected ';' but found Num(1.0) (line 1)` |
 
@@ -1827,8 +1828,9 @@ cases the fuzzer is scoped away from)
 - **The ENTRY script is not wrapped in the CommonJS wrapper.** A `require`d
   module is (`module.rs:315`), and there `__filename`/`__dirname`/`module`/
   `exports`/`arguments` all match Node down to `arguments.length === 5`. In the
-  file passed on the command line they are `undefined`, and top-level
-  `arguments` is a `ReferenceError`. Node runs both through the same wrapper.
+  file passed on the command line `__filename`, `__dirname`, `module`, `exports`
+  and `require` are bound (and `this === module.exports`), but top-level
+  `arguments` is a `ReferenceError` where Node reads its 5 wrapper arguments.
 
 - **`util.inspect` does not see a `Symbol.toStringTag` GETTER.** An inherited
   DATA property renders as the `Ctor [Tag] ` prefix, but

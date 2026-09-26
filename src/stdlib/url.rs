@@ -375,13 +375,25 @@ fn normalize_path(path: &str) -> String {
 
 /// `new URL(input[, base])`.
 pub fn construct(args: &[Value]) -> Result<Value, String> {
-    let input = arg_str(args, 0);
+    // Both arguments go through ToString, so an object's own `toString` is
+    // what gets parsed (`new URL('x', { toString() { return 'http://a/' } })`).
+    let to_str = |v: &Value| {
+        crate::host::to_string_value(v).map(|s| crate::host::with_host(|h| h.str_of(&s)))
+    };
+    let input = match args.first() {
+        Some(v) => to_str(v)?,
+        None => "undefined".to_string(),
+    };
+    // An explicit `undefined` base is no base at all.
+    let base = match args.get(1) {
+        Some(Value::Undef) | None => None,
+        Some(v) => Some(to_str(v)?),
+    };
     let parts = parse_absolute(&input)
         .or_else(|| {
             // A base makes a relative input absolute (path replacement only).
-            if args.len() > 1 {
-                let base = arg_str(args, 1);
-                parse_absolute(&base).map(|mut b| {
+            if let Some(base) = &base {
+                parse_absolute(base).map(|mut b| {
                     // Split the RELATIVE reference's own query/fragment off first;
                     // they replace the base's, they do not append to its path.
                     let mut rest = input.as_str();
@@ -427,8 +439,14 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
         // `code === 'ERR_INVALID_URL'`; the input is exposed as `err.input`, not
         // appended to the text. `url_legacy::invalid_url` was already emitting
         // the current form — this site was the one still hardcoding an older one.
+        // node also hangs the input (and the base, when one was passed) off the
+        // error as `err.input` / `err.base`.
         .ok_or_else(|| {
-            crate::host::plain_coded_error("TypeError", "ERR_INVALID_URL", "Invalid URL")
+            let mut fields = vec![("input", input.as_str())];
+            if let Some(b) = &base {
+                fields.push(("base", b.as_str()));
+            }
+            crate::host::plain_coded_error_with("TypeError", "ERR_INVALID_URL", "Invalid URL", &fields)
         })?;
     Ok(build(&parts))
 }

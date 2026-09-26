@@ -229,7 +229,7 @@ fn fail(msg: &str) -> ExitCode {
 /// a code one of them assigns is the one the process leaves with.
 fn fail_program(msg: &str) -> ExitCode {
     let code = nodejs::exit_code_after_failure();
-    eprintln!("node: {msg}");
+    eprintln!("node: {}", nodejs::host::plain_error_text(msg));
     ExitCode::from((code & 0xff) as u8)
 }
 

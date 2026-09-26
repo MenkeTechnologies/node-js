@@ -3165,6 +3165,57 @@ pub fn plain_coded_error(class: &str, code: &str, msg: &str) -> String {
     format!("{class}: {CODE_MARK}{code}\u{1}{msg}")
 }
 
+/// Marks the start of the extra string own properties a
+/// [`plain_coded_error_with`] error carries after its message.
+pub const FIELDS_MARK: char = '\u{2}';
+
+/// [`plain_coded_error`] plus extra enumerable string own properties, set after
+/// `code` in the order given — `new URL('x', 'nope')` throws with
+/// `Object.keys(e)` reading `["code","input","base"]`.
+///
+/// Each field is `key\u{3}<byte length>\u{3}value`, so a value (a URL input is
+/// arbitrary user text) may carry any character, the separators included.
+pub fn plain_coded_error_with(class: &str, code: &str, msg: &str, fields: &[(&str, &str)]) -> String {
+    let mut s = plain_coded_error(class, code, msg);
+    s.push(FIELDS_MARK);
+    for (k, v) in fields {
+        s.push_str(&format!("{k}\u{3}{}\u{3}{v}", v.len()));
+    }
+    s
+}
+
+/// An error string as a person reads it: `TypeError: Invalid URL`, with the
+/// internal code and field markers of [`plain_coded_error`] /
+/// [`plain_coded_error_with`] removed. An uncaught native error is printed
+/// from its string, and printed the wire format (`\u{1}code:ERR_INVALID_URL…`).
+pub fn plain_error_text(e: &str) -> String {
+    let Some(i) = e.find(CODE_MARK) else {
+        return e.to_string();
+    };
+    let (head, rest) = e.split_at(i);
+    match rest[CODE_MARK.len()..].split_once('\u{1}') {
+        Some((_, m)) => format!("{head}{}", split_error_fields(m).0),
+        None => e.to_string(),
+    }
+}
+
+/// Split a [`plain_coded_error_with`] message back into the message and its
+/// fields. A message with no field mark comes back whole with no fields.
+pub fn split_error_fields(msg: &str) -> (&str, Vec<(&str, &str)>) {
+    let Some((head, mut rest)) = msg.split_once(FIELDS_MARK) else {
+        return (msg, Vec::new());
+    };
+    let mut fields = Vec::new();
+    while let Some((k, tail)) = rest.split_once('\u{3}') {
+        let Some((len, tail)) = tail.split_once('\u{3}') else { break };
+        let Ok(len) = len.parse::<usize>() else { break };
+        let Some(v) = tail.get(..len) else { break };
+        fields.push((k, v));
+        rest = &tail[len..];
+    }
+    (head, fields)
+}
+
 /// `TypeError [ERR_INVALID_ARG_TYPE]: The "<name>" <kind> must be of type
 /// <expected>. Received …` — Node's single most common argument rejection.
 pub fn invalid_arg_type(name: &str, kind: &str, expected: &str, v: &Value) -> String {
