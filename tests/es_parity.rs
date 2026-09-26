@@ -379,6 +379,36 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn primitive_prototype_methods_brand_check_their_receiver() {
+    // `Number.prototype.valueOf()` used to overflow the stack and abort; the
+    // prototypes of Number/String/Boolean are wrappers of +0 / "" / false.
+    let src = r#"
+        const probe = (f) => { try { return f(); } catch (e) { return e.constructor.name + ": " + e.message; } };
+        console.log(probe(() => Number.prototype.toFixed.call({})));
+        console.log(probe(() => Number.prototype.valueOf.call("5")));
+        console.log(probe(() => Boolean.prototype.toString.call(1)));
+        console.log(probe(() => String.prototype.valueOf.call({})));
+        console.log(probe(() => BigInt.prototype.toString.call(1)));
+        console.log(probe(() => BigInt.prototype.valueOf()));
+        console.log(Number.prototype.valueOf(), JSON.stringify(String.prototype.toString()),
+                    Boolean.prototype.valueOf(), Number.prototype.toFixed(2));
+        console.log(Number.prototype.toString.call(Object(7), 2), String.prototype.valueOf.call(Object("s")),
+                    BigInt.prototype.toString.call(Object(5n)), Number.prototype.toString.call(255, 16));
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError: Number.prototype.toFixed requires that 'this' be a Number\n\
+         TypeError: Number.prototype.valueOf requires that 'this' be a Number\n\
+         TypeError: Boolean.prototype.toString requires that 'this' be a Boolean\n\
+         TypeError: String.prototype.valueOf requires that 'this' be a String\n\
+         TypeError: BigInt.prototype.toString requires that 'this' be a BigInt\n\
+         TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt\n\
+         0 \"\" false 0.00\n\
+         111 s 5 ff"
+    );
+}
+
+#[test]
 fn buffer_alloc_validates_size() {
     // A negative, NaN or too-large size is ERR_OUT_OF_RANGE (an integer past
     // 2^32 printed with `_` separators); a non-number is ERR_INVALID_ARG_TYPE.

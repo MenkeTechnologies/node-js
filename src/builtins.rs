@@ -3029,6 +3029,52 @@ fn nullish_receiver_error(ctor: &str, method: &str, recv: &str) -> Option<String
     })
 }
 
+/// Whether `<ctor>.prototype.<method>` begins with a `this<Type>Value` brand
+/// check (21.1.3, 20.3.3, 22.1.3.29/.35, 21.2.3). Every `Number.prototype`
+/// method does; of `String.prototype` only `toString`/`valueOf` do — the rest
+/// are generic and coerce their receiver with `ToString`.
+fn is_brand_checked_primitive_method(ctor: &str, method: &str) -> bool {
+    match ctor {
+        "Number" => matches!(
+            method,
+            "toString" | "toLocaleString" | "valueOf" | "toFixed" | "toExponential" | "toPrecision"
+        ),
+        "BigInt" => matches!(method, "toString" | "toLocaleString" | "valueOf"),
+        "String" | "Boolean" => matches!(method, "toString" | "valueOf"),
+        _ => false,
+    }
+}
+
+/// `this<Type>Value(recv)` for `ctor` ∈ Number/String/Boolean/BigInt: the
+/// primitive itself, the primitive a wrapper boxes, or — for the three
+/// prototypes that are themselves wrappers (21.1.3, 22.1.3, 20.3.3) — the
+/// prototype's own `+0` / `""` / `false`. `None` is the TypeError case.
+fn this_primitive_value(ctor: &str, recv: &Value) -> Option<Value> {
+    let expected = match ctor {
+        "Number" => "number",
+        "String" => "string",
+        "Boolean" => "boolean",
+        "BigInt" => "bigint",
+        _ => return None,
+    };
+    let is_expected = |v: &Value| with_host(|h| h.type_of(v)) == expected;
+    if is_expected(recv) {
+        return Some(recv.clone());
+    }
+    if let Some(prim) = wrapped_primitive(recv).filter(is_expected) {
+        return Some(prim);
+    }
+    if with_host(|h| h.intrinsic_proto_ctor(recv) == Some(ctor)) {
+        return match ctor {
+            "Number" => Some(Value::Float(0.0)),
+            "String" => Some(with_host(|h| h.new_str(""))),
+            "Boolean" => Some(Value::Bool(false)),
+            _ => None,
+        };
+    }
+    None
+}
+
 pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result<Value, String> {
     let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
     // A prototype ACCESSOR installed by `ensure_ctor_proto`: it reads or writes
@@ -3104,6 +3150,21 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
             }
         };
         return Ok(with_host(|h| h.new_str(s)));
+    }
+    // The methods that read their receiver through `thisNumberValue` /
+    // `thisBooleanValue` / `thisStringValue` / `thisBigIntValue` accept only the
+    // primitive, its wrapper, or the prototype object (which carries the zero
+    // value) — anything else is a TypeError naming the method. Unchecked,
+    // `Number.prototype.valueOf.call({})` answered `{}`, `toFixed.call({})`
+    // reported "toFixed is not a function", and `Number.prototype.valueOf()`
+    // recursed through the generic conversion until the stack overflowed.
+    if is_brand_checked_primitive_method(ctor, method) {
+        let Some(prim) = this_primitive_value(ctor, recv) else {
+            return Err(format!(
+                "TypeError: {ctor}.prototype.{method} requires that 'this' be a {ctor}"
+            ));
+        };
+        return host::call_method(&prim, method, args);
     }
     // A primitive wrapper's `toString`/`valueOf`/`toLocaleString`: unwrap and
     // answer as the boxed primitive does. `Number.prototype.toString.call(5)`
