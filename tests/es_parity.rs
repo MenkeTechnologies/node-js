@@ -406,6 +406,42 @@ fn buffer_alloc_validates_size() {
 }
 
 #[test]
+fn path_methods_validate_their_arguments() {
+    // Each method names the parameter node's lib/path.js validates, in node's
+    // order; resolve stops at the argument that settles the result, so a bad
+    // value to its left is never examined. A function is described by name.
+    let src = r#"
+        const p = require("path");
+        for (const f of [() => p.join("a", 1), () => p.resolve("a", 2), () => p.resolve(1, "/a"),
+                         () => p.win32.resolve(1, "C:\\a"), () => p.relative("a", 2),
+                         () => p.basename(1, 2), () => p.dirname(), () => p.format(null),
+                         () => p.format([]), () => p.matchesGlob("a", 1),
+                         () => typeof p.toNamespacedPath(1), () => p.join(function foo() {})]) {
+            try { console.log(f()); }
+            catch (e) { console.log(e.code, e.message); }
+        }
+    "#;
+    let t = "ERR_INVALID_ARG_TYPE The";
+    assert_eq!(
+        run(src),
+        format!(
+            "{t} \"path\" argument must be of type string. Received type number (1)\n\
+             {t} \"paths[1]\" argument must be of type string. Received type number (2)\n\
+             /a\n\
+             C:\\a\n\
+             {t} \"to\" argument must be of type string. Received type number (2)\n\
+             {t} \"suffix\" argument must be of type string. Received type number (2)\n\
+             {t} \"path\" argument must be of type string. Received undefined\n\
+             {t} \"pathObject\" argument must be of type object. Received null\n\
+             {t} \"pathObject\" argument must be of type object. Received an instance of Array\n\
+             {t} \"pattern\" argument must be of type string. Received type number (1)\n\
+             number\n\
+             {t} \"path\" argument must be of type string. Received function foo"
+        )
+    );
+}
+
+#[test]
 fn regex_reference_to_an_unset_group_matches_empty() {
     // Forward references, a group skipped by `?`, a group from the other
     // alternative, and a named forward reference all match the empty string.

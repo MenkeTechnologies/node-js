@@ -14,7 +14,7 @@
 //! are identical — only the intermediate index values differ on astral input.
 
 use super::arg_str;
-use crate::host::with_host;
+use crate::host::{invalid_arg_type, with_host};
 use fusevm::Value;
 use indexmap::IndexMap;
 
@@ -72,7 +72,86 @@ pub fn constant(flavor: Flavor, name: &str) -> Option<Value> {
     }
 }
 
+/// `lib/path.js`'s argument validation, run before any work and in the same
+/// order node runs it, so the first bad argument is the one named.
+///
+/// Every method takes strings (`validateString`), except `format` (an object,
+/// `validateObject`) and `toNamespacedPath` (anything; a non-string comes back
+/// unchanged, handled at its call site). `basename` checks its suffix before its
+/// path, and only when the suffix is not `undefined`. `resolve` walks its
+/// arguments right to left and stops at the first one that settles the result —
+/// posix: an absolute path; win32: an absolute path carrying a device (`C:\`,
+/// `\\server\share`) — so an argument to the left of that is never looked at
+/// (`path.resolve(1, '/a')` is `'/a'` in node).
+fn validate_args(flavor: Flavor, method: &str, args: &[Value]) -> Result<(), String> {
+    let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Undef);
+    let string = |i: usize, name: &str| -> Result<(), String> {
+        let v = arg(i);
+        if with_host(|h| h.type_of(&v)) == "string" {
+            Ok(())
+        } else {
+            Err(invalid_arg_type(name, "argument", "string", &v))
+        }
+    };
+    match method {
+        "join" => (0..args.len()).try_for_each(|i| string(i, "path")),
+        "resolve" => {
+            for i in (0..args.len()).rev() {
+                string(i, &format!("paths[{i}]"))?;
+                let p = chars(&with_host(|h| h.str_of(&args[i])));
+                let settles = match flavor {
+                    Flavor::Posix => p.first() == Some(&'/'),
+                    Flavor::Win32 => {
+                        let unc = p.len() > 1 && flavor.is_sep(p[0]) && flavor.is_sep(p[1]);
+                        let drive_abs = p.len() > 2
+                            && is_device_root(p[0])
+                            && p[1] == ':'
+                            && flavor.is_sep(p[2]);
+                        unc || drive_abs
+                    }
+                };
+                if settles {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        "relative" => string(0, "from").and_then(|_| string(1, "to")),
+        "basename" => {
+            if !matches!(arg(1), Value::Undef) {
+                string(1, "suffix")?;
+            }
+            string(0, "path")
+        }
+        "matchesGlob" => string(0, "path").and_then(|_| string(1, "pattern")),
+        "format" => {
+            let v = arg(0);
+            let is_object = with_host(|h| {
+                !h.is_null(&v)
+                    && h.type_of(&v) == "object"
+                    && !matches!(h.get(&v), Some(crate::host::JsObj::Array(_)))
+            });
+            if is_object {
+                Ok(())
+            } else {
+                Err(invalid_arg_type("pathObject", "argument", "object", &v))
+            }
+        }
+        "normalize" | "dirname" | "extname" | "isAbsolute" | "parse" => string(0, "path"),
+        _ => Ok(()),
+    }
+}
+
 pub fn call(flavor: Flavor, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if let Err(e) = validate_args(flavor, method, args) {
+        return Some(Err(e));
+    }
+    if matches!(method, "toNamespacedPath" | "_makeLong") {
+        let v = args.first().cloned().unwrap_or(Value::Undef);
+        if with_host(|h| h.type_of(&v)) != "string" {
+            return Some(Ok(v));
+        }
+    }
     let parts: Vec<String> = (0..args.len()).map(|i| arg_str(args, i)).collect();
     let s = |v: String| Ok(with_host(|h| h.new_str(v)));
     let one = |i: usize| chars(parts.get(i).map(String::as_str).unwrap_or(""));

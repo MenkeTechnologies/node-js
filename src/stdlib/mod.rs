@@ -1073,8 +1073,8 @@ pub fn instance_call(
 
 /// The `Received …` tail Node appends to an `ERR_INVALID_ARG_TYPE` message
 /// (`internal/errors.js` `determineSpecificType`): `null`/`undefined` verbatim,
-/// a primitive as `type <typeof> (<inspected>)`, an object as
-/// `an instance of <Ctor>`.
+/// a primitive as `type <typeof> (<inspected>)`, a function as
+/// `function <name>`, an object as `an instance of <Ctor>`.
 pub(crate) fn received_desc(v: &Value) -> String {
     with_host(|h| {
         if matches!(v, Value::Undef) {
@@ -1084,7 +1084,13 @@ pub(crate) fn received_desc(v: &Value) -> String {
             return "null".to_string();
         }
         let ty = h.type_of(v);
-        if ty == "object" || ty == "function" {
+        // A callable is named by its own `.name`, never by its constructor:
+        // `determineSpecificType` reports `function foo` (and `function ` for an
+        // anonymous one), where this used to say `an instance of Object`.
+        if ty == "function" {
+            return format!("function {}", h.callable_name(v));
+        }
+        if ty == "object" {
             // `ctor_name` is empty for the builtin shapes (they carry no user
             // class), so fall back to the intrinsic constructor name.
             let name = match h.ctor_name(v) {
