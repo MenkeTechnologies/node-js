@@ -4018,7 +4018,13 @@ impl JsHost {
         let ctor = match &prim {
             Value::Bool(_) => "Boolean",
             Value::Int(_) | Value::Float(_) => "Number",
-            _ => "String",
+            // BigInt and Symbol primitives live on the heap; their boxes are
+            // `[BigInt: 1n]` and `[Symbol: Symbol(s)]`.
+            _ => match self.get(&prim) {
+                Some(JsObj::BigInt(_)) => "BigInt",
+                Some(JsObj::Symbol { .. }) => "Symbol",
+                _ => "String",
+            },
         };
         let head = format!("[{ctor}: {}]", self.inspect_lvl(&prim, indent, st));
         // Extra own properties still print, as `[String: 'ab'] { tag: 1 }`. The
@@ -4214,6 +4220,34 @@ impl JsHost {
                 // pure `&self` read like every other inspect arm.
                 Some(JsObj::Proxy { target, .. }) => {
                     format!("Proxy({})", self.inspect_lvl(target, indent, st))
+                }
+                // `arguments` is backed by an Array but is an ordinary-shaped
+                // exotic to util.inspect: node prints its indices as quoted
+                // keys under the `[Arguments]` tag, `[Arguments] { '0': 1 }`.
+                Some(JsObj::Array(items)) if crate::builtins::is_arguments_h(self, v) => {
+                    if indent as i64 > inspect_indent_limit() {
+                        return "[Arguments]".into();
+                    }
+                    let mut inner: Vec<String> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, x)| format!("'{i}': {}", self.inspect_lvl(x, indent + 2, st)))
+                        .collect();
+                    for k in self.fn_prop_keys(v) {
+                        if k.starts_with("@@") || !self.prop_attrs(v, &k).enumerable {
+                            continue;
+                        }
+                        let val = self.fn_prop(v, &k).unwrap_or(Value::Undef);
+                        inner.push(format!(
+                            "{}: {}",
+                            fmt_key(&k),
+                            self.inspect_lvl(&val, indent + 2, st)
+                        ));
+                    }
+                    if inner.is_empty() {
+                        return "[Arguments] {}".into();
+                    }
+                    self.render_object(&inner, "[Arguments] ", indent, st)
                 }
                 Some(JsObj::Array(items)) => {
                     // Own enumerable non-index string props (e.g. a `str.match(re)`
