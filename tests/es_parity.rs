@@ -379,6 +379,33 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn buffer_alloc_validates_size() {
+    // A negative, NaN or too-large size is ERR_OUT_OF_RANGE (an integer past
+    // 2^32 printed with `_` separators); a non-number is ERR_INVALID_ARG_TYPE.
+    // `Buffer.alloc(2 ** 53)` used to abort the process on the allocation.
+    let src = r#"
+        for (const f of [() => Buffer.alloc(-1), () => Buffer.alloc("x"), () => Buffer.alloc(NaN),
+                         () => Buffer.alloc(2 ** 53), () => Buffer.allocUnsafe(-5e9),
+                         () => Buffer.allocUnsafeSlow("2"), () => Buffer.alloc(1e21)]) {
+            try { f(); console.log("no throw"); }
+            catch (e) { console.log(String(e)); }
+        }
+        console.log(Buffer.alloc(3, "ab").toString(), Buffer.allocUnsafe(2.7).length);
+    "#;
+    let range = "RangeError [ERR_OUT_OF_RANGE]: The value of \"size\" is out of range. \
+                 It must be >= 0 && <= 9007199254740991. Received";
+    let ty = "TypeError [ERR_INVALID_ARG_TYPE]: The \"size\" argument must be of type number. \
+              Received type string";
+    assert_eq!(
+        run(src),
+        format!(
+            "{range} -1\n{ty} ('x')\n{range} NaN\n{range} 9_007_199_254_740_992\n\
+             {range} -5_000_000_000\n{ty} ('2')\n{range} 1e_+21\naba 2"
+        )
+    );
+}
+
+#[test]
 fn regex_reference_to_an_unset_group_matches_empty() {
     // Forward references, a group skipped by `?`, a group from the other
     // alternative, and a named forward reference all match the empty string.

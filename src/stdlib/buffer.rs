@@ -497,11 +497,64 @@ pub fn byte_set(recv: &Value, index: &str, val: &Value) -> bool {
     true
 }
 
+/// `buffer.kMaxLength` — node v26's ceiling on a Buffer's size, 2^53 - 1.
+const K_MAX_LENGTH: f64 = 9_007_199_254_740_991.0;
+
+/// Node's `validateNumber(size, 'size', 0, kMaxLength)`, the check
+/// `Buffer.alloc` / `allocUnsafe` / `allocUnsafeSlow` run before allocating: a
+/// non-number is `ERR_INVALID_ARG_TYPE`, and a negative, too-large or NaN size is
+/// `ERR_OUT_OF_RANGE`. Without it `Buffer.alloc(-1)` and `Buffer.alloc('x')`
+/// quietly returned an empty buffer, and `Buffer.alloc(2 ** 53)` aborted the
+/// process on a failed allocation instead of throwing.
+fn validate_size(args: &[Value]) -> Result<usize, String> {
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    if with_host(|h| h.type_of(&v)) != "number" {
+        return Err(crate::host::invalid_arg_type(
+            "size", "argument", "number", &v,
+        ));
+    }
+    let n = with_host(|h| h.to_number(&v));
+    if n.is_nan() || !(0.0..=K_MAX_LENGTH).contains(&n) {
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!(
+                "The value of \"size\" is out of range. It must be >= 0 && <= {}. Received {}",
+                crate::host::fmt_number(K_MAX_LENGTH),
+                out_of_range_received(n)
+            ),
+        ));
+    }
+    Ok(n as usize)
+}
+
+/// How node's `ERR_OUT_OF_RANGE` shows a numeric input: an integer beyond 2^32
+/// through `addNumericalSeparator` (`_` every three characters from the right,
+/// applied to the printed text, so `1e21` becomes `1e_+21` exactly as in node),
+/// anything else as `inspect` would.
+fn out_of_range_received(n: f64) -> String {
+    let shown = crate::host::fmt_number(n);
+    if n.fract() != 0.0 || n.abs() <= 4_294_967_296.0 {
+        return shown;
+    }
+    let start = usize::from(shown.starts_with('-'));
+    let mut i = shown.len();
+    let mut groups = String::new();
+    while i >= start + 4 {
+        groups = format!("_{}{groups}", &shown[i - 3..i]);
+        i -= 3;
+    }
+    format!("{}{groups}", &shown[..i])
+}
+
 pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "from" => from(args),
         "alloc" => {
-            let n = super::arg_num(args, 0).max(0.0) as usize;
+            let n = match validate_size(args) {
+                Ok(n) => n,
+                Err(e) => return Some(Err(e)),
+            };
             // A string fill repeats to length n; a numeric fill is a single byte.
             // alloc(size[, fill[, encoding]]).
             let pat = if args.len() > 1 {
@@ -524,11 +577,7 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         // `allocUnsafeSlow` differs from `allocUnsafe` only in skipping Node's
         // shared pool — an allocator detail with no observable difference here,
         // where every Buffer already owns its bytes.
-        "allocUnsafe" | "allocUnsafeSlow" => Ok(from_bytes(&vec![
-            0u8;
-            super::arg_num(args, 0).max(0.0)
-                as usize
-        ])),
+        "allocUnsafe" | "allocUnsafeSlow" => validate_size(args).map(|n| from_bytes(&vec![0u8; n])),
         "concat" => concat(args),
         // `Buffer.of(...bytes)` — the `%TypedArray%.of` form: each argument is one
         // byte. Measured: `Buffer.of(1,2,3).toString('hex') === '010203'`,
