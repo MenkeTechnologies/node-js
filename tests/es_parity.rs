@@ -6628,3 +6628,38 @@ fn concat_boxes_a_non_array_receiver_as_one_element() {
         "[ [String: 'ab'], 1 ] [ [Number: 1], 2 ]\n[ { '0': 'a', length: 1 }, 2 ]\n[ 'x', 'y', 3 ]\n[ [Arguments] { '0': 1, '1': 2 }, 9 ] 2\n2 [ 1, <1 empty item>, 3, 4, <1 empty item>, 6 ]"
     );
 }
+
+#[test]
+fn a_circular_json_error_names_the_cycle() {
+    // V8 lists the path from the object the cycle starts at to the key that
+    // closes it — at most two leading steps and the last, `...` between.
+    let src = r#"
+        function t(f) { try { f() } catch (e) { console.log(e.message) } }
+        const a = {}; a.x = { y: [0, {}] }; a.x.y[1].back = a; t(() => JSON.stringify(a));
+        const b = { p: { q: { r: { s: { t: {} } } } } }; b.p.q.r.s.t.u = b.p; t(() => JSON.stringify({ root: b }));
+        class K { constructor() { this.me = this } } t(() => JSON.stringify(new K()));
+        const arr = []; arr.push(arr); t(() => JSON.stringify(arr));
+    "#;
+    assert_eq!(
+        run(src),
+        "Converting circular structure to JSON
+    --> starting at object with constructor 'Object'
+    |     property 'x' -> object with constructor 'Object'
+    |     property 'y' -> object with constructor 'Array'
+    |     index 1 -> object with constructor 'Object'
+    --- property 'back' closes the circle
+Converting circular structure to JSON
+    --> starting at object with constructor 'Object'
+    |     property 'q' -> object with constructor 'Object'
+    |     property 'r' -> object with constructor 'Object'
+    |     ...
+    |     property 't' -> object with constructor 'Object'
+    --- property 'u' closes the circle
+Converting circular structure to JSON
+    --> starting at object with constructor 'K'
+    --- property 'me' closes the circle
+Converting circular structure to JSON
+    --> starting at object with constructor 'Array'
+    --- index 0 closes the circle"
+    );
+}

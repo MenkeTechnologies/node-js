@@ -8671,7 +8671,7 @@ fn apply_to_json(
     holder: &Value,
     key: &str,
     v: &Value,
-    path: &mut Vec<Value>,
+    path: &mut JsonPath,
     rep: Option<&Value>,
 ) -> Result<Value, String> {
     let mut v = v.clone();
@@ -8701,7 +8701,52 @@ fn apply_to_json(
         let k = with_host(|h| h.new_str(key.to_string()));
         v = host::invoke(rep, vec![k, v.clone()], Some(holder.clone()))?;
     }
-    json_walk_children(&v, path, rep)
+    // How `v` was reached from its holder, as V8 names the step in a
+    // circular-structure message: `index 1` under an array, else `property 'k'`.
+    let via = if matches!(with_host(|h| h.get(holder).cloned()), Some(JsObj::Array(_))) {
+        format!("index {key}")
+    } else {
+        format!("property '{key}'")
+    };
+    json_walk_children(&v, path, &via, rep)
+}
+
+/// The objects `JSON.stringify` is inside of, outermost first, each with the
+/// step that reached it from its holder (`property 'x'` / `index 1`).
+type JsonPath = Vec<(String, Value)>;
+
+/// V8's `ConstructCircularStructureErrorMessage`: the cycle from the object it
+/// starts at to the key that closes it. At most the first two and the last one
+/// intermediate step are listed, with `|     ...` standing for the rest.
+fn circular_json_message(path: &JsonPath, start: usize, closing: &str) -> String {
+    const PREFIX: usize = 2;
+    const POSTFIX: usize = 1;
+    let ctor = |v: &Value| -> String {
+        with_host(|h| match h.get(v) {
+            Some(JsObj::Array(_)) if h.proto_of(v).is_none() => "Array".to_string(),
+            _ => match h.ctor_name(v) {
+                n if n.is_empty() => "Object".to_string(),
+                n => n,
+            },
+        })
+    };
+    let line = |i: usize| format!("\n    |     {} -> object with constructor '{}'", path[i].0, ctor(&path[i].1));
+    let mut msg = format!(
+        "Converting circular structure to JSON\n    --> starting at object with constructor '{}'",
+        ctor(&path[start].1)
+    );
+    let prefix_end = path.len().min(start + 1 + PREFIX);
+    for i in start + 1..prefix_end {
+        msg.push_str(&line(i));
+    }
+    if path.len() > prefix_end + POSTFIX {
+        msg.push_str("\n    |     ...");
+    }
+    for i in prefix_end.max(path.len().saturating_sub(POSTFIX))..path.len() {
+        msg.push_str(&line(i));
+    }
+    msg.push_str(&format!("\n    --- {closing} closes the circle"));
+    msg
 }
 
 /// Whether a raw property key of a host object is one `json_str` serializes. The
@@ -8715,28 +8760,29 @@ fn json_visible_key(k: &str) -> bool {
 /// `apply_to_json` for each with this value as the holder.
 fn json_walk_children(
     v: &Value,
-    path: &mut Vec<Value>,
+    path: &mut JsonPath,
+    via: &str,
     rep: Option<&Value>,
 ) -> Result<Value, String> {
     if !matches!(v, Value::Obj(_)) {
         return Ok(v.clone());
     }
     // A value that contains itself has no JSON form.
-    if with_host(|h| path.iter().any(|p| h.strict_eq(p, v))) {
-        return Err(host::type_error("Converting circular structure to JSON"));
+    if let Some(start) = with_host(|h| path.iter().position(|(_, p)| h.strict_eq(p, v))) {
+        return Err(host::type_error(&circular_json_message(path, start, via)));
     }
     // A Proxy owns no property map, so it is snapshotted through its traps into
     // the plain array/object `SerializeJSONArray`/`SerializeJSONObject` describe
     // — which read every member through `[[Get]]`, exactly as the snapshot does.
     if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
         let snap = crate::proxy::json_snapshot(v)?;
-        path.push(v.clone());
-        let out = json_walk_children(&snap, path, rep);
+        path.push((via.to_string(), v.clone()));
+        let out = json_walk_children(&snap, path, via, rep);
         path.pop();
         return out;
     }
     let obj = with_host(|h| h.get(v).cloned());
-    path.push(v.clone());
+    path.push((via.to_string(), v.clone()));
     let out = (|| match obj {
         Some(JsObj::Array(items)) => {
             // Read the elements through the accessor-aware funnel: an index
