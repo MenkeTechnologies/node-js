@@ -10564,24 +10564,31 @@ fn array_method_on(
             Ok(out)
         }
         "concat" => {
-            let mut out = array_items(recv);
-            // A hole in either the receiver or a spreadable argument stays a hole
-            // in the result, at its shifted position.
-            let mut holes = absent_set(recv);
-            let mut sources: Vec<(Value, usize)> = Vec::new();
-            for a in &args {
-                // `Symbol.isConcatSpreadable` (23.1.3.1) decides whether an
-                // argument is spread, overriding `IsArray` in BOTH directions:
-                // a plain array-like opts IN, and an array opts OUT. It was
-                // never consulted, so an array was always spread and an
-                // array-like never was.
+            // `Symbol.isConcatSpreadable` (23.1.3.1) decides whether a value
+            // is spread, overriding `IsArray` in BOTH directions: a plain
+            // array-like opts IN, and an array opts OUT.
+            let spreadable = |a: &Value| -> bool {
                 let flag = get_property(a, "@@isConcatSpreadable").unwrap_or(Value::Undef);
-                let spread = if matches!(flag, Value::Undef) {
+                if matches!(flag, Value::Undef) {
                     matches!(with_host(|h| h.get(a).cloned()), Some(JsObj::Array(_)))
+                        && !is_arguments(a)
                 } else {
                     with_host(|h| h.truthy(&flag))
-                };
-                if !spread {
+                }
+            };
+            // Step 5 iterates `« O » ++ items`, so the receiver takes the same
+            // test: a non-spreadable `this` (`concat.call("ab", 1)`) is ONE
+            // element, its `ToObject` box, not the characters `array_generic`
+            // read out of it. A hole in a spread receiver or argument stays a
+            // hole in the result, at its shifted position.
+            let (mut out, mut holes) = if spreadable(this_value) {
+                (array_items(recv), absent_set(recv))
+            } else {
+                (vec![to_object(this_value)], Default::default())
+            };
+            let mut sources: Vec<(Value, usize)> = Vec::new();
+            for a in &args {
+                if !spreadable(a) {
                     out.push(a.clone());
                     continue;
                 }
