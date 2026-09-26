@@ -6663,3 +6663,36 @@ Converting circular structure to JSON
     --- index 0 closes the circle"
     );
 }
+
+#[test]
+fn typed_array_and_buffer_constructors_validate_through_to_index() {
+    // Lengths and offsets go through ToIndex, with V8's own messages; a
+    // negative length used to give an empty array, a misaligned buffer a view.
+    let src = r#"
+        function t(f) { try { console.log(f()) } catch (e) { console.log(e.name + ': ' + e.message) } }
+        const B = (n) => new ArrayBuffer(n);
+        t(() => new Uint8Array(-1)); t(() => new Uint8Array(-0.5)); t(() => new Uint8Array('2')); t(() => new Uint8Array(2 ** 53));
+        t(() => new ArrayBuffer(-1)); t(() => new ArrayBuffer(4, { maxByteLength: 2 }));
+        t(() => new Uint16Array(B(3))); t(() => new Uint32Array(B(8), 2)); t(() => new Uint16Array(B(4), -2));
+        t(() => new Uint16Array(B(4), 6)); t(() => new Uint8Array(B(4), 2, 5)); t(() => new Uint8Array(B(4), 1, 9.5));
+        t(() => new DataView(B(2), 3)); t(() => new DataView(B(2), 1, 2)); t(() => new DataView(B(4), -1.5));
+    "#;
+    assert_eq!(
+        run(src),
+        "RangeError: Invalid typed array length: -1
+Uint8Array(0) []
+Uint8Array(2) [ 0, 0 ]
+RangeError: Invalid typed array length: 9007199254740992
+RangeError: Invalid array buffer length
+RangeError: Invalid array buffer max length
+RangeError: byte length of Uint16Array should be a multiple of 2
+RangeError: start offset of Uint32Array should be a multiple of 4
+RangeError: Start offset -2 is outside the bounds of the buffer
+RangeError: Start offset 6 is outside the bounds of the buffer
+RangeError: Invalid typed array length: 5
+RangeError: Invalid typed array length: 9.5
+RangeError: Start offset 3 is outside the bounds of the buffer
+RangeError: Invalid DataView length 2
+RangeError: Start offset -1 is outside the bounds of the buffer"
+    );
+}

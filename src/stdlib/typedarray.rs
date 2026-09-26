@@ -13,7 +13,7 @@
 //! node-js has no GC of JS objects, so this is observably correct for the
 //! express dependency tree (object-inspect/qs/side-channel only ever `deref()`).
 
-use crate::host::{with_host, JsObj};
+use crate::host::{fmt_number, with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 
@@ -303,28 +303,72 @@ fn make_view(kind: &str, buf: &Value, byte_off: usize, len: usize) -> Value {
     })
 }
 
+/// ToIntegerOrInfinity (7.1.5): truncation, with NaN as 0.
+fn integer_or_infinity(n: f64) -> f64 {
+    if n.is_nan() {
+        0.0
+    } else {
+        n.trunc() + 0.0
+    }
+}
+
+/// ToIndex (7.1.22): `None` for a negative or above-2^53-1 integer.
+fn to_index(n: f64) -> Option<usize> {
+    let i = integer_or_infinity(n);
+    (0.0..=9_007_199_254_740_991.0)
+        .contains(&i)
+        .then_some(i as usize)
+}
+
+/// Whether a constructor argument is a primitive rather than an Object.
+fn is_primitive(v: &Value) -> bool {
+    match v {
+        Value::Obj(_) => with_host(|h| {
+            matches!(
+                h.get(v),
+                Some(JsObj::Str(_))
+                    | Some(JsObj::Null)
+                    | Some(JsObj::BigInt(_))
+                    | Some(JsObj::Symbol { .. })
+            )
+        }),
+        _ => true,
+    }
+}
+
 /// `new Uint8Array(...)` etc. `ArrayBuffer` is a byte container with only a
 /// `byteLength`.
 pub fn construct(kind: &str, args: &[Value]) -> Result<Value, String> {
     if kind == "ArrayBuffer" {
-        let n = super::arg_num(args, 0).max(0.0) as usize;
+        let n = to_index(super::arg_num(args, 0))
+            .ok_or_else(|| crate::host::range_error("Invalid array buffer length"))?;
+        // `maxByteLength` is read (and validated) before the buffer exists.
+        let max = match args.get(1) {
+            Some(opts) => {
+                crate::builtins::get_property(opts, "maxByteLength").unwrap_or(Value::Undef)
+            }
+            None => Value::Undef,
+        };
+        let max_len = match max {
+            Value::Undef => None,
+            _ => match to_index(with_host(|h| h.to_number(&max))) {
+                Some(m) if m >= n => Some(m),
+                _ => return Err(crate::host::range_error("Invalid array buffer max length")),
+            },
+        };
         let ab = new_array_buffer(n);
         // `new ArrayBuffer(n, { maxByteLength })` is a RESIZABLE buffer, which
         // reports `resizable` and `maxByteLength` and accepts `resize`.
-        if let Some(opts) = args.get(1) {
-            let max = crate::builtins::get_property(opts, "maxByteLength").unwrap_or(Value::Undef);
-            if !matches!(max, Value::Undef) {
-                let m = with_host(|h| h.to_number(&max)).max(0.0) as usize;
-                with_host(|h| {
-                    if let Some(JsObj::Object(p)) = h.get_mut(&ab) {
-                        p.insert("@@maxByteLength".into(), Value::Float(m as f64));
-                        p.insert("maxByteLength".into(), Value::Float(m as f64));
-                        p.insert("resizable".into(), Value::Bool(true));
-                    }
-                    h.hide_prop(&ab, "maxByteLength");
-                    h.hide_prop(&ab, "resizable");
-                });
-            }
+        if let Some(m) = max_len {
+            with_host(|h| {
+                if let Some(JsObj::Object(p)) = h.get_mut(&ab) {
+                    p.insert("@@maxByteLength".into(), Value::Float(m as f64));
+                    p.insert("maxByteLength".into(), Value::Float(m as f64));
+                    p.insert("resizable".into(), Value::Bool(true));
+                }
+                h.hide_prop(&ab, "maxByteLength");
+                h.hide_prop(&ab, "resizable");
+            });
         }
         return Ok(ab);
     }
@@ -340,21 +384,51 @@ pub fn construct(kind: &str, args: &[Value]) -> Result<Value, String> {
                     "Cannot perform Construct on a detached ArrayBuffer",
                 ));
             }
+            // InitializeTypedArrayFromArrayBuffer (23.2.5.1.3), in its order,
+            // with V8's messages: they name the offending number as given.
             let bpe = bytes_per_element(kind);
             let total = buffer_byte_length(first);
-            let off = super::arg_num(args, 1).max(0.0) as usize;
-            if off > total || off % bpe != 0 {
-                return Err(crate::host::range_error(
-                    "start offset of Uint8Array should be a multiple of element size",
-                ));
+            let off_n = super::arg_num(args, 1);
+            let off = to_index(off_n).ok_or_else(|| {
+                crate::host::range_error(&format!(
+                    "Start offset {} is outside the bounds of the buffer",
+                    fmt_number(off_n)
+                ))
+            })?;
+            if off % bpe != 0 {
+                return Err(crate::host::range_error(&format!(
+                    "start offset of {kind} should be a multiple of {bpe}"
+                )));
             }
             let len = match args.get(2) {
-                Some(Value::Undef) | None => (total - off) / bpe,
-                Some(_) => super::arg_num(args, 2).max(0.0) as usize,
+                Some(Value::Undef) | None => {
+                    if total % bpe != 0 {
+                        return Err(crate::host::range_error(&format!(
+                            "byte length of {kind} should be a multiple of {bpe}"
+                        )));
+                    }
+                    if off > total {
+                        return Err(crate::host::range_error(&format!(
+                            "Start offset {off} is outside the bounds of the buffer"
+                        )));
+                    }
+                    (total - off) / bpe
+                }
+                Some(_) => {
+                    let len_n = super::arg_num(args, 2);
+                    let bad = || {
+                        crate::host::range_error(&format!(
+                            "Invalid typed array length: {}",
+                            fmt_number(len_n)
+                        ))
+                    };
+                    let len = to_index(len_n).ok_or_else(bad)?;
+                    if off + len * bpe > total {
+                        return Err(bad());
+                    }
+                    len
+                }
             };
-            if off + len * bpe > total {
-                return Err(crate::host::range_error("Invalid typed array length"));
-            }
             return Ok(make_view(kind, first, off, len));
         }
     }
@@ -394,20 +468,37 @@ pub fn construct_dataview(args: &[Value]) -> Result<Value, String> {
             "First argument to DataView constructor must be an ArrayBuffer",
         ));
     }
+    // 25.3.2.1, with V8's messages, which name the offending value after
+    // ToIntegerOrInfinity (`-1.5` reports as `-1`).
     let total = buffer_byte_length(&buf);
-    let off = super::arg_num(args, 1).max(0.0) as usize;
+    let off_n = super::arg_num(args, 1);
+    let outside = |n: f64| {
+        crate::host::range_error(&format!(
+            "Start offset {} is outside the bounds of the buffer",
+            fmt_number(integer_or_infinity(n))
+        ))
+    };
+    let off = to_index(off_n).ok_or_else(|| outside(off_n))?;
     if off > total {
-        return Err(crate::host::range_error(
-            "Start offset is outside the bounds of the buffer",
-        ));
+        return Err(outside(off_n));
     }
+    let bad_len = |n: f64| {
+        crate::host::range_error(&format!(
+            "Invalid DataView length {}",
+            fmt_number(integer_or_infinity(n))
+        ))
+    };
     let len = match args.get(2) {
         Some(Value::Undef) | None => total - off,
-        Some(_) => super::arg_num(args, 2).max(0.0) as usize,
+        Some(_) => {
+            let len_n = super::arg_num(args, 2);
+            let len = to_index(len_n).ok_or_else(|| bad_len(len_n))?;
+            if off + len > total {
+                return Err(bad_len(len_n));
+            }
+            len
+        }
     };
-    if off + len > total {
-        return Err(crate::host::range_error("Invalid DataView length"));
-    }
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("DataView"));
