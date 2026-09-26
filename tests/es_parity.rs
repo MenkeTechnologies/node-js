@@ -6717,3 +6717,11 @@ Int8Array(3) [ 0, 5, 0 ]
 Uint8Array(2) [ 0, 3 ]"
     );
 }
+
+#[test]
+fn identifiers_and_whitespace_follow_unicode() {
+    // IdentifierStart is any Unicode letter, and the BOM, NBSP and the other
+    // Zs spaces are WhiteSpace; each used to be `unexpected character`.
+    let src = "\u{FEFF}const\u{A0}x = 1;\u{2028}let Δx = 2, 名前 = 3; class Ü { #é = 4; get() { return this.#é } }\nconsole.log(x, Δx, 名前, new Ü().get(), Ü.name)";
+    assert_eq!(run(src), "1 2 3 4 Ü");
+}

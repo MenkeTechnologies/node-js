@@ -108,7 +108,19 @@ impl Lexer {
                     self.bump();
                     self.pending_newline = true;
                 }
-                Some(c) if c == ' ' || c == '\t' || c == '\r' => {
+                // LS and PS are line terminators (12.3) just as LF is.
+                Some('\u{2028}' | '\u{2029}') => {
+                    self.bump();
+                    self.pending_newline = true;
+                }
+                // WhiteSpace (12.2): TAB, VT, FF, the BOM and every Zs space.
+                Some(
+                    ' ' | '\t' | '\r' | '\u{0B}' | '\u{0C}' | '\u{FEFF}' | '\u{A0}' | '\u{1680}'
+                    | '\u{2000}'..='\u{200A}'
+                    | '\u{202F}'
+                    | '\u{205F}'
+                    | '\u{3000}',
+                ) => {
                     self.bump();
                 }
                 Some('/') if self.peek_at(1) == Some('/') => {
@@ -245,14 +257,17 @@ impl Lexer {
         if c == '`' {
             return self.scan_template();
         }
-        if c.is_ascii_alphabetic() || c == '_' || c == '$' {
+        // IdentifierStart (12.7) is any Unicode letter, not only ASCII:
+        // `const é = 1` and `let Δx` are ordinary names. `scan_name` already
+        // continues on any alphanumeric.
+        if c.is_alphabetic() || c == '_' || c == '$' {
             return self.scan_name();
         }
         // Private class member (`#name`): scanned as an identifier keeping the `#`.
         if c == '#'
             && self
                 .peek_at(1)
-                .map(|d| d.is_ascii_alphabetic() || d == '_' || d == '$')
+                .map(|d| d.is_alphabetic() || d == '_' || d == '$')
                 .unwrap_or(false)
         {
             return self.scan_name();
