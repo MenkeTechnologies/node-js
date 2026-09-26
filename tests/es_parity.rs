@@ -379,6 +379,26 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn class_body_binding_of_the_class_name_is_immutable() {
+    // The class body's own binding (15.7.14 step 8) is immutable — from a static
+    // initializer, a method, a class expression's inner name, `++`, `+=` and a
+    // destructuring target. The OUTER declaration binding stays mutable.
+    let src = r#"
+        const probe = (f) => { try { return String(f()); } catch (e) { return e.constructor.name + ": " + e.message; } };
+        console.log(probe(() => { class E { static z = (E = 1) } return E; }));
+        console.log(probe(() => { class C { m() { C = 1 } } new C().m(); }));
+        console.log(probe(() => { const K = class Inner { static f() { Inner = 2 } }; K.f(); }));
+        console.log(probe(() => { class C { static inc() { C++ } } C.inc(); }));
+        console.log(probe(() => { class C { static s() { C += 1 } } C.s(); }));
+        console.log(probe(() => { class C { static s() { [C] = [1] } } C.s(); }));
+        console.log(probe(() => { class C {} C = 1; return C; }));
+        console.log(probe(() => { let C = class { static f() { C = 3 } }; C.f(); return C; }));
+    "#;
+    let c = "TypeError: Assignment to constant variable.";
+    assert_eq!(run(src), format!("{c}\n{c}\n{c}\n{c}\n{c}\n{c}\n1\n3"));
+}
+
+#[test]
 fn derived_constructor_this_is_unbound_until_super() {
     // `this` before super(), falling off the end without super(), a default
     // parameter reading `this`, a second super(), a primitive return; and the

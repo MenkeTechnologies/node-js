@@ -2144,7 +2144,7 @@ impl Compiler {
         if let Some(name) = &node.name {
             self.emit_push_scope(b);
             b.emit(Op::Dup, 0); // [class, class]
-            self.declare_as(b, &Expr::Ident(name.clone()), BindMode::Lexical); // [class]
+            self.declare_as(b, &Expr::Ident(name.clone()), BindMode::Const); // [class]
         }
 
         // `ClassDefinitionEvaluation` (15.7.14) installs every method and
