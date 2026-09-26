@@ -9031,6 +9031,19 @@ impl JsHost {
         if let Some(p) = self.native_protos.get(ctor) {
             return Some(p.clone());
         }
+        // `Buffer` and the typed-array kinds belong to the chain
+        // `ensure_native_protos` builds. Building one of them here first hung it
+        // straight off `Object.prototype` AND registered it, which made that
+        // chain's own `contains_key("Buffer")` guard skip the build for the rest
+        // of the process: after `Buffer.from([1])`, `Buffer.prototype instanceof
+        // Uint8Array` read false.
+        if ctor == "Buffer"
+            || ctor == "TypedArray"
+            || crate::stdlib::typedarray::ELEMENT_KINDS.contains(&ctor)
+        {
+            self.ensure_native_protos();
+            return self.native_protos.get(ctor).cloned();
+        }
         let (own, emitter) = crate::stdlib::instance_method_lists(ctor);
         // A class can carry accessors and no methods at all
         // (`AsymmetricKeyObject` is only `asymmetricKeyType` and

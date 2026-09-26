@@ -379,6 +379,21 @@ fn regex_backrefs_and_lookaround() {
 // Expected lines captured from node v26.10.0.
 
 #[test]
+fn buffer_prototype_chain_survives_a_buffer_built_first() {
+    // Building a Buffer before anything touched Uint8Array registered a
+    // Buffer.prototype hung off Object.prototype, and the typed-array chain
+    // was never built for the rest of the process.
+    let src = r#"
+        Buffer.from([1]);
+        const TAp = Object.getPrototypeOf(Uint8Array.prototype);
+        console.log(Buffer.prototype instanceof Uint8Array, Object.getPrototypeOf(Buffer.prototype) === Uint8Array.prototype);
+        console.log(Object.getPrototypeOf(TAp) === Object.prototype, TAp.hasOwnProperty('every'), Uint8Array.prototype.hasOwnProperty('BYTES_PER_ELEMENT'));
+        console.log(new Int32Array([1, 2]).map(x => x).constructor.name);
+    "#;
+    assert_eq!(run(src), "true true\ntrue true true\nInt32Array");
+}
+
+#[test]
 fn function_prototype_methods_on_a_callable_proxy() {
     // Each of these overflowed the stack and aborted the process: the method
     // was re-read off the proxy, which resolved to the same thunk.
