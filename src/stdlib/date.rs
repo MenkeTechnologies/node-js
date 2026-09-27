@@ -134,7 +134,10 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
                 with_host(|h| h.to_number(a))
             }
         }
-        // (year, month[, day, hours, minutes, seconds, ms]) — interpreted as UTC.
+        // (year, month[, day, hours, minutes, seconds, ms]) — LOCAL time
+        // (21.4.2.1 step 5.k: `UTC(MakeDate(...))`). It was taken as UTC, so
+        // under `TZ=America/New_York` `new Date(2024, 0, 31)` read back as
+        // 19:00 on the 30th, and `new Date(99, 0).getFullYear()` as 1998.
         _ => {
             let n = |i: usize, dflt: f64| {
                 args.get(i)
@@ -143,10 +146,10 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
             };
             let mut year = n(0, f64::NAN);
             // Years 0..99 map to 1900..1999 per the spec.
-            if (0.0..=99.0).contains(&year) {
-                year += 1900.0;
+            if (0.0..=99.0).contains(&year.trunc()) {
+                year = year.trunc() + 1900.0;
             }
-            utc_from_fields(
+            utc_from_local(utc_from_fields(
                 year,
                 n(1, 0.0),
                 n(2, 1.0),
@@ -154,7 +157,7 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
                 n(4, 0.0),
                 n(5, 0.0),
                 n(6, 0.0),
-            )
+            ))
         }
     };
     // TimeClip (21.4.1.31): a value beyond ±8.64e15 ms is not a representable
@@ -175,8 +178,8 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
                     .unwrap_or(dflt)
             };
             let mut year = n(0, f64::NAN);
-            if (0.0..=99.0).contains(&year) {
-                year += 1900.0;
+            if (0.0..=99.0).contains(&year.trunc()) {
+                year = year.trunc() + 1900.0;
             }
             Ok(Value::Float(utc_from_fields(
                 year,
@@ -301,10 +304,12 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
         "getUTCMilliseconds" => Value::Float(field(ms, Field::Millis)),
         // 21.4.4.7: minutes WEST of UTC, so the sign is the opposite of the
         // offset itself — `TZ=America/Detroit` reports 300, not -300.
+        // Computed as `(t - LocalTime(t)) / msPerMinute`, as written, so a zero
+        // offset is +0: negating it printed `-0` under `TZ=UTC`.
         "getTimezoneOffset" => Value::Float(if ms.is_nan() {
             f64::NAN
         } else {
-            -zone_offset_ms(ms) / 60_000.0
+            (ms - local_ms(ms)) / 60_000.0
         }),
         "toTimeString" => with_host(|h| h.new_str(time_string(ms))),
         "setTime" => Value::Float(store_ms(recv, time_clip(super::arg_num(_args, 0)))),
@@ -415,9 +420,13 @@ fn field(ms: f64, which: Field) -> f64 {
 /// Assemble a UTC time value from broken-down fields (with month/day overflow
 /// normalized the way JS does, e.g. month 12 rolls into the next year).
 fn utc_from_fields(y: f64, mo: f64, d: f64, h: f64, mi: f64, s: f64, ms: f64) -> f64 {
-    if [y, mo, d, h, mi, s, ms].iter().any(|v| v.is_nan()) {
+    // MakeDay / MakeTime (21.4.1.28-29): a non-finite field is NaN, and every
+    // field is `ToIntegerOrInfinity`d first — so `new Date(2024, 0, 1, 1.5)` is
+    // 01:00, not 01:30, and `Date.UTC(1970, 0, 1, 0, 0, 0, 0.9)` is 0.
+    if [y, mo, d, h, mi, s, ms].iter().any(|v| !v.is_finite()) {
         return f64::NAN;
     }
+    let [y, mo, d, h, mi, s, ms] = [y, mo, d, h, mi, s, ms].map(f64::trunc);
     // Normalize month into 0..11, carrying into the year.
     let total_months = y as i64 * 12 + mo as i64;
     let year = total_months.div_euclid(12);
@@ -722,96 +731,431 @@ fn iso_string(ms: f64) -> String {
     )
 }
 
-/// Parse a date string. Supports the two forms HTTP code produces: ISO-8601
-/// (`2015-10-21T07:28:00.000Z` / date-only `2015-10-21`) and the RFC-1123 /
-/// IMF-fixdate header form (`Wed, 21 Oct 2015 07:28:00 GMT`). Returns NaN on any
-/// input that does not match — the JS "Invalid Date" contract.
+/// Parse a date string: the Date Time String Format first ([`parse_iso`]),
+/// then the free-form fallback every engine keeps ([`parse_legacy`]). NaN on
+/// anything neither accepts — the "Invalid Date" contract.
+///
+/// The string is not trimmed first: V8 hands `" 2024-01-01 "` to the fallback,
+/// which reads it as LOCAL midnight rather than the format's UTC one.
 fn parse_str(s: &str) -> f64 {
-    let s = s.trim();
-    if let Some(ms) = parse_iso(s) {
-        return ms;
-    }
-    if let Some(ms) = parse_rfc1123(s) {
-        return ms;
-    }
-    f64::NAN
+    time_clip(parse_iso(s).or_else(|| parse_legacy(s)).unwrap_or(f64::NAN))
 }
 
-/// ISO-8601: `YYYY-MM-DD[THH:MM:SS[.sss]][Z]` (a bare date is treated as UTC
-/// midnight, matching modern V8).
+/// The Date Time String Format (21.4.1.32): `YYYY[-MM[-DD]]`, optionally
+/// followed by `THH:mm[:ss[.sss]]`, optionally followed by a zone — `Z` or
+/// `±HH:mm` (V8 also takes `±HHmm`). The year may be the expanded `±YYYYYY`.
+///
+/// A date-only form is UTC; a date-time form WITHOUT a zone is LOCAL time
+/// (21.4.3.2 via the format's own note), which is why `"2024-01-01T10:20"` is
+/// 15:20Z under `TZ=America/New_York`. The offset used to be dropped entirely:
+/// `"…30.123+01:00"` read the fraction as `123` and ignored the rest, and
+/// `"…00+05:30"` failed to parse. Fields out of range (`T25:00`, `T10:60`, a
+/// month of 13) are NaN, as in V8; a day up to 31 rolls over as V8's does
+/// (`2023-02-29` is March 1).
 fn parse_iso(s: &str) -> Option<f64> {
-    let (date, time) = match s.split_once(['T', ' ']) {
-        Some((d, t)) => (d, Some(t)),
-        None => (s, None),
-    };
-    let dp: Vec<&str> = date.split('-').collect();
-    if dp.len() != 3 {
-        return None;
-    }
-    let y: i64 = dp[0].parse().ok()?;
-    let mo: i64 = dp[1].parse().ok()?;
-    let d: i64 = dp[2].parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
-        return None;
-    }
-    let (mut h, mut mi, mut sec, mut milli) = (0i64, 0i64, 0i64, 0i64);
-    if let Some(t) = time {
-        let t = t.trim_end_matches('Z');
-        let (hms, frac) = match t.split_once('.') {
-            Some((a, b)) => (a, Some(b)),
-            None => (t, None),
-        };
-        let tp: Vec<&str> = hms.split(':').collect();
-        if tp.is_empty() {
+    let b = s.as_bytes();
+    let mut i = 0;
+    // `n` ASCII digits at the cursor, as a number.
+    let digits = |i: &mut usize, n: usize| -> Option<i64> {
+        let end = *i + n;
+        let part = b.get(*i..end)?;
+        if !part.iter().all(u8::is_ascii_digit) {
             return None;
         }
-        h = tp[0].parse().ok()?;
-        mi = tp.get(1).map(|v| v.parse().ok()).unwrap_or(Some(0))?;
-        sec = tp.get(2).map(|v| v.parse().ok()).unwrap_or(Some(0))?;
-        if let Some(fr) = frac {
-            let fr: String = fr.chars().take(3).collect();
-            let padded = format!("{fr:0<3}");
-            milli = padded.parse().ok()?;
+        *i = end;
+        std::str::from_utf8(part).ok()?.parse().ok()
+    };
+    let year = match b.first()? {
+        sign @ (b'+' | b'-') => {
+            i = 1;
+            let y = digits(&mut i, 6)?;
+            // `-000000` is the one spelling the format forbids.
+            if *sign == b'-' && y == 0 {
+                return None;
+            }
+            if *sign == b'-' {
+                -y
+            } else {
+                y
+            }
+        }
+        _ => digits(&mut i, 4)?,
+    };
+    let (mut month, mut day) = (1, 1);
+    if b.get(i) == Some(&b'-') {
+        i += 1;
+        month = digits(&mut i, 2)?;
+        if b.get(i) == Some(&b'-') {
+            i += 1;
+            day = digits(&mut i, 2)?;
         }
     }
-    let days = days_from_civil(y, mo - 1, d);
-    Some(
-        days as f64 * MS_PER_DAY
-            + h as f64 * 3_600_000.0
-            + mi as f64 * 60_000.0
-            + sec as f64 * 1000.0
-            + milli as f64,
-    )
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let date = days_from_civil(year, month - 1, day) as f64 * MS_PER_DAY;
+    // A date-only form, bare or with `Z`, is UTC.
+    match b.get(i) {
+        None => return Some(date),
+        Some(b'Z' | b'z') if i + 1 == b.len() => return Some(date),
+        Some(b'T' | b't' | b' ') => i += 1,
+        Some(_) => return None,
+    }
+    let h = digits(&mut i, 2)?;
+    if b.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    let mi = digits(&mut i, 2)?;
+    let (mut sec, mut milli) = (0, 0);
+    if b.get(i) == Some(&b':') {
+        i += 1;
+        sec = digits(&mut i, 2)?;
+        if b.get(i) == Some(&b'.') {
+            i += 1;
+            let start = i;
+            while b.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            // Only the milliseconds are kept; further digits are truncated.
+            let frac = &s[start..i.min(start + 3)];
+            milli = format!("{frac:0<3}").parse().ok()?;
+        }
+    }
+    // `24:00` is the end of the day and nothing past it is.
+    if h > 24 || mi > 59 || sec > 59 || (h == 24 && (mi, sec, milli) != (0, 0, 0)) {
+        return None;
+    }
+    let wall = date
+        + h as f64 * 3_600_000.0
+        + mi as f64 * 60_000.0
+        + sec as f64 * 1000.0
+        + milli as f64;
+    let offset = match b.get(i) {
+        None => return Some(utc_from_local(wall)),
+        Some(b'Z' | b'z') if i + 1 == b.len() => 0.0,
+        Some(sign @ (b'+' | b'-')) => {
+            let sign = if *sign == b'-' { -1.0 } else { 1.0 };
+            i += 1;
+            let oh = digits(&mut i, 2)?;
+            if b.get(i) == Some(&b':') {
+                i += 1;
+            }
+            let om = digits(&mut i, 2)?;
+            if i != b.len() || oh > 23 || om > 59 {
+                return None;
+            }
+            sign * (oh as f64 * 3_600_000.0 + om as f64 * 60_000.0)
+        }
+        Some(_) => return None,
+    };
+    Some(wall - offset)
 }
 
-/// RFC-1123 / IMF-fixdate: `Wed, 21 Oct 2015 07:28:00 GMT`.
-fn parse_rfc1123(s: &str) -> Option<f64> {
-    // Drop an optional leading weekday token (`Wed,`).
-    let s = match s.split_once(", ") {
-        Some((_, rest)) => rest,
-        None => s,
+/// One token of a free-form date string, as V8's `DateStringTokenizer` splits
+/// it: a run of digits (with its length, which decides how an offset reads), a
+/// run of letters, one other character, or white space. A parenthesized
+/// comment — `(Eastern Standard Time)` — is skipped whole.
+#[derive(Clone, Copy, PartialEq)]
+enum Tok<'a> {
+    Num(i64, usize),
+    Word(&'a str),
+    Sym(u8),
+    Space,
+    End,
+}
+
+struct Toks<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl<'a> Toks<'a> {
+    fn next(&mut self) -> Tok<'a> {
+        let b = self.s.as_bytes();
+        let Some(&c) = b.get(self.i) else {
+            return Tok::End;
+        };
+        let start = self.i;
+        let run = |i: &mut usize, f: fn(&u8) -> bool| {
+            while b.get(*i).is_some_and(f) {
+                *i += 1;
+            }
+        };
+        if c.is_ascii_digit() {
+            run(&mut self.i, u8::is_ascii_digit);
+            let text = &self.s[start..self.i];
+            // A number too long for any field is still one token; its value
+            // only has to be large enough to fail every range check.
+            return Tok::Num(text.parse().unwrap_or(i64::MAX), text.len());
+        }
+        if c.is_ascii_alphabetic() {
+            run(&mut self.i, u8::is_ascii_alphabetic);
+            return Tok::Word(&self.s[start..self.i]);
+        }
+        if c.is_ascii_whitespace() {
+            run(&mut self.i, u8::is_ascii_whitespace);
+            return Tok::Space;
+        }
+        if c == b'(' {
+            let mut depth = 0;
+            while let Some(&c) = b.get(self.i) {
+                self.i += 1;
+                match c {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Tok::Space;
+        }
+        // One character, whole: a non-ASCII one is ignored like any symbol.
+        let len = self.s[start..].chars().next().map_or(1, char::len_utf8);
+        self.i += len;
+        Tok::Sym(if len == 1 { c } else { 0 })
+    }
+
+    fn peek(&self) -> Tok<'a> {
+        Toks { s: self.s, i: self.i }.next()
+    }
+
+    fn skip(&mut self, sym: u8) -> bool {
+        let taken = self.peek() == Tok::Sym(sym);
+        if taken {
+            self.next();
+        }
+        taken
+    }
+}
+
+/// What a word means to the fallback parser: V8's `KeywordTable`, matched on
+/// the first three letters (so `January` and `Janu` are both January, and `Ja`
+/// is nothing), with the short entries matched whole.
+enum Keyword {
+    Month(i64),
+    AmPm(i64),
+    /// A zone: its offset from UTC in hours.
+    Zone(i64),
+    Other,
+}
+
+fn keyword(word: &str) -> Keyword {
+    let w = word.to_ascii_lowercase();
+    let prefix = &w[..w.len().min(3)];
+    if w.len() >= 3 {
+        const MONTHS: [&str; 12] = [
+            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        ];
+        if let Some(m) = MONTHS.iter().position(|m| *m == prefix) {
+            return Keyword::Month(m as i64 + 1);
+        }
+    }
+    match prefix {
+        "am" if w.len() == 2 => Keyword::AmPm(0),
+        "pm" if w.len() == 2 => Keyword::AmPm(12),
+        "ut" if w.len() == 2 => Keyword::Zone(0),
+        "z" => Keyword::Zone(0),
+        "utc" | "gmt" if w.len() >= 3 => Keyword::Zone(0),
+        "cdt" => Keyword::Zone(-5),
+        "cst" => Keyword::Zone(-6),
+        "edt" => Keyword::Zone(-4),
+        "est" => Keyword::Zone(-5),
+        "mdt" => Keyword::Zone(-6),
+        "mst" => Keyword::Zone(-7),
+        "pdt" => Keyword::Zone(-7),
+        "pst" => Keyword::Zone(-8),
+        _ => Keyword::Other,
+    }
+}
+
+/// The free-form fallback — V8's legacy `DateParser` loop, which is what makes
+/// `new Date("March 7, 2024 10:00")`, `"1/5/2024"`, `"Oct 21, 2015 7:28 PM"`
+/// and the `toString` form `"Thu Mar 07 2024 10:00:00 GMT-0500 (…)"` dates.
+/// Only the IMF-fixdate header form was read before, so every one of those was
+/// an Invalid Date.
+///
+/// Numbers fill the date (`DayComposer`), a number followed by `:` starts the
+/// time (`TimeComposer`), and a zone word or a sign after the time sets the
+/// offset (`TimeZoneComposer`). With no zone the result is LOCAL time.
+fn parse_legacy(s: &str) -> Option<f64> {
+    const NONE: i64 = i64::MIN;
+    let mut t = Toks { s, i: 0 };
+    let (mut day, mut named_month) = (Vec::with_capacity(3), NONE);
+    let (mut time, mut hour_offset) = (Vec::with_capacity(4), NONE);
+    let (mut sign, mut tz_hour, mut tz_min) = (0i64, NONE, NONE);
+    let mut read_number = false;
+    // `TimeComposer::IsExpecting`: the next field the time can take.
+    let expecting = |time: &Vec<i64>, n: i64| match time.len() {
+        1 | 2 => (0..60).contains(&n),
+        3 => (0..1000).contains(&n),
+        _ => false,
     };
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() < 5 {
+    loop {
+        match t.next() {
+            Tok::End => break,
+            Tok::Num(n, _) => {
+                read_number = true;
+                if t.skip(b':') {
+                    if t.skip(b':') {
+                        if !time.is_empty() {
+                            return None;
+                        }
+                        time.extend([n, 0]);
+                    } else {
+                        if time.len() >= 4 {
+                            return None;
+                        }
+                        time.push(n);
+                        t.skip(b'.');
+                    }
+                } else if t.peek() == Tok::Sym(b'.') && expecting(&time, n) {
+                    t.next();
+                    time.push(n);
+                    let Tok::Num(ms, len) = t.next() else {
+                        return None;
+                    };
+                    // Milliseconds are the first three digits, scaled.
+                    let ms = match len {
+                        1 => ms * 100,
+                        2 => ms * 10,
+                        3 => ms,
+                        _ => t.s[t.i - len..t.i - len + 3].parse().ok()?,
+                    };
+                    time.push(ms);
+                    time.resize(4, 0);
+                } else if tz_hour != NONE && tz_min == NONE && (0..60).contains(&n) {
+                    tz_min = n;
+                } else if expecting(&time, n) {
+                    time.push(n);
+                    time.resize(4, 0);
+                    // The time must end at the end, white space, `Z` or a sign.
+                    match t.peek() {
+                        Tok::End | Tok::Space | Tok::Sym(b'+' | b'-') => {}
+                        Tok::Word(w) if w.eq_ignore_ascii_case("z") => {}
+                        _ => return None,
+                    }
+                } else {
+                    if day.len() >= 3 {
+                        return None;
+                    }
+                    day.push(n);
+                    t.skip(b'-');
+                }
+            }
+            Tok::Word(w) => match keyword(w) {
+                Keyword::AmPm(off) if !time.is_empty() => hour_offset = off,
+                Keyword::Month(m) => {
+                    named_month = m;
+                    t.skip(b'-');
+                }
+                Keyword::Zone(h) if read_number => {
+                    sign = if h < 0 { -1 } else { 1 };
+                    tz_hour = h.abs();
+                    tz_min = 0;
+                }
+                _ => {
+                    // A stray word is refused once a number has been read,
+                    // and must be kept apart from the first number.
+                    if read_number || matches!(t.peek(), Tok::Num(..)) {
+                        return None;
+                    }
+                }
+            },
+            Tok::Sym(c @ (b'+' | b'-')) if (sign != 0 && tz_hour == 0 && tz_min == 0) || !time.is_empty() => {
+                // An offset, only after a UTC word or a time: `+05`, `+0530`,
+                // `+05:30`.
+                sign = if c == b'-' { -1 } else { 1 };
+                let (n, len) = match t.peek() {
+                    Tok::Num(n, len) => {
+                        t.next();
+                        (n, len)
+                    }
+                    _ => (0, 0),
+                };
+                read_number = true;
+                if t.peek() == Tok::Sym(b':') {
+                    tz_hour = n;
+                    tz_min = NONE;
+                } else if len <= 2 {
+                    tz_hour = n;
+                    tz_min = 0;
+                } else if len <= 4 {
+                    tz_hour = n / 100;
+                    tz_min = n % 100;
+                } else {
+                    return None;
+                }
+            }
+            Tok::Sym(b'+' | b'-' | b')') if read_number => return None,
+            Tok::Sym(_) | Tok::Space => {}
+        }
+    }
+
+    // `DayComposer::Write`: the missing components are 1, and which one is the
+    // year is decided by whether the first can be a day at all.
+    if day.is_empty() {
         return None;
     }
-    let d: i64 = parts[0].parse().ok()?;
-    let mo = MONTHS.iter().position(|m| *m == parts[1])? as i64;
-    let y: i64 = parts[2].parse().ok()?;
-    let tp: Vec<&str> = parts[3].split(':').collect();
-    if tp.len() < 2 {
+    day.resize(3, 1);
+    let is_day = |n: i64| (1..=31).contains(&n);
+    let (mut year, month, dd) = if named_month == NONE {
+        if is_day(day[0]) {
+            (day[2], day[0], day[1])
+        } else {
+            (day[0], day[1], day[2])
+        }
+    } else if !is_day(day[0]) {
+        (day[0], named_month, day[1])
+    } else {
+        (day[1], named_month, day[0])
+    };
+    if (0..=49).contains(&year) {
+        year += 2000;
+    } else if (50..=99).contains(&year) {
+        year += 1900;
+    }
+    if !(1..=12).contains(&month) || !is_day(dd) {
         return None;
     }
-    let h: i64 = tp[0].parse().ok()?;
-    let mi: i64 = tp[1].parse().ok()?;
-    let sec: i64 = tp.get(2).map(|v| v.parse().ok()).unwrap_or(Some(0))?;
-    let days = days_from_civil(y, mo, d);
-    Some(
-        days as f64 * MS_PER_DAY
-            + h as f64 * 3_600_000.0
-            + mi as f64 * 60_000.0
-            + sec as f64 * 1000.0,
-    )
+
+    // `TimeComposer::Write`: missing fields are 0; AM/PM needs an hour of
+    // 0-12; hour 24 only as the very end of a day.
+    time.resize(4, 0);
+    let (mut h, mi, sec, ms) = (time[0], time[1], time[2], time[3]);
+    if hour_offset != NONE {
+        if !(0..=12).contains(&h) {
+            return None;
+        }
+        h = h % 12 + hour_offset;
+    }
+    let in_range = (0..24).contains(&h) && (0..60).contains(&mi) && (0..60).contains(&sec) && (0..1000).contains(&ms);
+    if !in_range && (h, mi, sec, ms) != (24, 0, 0, 0) {
+        return None;
+    }
+
+    let wall = utc_from_fields(
+        year as f64,
+        (month - 1) as f64,
+        dd as f64,
+        h as f64,
+        mi as f64,
+        sec as f64,
+        ms as f64,
+    );
+    if sign == 0 {
+        return Some(utc_from_local(wall));
+    }
+    let tz_min = if tz_min == NONE { 0 } else { tz_min };
+    let tz_hour = if tz_hour == NONE { 0 } else { tz_hour };
+    Some(wall - sign as f64 * (tz_hour * 3_600_000 + tz_min * 60_000) as f64)
 }
 
 /// A Date's `util.inspect` rendering, resolved against an ALREADY-BORROWED host.

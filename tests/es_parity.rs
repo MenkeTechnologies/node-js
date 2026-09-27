@@ -45,6 +45,12 @@ fn exit_status(ok: bool) -> std::process::ExitStatus {
 /// reads it is its own deadlock, and polling `try_wait` is what makes the
 /// deadline enforceable.
 fn run_bounded(path: &std::path::Path) -> (bool, String, String) {
+    run_bounded_env(path, &[])
+}
+
+/// [`run_bounded`] with extra environment variables set for the child — a `TZ`,
+/// for the Date behavior only a zone other than UTC can tell apart.
+fn run_bounded_env(path: &std::path::Path, env: &[(&str, &str)]) -> (bool, String, String) {
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("node");
     let dir = std::env::temp_dir();
     // The pid alone is not unique: `cargo test` runs these on threads of ONE
@@ -68,6 +74,7 @@ fn run_bounded(path: &std::path::Path) -> (bool, String, String) {
     );
     let mut child = Command::new(env!("CARGO_BIN_EXE_node"))
         .arg(path)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::from(of))
         .stderr(Stdio::from(ef))
@@ -3499,6 +3506,90 @@ fn json_stringify_uses_every_short_escape() {
          true\n\
          \"\u{7f}\""
     );
+}
+
+// ── Date: local fields, offsets and the free-form parser, in a real zone ─────
+
+/// [`run`] under a given `TZ`. The parity harness pins `TZ=UTC`, where local
+/// time IS UTC, so a Date that treats local fields as UTC is invisible there;
+/// these tests name a zone so the difference cannot hide.
+fn run_in_zone(src: &str, tz: &str) -> String {
+    let mut f = tempfile::Builder::new()
+        .suffix(".js")
+        .tempfile()
+        .expect("temp file");
+    f.write_all(src.as_bytes()).expect("write source");
+    let (ok, stdout, stderr) = run_bounded_env(f.path(), &[("TZ", tz)]);
+    if !ok {
+        panic!("program failed:\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}");
+    }
+    stdout.trim_end().to_string()
+}
+
+/// `new Date(y, m, …)` and an ISO date-time WITHOUT a zone are LOCAL time
+/// (21.4.2.1 step 5.k; 21.4.1.32). Both were taken as UTC, so under
+/// `TZ=America/New_York` `new Date(2024, 0, 31)` read back as the 30th and
+/// `"2024-01-01T10:20"` as 10:20Z. The offset of `"…30.123+01:00"` was
+/// dropped (the fraction swallowed it) and `"…00+05:30"` did not parse. Each
+/// field is truncated first (MakeTime), and `24:00` is the end of a day while
+/// `25:00` is nothing. Expected values from node v26.10.0 under the same zone.
+#[test]
+fn date_fields_and_zoneless_iso_strings_are_local_time() {
+    let src = r#"
+        const iso = v => Number.isNaN(+v) ? 'NaN' : new Date(v).toISOString();
+        const d = new Date(2024, 0, 31);
+        console.log(iso(d), d.getDate(), d.getHours(), new Date(99, 0).getFullYear());
+        d.setMonth(1); console.log(iso(d), d.getMonth(), d.getDate());
+        console.log(iso(new Date(2024, 0, 1, 1.5, 2.7)), Date.UTC(1970, 0, 1, 0, 0, 0, 0.9), iso(new Date(99.5, 0)));
+        console.log(iso(Date.parse("2024-01-01T10:20")), iso(Date.parse("2024-01-01")), iso(Date.parse(" 2024-01-01 ")));
+        console.log(iso(Date.parse("2024-01-01T00:00:00+05:30")), iso(Date.parse("2024-01-01T10:20:30.123+01:00")), iso(Date.parse("2024-01-01T10:20+0530")));
+        console.log(iso(Date.parse("2024-01-01T25:00")), iso(Date.parse("2024-01-01T24:00")), iso(Date.parse("2024-06")), iso(Date.parse("+002024-01-01T00:00:00Z")));
+    "#;
+    assert_eq!(
+        run_in_zone(src, "America/New_York"),
+        "2024-01-31T05:00:00.000Z 31 0 1999\n\
+         2024-03-02T05:00:00.000Z 2 2\n\
+         2024-01-01T06:02:00.000Z 0 1999-01-01T05:00:00.000Z\n\
+         2024-01-01T15:20:00.000Z 2024-01-01T00:00:00.000Z 2024-01-01T05:00:00.000Z\n\
+         2023-12-31T18:30:00.000Z 2024-01-01T09:20:30.123Z 2024-01-01T04:50:00.000Z\n\
+         NaN 2024-01-02T05:00:00.000Z 2024-06-01T00:00:00.000Z 2024-01-01T00:00:00.000Z"
+    );
+}
+
+/// The free-form fallback every engine keeps beside the ISO format — V8's
+/// legacy `DateParser`. Only the IMF-fixdate header form was read before, so
+/// `new Date("March 7, 2024 10:00")`, `"1/5/2024"` and even a Date's own
+/// `toString()` were Invalid Dates. Month names match on three letters, a
+/// first number that cannot be a day makes the order year-first, two-digit
+/// years pivot at 50, a zone word or a sign after the time is an offset, and
+/// no zone is local time. Expected values from node v26.10.0.
+#[test]
+fn date_parse_reads_the_free_form_fallback() {
+    let src = r#"
+        const iso = v => Number.isNaN(+v) ? 'NaN' : new Date(v).toISOString();
+        console.log(iso(Date.parse("March 7, 2024 10:00")), iso(Date.parse("1/5/2024, 3:04:05 PM")), iso(Date.parse("2024/1/5 8:00:00")));
+        console.log(iso(Date.parse("Thu Mar 07 2024 10:00:00 GMT-0500 (Eastern Standard Time)")), iso(Date.parse("Jan 5 2024 10:00 GMT+05:30")), iso(Date.parse("Jan 5 2024 10:00 PDT")));
+        console.log(iso(Date.parse("Wed, 21 Oct 2015 07:28:00 GMT")), iso(Date.parse("Oct 21, 2015 12:05 AM")), iso(Date.parse("1/5/49")), iso(Date.parse("Sat Jan 5")));
+        console.log(iso(Date.parse("Ja 5 2024")), iso(Date.parse("Jan 32 2024")), iso(Date.parse("2024-1-5T10:00")), iso(Date.parse("20240105")));
+        const r = new Date(2024, 6, 4, 13, 14, 15);
+        console.log(new Date(r.toString()).getTime() === r.getTime());
+    "#;
+    assert_eq!(
+        run_in_zone(src, "America/New_York"),
+        "2024-03-07T15:00:00.000Z 2024-01-05T20:04:05.000Z 2024-01-05T13:00:00.000Z\n\
+         2024-03-07T15:00:00.000Z 2024-01-05T04:30:00.000Z 2024-01-05T17:00:00.000Z\n\
+         2015-10-21T07:28:00.000Z 2015-10-21T04:05:00.000Z 2049-01-05T05:00:00.000Z 2001-01-05T05:00:00.000Z\n\
+         NaN NaN NaN NaN\n\
+         true"
+    );
+}
+
+/// `getTimezoneOffset` is `(t - LocalTime(t)) / msPerMinute`: under UTC that is
+/// +0. It was the negated offset, which is -0, and printed as `-0`.
+#[test]
+fn a_zero_timezone_offset_is_positive_zero() {
+    let src = "console.log(Object.is(new Date(0).getTimezoneOffset(), 0), new Date(0).getTimezoneOffset());";
+    assert_eq!(run_in_zone(src, "UTC"), "true 0");
 }
 
 // ── Date: component setters, TimeClip, ToDateString ──────────────────────────
