@@ -980,8 +980,7 @@ fn from(kind: &str, args: &[Value]) -> Result<Value, String> {
     let items = if let Some(e) = elems_of(&src) {
         e.into_iter().map(Value::Float).collect()
     } else {
-        crate::host::iter_all(&src)
-            .unwrap_or_else(|_| crate::builtins::array_like_items(&src))
+        crate::host::iter_all(&src).unwrap_or_else(|_| crate::builtins::array_like_items(&src))
     };
     let mut out = Vec::with_capacity(items.len());
     for (i, it) in items.into_iter().enumerate() {
@@ -1876,7 +1875,13 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                     .map(|(i, v)| h.new_array(vec![Value::Float(i as f64), v.clone()]))
                     .collect(),
             });
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
+            Ok(with_host(|h| {
+                h.alloc(JsObj::Iter {
+                    items,
+                    idx: 0,
+                    array: None,
+                })
+            }))
         }
         "toString" | "join" => {
             let sep = if method == "join" && !args.is_empty() {

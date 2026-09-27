@@ -90,7 +90,10 @@ pub fn compile_completion_strict(
     caller_strict: bool,
 ) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    with_source(compiler::compile_completion_strict(&stmts, false, caller_strict), src)
+    with_source(
+        compiler::compile_completion_strict(&stmts, false, caller_strict),
+        src,
+    )
 }
 
 /// Compile with per-statement DAP line markers enabled (`node --dap`).

@@ -3220,7 +3220,12 @@ pub const FIELDS_MARK: char = '\u{2}';
 ///
 /// Each field is `key\u{3}<byte length>\u{3}value`, so a value (a URL input is
 /// arbitrary user text) may carry any character, the separators included.
-pub fn plain_coded_error_with(class: &str, code: &str, msg: &str, fields: &[(&str, &str)]) -> String {
+pub fn plain_coded_error_with(
+    class: &str,
+    code: &str,
+    msg: &str,
+    fields: &[(&str, &str)],
+) -> String {
     let mut s = plain_coded_error(class, code, msg);
     s.push(FIELDS_MARK);
     for (k, v) in fields {
@@ -3252,7 +3257,9 @@ pub fn split_error_fields(msg: &str) -> (&str, Vec<(&str, &str)>) {
     };
     let mut fields = Vec::new();
     while let Some((k, tail)) = rest.split_once('\u{3}') {
-        let Some((len, tail)) = tail.split_once('\u{3}') else { break };
+        let Some((len, tail)) = tail.split_once('\u{3}') else {
+            break;
+        };
         let Ok(len) = len.parse::<usize>() else { break };
         let Some(v) = tail.get(..len) else { break };
         fields.push((k, v));
@@ -8297,7 +8304,13 @@ pub fn get_async_iterator(src: &Value) -> Result<Value, String> {
         }
     }
     let items = iter_all(src)?;
-    Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
+    Ok(with_host(|h| {
+        h.alloc(JsObj::Iter {
+            items,
+            idx: 0,
+            array: None,
+        })
+    }))
 }
 
 /// If `v` has an own/inherited `Symbol.asyncIterator` method, return it.

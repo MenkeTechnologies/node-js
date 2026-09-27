@@ -829,11 +829,8 @@ fn parse_iso(s: &str) -> Option<f64> {
     if h > 24 || mi > 59 || sec > 59 || (h == 24 && (mi, sec, milli) != (0, 0, 0)) {
         return None;
     }
-    let wall = date
-        + h as f64 * 3_600_000.0
-        + mi as f64 * 60_000.0
-        + sec as f64 * 1000.0
-        + milli as f64;
+    let wall =
+        date + h as f64 * 3_600_000.0 + mi as f64 * 60_000.0 + sec as f64 * 1000.0 + milli as f64;
     let offset = match b.get(i) {
         None => return Some(utc_from_local(wall)),
         Some(b'Z' | b'z') if i + 1 == b.len() => 0.0,
@@ -924,7 +921,11 @@ impl<'a> Toks<'a> {
     }
 
     fn peek(&self) -> Tok<'a> {
-        Toks { s: self.s, i: self.i }.next()
+        Toks {
+            s: self.s,
+            i: self.i,
+        }
+        .next()
     }
 
     fn skip(&mut self, sym: u8) -> bool {
@@ -1069,7 +1070,9 @@ fn parse_legacy(s: &str) -> Option<f64> {
                     }
                 }
             },
-            Tok::Sym(c @ (b'+' | b'-')) if (sign != 0 && tz_hour == 0 && tz_min == 0) || !time.is_empty() => {
+            Tok::Sym(c @ (b'+' | b'-'))
+                if (sign != 0 && tz_hour == 0 && tz_min == 0) || !time.is_empty() =>
+            {
                 // An offset, only after a UTC word or a time: `+05`, `+0530`,
                 // `+05:30`.
                 sign = if c == b'-' { -1 } else { 1 };
@@ -1136,7 +1139,10 @@ fn parse_legacy(s: &str) -> Option<f64> {
         }
         h = h % 12 + hour_offset;
     }
-    let in_range = (0..24).contains(&h) && (0..60).contains(&mi) && (0..60).contains(&sec) && (0..1000).contains(&ms);
+    let in_range = (0..24).contains(&h)
+        && (0..60).contains(&mi)
+        && (0..60).contains(&sec)
+        && (0..1000).contains(&ms);
     if !in_range && (h, mi, sec, ms) != (24, 0, 0, 0) {
         return None;
     }

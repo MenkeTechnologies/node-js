@@ -138,7 +138,14 @@ impl Lexer {
                 }
                 // WhiteSpace (12.2): TAB, VT, FF, the BOM and every Zs space.
                 Some(
-                    ' ' | '\t' | '\r' | '\u{0B}' | '\u{0C}' | '\u{FEFF}' | '\u{A0}' | '\u{1680}'
+                    ' '
+                    | '\t'
+                    | '\r'
+                    | '\u{0B}'
+                    | '\u{0C}'
+                    | '\u{FEFF}'
+                    | '\u{A0}'
+                    | '\u{1680}'
                     | '\u{2000}'..='\u{200A}'
                     | '\u{202F}'
                     | '\u{205F}'

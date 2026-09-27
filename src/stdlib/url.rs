@@ -330,7 +330,13 @@ fn parse_absolute(input: &str) -> Option<Parts> {
         String::new()
     } else if port.bytes().all(|b| b.is_ascii_digit()) {
         port.trim_start_matches('0').parse::<u16>().map_or_else(
-            |_| if port.bytes().all(|b| b == b'0') { Some("0".to_string()) } else { None },
+            |_| {
+                if port.bytes().all(|b| b == b'0') {
+                    Some("0".to_string())
+                } else {
+                    None
+                }
+            },
             |n| Some(n.to_string()),
         )?
     } else {
@@ -492,7 +498,12 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
             if let Some(b) = &base {
                 fields.push(("base", b.as_str()));
             }
-            crate::host::plain_coded_error_with("TypeError", "ERR_INVALID_URL", "Invalid URL", &fields)
+            crate::host::plain_coded_error_with(
+                "TypeError",
+                "ERR_INVALID_URL",
+                "Invalid URL",
+                &fields,
+            )
         })?;
     Ok(build(&parts))
 }
@@ -1150,14 +1161,22 @@ pub fn search_params_call(recv: &Value, method: &str, args: &[Value]) -> Result<
             let pairs = pairs_of(recv);
             Ok(with_host(|h| {
                 let items = pairs.into_iter().map(|(k, _)| h.new_str(k)).collect();
-                h.alloc(JsObj::Iter { items, idx: 0, array: None })
+                h.alloc(JsObj::Iter {
+                    items,
+                    idx: 0,
+                    array: None,
+                })
             }))
         }
         "values" => {
             let pairs = pairs_of(recv);
             Ok(with_host(|h| {
                 let items = pairs.into_iter().map(|(_, v)| h.new_str(v)).collect();
-                h.alloc(JsObj::Iter { items, idx: 0, array: None })
+                h.alloc(JsObj::Iter {
+                    items,
+                    idx: 0,
+                    array: None,
+                })
             }))
         }
         "entries" | "@@iterator" => {
@@ -1170,7 +1189,11 @@ pub fn search_params_call(recv: &Value, method: &str, args: &[Value]) -> Result<
                         h.new_array(kv)
                     })
                     .collect();
-                h.alloc(JsObj::Iter { items, idx: 0, array: None })
+                h.alloc(JsObj::Iter {
+                    items,
+                    idx: 0,
+                    array: None,
+                })
             }))
         }
         "forEach" => {

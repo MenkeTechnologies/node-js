@@ -5236,7 +5236,13 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
     // `lookup_chain` probe below reads the property map a proxy does not have.
     if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Proxy) {
         return match crate::proxy::iterate(&v) {
-            Ok(Some(items)) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })),
+            Ok(Some(items)) => with_host(|h| {
+                h.alloc(JsObj::Iter {
+                    items,
+                    idx: 0,
+                    array: None,
+                })
+            }),
             Ok(None) => abort(vm, "internal: kind_of said Proxy".into()),
             Err(e) => abort(vm, e),
         };
@@ -5288,7 +5294,13 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
         return array_iterator(&v, host::ArrayIterKind::Values);
     }
     match with_host(|h| h.iter_vec(&v)) {
-        Ok(items) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })),
+        Ok(items) => with_host(|h| {
+            h.alloc(JsObj::Iter {
+                items,
+                idx: 0,
+                array: None,
+            })
+        }),
         // V8 names the SOURCE EXPRESSION, not the value: `for (const x of a)`
         // reports `a is not iterable`. The text was recorded for this op.
         Err(e) => {
@@ -11653,7 +11665,13 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         // on `s.chars()` on purpose — do not "fix" it to match the others.
         "@@iterator" => {
             let items: Vec<Value> = s.chars().map(|c| new_s(c.to_string())).collect();
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
+            Ok(with_host(|h| {
+                h.alloc(JsObj::Iter {
+                    items,
+                    idx: 0,
+                    array: None,
+                })
+            }))
         }
         "toUpperCase" => Ok(new_s(s.to_uppercase())),
         "toLowerCase" => Ok(new_s(s.to_lowercase())),
@@ -13313,14 +13331,22 @@ pub(crate) fn iter_step(it: &Value) -> Option<Option<Value>> {
     // read: the array, the kind and the index.
     let step = with_host(|h| {
         let (arr, kind, i) = match h.get_mut(it) {
-            Some(JsObj::Iter { items, idx, array: None }) => {
+            Some(JsObj::Iter {
+                items,
+                idx,
+                array: None,
+            }) => {
                 let v = items.get(*idx).cloned();
                 if v.is_some() {
                     *idx += 1;
                 }
                 return Some(Ok(v));
             }
-            Some(JsObj::Iter { idx, array: Some((arr, kind)), .. }) => (arr.clone(), *kind, *idx),
+            Some(JsObj::Iter {
+                idx,
+                array: Some((arr, kind)),
+                ..
+            }) => (arr.clone(), *kind, *idx),
             _ => return None,
         };
         // `usize::MAX` marks an iterator that has already reported done, and
@@ -13374,7 +13400,11 @@ fn iter_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Stri
             // Exhaust the cursor and report done.
             with_host(|h| {
                 if let Some(JsObj::Iter { items, idx, array }) = h.get_mut(recv) {
-                    *idx = if array.is_some() { usize::MAX } else { items.len() };
+                    *idx = if array.is_some() {
+                        usize::MAX
+                    } else {
+                        items.len()
+                    };
                 }
             });
             Ok(iter_result(arg0(&args), true))

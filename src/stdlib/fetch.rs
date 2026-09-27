@@ -349,7 +349,13 @@ pub fn headers_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value,
                     }
                 })
                 .collect();
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
+            Ok(with_host(|h| {
+                h.alloc(JsObj::Iter {
+                    items,
+                    idx: 0,
+                    array: None,
+                })
+            }))
         }
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
@@ -757,7 +763,13 @@ pub fn form_data_call(recv: &Value, method: &str, args: &[Value]) -> Result<Valu
                     }
                 })
                 .collect();
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
+            Ok(with_host(|h| {
+                h.alloc(JsObj::Iter {
+                    items,
+                    idx: 0,
+                    array: None,
+                })
+            }))
         }
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
