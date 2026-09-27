@@ -1826,10 +1826,11 @@ Each is pinned by a test in `tests/es_parity.rs`.
 | `new Uint8Array(-1)` was empty, `new Uint8Array('2')` iterated the string, a misaligned buffer view succeeded; `DataView`/`ArrayBuffer` bounds used generic messages | ToIndex with V8's messages (`Invalid typed array length: -1`, `start offset of Uint32Array should be a multiple of 4`, `Start offset 6 is outside the bounds of the buffer`, `Invalid array buffer max length`) |
 | `ta.set(src, off)` wrote a partial prefix past the end and ignored array-likes; `TypedArray.from({length})` was empty | `RangeError: offset is out of bounds` before any write; array-likes are read by `length` |
 
-## FIXED in round 10 — `Date` in a real zone, verified against node v26.10.0
+## FIXED in round 10 — `Date` in a real zone, and live array iteration, verified against node v26.10.0
 
-Each is pinned by a test in `tests/es_parity.rs` that runs under a named `TZ`,
-since under the harness's `TZ=UTC` local time is UTC and none of these shows.
+Each is pinned by a test in `tests/es_parity.rs`. The `Date` ones run under a
+named `TZ`, since under the harness's `TZ=UTC` local time is UTC and none of
+them shows.
 
 | was | now |
 | --- | --- |
@@ -1839,6 +1840,7 @@ since under the harness's `TZ=UTC` local time is UTC and none of these shows.
 | only the IMF-fixdate header form parsed outside ISO, so `"March 7, 2024 10:00"`, `"1/5/2024"`, `"Oct 21, 2015 7:28 PM"` and a Date's own `toString()` were Invalid Dates | V8's legacy free-form parser: month names by three letters, year-first when the first number cannot be a day, two-digit years pivoting at 50, AM/PM, zone words and signs |
 | `new Date(2024, 0, 1, 1.5)` was 01:30 and `Date.UTC(…, 0.9)` kept the fraction | each field is truncated (MakeTime/MakeDay); a non-finite one is NaN |
 | `getTimezoneOffset()` under UTC was `-0` | `0` |
+| `for (const n of q) q.push(…)` visited one element; `for-of`, spread and `values()`/`keys()`/`entries()` iterated a snapshot taken when the loop began | an array iterator reads the array at every step (23.1.5.1): pushes are visited, a pop ends the loop sooner, a hole or index accessor reads as `a[i]`, and a finished iterator stays finished |
 
 ## Still open — found in round 7
 
@@ -1850,6 +1852,8 @@ since under the harness's `TZ=UTC` local time is UTC and none of these shows.
 | `async function f(){ return f() }; f()` | `RangeError: Maximum call stack size exceeded` | hangs — each call starts a coroutine and returns a promise, so the recursion is an unbounded MICROTASK chain rather than stack growth, and the stack guard never sees it |
 | `new o.m()` where `o.m` is a `function*` | message names the callee's SOURCE TEXT (`o.m is not a constructor`) | names it by function NAME (`m is not a constructor`) — the class, `.name` and catchability all match |
 | `eval('await 1')` | `SyntaxError: await is only valid in async functions …` | `SyntaxError: expected ';' but found Num(1.0) (line 1)` |
+| `Object.prototype.toString.call([].values())` (found in round 10, against v26.10.0) | `[object Array Iterator]`; likewise `Map Iterator`, `Set Iterator`, `String Iterator`, `RegExp String Iterator`, and the same `Symbol.toStringTag` read directly | `[object Object]`, and the tag reads `undefined`; `console.log([].values())` prints `undefined` where node prints `Object [Array Iterator] {}` |
+| `Atomics` (found in round 10) | the namespace object: `typeof Atomics` is `object`, `String(Atomics)` is `[object Atomics]` | absent: `typeof Atomics` is `undefined` and a reference is `ReferenceError: Atomics is not defined` |
 
 ## Still open — found by the round-5 doc audit, not yet fixed
 
