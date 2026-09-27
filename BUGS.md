@@ -1455,17 +1455,19 @@ already used for `Number.prototype.toLocaleString`, at UTC, with the
 now VALIDATES the form: node throws `RangeError` outside NFC/NFD/NFKC/NFKD, and
 a try/catch support probe used to be told every form worked.
 
-**node-js reads no `LANG`, `LC_ALL` or `TZ` anywhere**, and that is a property
-worth stating rather than a coincidence: `Date` is hardwired to UTC, the number
-formats to en-US, `normalize` to the identity, and `toUpperCase`/`toLowerCase`
-to Rust's locale-INDEPENDENT Default Case Conversion, which is what the spec
-mandates for the non-`Locale` forms. So node-js's output is byte-identical on
-every machine. Reference `node` is NOT — `(1234.5).toLocaleString()` is
-`1.234,5` under `de_DE`, `'ä'.localeCompare('z')` is `1` under `sv_SE` and `-1`
-under `de_DE`, and `new Date(0).getHours()` is `9` under `Asia/Tokyo`. All three
-harnesses therefore PIN `TZ=UTC LANG=LC_ALL=en_US.UTF-8` rather than inheriting
-the developer's, so a corpus case touching the locale surface cannot pass on one
-machine and fail on another.
+**node-js reads no `LANG` or `LC_ALL` anywhere**, and that is a property worth
+stating rather than a coincidence: the number formats are hardwired to en-US,
+`normalize` to the identity, and `toUpperCase`/`toLowerCase` to Rust's
+locale-INDEPENDENT Default Case Conversion, which is what the spec mandates for
+the non-`Locale` forms. `TZ` is the one input read: `Date`'s local time follows
+it through the C library's `localtime_r`, as node's does. Reference `node`
+follows the rest too — `(1234.5).toLocaleString()` is `1.234,5` under `de_DE`,
+and `'ä'.localeCompare('z')` is `1` under `sv_SE` and `-1` under `de_DE` — and
+`new Date(0).getHours()` is `9` under `Asia/Tokyo` in both. All three harnesses
+therefore PIN `TZ=UTC LANG=LC_ALL=en_US.UTF-8` rather than inheriting the
+developer's, so a corpus case touching the locale surface cannot pass on one
+machine and fail on another; the zone-dependent `Date` cases name their zone in
+`tests/es_parity.rs` instead.
 
 `localeCompare` is unchanged and still the ASCII approximation documented above:
 it diverges from ICU for any non-ASCII input (`'ä'.localeCompare('z')` is `1`
@@ -1823,6 +1825,20 @@ Each is pinned by a test in `tests/es_parity.rs`.
 | `JSON.stringify` of a cycle threw the bare first line | V8's `--> starting at object with constructor …` / `--- property 'k' closes the circle` path |
 | `new Uint8Array(-1)` was empty, `new Uint8Array('2')` iterated the string, a misaligned buffer view succeeded; `DataView`/`ArrayBuffer` bounds used generic messages | ToIndex with V8's messages (`Invalid typed array length: -1`, `start offset of Uint32Array should be a multiple of 4`, `Start offset 6 is outside the bounds of the buffer`, `Invalid array buffer max length`) |
 | `ta.set(src, off)` wrote a partial prefix past the end and ignored array-likes; `TypedArray.from({length})` was empty | `RangeError: offset is out of bounds` before any write; array-likes are read by `length` |
+
+## FIXED in round 10 — `Date` in a real zone, verified against node v26.10.0
+
+Each is pinned by a test in `tests/es_parity.rs` that runs under a named `TZ`,
+since under the harness's `TZ=UTC` local time is UTC and none of these shows.
+
+| was | now |
+| --- | --- |
+| `new Date(y, m, …)` took its fields as UTC: under `America/New_York` `new Date(2024, 0, 31).getDate()` was 30 and `new Date(99, 0).getFullYear()` 1998 | local time, `UTC(MakeDate(…))` |
+| an ISO date-time without a zone (`"2024-01-01T10:20"`) was UTC | local; a date-only form stays UTC |
+| `"…30.123+01:00"` dropped the offset (the fraction read swallowed it), `"…00+05:30"` and `"…+0530"` were Invalid Dates, `"T25:00"` rolled into the next day | the Date Time String Format as V8 reads it: `Z` or `±HH:mm`/`±HHmm`, `±YYYYYY` years, `24:00` only as the end of a day |
+| only the IMF-fixdate header form parsed outside ISO, so `"March 7, 2024 10:00"`, `"1/5/2024"`, `"Oct 21, 2015 7:28 PM"` and a Date's own `toString()` were Invalid Dates | V8's legacy free-form parser: month names by three letters, year-first when the first number cannot be a day, two-digit years pivoting at 50, AM/PM, zone words and signs |
+| `new Date(2024, 0, 1, 1.5)` was 01:30 and `Date.UTC(…, 0.9)` kept the fraction | each field is truncated (MakeTime/MakeDay); a non-finite one is NaN |
+| `getTimezoneOffset()` under UTC was `-0` | `0` |
 
 ## Still open — found in round 7
 
