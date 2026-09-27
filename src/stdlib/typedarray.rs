@@ -1876,7 +1876,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                     .map(|(i, v)| h.new_array(vec![Value::Float(i as f64), v.clone()]))
                     .collect(),
             });
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
         }
         "toString" | "join" => {
             let sep = if method == "join" && !args.is_empty() {

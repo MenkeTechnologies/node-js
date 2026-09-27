@@ -121,6 +121,34 @@ fn run(src: &str) -> String {
     stdout.trim_end().to_string()
 }
 
+// ── array iteration is live ──────────────────────────────────────────────────
+
+/// An array iterator reads the array at every step (23.1.5.1). `for-of`, spread
+/// and `values()`/`keys()`/`entries()` all iterated a SNAPSHOT taken when the
+/// loop began, so a worklist `for (const n of q) q.push(…)` stopped after the
+/// first element, a `pop` during the loop still visited the popped element,
+/// and a write ahead of the cursor was not seen. Once done an iterator stays
+/// done even if the array grows; an index accessor and a hole read as `a[i]`
+/// does. Expected values from node v26.10.0.
+#[test]
+fn array_iteration_reads_the_array_at_every_step() {
+    let src = r#"
+        const q = [1]; const seen = []; for (const n of q) { seen.push(n); if (n < 4) q.push(n + 1); } console.log(seen.join());
+        function f() { const q = [1]; const s = []; for (const n of q) { s.push(n); if (n < 3) q.push(n + 1); } return s.join(); } console.log(f());
+        const c = [1, 2, 3]; const r = []; for (const x of c) { r.push(x); if (x === 1) c.pop(); } console.log(r.join());
+        const m = [1, 2, 3]; const o = []; for (const v of m) { o.push(v); m[2] = 7; } console.log(o.join());
+        const a = [1]; const it = a.values(); a.push(2); console.log([...it].join(), it.next().done);
+        const b = [1]; const bi = b.values(); bi.next(); bi.next(); b.push(5); console.log(bi.next().done);
+        const e = [1, , 3]; Object.defineProperty(e, 0, { get() { return 'g'; } }); Array.prototype[1] = 'p';
+        console.log(JSON.stringify([...e.entries()]), [...e.keys()].join()); for (const x of e) console.log(x);
+        delete Array.prototype[1];
+    "#;
+    assert_eq!(
+        run(src),
+        "1,2,3,4\n1,2,3\n1,2\n1,2,7\n1,2 true\ntrue\n[[0,\"g\"],[1,\"p\"],[2,3]] 0,1,2\ng\np\n3"
+    );
+}
+
 // ── Array.prototype.flat(depth) ──────────────────────────────────────────────
 
 #[test]

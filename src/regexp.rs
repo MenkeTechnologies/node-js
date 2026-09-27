@@ -859,7 +859,7 @@ pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
         items.push(build_match_array(&re, &caps, s, indices));
     }
     // Return a live iterator so `for-of`/spread/`Array.from` all work.
-    Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+    Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
 }
 
 /// `str.search(re)`: char index of the first match, or -1.

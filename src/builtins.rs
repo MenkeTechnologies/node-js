@@ -5236,7 +5236,7 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
     // `lookup_chain` probe below reads the property map a proxy does not have.
     if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Proxy) {
         return match crate::proxy::iterate(&v) {
-            Ok(Some(items)) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })),
+            Ok(Some(items)) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })),
             Ok(None) => abort(vm, "internal: kind_of said Proxy".into()),
             Err(e) => abort(vm, e),
         };
@@ -5281,8 +5281,14 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
             }
         }
     }
+    // An array is iterated live, as its `values()` iterator does: a snapshot
+    // missed every push during the loop, so a worklist `for (const n of q)
+    // q.push(…)` stopped after the first element.
+    if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Array) {
+        return array_iterator(&v, host::ArrayIterKind::Values);
+    }
     match with_host(|h| h.iter_vec(&v)) {
-        Ok(items) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })),
+        Ok(items) => with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })),
         // V8 names the SOURCE EXPRESSION, not the value: `for (const x of a)`
         // reports `a is not iterable`. The text was recorded for this op.
         Err(e) => {
@@ -5396,19 +5402,9 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
         Some(v) => v.clone(),
         None => return abort(vm, "internal: FORITER with empty stack".into()),
     };
-    // Eager array-backed iterator (arrays/strings/Map/Set).
-    let eager = with_host(|h| {
-        if let Some(JsObj::Iter { items, idx }) = h.get_mut(&it) {
-            if *idx < items.len() {
-                let v = items[*idx].clone();
-                *idx += 1;
-                return Some(Some(v));
-            }
-            return Some(None);
-        }
-        None
-    });
-    if let Some(step) = eager {
+    // A built-in iterator: a snapshot (strings, a Proxy's items) or live over
+    // an array.
+    if let Some(step) = iter_step(&it) {
         return match step {
             Some(v) => {
                 vm.push(v);
@@ -11123,29 +11119,10 @@ fn array_method_on(
             flatten_into(recv, depth, &mut out)?;
             array_species_create(this_value, out)
         }
-        "keys" => {
-            let n = array_len(recv);
-            let items: Vec<Value> = (0..n).map(|i| Value::Float(i as f64)).collect();
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
-        }
-        "values" | "@@iterator" => {
-            let items = array_items(recv);
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
-        }
-        "entries" => {
-            let items = array_items(recv);
-            let pairs: Vec<Value> = items
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| with_host(|h| h.new_array(vec![Value::Float(i as f64), v])))
-                .collect();
-            Ok(with_host(|h| {
-                h.alloc(JsObj::Iter {
-                    items: pairs,
-                    idx: 0,
-                })
-            }))
-        }
+        // Live over the array (23.1.5.1): each step reads it as it is then.
+        "keys" => Ok(array_iterator(recv, host::ArrayIterKind::Keys)),
+        "values" | "@@iterator" => Ok(array_iterator(recv, host::ArrayIterKind::Values)),
+        "entries" => Ok(array_iterator(recv, host::ArrayIterKind::Entries)),
         "splice" => array_splice(recv, args),
         // `Array.prototype.toString` IS `join()` with the default separator
         // (23.1.3.36), so it converts each element with `ToString` too — and
@@ -11676,7 +11653,7 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         // on `s.chars()` on purpose — do not "fix" it to match the others.
         "@@iterator" => {
             let items: Vec<Value> = s.chars().map(|c| new_s(c.to_string())).collect();
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
         }
         "toUpperCase" => Ok(new_s(s.to_uppercase())),
         "toLowerCase" => Ok(new_s(s.to_lowercase())),
@@ -13309,31 +13286,95 @@ fn iter_result(value: Value, done: bool) -> Value {
     })
 }
 
-/// Built-in iterator object (`arr.values()`, `arr[Symbol.iterator]()`): a lazy
-/// cursor over a materialized item list.
+/// A live iterator over array `arr` — what `keys()`, `values()`, `entries()`
+/// and `Symbol.iterator` return, and what a `for-of` over an array steps.
+pub(crate) fn array_iterator(arr: &Value, kind: host::ArrayIterKind) -> Value {
+    with_host(|h| {
+        h.alloc(JsObj::Iter {
+            items: Vec::new(),
+            idx: 0,
+            array: Some((arr.clone(), kind)),
+        })
+    })
+}
+
+/// One step of a `JsObj::Iter`: `None` when `it` is not one, `Some(None)` once
+/// it is exhausted, otherwise the next value.
+///
+/// An array iterator reads the array at every step (23.1.5.1
+/// `%ArrayIteratorPrototype%.next`): the length is re-read, so an element
+/// pushed during a `for-of` is visited and one popped is not, and the element
+/// is read as `a[i]` reads it — an accessor runs, a hole reads through the
+/// prototype. Once it reports done it stays done, even if the array grows.
+pub(crate) fn iter_step(it: &Value) -> Option<Option<Value>> {
+    use host::ArrayIterKind;
+    // One host borrow for the common case — a snapshot, or an array slot that
+    // is neither a hole nor an accessor. `Err` carries what only `[[Get]]` can
+    // read: the array, the kind and the index.
+    let step = with_host(|h| {
+        let (arr, kind, i) = match h.get_mut(it) {
+            Some(JsObj::Iter { items, idx, array: None }) => {
+                let v = items.get(*idx).cloned();
+                if v.is_some() {
+                    *idx += 1;
+                }
+                return Some(Ok(v));
+            }
+            Some(JsObj::Iter { idx, array: Some((arr, kind)), .. }) => (arr.clone(), *kind, *idx),
+            _ => return None,
+        };
+        // `usize::MAX` marks an iterator that has already reported done, and
+        // it stays done even if the array grows.
+        let len = match h.get(&arr) {
+            Some(JsObj::Array(items)) => items.len(),
+            _ => 0,
+        };
+        let done = i == usize::MAX || i >= len;
+        if let Some(JsObj::Iter { idx, .. }) = h.get_mut(it) {
+            *idx = if done { usize::MAX } else { i + 1 };
+        }
+        if done {
+            return Some(Ok(None));
+        }
+        let key = Value::Float(i as f64);
+        let slot = match (kind, h.get(&arr)) {
+            (ArrayIterKind::Keys, _) => return Some(Ok(Some(key))),
+            (_, Some(JsObj::Array(items)))
+                if !h.is_hole(&arr, i) && h.own_accessor_keys(&arr).is_empty() =>
+            {
+                items[i].clone()
+            }
+            _ => return Some(Err((arr, kind, i))),
+        };
+        Some(Ok(Some(match kind {
+            ArrayIterKind::Entries => h.new_array(vec![key, slot]),
+            _ => slot,
+        })))
+    })?;
+    let (arr, kind, i) = match step {
+        Ok(step) => return Some(step),
+        Err(slow) => slow,
+    };
+    let value = get_property(&arr, &i.to_string()).unwrap_or(Value::Undef);
+    Some(Some(match kind {
+        ArrayIterKind::Entries => with_host(|h| h.new_array(vec![Value::Float(i as f64), value])),
+        _ => value,
+    }))
+}
+
+/// Built-in iterator object (`arr.values()`, `arr[Symbol.iterator]()`): a
+/// cursor over a snapshot, or live over an array ([`iter_step`]).
 fn iter_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
-        "next" => {
-            let step = with_host(|h| {
-                if let Some(JsObj::Iter { items, idx }) = h.get_mut(recv) {
-                    if *idx < items.len() {
-                        let v = items[*idx].clone();
-                        *idx += 1;
-                        return Some(v);
-                    }
-                }
-                None
-            });
-            Ok(match step {
-                Some(v) => iter_result(v, false),
-                None => iter_result(Value::Undef, true),
-            })
-        }
+        "next" => Ok(match iter_step(recv).flatten() {
+            Some(v) => iter_result(v, false),
+            None => iter_result(Value::Undef, true),
+        }),
         "return" => {
             // Exhaust the cursor and report done.
             with_host(|h| {
-                if let Some(JsObj::Iter { items, idx }) = h.get_mut(recv) {
-                    *idx = items.len();
+                if let Some(JsObj::Iter { items, idx, array }) = h.get_mut(recv) {
+                    *idx = if array.is_some() { usize::MAX } else { items.len() };
                 }
             });
             Ok(iter_result(arg0(&args), true))

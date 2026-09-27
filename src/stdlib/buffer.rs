@@ -997,7 +997,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                     })
                     .collect(),
             });
-            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+            Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
         }
         // IEEE-754 reads/writes. `f32`/`f64` go through their raw bit patterns,
         // so the endianness handling is the same byte reversal as the integers.

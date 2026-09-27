@@ -417,6 +417,15 @@ pub struct FuncVal {
     pub home_object: Option<Value>,
 }
 
+/// What an array iterator yields at each index: `keys()`, `values()` (and
+/// `Symbol.iterator`), or `entries()`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArrayIterKind {
+    Keys,
+    Values,
+    Entries,
+}
+
 /// A heap object.
 #[derive(Clone)]
 pub enum JsObj {
@@ -435,10 +444,17 @@ pub enum JsObj {
     },
     /// The single canonical `null`.
     Null,
-    /// A live iterator over a sequence, with a cursor.
+    /// An iterator over a sequence, with a cursor.
+    ///
+    /// `items` is a snapshot, taken when the iterator was made. An ARRAY
+    /// iterator is not one: `array` names the array and what each step yields,
+    /// and every step reads the array as it is then (23.1.5.1), so a `for-of`
+    /// sees an element pushed or written during the loop and stops at a length
+    /// that shrank. `items` is empty for those.
     Iter {
         items: Vec<Value>,
         idx: usize,
+        array: Option<(Value, ArrayIterKind)>,
     },
     /// A bound function (`fn.bind(thisArg, ...preargs)`).
     BoundFunc {
@@ -5935,7 +5951,32 @@ impl JsHost {
                 let chars: Vec<String> = s.chars().map(|c| c.to_string()).collect();
                 Ok(chars.into_iter().map(|c| self.new_str(c)).collect())
             }
-            Some(JsObj::Iter { items, idx }) => Ok(items[*idx..].to_vec()),
+            // A live array iterator, read from where its cursor stands. The
+            // backing slots only: `iter_all` steps one through `[[Get]]` instead.
+            Some(JsObj::Iter {
+                idx,
+                array: Some((arr, kind)),
+                ..
+            }) => {
+                let (idx, kind) = (*idx, *kind);
+                let items = match self.get(arr) {
+                    Some(JsObj::Array(items)) if idx < items.len() => items[idx..].to_vec(),
+                    _ => Vec::new(),
+                };
+                Ok(items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, v)| {
+                        let key = Value::Float((idx + n) as f64);
+                        match kind {
+                            ArrayIterKind::Keys => key,
+                            ArrayIterKind::Values => v,
+                            ArrayIterKind::Entries => self.new_array(vec![key, v]),
+                        }
+                    })
+                    .collect())
+            }
+            Some(JsObj::Iter { items, idx, .. }) => Ok(items[*idx..].to_vec()),
             Some(JsObj::Set { entries, .. }) => Ok(entries.values().cloned().collect()),
             Some(JsObj::Map { entries, .. }) => {
                 // Map iterates as `[key, value]` pairs.
@@ -8194,6 +8235,16 @@ pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
         }
         return Ok(out);
     }
+    // A live array iterator is stepped to the end, so an accessor or a hole
+    // reads as `a[i]` does and the iterator is left exhausted, as spreading it
+    // leaves it in node.
+    if with_host(|h| matches!(h.get(v), Some(JsObj::Iter { array: Some(_), .. }))) {
+        let mut out = Vec::new();
+        while let Some(Some(x)) = crate::builtins::iter_step(v) {
+            out.push(x);
+        }
+        return Ok(out);
+    }
     // Object with a user-defined Symbol.iterator: drive its iterator protocol.
     // Checked BEFORE the reachability guard below, since an own `Symbol
     // .iterator` makes a value iterable no matter what its prototype is.
@@ -8246,7 +8297,7 @@ pub fn get_async_iterator(src: &Value) -> Result<Value, String> {
         }
     }
     let items = iter_all(src)?;
-    Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0 })))
+    Ok(with_host(|h| h.alloc(JsObj::Iter { items, idx: 0, array: None })))
 }
 
 /// If `v` has an own/inherited `Symbol.asyncIterator` method, return it.
@@ -8286,7 +8337,7 @@ pub fn async_step(iterator: &Value) -> Result<Value, String> {
         }
     }
     // Sync-fallback iterator: drive it here, awaiting each yielded value.
-    if let Some(JsObj::Iter { items, idx }) = with_host(|h| h.get(iterator).cloned()) {
+    if let Some(JsObj::Iter { items, idx, .. }) = with_host(|h| h.get(iterator).cloned()) {
         if idx >= items.len() {
             // `AsyncFromSyncIteratorContinuation` resolves the record THROUGH a
             // promise even at exhaustion, so the `done: true` step costs the same

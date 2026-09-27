@@ -1805,14 +1805,14 @@ pub fn mime_params_instance_call(
             let pairs = mime_pairs_of(recv);
             Ok(with_host(|h| {
                 let items = pairs.into_iter().map(|(k, _)| h.new_str(k)).collect();
-                h.alloc(JsObj::Iter { items, idx: 0 })
+                h.alloc(JsObj::Iter { items, idx: 0, array: None })
             }))
         }
         "values" => {
             let pairs = mime_pairs_of(recv);
             Ok(with_host(|h| {
                 let items = pairs.into_iter().map(|(_, v)| h.new_str(v)).collect();
-                h.alloc(JsObj::Iter { items, idx: 0 })
+                h.alloc(JsObj::Iter { items, idx: 0, array: None })
             }))
         }
         "entries" | "@@iterator" => {
@@ -1825,7 +1825,7 @@ pub fn mime_params_instance_call(
                         h.new_array(kv)
                     })
                     .collect();
-                h.alloc(JsObj::Iter { items, idx: 0 })
+                h.alloc(JsObj::Iter { items, idx: 0, array: None })
             }))
         }
         "toString" | "toJSON" => {
