@@ -1885,6 +1885,12 @@ them shows.
 | `getTimezoneOffset()` under UTC was `-0` | `0` |
 | `for (const n of q) q.push(…)` visited one element; `for-of`, spread and `values()`/`keys()`/`entries()` iterated a snapshot taken when the loop began | an array iterator reads the array at every step (23.1.5.1): pushes are visited, a pop ends the loop sooner, a hole or index accessor reads as `a[i]`, and a finished iterator stays finished |
 
+## FIXED in round 11 — verified against node v26.10.0
+
+| was | now |
+| --- | --- |
+| a template literal's `${…}` field parsed as if at the top level: `` `${await x}` `` in an async function was `ReferenceError: await is not defined`, `` `${yield}` `` the same for `yield`, and `` `${this.#c}` `` in a class body `SyntaxError: Private field '#c' must be declared in an enclosing class` | the field parses in its enclosing context — async/generator flags, and private names checked against the enclosing class (`parity-scripts/lang/33_template_field_context.js`) |
+
 ## Still open — found in round 7
 
 | gap | node v26.7.0 | node-js |

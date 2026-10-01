@@ -111,10 +111,26 @@ impl Parser {
         &self.toks[self.pos]
     }
     /// Parse one `${…}` field of a template token, keeping its spans in this
-    /// script's coordinates.
-    fn parse_field(&self, src: &str, at: u32) -> Result<Expr, String> {
-        parse_expr_source(src, self.spans.then_some(at))
+    /// script's coordinates. The field is part of the enclosing code, so it
+    /// parses in the same context: `await` and `yield` stay operators inside
+    /// an async or generator body, and a private name it uses is checked
+    /// against the enclosing class body like any other use. A field used to be
+    /// parsed as if at the top level, so `` `${await x}` `` was a
+    /// `ReferenceError` and `` `${this.#c}` `` a `SyntaxError`.
+    fn parse_field(&mut self, src: &str, at: u32) -> Result<Expr, String> {
+        let mut p = field_parser(src, self.spans.then_some(at))?;
+        p.in_generator = self.in_generator;
+        p.in_async = self.in_async;
+        if !self.class_scopes.is_empty() {
+            p.class_scopes.push(PrivateScope::default());
+        }
+        let e = p.parse_expr()?;
+        if let (Some(scope), Some(inner)) = (self.class_scopes.last_mut(), p.class_scopes.pop()) {
+            scope.used.extend(inner.used);
+        }
+        Ok(e)
     }
+
     /// Byte offset where token `i` begins.
     fn start_at(&self, i: usize) -> u32 {
         self.toks[i].start
@@ -1743,10 +1759,10 @@ impl Parser {
     }
 }
 
-/// Parse a template-literal `${...}` field's raw source into an expression.
-/// `base` is the field's byte offset in the enclosing script, so the spans
-/// recorded inside it index that script; `None` records none.
-fn parse_expr_source(src: &str, base: Option<u32>) -> Result<Expr, String> {
+/// A parser over a template-literal `${...}` field's raw source. `base` is the
+/// field's byte offset in the enclosing script, so the spans recorded inside it
+/// index that script; `None` records none.
+fn field_parser(src: &str, base: Option<u32>) -> Result<Parser, String> {
     let mut toks = lex(src)?;
     for t in &mut toks {
         t.start += base.unwrap_or(0);
@@ -1757,7 +1773,7 @@ fn parse_expr_source(src: &str, base: Option<u32>) -> Result<Expr, String> {
             }
         }
     }
-    let mut p = Parser {
+    Ok(Parser {
         toks,
         pos: 0,
         in_generator: false,
@@ -1765,7 +1781,5 @@ fn parse_expr_source(src: &str, base: Option<u32>) -> Result<Expr, String> {
         no_in: false,
         class_scopes: Vec::new(),
         spans: base.is_some(),
-    };
-    let e = p.parse_expr()?;
-    Ok(e)
+    })
 }
