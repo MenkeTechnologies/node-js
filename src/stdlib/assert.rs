@@ -2,8 +2,8 @@
 //! as an `Err`, which the host surfaces as a thrown JS exception).
 
 use crate::host::{
-    call_method, invoke, is_callable, promise_of, reject_promise_val, resolve_promise_val,
-    subscribe_native, take_exc_or_error, with_host, JsObj, PromiseState,
+    call_method, invoke, is_callable, reject_promise_val, resolve_promise_val, subscribe_native,
+    take_exc_or_error, with_host, JsObj, PromiseState,
 };
 use fusevm::Value;
 
@@ -84,8 +84,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "doesNotMatch" => assert_match(args, false),
         "ifError" => if_error(&a()),
         "partialDeepStrictEqual" => partial(&a(), &b(), args),
-        "rejects" => Ok(rejects_impl(&a(), true)),
-        "doesNotReject" => Ok(rejects_impl(&a(), false)),
+        "rejects" => Ok(rejects_impl(args, true)),
+        "doesNotReject" => Ok(rejects_impl(args, false)),
         _ => return None,
     })
 }
@@ -108,7 +108,7 @@ pub fn strict_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
 fn assert_match(args: &[Value], want_match: bool) -> Result<Value, String> {
     let s = args.first().cloned().unwrap_or(Value::Undef);
     let re = args.get(1).cloned().unwrap_or(Value::Undef);
-    if !with_host(|h| matches!(h.get(&re), Some(JsObj::RegExp(_)))) {
+    if !is_regexp(&re) {
         // Node names the instance, not a type, and appends the received value.
         return Err(crate::host::coded_error(
             "TypeError",
@@ -119,21 +119,43 @@ fn assert_match(args: &[Value], want_match: bool) -> Result<Value, String> {
             ),
         ));
     }
-    let matched = call_method(&re, "test", vec![s.clone()])?;
-    let matched = with_host(|h| h.truthy(&matched));
-    if matched == want_match {
+    // `internalMatch`: a non-string input fails either assertion, and the
+    // test is `RegExp.prototype.exec`, which honours `lastIndex`.
+    let is_string = with_host(|h| h.type_of(&s) == "string");
+    if is_string && regexp_matches(&re, &s)? == want_match {
         return Ok(Value::Undef);
     }
-    if let Some(m) = message(args, 2) {
-        return Err(assertion_error(&m));
-    }
-    let (sre, sstr) = with_host(|h| (h.inspect(&re), h.str_of(&s)));
-    let verb = if want_match {
-        "The input did not match the regular expression"
-    } else {
-        "The input was expected to not match the regular expression"
-    };
-    Err(assertion_error(&format!("{verb} {sre}. Input: '{sstr}'")))
+    let operator = if want_match { "match" } else { "doesNotMatch" };
+    let custom = message(args, 2);
+    let generated = custom.is_none();
+    let msg = custom.unwrap_or_else(|| {
+        with_host(|h| {
+            if !is_string {
+                return format!(
+                    "The \"string\" argument must be of type string. Received type {} ({})",
+                    h.type_of(&s),
+                    h.inspect(&s)
+                );
+            }
+            let verb = if want_match {
+                "The input did not match the regular expression"
+            } else {
+                "The input was expected to not match the regular expression"
+            };
+            format!("{verb} {}. Input:\n\n{}\n", h.inspect(&re), h.inspect(&s))
+        })
+    });
+    Err(throw_assertion(&msg, generated, operator, s, re))
+}
+
+fn is_regexp(v: &Value) -> bool {
+    with_host(|h| matches!(h.get(v), Some(JsObj::RegExp(_))))
+}
+
+/// `RegExpPrototypeExec(re, s) !== null`.
+fn regexp_matches(re: &Value, s: &Value) -> Result<bool, String> {
+    let m = call_method(re, "exec", vec![s.clone()])?;
+    Ok(!with_host(|h| h.is_null(&m)) && !matches!(m, Value::Undef))
 }
 
 /// `assert.ifError(value)` — throws unless `value` is `null`/`undefined`.
@@ -194,36 +216,71 @@ fn partial_deep(actual: &Value, expected: &Value) -> bool {
     }
 }
 
-/// `assert.rejects(fn|promise)` / `assert.doesNotReject(...)` — returns a Promise
-/// that fulfills when the operand settles the expected way, else rejects with an
-/// `AssertionError`.
-fn rejects_impl(input: &Value, want_reject: bool) -> Value {
+/// `assert.rejects(fn|promise[, error][, message])` / `assert.doesNotReject(...)`
+/// — node's `waitForActual` then `expectsError`/`expectsNoError`, so the
+/// `error` argument validates a rejection exactly as it validates a throw.
+/// Returns the promise those async functions return.
+fn rejects_impl(args: &[Value], want_reject: bool) -> Value {
+    let input = args.first().cloned().unwrap_or(Value::Undef);
+    let rest: Vec<Value> = args.get(1..).unwrap_or(&[]).to_vec();
     let result = with_host(|h| h.new_promise());
     let rid = with_host(|h| h.promise_id(&result).unwrap());
-    // Reduce the operand to a promise: call it if it is a function.
-    let operand = if with_host(|h| is_callable(h, input)) {
-        match invoke(input, Vec::new(), None) {
-            Ok(v) => promise_of(&v),
+    let fail = |e: String| {
+        let ev = take_exc_or_error(&e);
+        reject_promise_val(rid, ev);
+    };
+    // A function is called and must hand back a promise; anything else must
+    // be one. A synchronous throw rejects this promise with that error, as an
+    // `async function` would.
+    let operand = if with_host(|h| is_callable(h, &input)) {
+        match invoke(&input, Vec::new(), None) {
+            Ok(v) if is_promise_like(&v) => crate::host::promise_of(&v),
+            Ok(v) => {
+                fail(crate::host::coded_error(
+                    "TypeError",
+                    "ERR_INVALID_RETURN_VALUE",
+                    &format!(
+                        "Expected instance of Promise to be returned from the \"promiseFn\" function but got {}.",
+                        crate::stdlib::received_desc(&v)
+                    ),
+                ));
+                return result;
+            }
             Err(e) => {
-                let ev = take_exc_or_error(&e);
-                let p = with_host(|h| h.new_promise());
-                let pid = with_host(|h| h.promise_id(&p).unwrap());
-                reject_promise_val(pid, ev);
-                p
+                fail(e);
+                return result;
             }
         }
+    } else if is_promise_like(&input) {
+        crate::host::promise_of(&input)
     } else {
-        promise_of(input)
-    };
-    let Some(oid) = with_host(|h| h.promise_id(&operand)) else {
-        // Not thenable: treat as an immediate non-rejection.
-        settle_rejects(rid, false, want_reject);
+        fail(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"promiseFn\" argument must be of type function or an instance of Promise. Received {}",
+                crate::stdlib::received_desc(&input)
+            ),
+        ));
         return result;
     };
+    let oid = with_host(|h| h.promise_id(&operand).unwrap());
     subscribe_native(
         oid,
-        Box::new(move |state, _val| {
-            settle_rejects(rid, state == PromiseState::Rejected, want_reject);
+        Box::new(move |state, val| {
+            let actual = (state == PromiseState::Rejected).then_some(val);
+            let checked = if want_reject {
+                expects_error("rejects", "rejection", actual, &rest)
+            } else {
+                expects_no_error("doesNotReject", "rejection", actual, &rest)
+            };
+            match checked {
+                Ok(()) => resolve_promise_val(rid, Value::Undef),
+                Err(e) => {
+                    let ev = take_exc_or_error(&e);
+                    reject_promise_val(rid, ev);
+                }
+            }
             Ok(())
         }),
     );
@@ -341,20 +398,6 @@ fn throw_assertion(
     assertion_error(msg)
 }
 
-fn settle_rejects(rid: u32, rejected: bool, want_reject: bool) {
-    if rejected == want_reject {
-        resolve_promise_val(rid, Value::Undef);
-    } else {
-        let msg = if want_reject {
-            "AssertionError [ERR_ASSERTION]: Missing expected rejection."
-        } else {
-            "AssertionError [ERR_ASSERTION]: Got unwanted rejection."
-        };
-        let ev = with_host(|h| crate::builtins::synth_error(h, msg));
-        reject_promise_val(rid, ev);
-    }
-}
-
 /// `assert(value[, message])` — throws unless `value` is truthy.
 pub fn assert_ok(args: &[Value]) -> Result<Value, String> {
     let v = args.first().cloned().unwrap_or(Value::Undef);
@@ -465,34 +508,391 @@ fn check(
     ))
 }
 
+/// `assert.throws(fn[, error][, message])` / `assert.doesNotThrow(...)`: a port
+/// of node's `expectsError`/`expectedException` and `expectsNoError`
+/// (`lib/assert.js`). The `error` argument was ignored entirely, so
+/// `assert.throws(fn, RangeError)` passed whatever `fn` threw.
 fn throws(args: &[Value], want_throw: bool) -> Result<Value, String> {
     let f = args.first().cloned().unwrap_or(Value::Undef);
-    // The thrown value becomes `err.actual` on a `doesNotThrow` failure, so it
-    // has to be captured rather than discarded with `.is_err()`.
+    if !with_host(|h| is_callable(h, &f)) {
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"fn\" argument must be of type function. Received {}",
+                crate::stdlib::received_desc(&f)
+            ),
+        ));
+    }
+    // The thrown value becomes `err.actual`, so it has to be captured rather
+    // than discarded with `.is_err()`.
     let caught = match invoke(&f, Vec::new(), None) {
         Ok(_) => None,
         Err(e) => Some(crate::host::take_exc_or_error(&e)),
     };
-    let threw = caught.is_some();
-    match (threw, want_throw) {
-        (true, true) | (false, false) => Ok(Value::Undef),
-        // `generatedMessage` is FALSE for both, which is what node reports even
-        // though it wrote the sentence itself (v26.7.0, `assert.throws(()=>{})`).
-        (false, true) => Err(throw_assertion(
-            "Missing expected exception.",
-            false,
-            "throws",
-            Value::Undef,
-            Value::Undef,
-        )),
-        (true, false) => Err(throw_assertion(
-            "Got unwanted exception.",
-            false,
-            "doesNotThrow",
-            caught.unwrap_or(Value::Undef),
-            Value::Undef,
-        )),
+    let rest = args.get(1..).unwrap_or(&[]);
+    if want_throw {
+        expects_error("throws", "exception", caught, rest)
+    } else {
+        expects_no_error("doesNotThrow", "exception", caught, rest)
     }
+    .map(|_| Value::Undef)
+}
+
+/// The `error` argument's validation (`expectsError`). `actual` is `None`
+/// when nothing was thrown (or rejected).
+fn expects_error(
+    operator: &str,
+    kind: &str,
+    actual: Option<Value>,
+    rest: &[Value],
+) -> Result<(), String> {
+    let mut error = rest.first().cloned().unwrap_or(Value::Undef);
+    let mut msg = message(rest, 1);
+    let type_of = |v: &Value| with_host(|h| h.type_of(v));
+    if type_of(&error) == "string" {
+        if rest.len() >= 2 {
+            return Err(invalid_error_arg(&error));
+        }
+        let text = with_host(|h| h.str_of(&error));
+        if let Some(a) = &actual {
+            if is_object(a) {
+                let m = crate::builtins::get_property(a, "message")?;
+                if with_host(|h| h.type_of(&m) == "string" && h.str_of(&m) == text) {
+                    return Err(ambiguous(&format!(
+                        "The error message \"{text}\" is identical to the message."
+                    )));
+                }
+            } else if with_host(|h| h.type_of(a) == "string" && h.str_of(a) == text) {
+                return Err(ambiguous(&format!(
+                    "The error \"{text}\" is identical to the message."
+                )));
+            }
+        }
+        msg = Some(text);
+        error = Value::Undef;
+    } else if !with_host(|h| h.is_nullish(&error))
+        && !matches!(type_of(&error), "object" | "function")
+    {
+        return Err(invalid_error_arg(&error));
+    }
+    let Some(actual) = actual else {
+        let name = if with_host(|h| h.is_nullish(&error)) {
+            None
+        } else {
+            let n = crate::builtins::get_property(&error, "name")?;
+            with_host(|h| h.truthy(&n).then(|| h.str_of(&n)))
+        };
+        let mut details = name.map(|n| format!(" ({n})")).unwrap_or_default();
+        details.push_str(&msg.map(|m| format!(": {m}")).unwrap_or_else(|| ".".into()));
+        return Err(throw_assertion(
+            &format!("Missing expected {kind}{details}"),
+            false,
+            operator,
+            Value::Undef,
+            error,
+        ));
+    };
+    if !with_host(|h| h.truthy(&error)) {
+        return Ok(());
+    }
+    expected_exception(operator, actual, error, msg)
+}
+
+fn invalid_error_arg(error: &Value) -> String {
+    crate::host::coded_error(
+        "TypeError",
+        "ERR_INVALID_ARG_TYPE",
+        &format!(
+            "The \"error\" argument must be of type function or an instance of Error, RegExp, or Object. Received {}",
+            crate::stdlib::received_desc(error)
+        ),
+    )
+}
+
+fn ambiguous(detail: &str) -> String {
+    crate::host::coded_error(
+        "TypeError",
+        "ERR_AMBIGUOUS_ARGUMENT",
+        &format!("The \"error/message\" argument is ambiguous. {detail}"),
+    )
+}
+
+fn is_object(v: &Value) -> bool {
+    with_host(|h| h.type_of(v) == "object" && !h.is_null(v))
+}
+
+/// Whether `v` is an Error (node's `isError`: its brand is `Error`).
+fn is_error(v: &Value) -> bool {
+    is_object(v) && with_host(|h| crate::builtins::object_tag(h, v) == "[object Error]")
+}
+
+/// `expectedException`: check what was thrown against a RegExp, a validation
+/// object, an Error class or a validation function.
+fn expected_exception(
+    operator: &str,
+    actual: Value,
+    expected: Value,
+    msg: Option<String>,
+) -> Result<(), String> {
+    let generated = msg.is_none();
+    let fail = |text: String| -> Result<(), String> {
+        Err(throw_assertion(
+            &text,
+            generated,
+            operator,
+            actual.clone(),
+            expected.clone(),
+        ))
+    };
+    if with_host(|h| h.type_of(&expected)) != "function" {
+        if is_regexp(&expected) {
+            let s = crate::host::to_string_value(&actual)?;
+            if regexp_matches(&expected, &s)? {
+                return Ok(());
+            }
+            return fail(msg.unwrap_or_else(|| {
+                with_host(|h| {
+                    format!(
+                        "The input did not match the regular expression {}. Input:\n\n{}\n",
+                        h.inspect(&expected),
+                        h.inspect(&s)
+                    )
+                })
+            }));
+        }
+        if !is_object(&actual) {
+            let text = msg.unwrap_or_else(|| {
+                super::assert_diff::create_err_diff(&actual, &expected, "deepStrictEqual", None)
+            });
+            return fail(text);
+        }
+        // A validation object: every key must be deep-strict-equal, or a
+        // RegExp matching a string property. An Error compares `name` and
+        // `message` as well.
+        let keys_v = crate::builtins::call_builtin_function("Object.keys", vec![expected.clone()])?;
+        let mut keys: Vec<Value> = with_host(|h| match h.get(&keys_v) {
+            Some(JsObj::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        });
+        if is_error(&expected) {
+            keys.extend(with_host(|h| [h.new_str("name"), h.new_str("message")]));
+        } else if keys.is_empty() {
+            let shown = with_host(|h| h.inspect(&expected));
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_VALUE",
+                &format!("The argument 'error' may not be an empty object. Received {shown}"),
+            ));
+        }
+        for key in &keys {
+            let k = with_host(|h| h.str_of(key));
+            let a = crate::builtins::get_property(&actual, &k)?;
+            let e = crate::builtins::get_property(&expected, &k)?;
+            if with_host(|h| h.type_of(&a)) == "string" && is_regexp(&e) && regexp_matches(&e, &a)?
+            {
+                continue;
+            }
+            let present = crate::builtins::has_property(&actual, &k)?;
+            if present && deep_equal(&a, &e, true) {
+                continue;
+            }
+            let text = match &msg {
+                Some(m) => m.clone(),
+                None => {
+                    let keys_arr = with_host(|h| h.new_array(keys.clone()));
+                    let ca = comparison(&actual, &keys_arr, &Value::Undef)?;
+                    let cb = comparison(&expected, &keys_arr, &actual)?;
+                    super::assert_diff::create_err_diff(&ca, &cb, "deepStrictEqual", None)
+                }
+            };
+            return fail(text);
+        }
+        return Ok(());
+    }
+    // An Error class: the thrown value must be an instance of it.
+    let proto = crate::builtins::get_property(&expected, "prototype")?;
+    if !matches!(proto, Value::Undef) && crate::host::instance_of(&actual, &expected)? {
+        return Ok(());
+    }
+    if is_error_subclass(&expected) {
+        let text = match msg {
+            Some(m) => m,
+            None => {
+                let name = with_host(|h| h.callable_name(&expected));
+                let mut m =
+                    format!("The error is expected to be an instance of \"{name}\". Received ");
+                if is_error(&actual) {
+                    let ctor = crate::builtins::get_property(&actual, "constructor")?;
+                    let ctor_name = if with_host(|h| h.truthy(&ctor)) {
+                        crate::builtins::get_property(&ctor, "name")?
+                    } else {
+                        Value::Undef
+                    };
+                    let actual_name = if with_host(|h| h.truthy(&ctor_name)) {
+                        with_host(|h| h.str_of(&ctor_name))
+                    } else {
+                        let n = crate::builtins::get_property(&actual, "name")?;
+                        with_host(|h| h.str_of(&n))
+                    };
+                    if actual_name == name {
+                        m.push_str("an error with identical name but a different prototype.");
+                    } else {
+                        m.push_str(&format!("\"{actual_name}\""));
+                    }
+                    let am = crate::builtins::get_property(&actual, "message")?;
+                    if with_host(|h| h.truthy(&am)) {
+                        m.push_str(&format!(
+                            "\n\nError message:\n\n{}",
+                            with_host(|h| h.str_of(&am))
+                        ));
+                    }
+                } else {
+                    m.push_str(&format!("\"{}\"", with_host(|h| h.inspect(&actual))));
+                }
+                m
+            }
+        };
+        return fail(text);
+    }
+    // A validation function, called with a fresh `this`, must return `true`.
+    let this = with_host(|h| h.new_object(indexmap::IndexMap::new()));
+    let res = invoke(&expected, vec![actual.clone()], Some(this))?;
+    if matches!(res, Value::Bool(true)) {
+        return Ok(());
+    }
+    let text = match msg {
+        Some(m) => m,
+        None => {
+            let name = with_host(|h| h.callable_name(&expected));
+            let named = if name.is_empty() {
+                String::new()
+            } else {
+                format!("\"{name}\" ")
+            };
+            let mut m = format!(
+                "The {named}validation function is expected to return \"true\". Received {}",
+                with_host(|h| h.inspect(&res))
+            );
+            if is_error(&actual) {
+                let s = crate::host::to_string_value(&actual)?;
+                m.push_str(&format!(
+                    "\n\nCaught error:\n\n{}",
+                    with_host(|h| h.str_of(&s))
+                ));
+            }
+            m
+        }
+    };
+    fail(text)
+}
+
+/// `expectsNoError`: anything thrown fails, unless an `error` argument is
+/// given that it does NOT match, in which case it is rethrown as is.
+fn expects_no_error(
+    operator: &str,
+    kind: &str,
+    actual: Option<Value>,
+    rest: &[Value],
+) -> Result<(), String> {
+    let Some(actual) = actual else {
+        return Ok(());
+    };
+    let mut error = rest.first().cloned().unwrap_or(Value::Undef);
+    let mut msg = message(rest, 1);
+    if with_host(|h| h.type_of(&error)) == "string" {
+        msg = Some(with_host(|h| h.str_of(&error)));
+        error = Value::Undef;
+    }
+    if !with_host(|h| h.truthy(&error)) || has_matching_error(&actual, &error)? {
+        let details = msg.map(|m| format!(": {m}")).unwrap_or_else(|| ".".into());
+        let actual_message = if is_object(&actual) {
+            let m = crate::builtins::get_property(&actual, "message")?;
+            with_host(|h| h.str_of(&m))
+        } else {
+            "undefined".to_string()
+        };
+        return Err(throw_assertion(
+            &format!("Got unwanted {kind}{details}\nActual message: \"{actual_message}\""),
+            false,
+            operator,
+            actual,
+            error,
+        ));
+    }
+    Err(with_host(|h| {
+        h.exc = Some(actual.clone());
+        crate::builtins::error_string(h, &actual)
+    }))
+}
+
+/// `hasMatchingError`.
+fn has_matching_error(actual: &Value, expected: &Value) -> Result<bool, String> {
+    if with_host(|h| h.type_of(expected)) != "function" {
+        if is_regexp(expected) {
+            let s = crate::host::to_string_value(actual)?;
+            return regexp_matches(expected, &s);
+        }
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"expected\" argument must be of type function or an instance of RegExp. Received {}",
+                crate::stdlib::received_desc(expected)
+            ),
+        ));
+    }
+    let proto = crate::builtins::get_property(expected, "prototype")?;
+    if !matches!(proto, Value::Undef) && crate::host::instance_of(actual, expected)? {
+        return Ok(true);
+    }
+    if is_error_subclass(expected) {
+        return Ok(false);
+    }
+    let this = with_host(|h| h.new_object(indexmap::IndexMap::new()));
+    let res = invoke(expected, vec![actual.clone()], Some(this))?;
+    Ok(matches!(res, Value::Bool(true)))
+}
+
+/// `ObjectPrototypeIsPrototypeOf(Error, expected)`: whether `Error` is on
+/// `expected`'s prototype chain — a subclass of it, not `Error` itself.
+fn is_error_subclass(expected: &Value) -> bool {
+    let mut cur = crate::builtins::prototype_of(expected);
+    for _ in 0..100_000 {
+        if with_host(|h| h.is_null(&cur) || matches!(cur, Value::Undef)) {
+            return false;
+        }
+        if with_host(|h| matches!(h.get(&cur), Some(JsObj::Builtin(n)) if n == "Error")) {
+            return true;
+        }
+        cur = crate::builtins::prototype_of(&cur);
+    }
+    false
+}
+
+/// Node's `Comparison`: an object of the compared keys, so the diff an
+/// `assert.throws` validation object fails with names only those keys, under
+/// the class name `Comparison`. Defined once, in JavaScript, since it IS a
+/// class node defines in JavaScript.
+fn comparison(obj: &Value, keys: &Value, actual: &Value) -> Result<Value, String> {
+    thread_local! {
+        static FACTORY: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    let factory = match FACTORY.with(|f| f.borrow().clone()) {
+        Some(f) => f,
+        None => {
+            let f = crate::eval_in_global_scope(
+                "(() => { class Comparison { constructor(obj, keys, actual) { for (const key of keys) { if (key in obj) { if (actual !== undefined && typeof actual[key] === 'string' && Object.prototype.toString.call(obj[key]) === '[object RegExp]' && obj[key].exec(actual[key]) !== null) { this[key] = actual[key]; } else { this[key] = obj[key]; } } } } } return (obj, keys, actual) => new Comparison(obj, keys, actual); })()",
+            )?;
+            FACTORY.with(|c| *c.borrow_mut() = Some(f.clone()));
+            f
+        }
+    };
+    invoke(
+        &factory,
+        vec![obj.clone(), keys.clone(), actual.clone()],
+        None,
+    )
 }
 
 fn message(args: &[Value], idx: usize) -> Option<String> {
@@ -766,4 +1166,20 @@ fn object_of(h: &crate::host::JsHost, v: &Value) -> Vec<(String, Value)> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Node's `checkIsPromise`: a native promise, or an object whose `then` and
+/// `catch` are both functions.
+fn is_promise_like(v: &Value) -> bool {
+    if with_host(|h| h.promise_id(v)).is_some() {
+        return true;
+    }
+    if !is_object(v) {
+        return false;
+    }
+    ["then", "catch"].iter().all(|k| {
+        crate::builtins::get_property(v, k)
+            .map(|f| with_host(|h| is_callable(h, &f)))
+            .unwrap_or(false)
+    })
 }

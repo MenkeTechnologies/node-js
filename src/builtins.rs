@@ -2069,15 +2069,24 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             // proxy does not hold, which reported `false` for every proxy. From
             // the second hop on the chain is ordinary objects again, walked by
             // the recorded link exactly as before.
+            // Each further hop is `[[GetPrototypeOf]]` (`prototype_of`), the same
+            // answer `Object.getPrototypeOf` gives: the recorded link alone
+            // misses a class's parent constructor and every default prototype,
+            // so `A.isPrototypeOf(B)` for `class B extends A` and
+            // `Error.isPrototypeOf(RangeError)` read false.
+            let non_null = |p: Value| Some(p).filter(|p| !with_host(|h| h.is_null(p)));
             let mut cur = match crate::proxy::get_prototype_of(&target)? {
-                Some(p) => Some(p).filter(|p| !with_host(|h| h.is_null(p))),
-                None => with_host(|h| h.proto_of(&target)),
+                Some(p) => non_null(p),
+                None if with_host(|h| crate::host::is_primitive(h, &target)) => None,
+                None => non_null(prototype_of(&target)),
             };
-            while let Some(p) = cur {
+            // Bounded: a chain longer than any real one is a cycle.
+            for _ in 0..100_000 {
+                let Some(p) = cur else { break };
                 if with_host(|h| h.strict_eq(&p, recv)) {
                     return Ok(Value::Bool(true));
                 }
-                cur = with_host(|h| h.proto_of(&p));
+                cur = non_null(prototype_of(&p));
             }
             Ok(Value::Bool(false))
         }
@@ -14996,6 +15005,19 @@ pub fn prototype_of(v: &Value) -> Value {
     if matches!(with_host(|h| h.get(v).cloned()), Some(JsObj::Builtin(ref n)) if n == "Buffer") {
         return with_host(|h| h.alloc(JsObj::Builtin("Uint8Array".into())));
     }
+    // The NativeError constructors inherit from `Error` (20.5.6.2: their
+    // `[[Prototype]]` is %Error%), so `Object.getPrototypeOf(RangeError) ===
+    // Error`. They reported `null`.
+    if matches!(
+        with_host(|h| h.get(v).cloned()),
+        Some(JsObj::Builtin(ref n)) if matches!(
+            n.as_str(),
+            "EvalError" | "RangeError" | "ReferenceError" | "SyntaxError" | "TypeError"
+                | "URIError" | "AggregateError"
+        )
+    ) {
+        return with_host(|h| h.alloc(JsObj::Builtin("Error".into())));
+    }
     // Constructor-side inheritance for a `class B extends A` (ClassDefinition
     // 15.7.14 step 6.d: the constructor's `[[Prototype]]` is the parent
     // CONSTRUCTOR, not `Function.prototype`). Statics already resolved through
@@ -15046,6 +15068,11 @@ pub fn prototype_of(v: &Value) -> Value {
             Some(c) => h
                 .native_proto(c)
                 .unwrap_or_else(|| h.alloc(JsObj::Builtin(format!("{c}.prototype")))),
+            // A builtin FUNCTION (`Error`, `Math.max`, `parseInt`) is an ordinary
+            // function object whose `[[Prototype]]` is `Function.prototype`.
+            None if h.type_of(v) == "function" => h
+                .native_proto("Function")
+                .unwrap_or_else(|| h.alloc(JsObj::Builtin("Function.prototype".into()))),
             None => h.null(),
         }
     })
