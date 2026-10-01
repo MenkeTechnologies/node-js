@@ -1451,6 +1451,24 @@ thousands grouping. All are implemented, in the fixed en-US shape this runtime
 already used for `Number.prototype.toLocaleString`, at UTC, with the
 `locales`/`options` arguments accepted and ignored.
 
+`Number.prototype.toLocaleString` and `BigInt.prototype.toLocaleString` now
+HONOR their `options` bag (`src/numfmt.rs`), still in the en-US shape: the digit
+options (`minimumIntegerDigits`, `minimum`/`maximumFractionDigits`,
+`minimum`/`maximumSignificantDigits`, with ECMA-402's defaults and its
+`RangeError`s), `useGrouping` (including `"min2"`), `signDisplay`, and the
+`percent` and `currency` styles (`currencyDisplay: "code"` too). Rounding is
+ICU's, on the SHORTEST decimal form, half away from zero — `(1.005)
+.toLocaleString('en-US', {maximumFractionDigits: 2})` is `1.01` where `toFixed`
+gives `1.00`. The currency symbols and fraction digits are a table generated from
+node v26.10.0's ICU. Before, every option was dropped, so
+`(1234.5).toLocaleString('en-US', {style: 'currency', currency: 'USD'})` printed
+`1,234.5` instead of `$1,234.50`. Verified byte-for-byte by
+`parity-scripts/data/27_number_locale_options.js`. Still not modelled, each a
+divergence rather than a refusal: the `locales` argument, `notation`
+(`compact` prints the plain number), `currencyDisplay: "name"`/`"narrowSymbol"`
+(print the symbol), and the unit label of `style: "unit"` (prints the number
+alone).
+
 `String.prototype.normalize` remains the identity (no normalization tables) but
 now VALIDATES the form: node throws `RangeError` outside NFC/NFD/NFKC/NFKD, and
 a try/catch support probe used to be told every form worked.

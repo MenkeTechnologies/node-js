@@ -23,6 +23,7 @@ pub mod lexer;
 pub mod lsp;
 pub mod module;
 pub mod parser;
+pub mod numfmt;
 pub mod proxy;
 pub mod regexp;
 pub mod repl;

@@ -4012,6 +4012,32 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         }
         return Ok(());
     }
+    // A Proxy on the PROTOTYPE chain: `OrdinarySet` (10.1.9.2 step 2) hands a
+    // key the receiver does not own to `parent.[[Set]](P, V, Receiver)`, so the
+    // proxy's `set` trap runs with the ORIGINAL object as its receiver. The
+    // write used to land straight on the receiver, and a trap inherited through
+    // `Object.create(proxy)` never fired. A nearer link owning the key (data or
+    // accessor) still wins, as `proxy_proto_link` checks.
+    if name != "__proto__"
+        && peek(recv, |o| match o {
+            JsObj::Object(p) => Some(!p.contains_key(name)),
+            _ => None,
+        })
+        .unwrap_or(false)
+        && !with_host(|h| h.own_accessor(recv, name).is_some())
+    {
+        if let Some(link) = proxy_proto_link(recv, name) {
+            if crate::proxy::set(&link, name, &val, recv)? {
+                return Ok(());
+            }
+            if with_host(|h| h.current_strict()) {
+                return Err(host::type_error(&format!(
+                    "'set' on proxy: trap returned falsish for property '{name}'"
+                )));
+            }
+            return Ok(());
+        }
+    }
     // `globalThis.x = 1` creates a real global binding, so the bare `x` reads it
     // back. Writing only the own property left the two views disagreeing:
     // `globalThis.zz` was 7 while `zz` was still a `ReferenceError`.
@@ -10353,13 +10379,15 @@ fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String
     ) {
         return Ok(plain());
     }
-    // An explicit `@@species` wins; absent one, the constructor itself is the
-    // species, as the inherited accessor returns `this`.
-    let species = match get_property(&ctor, "@@species") {
-        Ok(Value::Undef) => ctor,
-        Ok(s) if with_host(|h| h.is_null(&s)) => return Ok(plain()),
-        Ok(s) => s,
-        Err(_) => ctor,
+    // `C[@@species]` (23.1.3.4 step 5): a subclass that does not override the
+    // accessor reads back ITSELF (the `@@species` arm of the class static
+    // lookup), so an `undefined` or `null` here was written by user code — a
+    // `static get [Symbol.species]() { return undefined }` — and both mean
+    // "make a plain Array". A getter that throws propagates.
+    let species = match get_property(&ctor, "@@species")? {
+        Value::Undef => return Ok(plain()),
+        s if with_host(|h| h.is_null(&s)) => return Ok(plain()),
+        s => s,
     };
     if !matches!(
         with_host(|h| h.kind_of(&species)),
@@ -12336,16 +12364,17 @@ fn bigint_method(b: &num_bigint::BigInt, name: &str, args: Vec<Value>) -> Result
         // `BigInt.prototype.toLocaleString` groups thousands like the Number
         // one does — `(1234567n).toLocaleString()` is `1,234,567` in node, and
         // returning the bare digits made it the only numeric type that skipped
-        // grouping. Same en-US-shaped output as `Number.prototype`; the
-        // `locales`/`options` arguments are ignored (no ICU here).
+        // grouping. Same en-US-shaped output as `Number.prototype`, formatted
+        // from the EXACT digits; `options` is honored, `locales` ignored (no
+        // ICU here).
         "toLocaleString" => {
             let digits = b.magnitude().to_string();
-            let sign = if b.sign() == num_bigint::Sign::Minus {
-                "-"
-            } else {
-                ""
-            };
-            Ok(new_s(format!("{sign}{}", group_thousands(&digits))))
+            let neg = b.sign() == num_bigint::Sign::Minus;
+            let opts = args.get(1).cloned().unwrap_or(Value::Undef);
+            Ok(new_s(crate::numfmt::to_locale_string(
+                crate::numfmt::Num::BigInt(&digits, neg),
+                &opts,
+            )?))
         }
         "valueOf" => Ok(with_host(|h| h.new_bigint(b.clone()))),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
@@ -12416,97 +12445,18 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
                 }
             }
         }
-        "toLocaleString" => Ok(new_s(to_locale_string(n))),
+        // The `options` argument (digit options, grouping, percent/currency
+        // style) is honored in the en-US shape; see `crate::numfmt`.
+        "toLocaleString" => {
+            let opts = args.get(1).cloned().unwrap_or(Value::Undef);
+            Ok(new_s(crate::numfmt::to_locale_string(
+                crate::numfmt::Num::Float(n),
+                &opts,
+            )?))
+        }
         "valueOf" => Ok(Value::Float(n)),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
-}
-
-/// `Number.prototype.toLocaleString()` with the default locale and options:
-/// integer part grouped in threes with `,`, up to 3 fraction digits (rounded
-/// half away from zero), trailing fractional zeros dropped. Mirrors V8's default
-/// `Intl.NumberFormat().format` output (`(12345.678).toLocaleString()` ⇒
-/// `"12,345.678"`; `(1234.5678)` ⇒ `"1,234.568"`). `NaN`, `±Infinity`, and `-0`
-/// render as `"NaN"`, `"∞"`/`"-∞"`, and `"-0"`.
-fn to_locale_string(n: f64) -> String {
-    if n.is_nan() {
-        return "NaN".to_string();
-    }
-    if n.is_infinite() {
-        return if n < 0.0 { "-∞" } else { "∞" }.to_string();
-    }
-    let neg = n.is_sign_negative();
-    // Round the magnitude to at most 3 fraction digits, then drop trailing zeros
-    // (and a bare trailing point). `to_fixed` rounds half away from zero.
-    // `to_fixed` falls back to `ToString` at |x| ≥ 1e21 (spec 21.1.3.3 step 6),
-    // which is exponential — and the grouping below then chopped up the
-    // exponent, so `(1e21).toLocaleString()` was `1e,+21` instead of node's
-    // `1,000,000,000,000,000,000,000`. Expanding the SHORTEST repr is the right
-    // source: node groups the shortest decimal form, so `(1e100)
-    // .toLocaleString()` is 1 followed by a hundred zeros rather than the exact
-    // binary value `1000…159028911…`. (`BigInt(1e100)` is the exact value, a
-    // deliberately different rule — see `bigint_ctor`.)
-    let fixed = expand_exponential(&to_fixed(n.abs(), 3));
-    let trimmed = match fixed.split_once('.') {
-        Some(_) => fixed.trim_end_matches('0').trim_end_matches('.'),
-        None => fixed.as_str(),
-    };
-    let (int_part, frac_part) = match trimmed.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (trimmed, None),
-    };
-    let mut out = String::new();
-    if neg {
-        out.push('-'); // Intl keeps the sign even for -0.
-    }
-    out.push_str(&group_thousands(int_part));
-    if let Some(f) = frac_part {
-        out.push('.');
-        out.push_str(f);
-    }
-    out
-}
-
-/// Write a nonnegative decimal string in plain positional form, expanding an
-/// `e+NN` exponent into zeros. `"1e+21"` → `"1000000000000000000000"`,
-/// `"1.5e+21"` → `"1500000000000000000000"`. A string with no exponent, or a
-/// negative exponent (a magnitude below 1, which the caller has already rounded
-/// to zero), is returned unchanged.
-fn expand_exponential(s: &str) -> String {
-    let Some((mantissa, exp)) = s.split_once(['e', 'E']) else {
-        return s.to_string();
-    };
-    let Ok(exp) = exp.trim_start_matches('+').parse::<i32>() else {
-        return s.to_string();
-    };
-    if exp <= 0 {
-        return s.to_string();
-    }
-    let (int_digits, frac_digits) = match mantissa.split_once('.') {
-        Some((i, f)) => (i.to_string(), f.to_string()),
-        None => (mantissa.to_string(), String::new()),
-    };
-    let mut digits = int_digits;
-    digits.push_str(&frac_digits);
-    // The exponent consumes the fractional digits first; whatever is left
-    // becomes trailing zeros.
-    let zeros = exp as usize - frac_digits.len().min(exp as usize);
-    digits.push_str(&"0".repeat(zeros));
-    digits
-}
-
-/// Insert `,` as a thousands separator into a nonnegative integer digit string.
-fn group_thousands(int_part: &str) -> String {
-    let bytes = int_part.as_bytes();
-    let n = bytes.len();
-    let mut out = String::with_capacity(n + n / 3);
-    for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (n - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(b as char);
-    }
-    out
 }
 
 /// `Number.prototype.toFixed(f)`: fixed-point with `f` fractional digits, rounding

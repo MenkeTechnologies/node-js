@@ -191,11 +191,70 @@ pub fn set(v: &Value, key: &str, val: &Value, receiver: &Value) -> Result<bool, 
     }
     match no_trap(v, "set")? {
         Some(target) => {
+            if receiver_observes_set(v, &target, key, receiver) {
+                return define_on_proxy_receiver(v, key, val);
+            }
             crate::builtins::set_property_pub(&target, key, val.clone())?;
             Ok(true)
         }
         None => Ok(false),
     }
+}
+
+/// Whether a trapless `[[Set]]` has to run `OrdinarySet` (10.1.9.2) against the
+/// target with THIS proxy as the receiver, rather than forwarding the write.
+///
+/// The forward is observationally identical unless the handler traps one of
+/// the two receiver operations that `OrdinarySet` performs on a data property:
+/// `[[GetOwnProperty]]` (step 3.c) and `[[DefineOwnProperty]]` (3.d.iv / 3.e).
+/// A logging or validating handler that installs only those still sees every
+/// `p.k = v`; forwarding skipped both traps. Only the plain case takes the
+/// receiver route: a data property the target can accept, on an ordinary
+/// target. An accessor or a read-only slot keeps the ordinary forward.
+fn receiver_observes_set(v: &Value, target: &Value, key: &str, receiver: &Value) -> bool {
+    with_host(|h| h.strict_eq(receiver, v))
+        && (has_trap(v, "getOwnPropertyDescriptor") || has_trap(v, "defineProperty"))
+        && parts(target).is_none()
+        && with_host(|h| {
+            host::lookup_accessor(h, target, key).is_none() && h.can_write_prop(target, key)
+        })
+}
+
+/// 10.1.9.2 steps 3.c–3.e with the proxy `v` as the receiver: read its own
+/// descriptor through the `getOwnPropertyDescriptor` trap, then DEFINE through
+/// the `defineProperty` trap — `{ value }` alone over an existing writable data
+/// property, a full enumerable/writable/configurable data descriptor for a new
+/// one. A refused define is a TypeError in strict code, named for the trap that
+/// refused (V8's message), and a silent `false` in sloppy code.
+fn define_on_proxy_receiver(v: &Value, key: &str, val: &Value) -> Result<bool, String> {
+    let existing = get_own_descriptor(v, key)?.unwrap_or(Value::Undef);
+    let mut desc = indexmap::IndexMap::new();
+    desc.insert("value".to_string(), val.clone());
+    if !matches!(existing, Value::Undef) {
+        let field = |n: &str| crate::builtins::get_property(&existing, n);
+        let is_accessor = with_host(|h| {
+            host::lookup_chain(h, &existing, "get").is_some()
+                || host::lookup_chain(h, &existing, "set").is_some()
+        });
+        let writable = field("writable")?;
+        if is_accessor || !with_host(|h| h.truthy(&writable)) {
+            return Ok(false);
+        }
+    } else {
+        for flag in ["writable", "enumerable", "configurable"] {
+            desc.insert(flag.to_string(), Value::Bool(true));
+        }
+    }
+    let desc = with_host(|h| h.new_object(desc));
+    if define_property(v, key, &desc)? {
+        return Ok(true);
+    }
+    if with_host(|h| h.current_strict()) {
+        return Err(host::type_error(&format!(
+            "'defineProperty' on proxy: trap returned falsish for property '{key}'"
+        )));
+    }
+    Ok(false)
 }
 
 /// `[[HasProperty]]` (`key in proxy`).

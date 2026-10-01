@@ -1381,8 +1381,12 @@ impl JsHost {
     /// object, no prefix).
     pub fn ctor_name(&self, obj: &Value) -> String {
         if let Some(c) = self.class_of(obj) {
-            if let Some(JsObj::Class(cv)) = self.get(&c) {
-                return cv.name.clone();
+            // `callable_name`, not the class record's own name: an anonymous
+            // class expression is named by inference from its binding
+            // (`const X = class {}`), which lands as an own `name` property,
+            // and node prints `new X()` as `X {}`.
+            if let Some(JsObj::Class(_)) = self.get(&c) {
+                return self.callable_name(&c);
             }
         }
         // A `function F(){}` constructor is not a `class`, so it has no
@@ -1405,6 +1409,31 @@ impl JsHost {
             cur = self.proto_of(&p);
         }
         String::new()
+    }
+
+    /// The prefix node's `getPrefix` gives a builtin collection: `Map(2) ` for
+    /// a plain one, `M2(2) [Map] ` for an instance of a subclass (constructor
+    /// name, then the builtin tag in brackets). `size` is `None` for a kind
+    /// with no count (`Promise`).
+    fn builtin_prefix(&self, v: &Value, tag: &str, size: Option<usize>) -> String {
+        let ctor = self.ctor_name(v);
+        let count = size.map(|n| format!("({n})")).unwrap_or_default();
+        if ctor.is_empty() || ctor == tag {
+            format!("{tag}{count} ")
+        } else {
+            format!("{ctor}{count} [{tag}] ")
+        }
+    }
+
+    /// The `[Name]` stub a builtin collection collapses to past the depth
+    /// limit: `[Map]`, or `[M2 [Map]]` for a subclass instance.
+    fn builtin_depth_stub(&self, v: &Value, tag: &str) -> String {
+        let ctor = self.ctor_name(v);
+        if ctor.is_empty() || ctor == tag {
+            format!("[{tag}]")
+        } else {
+            format!("[{ctor} [{tag}]]")
+        }
     }
 
     /// Whether a callable owns a `prototype` property. `MakeConstructor`
@@ -4781,15 +4810,25 @@ impl JsHost {
                     None => "Symbol()".into(),
                 },
                 Some(JsObj::Class(c)) => {
-                    let base = if c.parent.is_some() {
-                        let pname = c
-                            .parent
-                            .as_ref()
-                            .map(|p| self.callable_name(p))
-                            .unwrap_or_default();
-                        format!("[class {} extends {}]", c.name, pname)
+                    // Named like a function (`callable_name`), so a class
+                    // expression picks up its inferred binding name, and one
+                    // with no name at all prints `(anonymous)`. node's
+                    // `getClassBase` appends `extends <name>` only when the
+                    // parent HAS a name: `class extends null {}` prints
+                    // without it.
+                    let mut name = self.callable_name(v);
+                    if name.is_empty() {
+                        name = "(anonymous)".into();
+                    }
+                    let pname = c
+                        .parent
+                        .as_ref()
+                        .map(|p| self.callable_name(p))
+                        .unwrap_or_default();
+                    let base = if pname.is_empty() {
+                        format!("[class {name}]")
                     } else {
-                        format!("[class {}]", c.name)
+                        format!("[class {name} extends {pname}]")
                     };
                     self.with_callable_props(v, base, indent, st)
                 }
@@ -4812,11 +4851,12 @@ impl JsHost {
                 Some(JsObj::Set { weak: true, .. }) => "WeakSet { <items unknown> }".into(),
                 Some(JsObj::Map { entries, .. }) => {
                     let extra = self.side_table_parts(v, indent, st);
+                    let prefix = self.builtin_prefix(v, "Map", Some(entries.len()));
                     if entries.is_empty() && extra.is_empty() {
-                        return "Map(0) {}".into();
+                        return format!("{prefix}{{}}");
                     }
                     if indent as i64 > inspect_indent_limit() {
-                        return "[Map]".into();
+                        return self.builtin_depth_stub(v, "Map");
                     }
                     let mut inner: Vec<String> = entries
                         .values()
@@ -4839,16 +4879,16 @@ impl JsHost {
                     // could not break a Map at all. Node builds these through
                     // `reduceToSingleString` with `braces[0]` of `Map(n) {`, which
                     // is this `prefix` (the trailing space is the brace gap).
-                    let prefix = format!("Map({}) ", entries.len());
                     self.render_object(&inner, &prefix, indent, st)
                 }
                 Some(JsObj::Set { entries, .. }) => {
                     let extra = self.side_table_parts(v, indent, st);
+                    let prefix = self.builtin_prefix(v, "Set", Some(entries.len()));
                     if entries.is_empty() && extra.is_empty() {
-                        return "Set(0) {}".into();
+                        return format!("{prefix}{{}}");
                     }
                     if indent as i64 > inspect_indent_limit() {
-                        return "[Set]".into();
+                        return self.builtin_depth_stub(v, "Set");
                     }
                     let mut inner: Vec<String> = entries
                         .values()
@@ -4859,23 +4899,24 @@ impl JsHost {
                     // NOT column-group a wide Set the way it grids an array:
                     // `groupArrayElements` is reached only from the list
                     // formatter, so a 30-member Set is thirty lines.
-                    let prefix = format!("Set({}) ", entries.len());
                     self.render_object(&inner, &prefix, indent, st)
                 }
                 Some(JsObj::Generator { .. }) => "Object [Generator] {}".into(),
                 Some(JsObj::Promise { id }) => match self.promises.get(*id as usize) {
-                    Some(c) => match c.state {
-                        PromiseState::Pending => "Promise { <pending> }".into(),
-                        PromiseState::Fulfilled => {
-                            format!("Promise {{ {} }}", self.inspect_lvl(&c.value, 0, st))
-                        }
-                        PromiseState::Rejected => {
-                            format!(
-                                "Promise {{ <rejected> {} }}",
+                    Some(c) => {
+                        // `P2 [Promise] { 3 }` for an instance of a subclass.
+                        let prefix = self.builtin_prefix(v, "Promise", None);
+                        match c.state {
+                            PromiseState::Pending => format!("{prefix}{{ <pending> }}"),
+                            PromiseState::Fulfilled => {
+                                format!("{prefix}{{ {} }}", self.inspect_lvl(&c.value, 0, st))
+                            }
+                            PromiseState::Rejected => format!(
+                                "{prefix}{{ <rejected> {} }}",
                                 self.inspect_lvl(&c.value, 0, st)
-                            )
+                            ),
                         }
-                    },
+                    }
                     None => "Promise { <pending> }".into(),
                 },
                 Some(JsObj::Func(f)) => {
