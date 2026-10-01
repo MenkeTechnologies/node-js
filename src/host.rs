@@ -4585,6 +4585,48 @@ impl JsHost {
                     }
                     self.render_object(&parts, "ArrayBuffer ", indent, st)
                 }
+                // A live Map/Set iterator shows what it has left to yield, as
+                // node's `formatIterator` does: `[Map Entries] { [ 1, 'a' ] }`,
+                // `[Set Iterator] { 1 }`, and `{  }` once it is exhausted.
+                Some(JsObj::Object(_))
+                    if crate::builtins::collection_iterator_view(self, v).is_some() =>
+                {
+                    let (brand, rest) = crate::builtins::collection_iterator_view(self, v)
+                        .unwrap_or(("Map Iterator", Vec::new()));
+                    if indent as i64 > inspect_indent_limit() {
+                        let stub = if brand.starts_with("Map") {
+                            "Map Iterator"
+                        } else {
+                            "Set Iterator"
+                        };
+                        return format!("[Object [{stub}]]");
+                    }
+                    let entries = brand.ends_with("Entries");
+                    let shown = rest.len().min(100);
+                    let mut inner: Vec<String> = rest[..shown]
+                        .iter()
+                        .map(|(k, val)| {
+                            let ks = self.inspect_lvl(k, indent + 2, st);
+                            if entries {
+                                let vs = self.inspect_lvl(val, indent + 2, st);
+                                format!("[ {ks}, {vs} ]")
+                            } else {
+                                ks
+                            }
+                        })
+                        .collect();
+                    if rest.len() > shown {
+                        let more = rest.len() - shown;
+                        inner.push(format!(
+                            "... {more} more item{}",
+                            if more == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if inner.is_empty() {
+                        return format!("[{brand}] {{  }}");
+                    }
+                    self.render_object(&inner, &format!("[{brand}] "), indent, st)
+                }
                 // A `Date` renders as its ISO-8601 form. Its time value lives in
                 // the internal `@@ms` slot, which the generic object branch below
                 // does not show, so without this arm every Date printed as `{}` —
@@ -4902,6 +4944,7 @@ impl JsHost {
                     self.render_object(&inner, &prefix, indent, st)
                 }
                 Some(JsObj::Generator { .. }) => "Object [Generator] {}".into(),
+                Some(JsObj::Iter { array: Some(_), .. }) => "Object [Array Iterator] {}".into(),
                 Some(JsObj::Promise { id }) => match self.promises.get(*id as usize) {
                     Some(c) => {
                         // `P2 [Promise] { 3 }` for an instance of a subclass.

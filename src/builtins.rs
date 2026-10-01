@@ -3660,6 +3660,15 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             Some(JsObj::Str(_)) => "String".into(),
             Some(JsObj::Array(_)) if is_arguments_h(h, v) => "Arguments".into(),
             Some(JsObj::Array(_)) => "Array".into(),
+            // An array iterator and a Map/Set iterator carry the tags of their
+            // prototypes (23.1.5.2.2, 24.1.5.2.2, 24.2.6.2.2).
+            Some(JsObj::Iter { array: Some(_), .. }) => "Array Iterator".into(),
+            Some(JsObj::Object(_)) if collection_iterator_view(h, v).is_some() => {
+                match collection_iterator_view(h, v).map(|(b, _)| b) {
+                    Some(b) if b.starts_with("Map") => "Map Iterator".into(),
+                    _ => "Set Iterator".into(),
+                }
+            }
             // A lazy iterator helper brands as node does.
             Some(JsObj::Object(p))
                 if p.get("@@native").map(|t| h.str_of(t)).as_deref() == Some("IteratorHelper") =>
@@ -10124,6 +10133,58 @@ pub(crate) fn collection_iterator_next(recv: &Value) -> Result<Value, String> {
         _ => with_host(|h| h.new_array(vec![k, v])),
     };
     Ok(iter_result(out, false))
+}
+
+/// What `util.inspect` shows for a live `Map`/`Set` iterator: its brand
+/// (`Map Iterator`, `Map Entries`, `Set Iterator`, `Set Entries`) and the
+/// entries it has still to yield, as `(key, value)` pairs — without advancing
+/// it. `None` when `v` is not one.
+pub(crate) fn collection_iterator_view(
+    h: &host::JsHost,
+    v: &Value,
+) -> Option<(&'static str, Vec<(Value, Value)>)> {
+    let Some(JsObj::Object(p)) = h.get(v) else {
+        return None;
+    };
+    if p.get("@@native").map(|t| h.str_of(t)).as_deref() != Some("CollectionIterator") {
+        return None;
+    }
+    let coll = p.get("@@coll").cloned().unwrap_or(Value::Undef);
+    let kind = p.get("@@kind").map(|k| h.str_of(k)).unwrap_or_default();
+    let started = p.get("@@started").is_some_and(|s| h.truthy(s));
+    let last_idx = p
+        .get("@@lastIdx")
+        .map(|n| h.to_number(n) as usize)
+        .unwrap_or(0);
+    let is_map = matches!(h.get(&coll), Some(JsObj::Map { .. }));
+    let brand = match (is_map, kind == "entries") {
+        (true, true) => "Map Entries",
+        (true, false) => "Map Iterator",
+        (false, true) => "Set Entries",
+        (false, false) => "Set Iterator",
+    };
+    // The same cursor rule `collection_iterator_next` steps by.
+    let mut idx = if !started {
+        0
+    } else {
+        match p
+            .get("@@lastKey")
+            .and_then(|k| collection_index_of(h, &coll, k))
+        {
+            Some(i) => i + 1,
+            None => last_idx,
+        }
+    };
+    let mut rest = Vec::new();
+    while let Some((k, val)) = collection_entry_at(h, &coll, idx) {
+        rest.push(match kind.as_str() {
+            "keys" => (k.clone(), k),
+            "values" => (val.clone(), val),
+            _ => (k, val),
+        });
+        idx += 1;
+    }
+    Some((brand, rest))
 }
 
 /// The (key, value) at `idx` in a Map, or (value, value) in a Set.
