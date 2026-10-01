@@ -17,12 +17,14 @@
 //!   * `execFile(file, args, cb)` is `exec` without a shell — `file` is run
 //!     directly with the `args` array — and additionally returns a (non-live)
 //!     ChildProcess-shaped object carrying the collected result.
-//!   * `spawn(cmd, args)` runs the command to completion up front and returns a
-//!     minimal ChildProcess-shaped object carrying the already-collected
-//!     `pid`, `exitCode`, `stdout` and `stderr`. LIMITATION: because these run
-//!     synchronously, the returned object is not live — `.on('close'|'exit', …)`
-//!     listeners registered by the caller after the call do not fire (the
-//!     process has already finished and its output is exposed as properties).
+//!   * `spawn(cmd, args)` runs the command to completion up front, then
+//!     delivers what happened on a later turn of the loop, as events on the
+//!     ChildProcess it returned: `'spawn'`, `'data'`/`'end'` on the
+//!     `child.stdout`/`child.stderr` streams (or the output written straight
+//!     through under `stdio: 'inherit'`), `'exit'`, `'close'`; a binary that
+//!     cannot start is an `'error'` event. LIMITATION: the child has finished
+//!     before `spawn` returns, so a long-running one blocks the caller and its
+//!     output arrives as one chunk per stream.
 //!
 //! `fork(modulePath)` is the exception: it spawns THIS `node` executable on
 //! `modulePath` as a genuinely live child and returns a live ChildProcess
@@ -61,6 +63,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "exec" => exec(args),
         "execFile" => exec_file(args),
         "spawn" => spawn(args),
+        "@@childEvents" => {
+            let child = args.first().cloned().unwrap_or(Value::Undef);
+            child_events(&child).map(|_| Value::Undef)
+        }
         "fork" => fork(args),
         _ => return None,
     })
@@ -93,6 +99,8 @@ fn child_object(extra: IndexMap<String, Value>) -> Value {
 /// signal), captured stdout, captured stderr.
 struct Run {
     status: Option<i32>,
+    /// The signal that terminated the child, when one did.
+    signal: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     pid: u32,
@@ -180,8 +188,13 @@ fn run(program: &str, args: &[String], opts: &SpawnOpts) -> std::io::Result<Run>
         }
     }
     let out = child.wait_with_output()?;
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&out.status);
+    #[cfg(not(unix))]
+    let signal = None;
     Ok(Run {
         status: out.status.code(),
+        signal,
         stdout: out.stdout,
         stderr: out.stderr,
         pid,
@@ -417,30 +430,252 @@ fn exec(args: &[Value]) -> Result<Value, String> {
 fn spawn(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     let cmd_args = arg_array(args, 1);
-    match run(&cmd, &cmd_args, &spawn_opts(args, 2)) {
+    let disp = stdio_dispositions(args.get(2));
+    let null = with_host(|h| h.null());
+    let pipe = |d: Disposition| match d {
+        Disposition::Pipe => child_pipe(),
+        _ => null.clone(),
+    };
+    let (stdout, stderr) = (pipe(disp[1]), pipe(disp[2]));
+    let mut m = IndexMap::new();
+    let (status, signal, out, err, spawn_err) = match run(&cmd, &cmd_args, &spawn_opts(args, 2)) {
         Ok(r) => {
-            // Allocate the Buffers / null before building the map (`from_bytes` and
-            // `null` borrow the host — nesting inside another `with_host` panics).
-            let stdout = super::buffer::from_bytes(&r.stdout);
-            let stderr = super::buffer::from_bytes(&r.stderr);
-            let null = with_host(|h| h.null());
-            let mut m = IndexMap::new();
             m.insert("pid".into(), Value::Float(r.pid as f64));
-            m.insert(
-                "exitCode".into(),
-                r.status
-                    .map(|c| Value::Float(c as f64))
-                    .unwrap_or_else(|| null.clone()),
-            );
-            m.insert("signalCode".into(), null);
-            m.insert("killed".into(), Value::Bool(false));
-            m.insert("connected".into(), Value::Bool(false));
-            m.insert("stdout".into(), stdout);
-            m.insert("stderr".into(), stderr);
-            Ok(child_object(m))
+            (r.status, r.signal, r.stdout, r.stderr, None)
         }
-        Err(e) => Err(format!("Error: spawn {cmd} {e}")),
+        // A binary that cannot be started is an `'error'` EVENT, followed by
+        // `'close'` with code -2, not a throw: `spawn` is asynchronous in node.
+        Err(e) => {
+            m.insert("pid".into(), Value::Undef);
+            (
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Some(spawn_error(&cmd, &cmd_args, &e)),
+            )
+        }
+    };
+    // Not exited yet, as far as the caller can tell: `exitCode` is `null` until
+    // `'exit'` fires.
+    m.insert("exitCode".into(), null.clone());
+    m.insert("signalCode".into(), null.clone());
+    m.insert("killed".into(), Value::Bool(false));
+    m.insert("connected".into(), Value::Bool(false));
+    m.insert("stdout".into(), stdout);
+    m.insert("stderr".into(), stderr);
+    let child = child_object(m);
+    PENDING.with(|p| {
+        p.borrow_mut().push(Finished {
+            child: child.clone(),
+            status,
+            signal,
+            out,
+            err,
+            disp,
+            spawn_err,
+        })
+    });
+    with_host(|h| {
+        let cb = h.alloc(JsObj::Builtin("child_process.@@childEvents".into()));
+        h.add_timer(-1.0, cb, vec![child.clone()], None);
+    });
+    Ok(child)
+}
+
+/// Where a spawned child's stdout or stderr goes (`options.stdio`).
+#[derive(Clone, Copy, PartialEq)]
+enum Disposition {
+    /// A `child.stdout`/`child.stderr` stream carries it.
+    Pipe,
+    /// Straight to this process's own stream; the property is `null`.
+    Inherit,
+    Ignore,
+}
+
+/// Read `options.stdio`: one string for all three streams, or an array of
+/// per-stream entries, where a descriptor number or a stream object
+/// (`process.stdout`) means the parent's own.
+fn stdio_dispositions(opts: Option<&Value>) -> [Disposition; 3] {
+    let Some(stdio) = opts.and_then(|o| crate::builtins::get_property(o, "stdio").ok()) else {
+        return [Disposition::Pipe; 3];
+    };
+    let one = |v: &Value| -> Disposition {
+        match v {
+            Value::Float(_) | Value::Int(_) => Disposition::Inherit,
+            Value::Undef => Disposition::Pipe,
+            _ => with_host(|h| {
+                if h.is_null(v) {
+                    return Disposition::Pipe;
+                }
+                if matches!(h.get(v), Some(JsObj::Object(_))) {
+                    return Disposition::Inherit;
+                }
+                match h.str_of(v).as_str() {
+                    "inherit" => Disposition::Inherit,
+                    "ignore" => Disposition::Ignore,
+                    _ => Disposition::Pipe,
+                }
+            }),
+        }
+    };
+    let items = with_host(|h| match h.get(&stdio) {
+        Some(JsObj::Array(items)) => Some(items.clone()),
+        _ => None,
+    });
+    match items {
+        Some(items) => {
+            let at = |i: usize| one(items.get(i).unwrap_or(&Value::Undef));
+            [at(0), at(1), at(2)]
+        }
+        None => [one(&stdio); 3],
     }
+}
+
+/// A finished child whose events have not been delivered yet.
+struct Finished {
+    child: Value,
+    status: Option<i32>,
+    signal: Option<i32>,
+    out: Vec<u8>,
+    err: Vec<u8>,
+    disp: [Disposition; 3],
+    spawn_err: Option<Value>,
+}
+
+thread_local! {
+    static PENDING: std::cell::RefCell<Vec<Finished>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A `child.stdout`/`child.stderr` stream: an emitter with the readable
+/// surface programs use on it.
+fn child_pipe() -> Value {
+    super::net::new_emitter_object("ChildPipe", IndexMap::new())
+}
+
+/// The methods of a `ChildPipe`, besides the EventEmitter ones.
+pub const CHILD_PIPE_METHODS: &[&str] = &["setEncoding", "pipe", "resume", "pause", "destroy"];
+
+pub fn pipe_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    if !CHILD_PIPE_METHODS.contains(&method) && super::events::METHODS.contains(&method) {
+        return super::events::instance_call(recv, method, args);
+    }
+    match method {
+        "setEncoding" => {
+            let enc = match args.first() {
+                Some(v) if !matches!(v, Value::Undef) => arg_str(&args, 0),
+                _ => "utf8".to_string(),
+            };
+            set_prop(recv, "@@encoding", with_host(|h| h.new_str(enc)));
+            Ok(recv.clone())
+        }
+        "pipe" => {
+            let dest = args.first().cloned().unwrap_or(Value::Undef);
+            set_prop(recv, "@@pipeDest", dest.clone());
+            Ok(dest)
+        }
+        "resume" | "pause" | "destroy" => Ok(recv.clone()),
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
+    }
+}
+
+fn prop(v: &Value, key: &str) -> Option<Value> {
+    with_host(|h| match h.get(v) {
+        Some(JsObj::Object(p)) => p.get(key).cloned(),
+        _ => None,
+    })
+}
+
+fn emit(target: &Value, event: &str, mut args: Vec<Value>) -> Result<(), String> {
+    args.insert(0, with_host(|h| h.new_str(event)));
+    super::events::instance_call(target, "emit", args).map(|_| ())
+}
+
+/// Deliver a pipe's bytes: one `'data'` chunk (a Buffer, or a string after
+/// `setEncoding`), written on to a `pipe` destination too, then `'end'`.
+fn pipe_output(pipe: &Value, bytes: &[u8]) -> Result<(), String> {
+    let dest = prop(pipe, "@@pipeDest");
+    if !bytes.is_empty() {
+        let enc = prop(pipe, "@@encoding").map(|v| with_host(|h| h.str_of(&v)));
+        let chunk = output_value(bytes, enc.as_deref());
+        if let Some(dest) = &dest {
+            crate::host::call_method(dest, "write", vec![chunk.clone()])?;
+        }
+        emit(pipe, "data", vec![chunk])?;
+    }
+    if let Some(dest) = &dest {
+        let is_std = super::native_tag(dest).as_deref() == Some("WriteStream");
+        if !is_std {
+            crate::host::call_method(dest, "end", Vec::new())?;
+        }
+    }
+    emit(pipe, "end", Vec::new())
+}
+
+/// The events of a spawned child, delivered on a later turn of the loop as
+/// node delivers them: `'spawn'`, each pipe's output, `'exit'` (with
+/// `exitCode`/`signalCode` set), `'close'`, then the pipes' own `'close'`. A
+/// child that could not start emits `'error'` and `'close'` with code -2.
+fn child_events(child: &Value) -> Result<(), String> {
+    let found = PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let i = p
+            .iter()
+            .position(|f| with_host(|h| h.strict_eq(&f.child, child)))?;
+        Some(p.remove(i))
+    });
+    let Some(f) = found else { return Ok(()) };
+    let null = with_host(|h| h.null());
+    if let Some(err) = f.spawn_err {
+        emit(child, "error", vec![err])?;
+        return emit(child, "close", vec![Value::Float(-2.0), null]);
+    }
+    emit(child, "spawn", Vec::new())?;
+    let pipes = [prop(child, "stdout"), prop(child, "stderr")];
+    for (i, bytes) in [(1, &f.out), (2, &f.err)] {
+        match f.disp[i] {
+            Disposition::Pipe => {
+                if let Some(p) = &pipes[i - 1] {
+                    pipe_output(p, bytes)?;
+                }
+            }
+            Disposition::Inherit => with_host(|h| h.write_out_bytes(bytes, i == 2)),
+            Disposition::Ignore => {}
+        }
+    }
+    let code = f
+        .status
+        .map_or_else(|| null.clone(), |c| Value::Float(c as f64));
+    let signal = match f.signal.and_then(signal_name) {
+        Some(name) => with_host(|h| h.new_str(name)),
+        None => null.clone(),
+    };
+    set_prop(child, "exitCode", code.clone());
+    set_prop(child, "signalCode", signal.clone());
+    emit(child, "exit", vec![code.clone(), signal.clone()])?;
+    emit(child, "close", vec![code, signal])?;
+    for (i, p) in pipes.iter().enumerate() {
+        if let (Some(p), Disposition::Pipe) = (p, f.disp[i + 1]) {
+            emit(p, "close", Vec::new())?;
+        }
+    }
+    Ok(())
+}
+
+/// The name of signal number `n` (`SIGTERM`), from the same table
+/// `process.kill` reads.
+fn signal_name(n: i32) -> Option<&'static str> {
+    const NAMES: &[&str] = &[
+        "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS", "SIGFPE",
+        "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGCHLD",
+        "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGWINCH",
+    ];
+    NAMES
+        .iter()
+        .copied()
+        .find(|name| super::process::signal_number(name) == Some(n))
 }
 
 /// `execFile(file[, args][, options][, callback])` — like `exec` but WITHOUT a

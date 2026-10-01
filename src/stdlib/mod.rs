@@ -891,6 +891,7 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         "Deserializer" => v8::DESERIALIZER_METHODS,
         "Console" => console::CONSOLE_METHODS,
         "ChildProcess" => child_process::CHILD_PROCESS_METHODS,
+        "ChildPipe" => child_process::CHILD_PIPE_METHODS,
         "Sign" => &["update", "sign"],
         "Verify" => &["update", "verify"],
         "KeyObject" => &["equals", "toCryptoKey"],
@@ -950,6 +951,7 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
             | "FSReadStream"
             | "FSWriteStream"
             | "ChildProcess"
+            | "ChildPipe"
     );
     (base, if is_emitter { EMITTER } else { &[] })
 }
@@ -1070,6 +1072,7 @@ pub fn instance_call(
         "Serializer" | "Deserializer" => v8::instance_call(tag, recv, method, args),
         "Console" => console::instance_call(recv, method, args),
         "ChildProcess" => child_process::instance_call(recv, method, args),
+        "ChildPipe" => child_process::pipe_call(recv, method, args),
         t if stream_web::is_class(t) => stream_web::instance_call(t, recv, method, args),
         "AsyncLocalStorage" | "AsyncHook" | "AsyncResource" => {
             async_hooks::instance_call(tag, recv, method, args)
