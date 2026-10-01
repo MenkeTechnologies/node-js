@@ -6926,3 +6926,85 @@ fn a_hashbang_line_is_a_comment_in_scripts_and_modules() {
     assert!(ok, "stderr: {stderr}");
     assert_eq!(stdout.trim_end(), "5");
 }
+
+// ── standard input: readline line events and fd 0 ───────────────────────────
+
+/// Run `src` with `input` piped to its standard input, returning stdout.
+fn run_with_stdin(src: &str, input: &str) -> String {
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg("-e")
+        .arg(src)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn node binary");
+    // Dropping the handle closes the pipe, so the program sees end of input.
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "program failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+}
+
+const STDIN_LINES: &str = "a\r\nb\rc\n\nstop\nafter\nlast";
+
+/// An Interface over `process.stdin` emits `'line'` per `\r\n`, `\r` or `\n`,
+/// a chunk's lines synchronously (so `rl.close()` from a listener fires
+/// `'close'` before any microtask, and the rest of the chunk still arrives),
+/// and the unterminated tail only at end of input — after `close`, so never.
+/// Nothing was emitted before: the listeners were stored and never called.
+/// Expected values from node v26.10.0.
+#[test]
+fn readline_emits_stdin_lines() {
+    let src = r#"
+        const rl = require('readline').createInterface({ input: process.stdin });
+        rl.on('line', async l => { await null; console.log('after', JSON.stringify(l)) });
+        rl.on('line', l => { Promise.resolve().then(() => console.log('m', l)); if (l === 'stop') rl.close() });
+        rl.on('close', () => console.log('close'));
+        console.log('sync');
+    "#;
+    assert_eq!(
+        run_with_stdin(src, STDIN_LINES),
+        "sync\nclose\nafter \"a\"\nm a\nafter \"b\"\nm b\nafter \"c\"\nm c\nafter \"\"\nm \n\
+         after \"stop\"\nm stop\nafter \"after\"\nm after"
+    );
+}
+
+/// `for await (const line of rl)` over standard input, and `break` closing the
+/// Interface on the next tick (a `'close'` listener added after the loop still
+/// hears it); and `fs.readFileSync(0)`, which opened a file named `0`.
+#[test]
+fn readline_async_iteration_and_fd_zero_read_stdin() {
+    let src = r#"
+        (async () => {
+            const rl = require('readline').createInterface({ input: process.stdin });
+            const seen = [];
+            for await (const l of rl) { seen.push(l); if (seen.length === 3) break }
+            console.log('broke', JSON.stringify(seen));
+            rl.on('close', () => console.log('close after loop'));
+        })();
+    "#;
+    assert_eq!(
+        run_with_stdin(src, STDIN_LINES),
+        "broke [\"a\",\"b\",\"c\"]\nclose after loop"
+    );
+    let src = r#"
+        const fs = require('fs');
+        console.log(JSON.stringify(fs.readFileSync(0, 'utf8')), fs.readFileSync(0).length);
+        try { fs.readFileSync(987) } catch (e) { console.log(e.code, e.message) }
+    "#;
+    assert_eq!(
+        run_with_stdin(src, STDIN_LINES),
+        "\"a\\r\\nb\\rc\\n\\nstop\\nafter\\nlast\" 0\nEBADF EBADF: bad file descriptor, fstat"
+    );
+}

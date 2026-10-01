@@ -1890,6 +1890,13 @@ them shows.
 | was | now |
 | --- | --- |
 | a template literal's `${…}` field parsed as if at the top level: `` `${await x}` `` in an async function was `ReferenceError: await is not defined`, `` `${yield}` `` the same for `yield`, and `` `${this.#c}` `` in a class body `SyntaxError: Private field '#c' must be declared in an enclosing class` | the field parses in its enclosing context — async/generator flags, and private names checked against the enclosing class (`parity-scripts/lang/33_template_field_context.js`) |
+| `readline`'s `'line'`/`'close'` listeners were stored and never called, `for await (const line of rl)` threw, and `rl.close()` did nothing — so the usual way of reading input line by line printed nothing | an Interface over `process.stdin` reads it in chunks and emits each chunk's lines synchronously (split on `\r\n`, `\n` or a lone `\r`), the unterminated tail at end of input, then `'close'`; over any other stream it follows the stream's `'data'`/`'end'`; `once`, `prependListener`, `off`, `removeAllListeners`, async iteration (a `break` closes the Interface on the next tick) and `close()` behave as in node (`tests/es_parity.rs`, `parity-scripts/stdlib/36_readline_streams.js`) |
+| `fs.readFileSync(0)` opened a file named `0` (`ENOENT`), and `fs.readSync(0, buf)` was `EBADF` — the two ways a script slurps or chunks its standard input | a number is a descriptor: `0` reads standard input, an `openSync` descriptor reads to its end, an unknown one is `EBADF: bad file descriptor, fstat` |
+| `fs.createReadStream(p).on(…)` and `fs.createWriteStream(p).on(…)` threw `on is not a function`: neither stream reached the EventEmitter methods. A read stream emitted no `open`/`ready`, and `end`/`close` in the same tick as `data`; a write stream ran `finish` inside `end()` and its callbacks synchronously with no argument | the emitter methods delegate to `events`; `open` carries a real descriptor, `end` and `close` follow on later ticks, and a write stream's `write`/`end` callbacks get `null` after the call returns, the `end` ones before `finish` |
+
+One limit of the stdin pump: its read blocks the event loop while standard input
+has no data, so on an interactive terminal a timer that falls due meanwhile fires
+only once the next line arrives. Piped and redirected input is unaffected.
 
 ## Still open — found in round 7
 

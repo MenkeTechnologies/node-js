@@ -152,6 +152,37 @@ fn with_file<R>(fd: i32, f: impl FnOnce(&File) -> R) -> Option<R> {
     FD_TABLE.with(|t| t.borrow().get(&fd).map(f))
 }
 
+/// The file descriptor an fs call names when its first argument is a number
+/// rather than a path.
+fn fd_arg(v: Option<&Value>) -> Option<i32> {
+    match v? {
+        Value::Int(n) => Some(*n as i32),
+        Value::Float(n) if n.fract() == 0.0 => Some(*n as i32),
+        _ => None,
+    }
+}
+
+/// Everything left to read on `fd`: standard input for `0`, otherwise a
+/// descriptor `openSync` handed out. `fstat` is the call node fails on for an
+/// unknown descriptor.
+fn read_fd_to_end(fd: i32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let r = if fd == 0 {
+        // Through Rust's shared stdin buffer, so a read here and a
+        // `readline` read of the same input never skip each other's bytes.
+        std::io::stdin().lock().read_to_end(&mut out)
+    } else {
+        match with_file(fd, |file| {
+            let mut fr: &File = file;
+            fr.read_to_end(&mut out)
+        }) {
+            Some(r) => r,
+            None => return Err("Error: EBADF: bad file descriptor, fstat".to_string()),
+        }
+    };
+    r.map(|_| out).map_err(|e| err_str("read", "", &e))
+}
+
 fn close_fd(fd: i32) -> bool {
     FD_TABLE.with(|t| t.borrow_mut().remove(&fd).is_some())
 }
@@ -309,8 +340,19 @@ fn is_fn(v: &Value) -> bool {
 // ── read/write/append ────────────────────────────────────────────────────────
 
 fn read_file_sync(args: &[Value]) -> Result<Value, String> {
-    let path = arg_str(args, 0);
     let enc = encoding_arg(args, 1);
+    // A NUMBER is a file descriptor, read from its current position to the
+    // end: `readFileSync(0, 'utf8')` is how a script slurps its stdin. The
+    // number was stringified and opened as a path, so that was `ENOENT ... '0'`.
+    if let Some(fd) = fd_arg(args.first()) {
+        let bytes = read_fd_to_end(fd)?;
+        return Ok(match enc {
+            Some(e) => with_host(|h| h.new_str(super::buffer::encode_bytes(&bytes, &e))),
+            None => super::buffer::from_bytes(&bytes),
+        });
+    }
+    let path = arg_str(args, 0);
+
     match std::fs::read(&path) {
         // The encoding names the REPRESENTATION to return, not just "decode as
         // text": `readFileSync(p, 'hex')` gives the hex digits of the file, and
@@ -844,6 +886,15 @@ fn read_impl(args: &[Value]) -> Result<usize, String> {
     let offset = num_or(args, 2, 0.0) as usize;
     let length = num_or(args, 3, (cap.saturating_sub(offset)) as f64) as usize;
     let position = position_arg(args, 4);
+    // Descriptor 0 is standard input, which `openSync` never registers: a
+    // `readSync(0, buf)` loop is how a script reads its input in pieces.
+    if fd == 0 {
+        let mut buf = vec![0u8; length];
+        return match std::io::stdin().lock().read(&mut buf) {
+            Ok(n) => Ok(write_into_buffer(&buffer, offset, &buf[..n])),
+            Err(e) => Err(err_str("read", "", &e)),
+        };
+    }
     let n = with_file(fd, |file| {
         let mut fr: &File = file;
         if let Some(pos) = position {
@@ -1282,8 +1333,23 @@ fn create_read_stream(args: &[Value]) -> Result<Value, String> {
 /// creation (so synchronously-attached `on('data')`/`on('end')` listeners fire).
 fn read_stream_pump(recv: &Value, path: &str) {
     with_host(|h| h.decr_handle());
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
+    let opened = File::open(path).and_then(|f| {
+        let mut bytes = Vec::new();
+        (&f).read_to_end(&mut bytes).map(|_| (f, bytes))
+    });
+    let bytes = match opened {
+        Ok((file, b)) => {
+            // `open` hands listeners the descriptor, then `ready`; the
+            // descriptor is real and closed again once the data is out.
+            let fd = register_fd(file);
+            let open = with_host(|h| h.new_str("open"));
+            let _ = super::events::instance_call(recv, "emit", vec![open, Value::Float(fd as f64)]);
+            let _ =
+                super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("ready"))]);
+            close_fd(fd);
+            b
+        }
+
         Err(e) => {
             let ev = with_host(|h| crate::builtins::synth_error(h, &err_str("open", path, &e)));
             let _ = super::events::instance_call(
@@ -1308,8 +1374,22 @@ fn read_stream_pump(recv: &Value, path: &str) {
         let name = with_host(|h| h.new_str("data"));
         let _ = super::events::instance_call(recv, "emit", vec![name, chunk]);
     }
-    let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("end"))]);
-    let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
+    // `end` and then `close` each follow on a later tick, as node schedules
+    // them, so what a `data` listener queued runs before the stream ends.
+    let target = recv.clone();
+    with_host(|h| {
+        h.queue_micro_native(Box::new(move || {
+            let end = with_host(|h| h.new_str("end"));
+            super::events::instance_call(&target, "emit", vec![end])?;
+            with_host(|h| {
+                h.queue_micro_native(Box::new(move || {
+                    let close = with_host(|h| h.new_str("close"));
+                    super::events::instance_call(&target, "emit", vec![close]).map(|_| ())
+                }))
+            });
+            Ok(())
+        }))
+    });
 }
 
 pub const READ_STREAM_METHODS: &[&str] = &[
@@ -1322,10 +1402,14 @@ pub const READ_STREAM_METHODS: &[&str] = &[
     "read",
 ];
 
-/// `fs.ReadStream` instance dispatch (tag `FSReadStream`). Emitter methods are
-/// handled by the parent's shared emitter routing; this covers the stream-only
-/// surface.
+/// `fs.ReadStream` instance dispatch (tag `FSReadStream`). The EventEmitter methods (`on`, `once`, `emit`, …) delegate to `events`, as every
+/// other emitter-backed instance does; this covers the stream-only surface.
+/// Nothing routed them here, so `fs.createReadStream(p).on('data', …)` threw
+/// `on is not a function`.
 pub fn read_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    if !READ_STREAM_METHODS.contains(&method) && super::events::METHODS.contains(&method) {
+        return super::events::instance_call(recv, method, args);
+    }
     match method {
         "pipe" => {
             if let Some(dest) = args.first().cloned() {
@@ -1377,8 +1461,9 @@ fn create_write_stream(args: &[Value]) -> Result<Value, String> {
     let recv = stream.clone();
     with_host(|h| {
         h.queue_micro_native(Box::new(move || {
+            let open = with_host(|h| h.new_str("open"));
             let _ =
-                super::events::instance_call(&recv, "emit", vec![with_host(|h| h.new_str("open"))]);
+                super::events::instance_call(&recv, "emit", vec![open, Value::Float(fd as f64)]);
             let _ = super::events::instance_call(
                 &recv,
                 "emit",
@@ -1400,13 +1485,23 @@ pub const WRITE_STREAM_METHODS: &[&str] = &[
     "setDefaultEncoding",
 ];
 
-/// `fs.WriteStream` instance dispatch (tag `FSWriteStream`).
+/// `fs.WriteStream` instance dispatch (tag `FSWriteStream`), with the
+/// EventEmitter methods delegated to `events` as for a read stream.
 pub fn write_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+    if !WRITE_STREAM_METHODS.contains(&method) && super::events::METHODS.contains(&method) {
+        return super::events::instance_call(recv, method, args);
+    }
     match method {
         "write" => {
             write_stream_bytes(recv, args.first());
+            // The write callback follows the call, with `null` for success.
             if let Some(cb) = args.iter().find(|v| is_fn(v)).cloned() {
-                let _ = invoke(&cb, vec![], None);
+                with_host(|h| {
+                    h.queue_micro_native(Box::new(move || {
+                        let null = with_host(|h| h.null());
+                        invoke(&cb, vec![null], None).map(|_| ())
+                    }))
+                });
             }
             Ok(Value::Bool(true))
         }
@@ -1421,19 +1516,31 @@ pub fn write_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result
             {
                 close_fd(fd);
             }
-            let _ = super::events::instance_call(
-                recv,
-                "emit",
-                vec![with_host(|h| h.new_str("finish"))],
-            );
-            let _ =
-                super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("close"))]);
             with_host(|h| h.decr_handle());
-            if let Some(cb) = args.iter().find(|v| is_fn(v)).cloned() {
-                let _ = invoke(&cb, vec![], None);
-            }
+            // `finish`, the `end` callback and `close` follow the call rather
+            // than happening inside it: node finishes a write stream once its
+            // pending writes have drained, so code after `end()` runs first.
+            let target = recv.clone();
+            let cb = args.iter().find(|v| is_fn(v)).cloned();
+            with_host(|h| {
+                h.queue_micro_native(Box::new(move || {
+                    let ev = |name: &str| {
+                        let n = with_host(|h| h.new_str(name));
+                        super::events::instance_call(&target, "emit", vec![n]).map(|_| ())
+                    };
+                    // Node runs the `end` callbacks, with `null`, before it
+                    // emits `finish`.
+                    if let Some(cb) = cb {
+                        let null = with_host(|h| h.null());
+                        invoke(&cb, vec![null], None)?;
+                    }
+                    ev("finish")?;
+                    ev("close")
+                }))
+            });
             Ok(recv.clone())
         }
+
         "destroy" | "close" => {
             if let Some(fd) = get_prop(recv, "@@wfd").map(|v| with_host(|h| h.to_number(&v)) as i32)
             {
