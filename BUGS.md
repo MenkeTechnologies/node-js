@@ -2,8 +2,9 @@
 
 ## Node core-module coverage
 Implemented natively (verified vs node v26): `assert`(+`/strict`), `buffer`,
-`child_process` (exec/spawnSync/execSync; `spawn` is sync-backed, not a live
-streaming ChildProcess), `console`, `crypto` (hashes/hmac), `dns` (lookup/resolve
+`child_process` (exec/spawnSync/execSync; `spawn` is sync-backed — the child
+runs to completion inside the call, then its events and output are delivered
+asynchronously — not a live streaming ChildProcess), `console`, `crypto` (hashes/hmac), `dns` (lookup/resolve
 via std), `diagnostics_channel`, `events`, `fs`, `http`, `net`, `os`, `path`
 (+`/posix` +`/win32` — both flavors are a faithful port of Node's `lib/path.js`,
 differentially verified against the reference over a generated cross-product of
