@@ -1469,6 +1469,31 @@ divergence rather than a refusal: the `locales` argument, `notation`
 (print the symbol), and the unit label of `style: "unit"` (prints the number
 alone).
 
+`Date.prototype.toLocaleString`/`toLocaleDateString`/`toLocaleTimeString` now
+HONOR their `options` bag too (`src/datefmt.rs`), in the en-US shape. The bag
+becomes an ICU skeleton exactly as V8 builds it (ECMA-402 `ToDateTimeOptions`
+defaults, the hour cycle from `hour12`/`hourCycle` — a defaulted hour keeps only
+the 12/24 split of `h11`/`h24`, an explicit one keeps the cycle), and the
+skeleton becomes a pattern through a port of ICU's `DateTimePatternGenerator`
+(`getBestRaw`'s distance search and tie-break, `adjustFieldTypes`,
+`getBestAppending` with en's `appendItems`, and the date/time glue chosen by the
+month width — `", "` or `" at "`) over en's `availableFormats`. So the odd
+combinations come out as node prints them: `{day: '2-digit', hour: '2-digit',
+second: 'numeric', hour12: false}` is `09, 9 (hour: 13)`. `dateStyle`/
+`timeStyle`, day periods (`in the morning`, `noon`), fractional seconds, every
+`timeZoneName` form, and `timeZone` — UTC under its aliases, `±HH:MM` offsets,
+`Etc/GMT±N`, and any IANA name, read from the system zoneinfo (`src/tzif.rs`,
+transitions plus the footer's POSIX rule) — are covered, along with V8's
+`RangeError`/`TypeError` wordings. Two option matrices (23,328 and 36,534
+output lines: every component combination, then day periods × fractions ×
+zone names × cycles × zones × styles) are byte-identical to node v26.10.0;
+`parity-scripts/data/28_date_locale_options.js` samples them. Before, every
+option was dropped: `{weekday: 'long', year: 'numeric', month: 'long', day:
+'numeric'}` printed `2/29/2024`. Still not modelled: the `locales` argument,
+and a zone's long name outside UTC, `GMT` and the US zones (`Asia/Kolkata`
+long is `GMT+05:30` here, `India Standard Time` in node) — en's metazone names
+are ICU data.
+
 `String.prototype.normalize` remains the identity (no normalization tables) but
 now VALIDATES the form: node throws `RangeError` outside NFC/NFD/NFKC/NFKD, and
 a try/catch support probe used to be told every form worked.
@@ -2661,9 +2686,8 @@ Still divergent, and why:
   abbreviation and nothing else. UTC is the one name spelled out, since it is
   not data. The clock and the numeric offset are right in every zone
   (`examples/datelocal.js`).
-- **`toLocaleString` ignores its `locales`/`options` arguments**, answering
-  node's default en-US shape (`M/D/YYYY`, 12-hour `h:mm:ss AM/PM`) in the local
-  zone. Varying it needs ICU too.
+- **`toLocaleString` ignores its `locales` argument**: every locale formats as
+  en-US. The `options` bag is honored (see "the locale surface" above).
 - **Children and `zlib` jobs are run SYNCHRONOUSLY, so two outstanding
   callbacks interleave in call order.** Node runs a child on the event loop and
   a `zlib` job on the threadpool, so `zlib.gunzip(bad, cb1); cp.exec(cmd, cb2)`

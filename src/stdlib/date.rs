@@ -2,13 +2,12 @@
 //! `@@native = "Date"` whose time value (milliseconds since the Unix epoch, or
 //! NaN for an invalid date) lives in a hidden `@@ms` field.
 //!
-//! The UTC-based surface is implemented in full: `getTime`/`valueOf`, the
-//! `toISOString`/`toUTCString`/`toString`/`toDateString`/`toTimeString`/
-//! `toLocale*` renderings, the field getters, the component SETTERS, the Annex-B
-//! `getYear`/`setYear`, and the statics `Date.now`/`Date.parse`/`Date.UTC`.
-//! Local-timezone getters and setters alias the UTC ones (node-js runs as if
-//! `TZ=UTC`), which is the correct answer for the machine-readable date headers
-//! express/send/fresh produce.
+//! The surface is implemented in full: `getTime`/`valueOf`, the
+//! `toISOString`/`toUTCString`/`toString`/`toDateString`/`toTimeString`
+//! renderings, the `toLocale*` forms with their options (`crate::datefmt`),
+//! the field getters, the component SETTERS, the Annex-B `getYear`/`setYear`,
+//! and the statics `Date.now`/`Date.parse`/`Date.UTC`. Local time is the
+//! process's zone, read through `localtime_r` as node reads `TZ`.
 
 use crate::host::{with_host, JsObj};
 use fusevm::Value;
@@ -195,7 +194,7 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
     })
 }
 
-/// Date instance methods (all treated as UTC — see the module note).
+/// Date instance methods.
 pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Value, String> {
     // Every `set*` argument is `ToNumber`d (21.4.4.x), which runs a user
     // `valueOf` and can throw from it. The reads below are infallible and do no
@@ -254,38 +253,24 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
             })
         }),
         "toDateString" => with_host(|h| h.new_str(date_string(local_ms(ms)))),
-        // The three `toLocale*` forms threw `is not a function` — absent
-        // entirely, so `new Date(0).toLocaleString()` failed where node prints
-        // `1/1/1970, 12:00:00 AM`. Rendered in node's default en-US shape
-        // (`M/D/YYYY` and 12-hour `h:mm:ss AM/PM`) at UTC, consistent with the
-        // rest of this module running as if `TZ=UTC`. The `locales`/`options`
-        // arguments are accepted and ignored: without ICU there is nothing to
-        // vary, and answering the default form beats throwing.
-        "toLocaleString" => with_host(|h| {
-            h.new_str(if ms.is_nan() {
-                "Invalid Date".into()
-            } else {
-                format!(
-                    "{}, {}",
-                    locale_date(local_ms(ms)),
-                    locale_time(local_ms(ms))
-                )
-            })
-        }),
-        "toLocaleDateString" => with_host(|h| {
-            h.new_str(if ms.is_nan() {
-                "Invalid Date".into()
-            } else {
-                locale_date(local_ms(ms))
-            })
-        }),
-        "toLocaleTimeString" => with_host(|h| {
-            h.new_str(if ms.is_nan() {
-                "Invalid Date".into()
-            } else {
-                locale_time(local_ms(ms))
-            })
-        }),
+        // ECMA-402 `Date.prototype.toLocale{,Date,Time}String`: the options bag
+        // resolves to an ICU pattern (see `crate::datefmt`), in the en-US
+        // shape whatever `locales` says.
+        "toLocaleString" | "toLocaleDateString" | "toLocaleTimeString" => {
+            let required = match method {
+                "toLocaleDateString" => crate::datefmt::Required::Date,
+                "toLocaleTimeString" => crate::datefmt::Required::Time,
+                _ => crate::datefmt::Required::Any,
+            };
+            let opts = _args.get(1).cloned().unwrap_or(Value::Undef);
+            let s = crate::datefmt::date_to_locale(
+                ms,
+                &opts,
+                required,
+                &format!("Date.prototype.{method}"),
+            )?;
+            with_host(|h| h.new_str(s))
+        }
         "getFullYear" => Value::Float(field(local_ms(ms), Field::Year)),
         "getUTCFullYear" => Value::Float(field(ms, Field::Year)),
         "getMonth" => Value::Float(field(local_ms(ms), Field::Month)),
@@ -366,7 +351,7 @@ enum Field {
 
 /// Split a time value into (days-from-epoch, ms-within-day), flooring toward -∞
 /// so negative (pre-1970) times decompose correctly.
-fn split_day(ms: f64) -> (i64, i64) {
+pub(crate) fn split_day(ms: f64) -> (i64, i64) {
     let day = (ms / MS_PER_DAY).floor();
     let rem = ms - day * MS_PER_DAY;
     (day as i64, rem as i64)
@@ -374,7 +359,7 @@ fn split_day(ms: f64) -> (i64, i64) {
 
 /// Convert a days-from-epoch count to (year, month 0-11, day 1-31) using
 /// Howard Hinnant's civil_from_days algorithm.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]
@@ -388,7 +373,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// Inverse: (year, month 0-11, day) → days from epoch.
-fn days_from_civil(y: i64, m0: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m0: i64, d: i64) -> i64 {
     let m = m0 + 1;
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -446,7 +431,7 @@ fn utc_from_fields(y: f64, mo: f64, d: f64, h: f64, mi: f64, s: f64, ms: f64) ->
 /// `new Date(0).getMonth()` 0 where node says 11. The parity harness pins
 /// `TZ=UTC` for both sides, which is why no record ever caught it.
 #[cfg(unix)]
-fn zone_offset_ms(ms: f64) -> f64 {
+pub(crate) fn zone_offset_ms(ms: f64) -> f64 {
     if !ms.is_finite() {
         return 0.0;
     }
@@ -464,7 +449,7 @@ fn zone_offset_ms(ms: f64) -> f64 {
 }
 
 #[cfg(not(unix))]
-fn zone_offset_ms(_ms: f64) -> f64 {
+pub(crate) fn zone_offset_ms(_ms: f64) -> f64 {
     0.0
 }
 
@@ -553,26 +538,32 @@ fn time_string(ms: f64) -> String {
 
 /// The zone's display name for `toString`. UTC is spelled out the way node
 /// does; anything else falls back to the abbreviation.
-#[cfg(unix)]
 fn zone_name(ms: f64) -> String {
     if zone_offset_ms(ms) == 0.0 {
         return "Coordinated Universal Time".into();
     }
+    zone_abbrev(ms).unwrap_or_else(|| "Coordinated Universal Time".into())
+}
+
+/// The local zone's abbreviation at `ms` (`EST`, `EDT`, `UTC`), as
+/// `localtime_r` reports it.
+#[cfg(unix)]
+pub(crate) fn zone_abbrev(ms: f64) -> Option<String> {
     let secs = (ms / 1000.0).floor() as i64;
     let t = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: as in `zone_offset_ms`.
     if unsafe { libc::localtime_r(&t, &mut tm).is_null() } || tm.tm_zone.is_null() {
-        return "Coordinated Universal Time".into();
+        return None;
     }
     // SAFETY: `tm_zone` points at a static zone-name string owned by libc.
     let z = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
-    z.to_string_lossy().into_owned()
+    Some(z.to_string_lossy().into_owned())
 }
 
 #[cfg(not(unix))]
-fn zone_name(_ms: f64) -> String {
-    "Coordinated Universal Time".into()
+pub(crate) fn zone_abbrev(_ms: f64) -> Option<String> {
+    None
 }
 
 /// TimeClip (21.4.1.31): a time value more than 8.64e15 ms from the epoch is not
@@ -673,32 +664,6 @@ fn date_string(ms: f64) -> String {
     let (y, mo, d) = civil_from_days(day);
     let wd = (((day % 7) + 4 + 7) % 7) as usize;
     format!("{} {} {:02} {:04}", DAYS[wd], MONTHS[mo as usize], d, y)
-}
-
-/// `1/2/2020` — the `toLocaleDateString` default (en-US `M/D/YYYY`, no padding).
-fn locale_date(ms: f64) -> String {
-    let (day, _) = split_day(ms);
-    let (y, mo, d) = civil_from_days(day);
-    format!("{}/{}/{:04}", mo + 1, d, y)
-}
-
-/// `3:04:05 PM` — the `toLocaleTimeString` default (en-US 12-hour). Hour 0 and
-/// hour 12 both render as `12`, which is why this is not `h % 12`.
-fn locale_time(ms: f64) -> String {
-    let h24 = field(ms, Field::Hours) as i64;
-    let (h12, meridiem) = match h24 {
-        0 => (12, "AM"),
-        1..=11 => (h24, "AM"),
-        12 => (12, "PM"),
-        _ => (h24 - 12, "PM"),
-    };
-    format!(
-        "{}:{:02}:{:02} {}",
-        h12,
-        field(ms, Field::Minutes) as i64,
-        field(ms, Field::Seconds) as i64,
-        meridiem
-    )
 }
 
 /// The year field of an ISO-8601 date (21.4.4.36 `Date.prototype.toISOString`).

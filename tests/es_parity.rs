@@ -3584,6 +3584,30 @@ fn date_fields_and_zoneless_iso_strings_are_local_time() {
     );
 }
 
+/// `toLocaleString`'s `timeZoneName` in the process's zone: en names the US
+/// zones (`EST`, `Eastern Daylight Time`, `ET`, `Eastern Time`) from 1970 on
+/// and every other instant or zone by its GMT offset, and an explicit IANA
+/// `timeZone` is read from the system zoneinfo. The options bag was ignored
+/// before, so each line printed the bare default form. Expected values from
+/// node v26.10.0 under the same zone.
+#[test]
+fn date_to_locale_string_names_the_local_zone() {
+    let src = r#"
+        const w = new Date(Date.UTC(2024, 0, 15, 12)), s = new Date(Date.UTC(2024, 6, 15, 3, 30));
+        for (const t of ['short', 'long', 'shortGeneric', 'longGeneric', 'shortOffset']) console.log(w.toLocaleString('en-US', {timeZoneName: t}), '|', s.toLocaleTimeString('en-US', {timeZoneName: t}));
+        console.log(new Date(Date.UTC(1900, 0, 15, 12)).toLocaleString('en-US', {timeZoneName: 'short'}), '|', w.toLocaleString('en-US', {timeZone: 'Asia/Kolkata', timeZoneName: 'short'}), '|', s.toLocaleString('en-US', {timeZone: 'Europe/London', dateStyle: 'medium', timeStyle: 'long'}));
+    "#;
+    assert_eq!(
+        run_in_zone(src, "America/New_York"),
+        "1/15/2024, 7:00:00 AM EST | 11:30:00 PM EDT\n\
+         1/15/2024, 7:00:00 AM Eastern Standard Time | 11:30:00 PM Eastern Daylight Time\n\
+         1/15/2024, 7:00:00 AM ET | 11:30:00 PM ET\n\
+         1/15/2024, 7:00:00 AM Eastern Time | 11:30:00 PM Eastern Time\n\
+         1/15/2024, 7:00:00 AM GMT-5 | 11:30:00 PM GMT-4\n\
+         1/15/1900, 7:00:00 AM GMT-5 | 1/15/2024, 5:30:00 PM GMT+5:30 | Jul 15, 2024, 4:30:00 AM GMT+1"
+    );
+}
+
 /// The free-form fallback every engine keeps beside the ISO format — V8's
 /// legacy `DateParser`. Only the IMF-fixdate header form was read before, so
 /// `new Date("March 7, 2024 10:00")`, `"1/5/2024"` and even a Date's own
