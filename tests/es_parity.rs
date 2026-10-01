@@ -7008,3 +7008,49 @@ fn readline_async_iteration_and_fd_zero_read_stdin() {
         "\"a\\r\\nb\\rc\\n\\nstop\\nafter\\nlast\" 0\nEBADF EBADF: bad file descriptor, fstat"
     );
 }
+
+/// `process.stdin` is a readable stream: `'data'` (a Buffer, or a string after
+/// `setEncoding`), `'end'` and `'close'`; `'readable'` with `read()` draining
+/// the buffer and a final `'readable'` at end of input; `for await` over its
+/// chunks; and `pipe`. Every listener was accepted and never called, and
+/// `for await` threw `process.stdin is not async iterable`. Expected values
+/// from node v26.10.0.
+#[test]
+fn process_stdin_is_a_readable_stream() {
+    let flowing = r#"
+        process.stdin.on('data', d => console.log('data', d));
+        process.stdin.on('end', () => console.log('end'));
+        process.stdin.on('close', () => console.log('close'));
+        console.log('sync');
+    "#;
+    assert_eq!(
+        run_with_stdin(flowing, "ab\ncd"),
+        "sync\ndata <Buffer 61 62 0a 63 64>\nend\nclose"
+    );
+    let readable = r#"
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('readable', () => {
+            let c;
+            while ((c = process.stdin.read()) !== null) console.log('chunk', JSON.stringify(c));
+            console.log('readable done');
+        });
+        process.stdin.on('end', () => console.log('end'));
+    "#;
+    assert_eq!(
+        run_with_stdin(readable, "ab\ncd"),
+        "chunk \"ab\\ncd\"\nreadable done\nreadable done\nend"
+    );
+    let iterate = r#"
+        (async () => {
+            const parts = [];
+            for await (const c of process.stdin) parts.push(c);
+            console.log(Buffer.concat(parts).toString());
+        })();
+    "#;
+    assert_eq!(run_with_stdin(iterate, "ab\ncd"), "ab\ncd");
+    let pipe =
+        r#"process.stdin.pipe(process.stdout); process.stdin.on('end', () => console.log('|end'))"#;
+    assert_eq!(run_with_stdin(pipe, "xy"), "xy|end");
+    let utf8 = r#"process.stdin.setEncoding('utf8'); process.stdin.on('data', d => console.log(typeof d, d))"#;
+    assert_eq!(run_with_stdin(utf8, "éz"), "string éz");
+}

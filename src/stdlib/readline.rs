@@ -1,15 +1,15 @@
 //! Node `readline` module.
 //!
 //! * `'line'` and `'close'` events, and `for await (const line of rl)`: an
-//!   Interface over `process.stdin` reads it in chunks from a macrotask pump
-//!   (started by the first `'line'`/`'close'` listener or async iterator); over
-//!   any other stream it listens to the stream's `'data'`/`'end'`. Lines split
+//!   Interface listens to its input stream's `'data'`/`'end'` — from creation,
+//!   or for `process.stdin` from the first `'line'`/`'close'` listener or async
+//!   iterator, which sets standard input flowing (`process::stdin_call`). Lines split
 //!   on `\r\n`, `\n` or a lone `\r`, an unterminated last line is delivered at
 //!   end of input, then `'close'`. See "line events" below for the ordering.
 //! * `interface.question(query, cb)` writes `query` to stdout and, before any
 //!   line events have started, reads exactly ONE line from stdin synchronously
 //!   and invokes `cb(line)`; once they have, the answer is the next line the
-//!   pump delivers. `readline/promises` resolves a promise instead.
+//!   input delivers. `readline/promises` resolves a promise instead.
 //! * `interface.write(data)` writes to the output; `prompt()` writes the stored
 //!   prompt; `setPrompt`/`getPrompt` manage it; the module cursor helpers
 //!   (`cursorTo`/`moveCursor`/`clearLine`/`clearScreenDown`) emit the
@@ -27,7 +27,7 @@ use crate::host::{is_callable, with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 pub const METHODS: &[&str] = &[
     "createInterface",
@@ -204,7 +204,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             write_stdout(&query);
             // Once input is flowing as line events, the answer is the next
             // line the stream delivers rather than a read of its own.
-            if with_state(recv, |s| s.pumping) {
+            if with_state(recv, |s| s.flowing) {
                 if read_hidden(recv, "@@promises") == "1" {
                     let (promise, id) = with_host(|h| {
                         let p = h.new_promise();
@@ -275,7 +275,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             Ok(with_host(|h| h.new_str(prompt)))
         }
         // Listener registration, under `@@listeners[event]`. A `'line'` or
-        // `'close'` listener on standard input starts the pump that feeds them.
+        // `'close'` listener on standard input sets it flowing.
         "on" | "once" | "addListener" | "prependListener" => {
             if let (Some(ev), Some(cb)) = (args.first(), args.get(1)) {
                 let event = with_host(|h| h.str_of(ev));
@@ -312,8 +312,8 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             Ok(Value::Undef)
         }
         "@@asyncIterator" => Ok(async_iterator(recv)),
-        // Reading is driven by the pump and the stream's own events; there is
-        // no separate flow switch to flip.
+        // Reading is driven by the input stream's own events; there is no
+        // separate flow switch to flip here.
         "pause" | "resume" => Ok(recv.clone()),
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
@@ -481,12 +481,10 @@ fn opt_prop(v: &Value, key: &str) -> Option<Value> {
 // ── line events ──────────────────────────────────────────────────────────────
 //
 // An Interface splits its input into lines and emits `'line'` for each, then
-// `'close'` when the input ends, as node's does. Standard input is read by a
-// PUMP: a macrotask that reads one chunk (blocking, up to 64 KiB, through
-// Rust's shared stdin buffer so `question` and this never skip each other's
-// bytes) and re-arms itself until end of input. Any other input is a stream
-// object, whose `'data'`/`'end'` events are listened to. A chunk's lines are
-// emitted synchronously, one after another, as node emits them.
+// `'close'` when the input ends, as node's does. It listens to its input
+// stream's `'data'`/`'end'` (standard input reads through the same Rust buffer
+// `question` reads, so the two never skip each other's bytes). A chunk's lines
+// are emitted synchronously, one after another, as node emits them.
 
 /// Per-Interface line state, keyed by the Interface's `@@rlid`.
 #[derive(Default)]
@@ -503,8 +501,9 @@ struct LineState {
     /// The input has ended: `'close'` follows the last line.
     ended: bool,
     closed: bool,
-    /// The stdin pump has been started.
-    pumping: bool,
+    /// The input is flowing into this Interface (always, for a stream input;
+    /// from the first listener, for standard input).
+    flowing: bool,
     /// Async iteration: lines no `next()` has taken yet, and the promises of
     /// the `next()` calls waiting for one.
     iterating: bool,
@@ -555,37 +554,20 @@ fn ensure_flowing(recv: &Value) {
         return;
     }
     let start = with_state(recv, |s| {
-        !std::mem::replace(&mut s.pumping, true) && !s.closed
+        !std::mem::replace(&mut s.flowing, true) && !s.closed
     });
     if start {
-        schedule_pump(recv);
+        attach_stream(recv, &input);
     }
-}
-
-fn schedule_pump(recv: &Value) {
-    with_host(|h| {
-        let cb = h.alloc(JsObj::Builtin("readline.@@pump".into()));
-        h.add_timer(-1.0, cb, vec![recv.clone()], None);
-    });
-}
-
-/// One turn of the stdin pump.
-fn pump(recv: &Value) -> Result<(), String> {
-    if with_state(recv, |s| s.closed) {
-        return Ok(());
-    }
-    let mut buf = vec![0u8; 65536];
-    let n = io::stdin().lock().read(&mut buf).unwrap_or(0);
-    if n == 0 {
-        return on_end(recv);
-    }
-    schedule_pump(recv);
-    on_data(recv, &buf[..n])
 }
 
 /// Split a chunk into lines on `\r\n`, `\n` or a lone `\r`, keeping the
 /// unterminated tail for the next chunk.
 fn on_data(recv: &Value, bytes: &[u8]) -> Result<(), String> {
+    // A closed Interface has stopped listening to its input.
+    if with_state(recv, |s| s.closed) {
+        return Ok(());
+    }
     let start = with_state(recv, |s| {
         let mut i = 0;
         if s.after_cr && bytes.first() == Some(&b'\n') {
@@ -708,6 +690,12 @@ fn close(recv: &Value) -> Result<(), String> {
     let Some(waiters) = waiters else {
         return Ok(());
     };
+    // A closed Interface stops its input, so standard input no longer holds
+    // the process open.
+    let input = opt_prop(recv, "@@input").unwrap_or(Value::Undef);
+    if is_stdin(&input) {
+        crate::host::call_method(&input, "pause", Vec::new())?;
+    }
     emit(recv, "close", Vec::new())?;
     for id in waiters {
         crate::host::resolve_promise_val(id, iter_result(Value::Undef, true));
@@ -738,11 +726,10 @@ fn iter_result(value: Value, done: bool) -> Value {
 }
 
 /// Module-internal entry points reached through `readline.@@…` builtins: the
-/// stdin pump (a timer callback) and the listeners attached to a stream input.
+/// listeners attached to the input stream, and the deferred `close`.
 fn internal_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let recv = args.first().cloned().unwrap_or(Value::Undef);
     let r = match method {
-        "@@pump" => pump(&recv),
         "@@feed" => {
             let chunk = args.get(1).cloned().unwrap_or(Value::Undef);
             let bytes = super::buffer::view_bytes(&chunk)
@@ -759,6 +746,7 @@ fn internal_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> 
 /// Listen to a stream input's `'data'` and `'end'`, as node's Interface does
 /// from the moment it is created.
 fn attach_stream(recv: &Value, input: &Value) {
+    with_state(recv, |s| s.flowing = true);
     let has_on = crate::builtins::get_property(input, "on")
         .map(|f| with_host(|h| is_callable(h, &f)))
         .unwrap_or(false);

@@ -407,6 +407,7 @@ pub fn set_exit_code(val: &Value) -> Result<(), String> {
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
+        "@@stdinPump" => stdin_pump().map(|_| Value::Undef),
         "cwd" => {
             let d = std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -821,6 +822,11 @@ fn std_stream(fd: i32) -> Value {
 /// emit the chunk raw (no newline) to the stream's fd, so ordering interleaves
 /// correctly with `console.log`.
 pub fn stream_instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    if stream_fd(recv) == 0.0 {
+        if let Some(r) = stdin_call(recv, method, args) {
+            return r;
+        }
+    }
     match method {
         "write" | "end" => {
             let fd = with_host(|h| match h.get(recv) {
@@ -836,8 +842,16 @@ pub fn stream_instance_call(recv: &Value, method: &str, args: &[Value]) -> Resul
             with_host(|h| h.write_out_bytes(&bytes, fd == 2.0));
             Ok(Value::Bool(true))
         }
-        // A no-op stream surface so `.on('data')`/`.once`/`.end()` chaining loads.
-        "on" | "once" | "removeListener" | "cork" | "uncork" | "setEncoding" => Ok(recv.clone()),
+        // A no-op stream surface on stdout/stderr so `.on('drain')`/`.once`/
+        // `.end()` chaining loads; standard input answers these for real
+        // (`stdin_call`).
+        "on" | "once" | "addListener" | "prependListener" | "removeListener" | "off"
+        | "removeAllListeners" | "cork" | "uncork" | "setEncoding" | "resume" | "pause" => {
+            Ok(recv.clone())
+        }
+        "listenerCount" => Ok(Value::Float(0.0)),
+        "read" => Ok(with_host(|h| h.null())),
+        "pipe" => Ok(args.first().cloned().unwrap_or(Value::Undef)),
         // `tty.WriteStream` cursor/erase control — emit the corresponding ANSI
         // escape to the stream's fd (best-effort; only meaningful on a real tty).
         "cursorTo" | "moveCursor" | "clearLine" | "clearScreenDown" => {
@@ -1244,4 +1258,397 @@ fn event_name(args: &[Value]) -> String {
     args.first()
         .map(|v| with_host(|h| h.str_of(v)))
         .unwrap_or_default()
+}
+
+// ── process.stdin as a readable stream ───────────────────────────────────────
+//
+// Standard input is read by a PUMP: a macrotask that reads one chunk (blocking,
+// up to 64 KiB, through Rust's shared stdin buffer, which `readline` and
+// `fs.readFileSync(0)` read through too) and re-arms itself until end of
+// input. What a chunk becomes depends on how the program consumes the stream,
+// as in node: a `'data'` listener or `resume()` makes it FLOW (each chunk is a
+// `'data'` event), a `'readable'` listener buffers it for `read()`, and an
+// async iterator hands it to `next()`. End of input is `'end'`, then `'close'`.
+
+/// The state of `process.stdin`.
+#[derive(Default)]
+struct Stdin {
+    /// Registered `(event, callback, once)` listeners, in call order.
+    listeners: Vec<(String, Value, bool)>,
+    /// `setEncoding`: chunks are strings in this encoding instead of Buffers.
+    encoding: Option<String>,
+    /// The tail of a UTF-8 sequence a chunk split, held for the next one.
+    partial: Vec<u8>,
+    /// The pump has been scheduled and has not reached end of input.
+    pumping: bool,
+    /// `pause()` stops the pump; `resume()` restarts it.
+    paused: bool,
+    flowing: bool,
+    readable_mode: bool,
+    /// Chunks waiting for `read()` or an async iterator's `next()`.
+    buffered: std::collections::VecDeque<Value>,
+    waiters: std::collections::VecDeque<u32>,
+    iterating: bool,
+    ended: bool,
+    /// Where `pipe(dest)` sends each chunk.
+    pipe_dest: Option<Value>,
+}
+
+thread_local! {
+    static STDIN: std::cell::RefCell<Stdin> = std::cell::RefCell::new(Stdin::default());
+}
+
+fn with_stdin<R>(f: impl FnOnce(&mut Stdin) -> R) -> R {
+    STDIN.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// Schedule the pump if it is not running and the stream is not paused.
+fn start_stdin() {
+    let start = with_stdin(|s| {
+        if s.pumping || s.paused || s.ended {
+            return false;
+        }
+        s.pumping = true;
+        true
+    });
+    if start {
+        schedule_stdin_pump();
+    }
+}
+
+fn schedule_stdin_pump() {
+    with_host(|h| {
+        let cb = h.alloc(JsObj::Builtin("process.@@stdinPump".into()));
+        h.add_timer(-1.0, cb, Vec::new(), None);
+    });
+}
+
+fn emit_stdin(recv: &Value, event: &str, args: Vec<Value>) -> Result<(), String> {
+    let entries: Vec<(Value, bool)> = with_stdin(|s| {
+        let found = s
+            .listeners
+            .iter()
+            .filter(|(e, _, _)| e == event)
+            .map(|(_, cb, once)| (cb.clone(), *once))
+            .collect();
+        s.listeners.retain(|(e, _, once)| !(e == event && *once));
+        found
+    });
+    for (cb, _) in entries {
+        crate::host::invoke(&cb, args.clone(), Some(recv.clone()))?;
+    }
+    Ok(())
+}
+
+/// A chunk as the program sees it: a Buffer, or a string under `setEncoding`.
+/// A UTF-8 sequence split between two reads is held back and completed by the
+/// next one, as node's `StringDecoder` does.
+fn stdin_chunk(bytes: &[u8]) -> Option<Value> {
+    let enc = with_stdin(|s| s.encoding.clone());
+    let Some(enc) = enc else {
+        return Some(super::buffer::from_bytes(bytes));
+    };
+    if enc != "utf8" && enc != "utf-8" {
+        return Some(with_host(|h| {
+            h.new_str(super::buffer::encode_bytes(bytes, &enc))
+        }));
+    }
+    let mut all = with_stdin(|s| std::mem::take(&mut s.partial));
+    all.extend_from_slice(bytes);
+    let keep = incomplete_utf8_tail(&all);
+    let tail = all.split_off(all.len() - keep);
+    with_stdin(|s| s.partial = tail);
+    if all.is_empty() {
+        return None;
+    }
+    Some(with_host(|h| {
+        h.new_str(String::from_utf8_lossy(&all).into_owned())
+    }))
+}
+
+/// How many bytes at the end of `b` begin a UTF-8 sequence that is not yet
+/// complete.
+fn incomplete_utf8_tail(b: &[u8]) -> usize {
+    for back in 1..=3.min(b.len()) {
+        let c = b[b.len() - back];
+        if c & 0xC0 == 0x80 {
+            continue;
+        }
+        let need = match c {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if need > back { back } else { 0 };
+    }
+    0
+}
+
+/// One turn of the stdin pump.
+fn stdin_pump() -> Result<(), String> {
+    use std::io::Read;
+    let recv = stdin_value();
+    if with_stdin(|s| s.paused) {
+        with_stdin(|s| s.pumping = false);
+        return Ok(());
+    }
+    let mut buf = vec![0u8; 65536];
+    let n = std::io::stdin().lock().read(&mut buf).unwrap_or(0);
+    if n == 0 {
+        return stdin_end(&recv);
+    }
+    schedule_stdin_pump();
+    let Some(chunk) = stdin_chunk(&buf[..n]) else {
+        return Ok(());
+    };
+    stdin_deliver(&recv, chunk)
+}
+
+/// Hand a chunk to whatever is consuming the stream.
+fn stdin_deliver(recv: &Value, chunk: Value) -> Result<(), String> {
+    if let Some(dest) = with_stdin(|s| s.pipe_dest.clone()) {
+        crate::host::call_method(&dest, "write", vec![chunk.clone()])?;
+    }
+    let (flowing, readable, waiter) = with_stdin(|s| {
+        let waiter = if s.iterating {
+            s.waiters.pop_front()
+        } else {
+            None
+        };
+        (s.flowing, s.readable_mode, waiter)
+    });
+    if let Some(id) = waiter {
+        crate::host::resolve_promise_val(id, stdin_iter_result(chunk, false));
+        return Ok(());
+    }
+    if flowing {
+        emit_stdin(recv, "data", vec![chunk])?;
+    } else if readable || with_stdin(|s| s.iterating) {
+        with_stdin(|s| s.buffered.push_back(chunk));
+        if readable {
+            emit_stdin(recv, "readable", Vec::new())?;
+        }
+    }
+    Ok(())
+}
+
+/// End of input: a last `'readable'` (for `read()` to report `null`), `'end'`,
+/// the end of any async iteration, then `'close'` on a later tick.
+fn stdin_end(recv: &Value) -> Result<(), String> {
+    let (readable, waiters, dest) = with_stdin(|s| {
+        s.ended = true;
+        s.pumping = false;
+        (
+            s.readable_mode,
+            std::mem::take(&mut s.waiters),
+            s.pipe_dest.clone(),
+        )
+    });
+    if readable {
+        emit_stdin(recv, "readable", Vec::new())?;
+    }
+    for id in waiters {
+        crate::host::resolve_promise_val(id, stdin_iter_result(Value::Undef, true));
+    }
+    // `pipe` ends its destination, except the process's own stdout/stderr.
+    if let Some(dest) = dest {
+        let is_std = with_host(|h| match h.get(&dest) {
+            Some(JsObj::Object(p)) => {
+                p.get("@@native").map(|v| h.str_of(v)).as_deref() == Some("WriteStream")
+            }
+            _ => false,
+        });
+        if !is_std {
+            crate::host::call_method(&dest, "end", Vec::new())?;
+        }
+    }
+    emit_stdin(recv, "end", Vec::new())?;
+    let target = recv.clone();
+    with_host(|h| h.queue_micro_native(Box::new(move || emit_stdin(&target, "close", Vec::new()))));
+    Ok(())
+}
+
+fn stdin_iter_result(value: Value, done: bool) -> Value {
+    with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("value".into(), value);
+        m.insert("done".into(), Value::Bool(done));
+        h.new_object(m)
+    })
+}
+
+/// The `process.stdin` object.
+fn stdin_value() -> Value {
+    constant("stdin").unwrap_or(Value::Undef)
+}
+
+/// The methods `process.stdin` answers as a readable stream. `None` hands the
+/// call to the shared `WriteStream` surface.
+fn stdin_call(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let str_arg = |i: usize| with_host(|h| args.get(i).map(|v| h.str_of(v)).unwrap_or_default());
+    Some(match method {
+        "on" | "once" | "addListener" | "prependListener" => {
+            let event = str_arg(0);
+            if let Some(cb) = args.get(1).cloned() {
+                with_stdin(|s| {
+                    let entry = (event.clone(), cb, method == "once");
+                    if method == "prependListener" {
+                        s.listeners.insert(0, entry);
+                    } else {
+                        s.listeners.push(entry);
+                    }
+                    match event.as_str() {
+                        "data" => s.flowing = true,
+                        "readable" => s.readable_mode = true,
+                        _ => {}
+                    }
+                });
+                if matches!(event.as_str(), "data" | "readable") {
+                    start_stdin();
+                }
+            }
+            Ok(recv.clone())
+        }
+        "removeListener" | "off" => {
+            let event = str_arg(0);
+            if let Some(cb) = args.get(1) {
+                with_stdin(|s| {
+                    let pos = s
+                        .listeners
+                        .iter()
+                        .position(|(e, f, _)| *e == event && with_host(|h| h.strict_eq(f, cb)));
+                    if let Some(i) = pos {
+                        s.listeners.remove(i);
+                    }
+                });
+            }
+            Ok(recv.clone())
+        }
+        "removeAllListeners" => {
+            let event = args
+                .first()
+                .filter(|v| !matches!(v, Value::Undef))
+                .map(|_| str_arg(0));
+            with_stdin(|s| match &event {
+                Some(e) => s.listeners.retain(|(x, _, _)| x != e),
+                None => s.listeners.clear(),
+            });
+            Ok(recv.clone())
+        }
+        "listenerCount" => {
+            let event = str_arg(0);
+            let n = with_stdin(|s| s.listeners.iter().filter(|(e, _, _)| *e == event).count());
+            Ok(Value::Float(n as f64))
+        }
+        "setEncoding" => {
+            let enc = match args.first() {
+                Some(v) if !matches!(v, Value::Undef) => str_arg(0).to_ascii_lowercase(),
+                _ => "utf8".to_string(),
+            };
+            with_stdin(|s| s.encoding = Some(enc));
+            Ok(recv.clone())
+        }
+        "resume" => {
+            with_stdin(|s| {
+                s.paused = false;
+                s.flowing = true;
+            });
+            start_stdin();
+            Ok(recv.clone())
+        }
+        "pause" => {
+            with_stdin(|s| s.paused = true);
+            Ok(recv.clone())
+        }
+        "read" => {
+            let chunk = with_stdin(|s| {
+                let parts: Vec<Value> = s.buffered.drain(..).collect();
+                (!parts.is_empty()).then_some(parts)
+            });
+            match chunk {
+                None => Ok(with_host(|h| h.null())),
+                Some(parts) if parts.len() == 1 => {
+                    Ok(parts.into_iter().next().unwrap_or(Value::Undef))
+                }
+                Some(parts) => {
+                    // Several buffered chunks come back joined, as node's
+                    // `read()` with no size returns everything buffered.
+                    if with_stdin(|s| s.encoding.is_some()) {
+                        let joined: String =
+                            parts.iter().map(|p| with_host(|h| h.str_of(p))).collect();
+                        Ok(with_host(|h| h.new_str(joined)))
+                    } else {
+                        let bytes: Vec<u8> = parts
+                            .iter()
+                            .flat_map(|p| super::buffer::view_bytes(p).unwrap_or_default())
+                            .collect();
+                        Ok(super::buffer::from_bytes(&bytes))
+                    }
+                }
+            }
+        }
+        "pipe" => {
+            let dest = args.first().cloned().unwrap_or(Value::Undef);
+            with_stdin(|s| {
+                s.pipe_dest = Some(dest.clone());
+                s.flowing = true;
+            });
+            start_stdin();
+            Ok(dest)
+        }
+        "@@asyncIterator" => {
+            with_stdin(|s| s.iterating = true);
+            start_stdin();
+            Ok(with_host(|h| {
+                let mut m = IndexMap::new();
+                m.insert("@@native".into(), h.new_str("StdinIterator"));
+                h.new_object(m)
+            }))
+        }
+        _ => return None,
+    })
+}
+
+/// The methods of the async iterator `for await (const chunk of process.stdin)`
+/// reads.
+pub const STDIN_ITERATOR_METHODS: &[&str] = &["next", "return", "@@asyncIterator"];
+
+pub fn stdin_iterator_call(recv: &Value, method: &str) -> Result<Value, String> {
+    match method {
+        "@@asyncIterator" => Ok(recv.clone()),
+        "next" => {
+            let ready = with_stdin(|s| match s.buffered.pop_front() {
+                Some(c) => Some(Some(c)),
+                None if s.ended => Some(None),
+                None => None,
+            });
+            match ready {
+                Some(Some(c)) => crate::builtins::promise_resolve_pub(stdin_iter_result(c, false)),
+                Some(None) => {
+                    crate::builtins::promise_resolve_pub(stdin_iter_result(Value::Undef, true))
+                }
+                None => {
+                    let (promise, id) = with_host(|h| {
+                        let p = h.new_promise();
+                        let id = h.promise_id(&p).unwrap_or(0);
+                        (p, id)
+                    });
+                    with_stdin(|s| s.waiters.push_back(id));
+                    Ok(promise)
+                }
+            }
+        }
+        // Leaving the loop early stops reading, as destroying the stream does.
+        "return" => {
+            with_stdin(|s| {
+                s.iterating = false;
+                s.paused = true;
+            });
+            crate::builtins::promise_resolve_pub(stdin_iter_result(Value::Undef, true))
+        }
+        _ => Err(crate::host::type_error(&format!(
+            "{method} is not a function"
+        ))),
+    }
 }

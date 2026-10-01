@@ -828,11 +828,22 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
             "end",
             "on",
             "once",
+            "addListener",
+            "prependListener",
             "removeListener",
+            "off",
+            "removeAllListeners",
+            "listenerCount",
             "cork",
             "uncork",
             "setEncoding",
+            "resume",
+            "pause",
+            "read",
+            "pipe",
+            "@@asyncIterator",
         ],
+        "StdinIterator" => process::STDIN_ITERATOR_METHODS,
         // `Hash` and `Hmac` answer the same two methods (both route to
         // `crypto::hashlike_call`). Only `Hmac` was listed, so
         // `ensure_ctor_proto("Hash")` found nothing and `crypto.Hash.prototype`
@@ -1065,6 +1076,7 @@ pub fn instance_call(
         }
         "Channel" => diagnostics_channel::instance_call(recv, method, &args),
         "WriteStream" => process::stream_instance_call(recv, method, &args),
+        "StdinIterator" => process::stdin_iterator_call(recv, method),
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
         ))),
