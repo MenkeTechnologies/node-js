@@ -3052,7 +3052,7 @@ fn nullish_receiver_error(ctor: &str, method: &str, recv: &str) -> Option<String
         "Symbol" => branded("Symbol", "Symbol"),
         "Function" if method == "bind" => "Bind must be called on a function".to_string(),
         "Function" if matches!(method, "call" | "apply") => format!(
-            "Function.prototype.{method} was called on undefined, which is undefined and not a function"
+            "Function.prototype.{method} was called on {recv}, which is {recv} and not a function"
         ),
         "Function" => branded("Function", "Function"),
         // `Promise.prototype.catch`/`finally` are written in terms of `then`, so
@@ -3176,6 +3176,43 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         if let Some(msg) = nullish_receiver_error(ctor, method, shown) {
             return Err(format!("TypeError: {msg}"));
         }
+    }
+    // `Function.prototype.call`/`apply`/`bind`/`toString` reached with a
+    // receiver that is not callable — `Function.prototype.call.call(1)`, or a
+    // borrowed `call` applied to a plain object. Each starts with an
+    // `IsCallable(this)` check and V8 words the failure per method, naming
+    // the receiver the side-effect-free way and its type by `typeof` (with
+    // `null` for null). Falling through dispatched `call` ON the receiver and
+    // reported the method missing instead.
+    if ctor == "Function"
+        && matches!(method, "call" | "apply" | "bind" | "toString")
+        && !with_host(|h| host::is_callable(h, recv))
+    {
+        let msg = match method {
+            "bind" => "Bind must be called on a function".to_string(),
+            "toString" => {
+                "Function.prototype.toString requires that 'this' be a Function".to_string()
+            }
+            _ => {
+                let kind = with_host(|h| {
+                    if h.is_null(recv) {
+                        "null"
+                    } else {
+                        h.type_of(recv)
+                    }
+                });
+                let kind = match kind {
+                    "object" => "an object".to_string(),
+                    "null" | "undefined" => kind.to_string(),
+                    other => format!("a {other}"),
+                };
+                format!(
+                    "Function.prototype.{method} was called on {}, which is {kind} and not a function",
+                    no_side_effects_string(recv)
+                )
+            }
+        };
+        return Err(host::type_error(&msg));
     }
     // `Error.prototype.toString` (20.5.3.4): `name`, `message`, or `name:
     // message`, read off the chain so a subclass's `this.name = 'E'` is honored.
@@ -6319,6 +6356,11 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         let spec = with_host(|h| h.str_of(&arg0(&args)));
         let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
         return crate::module::require(&spec, std::path::Path::new(&from));
+    }
+    // `Function.prototype` is itself a function (20.2.3): it accepts any
+    // arguments and returns undefined.
+    if name == "Function.prototype" {
+        return Ok(Value::Undef);
     }
     if name == "process.memoryUsage.rss" {
         return Ok(crate::stdlib::process::memory_usage_rss());

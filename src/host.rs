@@ -7284,6 +7284,13 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
         if crate::builtins::is_known_builtin(&qualified) {
             return crate::builtins::call_builtin_function(&qualified, args);
         }
+        // A member that is not itself a dispatch entry but reads back as a
+        // function — `Function.prototype`, the one callable prototype — is
+        // called as what it reads as, with the namespace as `this`.
+        let member = crate::builtins::namespace_property(&ns, name);
+        if with_host(|h| is_callable(h, &member)) {
+            return invoke(&member, args, Some(recv.clone()));
+        }
     }
     // Object / instance: an accessor getter that yields a function, an own or
     // inherited method (class methods live on the prototype chain), then an
