@@ -656,7 +656,8 @@ itself (`every`/`some`/`map`/`filter`/`find*`/`reduce*`/`forEach`/`sort`/
 `reverse`/`copyWithin`/`join`/`at`/`lastIndexOf`), and a derivation keeps the
 receiver's type: `buf.map(f)` is a Buffer, `int32.map(f)` an `Int32Array`.
 Anything that accepts a Buffer accepts any typed array — `Buffer.from`,
-`Buffer.concat`, `buf.equals` and `buf.indexOf` share one byte-source helper,
+`buf.equals` and `buf.indexOf` share one byte-source helper (`Buffer.concat`
+takes only Buffers and Uint8Arrays, as node's `isUint8Array` check does),
 and `Buffer.byteLength` reports the VIEW size (12 for three `Int32Array`
 elements, not 3). A typed array sorts numerically, unlike `Array`.
 
