@@ -700,7 +700,7 @@ fn wildcard_match(pat: &str, s: &str) -> bool {
 
 /// Remove ANSI/VT escape sequences: two-char escapes, CSI (`ESC [ … final`),
 /// and OSC (`ESC ] … BEL|ST`), including the C1 CSI introducer ``.
-fn strip_vt(s: &str) -> String {
+pub(crate) fn strip_vt(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

@@ -190,8 +190,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // input (a primitive, a function, …) falls back to `console.log`.
         "table" => {
             match render_table(args) {
-                Some(t) => emit(&t, false),
-                None => match format_args(args) {
+                Err(e) => return Some(Err(e)),
+                Ok(Some(t)) => emit(&t, false),
+                // `this.log(tabularData)`: only the data, never `properties`.
+                Ok(None) => match format_args(&args[..args.len().min(1)]) {
                     Ok(s) => emit(&s, false),
                     Err(e) => return Some(Err(e)),
                 },
@@ -310,166 +312,277 @@ fn emit(line: &str, stderr: bool) {
 }
 
 // ── console.table ────────────────────────────────────────────────────────────
+//
+// A port of node's `Console.prototype.table` (lib/internal/console/
+// constructor.js) and of `lib/internal/cli_table.js`, which draws the box.
 
-/// Render `console.table(data[, properties])` as a box-drawn ASCII table, or
-/// `None` when `data` is not a tabular value (array/object) — the caller then
-/// falls back to `console.log`.
-fn render_table(args: &[Value]) -> Option<String> {
+/// `console.table(data[, properties])` as node renders it, or `Ok(None)` when
+/// `data` is not an object — the caller then logs it as `console.log` would.
+fn render_table(args: &[Value]) -> Result<Option<String>, String> {
     let data = args.first().cloned().unwrap_or(Value::Undef);
-    let restrict: Option<Vec<String>> =
-        with_host(|h| match h.get(args.get(1).unwrap_or(&Value::Undef)) {
-            Some(JsObj::Array(items)) => Some(items.iter().map(|v| h.str_of(v)).collect()),
-            _ => None,
-        });
-    // (index label, row value) for each row.
-    let entries: Vec<(String, Value)> = with_host(|h| match h.get(&data) {
-        Some(JsObj::Array(items)) => items
+    let properties = args.get(1).cloned().unwrap_or(Value::Undef);
+    let properties: Option<Vec<Value>> = match with_host(|h| h.get(&properties).cloned()) {
+        _ if matches!(properties, Value::Undef) => None,
+        Some(JsObj::Array(items)) => Some(items),
+        _ => {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_TYPE",
+                &format!(
+                    "The \"properties\" argument must be an instance of Array. Received {}",
+                    crate::stdlib::received_desc(&properties)
+                ),
+            ))
+        }
+    };
+    if with_host(|h| crate::host::is_primitive(h, &data) || h.is_null(&data)) {
+        return Ok(None);
+    }
+    let index_array = |n: usize| -> Result<Vec<Option<String>>, String> {
+        (0..n)
+            .map(|i| table_inspect(&Value::Float(i as f64)).map(Some))
+            .collect()
+    };
+
+    // A Map, or a Map/Set iterator, is read without being consumed
+    // (`previewEntries`); a Map entries iterator and a Map are key/value.
+    let view = with_host(|h| crate::builtins::collection_iterator_view(h, &data));
+    let (map_entries, set_values): (Option<Vec<(Value, Value)>>, Option<Vec<Value>>) =
+        match (view, with_host(|h| h.get(&data).cloned())) {
+            (Some(("Map Entries", rest)), _) => (Some(rest), None),
+            // `previewEntries` of a Set entries iterator is the flat
+            // `[v, v, …]` list, each value twice.
+            (Some(("Set Entries", rest)), _) => (
+                None,
+                Some(rest.into_iter().flat_map(|(k, v)| [k, v]).collect()),
+            ),
+            (Some((_, rest)), _) => (None, Some(rest.into_iter().map(|(k, _)| k).collect())),
+            (None, Some(JsObj::Map { entries, .. })) => {
+                (Some(entries.values().cloned().collect()), None)
+            }
+            (None, Some(JsObj::Set { entries, .. })) => {
+                (None, Some(entries.values().cloned().collect()))
+            }
+            _ => (None, None),
+        };
+    if let Some(pairs) = map_entries {
+        let mut keys = Vec::with_capacity(pairs.len());
+        let mut values = Vec::with_capacity(pairs.len());
+        for (k, v) in &pairs {
+            keys.push(Some(table_inspect(k)?));
+            values.push(Some(table_inspect(v)?));
+        }
+        let head = ["(iteration index)", "Key", "Values"].map(str::to_string);
+        return Ok(Some(cli_table(
+            &head,
+            &[index_array(pairs.len())?, keys, values],
+        )));
+    }
+    if let Some(items) = set_values {
+        let values = items
             .iter()
-            .enumerate()
-            .map(|(i, v)| (i.to_string(), v.clone()))
-            .collect(),
-        Some(JsObj::Object(m)) => m
-            .iter()
-            .filter(|(k, _)| !k.starts_with("@@"))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        _ => Vec::new(),
-    });
-    if with_host(|h| !matches!(h.get(&data), Some(JsObj::Array(_) | JsObj::Object(_)))) {
-        return None;
+            .map(|v| table_inspect(v).map(Some))
+            .collect::<Result<Vec<_>, _>>()?;
+        let head = ["(iteration index)", "Values"].map(str::to_string);
+        return Ok(Some(cli_table(&head, &[index_array(items.len())?, values])));
     }
 
-    // Discover columns (union of tabular rows' keys) and whether any row is a bare
-    // value (needing the trailing "Values" column).
-    let mut columns: Vec<String> = Vec::new();
-    let mut has_values = false;
-    for (_, val) in &entries {
-        match row_keys(val) {
-            Some(keys) => {
-                for k in keys {
-                    if !columns.contains(&k) {
-                        columns.push(k);
-                    }
+    // One column per key, in `ObjectKeys` order of first appearance; a row
+    // that lacks the key leaves its cell empty.
+    let index_keys = object_keys(&data)?;
+    let mut map: Vec<(String, Vec<Option<String>>)> = Vec::new();
+    let mut has_primitives = false;
+    let mut values_column: Vec<Option<String>> = Vec::new();
+    for (i, k) in index_keys.iter().enumerate() {
+        let item = crate::builtins::get_property(&data, k)?;
+        let primitive = with_host(|h| h.is_nullish(&item) || crate::host::is_primitive(h, &item));
+        if properties.is_none() && primitive {
+            has_primitives = true;
+            set_cell(&mut values_column, i, table_inspect(&item)?);
+            continue;
+        }
+        let keys: Vec<String> = match &properties {
+            Some(p) => p
+                .iter()
+                .map(|v| crate::host::to_property_key(v))
+                .collect::<Result<_, _>>()?,
+            None => object_keys(&item)?,
+        };
+        for key in keys {
+            let pos = match map.iter().position(|(k, _)| *k == key) {
+                Some(p) => p,
+                None => {
+                    map.push((key.clone(), Vec::new()));
+                    map.len() - 1
                 }
-            }
-            None => has_values = true,
-        }
-    }
-    if let Some(r) = &restrict {
-        columns = r.clone();
-        has_values = false;
-    }
-
-    // Header + body as a grid of already-rendered cell strings.
-    let mut header = Vec::with_capacity(columns.len() + 2);
-    header.push("(index)".to_string());
-    header.extend(columns.iter().cloned());
-    if has_values {
-        header.push("Values".to_string());
-    }
-
-    let mut rows: Vec<Vec<String>> = Vec::with_capacity(entries.len());
-    for (idx, val) in &entries {
-        let is_primitive = row_keys(val).is_none();
-        let mut row = Vec::with_capacity(header.len());
-        row.push(idx.clone());
-        for col in &columns {
-            match row_get(val, col) {
-                Some(cell) => row.push(with_host(|h| h.inspect(&cell))),
-                None => row.push(String::new()),
-            }
-        }
-        if has_values {
-            row.push(if is_primitive {
-                with_host(|h| h.inspect(val))
-            } else {
+            };
+            let cell = if (primitive && properties.is_some()) || !has_own(&item, &key)? {
                 String::new()
-            });
-        }
-        rows.push(row);
-    }
-
-    Some(draw_table(&header, &rows))
-}
-
-/// The own tabular keys of a row value (`Some` for arrays/objects), or `None` when
-/// the row is a primitive (rendered in the "Values" column).
-fn row_keys(val: &Value) -> Option<Vec<String>> {
-    with_host(|h| match h.get(val) {
-        Some(JsObj::Array(items)) => Some((0..items.len()).map(|i| i.to_string()).collect()),
-        Some(JsObj::Object(m)) => {
-            Some(m.keys().filter(|k| !k.starts_with("@@")).cloned().collect())
-        }
-        _ => None,
-    })
-}
-
-/// Read column `key` from a row value, if present.
-fn row_get(val: &Value, key: &str) -> Option<Value> {
-    with_host(|h| match h.get(val) {
-        Some(JsObj::Array(items)) => key
-            .parse::<usize>()
-            .ok()
-            .and_then(|i| items.get(i).cloned()),
-        Some(JsObj::Object(m)) => m.get(key).cloned(),
-        _ => None,
-    })
-}
-
-/// Draw the box-drawing table from a header row and body rows.
-fn draw_table(header: &[String], rows: &[Vec<String>]) -> String {
-    let ncols = header.len();
-    let mut widths = vec![0usize; ncols];
-    for (i, cell) in header.iter().enumerate() {
-        widths[i] = cell.chars().count();
-    }
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.chars().count());
+            } else {
+                table_inspect(&crate::builtins::get_property(&item, &key)?)?
+            };
+            set_cell(&mut map[pos].1, i, cell);
         }
     }
+    // `ObjectKeys(map)` of the null-prototype accumulator: integer keys first.
+    let (mut ordered, rest): (Vec<_>, Vec<_>) = map
+        .into_iter()
+        .partition(|(k, _)| crate::host::array_index(k).is_some());
+    ordered.sort_by_key(|(k, _)| crate::host::array_index(k));
+    ordered.extend(rest);
+    let mut head = vec!["(index)".to_string()];
+    let mut columns = vec![index_keys.into_iter().map(Some).collect::<Vec<_>>()];
+    for (k, col) in ordered {
+        head.push(k);
+        columns.push(col);
+    }
+    if has_primitives {
+        head.push("Values".to_string());
+        columns.push(values_column);
+    }
+    Ok(Some(cli_table(&head, &columns)))
+}
 
-    let rule = |left: &str, mid: &str, right: &str| -> String {
-        let mut s = String::from(left);
-        for (i, w) in widths.iter().enumerate() {
-            if i > 0 {
-                s.push_str(mid);
+/// `map[key][i] = cell`: a sparse column grows to `i + 1`, its gaps holes.
+fn set_cell(column: &mut Vec<Option<String>>, i: usize, cell: String) {
+    if column.len() <= i {
+        column.resize(i + 1, None);
+    }
+    column[i] = Some(cell);
+}
+
+/// `ObjectKeys(v)` as strings.
+fn object_keys(v: &Value) -> Result<Vec<String>, String> {
+    let keys = crate::builtins::call_builtin_function("Object.keys", vec![v.clone()])?;
+    Ok(with_host(|h| match h.get(&keys) {
+        Some(JsObj::Array(items)) => items.iter().map(|k| h.str_of(k)).collect(),
+        _ => Vec::new(),
+    }))
+}
+
+fn has_own(v: &Value, key: &str) -> Result<bool, String> {
+    let k = with_host(|h| h.new_str(key.to_string()));
+    let r = crate::builtins::object_builtin_method(v, "hasOwnProperty", vec![k])?;
+    Ok(with_host(|h| h.truthy(&r)))
+}
+
+/// The table's `_inspect`: an object with more than two own keys collapses to
+/// `[Object]` (depth -1), everything else shows one level; at most three array
+/// items; never wrapped.
+fn table_inspect(v: &Value) -> Result<String, String> {
+    // node's `isArray` here also admits typed arrays and Buffers.
+    let view = matches!(
+        crate::stdlib::native_tag(v).as_deref(),
+        Some("TypedArray" | "Buffer")
+    );
+    let collapse = !view
+        && with_host(|h| {
+            !crate::host::is_primitive(h, v)
+                && !h.is_nullish(v)
+                && !matches!(h.get(v), Some(JsObj::Array(_)))
+        })
+        && object_keys(v)?.len() > 2;
+    let opts = with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert(
+            "depth".into(),
+            Value::Float(if collapse { -1.0 } else { 0.0 }),
+        );
+        m.insert("maxArrayLength".into(), Value::Float(3.0));
+        m.insert("breakLength".into(), Value::Float(f64::INFINITY));
+        h.new_object(m)
+    });
+    let out = crate::stdlib::util::call("inspect", &[v.clone(), opts])
+        .unwrap_or_else(|| Ok(with_host(|h| h.new_str(h.inspect(v)))))?;
+    Ok(with_host(|h| h.str_of(&out)))
+}
+
+/// node's `getStringWidth` (the build without ICU data, which is the one
+/// written out in `lib/internal/util/inspect.js`): VT escapes removed, NFC,
+/// then one column per code point except the zero-width ones, two for the
+/// East Asian full-width ranges.
+fn string_width(s: &str) -> usize {
+    use unicode_normalization::UnicodeNormalization;
+    let s: String = crate::stdlib::util::strip_vt(s).nfc().collect();
+    s.chars()
+        .map(|c| {
+            let code = c as u32;
+            if is_full_width(code) {
+                2
+            } else if is_zero_width(code) {
+                0
+            } else {
+                1
             }
-            s.push_str(&"─".repeat(w + 2));
-        }
-        s.push_str(right);
-        s
-    };
-    let render_row = |cells: &[String]| -> String {
-        let mut s = String::from("│");
-        for (i, w) in widths.iter().enumerate() {
-            let cell = cells.get(i).map(String::as_str).unwrap_or("");
-            s.push(' ');
-            s.push_str(&pad_center(cell, *w));
-            s.push_str(" │");
-        }
-        s
-    };
-
-    let mut lines = Vec::with_capacity(rows.len() + 4);
-    lines.push(rule("┌", "┬", "┐"));
-    lines.push(render_row(header));
-    lines.push(rule("├", "┼", "┤"));
-    for row in rows {
-        lines.push(render_row(row));
-    }
-    lines.push(rule("└", "┴", "┘"));
-    lines.join("\n")
+        })
+        .sum()
 }
 
-/// Center `s` within `w` columns (extra space biased to the right, as Node does).
-fn pad_center(s: &str, w: usize) -> String {
-    let len = s.chars().count();
-    if len >= w {
-        return s.to_string();
+fn is_zero_width(code: u32) -> bool {
+    code <= 0x1F
+        || (0x7F..=0x9F).contains(&code)
+        || (0x300..=0x36F).contains(&code)
+        || (0x200B..=0x200F).contains(&code)
+        || (0x20D0..=0x20FF).contains(&code)
+        || (0xFE00..=0xFE0F).contains(&code)
+        || (0xFE20..=0xFE2F).contains(&code)
+        || (0xE0100..=0xE01EF).contains(&code)
+}
+
+fn is_full_width(code: u32) -> bool {
+    code >= 0x1100
+        && (code <= 0x115f
+            || code == 0x2329
+            || code == 0x232a
+            || ((0x2e80..=0x3247).contains(&code) && code != 0x303f)
+            || (0x3250..=0x4dbf).contains(&code)
+            || (0x4e00..=0xa4c6).contains(&code)
+            || (0xa960..=0xa97c).contains(&code)
+            || (0xac00..=0xd7a3).contains(&code)
+            || (0xf900..=0xfaff).contains(&code)
+            || (0xfe10..=0xfe19).contains(&code)
+            || (0xfe30..=0xfe6b).contains(&code)
+            || (0xff01..=0xff60).contains(&code)
+            || (0xffe0..=0xffe6).contains(&code)
+            || (0x1b000..=0x1b001).contains(&code)
+            || (0x1f200..=0x1f251).contains(&code)
+            || (0x1f300..=0x1f64f).contains(&code)
+            || (0x20000..=0x3fffd).contains(&code))
+}
+
+/// `cli_table(head, columns)`: every column as wide as its widest cell, each
+/// cell LEFT-justified, a missing cell (a hole, or past the column's end)
+/// blank.
+fn cli_table(head: &[String], columns: &[Vec<Option<String>>]) -> String {
+    let longest = columns.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths: Vec<usize> = head.iter().map(|h| string_width(h)).collect();
+    let mut rows: Vec<Vec<String>> = vec![Vec::with_capacity(head.len()); longest];
+    for (i, column) in columns.iter().enumerate() {
+        for (j, row) in rows.iter_mut().enumerate() {
+            let value = column.get(j).cloned().flatten().unwrap_or_default();
+            widths[i] = widths[i].max(string_width(&value));
+            row.push(value);
+        }
     }
-    let total = w - len;
-    let left = total / 2;
-    let right = total - left;
-    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+    let render_row = |row: &[String]| -> String {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .map(|(cell, w)| format!("{cell}{}", " ".repeat(w.saturating_sub(string_width(cell)))))
+            .collect();
+        format!("│ {} │", cells.join(" │ "))
+    };
+    let divider: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+    let mut out = format!(
+        "┌{}┐\n{}\n├{}┤\n",
+        divider.join("┬"),
+        render_row(head),
+        divider.join("┼")
+    );
+    for row in &rows {
+        out.push_str(&render_row(row));
+        out.push('\n');
+    }
+    out.push_str(&format!("└{}┘", divider.join("┴")));
+    out
 }
