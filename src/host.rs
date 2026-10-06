@@ -6527,6 +6527,11 @@ fn quote_str(s: &str) -> String {
 
 /// Render an object key: bare if it is a valid identifier, quoted otherwise.
 fn fmt_key(k: &str) -> String {
+    // node prints an OWN `__proto__` key computed-style, so it cannot be read
+    // back as the prototype setter: `{ ['__proto__']: 5 }`.
+    if k == "__proto__" {
+        return "['__proto__']".to_string();
+    }
     let ok = !k.is_empty()
         && k.chars()
             .next()
@@ -7067,6 +7072,26 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// The receiver check every `Promise` static runs before anything else: a
+/// non-object is refused with V8's per-method wording, an object that is not a
+/// constructor with `<value> is not a constructor`.
+fn promise_static_receiver(name: &str, recv: &Value) -> Result<(), String> {
+    let is_object = with_host(|h| !is_primitive(h, recv) && !h.is_nullish(recv));
+    if !is_object {
+        let msg = match name {
+            "Promise.resolve" => "PromiseResolve called on non-object".to_string(),
+            "Promise.reject" => "PromiseReject called on non-object".to_string(),
+            _ => format!("{name} called on non-object"),
+        };
+        return Err(type_error(&msg));
+    }
+    if !with_host(|h| is_callable(h, recv)) {
+        let shown = crate::builtins::no_side_effects_string_pub(recv);
+        return Err(type_error(&format!("{shown} is not a constructor")));
+    }
+    Ok(())
+}
+
 /// Run `f` with `recv` recorded as the receiver of a builtin static call.
 pub fn with_static_this<R>(recv: &Value, f: impl FnOnce() -> R) -> R {
     STATIC_THIS.with(|s| s.borrow_mut().push(recv.clone()));
@@ -7403,6 +7428,13 @@ pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result
                 .expect("guard checked a native constructor")?;
             adopt_native_slots(&target, &built);
             Ok(Value::Undef)
+        }
+        // A `Promise` static reached through `.call`/`.apply` checks its
+        // receiver first, as 27.2.4 does: `Promise.resolve.call(1)` throws.
+        Some(JsObj::Builtin(name)) if name.starts_with("Promise.") && this.is_some() => {
+            let recv = this.expect("guard checked");
+            promise_static_receiver(&name, &recv)?;
+            crate::builtins::call_builtin_function(&name, args)
         }
         Some(JsObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args),
         Some(JsObj::Func(fv)) => run_user_func_of(&fv, args, this, Some(callable.clone())),
@@ -8824,7 +8856,7 @@ pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
         return Ok(out);
     }
     if let Some(iter_fn) = user_iterator_fn(v) {
-        let iterator = invoke(&iter_fn, Vec::new(), Some(v.clone()))?;
+        let iterator = call_iterator_method(&iter_fn, v)?;
         let mut out = Vec::new();
         while out.len() < n {
             let step = call_method(&iterator, "next", Vec::new())?;
@@ -8857,6 +8889,32 @@ pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
     with_host(|h| h.iter_vec(v)).map(|items| items.into_iter().take(n).collect())
 }
 
+/// `GetIteratorFromMethod` (7.4.3): call `@@iterator` on `src` and refuse a
+/// result that is not an object, with V8's wording, before anything reads
+/// `next` off it.
+pub fn call_iterator_method(iter_fn: &Value, src: &Value) -> Result<Value, String> {
+    let iterator = invoke(iter_fn, Vec::new(), Some(src.clone()))?;
+    if with_host(|h| is_primitive(h, &iterator) || h.is_nullish(&iterator)) {
+        return Err(type_error("Result of the Symbol.iterator method is not an object"));
+    }
+    Ok(iterator)
+}
+
+/// [`iter_all`] for a BUILTIN consuming an iterable argument (`new Set(x)`,
+/// `Object.fromEntries(x)`, `Promise.all(x)`): V8 has no source text to name
+/// there, so a non-iterable is reported by type —
+/// `number 5 is not iterable (cannot read property Symbol(Symbol.iterator))`.
+pub fn iter_all_for_builtin(v: &Value) -> Result<Vec<Value>, String> {
+    iter_all(v).map_err(|e| {
+        let shown = with_host(|h| h.inspect(v));
+        if e == type_error(&format!("{shown} is not iterable")) {
+            type_error(&crate::builtins::not_iterable_typed(v))
+        } else {
+            e
+        }
+    })
+}
+
 pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
     // A Proxy iterates through its traps (see `crate::proxy::iterate`); it has
     // no heap variant `iter_vec` could recognise.
@@ -8885,7 +8943,7 @@ pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
     // Checked BEFORE the reachability guard below, since an own `Symbol
     // .iterator` makes a value iterable no matter what its prototype is.
     if let Some(iter_fn) = user_iterator_fn(v) {
-        let iterator = invoke(&iter_fn, Vec::new(), Some(v.clone()))?;
+        let iterator = call_iterator_method(&iter_fn, v)?;
         return drain_iterator(&iterator);
     }
     // The fast paths below read a builtin's backing storage directly, which is
@@ -9039,6 +9097,33 @@ pub fn user_iterator_fn(v: &Value) -> Option<Value> {
     with_host(|h| is_callable(h, &f)).then_some(f)
 }
 
+/// [`iter_for_each`] for a BUILTIN consuming an iterable argument, with the
+/// type-named not-iterable wording of [`iter_all_for_builtin`].
+pub fn iter_for_each_for_builtin(
+    src: &Value,
+    mut f: impl FnMut(Value, usize) -> Result<(), String>,
+) -> Result<(), String> {
+    // Mapped only when the failure came before any element was visited, so a
+    // callback's own error is never reworded. Nothing is probed up front: that
+    // would consume a generator.
+    let mut visited = false;
+    let r = iter_for_each(src, |v, i| {
+        visited = true;
+        f(v, i)
+    });
+    match r {
+        Err(e) if !visited => {
+            let shown = with_host(|h| h.inspect(src));
+            if e == type_error(&format!("{shown} is not iterable")) {
+                Err(type_error(&crate::builtins::not_iterable_typed(src)))
+            } else {
+                Err(e)
+            }
+        }
+        r => r,
+    }
+}
+
 /// Drive an iterator object (one with a `.next()` returning `{value, done}`) to
 /// exhaustion.
 /// Step `src`'s iterator, handing each value to `f`, and CLOSE the iterator if
@@ -9059,7 +9144,7 @@ pub fn iter_for_each(
         }
         return Ok(());
     };
-    let iterator = invoke(&iter_fn, Vec::new(), Some(src.clone()))?;
+    let iterator = call_iterator_method(&iter_fn, src)?;
     let mut i = 0usize;
     loop {
         let step = call_method(&iterator, "next", Vec::new())?;

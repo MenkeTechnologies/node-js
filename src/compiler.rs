@@ -3049,7 +3049,16 @@ impl Compiler {
                             ..
                         }
                     );
-                    b.emit(Op::LoadInt(if defines_method { 3 } else { 0 }), 0);
+                    // Tag 4 marks a COMPUTED key: `{ ["__proto__"]: v }` defines an own
+                    // property (B.3.1 applies only to the literal `__proto__: v` form).
+                    let tag = if defines_method {
+                        3
+                    } else if *computed {
+                        4
+                    } else {
+                        0
+                    };
+                    b.emit(Op::LoadInt(tag), 0);
                     // Key coerces to a property key (Symbol-aware: a Symbol maps to
                     // its internal `@@…` key rather than a `String()` coercion).
                     self.compile_expr(b, key)?;

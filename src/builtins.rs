@@ -3531,6 +3531,11 @@ fn branded_method_label(ctor: &str, recv: &Value) -> Option<&'static str> {
 /// prints what the BUILTIN brand would be — V8 never calls the user's method,
 /// which is why an object with its own `toString` prints `[object Object]` and
 /// not what that method returns.
+/// [`no_side_effects_string`] for callers outside this module.
+pub(crate) fn no_side_effects_string_pub(recv: &Value) -> String {
+    no_side_effects_string(recv)
+}
+
 fn no_side_effects_string(recv: &Value) -> String {
     if with_host(|h| host::is_primitive(h, recv)) || with_host(|h| host::is_callable(h, recv)) {
         return with_host(|h| h.str_of(recv));
@@ -4662,7 +4667,8 @@ fn b_mkobj(vm: &mut VM, argc: u8) -> Value {
             }
         } else {
             let key = with_host(|h| h.str_of(&flat[i + 1]));
-            if key == "__proto__" {
+            let computed = matches!(flat[i], Value::Int(4));
+            if key == "__proto__" && !computed {
                 proto_override = Some(flat[i + 2].clone());
             } else {
                 props.insert(key, flat[i + 2].clone());
@@ -5351,7 +5357,7 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
     if !direct {
         if let Ok(iter_fn) = get_property(&v, "@@iterator") {
             if with_host(|h| host::is_callable(h, &iter_fn)) {
-                return match host::invoke(&iter_fn, Vec::new(), Some(v.clone())) {
+                return match host::call_iterator_method(&iter_fn, &v) {
                     Ok(it) => it,
                     Err(e) => abort(vm, e),
                 };
@@ -7300,7 +7306,7 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
                 // stop the construction at that element and CLOSE the iterator
                 // (24.1.1.2 step 8). Materializing first meant a bad entry in an
                 // infinite source was never reached and the constructor HUNG.
-                host::iter_for_each(init, |p, _| {
+                host::iter_for_each_for_builtin(init, |p, _| {
                     // 24.1.1.2 step 8.d: each entry must be an OBJECT. A string
                     // is iterable, so without this check `new Map(["ab"])`
                     // happily stored `'a' => 'b'` instead of throwing — and over
@@ -7336,7 +7342,7 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
                 .first()
                 .filter(|a| !matches!(a, Value::Undef) && !with_host(|h| h.is_null(a)))
             {
-                host::iter_for_each(init, |v, _| {
+                host::iter_for_each_for_builtin(init, |v, _| {
                     set_method(&s, "add", vec![v])?;
                     Ok(())
                 })?;
@@ -8465,15 +8471,34 @@ fn object_assign(args: Vec<Value>) -> Result<Value, String> {
 }
 
 fn object_from_entries(args: Vec<Value>) -> Result<Value, String> {
-    let pairs = with_host(|h| h.iter_vec(&arg0(&args))).unwrap_or_default();
-    let mut props: IndexMap<String, Value> = IndexMap::new();
-    for p in pairs {
-        let kv = with_host(|h| h.iter_vec(&p)).unwrap_or_default();
-        let key = with_host(|h| h.str_of(&kv.first().cloned().unwrap_or(Value::Undef)));
-        let val = kv.get(1).cloned().unwrap_or(Value::Undef);
-        props.insert(key, val);
+    // 20.1.2.7: RequireObjectCoercible, then AddEntriesFromIterable — each
+    // entry must be an object, read by INDEX (`[[Get]]` of "0" and "1"), its
+    // key through ToPropertyKey, and stored with CreateDataProperty. A bad
+    // entry stops the walk and closes the iterator.
+    let src = arg0(&args);
+    if with_host(|h| h.is_nullish(&src)) {
+        return Err(host::type_error("undefined is not iterable"));
     }
-    Ok(with_host(|h| h.new_object(props)))
+    let obj = with_host(|h| h.new_object(IndexMap::new()));
+    host::iter_for_each_for_builtin(&src, |entry, _| {
+        if !with_host(|h| is_object_like(h, &entry)) {
+            let shown = with_host(|h| h.str_of(&entry));
+            return Err(host::type_error(&format!(
+                "Iterator value {shown} is not an entry object"
+            )));
+        }
+        let k = get_property(&entry, "0")?;
+        let v = get_property(&entry, "1")?;
+        let key = host::to_property_key(&k)?;
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(&obj) {
+                p.insert(key, v);
+                host::canonicalize_own_keys(p);
+            }
+        });
+        Ok(())
+    })?;
+    Ok(obj)
 }
 
 /// `Object.groupBy(items, cb)` — group the iterable `items` into a null-prototype
@@ -8542,7 +8567,9 @@ pub(crate) fn not_iterable_typed(v: &Value) -> String {
     let shown = with_host(|h| {
         let kind = h.type_of(v);
         match kind {
-            "object" | "symbol" | "bigint" => kind.to_string(),
+            "object" if h.is_null(v) => "object null".to_string(),
+            "undefined" => "undefined".to_string(),
+            "object" | "symbol" | "bigint" | "function" => kind.to_string(),
             "string" => format!("string \"{}\"", h.str_of(v)),
             _ => format!("{kind} {}", h.str_of(v)),
         }
@@ -8628,6 +8655,19 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
     // `Array.from` accepts generators and user iterables, plus array-likes with a
     // numeric `.length`.
     let src = arg0(&args);
+    // 23.1.2.1 step 4: `GetMethod(items, @@iterator)`. Reading it off a nullish
+    // value throws; a method that is present but not callable throws; only an
+    // ABSENT one (undefined/null) selects the array-like path.
+    if with_host(|h| h.is_nullish(&src)) {
+        return Err(host::type_error(&not_iterable_typed(&src)));
+    }
+    let method = get_property(&src, "@@iterator")?;
+    let has_iter = !with_host(|h| h.is_nullish(&method));
+    if has_iter && !with_host(|h| host::is_callable(h, &method)) {
+        return Err(host::type_error(
+            "%Array%.from requires that the property of the first argument, items[Symbol.iterator], when exists, be a function",
+        ));
+    }
     if let Some(cb) = args.get(1).cloned() {
         // Stepped, not drained: the mapper runs per element as the iterator
         // yields it (23.1.2.1 step 6.e). Materializing the whole sequence first
@@ -8635,19 +8675,22 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
         // all and HUNG, and a throwing mapper could not close the iterator.
         let this = this_arg(&args, 2);
         let mut out = Vec::new();
-        let mapped = host::iter_for_each(&src, |v, i| {
-            out.push(host::invoke(
-                &cb,
-                vec![v, Value::Float(i as f64)],
-                this.clone(),
-            )?);
-            Ok(())
-        });
+        let mapped = if has_iter {
+            host::iter_for_each(&src, |v, i| {
+                out.push(host::invoke(
+                    &cb,
+                    vec![v, Value::Float(i as f64)],
+                    this.clone(),
+                )?);
+                Ok(())
+            })
+        } else {
+            Err(String::new())
+        };
         match mapped {
             Ok(()) => {}
             // An array-LIKE has no iterator; fall back to its indexed items.
-            Err(e) if host::user_iterator_fn(&src).is_none() && e.ends_with(" is not iterable") => {
-                out.clear();
+            Err(_) if !has_iter => {
                 for (i, it) in array_like_items(&src).into_iter().enumerate() {
                     out.push(host::invoke(
                         &cb,
@@ -8660,9 +8703,10 @@ fn array_from(args: Vec<Value>) -> Result<Value, String> {
         }
         return construct_array_like(host::current_static_this(), out);
     }
-    let items = match host::iter_all(&src) {
-        Ok(v) => v,
-        Err(_) => array_like_items(&src),
+    let items = if has_iter {
+        host::iter_all(&src)?
+    } else {
+        array_like_items(&src)
     };
     // 23.1.2.1 step 5: `Array.from` builds through `this`, so on a subclass the
     // result is an instance of it. It always allocated a plain array, which is
@@ -15239,6 +15283,11 @@ pub fn promise_species_from(recv: &Value) -> Result<Option<Value>, String> {
 }
 
 fn new_promise(executor: Value) -> Result<Value, String> {
+    // 27.2.3.1 step 2: a non-callable executor throws before any promise exists.
+    if !with_host(|h| host::is_callable(h, &executor)) {
+        let shown = no_side_effects_string(&executor);
+        return Err(host::type_error(&format!("Promise resolver {shown} is not a function")));
+    }
     let p = with_host(|h| h.new_promise());
     let id = with_host(|h| h.promise_id(&p).unwrap());
     let res = make_builtin(format!("@@presolve:{id}"));
@@ -15477,7 +15526,7 @@ enum AllMode {
 
 /// `Promise.all` / `Promise.allSettled`.
 fn promise_all(args: Vec<Value>, mode: AllMode) -> Result<Value, String> {
-    let items = match host::iter_all(&arg0(&args)) {
+    let items = match host::iter_all_for_builtin(&arg0(&args)) {
         Ok(v) => v,
         Err(e) => return Ok(rejected_promise(e)),
     };
@@ -15541,7 +15590,7 @@ fn promise_all(args: Vec<Value>, mode: AllMode) -> Result<Value, String> {
 
 /// `Promise.race` (first to settle wins) / `Promise.any` (first to fulfill wins).
 fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
-    let items = match host::iter_all(&arg0(&args)) {
+    let items = match host::iter_all_for_builtin(&arg0(&args)) {
         Ok(v) => v,
         Err(e) => return Ok(rejected_promise(e)),
     };

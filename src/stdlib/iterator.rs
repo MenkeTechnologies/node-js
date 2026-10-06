@@ -380,6 +380,40 @@ fn iterator_of(v: &Value) -> Result<Value, String> {
     )))
 }
 
+/// `GetIteratorFlattenable(obj, iterate-string-primitives)` (27.1.3.2.1.1) —
+/// the iterator `Iterator.from` starts from. A non-string primitive is
+/// refused; an absent `@@iterator` takes `obj` itself as the iterator; a
+/// present but non-callable one, or one returning a non-object, throws with
+/// V8's wording.
+fn iterator_flattenable(obj: &Value) -> Result<Value, String> {
+    let (is_object, is_string) = with_host(|h| {
+        (
+            !crate::host::is_primitive(h, obj) && !h.is_nullish(obj),
+            h.as_str(obj).is_some(),
+        )
+    });
+    if !is_object && !is_string {
+        return Err(crate::host::type_error("Iterator.from called on non-object"));
+    }
+    let method = crate::builtins::get_property(obj, "@@iterator")?;
+    if with_host(|h| h.is_nullish(&method)) {
+        return Ok(obj.clone());
+    }
+    if !with_host(|h| is_callable(h, &method)) {
+        let shown = with_host(|h| h.str_of(&method));
+        let owner = crate::builtins::no_side_effects_string_pub(obj);
+        return Err(crate::host::type_error(&format!(
+            "'{shown}' returned for property 'Symbol(Symbol.iterator)' of object '{owner}' is not a function"
+        )));
+    }
+    let it = crate::host::invoke(&method, Vec::new(), Some(obj.clone()))?;
+    if with_host(|h| crate::host::is_primitive(h, &it) || h.is_nullish(&it)) {
+        let owner = crate::builtins::no_side_effects_string_pub(obj);
+        return Err(crate::host::type_error(&format!("{owner} is not iterable")));
+    }
+    Ok(it)
+}
+
 /// `Iterator.from(x)`.
 pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match method {
@@ -388,7 +422,7 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         // — here in a pass-through helper, which is the same wrapper every
         // other stage uses.
         "from" => Some(
-            iterator_of(&args.first().cloned().unwrap_or(Value::Undef)).map(|it| {
+            iterator_flattenable(&args.first().cloned().unwrap_or(Value::Undef)).map(|it| {
                 if super::native_tag(&it).as_deref() == Some("IteratorHelper")
                     || matches!(
                         with_host(|h| h.kind_of(&it)),
