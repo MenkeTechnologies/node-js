@@ -185,7 +185,7 @@ fn boxed_kind(v: &Value) -> Option<Boxed> {
 /// The typed-array kind of `v` (`"Uint8Array"`/…/`"Float64Array"`), or `None` if
 /// it is not a typed array. A native `Buffer` reports `Uint8Array` (Node models
 /// `Buffer` as a `Uint8Array` subclass).
-fn ta_kind(v: &Value) -> Option<String> {
+pub(crate) fn ta_kind(v: &Value) -> Option<String> {
     match super::native_tag(v).as_deref() {
         Some("TypedArray") => with_host(|h| match h.get(v) {
             Some(JsObj::Object(p)) => p.get("@@kind").map(|k| h.str_of(k)),

@@ -803,18 +803,78 @@ fn received_label(v: &Value) -> String {
 }
 
 fn concat(args: &[Value]) -> Result<Value, String> {
-    let list = with_host(
-        |h| match h.get(&args.first().cloned().unwrap_or(Value::Undef)) {
-            Some(JsObj::Array(items)) => items.clone(),
-            _ => Vec::new(),
-        },
-    );
+    // `lib/buffer.js` `Buffer.concat(list, length)`: `validateArray(list)`; an
+    // empty list is an empty Buffer before `length` is looked at; `length` is
+    // `validateOffset`ed; each part must be a Uint8Array; the result is exactly
+    // `length` bytes, truncated or zero-filled.
+    let list_v = args.first().cloned().unwrap_or(Value::Undef);
+    let list = match with_host(|h| h.get(&list_v).cloned()) {
+        Some(JsObj::Array(items)) => items,
+        _ => {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_TYPE",
+                &format!(
+                    "The \"list\" argument must be an instance of Array. Received {}",
+                    super::received_desc(&list_v)
+                ),
+            ))
+        }
+    };
+    if list.is_empty() {
+        return Ok(from_bytes(&[]));
+    }
+    let length = match args.get(1) {
+        None | Some(Value::Undef) => None,
+        Some(v) => Some(validate_offset(v, "length")?),
+    };
     let mut out = Vec::new();
-    for b in &list {
-        // Each part may be a Buffer OR any other typed array.
+    for (i, b) in list.iter().enumerate() {
+        if super::util_types::ta_kind(b).as_deref() != Some("Uint8Array") {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_TYPE",
+                &format!(
+                    "The \"list[{i}]\" argument must be an instance of Buffer or Uint8Array. Received {}",
+                    super::received_desc(b)
+                ),
+            ));
+        }
         out.extend(bytes_like(b).unwrap_or_default());
     }
+    if let Some(n) = length {
+        out.resize(n, 0);
+    }
     Ok(from_bytes(&out))
+}
+
+/// `validateOffset(value, name)` from `lib/buffer.js`: a Number, an integer,
+/// and within `[0, kMaxLength]`.
+fn validate_offset(v: &Value, name: &str) -> Result<usize, String> {
+    if with_host(|h| h.type_of(v)) != "number" {
+        return Err(crate::host::invalid_arg_type(name, "argument", "number", v));
+    }
+    let n = with_host(|h| h.to_number(v));
+    let out_of_range = |must: String| {
+        crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!(
+                "The value of \"{name}\" is out of range. It must be {must}. Received {}",
+                out_of_range_received(n)
+            ),
+        )
+    };
+    if n.is_nan() || n.fract() != 0.0 {
+        return Err(out_of_range("an integer".to_string()));
+    }
+    if !(0.0..=K_MAX_LENGTH).contains(&n) {
+        return Err(out_of_range(format!(
+            ">= 0 && <= {}",
+            crate::host::fmt_number(K_MAX_LENGTH)
+        )));
+    }
+    Ok(n as usize)
 }
 
 /// Buffer instance methods.
@@ -1030,7 +1090,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             if method.ends_with("LE") {
                 raw.reverse();
             }
-            let off = super::arg_num(args, 1).max(0.0) as usize;
+            let off = write_offset(args, 4, bytes.len())?;
             store_bytes(recv, &bytes, off, &raw)?;
             Ok(Value::Float((off + 4) as f64))
         }
@@ -1039,7 +1099,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             if method.ends_with("LE") {
                 raw.reverse();
             }
-            let off = super::arg_num(args, 1).max(0.0) as usize;
+            let off = write_offset(args, 8, bytes.len())?;
             store_bytes(recv, &bytes, off, &raw)?;
             Ok(Value::Float((off + 8) as f64))
         }
@@ -1061,10 +1121,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
         "writeBigInt64BE" | "writeBigInt64LE" | "writeBigUInt64BE" | "writeBigUInt64LE" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
-            let n = with_host(|h| match h.get(&v) {
-                Some(JsObj::BigInt(b)) => b.clone(),
-                _ => num_bigint::BigInt::from(h.to_number(&v) as i64),
-            });
+            let n = big_write_value(&v, method.starts_with("writeBigInt"))?;
             // Both signed and unsigned store the same 64 bits; the sign is only
             // a question of how they are read back.
             let bits = num_traits::ToPrimitive::to_i64(&n)
@@ -1075,18 +1132,15 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             if method.ends_with("LE") {
                 raw.reverse();
             }
-            let off = super::arg_num(args, 1).max(0.0) as usize;
+            let off = write_offset(args, 8, bytes.len())?;
             store_bytes(recv, &bytes, off, &raw)?;
             Ok(Value::Float((off + 8) as f64))
         }
         // The variable-width family: `byteLength` is an argument (1..=6), which
         // is why these cannot share the fixed-width arms above.
         "readIntBE" | "readIntLE" | "readUIntBE" | "readUIntLE" => {
-            let off = super::arg_num(args, 0).max(0.0) as usize;
-            let width = (super::arg_num(args, 1).max(1.0) as usize).min(6);
-            if off + width > bytes.len() {
-                return Err(range_error_out_of_bounds());
-            }
+            let width = variable_byte_length(args.get(1))?;
+            let off = read_offset(args, width, bytes.len())?;
             let mut acc: u64 = 0;
             for k in 0..width {
                 let b = if method.ends_with("BE") {
@@ -1106,10 +1160,32 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             };
             Ok(Value::Float(out))
         }
-        "writeIntBE" | "writeIntLE" | "writeUIntBE" | "writeUIntLE" => {
-            let val = super::arg_num(args, 0) as i64 as u64;
-            let off = super::arg_num(args, 1).max(0.0) as usize;
-            let width = (super::arg_num(args, 2).max(1.0) as usize).min(6);
+        // `lib/internal/buffer.js`'s writers: `value = +value`, `checkInt` against
+        // the width's range, then the offset's `checkBounds`. A value outside the
+        // range used to wrap silently (`writeUInt8(300)` stored 0x2c) and an
+        // out-of-range offset could be negative or fractional.
+        "writeIntBE" | "writeIntLE" | "writeUIntBE" | "writeUIntLE" | "writeInt8" | "writeUInt8"
+        | "writeInt16BE" | "writeInt16LE" | "writeUInt16BE" | "writeUInt16LE" | "writeInt32BE"
+        | "writeInt32LE" | "writeUInt32BE" | "writeUInt32LE" => {
+            let width = match method {
+                "writeIntBE" | "writeIntLE" | "writeUIntBE" | "writeUIntLE" => {
+                    variable_byte_length(args.get(2))?
+                }
+                "writeInt8" | "writeUInt8" => 1,
+                m if m.contains("16") => 2,
+                _ => 4,
+            };
+            let value = super::arg_num(args, 0);
+            let bits = (width * 8) as i32;
+            let (min, max) = if method.starts_with("writeInt") {
+                (-(2f64.powi(bits - 1)), 2f64.powi(bits - 1) - 1.0)
+            } else {
+                (0.0, 2f64.powi(bits) - 1.0)
+            };
+            check_int_value(value, min, max, width - 1)?;
+            let off = write_offset(args, width, bytes.len())?;
+            // NaN stores 0, as `value as i64` gives.
+            let val = value as i64 as u64;
             let mut raw: Vec<u8> = (0..width)
                 .map(|k| (val >> (8 * (width - 1 - k))) as u8)
                 .collect();
@@ -1118,60 +1194,6 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             }
             store_bytes(recv, &bytes, off, &raw)?;
             Ok(Value::Float((off + width) as f64))
-        }
-        "writeInt8" => {
-            let off = super::arg_num(args, 1).max(0.0) as usize;
-            store_bytes(recv, &bytes, off, &[super::arg_num(args, 0) as i64 as u8])?;
-            Ok(Value::Float((off + 1) as f64))
-        }
-        "writeInt16BE" | "writeInt16LE" => {
-            let val = super::arg_num(args, 0) as i64 as u16;
-            let mut raw = val.to_be_bytes();
-            if method.ends_with("LE") {
-                raw.reverse();
-            }
-            let off = super::arg_num(args, 1).max(0.0) as usize;
-            store_bytes(recv, &bytes, off, &raw)?;
-            Ok(Value::Float((off + 2) as f64))
-        }
-        // In-place writes: mutate the backing `@@bytes`, return the next offset.
-        "writeUInt8" => {
-            let off = super::arg_num(args, 1).max(0.0) as usize;
-            store_bytes(recv, &bytes, off, &[super::arg_num(args, 0) as u8])?;
-            Ok(Value::Float((off + 1) as f64))
-        }
-        "writeUInt16BE" | "writeUInt16LE" => {
-            let mut b = bytes.clone();
-            let val = super::arg_num(args, 0) as u16;
-            let off = super::arg_num(args, 1).max(0.0) as usize;
-            let (hi, lo) = ((val >> 8) as u8, (val & 0xff) as u8);
-            let (b0, b1) = if method == "writeUInt16BE" {
-                (hi, lo)
-            } else {
-                (lo, hi)
-            };
-            let _ = &mut b;
-            store_bytes(recv, &bytes, off, &[b0, b1])?;
-            Ok(Value::Float((off + 2) as f64))
-        }
-        "writeUInt32BE" | "writeUInt32LE" | "writeInt32BE" | "writeInt32LE" => {
-            let mut b = bytes.clone();
-            let val = super::arg_num(args, 0) as i64 as u32;
-            let off = super::arg_num(args, 1).max(0.0) as usize;
-            let be = [
-                (val >> 24) as u8,
-                (val >> 16) as u8,
-                (val >> 8) as u8,
-                val as u8,
-            ];
-            let out: Vec<u8> = if method.ends_with("BE") {
-                be.to_vec()
-            } else {
-                be.iter().rev().copied().collect()
-            };
-            let _ = &mut b;
-            store_bytes(recv, &bytes, off, &out)?;
-            Ok(Value::Float((off + 4) as f64))
         }
         // write(string[, offset[, length]][, encoding]) — returns bytes written.
         // `length` and `encoding` used to be ignored entirely: every write was
@@ -1529,6 +1551,147 @@ fn truncate_chars(s: &str, enc: &str, max: usize) -> Vec<u8> {
 ///     Attempt to access memory outside buffer bounds
 /// ```
 fn read_offset(args: &[Value], size: usize, len: usize) -> Result<usize, String> {
+    checked_offset(args.first(), size, len)
+}
+
+/// [`read_offset`] for a write, whose offset is the SECOND argument.
+/// The BigInt a `writeBigInt64*` / `writeBigUInt64*` stores: `checkInt`
+/// against the 64-bit range (a Number is compared too, as node's mixed `>`
+/// does), and then a non-BigInt is refused by the BigInt arithmetic that
+/// follows in node.
+fn big_write_value(v: &Value, signed: bool) -> Result<num_bigint::BigInt, String> {
+    use num_bigint::BigInt;
+    let (min, max_excl) = if signed {
+        (-(BigInt::from(1u8) << 63usize), BigInt::from(1u8) << 63usize)
+    } else {
+        (BigInt::from(0u8), BigInt::from(1u8) << 64usize)
+    };
+    let range = if signed {
+        ">= -(2n ** 63n) and < 2n ** 63n"
+    } else {
+        ">= 0n and < 2n ** 64n"
+    };
+    let out_of_range = |received: String| {
+        crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!("The value of \"value\" is out of range. It must be {range}. Received {received}"),
+        )
+    };
+    match with_host(|h| h.get(v).cloned()) {
+        Some(JsObj::BigInt(b)) => {
+            if b < min || b >= max_excl {
+                let mut shown = b.to_string();
+                if b.magnitude() > &num_bigint::BigUint::from(1u64 << 32) {
+                    shown = grouped_digits(&shown);
+                }
+                return Err(out_of_range(format!("{shown}n")));
+            }
+            Ok(b)
+        }
+        _ => {
+            let n = with_host(|h| h.to_number(v));
+            let (lo, hi) = if signed {
+                (-(2f64.powi(63)), 2f64.powi(63))
+            } else {
+                (0.0, 2f64.powi(64))
+            };
+            if n < lo || n >= hi {
+                return Err(out_of_range(out_of_range_received(n)));
+            }
+            Err(crate::host::type_error(
+                "Cannot mix BigInt and other types, use explicit conversions",
+            ))
+        }
+    }
+}
+
+/// `addNumericalSeparator`: `_` every three digits from the right.
+fn grouped_digits(shown: &str) -> String {
+    let start = usize::from(shown.starts_with('-'));
+    let mut i = shown.len();
+    let mut groups = String::new();
+    while i >= start + 4 {
+        groups = format!("_{}{groups}", &shown[i - 3..i]);
+        i -= 3;
+    }
+    format!("{}{groups}", &shown[..i])
+}
+
+fn write_offset(args: &[Value], size: usize, len: usize) -> Result<usize, String> {
+    checked_offset(args.get(1), size, len)
+}
+
+/// `checkInt`'s value test from `lib/internal/buffer.js`: `value` (already
+/// `+value`) must lie in `[min, max]`. `byte_len` is node's `byteLength`
+/// argument there — the width minus one — which picks between the literal
+/// bounds and the power-of-two spelling used past 32 bits.
+fn check_int_value(value: f64, min: f64, max: f64, byte_len: usize) -> Result<(), String> {
+    if !(value > max || value < min) {
+        return Ok(());
+    }
+    let range = if byte_len > 3 {
+        let bits = (byte_len + 1) * 8;
+        if min == 0.0 {
+            format!(">= 0 and < 2 ** {bits}")
+        } else {
+            format!(">= -(2 ** {}) and < 2 ** {}", bits - 1, bits - 1)
+        }
+    } else {
+        format!(
+            ">= {} and <= {}",
+            crate::host::fmt_number(min),
+            crate::host::fmt_number(max)
+        )
+    };
+    Err(crate::host::coded_error(
+        "RangeError",
+        "ERR_OUT_OF_RANGE",
+        &format!(
+            "The value of \"value\" is out of range. It must be {range}. Received {}",
+            out_of_range_received(value)
+        ),
+    ))
+}
+
+/// The `byteLength` of the variable-width `readIntLE`/`writeUIntBE` family:
+/// `validateNumber`, then node's `boundsError(byteLength, 6, 'byteLength')`.
+fn variable_byte_length(v: Option<&Value>) -> Result<usize, String> {
+    let v = v.cloned().unwrap_or(Value::Undef);
+    if with_host(|h| h.type_of(&v)) != "number" {
+        return Err(crate::host::invalid_arg_type("byteLength", "argument", "number", &v));
+    }
+    let n = with_host(|h| h.to_number(&v));
+    if n.fract() != 0.0 || n.is_nan() {
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!(
+                "The value of \"byteLength\" is out of range. It must be an integer. Received {}",
+                crate::host::fmt_number(n)
+            ),
+        ));
+    }
+    if !(1.0..=6.0).contains(&n) {
+        return Err(crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!(
+                "The value of \"byteLength\" is out of range. It must be >= 1 and <= 6. Received {}",
+                crate::host::fmt_number(n)
+            ),
+        ));
+    }
+    Ok(n as usize)
+}
+
+fn checked_offset(arg: Option<&Value>, size: usize, len: usize) -> Result<usize, String> {
+    // `validateNumber(offset, 'offset')`: a present non-number is a type error.
+    if let Some(v) = arg {
+        if !matches!(v, Value::Undef) && with_host(|h| h.type_of(v)) != "number" {
+            return Err(crate::host::invalid_arg_type("offset", "argument", "number", v));
+        }
+    }
     if len < size {
         return Err(crate::host::coded_error(
             "RangeError",
@@ -1537,9 +1700,9 @@ fn read_offset(args: &[Value], size: usize, len: usize) -> Result<usize, String>
         ));
     }
     let max = len - size;
-    let raw = match args.first() {
+    let raw = match arg {
         None | Some(Value::Undef) => 0.0,
-        Some(_) => super::arg_num(args, 0),
+        Some(v) => with_host(|h| h.to_number(v)),
     };
     // A non-integer offset is its own rejection, with a different tail than the
     // range one — `readUInt8(1.5)` is "It must be an integer", not a bound.

@@ -68,10 +68,30 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         // must still read back what was set — `setMaxListeners` used to discard
         // the value and `getMaxListeners` always answered the default 10.
         "setMaxListeners" => {
-            let n = args
-                .first()
-                .map(|v| with_host(|h| h.to_number(v)))
-                .unwrap_or(10.0);
+            // `validateNumber(n, 'setMaxListeners', 0)`.
+            let arg = args.first().cloned().unwrap_or(Value::Undef);
+            let n = match arg {
+                Value::Float(n) => n,
+                Value::Int(n) => n as f64,
+                _ => {
+                    return Err(crate::host::invalid_arg_type(
+                        "setMaxListeners",
+                        "argument",
+                        "number",
+                        &arg,
+                    ))
+                }
+            };
+            if n.is_nan() || n < 0.0 {
+                return Err(crate::host::coded_error(
+                    "RangeError",
+                    "ERR_OUT_OF_RANGE",
+                    &format!(
+                        "The value of \"setMaxListeners\" is out of range. It must be >= 0. Received {}",
+                        crate::host::fmt_number(n)
+                    ),
+                ));
+            }
             with_host(|h| {
                 let nv = Value::Float(n);
                 match h.get_mut(recv) {
@@ -92,6 +112,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             let prepend = method.starts_with("prepend");
             let name = event_key(&args);
             let f = args.get(1).cloned().unwrap_or(Value::Undef);
+            check_listener(&f)?;
             // `newListener` fires BEFORE the listener is added, so a handler for
             // it sees the emitter without the new listener and can add its own
             // ahead of it. It was never emitted at all.
@@ -116,6 +137,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         "removeListener" | "off" => {
             let name = event_key(&args);
             let f = args.get(1).cloned();
+            check_listener(&f.clone().unwrap_or(Value::Undef))?;
             let had = f
                 .as_ref()
                 .is_some_and(|f| listeners(recv, &name).iter().any(|l| l == f));
@@ -287,6 +309,14 @@ fn listeners(recv: &Value, name: &str) -> Vec<Value> {
     })
 }
 
+/// `checkListener`: every registration and removal refuses a non-function.
+fn check_listener(f: &Value) -> Result<(), String> {
+    if with_host(|h| crate::host::is_callable(h, f)) {
+        return Ok(());
+    }
+    Err(crate::host::invalid_arg_type("listener", "argument", "function", f))
+}
+
 fn emit(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let to_call = listeners(recv, name);
     // An `error` event with no listener THROWS rather than being dropped. This
@@ -294,12 +324,21 @@ fn emit(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // it turned every such failure into silence.
     if name == "error" && to_call.is_empty() {
         let err = args.first().cloned().unwrap_or(Value::Undef);
-        if matches!(err, Value::Undef) {
-            return Err(crate::host::plain_coded_error(
+        // Only an `Error` is thrown as itself; anything else is wrapped in
+        // ERR_UNHANDLED_ERROR quoting its inspection, with the value kept as
+        // `context` (lib/events.js).
+        let error_ctor = crate::builtins::global_binding("Error").unwrap_or(Value::Undef);
+        if !crate::host::instance_of(&err, &error_ctor).unwrap_or(false) {
+            let shown = crate::host::inspect_js(&err)?;
+            let msg = crate::host::coded_error(
                 "Error",
                 "ERR_UNHANDLED_ERROR",
-                "Unhandled error.",
-            ));
+                &format!("Unhandled error. ({shown})"),
+            );
+            let wrapped = with_host(|h| crate::builtins::synth_error(h, &msg));
+            crate::builtins::set_property_pub(&wrapped, "context", err)?;
+            with_host(|h| h.exc = Some(wrapped));
+            return Err(msg);
         }
         let msg = with_host(|h| {
             h.exc = Some(err.clone());
