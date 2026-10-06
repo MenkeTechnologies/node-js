@@ -8806,21 +8806,9 @@ fn json_stringify(args: Vec<Value>) -> Result<Value, String> {
     if with_host(|h| json_has_bigint(h, &v)) {
         return Err(host::type_error("Do not know how to serialize a BigInt"));
     }
-    let indent = match args.get(2) {
-        Some(Value::Float(f)) => " ".repeat((*f as usize).min(10)),
-        Some(other) => with_host(|h| h.as_str(other)).unwrap_or_default(),
-        None => String::new(),
-    };
-    // A replacer array (args[1]) restricts which object keys are serialized.
-    let keys: Option<Vec<String>> = args.get(1).and_then(|r| {
-        with_host(|h| match h.get(r) {
-            Some(JsObj::Array(items)) => {
-                Some(items.iter().map(|k| h.str_of(k)).collect::<Vec<_>>())
-            }
-            _ => None,
-        })
-    });
-    let s = with_host(|h| json_str(h, &v, &indent, 0, keys.as_deref()));
+    let indent = json_gap(args.get(2).cloned().unwrap_or(Value::Undef))?;
+    let keys = json_property_list(args.get(1).cloned().unwrap_or(Value::Undef))?;
+    let s = with_host(|h| json_str(h, &v, indent.as_deref(), 0, keys.as_deref()));
     match s {
         Some(s) => Ok(with_host(|h| h.new_str(s))),
         None => Ok(Value::Undef),
@@ -9057,11 +9045,11 @@ fn json_has_bigint(h: &host::JsHost, v: &Value) -> bool {
 fn json_str(
     h: &host::JsHost,
     v: &Value,
-    indent: &str,
+    indent: Option<&str>,
     depth: usize,
     keys: Option<&[String]>,
 ) -> Option<String> {
-    let sep = if indent.is_empty() { ":" } else { ": " };
+    let sep = if indent.is_none() { ":" } else { ": " };
     match v {
         Value::Undef => None,
         Value::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
@@ -9178,10 +9166,11 @@ fn json_str(
     }
 }
 
-fn wrap(parts: &[String], open: &str, close: &str, indent: &str, depth: usize) -> String {
-    if indent.is_empty() {
-        format!("{open}{}{close}", parts.join(","))
-    } else {
+fn wrap(parts: &[String], open: &str, close: &str, indent: Option<&str>, depth: usize) -> String {
+    let Some(indent) = indent else {
+        return format!("{open}{}{close}", parts.join(","));
+    };
+    {
         let pad = indent.repeat(depth + 1);
         let pad_close = indent.repeat(depth);
         format!(
@@ -15835,4 +15824,67 @@ fn f16_round(x: f64) -> f64 {
     let r = (a / quantum).round_ties_even() * quantum;
     let r = if r > 65504.0 { f64::INFINITY } else { r };
     r.copysign(x)
+}
+
+/// `JSON.stringify` steps 4.b: the PropertyList a replacer ARRAY selects. Only
+/// a String or Number element (primitive or wrapper) names a key, in
+/// `ToString` form; every other element is ignored, and a key already listed
+/// is not listed twice, so `["a", "a"]` emits `a` once. `IsArray` sees through
+/// a Proxy, and the elements are read with `[[Get]]`, so its traps run.
+fn json_property_list(replacer: Value) -> Result<Option<Vec<String>>, String> {
+    let subject = crate::proxy::ultimate_target(&replacer).unwrap_or_else(|| replacer.clone());
+    let is_array = with_host(|h| matches!(h.get(&subject), Some(JsObj::Array(_))))
+        && !is_arguments(&subject);
+    if !is_array || with_host(|h| host::is_callable(h, &replacer)) {
+        return Ok(None);
+    }
+    let len = host::to_number_value(&get_property(&replacer, "length")?)?;
+    let mut list: Vec<String> = Vec::new();
+    for i in 0..(len.max(0.0) as usize) {
+        let v = get_property(&replacer, &i.to_string())?;
+        let named = with_host(|h| {
+            h.as_str(&v).is_some()
+                || matches!(v, Value::Int(_) | Value::Float(_))
+                || matches!(h.get(&v), Some(JsObj::Object(p))
+                    if p.get("@@primitive").is_some_and(|p| {
+                        h.as_str(p).is_some() || matches!(p, Value::Int(_) | Value::Float(_))
+                    }))
+        });
+        if !named {
+            continue;
+        }
+        let item = host::to_string_value(&v)?;
+        let item = with_host(|h| h.str_of(&item));
+        if !list.contains(&item) {
+            list.push(item);
+        }
+    }
+    Ok(Some(list))
+}
+
+/// `JSON.stringify` steps 5-8: the indentation `gap`, or `None` for the compact
+/// form. A Number or String wrapper is unwrapped first; a string gives its
+/// first ten code units; a number gives that many spaces, at most ten.
+///
+/// The number arm follows V8 (`JsonStringifier::InitializeGap`) rather than
+/// the spec's `ToIntegerOrInfinity`-then-`< 1` test: V8 enables the multi-line
+/// form for ANY value above zero and truncates only afterwards, so
+/// `JSON.stringify({a: 1}, null, 0.5)` is `{\n"a": 1\n}` — line breaks with an
+/// empty indent — in node.
+fn json_gap(space: Value) -> Result<Option<String>, String> {
+    let space = match wrapped_primitive(&space) {
+        Some(p) if with_host(|h| h.as_str(&p).is_some()) => host::to_string_value(&space)?,
+        Some(p) if matches!(p, Value::Int(_) | Value::Float(_)) => {
+            Value::Float(host::to_number_value(&space)?)
+        }
+        _ => space,
+    };
+    if let Value::Int(_) | Value::Float(_) = space {
+        let n = with_host(|h| h.to_number(&space));
+        // `n > 0.0` is false for NaN, which V8's `std::min` also keeps.
+        return Ok((n > 0.0).then(|| " ".repeat(n.min(10.0) as usize)));
+    }
+    Ok(with_host(|h| h.as_str(&space))
+        .filter(|s| !s.is_empty())
+        .map(|s| crate::utf16::Units::of(&s).slice(0, 10)))
 }
