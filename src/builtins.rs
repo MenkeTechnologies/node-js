@@ -3067,10 +3067,7 @@ fn nullish_receiver_error(ctor: &str, method: &str, recv: &str) -> Option<String
         // The plain GETTERS and `valueOf` read `[[DateValue]]` directly and
         // report that slot check; every setter, every `to*String` and the two
         // legacy year methods go through the generic receiver check first.
-        "Date"
-            if method == "valueOf"
-                || (method.starts_with("get") && method != "getYear") =>
-        {
+        "Date" if method == "valueOf" || (method.starts_with("get") && method != "getYear") => {
             "this is not a Date object.".to_string()
         }
         // An ALIAS reports the method it aliases: `toGMTString` IS `toUTCString`
@@ -15875,8 +15872,8 @@ fn f16_round(x: f64) -> f64 {
 /// a Proxy, and the elements are read with `[[Get]]`, so its traps run.
 fn json_property_list(replacer: Value) -> Result<Option<Vec<String>>, String> {
     let subject = crate::proxy::ultimate_target(&replacer).unwrap_or_else(|| replacer.clone());
-    let is_array = with_host(|h| matches!(h.get(&subject), Some(JsObj::Array(_))))
-        && !is_arguments(&subject);
+    let is_array =
+        with_host(|h| matches!(h.get(&subject), Some(JsObj::Array(_)))) && !is_arguments(&subject);
     if !is_array || with_host(|h| host::is_callable(h, &replacer)) {
         return Ok(None);
     }
@@ -15888,9 +15885,9 @@ fn json_property_list(replacer: Value) -> Result<Option<Vec<String>>, String> {
             h.as_str(&v).is_some()
                 || matches!(v, Value::Int(_) | Value::Float(_))
                 || matches!(h.get(&v), Some(JsObj::Object(p))
-                    if p.get("@@primitive").is_some_and(|p| {
-                        h.as_str(p).is_some() || matches!(p, Value::Int(_) | Value::Float(_))
-                    }))
+                if p.get("@@primitive").is_some_and(|p| {
+                    h.as_str(p).is_some() || matches!(p, Value::Int(_) | Value::Float(_))
+                }))
         });
         if !named {
             continue;
