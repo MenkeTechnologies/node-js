@@ -769,19 +769,26 @@ fn from_js(v: &Value) -> (Url, Option<String>) {
 
 /// `url.format(urlObject)` — a string is re-parsed first, a `URL` instance uses
 /// its `href`, and anything else goes through `Url.prototype.format`.
-pub fn format_value(v: &Value) -> Result<Value, String> {
+pub fn format_value(v: &Value, options: &Value) -> Result<Value, String> {
     if let Some(s) = with_host(|h| h.as_str(v)) {
         let u = parse(&s, false, false)?;
         let out = format_url(&u, None);
         return Ok(with_host(|h| h.new_str(out)));
     }
-    // A WHATWG `URL` instance formats to its `href`.
+    // A WHATWG `URL` instance formats from its `href`, minus whatever the
+    // options turn off (`auth`, `fragment`, `search`) and with the host in
+    // Unicode under `unicode` — node's `bindingUrl.format`.
     let href = with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) if p.get("@@native").is_some() => p.get("href").map(|x| h.str_of(x)),
+        Some(JsObj::Object(p))
+            if p.get("@@native").map(|t| h.str_of(t)).as_deref() == Some("URL") =>
+        {
+            p.get("@@href").map(|x| h.str_of(x))
+        }
         _ => None,
     });
     if let Some(href) = href {
-        return Ok(with_host(|h| h.new_str(href)));
+        let out = format_whatwg(&href, options);
+        return Ok(with_host(|h| h.new_str(out)));
     }
     let is_obj = with_host(|h| matches!(h.get(v), Some(JsObj::Object(_))));
     if !is_obj {
@@ -794,6 +801,46 @@ pub fn format_value(v: &Value) -> Result<Value, String> {
     let (u, qs) = from_js(v);
     let out = format_url(&u, qs.as_deref());
     Ok(with_host(|h| h.new_str(out)))
+}
+
+/// `url.format(URL, { auth, fragment, search, unicode })`. Each flag defaults
+/// to node's (`true`, `true`, `true`, `false`) and is read with `Boolean()`
+/// when not nullish.
+fn format_whatwg(href: &str, options: &Value) -> String {
+    let flag = |name: &str, default: bool| {
+        let v = crate::builtins::get_property(options, name).unwrap_or(Value::Undef);
+        with_host(|h| if h.is_nullish(&v) { default } else { h.truthy(&v) })
+    };
+    let has_options = with_host(|h| !h.is_nullish(options));
+    let (auth, fragment, search, unicode) = if has_options {
+        (flag("auth", true), flag("fragment", true), flag("search", true), flag("unicode", false))
+    } else {
+        (true, true, true, false)
+    };
+    let Ok(mut u) = url::Url::parse(href) else {
+        return href.to_string();
+    };
+    if !auth {
+        let _ = u.set_username("");
+        let _ = u.set_password(None);
+    }
+    if !fragment {
+        u.set_fragment(None);
+    }
+    if !search {
+        u.set_query(None);
+    }
+    match u.host() {
+        Some(url::Host::Domain(d)) if unicode => {
+            let shown = url::quirks::domain_to_unicode(d);
+            format!(
+                "{}{shown}{}",
+                &u[..url::Position::BeforeHost],
+                &u[url::Position::AfterHost..]
+            )
+        }
+        _ => u.as_str().to_string(),
+    }
 }
 
 // ── Url.prototype.resolveObject ──────────────────────────────────────────────

@@ -747,15 +747,12 @@ pub fn instance_members_enumerable(tag: &str) -> bool {
     )
 }
 
-pub fn instance_accessor_written(tag: &str, key: &str, recv: &Value) {
+pub fn instance_accessor_written(tag: &str, key: &str, recv: &Value, value: &Value) -> Result<(), String> {
+    // A URL component goes through the URL Standard's setter for it.
     if tag == "URL" {
-        // `href` is the whole URL, not a field of it, and `host` is two fields.
-        match key {
-            "href" => url::reparse(recv),
-            "host" => url::split_host(recv),
-            _ => url::refresh(recv),
-        }
+        return url::set_component(recv, key, value);
     }
+    Ok(())
 }
 
 pub fn instance_accessors(tag: &str) -> (&'static [(&'static str, bool)], &'static str) {

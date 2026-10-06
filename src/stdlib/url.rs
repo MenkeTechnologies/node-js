@@ -1,14 +1,11 @@
 //! Node `url` module: the WHATWG `URL` class (global + `require('url').URL`) and
-//! the legacy `url.parse`. A `URL` instance stores its components as data
-//! properties (so `u.hostname` reads directly) plus a `@@native = "URL"` tag for
-//! `toString`. Assigning one of those components goes through [`refresh`], which
-//! rewrites the DERIVED fields (`href`, `host`, `origin`) so the object cannot
-//! disagree with itself; the `searchParams` it carries holds an `@@ownerUrl`
-//! back-reference so its own mutations rewrite the query in the other direction.
-//!
-//! They remain OWN properties of the instance, where node has them as accessors
-//! on `URL.prototype` — so `Object.keys(url)` lists twelve names here and none
-//! in node.
+//! the legacy `url.parse`. Parsing and the component setters are the URL
+//! Standard's, through the `url` crate (its basic URL parser and `quirks`
+//! setters). A `URL` instance keeps each component in a hidden `@@<name>` slot
+//! read by the accessors on `URL.prototype`; a setter rewrites every slot from
+//! the re-serialized URL ([`set_component`]), and the `searchParams` it carries
+//! holds an `@@ownerUrl` back-reference so its own mutations rewrite the query
+//! in the other direction.
 
 use super::arg_str;
 use crate::host::{with_host, JsObj};
@@ -51,51 +48,91 @@ pub fn is_component(name: &str) -> bool {
     COMPONENTS.contains(&name)
 }
 
-/// Recompute `href`, `host` and `origin` from the component properties now on
-/// `url`, and normalise the two components that carry a leading delimiter.
-///
-/// `sync_params` rewrites the attached `searchParams` from the new query. It is
-/// false when the caller IS that `searchParams` object pushing its own edit
-/// back, which would otherwise recurse.
-fn recompute(url: &Value, sync_params: bool) {
-    let read = |k: &str| {
-        with_host(|h| match h.get(url) {
-            Some(JsObj::Object(p)) => p.get(k).map(|v| h.str_of(v)).unwrap_or_default(),
-            _ => String::new(),
-        })
+/// The components a URL's parse produced, as the getters report them.
+fn parts_of(u: &url::Url) -> Parts {
+    let delimited = |lead: char, s: Option<&str>| match s {
+        Some(s) if !s.is_empty() => format!("{lead}{s}"),
+        _ => String::new(),
     };
-    let mut protocol = read("@@protocol");
-    if !protocol.is_empty() && !protocol.ends_with(':') {
-        protocol.push(':');
+    Parts {
+        protocol: format!("{}:", u.scheme()),
+        username: u.username().to_string(),
+        password: u.password().unwrap_or("").to_string(),
+        hostname: u.host_str().unwrap_or("").to_string(),
+        port: u.port().map(|p| p.to_string()).unwrap_or_default(),
+        pathname: u.path().to_string(),
+        search: delimited('?', u.query()),
+        hash: delimited('#', u.fragment()),
+        authority: u.has_authority(),
+        href: Some(u.as_str().to_string()),
     }
-    // A search or hash assigned without its delimiter gains one; assigning the
-    // empty string clears it, as the WHATWG setters do.
-    let delimited = |s: String, lead: char| {
-        if s.is_empty() || s.starts_with(lead) {
-            s
-        } else {
-            format!("{lead}{s}")
+}
+
+/// Assign one `URL` component through the URL Standard's setter for it — the
+/// state-override parse `url::quirks` implements — and rewrite every stored
+/// field from the result. A value the setter rejects leaves the URL as it was
+/// (`u.port = 'abc'`), as in node; only `href` throws, since it reparses the
+/// whole URL.
+pub fn set_component(url_obj: &Value, key: &str, v: &Value) -> Result<(), String> {
+    let value = crate::host::to_string_value(v).map(|s| with_host(|h| h.str_of(&s)))?;
+    let href = read_slot(url_obj, "@@href");
+    let Ok(mut u) = url::Url::parse(&href) else {
+        return Ok(());
+    };
+    use url::quirks;
+    match key {
+        "href" => {
+            u = url::Url::parse(&value).map_err(|_| {
+                crate::host::plain_coded_error_with(
+                    "TypeError",
+                    "ERR_INVALID_URL",
+                    "Invalid URL",
+                    &[("input", value.as_str())],
+                )
+            })?;
         }
-    };
-    let parts = Parts {
-        protocol,
-        username: read("@@username"),
-        password: read("@@password"),
-        hostname: read("@@hostname"),
-        port: read("@@port"),
-        pathname: read("@@pathname"),
-        search: delimited(read("@@search"), '?'),
-        hash: delimited(read("@@hash"), '#'),
-    };
-    let (href, host, origin) = (parts.href(), parts.host(), parts.origin());
-    let search = parts.search.clone();
+        "protocol" => {
+            let _ = quirks::set_protocol(&mut u, &value);
+        }
+        "username" => {
+            let _ = quirks::set_username(&mut u, &value);
+        }
+        "password" => {
+            let _ = quirks::set_password(&mut u, &value);
+        }
+        "host" => {
+            let _ = quirks::set_host(&mut u, &value);
+        }
+        "hostname" => {
+            let _ = quirks::set_hostname(&mut u, &value);
+        }
+        "port" => {
+            let _ = quirks::set_port(&mut u, &value);
+        }
+        "pathname" => quirks::set_pathname(&mut u, &value),
+        "search" => quirks::set_search(&mut u, &value),
+        "hash" => quirks::set_hash(&mut u, &value),
+        _ => return Ok(()),
+    }
+    store_parts(url_obj, &parts_of(&u), true);
+    Ok(())
+}
+
+fn read_slot(obj: &Value, key: &str) -> String {
+    with_host(|h| match h.get(obj) {
+        Some(JsObj::Object(p)) => p.get(key).map(|v| h.str_of(v)).unwrap_or_default(),
+        _ => String::new(),
+    })
+}
+
+/// Write every component of `p` into the URL's hidden slots. `sync_params`
+/// rewrites the attached `URLSearchParams` IN PLACE (one object per URL for its
+/// life); it is false when that object is the one pushing its own edit back.
+fn store_parts(url_obj: &Value, p: &Parts, sync_params: bool) {
     if sync_params {
-        // The attached `searchParams` is updated IN PLACE: node hands out one
-        // object per URL for the life of the URL, so `u.searchParams` before and
-        // after `u.search = …` is the same object.
-        let query = search.strip_prefix('?').unwrap_or(&search).to_string();
-        let params = with_host(|h| match h.get(url) {
-            Some(JsObj::Object(p)) => p.get("@@searchParams").cloned(),
+        let query = p.search.strip_prefix('?').unwrap_or(&p.search).to_string();
+        let params = with_host(|h| match h.get(url_obj) {
+            Some(JsObj::Object(o)) => o.get("@@searchParams").cloned(),
             _ => None,
         });
         if let Some(params) = params {
@@ -104,82 +141,22 @@ fn recompute(url: &Value, sync_params: bool) {
     }
     with_host(|h| {
         let vals = [
-            ("@@href", h.new_str(href)),
-            ("@@host", h.new_str(host)),
-            ("@@origin", h.new_str(origin)),
-            ("@@protocol", h.new_str(parts.protocol.clone())),
-            ("@@search", h.new_str(search)),
-            ("@@hash", h.new_str(parts.hash.clone())),
+            ("@@href", h.new_str(p.href())),
+            ("@@origin", h.new_str(p.origin())),
+            ("@@protocol", h.new_str(p.protocol.clone())),
+            ("@@username", h.new_str(p.username.clone())),
+            ("@@password", h.new_str(p.password.clone())),
+            ("@@host", h.new_str(p.host())),
+            ("@@hostname", h.new_str(p.hostname.clone())),
+            ("@@port", h.new_str(p.port.clone())),
+            ("@@pathname", h.new_str(p.pathname.clone())),
+            ("@@search", h.new_str(p.search.clone())),
+            ("@@hash", h.new_str(p.hash.clone())),
+            ("@@authority", h.new_str(if p.authority { "true" } else { "false" })),
         ];
-        if let Some(JsObj::Object(p)) = h.get_mut(url) {
+        if let Some(JsObj::Object(o)) = h.get_mut(url_obj) {
             for (k, v) in vals {
-                p.insert(k.to_string(), v);
-            }
-        }
-    });
-}
-
-/// Refresh a `URL` after one of its components was assigned.
-pub fn refresh(url: &Value) {
-    recompute(url, true);
-}
-
-/// Split the `host` just assigned to `url` into the `hostname` and `port` it
-/// actually carries.
-///
-/// `host` is DERIVED from those two on every refresh, so writing it as one
-/// string was undone immediately: `u.host = 'b:99'` left the URL pointing at
-/// the old host entirely.
-pub fn split_host(url: &Value) {
-    let host = with_host(|h| match h.get(url) {
-        Some(JsObj::Object(p)) => p.get("@@host").map(|v| h.str_of(v)).unwrap_or_default(),
-        _ => String::new(),
-    });
-    // An IPv6 literal keeps its brackets; the port is whatever follows the LAST
-    // colon outside them.
-    let split = match host.rfind(']') {
-        Some(i) => host[i..].find(':').map(|j| i + j),
-        None => host.rfind(':'),
-    };
-    let (hostname, port) = match split {
-        Some(i) => (host[..i].to_string(), host[i + 1..].to_string()),
-        None => (host.clone(), String::new()),
-    };
-    with_host(|h| {
-        let (hn, pt) = (h.new_str(hostname), h.new_str(port));
-        if let Some(JsObj::Object(p)) = h.get_mut(url) {
-            p.insert("@@hostname".into(), hn);
-            p.insert("@@port".into(), pt);
-        }
-    });
-    refresh(url);
-}
-
-/// Re-parse `url` from the `href` just assigned to it.
-///
-/// `href` is not a component: it is the WHOLE URL, so setting it replaces every
-/// other field. Treating it as one more stored string left `u.host` and
-/// `u.pathname` reporting the old URL's values while `u.href` showed the new
-/// one. An unparseable value is ignored, which is what node does — its `href`
-/// setter throws only for a value no parser can accept, and this parser is the
-/// one deciding that.
-pub fn reparse(url: &Value) {
-    let href = with_host(|h| match h.get(url) {
-        Some(JsObj::Object(p)) => p.get("@@href").map(|v| h.str_of(v)).unwrap_or_default(),
-        _ => String::new(),
-    });
-    let Some(parts) = parse_absolute(&href) else {
-        return;
-    };
-    let fresh = build(&parts);
-    let props = with_host(|h| match h.get(&fresh) {
-        Some(JsObj::Object(p)) => p.clone(),
-        _ => IndexMap::new(),
-    });
-    with_host(|h| {
-        if let Some(JsObj::Object(p)) = h.get_mut(url) {
-            for (k, v) in props {
-                p.insert(k, v);
+                o.insert(k.to_string(), v);
             }
         }
     });
@@ -194,6 +171,12 @@ struct Parts {
     pathname: String,
     search: String,
     hash: String,
+    /// Whether the URL has an authority (`//`): an opaque-path URL such as
+    /// `mailto:a@b` has none and serializes without the slashes.
+    authority: bool,
+    /// The parser's own serialization, when the parts came from it; setters
+    /// re-serialize from the components instead.
+    href: Option<String>,
 }
 
 impl Parts {
@@ -205,6 +188,16 @@ impl Parts {
         }
     }
     fn origin(&self) -> String {
+        // A `blob:` URL's origin is that of the URL in its path, when that one
+        // is http(s) (URL Standard, "origin" for scheme `blob`).
+        if self.protocol == "blob:" {
+            return match url::Url::parse(&self.pathname) {
+                Ok(inner) if matches!(inner.scheme(), "http" | "https") => {
+                    inner.origin().ascii_serialization()
+                }
+                _ => "null".into(),
+            };
+        }
         // Only a special scheme with a network host has a tuple origin; every
         // other URL (`foo://h/`, `redis://h:1/`, `file:///x`) is opaque: `null`.
         let scheme = self.protocol.strip_suffix(':').unwrap_or(&self.protocol);
@@ -215,6 +208,15 @@ impl Parts {
         }
     }
     fn href(&self) -> String {
+        if let Some(h) = &self.href {
+            return h.clone();
+        }
+        if !self.authority && self.hostname.is_empty() {
+            // The URL Standard's serializer: no host, so no `//`; a path that
+            // would then read as one gets the `/.` prefix.
+            let dot = if self.pathname.starts_with("//") { "/." } else { "" };
+            return format!("{}{dot}{}{}{}", self.protocol, self.pathname, self.search, self.hash);
+        }
         let auth = if self.username.is_empty() {
             String::new()
         } else if self.password.is_empty() {
@@ -244,185 +246,20 @@ fn special_port(scheme: &str) -> Option<&'static str> {
     }
 }
 
-/// Parse an absolute URL. Returns `None` if there is no `scheme://`.
-fn parse_absolute(input: &str) -> Option<Parts> {
-    // The URL parser REMOVES every tab and newline from the input before doing
-    // anything else, rather than treating them as content. They were surviving
-    // into the components and then being percent-encoded.
-    let stripped: String;
-    let input = if input.contains(['\t', '\n', '\r']) {
-        stripped = input.replace(['\t', '\n', '\r'], "");
-        stripped.as_str()
-    } else {
-        input
+/// The WHATWG URL parser (`url` crate, an implementation of the URL Standard's
+/// basic URL parser) over `input`, resolved against `base` when one is given.
+///
+/// Replaces a hand-rolled split on `://` that knew nothing of opaque paths
+/// (`mailto:a@b`, `data:…`, `x:` were all `Invalid URL`), scheme-relative input
+/// (`//h/p` was appended to the base's path), a base's query surviving a
+/// fragment-only reference, or a same-scheme `http:foo` reference.
+fn parse_whatwg(input: &str, base: Option<&str>) -> Option<Parts> {
+    let base = match base {
+        Some(b) => Some(url::Url::parse(b).ok()?),
+        None => None,
     };
-    let (scheme, rest) = input.split_once("://")?;
-    // For a special scheme a backslash is a path separator, not a character —
-    // in the AUTHORITY too, where it terminates the userinfo. It is NOT one in
-    // the query or fragment, where node keeps it literal, so the rewrite stops
-    // at whichever of `?`/`#` comes first.
-    let backslashed: String;
-    let rest = if special_port(&scheme.to_ascii_lowercase()).is_some() && rest.contains('\\') {
-        let cut = rest.find(['?', '#']).unwrap_or(rest.len());
-        backslashed = format!("{}{}", rest[..cut].replace('\\', "/"), &rest[cut..]);
-        backslashed.as_str()
-    } else {
-        rest
-    };
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    {
-        return None;
-    }
-    // A special scheme ignores any further slashes before the authority
-    // ("special authority ignore slashes state"): `http:///a` is `http://a/`.
-    let rest = if special_port(&scheme.to_ascii_lowercase()).is_some() {
-        rest.trim_start_matches('/')
-    } else {
-        rest
-    };
-    // authority is up to the first '/', '?' or '#'.
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..auth_end];
-    let mut tail = &rest[auth_end..];
-
-    let (userinfo, hostport) = match authority.rsplit_once('@') {
-        Some((u, h)) => (u, h),
-        None => ("", authority),
-    };
-    let (username, password) = match userinfo.split_once(':') {
-        Some((u, p)) => (u.to_string(), p.to_string()),
-        None => (userinfo.to_string(), String::new()),
-    };
-    // An IPv6 literal carries colons of its own: the port separator is the
-    // first colon AFTER its closing bracket, and nothing else may sit there.
-    let (hostname, port) = if hostport.starts_with('[') {
-        let close = hostport.find(']')?;
-        match &hostport[close + 1..] {
-            "" => (&hostport[..=close], ""),
-            p => (&hostport[..=close], p.strip_prefix(':')?),
-        }
-    } else {
-        hostport.split_once(':').unwrap_or((hostport, ""))
-    };
-    let lower_scheme = scheme.to_ascii_lowercase();
-    let special = special_port(&lower_scheme).is_some();
-    // The host parser: a special scheme's host is a domain (percent-decoded,
-    // mapped to ASCII, and checked for forbidden code points), an IPv4 address
-    // in any of its number forms, or a bracketed IPv6 address, each serialized
-    // canonically — `http://0x7f.1/` is `http://127.0.0.1/`, and `http://a b/`
-    // is no URL at all. Any other scheme's host is opaque and only checked.
-    let hostname = if special {
-        if hostname.is_empty() {
-            return None;
-        }
-        url::Host::parse(hostname).ok()?.to_string()
-    } else if hostname.is_empty() {
-        String::new()
-    } else {
-        url::Host::parse_opaque(hostname).ok()?.to_string()
-    };
-    // A port is digits only and at most 65535, serialized without leading
-    // zeros; an empty port after the colon is the same as none.
-    let port = if port.is_empty() {
-        String::new()
-    } else if port.bytes().all(|b| b.is_ascii_digit()) {
-        port.trim_start_matches('0').parse::<u16>().map_or_else(
-            |_| {
-                if port.bytes().all(|b| b == b'0') {
-                    Some("0".to_string())
-                } else {
-                    None
-                }
-            },
-            |n| Some(n.to_string()),
-        )?
-    } else {
-        return None;
-    };
-
-    let hash = match tail.find('#') {
-        Some(i) => {
-            let h = tail[i..].to_string();
-            tail = &tail[..i];
-            h
-        }
-        None => String::new(),
-    };
-    let search = match tail.find('?') {
-        Some(i) => {
-            let s = tail[i..].to_string();
-            tail = &tail[..i];
-            s
-        }
-        None => String::new(),
-    };
-    // A scheme is case-insensitive and reported lower-case.
-    let scheme = scheme.to_ascii_lowercase();
-    let default_port = special_port(&scheme);
-    let pathname = if tail.is_empty() {
-        "/".to_string()
-    } else {
-        normalize_path(tail)
-    };
-    // The scheme's default port is not part of the serialization.
-    let port = if default_port == Some(port.as_str()) {
-        String::new()
-    } else {
-        port
-    };
-
-    Some(Parts {
-        protocol: format!("{scheme}:"),
-        username,
-        password,
-        hostname,
-        port,
-        pathname,
-        search,
-        hash,
-    })
-}
-
-/// Collapse `.` and `..` segments in an absolute-ish URL path, per the WHATWG
-/// URL path-state machine: `.` drops, `..` pops the previous segment (never past
-/// the root), and a trailing `.`/`..` leaves a trailing slash
-/// (`/a/b/../../../c` → `/c`, `/a/b/..` → `/a/`).
-fn normalize_path(path: &str) -> String {
-    if !path.contains('.') {
-        return path.to_string();
-    }
-    let rooted = path.starts_with('/');
-    let mut out: Vec<&str> = Vec::new();
-    let mut trailing_slash = false;
-    for seg in path.split('/') {
-        match seg {
-            "." => trailing_slash = true,
-            ".." => {
-                out.pop();
-                trailing_slash = true;
-            }
-            _ => {
-                out.push(seg);
-                trailing_slash = false;
-            }
-        }
-    }
-    // `split` on a rooted path yields a leading "" that rebuilds the root slash;
-    // a `..` may have popped it, so restore it.
-    if rooted && out.first() != Some(&"") {
-        out.insert(0, "");
-    }
-    let mut joined = out.join("/");
-    if trailing_slash && !joined.ends_with('/') {
-        joined.push('/');
-    }
-    if joined.is_empty() {
-        joined.push('/');
-    }
-    joined
+    let u = url::Url::options().base_url(base.as_ref()).parse(input).ok()?;
+    Some(parts_of(&u))
 }
 
 /// `new URL(input[, base])`.
@@ -441,52 +278,7 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
         Some(Value::Undef) | None => None,
         Some(v) => Some(to_str(v)?),
     };
-    let parts = parse_absolute(&input)
-        .or_else(|| {
-            // A base makes a relative input absolute (path replacement only).
-            if let Some(base) = &base {
-                parse_absolute(base).map(|mut b| {
-                    // Split the RELATIVE reference's own query/fragment off first;
-                    // they replace the base's, they do not append to its path.
-                    let mut rest = input.as_str();
-                    let hash = match rest.find('#') {
-                        Some(i) => {
-                            let h = rest[i..].to_string();
-                            rest = &rest[..i];
-                            h
-                        }
-                        None => String::new(),
-                    };
-                    let search = match rest.find('?') {
-                        Some(i) => {
-                            let q = rest[i..].to_string();
-                            rest = &rest[..i];
-                            q
-                        }
-                        None => String::new(),
-                    };
-                    // A rooted reference replaces the path; anything else resolves
-                    // against the base's DIRECTORY (everything up to its last `/`).
-                    let merged = if rest.starts_with('/') {
-                        rest.to_string()
-                    } else if rest.is_empty() {
-                        b.pathname.clone()
-                    } else {
-                        let dir = match b.pathname.rfind('/') {
-                            Some(i) => &b.pathname[..=i],
-                            None => "/",
-                        };
-                        format!("{dir}{rest}")
-                    };
-                    b.pathname = normalize_path(&merged);
-                    b.search = search;
-                    b.hash = hash;
-                    b
-                })
-            } else {
-                None
-            }
-        })
+    let parts = parse_whatwg(&input, base.as_deref())
         // Node's message is the bare `Invalid URL` and it carries
         // `code === 'ERR_INVALID_URL'`; the input is exposed as `err.input`, not
         // appended to the text. `url_legacy::invalid_url` was already emitting
@@ -567,6 +359,8 @@ fn build(p: &Parts) -> Value {
         pathname: percent_encode(&p.pathname, PATH_SET),
         search: percent_encode(&p.search, QUERY_SET),
         hash: percent_encode(&p.hash, FRAGMENT_SET),
+        authority: p.authority,
+        href: p.href.clone(),
     };
     // Build the `URLSearchParams` BEFORE the allocating `with_host` below (never
     // nest `with_host`); it is stored as the `searchParams` data property so
@@ -590,6 +384,7 @@ fn build(p: &Parts) -> Value {
         m.insert("@@search".into(), h.new_str(p.search.clone()));
         m.insert("@@searchParams".into(), search_params.clone());
         m.insert("@@hash".into(), h.new_str(p.hash.clone()));
+        m.insert("@@authority".into(), h.new_str(if p.authority { "true" } else { "false" }));
         let obj = h.new_object(m);
         // Hidden, and set after the URL exists so the two can point at each other.
         if let Some(JsObj::Object(sp)) = h.get_mut(&search_params) {
@@ -623,7 +418,10 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "parse" => legacy_parse(args).map(|u| super::url_legacy::to_js(&u)),
-        "format" => super::url_legacy::format_value(&args.first().cloned().unwrap_or(Value::Undef)),
+        "format" => super::url_legacy::format_value(
+            &args.first().cloned().unwrap_or(Value::Undef),
+            &args.get(1).cloned().unwrap_or(Value::Undef),
+        ),
         // `url.fileURLToPath(url)` — a `file:` URL/string → a filesystem path
         // (percent-decoded). POSIX best-effort: any authority (host) is accepted
         // but not re-prefixed; Windows drive/UNC rewriting is not modeled.
@@ -759,6 +557,8 @@ fn path_to_file_url(path: &str) -> Value {
         pathname,
         search: String::new(),
         hash: String::new(),
+        authority: true,
+        href: None,
     };
     build(&parts)
 }
@@ -980,19 +780,14 @@ fn set_pairs(recv: &Value, pairs: &[(String, String)]) {
         Some(JsObj::Object(p)) => p.get("@@ownerUrl").cloned(),
         _ => None,
     });
+    // URL Standard "update": the owner's query becomes the serialization,
+    // or null when there are no pairs.
     if let Some(owner) = owner {
         let query = encode_query(pairs);
-        with_host(|h| {
-            let s = h.new_str(if query.is_empty() {
-                String::new()
-            } else {
-                format!("?{query}")
-            });
-            if let Some(JsObj::Object(p)) = h.get_mut(&owner) {
-                p.insert("@@search".into(), s);
-            }
-        });
-        recompute(&owner, false);
+        if let Ok(mut u) = url::Url::parse(&read_slot(&owner, "@@href")) {
+            u.set_query(if query.is_empty() { None } else { Some(&query) });
+            store_parts(&owner, &parts_of(&u), false);
+        }
     }
 }
 

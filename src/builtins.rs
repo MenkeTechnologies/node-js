@@ -3152,12 +3152,16 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     }
     if let Some(key) = method.strip_prefix("@set@") {
         let v = args.first().cloned().unwrap_or(Value::Undef);
+        if ctor == "URL" {
+            crate::stdlib::instance_accessor_written(ctor, key, recv, &v)?;
+            return Ok(Value::Undef);
+        }
         with_host(|h| {
             if let Some(JsObj::Object(p)) = h.get_mut(recv) {
-                p.insert(format!("@@{key}"), v);
+                p.insert(format!("@@{key}"), v.clone());
             }
         });
-        crate::stdlib::instance_accessor_written(ctor, key, recv);
+        crate::stdlib::instance_accessor_written(ctor, key, recv, &v)?;
         return Ok(Value::Undef);
     }
     if with_host(|h| h.is_nullish(recv)) {
@@ -4174,7 +4178,8 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     // carries all-true attributes, which is why only the former broke.
     if let Some((getter, setter)) = with_host(|h| host::lookup_accessor(h, recv, name)) {
         if let Some(setter) = setter {
-            let _ = host::invoke(&setter, vec![val], Some(recv.clone()));
+            // A setter that throws propagates out of the assignment.
+            host::invoke(&setter, vec![val], Some(recv.clone()))?;
             return Ok(());
         }
         // Only a getter: the write is refused — silent in sloppy mode, a
