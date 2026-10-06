@@ -2556,6 +2556,11 @@ and `examples/dates.js`.
   so the custom methods in the subtree it will expand now run in a pre-pass
   with node's `(depth, options, inspect)` arguments, and the walk substitutes
   each answer (`parity-scripts/stdlib/39_inspect_custom.js`).
+- **`inspect` ignored `numericSeparator`, `maxStringLength`, `getters` and
+  `showProxy`,** and printed a RegExp's own properties as nothing. Getter values
+  are read in the same pre-pass as custom inspect methods
+  (`parity-scripts/stdlib/40_inspect_options.js`). A getter that throws prints
+  this runtime's `stack`, whose frames differ from node's.
 - **`util.format` swallowed throws.** `%j` on a BigInt and `%d`/`%i`/`%f` on a
   value whose coercion reaches a Symbol are TypeErrors in node; each printed
   `undefined` or `NaN`. `parseInt`/`parseFloat` had the same root cause — they

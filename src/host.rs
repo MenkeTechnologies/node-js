@@ -4356,31 +4356,67 @@ impl JsHost {
         match v {
             Value::Undef => "undefined".into(),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
-            Value::Int(n) => n.to_string(),
+            Value::Int(n) => inspect_number(n.to_string()),
             // `util.inspect` distinguishes negative zero; `String(-0)` does not.
             Value::Float(f) if *f == 0.0 && f.is_sign_negative() => "-0".into(),
-            Value::Float(f) => fmt_number(*f),
-            Value::Str(s) => quote_str(s),
+            Value::Float(f) => inspect_number(fmt_number(*f)),
+            Value::Str(s) => inspect_string(s),
             Value::Obj(_) => match self.get(v) {
-                Some(JsObj::Str(s)) => quote_str(s),
+                Some(JsObj::Str(s)) => inspect_string(s),
                 Some(JsObj::Null) => "null".into(),
                 // `util.inspect` renders a bigint with the `n` suffix, a regex bare.
-                Some(JsObj::BigInt(b)) => format!("{b}n"),
+                Some(JsObj::BigInt(b)) => format!("{}n", inspect_number(b.to_string())),
                 // `lastIndex` is a non-enumerable own property of every regex,
                 // so `showHidden` (and therefore `%o`) appends it:
                 // `/x/g { [lastIndex]: 0 }`.
+                // Own enumerable properties a script added follow the literal:
+                // `/x/g { y: 2 }`.
                 Some(JsObj::RegExp(r)) => {
                     let body = format!("/{}/{}", r.source, r.flags);
+                    let mut inner: Vec<String> = Vec::new();
                     if inspect_show_hidden() {
-                        format!("{body} {{ [lastIndex]: {} }}", r.last_index.get())
-                    } else {
-                        body
+                        inner.push(format!("[lastIndex]: {}", r.last_index.get()));
                     }
+                    for k in self.fn_prop_keys(v) {
+                        if k.starts_with("@@") || k.starts_with('#') || !self.prop_attrs(v, &k).enumerable {
+                            continue;
+                        }
+                        let val = self.fn_prop(v, &k).unwrap_or(Value::Undef);
+                        inner.push(format!("{}: {}", fmt_key(&k), self.inspect_lvl(&val, indent + 2, st)));
+                    }
+                    if inner.is_empty() {
+                        return body;
+                    }
+                    if indent as i64 > inspect_indent_limit() {
+                        return "[RegExp]".into();
+                    }
+                    self.render_object(&inner, &format!("{body} "), indent, st)
                 }
                 // `util.inspect` on node v26.7.0 renders a proxy as
                 // `Proxy(<target>)` — the target's own rendering, wrapped. It
                 // deliberately does NOT run the handler's traps, so this stays a
                 // pure `&self` read like every other inspect arm.
+                // `showProxy` (and `%o`) shows both halves: `Proxy [ target, handler ]`.
+                Some(JsObj::Proxy { target, handler, .. }) if inspect_show_proxy() => {
+                    if indent as i64 > inspect_indent_limit() {
+                        return "Proxy [Array]".into();
+                    }
+                    let inner = vec![
+                        self.inspect_lvl(target, indent + 2, st),
+                        self.inspect_lvl(handler, indent + 2, st),
+                    ];
+                    self.render_array(
+                        &inner,
+                        &[target.clone(), handler.clone()],
+                        indent,
+                        ArrayLayout {
+                            has_props: false,
+                            has_tail: false,
+                            base: "Proxy ",
+                        },
+                        st,
+                    )
+                }
                 Some(JsObj::Proxy { target, .. }) => {
                     format!("Proxy({})", self.inspect_lvl(target, indent, st))
                 }
@@ -4896,7 +4932,7 @@ impl JsHost {
                     } else {
                         prefix
                     };
-                    let mut shown: Vec<(String, Result<&Value, &'static str>)> = view_fields
+                    let mut shown: Vec<(String, Result<&Value, AccessorShown>)> = view_fields
                         .iter()
                         .filter_map(|k| props.get(*k).map(|val| (format!("[{k}]"), Ok(val))))
                         .collect();
@@ -4906,12 +4942,14 @@ impl JsHost {
                             Some(real) => {
                                 let attrs = self.prop_attrs(v, real);
                                 let label = match self.own_accessor(v, real)? {
-                                    (Some(_), Some(_)) => "[Getter/Setter]",
-                                    (Some(_), None) => "[Getter]",
-                                    (None, Some(_)) => "[Setter]",
+                                    (Some(_), Some(_)) => "Getter/Setter",
+                                    (Some(_), None) => "Getter",
+                                    (None, Some(_)) => "Setter",
                                     (None, None) => return None,
                                 };
-                                attrs.enumerable.then(|| (fmt_key(real), Err(label)))
+                                // Under `getters`, the value the pre-pass read.
+                                let read = getter_render(v, real);
+                                attrs.enumerable.then(|| (fmt_key(real), Err((label, read))))
                             }
                             // Only an ENUMERABLE own property is shown, as node
                             // does: a native instance keeps bookkeeping (a
@@ -4957,7 +4995,19 @@ impl JsHost {
                         .iter()
                         .map(|(k, val)| match val {
                             Ok(val) => format!("{k}: {}", self.inspect_lvl(val, indent + 2, st)),
-                            Err(label) => format!("{k}: {label}"),
+                            Err((label, None)) => format!("{k}: [{label}]"),
+                            // node's `formatProperty` under `getters`: an object
+                            // follows the bracket, anything else goes inside it.
+                            Err((label, Some(Ok(got)))) => {
+                                if matches!(got, Value::Obj(_)) && !is_primitive(self, got) && !self.is_null(got) {
+                                    format!("{k}: [{label}] {}", self.inspect_lvl(got, indent + 2, st))
+                                } else {
+                                    format!("{k}: [{label}: {}]", self.inspect_lvl(got, indent + 2, st))
+                                }
+                            }
+                            Err((label, Some(Err(e)))) => {
+                                format!("{k}: [{label}: <Inspection threw ({})>]", self.str_of(e))
+                            }
                         })
                         .collect();
                     self.render_object(&inner, &prefix, indent, st)
@@ -5820,6 +5870,104 @@ thread_local! {
     /// carries — an array's `length`, a typed array's element width and window
     /// onto its backing store. Off by default; `util.format`'s `%o` turns it on.
     static INSPECT_SHOW_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// `util.inspect`'s `numericSeparator`: group digits with `_`.
+    static INSPECT_NUMERIC_SEPARATOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// `util.inspect`'s `maxStringLength` (UTF-16 units shown before the
+    /// `... N more characters` trailer). Node's default is 10000.
+    static INSPECT_MAX_STRING_LENGTH: std::cell::Cell<usize> = const { std::cell::Cell::new(DEFAULT_MAX_STRING_LENGTH) };
+
+    /// `util.inspect`'s `showProxy`: render a Proxy as `Proxy [ target, handler ]`.
+    static INSPECT_SHOW_PROXY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Node's default `maxStringLength`.
+pub(crate) const DEFAULT_MAX_STRING_LENGTH: usize = 10000;
+
+/// Set the `util.inspect` `numericSeparator` option for the next render.
+pub fn set_inspect_numeric_separator(s: bool) {
+    INSPECT_NUMERIC_SEPARATOR.with(|x| x.set(s));
+}
+
+fn inspect_numeric_separator() -> bool {
+    INSPECT_NUMERIC_SEPARATOR.with(|x| x.get())
+}
+
+/// Set the `util.inspect` `maxStringLength` for the next render.
+pub fn set_inspect_max_string_length(n: usize) {
+    INSPECT_MAX_STRING_LENGTH.with(|x| x.set(n));
+}
+
+fn inspect_max_string_length() -> usize {
+    INSPECT_MAX_STRING_LENGTH.with(|x| x.get())
+}
+
+/// Set the `util.inspect` `showProxy` option for the next render.
+pub fn set_inspect_show_proxy(s: bool) {
+    INSPECT_SHOW_PROXY.with(|x| x.set(s));
+}
+
+fn inspect_show_proxy() -> bool {
+    INSPECT_SHOW_PROXY.with(|x| x.get())
+}
+
+/// Node's `formatNumber` under `numericSeparator`: `_` every three digits,
+/// counted from the decimal point outward on both sides. An exponential or
+/// non-finite form is left alone.
+fn numeric_separated(s: &str) -> String {
+    if s.contains('e') || s.contains('N') || s.contains('I') {
+        return s.to_string();
+    }
+    let (sign, digits) = match s.strip_prefix('-') {
+        Some(d) => ("-", d),
+        None => ("", s),
+    };
+    let (int, frac) = match digits.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (digits, None),
+    };
+    let mut grouped = String::new();
+    for (i, c) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i) % 3 == 0 {
+            grouped.push('_');
+        }
+        grouped.push(c);
+    }
+    if let Some(f) = frac {
+        grouped.push('.');
+        let chars: Vec<char> = f.chars().collect();
+        for (i, chunk) in chars.chunks(3).enumerate() {
+            if i > 0 {
+                grouped.push('_');
+            }
+            grouped.extend(chunk);
+        }
+    }
+    format!("{sign}{grouped}")
+}
+
+/// A number as `util.inspect` prints it: `-0` kept, digits grouped under
+/// `numericSeparator`.
+fn inspect_number(s: String) -> String {
+    if inspect_numeric_separator() {
+        numeric_separated(&s)
+    } else {
+        s
+    }
+}
+
+/// A quoted string as `util.inspect` prints it, cut to `maxStringLength` UTF-16
+/// units with node's `... N more characters` trailer.
+fn inspect_string(s: &str) -> String {
+    let max = inspect_max_string_length();
+    let units = crate::utf16::Units::of(s);
+    if units.len() <= max {
+        return quote_str(s);
+    }
+    let rest = units.len() - max;
+    let plural = if rest == 1 { "" } else { "s" };
+    format!("{}... {rest} more character{plural}", quote_str(&units.slice(0, max)))
 }
 
 /// Set the `util.inspect` `showHidden` option for the next render.
@@ -5952,8 +6100,28 @@ enum CustomRender {
     Value(Value),
 }
 
+/// An accessor as the generic object arm shows it: its label, and under the
+/// `getters` option what reading it produced (a value, or the thrown error's
+/// text).
+type AccessorShown = (&'static str, Option<Result<Value, Value>>);
+
 thread_local! {
     static CUSTOM_RENDERS: RefCell<HashMap<u32, CustomRender>> = RefCell::new(HashMap::new());
+    /// `getters`: the value each own getter returned, keyed by object and key.
+    static GETTER_RENDERS: RefCell<HashMap<(u32, String), Result<Value, Value>>> = RefCell::new(HashMap::new());
+    /// `util.inspect`'s `getters` option: 0 off, 1 every getter, 2 only
+    /// getters without a setter (`'get'`), 3 only those with one (`'set'`).
+    static INSPECT_GETTERS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the `util.inspect` `getters` option for the next render.
+pub fn set_inspect_getters(g: u8) {
+    INSPECT_GETTERS.with(|x| x.set(g));
+}
+
+fn getter_render(v: &Value, key: &str) -> Option<Result<Value, Value>> {
+    let Value::Obj(id) = v else { return None };
+    GETTER_RENDERS.with(|m| m.borrow().get(&(*id, key.to_string())).cloned())
 }
 
 fn custom_render(v: &Value) -> Option<CustomRender> {
@@ -5977,12 +6145,24 @@ fn with_custom_renders(v: &Value, render: impl FnOnce(&JsHost) -> String) -> Res
     // A custom method may itself call `inspect`, so the outer render's
     // answers are set aside and restored rather than shared.
     let saved = CUSTOM_RENDERS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    let saved_getters = GETTER_RENDERS.with(|m| std::mem::take(&mut *m.borrow_mut()));
     let mut seen = HashSet::new();
     let mut ctx = None;
     let r = collect_custom_renders(v, 0, &mut seen, &mut ctx);
     let out = r.map(|()| with_host(|h| render(h)));
     CUSTOM_RENDERS.with(|m| *m.borrow_mut() = saved);
+    GETTER_RENDERS.with(|m| *m.borrow_mut() = saved_getters);
     out
+}
+
+/// The text node prints for a getter that threw: the error's `stack`, or the
+/// value itself when it has none.
+fn uncaught_text(msg: &str) -> String {
+    let err = with_host(|h| h.exc.take()).unwrap_or_else(|| with_host(|h| crate::builtins::synth_error(h, msg)));
+    match crate::builtins::get_property(&err, "stack") {
+        Ok(s) if with_host(|h| h.type_of(&s) == "string") => with_host(|h| h.str_of(&s)),
+        _ => with_host(|h| h.str_of(&err)),
+    }
 }
 
 /// The `(options, inspect)` arguments node passes a custom method, built once
@@ -6051,7 +6231,7 @@ fn collect_custom_renders(
     ctx: &mut Option<(Value, Value)>,
 ) -> Result<(), String> {
     let Value::Obj(id) = v else { return Ok(()) };
-    if !inspect_custom() || !seen.insert(*id) {
+    if !seen.insert(*id) {
         return Ok(());
     }
     let skip = with_host(|h| is_primitive(h, v) || matches!(h.get(v), Some(JsObj::Proxy { .. })));
@@ -6062,7 +6242,11 @@ fn collect_custom_renders(
         let sym = h.symbol_for("nodejs.util.inspect.custom");
         h.property_key(&sym)
     });
-    let method = crate::builtins::get_property(v, &key)?;
+    let method = if inspect_custom() {
+        crate::builtins::get_property(v, &key)?
+    } else {
+        Value::Undef
+    };
     if with_host(|h| is_callable(h, &method)) {
         if ctx.is_none() {
             *ctx = Some(custom_inspect_args()?);
@@ -6116,6 +6300,34 @@ fn collect_custom_renders(
     });
     for c in &children {
         collect_custom_renders(c, level + 1, seen, ctx)?;
+    }
+    // `getters`: read each own enumerable accessor the option selects, as
+    // node's `formatProperty` does, so the walk can print what it returned.
+    let mode = INSPECT_GETTERS.with(|x| x.get());
+    if mode != 0 {
+        let getters: Vec<(String, Value)> = with_host(|h| {
+            h.own_accessor_keys(v)
+                .into_iter()
+                .filter(|k| h.prop_attrs(v, k).enumerable)
+                .filter_map(|k| match h.own_accessor(v, &k)? {
+                    (Some(g), set) if mode == 1 || (mode == 2) == set.is_none() => Some((k, g)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (k, g) in getters {
+            let read = match invoke(&g, Vec::new(), Some(v.clone())) {
+                Ok(val) => {
+                    collect_custom_renders(&val, level + 1, seen, ctx)?;
+                    Ok(val)
+                }
+                Err(e) => {
+                    let thrown = uncaught_text(&e);
+                    Err(with_host(|h| h.new_str(thrown)))
+                }
+            };
+            GETTER_RENDERS.with(|m| m.borrow_mut().insert((*id, k), read));
+        }
     }
     Ok(())
 }

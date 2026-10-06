@@ -148,6 +148,35 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                     }
                 }
             };
+            let numeric_separator_opt = read("numericSeparator");
+            let numeric_separator = with_host(|h| h.truthy(&numeric_separator_opt));
+            let show_proxy_opt = read("showProxy");
+            let show_proxy = with_host(|h| h.truthy(&show_proxy_opt));
+            // `maxStringLength: null | Infinity` means "no limit", as for arrays.
+            let max_string_length = match read("maxStringLength") {
+                Value::Undef => crate::host::DEFAULT_MAX_STRING_LENGTH,
+                v if with_host(|h| h.is_null(&v)) => usize::MAX,
+                v => {
+                    let n = with_host(|h| h.to_number(&v));
+                    if n.is_finite() {
+                        n.max(0.0) as usize
+                    } else {
+                        usize::MAX
+                    }
+                }
+            };
+            // `getters: true | 'get' | 'set'`.
+            let getters_opt = read("getters");
+            let getters = with_host(|h| match h.as_str(&getters_opt).as_deref() {
+                Some("get") => 2,
+                Some("set") => 3,
+                _ if h.truthy(&getters_opt) => 1,
+                _ => 0,
+            });
+            crate::host::set_inspect_getters(getters);
+            crate::host::set_inspect_numeric_separator(numeric_separator);
+            crate::host::set_inspect_show_proxy(show_proxy);
+            crate::host::set_inspect_max_string_length(max_string_length);
             crate::host::set_inspect_compact(compact);
             crate::host::set_inspect_break_length(break_length);
             crate::host::set_inspect_sorted(sorted);
@@ -162,6 +191,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             crate::host::set_inspect_sorted(false);
             crate::host::set_inspect_max_array_length(crate::host::DEFAULT_MAX_ARRAY_LENGTH);
             crate::host::set_inspect_custom(true);
+            crate::host::set_inspect_getters(0);
+            crate::host::set_inspect_numeric_separator(false);
+            crate::host::set_inspect_show_proxy(false);
+            crate::host::set_inspect_max_string_length(crate::host::DEFAULT_MAX_STRING_LENGTH);
             crate::host::set_inspect_show_hidden(false);
             out
         }
@@ -486,10 +519,12 @@ pub fn format(args: &[Value]) -> Result<String, String> {
             // silent alias of `%O`.
             'O' => out.push_str(&crate::host::inspect_js(arg)?),
             'o' => {
+                crate::host::set_inspect_show_proxy(true);
                 crate::host::set_inspect_show_hidden(true);
                 crate::host::set_inspect_max_depth(4);
                 let s = crate::host::inspect_js(arg);
                 crate::host::set_inspect_show_hidden(false);
+                crate::host::set_inspect_show_proxy(false);
                 crate::host::set_inspect_max_depth(2);
                 out.push_str(&s?);
             }
