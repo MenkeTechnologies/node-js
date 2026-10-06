@@ -152,7 +152,10 @@ fn store_parts(url_obj: &Value, p: &Parts, sync_params: bool) {
             ("@@pathname", h.new_str(p.pathname.clone())),
             ("@@search", h.new_str(p.search.clone())),
             ("@@hash", h.new_str(p.hash.clone())),
-            ("@@authority", h.new_str(if p.authority { "true" } else { "false" })),
+            (
+                "@@authority",
+                h.new_str(if p.authority { "true" } else { "false" }),
+            ),
         ];
         if let Some(JsObj::Object(o)) = h.get_mut(url_obj) {
             for (k, v) in vals {
@@ -214,8 +217,15 @@ impl Parts {
         if !self.authority && self.hostname.is_empty() {
             // The URL Standard's serializer: no host, so no `//`; a path that
             // would then read as one gets the `/.` prefix.
-            let dot = if self.pathname.starts_with("//") { "/." } else { "" };
-            return format!("{}{dot}{}{}{}", self.protocol, self.pathname, self.search, self.hash);
+            let dot = if self.pathname.starts_with("//") {
+                "/."
+            } else {
+                ""
+            };
+            return format!(
+                "{}{dot}{}{}{}",
+                self.protocol, self.pathname, self.search, self.hash
+            );
         }
         let auth = if self.username.is_empty() {
             String::new()
@@ -258,7 +268,10 @@ fn parse_whatwg(input: &str, base: Option<&str>) -> Option<Parts> {
         Some(b) => Some(url::Url::parse(b).ok()?),
         None => None,
     };
-    let u = url::Url::options().base_url(base.as_ref()).parse(input).ok()?;
+    let u = url::Url::options()
+        .base_url(base.as_ref())
+        .parse(input)
+        .ok()?;
     Some(parts_of(&u))
 }
 
@@ -384,7 +397,10 @@ fn build(p: &Parts) -> Value {
         m.insert("@@search".into(), h.new_str(p.search.clone()));
         m.insert("@@searchParams".into(), search_params.clone());
         m.insert("@@hash".into(), h.new_str(p.hash.clone()));
-        m.insert("@@authority".into(), h.new_str(if p.authority { "true" } else { "false" }));
+        m.insert(
+            "@@authority".into(),
+            h.new_str(if p.authority { "true" } else { "false" }),
+        );
         let obj = h.new_object(m);
         // Hidden, and set after the URL exists so the two can point at each other.
         if let Some(JsObj::Object(sp)) = h.get_mut(&search_params) {

@@ -393,7 +393,9 @@ fn iterator_flattenable(obj: &Value) -> Result<Value, String> {
         )
     });
     if !is_object && !is_string {
-        return Err(crate::host::type_error("Iterator.from called on non-object"));
+        return Err(crate::host::type_error(
+            "Iterator.from called on non-object",
+        ));
     }
     let method = crate::builtins::get_property(obj, "@@iterator")?;
     if with_host(|h| h.is_nullish(&method)) {

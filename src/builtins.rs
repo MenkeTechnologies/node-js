@@ -714,7 +714,10 @@ fn is_lazy_global(name: &str) -> bool {
 /// A name this runtime does not bind (`navigator`) is left out rather than
 /// listed with nothing behind it.
 pub(crate) fn enumerable_lazy_globals() -> impl Iterator<Item = &'static str> {
-    ENUMERABLE_GLOBALS.iter().copied().filter(|n| is_lazy_global(n))
+    ENUMERABLE_GLOBALS
+        .iter()
+        .copied()
+        .filter(|n| is_lazy_global(n))
 }
 
 /// Whether a name in the globals map is a real property of the global object:
@@ -15312,7 +15315,9 @@ fn new_promise(executor: Value) -> Result<Value, String> {
     // 27.2.3.1 step 2: a non-callable executor throws before any promise exists.
     if !with_host(|h| host::is_callable(h, &executor)) {
         let shown = no_side_effects_string(&executor);
-        return Err(host::type_error(&format!("Promise resolver {shown} is not a function")));
+        return Err(host::type_error(&format!(
+            "Promise resolver {shown} is not a function"
+        )));
     }
     let p = with_host(|h| h.new_promise());
     let id = with_host(|h| h.promise_id(&p).unwrap());

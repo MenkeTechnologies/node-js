@@ -747,7 +747,12 @@ pub fn instance_members_enumerable(tag: &str) -> bool {
     )
 }
 
-pub fn instance_accessor_written(tag: &str, key: &str, recv: &Value, value: &Value) -> Result<(), String> {
+pub fn instance_accessor_written(
+    tag: &str,
+    key: &str,
+    recv: &Value,
+    value: &Value,
+) -> Result<(), String> {
     // A URL component goes through the URL Standard's setter for it.
     if tag == "URL" {
         return url::set_component(recv, key, value);

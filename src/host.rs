@@ -3018,7 +3018,9 @@ impl JsHost {
     /// one-shot handler.
     /// Whether any `process.on(event)` listener is registered.
     pub fn has_process_listeners(&self, event: &str) -> bool {
-        self.process_listeners.get(event).is_some_and(|l| !l.is_empty())
+        self.process_listeners
+            .get(event)
+            .is_some_and(|l| !l.is_empty())
     }
 
     pub fn take_process_listeners(&mut self, event: &str) -> Vec<Value> {
@@ -3737,7 +3739,8 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
 /// The value an exception that reached the top of the stack carries: the
 /// thrown value, or an `Error` built from an internal error string.
 fn uncaught_value(msg: &str) -> Value {
-    with_host(|h| h.exc.take()).unwrap_or_else(|| with_host(|h| crate::builtins::synth_error(h, msg)))
+    with_host(|h| h.exc.take())
+        .unwrap_or_else(|| with_host(|h| crate::builtins::synth_error(h, msg)))
 }
 
 /// Offer an uncaught exception to `process.on('uncaughtException')`; `Ok(true)`
@@ -4311,7 +4314,9 @@ impl JsHost {
             return self.inspect_value(v, indent, st);
         }
         match custom_render(v) {
-            Some(CustomRender::Text(s)) => return s.replace('\n', &format!("\n{}", " ".repeat(indent))),
+            Some(CustomRender::Text(s)) => {
+                return s.replace('\n', &format!("\n{}", " ".repeat(indent)))
+            }
             Some(CustomRender::Value(r)) => return self.inspect_lvl(&r, indent, st),
             None => {}
         }
@@ -4378,11 +4383,18 @@ impl JsHost {
                         inner.push(format!("[lastIndex]: {}", r.last_index.get()));
                     }
                     for k in self.fn_prop_keys(v) {
-                        if k.starts_with("@@") || k.starts_with('#') || !self.prop_attrs(v, &k).enumerable {
+                        if k.starts_with("@@")
+                            || k.starts_with('#')
+                            || !self.prop_attrs(v, &k).enumerable
+                        {
                             continue;
                         }
                         let val = self.fn_prop(v, &k).unwrap_or(Value::Undef);
-                        inner.push(format!("{}: {}", fmt_key(&k), self.inspect_lvl(&val, indent + 2, st)));
+                        inner.push(format!(
+                            "{}: {}",
+                            fmt_key(&k),
+                            self.inspect_lvl(&val, indent + 2, st)
+                        ));
                     }
                     if inner.is_empty() {
                         return body;
@@ -4397,7 +4409,9 @@ impl JsHost {
                 // deliberately does NOT run the handler's traps, so this stays a
                 // pure `&self` read like every other inspect arm.
                 // `showProxy` (and `%o`) shows both halves: `Proxy [ target, handler ]`.
-                Some(JsObj::Proxy { target, handler, .. }) if inspect_show_proxy() => {
+                Some(JsObj::Proxy {
+                    target, handler, ..
+                }) if inspect_show_proxy() => {
                     if indent as i64 > inspect_indent_limit() {
                         return "Proxy [Array]".into();
                     }
@@ -4696,7 +4710,12 @@ impl JsHost {
                             .unwrap_or(0.0);
                         parts.insert(1, format!("maxByteLength: {}", fmt_number(max)));
                     }
-                    self.render_object(&parts, &self.builtin_prefix(v, "ArrayBuffer", None), indent, st)
+                    self.render_object(
+                        &parts,
+                        &self.builtin_prefix(v, "ArrayBuffer", None),
+                        indent,
+                        st,
+                    )
                 }
                 // A live Map/Set iterator shows what it has left to yield, as
                 // node's `formatIterator` does: `[Map Entries] { [ 1, 'a' ] }`,
@@ -4936,9 +4955,8 @@ impl JsHost {
                         .iter()
                         .filter_map(|k| props.get(*k).map(|val| (format!("[{k}]"), Ok(val))))
                         .collect();
-                    shown.extend(props
-                        .iter()
-                        .filter_map(|(k, val)| match k.strip_prefix(ORD_MARKER) {
+                    shown.extend(props.iter().filter_map(
+                        |(k, val)| match k.strip_prefix(ORD_MARKER) {
                             Some(real) => {
                                 let attrs = self.prop_attrs(v, real);
                                 let label = match self.own_accessor(v, real)? {
@@ -4949,7 +4967,9 @@ impl JsHost {
                                 };
                                 // Under `getters`, the value the pre-pass read.
                                 let read = getter_render(v, real);
-                                attrs.enumerable.then(|| (fmt_key(real), Err((label, read))))
+                                attrs
+                                    .enumerable
+                                    .then(|| (fmt_key(real), Err((label, read))))
                             }
                             // Only an ENUMERABLE own property is shown, as node
                             // does: a native instance keeps bookkeeping (a
@@ -4962,7 +4982,8 @@ impl JsHost {
                                 Some((fmt_key(k), Ok(val)))
                             }
                             None => None,
-                        }));
+                        },
+                    ));
                     // The curated accessor values, read from the hidden slots the
                     // getters read, in the order node prints them.
                     for name in inspect_members {
@@ -4999,10 +5020,19 @@ impl JsHost {
                             // node's `formatProperty` under `getters`: an object
                             // follows the bracket, anything else goes inside it.
                             Err((label, Some(Ok(got)))) => {
-                                if matches!(got, Value::Obj(_)) && !is_primitive(self, got) && !self.is_null(got) {
-                                    format!("{k}: [{label}] {}", self.inspect_lvl(got, indent + 2, st))
+                                if matches!(got, Value::Obj(_))
+                                    && !is_primitive(self, got)
+                                    && !self.is_null(got)
+                                {
+                                    format!(
+                                        "{k}: [{label}] {}",
+                                        self.inspect_lvl(got, indent + 2, st)
+                                    )
                                 } else {
-                                    format!("{k}: [{label}: {}]", self.inspect_lvl(got, indent + 2, st))
+                                    format!(
+                                        "{k}: [{label}: {}]",
+                                        self.inspect_lvl(got, indent + 2, st)
+                                    )
                                 }
                             }
                             Err((label, Some(Err(e)))) => {
@@ -5967,7 +5997,10 @@ fn inspect_string(s: &str) -> String {
     }
     let rest = units.len() - max;
     let plural = if rest == 1 { "" } else { "s" };
-    format!("{}... {rest} more character{plural}", quote_str(&units.slice(0, max)))
+    format!(
+        "{}... {rest} more character{plural}",
+        quote_str(&units.slice(0, max))
+    )
 }
 
 /// Set the `util.inspect` `showHidden` option for the next render.
@@ -6141,7 +6174,10 @@ pub fn console_format_js(v: &Value) -> Result<String, String> {
     with_custom_renders(v, |h| h.console_format(v))
 }
 
-fn with_custom_renders(v: &Value, render: impl FnOnce(&JsHost) -> String) -> Result<String, String> {
+fn with_custom_renders(
+    v: &Value,
+    render: impl FnOnce(&JsHost) -> String,
+) -> Result<String, String> {
     // A custom method may itself call `inspect`, so the outer render's
     // answers are set aside and restored rather than shared.
     let saved = CUSTOM_RENDERS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -6158,7 +6194,8 @@ fn with_custom_renders(v: &Value, render: impl FnOnce(&JsHost) -> String) -> Res
 /// The text node prints for a getter that threw: the error's `stack`, or the
 /// value itself when it has none.
 fn uncaught_text(msg: &str) -> String {
-    let err = with_host(|h| h.exc.take()).unwrap_or_else(|| with_host(|h| crate::builtins::synth_error(h, msg)));
+    let err = with_host(|h| h.exc.take())
+        .unwrap_or_else(|| with_host(|h| crate::builtins::synth_error(h, msg)));
     match crate::builtins::get_property(&err, "stack") {
         Ok(s) if with_host(|h| h.type_of(&s) == "string") => with_host(|h| h.str_of(&s)),
         _ => with_host(|h| h.str_of(&err)),
@@ -8895,7 +8932,9 @@ pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
 pub fn call_iterator_method(iter_fn: &Value, src: &Value) -> Result<Value, String> {
     let iterator = invoke(iter_fn, Vec::new(), Some(src.clone()))?;
     if with_host(|h| is_primitive(h, &iterator) || h.is_nullish(&iterator)) {
-        return Err(type_error("Result of the Symbol.iterator method is not an object"));
+        return Err(type_error(
+            "Result of the Symbol.iterator method is not an object",
+        ));
     }
     Ok(iterator)
 }

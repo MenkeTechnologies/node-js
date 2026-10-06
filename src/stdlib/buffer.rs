@@ -1164,9 +1164,9 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         // the width's range, then the offset's `checkBounds`. A value outside the
         // range used to wrap silently (`writeUInt8(300)` stored 0x2c) and an
         // out-of-range offset could be negative or fractional.
-        "writeIntBE" | "writeIntLE" | "writeUIntBE" | "writeUIntLE" | "writeInt8" | "writeUInt8"
-        | "writeInt16BE" | "writeInt16LE" | "writeUInt16BE" | "writeUInt16LE" | "writeInt32BE"
-        | "writeInt32LE" | "writeUInt32BE" | "writeUInt32LE" => {
+        "writeIntBE" | "writeIntLE" | "writeUIntBE" | "writeUIntLE" | "writeInt8"
+        | "writeUInt8" | "writeInt16BE" | "writeInt16LE" | "writeUInt16BE" | "writeUInt16LE"
+        | "writeInt32BE" | "writeInt32LE" | "writeUInt32BE" | "writeUInt32LE" => {
             let width = match method {
                 "writeIntBE" | "writeIntLE" | "writeUIntBE" | "writeUIntLE" => {
                     variable_byte_length(args.get(2))?
@@ -1562,7 +1562,10 @@ fn read_offset(args: &[Value], size: usize, len: usize) -> Result<usize, String>
 fn big_write_value(v: &Value, signed: bool) -> Result<num_bigint::BigInt, String> {
     use num_bigint::BigInt;
     let (min, max_excl) = if signed {
-        (-(BigInt::from(1u8) << 63usize), BigInt::from(1u8) << 63usize)
+        (
+            -(BigInt::from(1u8) << 63usize),
+            BigInt::from(1u8) << 63usize,
+        )
     } else {
         (BigInt::from(0u8), BigInt::from(1u8) << 64usize)
     };
@@ -1575,7 +1578,9 @@ fn big_write_value(v: &Value, signed: bool) -> Result<num_bigint::BigInt, String
         crate::host::coded_error(
             "RangeError",
             "ERR_OUT_OF_RANGE",
-            &format!("The value of \"value\" is out of range. It must be {range}. Received {received}"),
+            &format!(
+                "The value of \"value\" is out of range. It must be {range}. Received {received}"
+            ),
         )
     };
     match with_host(|h| h.get(v).cloned()) {
@@ -1659,7 +1664,12 @@ fn check_int_value(value: f64, min: f64, max: f64, byte_len: usize) -> Result<()
 fn variable_byte_length(v: Option<&Value>) -> Result<usize, String> {
     let v = v.cloned().unwrap_or(Value::Undef);
     if with_host(|h| h.type_of(&v)) != "number" {
-        return Err(crate::host::invalid_arg_type("byteLength", "argument", "number", &v));
+        return Err(crate::host::invalid_arg_type(
+            "byteLength",
+            "argument",
+            "number",
+            &v,
+        ));
     }
     let n = with_host(|h| h.to_number(&v));
     if n.fract() != 0.0 || n.is_nan() {
@@ -1689,7 +1699,9 @@ fn checked_offset(arg: Option<&Value>, size: usize, len: usize) -> Result<usize,
     // `validateNumber(offset, 'offset')`: a present non-number is a type error.
     if let Some(v) = arg {
         if !matches!(v, Value::Undef) && with_host(|h| h.type_of(v)) != "number" {
-            return Err(crate::host::invalid_arg_type("offset", "argument", "number", v));
+            return Err(crate::host::invalid_arg_type(
+                "offset", "argument", "number", v,
+            ));
         }
     }
     if len < size {

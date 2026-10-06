@@ -108,7 +108,11 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     let mut seen = String::new();
     for c in flags.chars() {
         // `u` and `v` are mutually exclusive (22.2.3.1 step 5).
-        if !"dgimsuvy".contains(c) || seen.contains(c) || (c == 'v' && seen.contains('u')) || (c == 'u' && seen.contains('v')) {
+        if !"dgimsuvy".contains(c)
+            || seen.contains(c)
+            || (c == 'v' && seen.contains('u'))
+            || (c == 'u' && seen.contains('v'))
+        {
             return Err(format!(
                 "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
             ));

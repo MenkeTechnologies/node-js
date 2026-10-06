@@ -809,11 +809,22 @@ pub fn format_value(v: &Value, options: &Value) -> Result<Value, String> {
 fn format_whatwg(href: &str, options: &Value) -> String {
     let flag = |name: &str, default: bool| {
         let v = crate::builtins::get_property(options, name).unwrap_or(Value::Undef);
-        with_host(|h| if h.is_nullish(&v) { default } else { h.truthy(&v) })
+        with_host(|h| {
+            if h.is_nullish(&v) {
+                default
+            } else {
+                h.truthy(&v)
+            }
+        })
     };
     let has_options = with_host(|h| !h.is_nullish(options));
     let (auth, fragment, search, unicode) = if has_options {
-        (flag("auth", true), flag("fragment", true), flag("search", true), flag("unicode", false))
+        (
+            flag("auth", true),
+            flag("fragment", true),
+            flag("search", true),
+            flag("unicode", false),
+        )
     } else {
         (true, true, true, false)
     };

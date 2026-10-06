@@ -314,7 +314,9 @@ fn check_listener(f: &Value) -> Result<(), String> {
     if with_host(|h| crate::host::is_callable(h, f)) {
         return Ok(());
     }
-    Err(crate::host::invalid_arg_type("listener", "argument", "function", f))
+    Err(crate::host::invalid_arg_type(
+        "listener", "argument", "function", f,
+    ))
 }
 
 fn emit(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
