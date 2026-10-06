@@ -77,13 +77,42 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// `new vm.Script(code)` → a Script object holding the source.
 pub fn construct(args: &[Value]) -> Result<Value, String> {
     let code = super::arg_str(args, 0);
+    // A `Script` exposes the two source annotations as OWN properties, read off
+    // the trailing `//#` comments. Neither existed, so a tool reading
+    // `script.sourceMapURL` — the standard way to find a source map — got
+    // `undefined` for a script that carries one.
+    let (url, map) = (
+        source_annotation(&code, "sourceURL"),
+        source_annotation(&code, "sourceMappingURL"),
+    );
     Ok(with_host(|h| {
         let code_val = h.new_str(code);
+        let to_val = |h: &mut crate::host::JsHost, s: Option<String>| match s {
+            Some(s) => h.new_str(s),
+            None => Value::Undef,
+        };
+        let (url, map) = (to_val(h, url), to_val(h, map));
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("Script"));
         m.insert("@@code".into(), code_val);
+        m.insert("sourceURL".into(), url);
+        m.insert("sourceMapURL".into(), map);
         h.new_object(m)
     }))
+}
+
+/// The value of a `//# <name>=<value>` annotation, taken from the LAST line
+/// that carries one — a later comment overrides an earlier one, as V8 does.
+fn source_annotation(code: &str, name: &str) -> Option<String> {
+    let prefix = format!("//# {name}=");
+    let alt = format!("//@ {name}=");
+    code.lines()
+        .rev()
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix(&prefix).or_else(|| l.strip_prefix(&alt))
+        })
+        .map(|v| v.trim().to_string())
 }
 
 /// Dispatch a method on a Script instance (`@@native = "Script"`).

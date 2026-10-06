@@ -128,3 +128,32 @@ t("key-chain ", () => {
   const proto = Object.getPrototypeOf(key);
   return [proto.constructor.name, Object.getPrototypeOf(proto).constructor.name];
 });
+
+// ── what util.inspect prints ─────────────────────────────────────────────────
+// With the values moved onto prototype getters the generic own-property
+// renderer has nothing to print, so each of these rendered as an empty `{}`.
+// Node gives them a custom inspect that prints a CURATED set: a URL shows all
+// twelve accessors, an AbortSignal shows only `aborted`, a KeyObject shows
+// none, and TextEncoder's omits the class name altogether.
+const util = require("util");
+t("ins-url   ", () => util.inspect(new URL("http://a/b?x=1")));
+t("ins-ctrl  ", () => util.inspect(new AbortController()));
+t("ins-abrtd ", () => { const a = new AbortController(); a.abort("why"); return util.inspect(a.signal); });
+t("ins-onab  ", () => { const a = new AbortController(); a.signal.onabort = () => {}; return util.inspect(a.signal); });
+t("ins-td    ", () => util.inspect(new TextDecoder("utf-8", { fatal: true })));
+t("ins-te    ", () => util.inspect(new TextEncoder()));
+t("ins-key   ", () => util.inspect(key));
+t("ins-nested", () => util.inspect({ u: new URL("http://a/"), s: new AbortController().signal }));
+t("ins-usp   ", () => util.inspect(new URLSearchParams("a=1&b=2")));
+
+// ── vm.Script's source annotations ───────────────────────────────────────────
+// Read off the trailing `//#` comments, and own properties rather than
+// accessors. Neither existed, so a tool looking for a script's source map found
+// `undefined` on a script that carries one.
+t("scr-plain ", () => { const s = new vm.Script("1"); return [s.sourceURL, s.sourceMapURL, Object.keys(s)]; });
+t("scr-url   ", () => { const s = new vm.Script("1\n//# sourceURL=foo.js"); return [s.sourceURL, s.sourceMapURL]; });
+t("scr-map   ", () => { const s = new vm.Script("1\n//# sourceMappingURL=map.js"); return [s.sourceURL, s.sourceMapURL]; });
+t("scr-both  ", () => { const s = new vm.Script("1\n//# sourceURL=a.js\n//# sourceMappingURL=b.map"); return [s.sourceURL, s.sourceMapURL]; });
+// The `filename` OPTION is not a source URL.
+t("scr-file  ", () => { const s = new vm.Script("1", { filename: "f.js" }); return [s.sourceURL, s.sourceMapURL]; });
+t("scr-runs  ", () => new vm.Script("1+1\n//# sourceURL=x.js").runInThisContext());

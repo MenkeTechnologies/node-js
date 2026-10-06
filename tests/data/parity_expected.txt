@@ -1722,6 +1722,21 @@ key-shape  ["SecretKeyObject","KeyObject",[],"{}"]
 key-size   ["secret",2,null]
 key-equals [true,false,false]
 key-chain  ["SecretKeyObject","KeyObject"]
+ins-url    "URL {\n  href: 'http://a/b?x=1',\n  origin: 'http://a',\n  protocol: 'http:',\n  username: '',\n  password: '',\n  host: 'a',\n  hostname: 'a',\n  port: '',\n  pathname: '/b',\n  search: '?x=1',\n  searchParams: URLSearchParams { 'x' => '1' },\n  hash: ''\n}"
+ins-ctrl   "AbortController { signal: AbortSignal { aborted: false } }"
+ins-abrtd  "AbortSignal { aborted: true }"
+ins-onab   "AbortSignal { aborted: false }"
+ins-td     "TextDecoder { encoding: 'utf-8', fatal: true, ignoreBOM: false }"
+ins-te     "{ encoding: 'utf-8' }"
+ins-key    "SecretKeyObject [KeyObject] {}"
+ins-nested "{\n  u: URL {\n    href: 'http://a/',\n    origin: 'http://a',\n    protocol: 'http:',\n    username: '',\n    password: '',\n    host: 'a',\n    hostname: 'a',\n    port: '',\n    pathname: '/',\n    search: '',\n    searchParams: URLSearchParams {},\n    hash: ''\n  },\n  s: AbortSignal { aborted: false }\n}"
+ins-usp    "URLSearchParams { 'a' => '1', 'b' => '2' }"
+scr-plain  [null,null,["sourceURL","sourceMapURL"]]
+scr-url    ["foo.js",null]
+scr-map    [null,"map.js"]
+scr-both   ["a.js","b.map"]
+scr-file   [null,null]
+scr-runs   2
 ==== newstatics.js ====
 try-meta   function 1 try
 esc-meta   function 1 escape

@@ -697,6 +697,44 @@ pub fn instance_late_methods(tag: &str) -> &'static [&'static str] {
     }
 }
 
+/// How `util.inspect` renders an instance of `tag`, as
+/// `(accessors to show, whether to print the class name)`.
+///
+/// Node gives these classes a custom inspect that prints a CURATED set of
+/// accessor values — a `URL` shows all twelve, an `AbortSignal` shows only
+/// `aborted`, and a `KeyObject` shows none. With the values moved off the
+/// instance and onto prototype getters, the generic own-property renderer has
+/// nothing left to print, so every one of them rendered as an empty `{}`.
+///
+/// `TextEncoder` is the odd one: node's custom inspect omits the class name, so
+/// it prints as a bare `{ encoding: 'utf-8' }`.
+pub fn instance_inspect_members(tag: &str) -> (&'static [&'static str], bool) {
+    match tag {
+        "URL" => (
+            &[
+                "href",
+                "origin",
+                "protocol",
+                "username",
+                "password",
+                "host",
+                "hostname",
+                "port",
+                "pathname",
+                "search",
+                "searchParams",
+                "hash",
+            ],
+            true,
+        ),
+        "AbortController" => (&["signal"], true),
+        "AbortSignal" => (&["aborted"], true),
+        "TextDecoder" => (&["encoding", "fatal", "ignoreBOM"], true),
+        "TextEncoder" => (&["encoding"], false),
+        _ => (&[], true),
+    }
+}
+
 pub fn instance_members_enumerable(tag: &str) -> bool {
     !matches!(
         tag,

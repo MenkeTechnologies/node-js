@@ -2576,14 +2576,6 @@ Still divergent, and why:
   pool allocator — `[byteOffset]: 144`, a `[buffer]` of `[byteLength]: 65599`,
   and `parent`/`offset` getters — none of which exist here, where a Buffer owns
   its bytes. The values are allocator state, not observable semantics.
-- **A `URL`'s components are own properties of the instance, where node has
-  them as accessors on `URL.prototype`.** They read and write correctly and the
-  derived fields stay in step (`examples/urlmutation.js`), but the shape is
-  visible: `Object.keys(new URL(u))` lists twelve names and node lists none,
-  `Object.getOwnPropertyNames` likewise, and `u.hasOwnProperty('href')` answers
-  true where node answers false. Fixing it means moving the twelve to the
-  prototype as real accessors and giving `util.inspect` the `URL { … }` form it
-  would then no longer get from enumerating own properties.
 - **`Object.getOwnPropertyNames(X.prototype)` is right for the intrinsics whose
   prototype is a builtin namespace, and still wrong for the six whose prototype
   is a real object.** `Map`, `Set`, `Promise`, `Date`, `Array`, `RegExp`,
@@ -2739,10 +2731,10 @@ Still divergent, and why:
   those lists are empty where node's are not. The PUBLIC surface agrees:
   everything node keeps on the prototype is on the prototype here too
   (`examples/nativeshapes.js`), and no public field leaks into an enumeration.
-- **`vm.Script` has no `sourceURL`/`sourceMapURL` own properties.** Node reads
-  them out of the options object and off the source's trailing
-  `//# sourceURL=` comment; nothing here records either, so both are absent
-  rather than `undefined`.
+- **A `StringDecoder`'s internal `Symbol(kNativeDecoder)` own property is
+  absent.** Node keeps the partial-sequence buffer there and `util.inspect`
+  prints it; this runtime tracks the same state elsewhere and does not invent a
+  slot to match. `encoding` — the one public own property — agrees.
 - **`crypto` key objects carry no `asymmetricKeyDetails`.** The accessor exists
   on `AsymmetricKeyObject.prototype` and answers `undefined`; node reports the
   modulus length, public exponent, curve name and the rest, which needs the key

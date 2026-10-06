@@ -4767,7 +4767,16 @@ impl JsHost {
                         n if n.is_empty() => "Object".to_string(),
                         n => n,
                     };
-                    let plain_prefix = if ctor == "Object" {
+                    // A native class that node gives a CUSTOM inspect to prints
+                    // the accessor values it curates rather than the instance's
+                    // own properties, which are hidden slots and print as
+                    // nothing. `TextEncoder`'s omits the class name entirely.
+                    let native = props.get("@@native").map(|t| self.str_of(t));
+                    let (inspect_members, show_class) = native
+                        .as_deref()
+                        .map(crate::stdlib::instance_inspect_members)
+                        .unwrap_or((&[], true));
+                    let plain_prefix = if ctor == "Object" || !show_class {
                         String::new()
                     } else {
                         format!("{ctor} ")
@@ -4775,7 +4784,9 @@ impl JsHost {
                     let prefix = if self.inspects_null_proto(v) {
                         "[Object: null prototype] ".to_string()
                     } else {
-                        // An inherited `Symbol.toStringTag` shows as `Ctor [Tag] `.
+                        // An inherited `Symbol.toStringTag` shows as `Ctor [Tag] `,
+                        // native classes included: a `SecretKeyObject` prints as
+                        // `SecretKeyObject [KeyObject] {}`.
                         match self.inspect_tag(v) {
                             Some(t) if t != ctor => format!("{ctor} [{t}] "),
                             _ => plain_prefix.clone(),
@@ -4817,6 +4828,13 @@ impl JsHost {
                             None => None,
                         })
                         .collect();
+                    // The curated accessor values, read from the hidden slots the
+                    // getters read, in the order node prints them.
+                    for name in inspect_members {
+                        if let Some(val) = props.get(&format!("@@{name}")) {
+                            shown.push(((*name).to_string(), Ok(val)));
+                        }
+                    }
                     shown.extend(props.iter().filter_map(|(k, val)| {
                         let sym = self.symbol_of_key(k)?;
                         self.prop_attrs(v, k)
