@@ -281,6 +281,14 @@ pub fn namespace_ctors(ns: &str) -> &'static [&'static str] {
 /// implements, not Node's full export list, so a package that copies a namespace
 /// key-by-key (safer-buffer clones `buffer` and `Buffer`) ends up with exactly the
 /// working set rather than an empty object.
+/// Whether a stdlib namespace's statics are ENUMERABLE own properties. A core
+/// module's exports and a node or WebIDL class's statics (`Buffer.from`,
+/// `URL.canParse`) are; an ECMAScript intrinsic constructor's are not
+/// (`Iterator.from`, `Iterator.concat`).
+pub fn namespace_statics_enumerable(ns: &str) -> bool {
+    ns != "Iterator"
+}
+
 pub fn namespace_keys(ns: &str) -> Vec<String> {
     // The `require.cache` view enumerates the resolved filenames it holds.
     if ns == crate::builtins::REQUIRE_CACHE {

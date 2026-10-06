@@ -2419,7 +2419,10 @@ fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
         && !crate::stdlib::namespace_keys(ns).iter().any(|k| k == key)
         && with_host(|h| h.builtin_static(ns, key).is_some());
     let enumerable = assigned
-        || (!frozen && !own_fn_meta && crate::stdlib::namespace_keys(ns).iter().any(|k| k == key));
+        || (!frozen
+            && !own_fn_meta
+            && crate::stdlib::namespace_statics_enumerable(ns)
+            && crate::stdlib::namespace_keys(ns).iter().any(|k| k == key));
     with_host(|h| {
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("value".into(), value);
@@ -6137,12 +6140,12 @@ const NS_METHODS: &[&str] = &[
     "Reflect.preventExtensions",
     "Reflect.set",
     "Reflect.setPrototypeOf",
-    "Promise.resolve",
-    "Promise.reject",
     "Promise.all",
     "Promise.allSettled",
-    "Promise.race",
     "Promise.any",
+    "Promise.race",
+    "Promise.resolve",
+    "Promise.reject",
     "Promise.withResolvers",
     "Promise.try",
     "RegExp.escape",
@@ -8393,6 +8396,23 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
         // keys are the members node-js implements, each resolved to the same
         // first-class value a property read would give.
         let mut names = crate::stdlib::namespace_keys(&ns);
+        // A constructor implemented as a stdlib namespace (`Iterator`, `Buffer`,
+        // `URL`) owns `length`, `name` and `prototype` ahead of its statics, as
+        // every function does; its key list names only the statics.
+        if mode == 3 && !names.is_empty() && is_builtin_ctor(&ns) {
+            let mut own: Vec<String> = ["length", "name", "prototype"]
+                .into_iter()
+                .filter(|k| !names.iter().any(|n| n == k))
+                .map(str::to_string)
+                .collect();
+            own.append(&mut names);
+            names = own;
+        }
+        // An ECMAScript constructor's statics are non-enumerable, so only
+        // `getOwnPropertyNames` lists them.
+        if mode != 3 && !crate::stdlib::namespace_statics_enumerable(&ns) {
+            names.clear();
+        }
         // A core namespace (`Reflect`, `Math`, `JSON`) has no stdlib key list —
         // its members live in the builtin dispatch table. They are
         // non-enumerable in V8, so they surface only under

@@ -6947,6 +6947,11 @@ impl JsHost {
             // A builtin namespace (`require('buffer')`, `Buffer`) enumerates the
             // members node-js implements, so a package that copies a namespace
             // key-by-key gets the working set instead of an empty object.
+            Some(JsObj::Builtin(ns))
+                if enum_only && !crate::stdlib::namespace_statics_enumerable(ns) =>
+            {
+                Vec::new()
+            }
             Some(JsObj::Builtin(ns)) => crate::stdlib::namespace_keys(&ns.clone()),
             // A `Map`/`Set`/`Promise`/`RegExp`/generator holds only its internal
             // slots, so what a script assigned lives in the side table — and is

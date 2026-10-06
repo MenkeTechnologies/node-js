@@ -1,6 +1,6 @@
 //! Iterator helpers (27.1.4) — `map`, `filter`, `take`, `drop`, `flatMap` and
 //! the terminal `reduce`/`toArray`/`forEach`/`some`/`every`/`find`, plus the
-//! `Iterator` constructor and `Iterator.from`.
+//! `Iterator` constructor, `Iterator.from` and `Iterator.concat`.
 //!
 //! None of it existed: `[1,2,3].values().map(f)` was "map is not a function".
 //!
@@ -40,7 +40,7 @@ pub const METHODS: &[&str] = &[
 ];
 
 /// `Iterator`'s own statics.
-pub const STATIC_METHODS: &[&str] = &["from"];
+pub const STATIC_METHODS: &[&str] = &["from", "concat"];
 
 /// True if `name` is one of the helper methods (lazy or terminal).
 pub fn is_helper(name: &str) -> bool {
@@ -94,6 +94,12 @@ pub fn helper_return(recv: &Value) -> Value {
     let already = slot(recv, "@@done").is_some_and(|v| with_host(|h| h.truthy(&v)));
     set_slot(recv, "@@done", Value::Bool(true));
     if !already {
+        // An inner iterator in flight (`flatMap`'s current mapping,
+        // `concat`'s current item) is closed first, then the source.
+        if let Some(inner) = slot(recv, "@@inner").filter(|v| !matches!(v, Value::Undef)) {
+            set_slot(recv, "@@inner", Value::Undef);
+            close(&inner);
+        }
         close(&src);
     }
     done_step()
@@ -346,6 +352,38 @@ pub fn helper_next(recv: &Value) -> Result<Value, String> {
             let inner = iterator_of(&mapped)?;
             set_slot(recv, "@@inner", inner);
         },
+        // `Iterator.concat`: `@@arg` holds the `(method, iterable)` pairs
+        // validated up front, flattened; each iterable is opened only when the
+        // previous one is exhausted, and its values pass through.
+        "concat" => loop {
+            if let Some(inner) = slot(recv, "@@inner").filter(|v| !matches!(v, Value::Undef)) {
+                let (v, done) = pull(&inner)?;
+                if !done {
+                    return Ok(step(v, false));
+                }
+                set_slot(recv, "@@inner", Value::Undef);
+            }
+            let pairs = with_host(|h| match h.get(&arg) {
+                Some(JsObj::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            });
+            let i = slot(recv, "@@count")
+                .map(|x| with_host(|h| h.to_number(&x)) as usize)
+                .unwrap_or(0);
+            if 2 * i >= pairs.len() {
+                return Ok(finish());
+            }
+            set_slot(recv, "@@count", Value::Float((i + 1) as f64));
+            let (method, iterable) = (pairs[2 * i].clone(), pairs[2 * i + 1].clone());
+            let it = crate::host::invoke(&method, Vec::new(), Some(iterable))?;
+            if with_host(|h| crate::host::is_primitive(h, &it) || h.is_nullish(&it)) {
+                return Err(crate::host::type_error(&format!(
+                    "{} is not iterable",
+                    crate::builtins::no_side_effects_string_pub(&it)
+                )));
+            }
+            set_slot(recv, "@@inner", it);
+        },
         // `Iterator.from`'s wrapper: forward each step unchanged.
         "wrap" => {
             let (v, done) = pull(&src)?;
@@ -437,6 +475,36 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
                 }
             }),
         ),
+        "concat" => Some(concat(args)),
         _ => None,
     }
+}
+
+/// `Iterator.concat(...items)`: every item is checked BEFORE anything is
+/// opened — it must be an object with a callable `Symbol.iterator` — and the
+/// result is a lazy Iterator Helper that opens each item in turn.
+fn concat(args: &[Value]) -> Result<Value, String> {
+    let mut pairs = Vec::with_capacity(2 * args.len());
+    for item in args {
+        if with_host(|h| crate::host::is_primitive(h, item) || h.is_nullish(item)) {
+            return Err(crate::host::type_error(
+                "Iterator.concat called on non-object",
+            ));
+        }
+        let method = crate::builtins::get_property(item, "@@iterator")?;
+        let owner = crate::builtins::no_side_effects_string_pub(item);
+        if with_host(|h| h.is_nullish(&method)) {
+            return Err(crate::host::type_error(&format!("{owner} is not iterable")));
+        }
+        if !with_host(|h| is_callable(h, &method)) {
+            let shown = with_host(|h| h.str_of(&method));
+            return Err(crate::host::type_error(&format!(
+                "'{shown}' returned for property 'Symbol(Symbol.iterator)' of object '{owner}' is not a function"
+            )));
+        }
+        pairs.push(method);
+        pairs.push(item.clone());
+    }
+    let list = with_host(|h| h.new_array(pairs));
+    Ok(helper(&Value::Undef, "concat", list))
 }
