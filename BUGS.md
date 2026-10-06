@@ -483,14 +483,18 @@ populates the exports object instead of throwing. Measured on node v26.7.0 with
 | `node -e` | `true false` | `false false` | `true false` |
 | `node -` | `true false` | `false false` | `true false` |
 
-**Remaining:** `globalThis` is still not backed by the global SCOPE. A top-level
-`var y = 2` does not appear as `globalThis.y`, and `globalThis.x = 1` does not
-create a bare readable binding `x` — the two live in separate tables
-(`JsHost.globals` versus the `globalThis` object). A property written through
-`globalThis` is readable through `globalThis`, which is what the identity fix
-bought; joining the two tables is a separate change. `globalThis.Error` and the
-other builtin names likewise read `undefined`, since the builtins are resolved by
-name at the `GetLocal` site rather than stored as properties of a global object.
+The two tables are joined now: `globalThis.x = 1` creates a bare binding `x`,
+`x = 1` with no declaration is readable as `globalThis.x`, and every lazily-bound
+builtin (`globalThis.Error`, `globalThis.performance`) reads, describes, and
+tests `in` as an own property. `Object.keys(globalThis)` and `for-in` list node's
+enumerable builtins first, then script-made globals in creation order; the
+CommonJS wrapper's parameters and the compiler's `.`-prefixed temporaries are
+never listed (`parity-scripts/objects/15_global_object_keys.js`).
+
+**Remaining:** `navigator` and `sessionStorage` are not bound, so they are
+absent from that listing, and `Object.getOwnPropertyNames(globalThis)` reports
+only the enumerable globals plus script-made ones rather than node's full
+non-enumerable set in V8's order.
 
 ## Entry points: `node f.js` vs `node -e` vs `node -` / piped stdin
 

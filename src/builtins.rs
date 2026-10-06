@@ -699,6 +699,30 @@ pub(crate) fn global_object_binding(name: &str) -> Option<Value> {
     global_binding_from(name, true)
 }
 
+/// Whether `name` is a global bound LAZILY — resolved on read by
+/// [`global_binding_from`] rather than stored in any map.
+fn is_lazy_global(name: &str) -> bool {
+    matches!(
+        name,
+        "undefined" | "NaN" | "Infinity" | "globalThis" | "global" | "crypto" | "performance"
+    ) || is_namespace(name)
+        || is_known_builtin(name)
+}
+
+/// The lazily-bound globals node makes ENUMERABLE own properties of the
+/// global object, in node's order — the head of `Object.keys(globalThis)`.
+/// A name this runtime does not bind (`navigator`) is left out rather than
+/// listed with nothing behind it.
+pub(crate) fn enumerable_lazy_globals() -> impl Iterator<Item = &'static str> {
+    ENUMERABLE_GLOBALS.iter().copied().filter(|n| is_lazy_global(n))
+}
+
+/// Whether a name in the globals map is a real property of the global object:
+/// not a CommonJS wrapper parameter and not a compiler temporary (`.forin0`).
+pub(crate) fn is_script_global_name(name: &str) -> bool {
+    !name.starts_with('.') && !CJS_WRAPPER_LOCALS.contains(&name)
+}
+
 fn global_binding_from(name: &str, object_only: bool) -> Option<Value> {
     let bound = with_host(|h| {
         if object_only {
@@ -724,6 +748,8 @@ fn global_binding_from(name: &str, object_only: bool) -> Option<Value> {
         // node-flavoured module: `globalThis.crypto.randomUUID` exists while
         // `globalThis.crypto.createHash` does not.
         "crypto" => return Some(with_host(|h| h.alloc(JsObj::Builtin("webcrypto".into())))),
+        // The global `performance` IS `require('perf_hooks').performance`.
+        "performance" => return Some(with_host(|h| h.alloc(JsObj::Builtin("performance".into())))),
         _ => {}
     }
     if is_namespace(name) || is_known_builtin(name) {
@@ -4766,20 +4792,16 @@ fn b_typeof_name(vm: &mut VM, _: u8) -> Value {
             h.new_str(t)
         });
     }
-    // Lazily-bound globals mirror `b_getlocal`: resolve to the same value it
-    // would produce, then take its type (so object-namespaces like `console`/
-    // `Math`/`JSON`/`process` report "object", constructors report "function").
-    let t = match name.as_str() {
-        "undefined" => "undefined".to_string(),
-        "NaN" | "Infinity" => "number".to_string(),
-        "globalThis" | "global" => "object".to_string(),
-        n if is_namespace(n) || is_known_builtin(n) => {
-            let v = with_host(|h| h.alloc(JsObj::Builtin(name.clone())));
-            with_host(|h| h.type_of(&v)).to_string()
-        }
-        _ => "undefined".to_string(), // genuinely unbound → JS returns "undefined"
-    };
-    with_host(|h| h.new_str(t))
+    // Lazily-bound globals resolve through `global_binding`, the same lookup
+    // `b_getlocal` uses, so `typeof crypto` cannot answer "undefined" for a
+    // name that `crypto.randomUUID()` reads successfully.
+    match global_binding(&name) {
+        Some(v) => with_host(|h| {
+            let t = h.type_of(&v);
+            h.new_str(t)
+        }),
+        None => with_host(|h| h.new_str("undefined")),
+    }
 }
 
 fn b_strict_eq(vm: &mut VM, _: u8) -> Value {

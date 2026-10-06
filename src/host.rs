@@ -4494,9 +4494,9 @@ impl JsHost {
                     // 64-bit view's come back as `undefined` (no allocation is
                     // possible here), which only affects column padding.
                     let vals = crate::stdlib::typedarray::elems_with_host(self, v);
-                    let base = format!("{kind}({}) ", elems.len());
+                    let base = self.builtin_prefix(v, &kind, Some(elems.len()));
                     if indent as i64 > inspect_indent_limit() {
-                        return format!("[{kind}]");
+                        return self.builtin_depth_stub(v, &kind);
                     }
                     let shown = elems.len().min(inspect_max_array_length());
                     let mut inner: Vec<String> = elems[..shown].to_vec();
@@ -4565,6 +4565,9 @@ impl JsHost {
                     if props.get("@@native").map(|t| self.str_of(t)).as_deref()
                         == Some("ArrayBuffer") =>
                 {
+                    if indent as i64 > inspect_indent_limit() {
+                        return self.builtin_depth_stub(v, "ArrayBuffer");
+                    }
                     let bytes: Vec<u8> = match props.get("@@bytes").and_then(|b| self.get(b)) {
                         Some(JsObj::Array(items)) => {
                             items.iter().map(|x| self.to_number(x) as u8).collect()
@@ -4583,7 +4586,7 @@ impl JsHost {
                             .unwrap_or(0.0);
                         parts.insert(1, format!("maxByteLength: {}", fmt_number(max)));
                     }
-                    self.render_object(&parts, "ArrayBuffer ", indent, st)
+                    self.render_object(&parts, &self.builtin_prefix(v, "ArrayBuffer", None), indent, st)
                 }
                 // A live Map/Set iterator shows what it has left to yield, as
                 // node's `formatIterator` does: `[Map Entries] { [ 1, 'a' ] }`,
@@ -4802,7 +4805,28 @@ impl JsHost {
                     // declaration order among the data properties. Without this
                     // an accessor rendered as nothing at all — `{ get z(){} }`
                     // printed `{}`.
-                    let mut shown: Vec<(String, Result<&Value, &'static str>)> = props
+                    // A DataView leads with its three view fields, bracketed as
+                    // node's `formatRaw` prints them (`keys.unshift('byteLength',
+                    // 'byteOffset', 'buffer')`), ahead of any own property.
+                    let is_view = native.as_deref() == Some("DataView");
+                    let view_fields: &[&str] = if is_view {
+                        &["byteLength", "byteOffset", "buffer"]
+                    } else {
+                        &[]
+                    };
+                    if is_view && indent as i64 > inspect_indent_limit() {
+                        return self.builtin_depth_stub(v, "DataView");
+                    }
+                    let prefix = if is_view {
+                        self.builtin_prefix(v, "DataView", None)
+                    } else {
+                        prefix
+                    };
+                    let mut shown: Vec<(String, Result<&Value, &'static str>)> = view_fields
+                        .iter()
+                        .filter_map(|k| props.get(*k).map(|val| (format!("[{k}]"), Ok(val))))
+                        .collect();
+                    shown.extend(props
                         .iter()
                         .filter_map(|(k, val)| match k.strip_prefix(ORD_MARKER) {
                             Some(real) => {
@@ -4826,8 +4850,7 @@ impl JsHost {
                                 Some((fmt_key(k), Ok(val)))
                             }
                             None => None,
-                        })
-                        .collect();
+                        }));
                     // The curated accessor values, read from the hidden slots the
                     // getters read, in the order node prints them.
                     for name in inspect_members {
@@ -6170,12 +6193,33 @@ impl JsHost {
         // ENUMERABLE property of the global object, but lives in the globals map
         // rather than in its property map — so no listing saw it, while
         // `globalThis.x` read it back and its descriptor called it enumerable.
+        //
+        // Node's own enumerable globals (`setTimeout`, `structuredClone`, …) come
+        // FIRST, in bootstrap order, and are not in either map. Two kinds of
+        // name in the globals map are not properties of the global object at
+        // all: the CommonJS wrapper's parameters and the compiler's `.`-prefixed
+        // temporaries (`.forin0`), which no identifier can spell.
         if self.is_global_object(v) {
+            // The globals map holds every script-created global in CREATION
+            // order (`globalThis.y = 1` writes it as well as the property map),
+            // so it is walked before the property map's own order.
+            let mut listed: Vec<String> = crate::builtins::enumerable_lazy_globals()
+                .map(str::to_string)
+                .collect();
             for k in self.globals.keys() {
-                if !keys.contains(k) {
-                    keys.push(k.clone());
+                if crate::builtins::is_script_global_name(k)
+                    && (!enum_only || self.prop_attrs(v, k).enumerable)
+                    && !listed.contains(k)
+                {
+                    listed.push(k.clone());
                 }
             }
+            for k in keys.drain(..) {
+                if !listed.contains(&k) {
+                    listed.push(k);
+                }
+            }
+            keys = listed;
         }
         // A RegExp's `lastIndex` is a SYNTHESIZED own property — it lives in the
         // `RegExpObj` struct, not a property map — so nothing above can list it.
@@ -6445,6 +6489,18 @@ pub fn own_enum_entries_deep(v: &Value) -> Result<Vec<(String, Value)>, String> 
                 .filter_map(|i| units.unit_str(i).map(|c| (i.to_string(), h.new_str(c))))
                 .collect()
         }));
+    }
+    // The global object's enumerable builtins and script-created globals live
+    // outside its property map, so each value is a full property READ —
+    // `Object.entries(globalThis)` paired every key with `undefined`.
+    if with_host(|h| h.is_global_object(v)) {
+        let keys = with_host(|h| h.own_enum_key_names(v));
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            let val = crate::builtins::get_property(v, &k)?;
+            out.push((k, val));
+        }
+        return Ok(out);
     }
     let accessor_keys: Vec<String> = with_host(|h| {
         h.own_accessor_keys(v)
