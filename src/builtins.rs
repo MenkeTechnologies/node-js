@@ -6362,6 +6362,10 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
     // CallSite array and its result becomes `.stack`, else `.stack` is a string.
     if name == "Error.captureStackTrace" {
         let target = arg0(&args);
+        // V8 refuses a primitive target with this literal message.
+        if with_host(|h| host::is_primitive(h, &target) || h.is_nullish(&target)) {
+            return Err(host::type_error("invalid_argument"));
+        }
         let prep = with_host(|h| h.builtin_static("Error", "prepareStackTrace"));
         let stack = match prep {
             Some(f)
@@ -6373,9 +6377,16 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 let sites = crate::module::callsite_stack(10)?;
                 host::invoke(&f, vec![target.clone(), sites], None)?
             }
-            _ => with_host(|h| h.new_str("")),
+            // No hook: node's default rendering, `Name: message` from the
+            // TARGET (`Error` for a plain object) and then the frames.
+            _ => {
+                let sites = crate::module::callsite_stack(10)?;
+                call_builtin_function(DEFAULT_PREPARE, vec![target.clone(), sites])?
+            }
         };
         let _ = set_property(&target, "stack", stack);
+        // `stack` is installed non-enumerable, so `Object.keys(o)` stays `[]`.
+        with_host(|h| h.hide_prop(&target, "stack"));
         return Ok(Value::Undef);
     }
     // Native stdlib module methods (path/os/fs/util/assert/crypto/buffer/url).
@@ -6389,15 +6400,25 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // render a stack it captured.
         DEFAULT_PREPARE => {
             let err = arg0(&args);
+            // Full property reads: a function target's `name` is not in any
+            // property map, and `Error.captureStackTrace(fn)` heads with it.
+            let name_v = get_property(&err, "name").unwrap_or(Value::Undef);
+            let msg_v = get_property(&err, "message").unwrap_or(Value::Undef);
             let header = with_host(|h| {
-                let name = host::lookup_chain(h, &err, "name")
-                    .map(|v| h.str_of(&v))
-                    .unwrap_or_else(|| "Error".to_string());
-                let msg = host::lookup_chain(h, &err, "message")
-                    .map(|v| h.str_of(&v))
-                    .unwrap_or_default();
+                let name = if matches!(name_v, Value::Undef) {
+                    "Error".to_string()
+                } else {
+                    h.str_of(&name_v)
+                };
+                let msg = if matches!(msg_v, Value::Undef) {
+                    String::new()
+                } else {
+                    h.str_of(&msg_v)
+                };
                 if msg.is_empty() {
                     name
+                } else if name.is_empty() {
+                    msg
                 } else {
                     format!("{name}: {msg}")
                 }
