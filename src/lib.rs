@@ -179,6 +179,11 @@ pub fn exit_code() -> Option<i32> {
 /// `process.on('exit', () => { process.exitCode = 9 }); throw new Error('z')`
 /// exits 9.
 pub fn exit_code_after_failure() -> i32 {
+    // An `uncaughtException` listener that itself threw: node exits 7 and
+    // fires no `exit` event.
+    if host::with_host(|h| h.fatal_handler_failed) {
+        return 7;
+    }
     host::with_host(|h| h.exit_code = Some(1));
     let _ = stdlib::process::emit_exit_event(1);
     host::with_host(|h| h.exit_code).unwrap_or(1)

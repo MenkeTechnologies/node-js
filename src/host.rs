@@ -1049,6 +1049,9 @@ pub struct JsHost {
     /// drains, or `None` while unset. Separate from an explicit
     /// `process.exit(n)`, which exits immediately with `n`.
     pub exit_code: Option<i32>,
+    /// An `uncaughtException` listener itself threw. Node treats that as fatal
+    /// with status 7 and fires no `exit` event.
+    pub fatal_handler_failed: bool,
     /// Whether the `exit` event has already been emitted, so the `process.exit`
     /// path and the end-of-loop path cannot both fire it (Node's `_exiting`).
     pub exiting: bool,
@@ -1281,6 +1284,7 @@ impl JsHost {
             open_handles: 0,
             capture: None,
             exit_code: None,
+            fatal_handler_failed: false,
             exiting: false,
             global_obj: Value::Undef,
         };
@@ -3012,6 +3016,11 @@ impl JsHost {
     /// The callbacks to run for `event`, consuming any `once` registration in
     /// the same step — so a listener that re-emits the event cannot re-enter a
     /// one-shot handler.
+    /// Whether any `process.on(event)` listener is registered.
+    pub fn has_process_listeners(&self, event: &str) -> bool {
+        self.process_listeners.get(event).is_some_and(|l| !l.is_empty())
+    }
+
     pub fn take_process_listeners(&mut self, event: &str) -> Vec<Value> {
         let Some(list) = self.process_listeners.get_mut(event) else {
             return Vec::new();
@@ -3704,13 +3713,73 @@ fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
 /// pending async work remains.
 pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     with_host(|h| h.module_scope = true);
-    let r = run_chunk_on(chunk);
+    let mut r = run_chunk_on(chunk);
     with_host(|h| h.signal = None);
+    if let Err(e) = &r {
+        if recover_uncaught(e, "uncaughtException")? {
+            r = Ok(Value::Undef);
+        }
+    }
     if r.is_ok() {
-        run_event_loop()?;
+        // A callback that throws ends this drain; a handled exception resumes
+        // it where it stopped, as node's loop carries on after
+        // `process._fatalException` reports the error handled.
+        while let Err(e) = run_event_loop() {
+            if !recover_uncaught(&e, "uncaughtException")? {
+                return Err(e);
+            }
+        }
         finish_process_events()?;
     }
     r
+}
+
+/// The value an exception that reached the top of the stack carries: the
+/// thrown value, or an `Error` built from an internal error string.
+fn uncaught_value(msg: &str) -> Value {
+    with_host(|h| h.exc.take()).unwrap_or_else(|| with_host(|h| crate::builtins::synth_error(h, msg)))
+}
+
+/// Offer an uncaught exception to `process.on('uncaughtException')`; `Ok(true)`
+/// means a listener took it and the program carries on.
+fn recover_uncaught(msg: &str, origin: &str) -> Result<bool, String> {
+    let has_listeners = with_host(|h| {
+        h.has_process_listeners("uncaughtException")
+            || h.has_process_listeners("uncaughtExceptionMonitor")
+    });
+    if !has_listeners {
+        return Ok(false);
+    }
+    let err = uncaught_value(msg);
+    let handled = deliver_uncaught(&err, origin)?;
+    if !handled {
+        // Unhandled after all (only a monitor was listening): put the value
+        // back so the fatal report prints the thrown value.
+        with_host(|h| h.exc = Some(err));
+    }
+    Ok(handled)
+}
+
+/// Node's `process._fatalException`: every `uncaughtExceptionMonitor` listener
+/// sees `(err, origin)` first, then — if any `uncaughtException` listener
+/// exists — each of those is called and the exception counts as handled.
+/// A listener that throws is fatal with status 7.
+fn deliver_uncaught(err: &Value, origin: &str) -> Result<bool, String> {
+    let origin = with_host(|h| h.new_str(origin));
+    for f in with_host(|h| h.take_process_listeners("uncaughtExceptionMonitor")) {
+        invoke(&f, vec![err.clone(), origin.clone()], None)?;
+    }
+    let listeners = with_host(|h| h.take_process_listeners("uncaughtException"));
+    if listeners.is_empty() {
+        return Ok(false);
+    }
+    for f in listeners {
+        if let Err(e) = invoke(&f, vec![err.clone(), origin.clone()], None) {
+            with_host(|h| h.fatal_handler_failed = true);
+            return Err(e);
+        }
+    }
+    Ok(true)
 }
 
 /// The shutdown sequence Node runs once the loop has drained on its own: fire
@@ -10325,6 +10394,18 @@ fn check_unhandled_rejections() -> Result<(), String> {
             let val = with_host(|h| h.promise_value(id));
             let listeners = with_host(|h| h.take_process_listeners("unhandledRejection"));
             if listeners.is_empty() {
+                // Node's default `--unhandled-rejections=throw` raises it as an
+                // uncaught exception with origin `unhandledRejection`, so an
+                // `uncaughtException` listener can still take it.
+                if with_host(|h| {
+                    h.has_process_listeners("uncaughtException")
+                        || h.has_process_listeners("uncaughtExceptionMonitor")
+                }) {
+                    let err = unhandled_rejection_error(&val)?;
+                    if deliver_uncaught(&err, "unhandledRejection")? {
+                        continue;
+                    }
+                }
                 let msg = with_host(|h| crate::builtins::error_string(h, &val));
                 with_host(|h| h.exc = Some(val));
                 return Err(msg);
@@ -10335,6 +10416,32 @@ fn check_unhandled_rejections() -> Result<(), String> {
             }
         }
     }
+}
+
+/// What an unhandled rejection is raised as: the reason itself when it is an
+/// `Error`, else node's `UnhandledPromiseRejection` wrapper — an `Error` whose
+/// message quotes the inspected reason, with own enumerable `code` and `name`.
+fn unhandled_rejection_error(reason: &Value) -> Result<Value, String> {
+    let error_ctor = crate::builtins::global_binding("Error").unwrap_or(Value::Undef);
+    if instance_of(reason, &error_ctor).unwrap_or(false) {
+        return Ok(reason.clone());
+    }
+    Ok(with_host(|h| {
+        let shown = h.inspect(reason);
+        let msg = format!(
+            "Error: This error originated either by throwing inside of an async function \
+             without a catch block, or by rejecting a promise which was not handled with \
+             .catch(). The promise rejected with the reason \"{shown}\"."
+        );
+        let err = crate::builtins::synth_error(h, &msg);
+        let code = h.new_str("ERR_UNHANDLED_REJECTION");
+        let name = h.new_str("UnhandledPromiseRejection");
+        if let Some(JsObj::Object(p)) = h.get_mut(&err) {
+            p.insert("code".into(), code);
+            p.insert("name".into(), name);
+        }
+        err
+    }))
 }
 
 /// Drain a settled promise's reactions into microtasks.

@@ -111,7 +111,10 @@ node --tiers script.js               # run it, then report which fusevm tiers to
 
 Errors go to stderr in terse `node: <reason>` form; nothing else is printed. A
 program that ran to completion exits with `process.exitCode` if it set one, and
-the `beforeExit`/`exit` events fire as they do in Node.
+the `beforeExit`/`exit` events fire as they do in Node. An uncaught exception
+(a top-level throw, a throwing timer or microtask, or an unhandled rejection) is
+offered to `process.on('uncaughtException')` and `uncaughtExceptionMonitor`
+first; a listener that throws exits 7.
 Runnable `examples/*.js` ship with the crate.
 
 ## [0x03] SUPPORTED TODAY
