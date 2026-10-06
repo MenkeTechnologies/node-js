@@ -79,9 +79,13 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // `console.dir` renders its first argument through the same inspector,
         // ignoring the (rarely-used) options argument.
         "dir" => {
-            let s = with_host(|h| h.inspect(&args.first().cloned().unwrap_or(Value::Undef)));
-            emit(&s, false);
-            Ok(Value::Undef)
+            match crate::host::inspect_js(&args.first().cloned().unwrap_or(Value::Undef)) {
+                Ok(s) => {
+                    emit(&s, false);
+                    Ok(Value::Undef)
+                }
+                Err(e) => Err(e),
+            }
         }
         // `console.trace` prints a "Trace:"-prefixed message to stderr. A full
         // captured stack is not attached here (no cheap synchronous stack source

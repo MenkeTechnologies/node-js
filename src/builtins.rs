@@ -2724,6 +2724,11 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     if ns == "util.promisify" && name == "custom" {
         return with_host(|h| h.symbol_for("nodejs.util.promisify.custom"));
     }
+    // `util.inspect.custom` — the registered symbol an object implements to
+    // supply its own `util.inspect` rendering.
+    if ns == "util.inspect" && name == "custom" {
+        return with_host(|h| h.symbol_for("nodejs.util.inspect.custom"));
+    }
     // `process.memoryUsage.rss()` — node's fast path for the one figure that
     // does not need the whole object built.
     if ns == "process.memoryUsage" && name == "rss" {

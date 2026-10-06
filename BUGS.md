@@ -2551,6 +2551,11 @@ and `examples/dates.js`.
 - **`AssertionError` carried no diff.** Node renders both operands and prints a
   line diff of the renderings; only two single-line operands take the
   `actual !== expected` form. Ported from `lib/internal/assert/myers_diff.js`.
+- **`[util.inspect.custom]` was never called, and `util.inspect.custom` was
+  `undefined`.** The inspect walk runs under a host borrow and cannot call JS,
+  so the custom methods in the subtree it will expand now run in a pre-pass
+  with node's `(depth, options, inspect)` arguments, and the walk substitutes
+  each answer (`parity-scripts/stdlib/39_inspect_custom.js`).
 - **`util.format` swallowed throws.** `%j` on a BigInt and `%d`/`%i`/`%f` on a
   value whose coercion reaches a Symbol are TypeErrors in node; each printed
   `undefined` or `NaN`. `parseInt`/`parseFloat` had the same root cause — they

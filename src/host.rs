@@ -4310,6 +4310,11 @@ impl JsHost {
         if !matches!(v, Value::Obj(_)) {
             return self.inspect_value(v, indent, st);
         }
+        match custom_render(v) {
+            Some(CustomRender::Text(s)) => return s.replace('\n', &format!("\n{}", " ".repeat(indent))),
+            Some(CustomRender::Value(r)) => return self.inspect_lvl(&r, indent, st),
+            None => {}
+        }
         if st.seen.iter().any(|p| self.strict_eq(p, v)) {
             return format!("[Circular *{}]", st.mark(self, v));
         }
@@ -5928,6 +5933,191 @@ fn str_to_number(s: &str) -> f64 {
         "-Infinity" => f64::NEG_INFINITY,
         _ => t.parse::<f64>().unwrap_or(f64::NAN),
     }
+}
+
+// ── `[util.inspect.custom]` ──────────────────────────────────────────────────
+//
+// The inspect walk runs under an immutable host borrow and cannot call into
+// JS, so an object's own `[util.inspect.custom](depth, options, inspect)` is
+// run in a PRE-PASS over the same subtree the walk will render, and the walk
+// substitutes each answer: a string is printed verbatim (its newlines indented
+// to the current level, as node's `formatValue` does), anything else is
+// rendered in the object's place. A method that returns the receiver itself
+// leaves it to the ordinary rendering.
+
+/// What a custom inspect method answered for one object.
+#[derive(Clone)]
+enum CustomRender {
+    Text(String),
+    Value(Value),
+}
+
+thread_local! {
+    static CUSTOM_RENDERS: RefCell<HashMap<u32, CustomRender>> = RefCell::new(HashMap::new());
+}
+
+fn custom_render(v: &Value) -> Option<CustomRender> {
+    let Value::Obj(id) = v else { return None };
+    CUSTOM_RENDERS.with(|m| m.borrow().get(id).cloned())
+}
+
+/// `h.inspect(v)` with every `[util.inspect.custom]` method in the rendered
+/// subtree run first. The entry point for every JS-facing render
+/// (`util.inspect`, `console.log`, `util.format`).
+pub fn inspect_js(v: &Value) -> Result<String, String> {
+    with_custom_renders(v, |h| h.inspect(v))
+}
+
+/// [`inspect_js`] for `console.log`'s argument form: a bare string prints raw.
+pub fn console_format_js(v: &Value) -> Result<String, String> {
+    with_custom_renders(v, |h| h.console_format(v))
+}
+
+fn with_custom_renders(v: &Value, render: impl FnOnce(&JsHost) -> String) -> Result<String, String> {
+    // A custom method may itself call `inspect`, so the outer render's
+    // answers are set aside and restored rather than shared.
+    let saved = CUSTOM_RENDERS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    let mut seen = HashSet::new();
+    let mut ctx = None;
+    let r = collect_custom_renders(v, 0, &mut seen, &mut ctx);
+    let out = r.map(|()| with_host(|h| render(h)));
+    CUSTOM_RENDERS.with(|m| *m.borrow_mut() = saved);
+    out
+}
+
+/// The `(options, inspect)` arguments node passes a custom method, built once
+/// per render: its user options with a colourless `stylize`, and `util.inspect`.
+fn custom_inspect_args() -> Result<(Value, Value), String> {
+    let stylize = crate::eval_in_global_scope("(function stylizeNoColor(str) { return str; })")?;
+    let depth = inspect_max_depth();
+    let opts = with_host(|h| {
+        let num = |n: i64| {
+            if n >= i64::MAX / 4 {
+                Value::Float(f64::INFINITY)
+            } else {
+                Value::Float(n as f64)
+            }
+        };
+        let max_array = inspect_max_array_length();
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert("stylize".into(), stylize);
+        m.insert("showHidden".into(), Value::Bool(inspect_show_hidden()));
+        m.insert("depth".into(), num(depth));
+        m.insert("colors".into(), Value::Bool(false));
+        m.insert("customInspect".into(), Value::Bool(true));
+        m.insert("showProxy".into(), Value::Bool(false));
+        m.insert(
+            "maxArrayLength".into(),
+            if max_array == usize::MAX {
+                Value::Float(f64::INFINITY)
+            } else {
+                Value::Float(max_array as f64)
+            },
+        );
+        m.insert("maxStringLength".into(), Value::Float(10000.0));
+        let bl = break_length();
+        m.insert(
+            "breakLength".into(),
+            if bl == usize::MAX {
+                Value::Float(f64::INFINITY)
+            } else {
+                Value::Float(bl as f64)
+            },
+        );
+        let compact = inspect_compact();
+        m.insert(
+            "compact".into(),
+            match compact {
+                0 => Value::Bool(false),
+                i64::MAX => Value::Bool(true),
+                n => Value::Float(n as f64),
+            },
+        );
+        m.insert("sorted".into(), Value::Bool(inspect_sorted()));
+        m.insert("getters".into(), Value::Bool(false));
+        m.insert("numericSeparator".into(), Value::Bool(false));
+        h.new_object(m)
+    });
+    let inspect = with_host(|h| h.alloc(JsObj::Builtin("util.inspect".into())));
+    Ok((opts, inspect))
+}
+
+/// Walk what the render will expand from `v` at nesting `level`, running each
+/// custom inspect method found and recording its answer.
+fn collect_custom_renders(
+    v: &Value,
+    level: i64,
+    seen: &mut HashSet<u32>,
+    ctx: &mut Option<(Value, Value)>,
+) -> Result<(), String> {
+    let Value::Obj(id) = v else { return Ok(()) };
+    if !inspect_custom() || !seen.insert(*id) {
+        return Ok(());
+    }
+    let skip = with_host(|h| is_primitive(h, v) || matches!(h.get(v), Some(JsObj::Proxy { .. })));
+    if skip {
+        return Ok(());
+    }
+    let key = with_host(|h| {
+        let sym = h.symbol_for("nodejs.util.inspect.custom");
+        h.property_key(&sym)
+    });
+    let method = crate::builtins::get_property(v, &key)?;
+    if with_host(|h| is_callable(h, &method)) {
+        if ctx.is_none() {
+            *ctx = Some(custom_inspect_args()?);
+        }
+        let (opts, inspect) = ctx.clone().unwrap_or((Value::Undef, Value::Undef));
+        let max = inspect_max_depth();
+        let depth = if max >= i64::MAX / 4 {
+            Value::Float(f64::INFINITY)
+        } else {
+            Value::Float((max - level) as f64)
+        };
+        let ret = invoke(&method, vec![depth, opts, inspect], Some(v.clone()))?;
+        if !with_host(|h| h.strict_eq(&ret, v)) {
+            let text = with_host(|h| match h.get(&ret) {
+                _ if matches!(ret, Value::Str(_)) => Some(h.str_of(&ret)),
+                Some(JsObj::Str(s)) => Some(s.clone()),
+                _ => None,
+            });
+            let render = match text {
+                Some(s) => CustomRender::Text(s),
+                None => {
+                    collect_custom_renders(&ret, level, seen, ctx)?;
+                    CustomRender::Value(ret)
+                }
+            };
+            CUSTOM_RENDERS.with(|m| m.borrow_mut().insert(*id, render));
+            return Ok(());
+        }
+    }
+    // Only a value the render EXPANDS has its children rendered.
+    if level > inspect_max_depth() {
+        return Ok(());
+    }
+    let children: Vec<Value> = with_host(|h| match h.get(v) {
+        Some(JsObj::Array(items)) => items.clone(),
+        Some(JsObj::Map { entries, .. }) => entries
+            .values()
+            .flat_map(|(k, val)| [k.clone(), val.clone()])
+            .collect(),
+        Some(JsObj::Set { entries, .. }) => entries.values().cloned().collect(),
+        Some(JsObj::Object(props)) => props
+            .iter()
+            .filter(|(k, _)| {
+                (!k.starts_with("@@") || h.symbol_of_key(k).is_some())
+                    && !k.starts_with('#')
+                    && h.prop_attrs(v, k).enumerable
+            })
+            .map(|(_, val)| val.clone())
+            .collect(),
+        _ => Vec::new(),
+    });
+    for c in &children {
+        collect_custom_renders(c, level + 1, seen, ctx)?;
+    }
+    Ok(())
 }
 
 /// `util.inspect` break length (the width past which entries wrap). Node's default.

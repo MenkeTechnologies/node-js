@@ -154,10 +154,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             crate::host::set_inspect_max_array_length(max_array_length);
             crate::host::set_inspect_custom(custom_inspect);
             crate::host::set_inspect_show_hidden(show_hidden);
-            let out = with_host(|h| {
-                let s = h.inspect(&args.first().cloned().unwrap_or(Value::Undef));
-                h.new_str(s)
-            });
+            let rendered = crate::host::inspect_js(&args.first().cloned().unwrap_or(Value::Undef));
+            let out = rendered.map(|s| with_host(|h| h.new_str(s)));
             crate::host::set_inspect_max_depth(2);
             crate::host::set_inspect_compact(3);
             crate::host::set_inspect_break_length(80);
@@ -165,7 +163,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             crate::host::set_inspect_max_array_length(crate::host::DEFAULT_MAX_ARRAY_LENGTH);
             crate::host::set_inspect_custom(true);
             crate::host::set_inspect_show_hidden(false);
-            Ok(out)
+            out
         }
         // `deprecate(fn, msg)`: return a callable that behaves like `fn`. The
         // house rule is no deprecation nags, so no warning is emitted — the
@@ -318,19 +316,18 @@ pub fn format(args: &[Value]) -> Result<String, String> {
     // Node: a single argument is returned as-is (no specifier processing) —
     // `util.format("100%% done")` === "100%% done".
     if args.len() == 1 {
-        return Ok(with_host(|h| h.console_format(&args[0])));
+        return crate::host::console_format_js(&args[0]);
     }
     let fmt = with_host(|h| h.str_of(&args[0]));
     // A non-string first argument: inspect everything, space-joined.
     if !matches!(args[0], Value::Str(_))
         && !with_host(|h| matches!(h.get(&args[0]), Some(JsObj::Str(_))))
     {
-        return Ok(with_host(|h| {
-            args.iter()
-                .map(|a| h.console_format(a))
-                .collect::<Vec<_>>()
-                .join(" ")
-        }));
+        return Ok(args
+            .iter()
+            .map(crate::host::console_format_js)
+            .collect::<Result<Vec<_>, _>>()?
+            .join(" "));
     }
 
     let mut out = String::new();
@@ -423,8 +420,9 @@ pub fn format(args: &[Value]) -> Result<String, String> {
                     out.push_str(&b);
                 } else if use_inspect {
                     crate::host::set_inspect_max_depth(0);
-                    let s = with_host(|h| h.inspect(arg));
+                    let s = crate::host::inspect_js(arg);
                     crate::host::set_inspect_max_depth(2);
+                    let s = s?;
                     out.push_str(&s);
                 } else {
                     // Full `ToPrimitive`, so a scripted `toString` actually runs;
@@ -486,14 +484,14 @@ pub fn format(args: &[Value]) -> Result<String, String> {
             // `[length]`, a typed array's window onto its buffer, and four levels
             // instead of two. Rendering both as the default inspect made `%o` a
             // silent alias of `%O`.
-            'O' => out.push_str(&with_host(|h| h.inspect(arg))),
+            'O' => out.push_str(&crate::host::inspect_js(arg)?),
             'o' => {
                 crate::host::set_inspect_show_hidden(true);
                 crate::host::set_inspect_max_depth(4);
-                let s = with_host(|h| h.inspect(arg));
+                let s = crate::host::inspect_js(arg);
                 crate::host::set_inspect_show_hidden(false);
                 crate::host::set_inspect_max_depth(2);
-                out.push_str(&s);
+                out.push_str(&s?);
             }
             'c' => {} // CSS directive: consumes the arg, emits nothing.
             _ => {}
@@ -502,7 +500,7 @@ pub fn format(args: &[Value]) -> Result<String, String> {
     // Append remaining arguments.
     for a in &args[ai..] {
         out.push(' ');
-        out.push_str(&with_host(|h| h.console_format(a)));
+        out.push_str(&crate::host::console_format_js(a)?);
     }
     Ok(out)
 }
