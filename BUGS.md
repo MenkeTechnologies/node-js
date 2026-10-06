@@ -1916,6 +1916,16 @@ One limit of the standard-input pump: its read blocks the event loop while the
 input has no data, so on an interactive terminal a timer that falls due meanwhile fires
 only once the next line arrives. Piped and redirected input is unaffected.
 
+## FIXED in round 12 — verified against node v26.10.0
+
+| was | now |
+| --- | --- |
+| an alias was a different function object from the method it aliases: `Array.prototype[Symbol.iterator] === Array.prototype.values`, `Set.prototype.keys === Set.prototype.values`, `Map.prototype[Symbol.iterator] === Map.prototype.entries`, `Date.prototype.toGMTString === Date.prototype.toUTCString` were all `false`, so a `Map` keyed by functions saw two entries; `String.prototype.trimLeft`/`trimRight` did not exist at all, and `%TypedArray%.prototype[Symbol.iterator]` read `undefined` although `getOwnPropertySymbols` listed it | each alias is the same function as its target (`===`, `Object.is`, Map/Set keys), the Annex B trims exist with `name` `trimStart`/`trimEnd`, and `%TypedArray%.prototype` owns `[Symbol.iterator]` (`parity-scripts/objects/17_intrinsic_aliases.js`) |
+| `Object.getOwnPropertyDescriptors` returned the string keys only, so a `[Symbol.toStringTag]` or `[Symbol.iterator]` member was dropped by the `Object.create(proto, getOwnPropertyDescriptors(src))` clone idiom | every key `[[OwnPropertyKeys]]` yields, strings then symbols, through a Proxy's traps as well (`parity-scripts/objects/18_own_descriptors_symbols.js`) |
+| a class method or accessor under a COMPUTED key was named `''`: `class C { [Symbol.iterator]() {} }` gave `''` where node gives `[Symbol.iterator]`, likewise `get [Symbol.split]` and `[k]()` (the object-literal form was already right) | SetFunctionName runs at class-definition time for a computed key: `[description]` for a symbol, `''` for a description-less one, the `get `/`set ` prefix for an accessor (`parity-scripts/lang/24_computed_method_names.js`) |
+| a symbol-keyed ACCESSOR leaked into the string-key listings under its internal spelling — `Object.getOwnPropertyNames({ get [Symbol.split]() {} })` was `[ '@@split' ]`, and `console.log` printed `'@@iterator': [Getter]` — and was missing from `Reflect.ownKeys`/`getOwnPropertySymbols` of a class prototype; the own keys of a function, a class or a class prototype kept creation order, so `static 2() {}` listed after `b` | a symbol accessor is a symbol key everywhere (printed `Symbol(…): [Getter]` after the string keys), and every listing puts the array-index keys first in ascending order (`parity-scripts/objects/19_own_key_order.js`) |
+| `util.inspect` of an array truncated at `maxArrayLength` laid out one column too few: `"x".repeat(200).split("")` printed 11 per row where node prints 12 | `groupArrayElements` averages over `output.length`, which counts the `... N more items` entry, as node does |
+
 ## Still open — found in round 7
 
 | gap | node v26.7.0 | node-js |

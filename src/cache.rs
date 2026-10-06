@@ -74,7 +74,9 @@ use std::path::PathBuf;
 ///     fourth argument naming the FuncDef that holds the class's span. A v11
 ///     blob has neither, so every function would print the `[code]` placeholder
 ///     from `Function.prototype.toString`.
-const SCHEMA: u64 = 12;
+/// v13: a class method/accessor under a COMPUTED key is named at run time
+///     (`NAMED_EVAL` before `DEF_MEMBER`); a v12 blob leaves it named `''`.
+const SCHEMA: u64 = 13;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

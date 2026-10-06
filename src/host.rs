@@ -2042,7 +2042,7 @@ impl JsHost {
     /// The own symbol-keyed property keys of `v` as SYMBOL values —
     /// `Object.getOwnPropertySymbols` / the symbol half of `Reflect.ownKeys`.
     pub fn own_symbol_keys(&self, v: &Value) -> Vec<Value> {
-        let keys: Vec<String> = match self.get(v) {
+        let mut keys: Vec<String> = match self.get(v) {
             Some(JsObj::Object(p)) => p.keys().cloned().collect(),
             // An Array/Function receiver has no property map: its non-index own
             // properties — symbol-keyed ones included — live in the fn-prop side
@@ -2050,7 +2050,29 @@ impl JsHost {
             Some(_) => self.fn_prop_keys(v),
             None => return Vec::new(),
         };
-        keys.iter().filter_map(|k| self.symbol_of_key(k)).collect()
+        // A symbol-keyed ACCESSOR is an own property too: it sits in the table
+        // as its ordering marker, or — defined on a class body — only in the
+        // accessor table, so `Reflect.ownKeys(C.prototype)` omitted the
+        // `Symbol.split` of `class C { get [Symbol.split]() {} }`.
+        for k in keys.iter_mut() {
+            if let Some(real) = k.strip_prefix(ORD_MARKER) {
+                *k = real.to_string();
+            }
+        }
+        for k in self.own_accessor_keys(v) {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        keys.iter()
+            .filter(|k| {
+                let fresh = !seen.contains(&k.as_str());
+                seen.push(k);
+                fresh
+            })
+            .filter_map(|k| self.symbol_of_key(k))
+            .collect()
     }
 
     /// The own SYMBOL-keyed enumerable `(internal key, value)` pairs of `v` —
@@ -4957,6 +4979,9 @@ impl JsHost {
                         .collect();
                     shown.extend(props.iter().filter_map(
                         |(k, val)| match k.strip_prefix(ORD_MARKER) {
+                            // A SYMBOL-keyed accessor is listed with the other
+                            // symbol keys below, after every string key.
+                            Some(real) if is_symbol_key(real) => None,
                             Some(real) => {
                                 let attrs = self.prop_attrs(v, real);
                                 let label = match self.own_accessor(v, real)? {
@@ -4991,7 +5016,27 @@ impl JsHost {
                             shown.push(((*name).to_string(), Ok(val)));
                         }
                     }
+                    // Symbol keys, data and accessor alike, in insertion order.
+                    // An accessor's ordering marker resolves back to its symbol;
+                    // without this arm `{ get [Symbol.iterator]() {} }` printed
+                    // its getter under the internal `'@@iterator'` spelling.
                     shown.extend(props.iter().filter_map(|(k, val)| {
+                        if let Some(real) = k.strip_prefix(ORD_MARKER) {
+                            let sym = self.symbol_of_key(real)?;
+                            if !self.prop_attrs(v, real).enumerable {
+                                return None;
+                            }
+                            let label = match self.own_accessor(v, real)? {
+                                (Some(_), Some(_)) => "Getter/Setter",
+                                (Some(_), None) => "Getter",
+                                (None, Some(_)) => "Setter",
+                                (None, None) => return None,
+                            };
+                            return Some((
+                                self.inspect(&sym),
+                                Err((label, getter_render(v, real))),
+                            ));
+                        }
                         let sym = self.symbol_of_key(k)?;
                         self.prop_attrs(v, k)
                             .enumerable
@@ -6440,7 +6485,11 @@ fn group_array_elements(
         return (output.to_vec(), false);
     }
     let approx_char_heights = 2.5f64;
-    let average_bias = (actual_max as f64 - total_length as f64 / output_length as f64).sqrt();
+    // Node divides by `output.length` here, NOT `outputLength`: the
+    // `... N more items` tail counts toward the average even though it was
+    // dropped from the totals, which shifts the column count of a truncated
+    // array (`"x".repeat(200).split("")` lays out 12 columns, not 11).
+    let average_bias = (actual_max as f64 - total_length as f64 / output.len() as f64).sqrt();
     let biased_max = (actual_max as f64 - 3.0 - average_bias).max(1.0);
     // Ideally a square grid; capped by break length, compact*4, and 15 columns.
     let columns = [
@@ -6747,7 +6796,22 @@ impl JsHost {
                 keys.push(k);
             }
         }
-        keys
+        // Only STRING keys belong here. An accessor resolved from its ordering
+        // marker or from the accessor table may be symbol-keyed, and listing it
+        // leaked the internal spelling: `Object.getOwnPropertyNames` of
+        // `{ get [Symbol.split]() {} }` reported `'@@split'`.
+        keys.retain(|k| !k.starts_with("@@") && !k.starts_with('#'));
+        // OrdinaryOwnPropertyKeys (10.1.11.1): every array-index key first, in
+        // ascending numeric order, then the other string keys in creation
+        // order. A function's or class's own keys (`static 2() {}`,
+        // `f[0] = 1`) and a class prototype's methods kept creation order. The
+        // partition is stable, so a listing that is already ordered (an
+        // array's indices, then `length`) comes through unchanged.
+        let (mut ordered, rest): (Vec<String>, Vec<String>) =
+            keys.into_iter().partition(|k| array_index(k).is_some());
+        ordered.sort_by_key(|k| array_index(k));
+        ordered.extend(rest);
+        ordered
     }
 
     /// The keys that own a slot in the object's property map, in insertion
@@ -9781,10 +9845,21 @@ impl JsHost {
                 }
                 self.hide_prop(&proto, "BYTES_PER_ELEMENT");
             }
-            for m in methods {
+            // The intermediate also owns `[Symbol.iterator]` (the same function
+            // as its `values`): the generated table lists it, and
+            // `getOwnPropertySymbols` already reported it, but the READ found
+            // no entry and answered `undefined`.
+            let symbol_methods = match ctor {
+                "TypedArray" => crate::builtins::proto_symbol_methods(ctor)
+                    .into_iter()
+                    .filter(|m| *m == "@@iterator")
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for m in methods.iter().copied().chain(symbol_methods) {
                 let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
                 if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
-                    p.insert((*m).to_string(), thunk);
+                    p.insert(m.to_string(), thunk);
                 }
                 self.hide_prop(&proto, m);
             }
@@ -11087,10 +11162,31 @@ pub fn this_before_super_error() -> String {
 /// defines as the SAME function object compare `===`: `Number.parseInt` is
 /// `%parseInt%` (21.1.2.13) and `Number.parseFloat` is `%parseFloat%`
 /// (21.1.2.12), so `Number.parseInt === parseInt` is `true`.
-fn builtin_identity(name: &str) -> &str {
+///
+/// A prototype ALIAS is the same: `String.prototype.trimLeft` IS `trimStart`,
+/// `Set.prototype.keys` IS `values`, `Date.prototype.toGMTString` IS
+/// `toUTCString`, and each `[Symbol.iterator]` the spec defines as an existing
+/// method (`Array.prototype[@@iterator]` is `values`) is that method. The
+/// generated arity table already records each alias by the name of the function
+/// it aliases, so an `@proto:` key whose table name is a plain identifier other
+/// than its own last segment resolves to that sibling. A table name in brackets
+/// (`[Symbol.iterator]`) is a function of its own, not an alias.
+fn builtin_identity(name: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     match name {
-        "Number.parseInt" => "parseInt",
-        "Number.parseFloat" => "parseFloat",
-        _ => name,
+        "Number.parseInt" => return Cow::Borrowed("parseInt"),
+        "Number.parseFloat" => return Cow::Borrowed("parseFloat"),
+        _ => {}
     }
+    if let Some((ctor, member)) = name
+        .strip_prefix("@proto:")
+        .and_then(|rest| rest.rsplit_once(':'))
+    {
+        if let Some((aliased, _)) = crate::builtins::builtin_meta(name) {
+            if aliased != member && !aliased.starts_with('[') {
+                return Cow::Owned(format!("@proto:{ctor}:{aliased}"));
+            }
+        }
+    }
+    Cow::Borrowed(name)
 }

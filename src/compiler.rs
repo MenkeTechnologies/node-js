@@ -2300,15 +2300,40 @@ impl Compiler {
                         MemberKind::Set => member::SET,
                         _ => member::METHOD,
                     };
+                    let static_op = if m.is_static {
+                        Op::LoadTrue
+                    } else {
+                        Op::LoadFalse
+                    };
+                    // A COMPUTED key is only known at run time, so the method is
+                    // named there (SetFunctionName via `NAMED_EVAL`): a symbol
+                    // key gives `[description]`, so `class C { [Symbol.iterator]()
+                    // {} }` is named `[Symbol.iterator]`, not `''`.
+                    // [class, key] Dup kind fn -> NAMED_EVAL -> [class, key, fn]
+                    // kind static -> [class, key, fn, kind, static]
+                    // Rot -> [class, key, kind, static, fn]
+                    if m.computed {
+                        let def_id = self.build_function(
+                            "",
+                            &m.params,
+                            &m.body,
+                            m.is_generator,
+                            m.is_async,
+                        )?;
+                        self.functions[def_id].1.is_method = true;
+                        self.functions[def_id].1.span = m.span;
+                        b.emit(Op::Dup, 0);
+                        b.emit(Op::LoadInt(kind), 0);
+                        self.emit_mkfunc(b, def_id);
+                        b.emit(Op::CallBuiltin(ops::NAMED_EVAL, 3), 0);
+                        b.emit(Op::LoadInt(kind), 0);
+                        b.emit(static_op, 0);
+                        b.emit(Op::Rot, 0);
+                        b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0);
+                        continue;
+                    }
                     b.emit(Op::LoadInt(kind), 0);
-                    b.emit(
-                        if m.is_static {
-                            Op::LoadTrue
-                        } else {
-                            Op::LoadFalse
-                        },
-                        0,
-                    );
+                    b.emit(static_op, 0);
                     // 10.2.9 step 4: an accessor's function name carries the
                     // `get `/`set ` prefix — `class C { get gg(){} }` gives
                     // `get gg`, not `gg`.

@@ -9777,6 +9777,10 @@ pub(crate) const STRING_PROTO_METHODS: &[&str] = &[
     "trim",
     "trimStart",
     "trimEnd",
+    // Annex B legacy aliases: the same function objects as `trimStart` and
+    // `trimEnd` (see `host::builtin_identity`).
+    "trimLeft",
+    "trimRight",
     "replace",
     "replaceAll",
     "repeat",
@@ -11949,8 +11953,8 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         "toWellFormed" => Ok(new_s(s.to_string())),
         // The JS `WhiteSpace` set, not Rust's — they differ on `U+FEFF`.
         "trim" => Ok(new_s(crate::utf16::js_trim(s).to_string())),
-        "trimStart" => Ok(new_s(crate::utf16::js_trim_start(s).to_string())),
-        "trimEnd" => Ok(new_s(crate::utf16::js_trim_end(s).to_string())),
+        "trimStart" | "trimLeft" => Ok(new_s(crate::utf16::js_trim_start(s).to_string())),
+        "trimEnd" | "trimRight" => Ok(new_s(crate::utf16::js_trim_end(s).to_string())),
         "toString" | "valueOf" => Ok(new_s(s.to_string())),
         "charAt" => {
             let at = unit_pos(arg_num(&args, 0)).and_then(|i| u.unit_str(i));
@@ -14389,21 +14393,24 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
     }
 }
 
-/// `Object.getOwnPropertyDescriptors(obj)` — the descriptor of every own string
-/// key, keyed by name. `Object.create(proto, getOwnPropertyDescriptors(src))` is
-/// the standard "clone with accessors intact" idiom, so this must agree
-/// key-for-key with `getOwnPropertyNames`.
+/// `Object.getOwnPropertyDescriptors(obj)` (§20.1.2.9) — the descriptor of
+/// every key `[[OwnPropertyKeys]]` yields: the string keys in
+/// `getOwnPropertyNames` order, then the symbol keys.
+/// `Object.create(proto, getOwnPropertyDescriptors(src))` is the standard
+/// "clone with accessors intact" idiom, so a `[Symbol.toStringTag]` or
+/// `[Symbol.iterator]` member must survive it too.
 fn object_get_own_descriptors(args: Vec<Value>) -> Result<Value, String> {
     let obj = arg0(&args);
     let names = object_keys(vec![obj.clone()], 3)?;
-    let keys: Vec<String> = with_host(|h| match h.get(&names) {
-        Some(JsObj::Array(items)) => items.iter().map(|k| h.str_of(k)).collect(),
+    let mut keys: Vec<Value> = with_host(|h| match h.get(&names) {
+        Some(JsObj::Array(items)) => items.clone(),
         _ => Vec::new(),
     });
+    keys.extend(proxy_or_own_symbol_keys(&obj)?);
     let mut out: IndexMap<String, Value> = IndexMap::new();
-    for k in keys {
-        let ks = with_host(|h| h.new_str(k.clone()));
-        let d = object_get_own_descriptor(vec![obj.clone(), ks])?;
+    for key in keys {
+        let k = host::to_property_key(&key)?;
+        let d = object_get_own_descriptor(vec![obj.clone(), key])?;
         if !matches!(d, Value::Undef) {
             out.insert(k, d);
         }
