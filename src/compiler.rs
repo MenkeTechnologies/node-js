@@ -462,7 +462,102 @@ fn callee_text(e: &Expr) -> Option<String> {
         Expr::False => "false".into(),
         Expr::Null => "null".into(),
         Expr::Undefined => "undefined".into(),
-        Expr::Array(items) if items.is_empty() => "[]".into(),
+        // V8's parser folds `-<number>` into one literal, so it prints bare.
+        Expr::Unary(UnOp::Neg, inner) if matches!(**inner, Expr::Number(_)) => match **inner {
+            Expr::Number(n) => crate::host::fmt_number(-n),
+            _ => return None,
+        },
+        Expr::Regex(body, flags) => format!("/{body}/{flags}"),
+        // `CallPrinter::VisitArrayLiteral`: the elements comma-joined with no
+        // space, a hole empty, a spread parenthesized.
+        Expr::Array(items) => {
+            let parts: Option<Vec<String>> = items
+                .iter()
+                .map(|item| match item {
+                    Expr::Hole => Some(String::new()),
+                    Expr::Spread(inner) => Some(format!("(...{})", callee_text(inner)?)),
+                    other => callee_text(other),
+                })
+                .collect();
+            format!("[{}]", parts?.join(","))
+        }
+        // A template with no substitutions is a string literal to V8. One with
+        // a single substitution prints just that substitution (`` `a${n}b` ``
+        // is reported as `n`).
+        Expr::Template { quasis, exprs } if exprs.is_empty() => {
+            format!("\"{}\"", quasis.concat())
+        }
+        Expr::Template { exprs, .. } if exprs.len() == 1 => callee_text(&exprs[0])?,
+        // Values V8 does not print from source: a function, arrow or class
+        // literal, a `new` expression, a BigInt literal.
+        Expr::Function { .. } | Expr::Class(_) | Expr::New { .. } | Expr::BigInt(_) => {
+            "(intermediate value)".into()
+        }
+        // A conditional is three unprinted values in a row.
+        Expr::Conditional { .. } => {
+            "(intermediate value)(intermediate value)(intermediate value)".into()
+        }
+        // An assignment is reported by its TARGET: `(o.a = 1)()` is `o.a`.
+        Expr::Assign { target, .. } => callee_text(target)?,
+        Expr::Unary(op, inner) => {
+            let op = match op {
+                UnOp::Neg => "-",
+                UnOp::Pos => "+",
+                UnOp::Not => "!",
+                UnOp::BitNot => "~",
+                UnOp::TypeOf => "typeof ",
+                UnOp::Void => "void ",
+                UnOp::Delete => "delete ",
+            };
+            format!("({op}{})", callee_text(inner)?)
+        }
+        Expr::Update { op, prefix, target } => {
+            let op = match op {
+                UpdateOp::Inc => "++",
+                UpdateOp::Dec => "--",
+            };
+            let t = callee_text(target)?;
+            if *prefix {
+                format!("({op}{t})")
+            } else {
+                format!("({t}{op})")
+            }
+        }
+        Expr::Binary(op, l, r) => {
+            let op = match op {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                BinOp::Mod => "%",
+                BinOp::Pow => "**",
+                BinOp::Lt => "<",
+                BinOp::Le => "<=",
+                BinOp::Gt => ">",
+                BinOp::Ge => ">=",
+                BinOp::EqEqEq => "===",
+                BinOp::NeEqEq => "!==",
+                BinOp::EqEq => "==",
+                BinOp::NeEq => "!=",
+                BinOp::BitAnd => "&",
+                BinOp::BitOr => "|",
+                BinOp::BitXor => "^",
+                BinOp::Shl => "<<",
+                BinOp::Shr => ">>",
+                BinOp::UShr => ">>>",
+                BinOp::In => "in",
+                BinOp::InstanceOf => "instanceof",
+            };
+            format!("({} {op} {})", callee_text(l)?, callee_text(r)?)
+        }
+        Expr::Logical(op, l, r) => {
+            let op = match op {
+                LogicalOp::And => "&&",
+                LogicalOp::Or => "||",
+                LogicalOp::Nullish => "??",
+            };
+            format!("({} {op} {})", callee_text(l)?, callee_text(r)?)
+        }
         Expr::Object(props) if props.is_empty() => "{}".into(),
         // A non-empty OBJECT literal is the one shape V8 will not render from
         // source: `({a: 1})()` is `{(intermediate value)} is not a function`,
@@ -484,13 +579,17 @@ fn callee_text(e: &Expr) -> Option<String> {
             optional,
         } => {
             let obj = callee_text(object)?;
-            // A string-literal key that is a plain identifier prints as a dot
-            // access, exactly as node reports it.
-            if let Expr::Str(k) = &**index {
-                if is_identifier(k) {
-                    let dot = if *optional { "?." } else { "." };
-                    return Some(format!("{obj}{dot}{k}"));
-                }
+            // A string-literal key prints as a dot access whatever it spells —
+            // V8 reports `o["has space"]` as `o.has space` and `o["5"]` as `o.5`.
+            // A substitution-free template is a string literal too.
+            let literal = match &**index {
+                Expr::Str(k) => Some(k.clone()),
+                Expr::Template { quasis, exprs } if exprs.is_empty() => Some(quasis.concat()),
+                _ => None,
+            };
+            if let Some(k) = literal {
+                let dot = if *optional { "?." } else { "." };
+                return Some(format!("{obj}{dot}{k}"));
             }
             let idx = callee_text(index)?;
             let open = if *optional { "?.[" } else { "[" };
@@ -499,23 +598,16 @@ fn callee_text(e: &Expr) -> Option<String> {
         // V8 prints a call in a callee position as `f(...)`, whatever its
         // arguments were: `require('fs').nope()` reports `require(...).nope`.
         Expr::Call { func, .. } => format!("{}(...)", callee_text(func)?),
+        // A one-element sequence is the parser's marker for a PARENTHESIZED
+        // optional chain, which V8 does not print: `(o?.a).b()` reports
+        // `(intermediate value).b`.
+        Expr::Sequence(items) if items.len() == 1 => "(intermediate value)".into(),
         Expr::Sequence(items) => {
             let parts: Option<Vec<String>> = items.iter().map(callee_text).collect();
             format!("({})", parts?.join(" , "))
         }
         _ => return None,
     })
-}
-
-/// Whether `s` can be written after a `.` — the test that decides whether a
-/// string-literal computed access prints in dot form.
-fn is_identifier(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 fn argc(n: usize) -> Result<u8, String> {

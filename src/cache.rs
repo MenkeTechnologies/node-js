@@ -76,7 +76,10 @@ use std::path::PathBuf;
 ///     from `Function.prototype.toString`.
 /// v13: a class method/accessor under a COMPUTED key is named at run time
 ///     (`NAMED_EVAL` before `DEF_MEMBER`); a v12 blob leaves it named `''`.
-const SCHEMA: u64 = 13;
+/// v14: the call-site side table prints more callee shapes (operators, array
+///     literals, templates, `(intermediate value)`); a v13 entry carries the
+///     old texts.
+const SCHEMA: u64 = 14;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
