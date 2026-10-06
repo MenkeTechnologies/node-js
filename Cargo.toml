@@ -159,7 +159,10 @@ ctr = "0.9"
 cipher = "0.4"
 subtle = "2.6"
 # dns: real recursive/system-config DNS resolution (resolve4/6/Mx/Txt/Cname/…).
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
+# hickory 0.25+ is async-only; each DNS worker thread drives its query on a
+# current-thread runtime.
+tokio = { version = "1", features = ["rt", "net", "time"] }
 
 # ── crypto (asymmetric): real RustCrypto backends for the `crypto` module ─────
 # RSA (keygen/sign/verify/OAEP+PKCS1), NIST P-256/P-384 ECDSA+ECDH, Ed25519,

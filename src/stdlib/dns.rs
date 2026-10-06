@@ -3,7 +3,8 @@
 //! `dns.lookup`/`dns.promises.lookup` use the platform resolver (`getaddrinfo`,
 //! via `std::net::ToSocketAddrs`) exactly like Node — they honour `/etc/hosts`.
 //! Every `resolve*`/`reverse` method is a real DNS query issued through
-//! `hickory_resolver`'s blocking `Resolver`. Because Node runs its DNS callbacks
+//! `hickory_resolver`'s `TokioResolver`, driven to completion on a current-thread
+//! Tokio runtime (`BlockingResolver`). Because Node runs its DNS callbacks
 //! asynchronously, each query runs on a dedicated `std::thread`; when it finishes
 //! it posts an `IoTask` back to the main thread which builds the JS record values
 //! and fires the Node-style `(err, records)` callback (or settles the Promise).
@@ -16,12 +17,12 @@
 use super::arg_str;
 use crate::host::{with_host, JsObj};
 use fusevm::Value;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::error::{ResolveError, ResolveErrorKind};
-use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::rdata::caa::{Property as CaaProperty, Value as CaaValue};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, GOOGLE};
+use hickory_resolver::lookup::Lookup;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::rr::{Name, RData, RecordType};
-use hickory_resolver::Resolver;
+use hickory_resolver::TokioResolver;
 use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -425,13 +426,12 @@ fn run_lookup_service(
 ) -> Result<(String, String), String> {
     let ip: IpAddr = addr.parse().map_err(|_| "EINVAL".to_string())?;
     let resolver = build_resolver(servers)?;
-    let lookup = resolver
-        .reverse_lookup(ip)
-        .map_err(|e| err_code(&e).to_string())?;
-    let host = lookup
-        .iter()
-        .next()
-        .map(|n| name_str(n))
+    let lookup = resolver.run(resolver.r.reverse_lookup(ip))?;
+    let host = rdata(&lookup)
+        .find_map(|d| match d {
+            RData::PTR(p) => Some(name_str(p)),
+            _ => None,
+        })
         .ok_or_else(|| "ENOTFOUND".to_string())?;
     Ok((host, port_service(port as u16)))
 }
@@ -723,46 +723,55 @@ enum AnyRec {
 }
 
 fn run_query(q: Query, name: &str, servers: Option<&[String]>) -> Result<DnsResult, String> {
-    let r = build_resolver(servers)?;
-    let ec = |e: ResolveError| err_code(&e).to_string();
+    let br = build_resolver(servers)?;
+    let r = &br.r;
     match q {
         Query::A => {
-            let l = r.ipv4_lookup(name).map_err(ec)?;
+            let l = br.run(r.ipv4_lookup(name))?;
             Ok(DnsResult::Strings(
-                l.iter().map(|a| a.to_string()).collect(),
+                rdata(&l)
+                    .filter_map(|d| match d {
+                        RData::A(a) => Some(a.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
             ))
         }
         Query::Aaaa => {
-            let l = r.ipv6_lookup(name).map_err(ec)?;
+            let l = br.run(r.ipv6_lookup(name))?;
             Ok(DnsResult::Strings(
-                l.iter().map(|a| a.to_string()).collect(),
+                rdata(&l)
+                    .filter_map(|d| match d {
+                        RData::AAAA(a) => Some(a.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
             ))
         }
         Query::Mx => {
-            let l = r.mx_lookup(name).map_err(ec)?;
+            let l = br.run(r.mx_lookup(name))?;
             Ok(DnsResult::Mx(
-                l.iter()
-                    .map(|m| (m.preference(), name_str(m.exchange())))
+                rdata(&l)
+                    .filter_map(|d| match d {
+                        RData::MX(m) => Some((m.preference, name_str(&m.exchange))),
+                        _ => None,
+                    })
                     .collect(),
             ))
         }
         Query::Txt => {
-            let l = r.txt_lookup(name).map_err(ec)?;
-            let entries = l
-                .iter()
-                .map(|t| {
-                    t.txt_data()
-                        .iter()
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .collect()
+            let l = br.run(r.txt_lookup(name))?;
+            let entries = rdata(&l)
+                .filter_map(|d| match d {
+                    RData::TXT(t) => Some(txt_chunks(t)),
+                    _ => None,
                 })
                 .collect();
             Ok(DnsResult::Txt(entries))
         }
         Query::Cname => {
-            let l = r.lookup(name, RecordType::CNAME).map_err(ec)?;
-            let names = l
-                .iter()
+            let l = br.run(r.lookup(name, RecordType::CNAME))?;
+            let names = rdata(&l)
                 .filter_map(|d| match d {
                     RData::CNAME(c) => Some(name_str(c)),
                     _ => None,
@@ -771,13 +780,18 @@ fn run_query(q: Query, name: &str, servers: Option<&[String]>) -> Result<DnsResu
             Ok(DnsResult::Strings(names))
         }
         Query::Ns => {
-            let l = r.ns_lookup(name).map_err(ec)?;
-            Ok(DnsResult::Strings(l.iter().map(|n| name_str(n)).collect()))
+            let l = br.run(r.ns_lookup(name))?;
+            let names = rdata(&l)
+                .filter_map(|d| match d {
+                    RData::NS(n) => Some(name_str(n)),
+                    _ => None,
+                })
+                .collect();
+            Ok(DnsResult::Strings(names))
         }
         Query::Ptr => {
-            let l = r.lookup(name, RecordType::PTR).map_err(ec)?;
-            let names = l
-                .iter()
+            let l = br.run(r.lookup(name, RecordType::PTR))?;
+            let names = rdata(&l)
                 .filter_map(|d| match d {
                     RData::PTR(p) => Some(name_str(p)),
                     _ => None,
@@ -786,18 +800,28 @@ fn run_query(q: Query, name: &str, servers: Option<&[String]>) -> Result<DnsResu
             Ok(DnsResult::Strings(names))
         }
         Query::Srv => {
-            let l = r.srv_lookup(name).map_err(ec)?;
-            Ok(DnsResult::Srv(l.iter().map(srv_rec).collect()))
+            let l = br.run(r.srv_lookup(name))?;
+            let recs = rdata(&l)
+                .filter_map(|d| match d {
+                    RData::SRV(s) => Some(srv_rec(s)),
+                    _ => None,
+                })
+                .collect();
+            Ok(DnsResult::Srv(recs))
         }
         Query::Soa => {
-            let l = r.soa_lookup(name).map_err(ec)?;
-            let soa = l.iter().next().ok_or_else(|| "ENODATA".to_string())?;
-            Ok(DnsResult::Soa(soa_rec(soa)))
+            let l = br.run(r.soa_lookup(name))?;
+            let soa = rdata(&l)
+                .find_map(|d| match d {
+                    RData::SOA(s) => Some(soa_rec(s)),
+                    _ => None,
+                })
+                .ok_or_else(|| "ENODATA".to_string())?;
+            Ok(DnsResult::Soa(soa))
         }
         Query::Naptr => {
-            let l = r.lookup(name, RecordType::NAPTR).map_err(ec)?;
-            let recs = l
-                .iter()
+            let l = br.run(r.lookup(name, RecordType::NAPTR))?;
+            let recs = rdata(&l)
                 .filter_map(|d| match d {
                     RData::NAPTR(n) => Some(naptr_rec(n)),
                     _ => None,
@@ -806,9 +830,8 @@ fn run_query(q: Query, name: &str, servers: Option<&[String]>) -> Result<DnsResu
             Ok(DnsResult::Naptr(recs))
         }
         Query::Caa => {
-            let l = r.lookup(name, RecordType::CAA).map_err(ec)?;
-            let recs = l
-                .iter()
+            let l = br.run(r.lookup(name, RecordType::CAA))?;
+            let recs = rdata(&l)
                 .filter_map(|d| match d {
                     RData::CAA(c) => Some(caa_rec(c)),
                     _ => None,
@@ -817,120 +840,136 @@ fn run_query(q: Query, name: &str, servers: Option<&[String]>) -> Result<DnsResu
             Ok(DnsResult::Caa(recs))
         }
         Query::Tlsa => {
-            let l = r.tlsa_lookup(name).map_err(ec)?;
-            let recs = l
-                .iter()
-                .map(|t| TlsaRec {
-                    cert_usage: t.cert_usage().into(),
-                    selector: t.selector().into(),
-                    matching: t.matching().into(),
-                    data: t.cert_data().to_vec(),
+            let l = br.run(r.tlsa_lookup(name))?;
+            let recs = rdata(&l)
+                .filter_map(|d| match d {
+                    RData::TLSA(t) => Some(TlsaRec {
+                        cert_usage: t.cert_usage.into(),
+                        selector: t.selector.into(),
+                        matching: t.matching.into(),
+                        data: t.cert_data.clone(),
+                    }),
+                    _ => None,
                 })
                 .collect();
             Ok(DnsResult::Tlsa(recs))
         }
         Query::Any => {
-            let l = r.lookup(name, RecordType::ANY).map_err(ec)?;
-            let recs = l.records().iter().filter_map(any_rec).collect();
+            let l = br.run(r.lookup(name, RecordType::ANY))?;
+            let recs = l.answers().iter().filter_map(any_rec).collect();
             Ok(DnsResult::Any(recs))
         }
         Query::Reverse => {
             let ip: IpAddr = name.parse().map_err(|_| "EINVAL".to_string())?;
-            let l = r.reverse_lookup(ip).map_err(ec)?;
-            Ok(DnsResult::Strings(l.iter().map(|n| name_str(n)).collect()))
+            let l = br.run(r.reverse_lookup(ip))?;
+            let names = rdata(&l)
+                .filter_map(|d| match d {
+                    RData::PTR(p) => Some(name_str(p)),
+                    _ => None,
+                })
+                .collect();
+            Ok(DnsResult::Strings(names))
         }
     }
 }
 
 // ── record → plain-data extractors (worker thread) ───────────────────────────
 
+/// The record data of every answer in `l`. Callers keep only the variant they
+/// asked for, so CNAME-chain records in the answer section are skipped.
+fn rdata(l: &Lookup) -> impl Iterator<Item = &RData> {
+    l.answers().iter().map(|rec| &rec.data)
+}
+
 fn name_str(n: &Name) -> String {
     n.to_ascii().trim_end_matches('.').to_string()
 }
 
+fn txt_chunks(t: &hickory_resolver::proto::rr::rdata::TXT) -> Vec<String> {
+    t.txt_data
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect()
+}
+
 fn srv_rec(s: &hickory_resolver::proto::rr::rdata::SRV) -> SrvRec {
     SrvRec {
-        priority: s.priority(),
-        weight: s.weight(),
-        port: s.port(),
-        name: name_str(s.target()),
+        priority: s.priority,
+        weight: s.weight,
+        port: s.port,
+        name: name_str(&s.target),
     }
 }
 
 fn soa_rec(s: &hickory_resolver::proto::rr::rdata::SOA) -> SoaRec {
     SoaRec {
-        nsname: name_str(s.mname()),
-        hostmaster: name_str(s.rname()),
-        serial: s.serial(),
-        refresh: s.refresh(),
-        retry: s.retry(),
-        expire: s.expire(),
-        minttl: s.minimum(),
+        nsname: name_str(&s.mname),
+        hostmaster: name_str(&s.rname),
+        serial: s.serial,
+        refresh: s.refresh,
+        retry: s.retry,
+        expire: s.expire,
+        minttl: s.minimum,
     }
 }
 
 fn naptr_rec(n: &hickory_resolver::proto::rr::rdata::NAPTR) -> NaptrRec {
     NaptrRec {
-        flags: String::from_utf8_lossy(n.flags()).into_owned(),
-        service: String::from_utf8_lossy(n.services()).into_owned(),
-        regexp: String::from_utf8_lossy(n.regexp()).into_owned(),
-        replacement: name_str(n.replacement()),
-        order: n.order(),
-        preference: n.preference(),
+        flags: String::from_utf8_lossy(&n.flags).into_owned(),
+        service: String::from_utf8_lossy(&n.services).into_owned(),
+        regexp: String::from_utf8_lossy(&n.regexp).into_owned(),
+        replacement: name_str(&n.replacement),
+        order: n.order,
+        preference: n.preference,
     }
 }
 
 fn caa_rec(c: &hickory_resolver::proto::rr::rdata::CAA) -> CaaRec {
     CaaRec {
-        critical: if c.issuer_critical() { 128 } else { 0 },
-        tag: caa_tag(c.tag()),
-        value: caa_value(c.value()),
+        critical: if c.issuer_critical { 128 } else { 0 },
+        tag: c.tag.clone(),
+        value: caa_value(c),
     }
 }
 
-fn caa_tag(p: &CaaProperty) -> String {
-    match p {
-        CaaProperty::Issue => "issue".into(),
-        CaaProperty::IssueWild => "issuewild".into(),
-        CaaProperty::Iodef => "iodef".into(),
-        CaaProperty::Unknown(s) => s.clone(),
-    }
-}
-
-fn caa_value(v: &CaaValue) -> String {
-    match v {
-        CaaValue::Issuer(name, kvs) => {
-            let mut s = name.as_ref().map(name_str).unwrap_or_default();
-            for kv in kvs {
-                s.push_str("; ");
-                s.push_str(kv.key());
-                s.push('=');
-                s.push_str(kv.value());
+/// `issue`/`issuewild` values are re-rendered as `issuer; key=value…`;
+/// `iodef` as its URL; anything unparsable or unknown as the raw bytes.
+fn caa_value(c: &hickory_resolver::proto::rr::rdata::CAA) -> String {
+    let raw = || String::from_utf8_lossy(&c.value).into_owned();
+    match c.tag.to_ascii_lowercase().as_str() {
+        "issue" | "issuewild" => match c.value_as_issue() {
+            Ok((name, kvs)) => {
+                let mut s = name.as_ref().map(name_str).unwrap_or_default();
+                for kv in &kvs {
+                    s.push_str("; ");
+                    s.push_str(kv.key());
+                    s.push('=');
+                    s.push_str(kv.value());
+                }
+                s
             }
-            s
-        }
-        CaaValue::Url(u) => u.to_string(),
-        CaaValue::Unknown(b) => String::from_utf8_lossy(b).into_owned(),
+            Err(_) => raw(),
+        },
+        "iodef" => c
+            .value_as_iodef()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| raw()),
+        _ => raw(),
     }
 }
 
 /// Map one record from an `ANY` response to its `AnyRec`, skipping unmodelled
 /// record types.
 fn any_rec(rec: &hickory_resolver::proto::rr::Record) -> Option<AnyRec> {
-    let ttl = rec.ttl();
-    Some(match rec.data()? {
+    let ttl = rec.ttl;
+    Some(match &rec.data {
         RData::A(a) => AnyRec::A(a.to_string(), ttl),
         RData::AAAA(a) => AnyRec::Aaaa(a.to_string(), ttl),
         RData::CNAME(c) => AnyRec::Cname(name_str(c)),
-        RData::MX(m) => AnyRec::Mx(m.preference(), name_str(m.exchange())),
+        RData::MX(m) => AnyRec::Mx(m.preference, name_str(&m.exchange)),
         RData::NS(n) => AnyRec::Ns(name_str(n)),
         RData::PTR(p) => AnyRec::Ptr(name_str(p)),
-        RData::TXT(t) => AnyRec::Txt(
-            t.txt_data()
-                .iter()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .collect(),
-        ),
+        RData::TXT(t) => AnyRec::Txt(txt_chunks(t)),
         RData::SRV(s) => AnyRec::Srv(srv_rec(s)),
         RData::SOA(s) => AnyRec::Soa(soa_rec(s)),
         RData::NAPTR(n) => AnyRec::Naptr(naptr_rec(n)),
@@ -1126,23 +1165,58 @@ fn soa_with_type(h: &mut crate::host::JsHost, s: &SoaRec) -> Value {
 
 // ── resolver construction / error mapping ────────────────────────────────────
 
-/// Build a blocking `Resolver`. With an explicit server list, use those
-/// nameservers (UDP/TCP, port 53); otherwise the system configuration.
-fn build_resolver(servers: Option<&[String]>) -> Result<Resolver, String> {
-    match servers {
-        Some(list) if !list.is_empty() => {
-            let ips: Vec<IpAddr> = list.iter().filter_map(|s| parse_ip(s)).collect();
-            if ips.is_empty() {
-                return Err("EBADFAMILY".into());
-            }
-            let group = NameServerConfigGroup::from_ips_clear(&ips, 53, true);
-            let cfg = ResolverConfig::from_parts(None, vec![], group);
-            Resolver::new(cfg, ResolverOpts::default()).map_err(|e| e.to_string())
-        }
-        _ => Resolver::from_system_conf()
-            .or_else(|_| Resolver::new(ResolverConfig::default(), ResolverOpts::default()))
-            .map_err(|e| e.to_string()),
+/// A `TokioResolver` paired with the current-thread runtime that drives it, so
+/// the DNS worker threads can issue queries synchronously.
+struct BlockingResolver {
+    rt: tokio::runtime::Runtime,
+    r: TokioResolver,
+}
+
+impl BlockingResolver {
+    /// Drive one lookup future to completion, mapping a failure to its
+    /// Node/c-ares error code.
+    fn run<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, NetError>>,
+    ) -> Result<T, String> {
+        self.rt.block_on(fut).map_err(|e| err_code(&e).to_string())
     }
+}
+
+/// Build a `BlockingResolver`. With an explicit server list, use those
+/// nameservers (UDP/TCP, port 53); otherwise the system configuration, falling
+/// back to Google's public resolvers when it cannot be read.
+fn build_resolver(servers: Option<&[String]>) -> Result<BlockingResolver, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let provider = TokioRuntimeProvider::default;
+    let r = {
+        // The connection provider binds to the ambient runtime handle.
+        let _guard = rt.enter();
+        let builder = match servers {
+            Some(list) if !list.is_empty() => {
+                let ns: Vec<NameServerConfig> = list
+                    .iter()
+                    .filter_map(|s| parse_ip(s))
+                    .map(NameServerConfig::udp_and_tcp)
+                    .collect();
+                if ns.is_empty() {
+                    return Err("EBADFAMILY".into());
+                }
+                TokioResolver::builder_with_config(
+                    ResolverConfig::from_name_servers(ns),
+                    provider(),
+                )
+            }
+            _ => TokioResolver::builder(provider()).unwrap_or_else(|_| {
+                TokioResolver::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), provider())
+            }),
+        };
+        builder.build().map_err(|e| e.to_string())?
+    };
+    Ok(BlockingResolver { rt, r })
 }
 
 /// Parse a bare IP or an `ip:port` / `[ipv6]:port` string to its `IpAddr`.
@@ -1158,7 +1232,7 @@ fn system_servers() -> Vec<String> {
         Ok((cfg, _)) => {
             let mut out: Vec<String> = Vec::new();
             for ns in cfg.name_servers() {
-                let ip = ns.socket_addr.ip().to_string();
+                let ip = ns.ip.to_string();
                 if !out.contains(&ip) {
                     out.push(ip);
                 }
@@ -1170,17 +1244,12 @@ fn system_servers() -> Vec<String> {
 }
 
 /// Map a `hickory` resolve error to the Node/c-ares error code string.
-fn err_code(e: &ResolveError) -> &'static str {
-    match e.kind() {
-        ResolveErrorKind::NoRecordsFound { response_code, .. } => {
-            if *response_code == ResponseCode::NXDomain {
-                "ENOTFOUND"
-            } else {
-                "ENODATA"
-            }
-        }
-        ResolveErrorKind::NoConnections => "ESERVFAIL",
-        ResolveErrorKind::Timeout => "ETIMEOUT",
+fn err_code(e: &NetError) -> &'static str {
+    match e {
+        NetError::Dns(DnsError::NoRecordsFound(_)) if e.is_nx_domain() => "ENOTFOUND",
+        NetError::Dns(DnsError::NoRecordsFound(_)) => "ENODATA",
+        NetError::NoConnections => "ESERVFAIL",
+        NetError::Timeout => "ETIMEOUT",
         _ => "ESERVFAIL",
     }
 }
