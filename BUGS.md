@@ -1925,6 +1925,8 @@ only once the next line arrives. Piped and redirected input is unaffected.
 | a class method or accessor under a COMPUTED key was named `''`: `class C { [Symbol.iterator]() {} }` gave `''` where node gives `[Symbol.iterator]`, likewise `get [Symbol.split]` and `[k]()` (the object-literal form was already right) | SetFunctionName runs at class-definition time for a computed key: `[description]` for a symbol, `''` for a description-less one, the `get `/`set ` prefix for an accessor (`parity-scripts/lang/24_computed_method_names.js`) |
 | a symbol-keyed ACCESSOR leaked into the string-key listings under its internal spelling — `Object.getOwnPropertyNames({ get [Symbol.split]() {} })` was `[ '@@split' ]`, and `console.log` printed `'@@iterator': [Getter]` — and was missing from `Reflect.ownKeys`/`getOwnPropertySymbols` of a class prototype; the own keys of a function, a class or a class prototype kept creation order, so `static 2() {}` listed after `b` | a symbol accessor is a symbol key everywhere (printed `Symbol(…): [Getter]` after the string keys), and every listing puts the array-index keys first in ascending order (`parity-scripts/objects/19_own_key_order.js`) |
 | `util.inspect` of an array truncated at `maxArrayLength` laid out one column too few: `"x".repeat(200).split("")` printed 11 per row where node prints 12 | `groupArrayElements` averages over `output.length`, which counts the `... N more items` entry, as node does |
+| `String.prototype.anchor`, `big`, `blink`, `bold`, `fixed`, `fontcolor`, `fontsize`, `italics`, `link`, `small`, `strike`, `sub` and `sup` did not exist; and every `String.prototype` method called on a non-string receiver — `String.prototype.trim.call(12)` — threw `trim is not a function` | the Annex B `CreateHTML` methods (`"` escaped as `&quot;`, the value `ToString`ed even when absent), and each method runs `ToString` on a coercible receiver, a Symbol one throwing (`parity-scripts/data/30_string_html_methods.js`) |
+| `Math.f16round` was absent (and `JSON` listed `stringify` before `parse`) | rounds to the nearest binary16 straight from the double, ties to even, overflowing to a signed infinity; both namespaces list their members in V8 order (`parity-scripts/data/31_math_f16round.js`) |
 
 ## Still open — found in round 7
 
@@ -2475,7 +2477,6 @@ Still open in the same area:
 | `Object.getOwnPropertyDescriptor(globalThis, 'process')` | an ACCESSOR (node defines it lazily) | a data descriptor |
 | `Object.getOwnPropertyDescriptor(Set.prototype, 'size')` | an accessor descriptor | `undefined` — a builtin prototype's accessors own no descriptor |
 | `Object.create(Map.prototype).constructor` | `Map` | `Object`, and `instanceof Set` is false for `Object.create(Set.prototype)` — a builtin prototype carries no `constructor` link |
-| `Math.f16round`, `JSON.rawJSON`/`isRawJSON` | implemented | absent, and correspondingly absent from `getOwnPropertyNames` |
 
 Two more borrows and one message, found in the same pass:
 

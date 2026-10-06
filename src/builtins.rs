@@ -3236,6 +3236,15 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     // arrives with an already-primitive receiver and needs no unwrapping.
     if matches!(ctor, "String" | "Number" | "Boolean") {
         let prim = wrapped_primitive(recv).unwrap_or_else(|| recv.clone());
+        // Every other `String.prototype` method is GENERIC: it starts with
+        // `ToString(RequireObjectCoercible(this))` (22.1.3), and a nullish
+        // receiver was refused above. Handing a number or an object straight to
+        // `call_method` looked the method up on THAT type instead, so
+        // `String.prototype.trim.call(12)` reported `trim is not a function`.
+        if ctor == "String" && with_host(|h| h.as_str(&prim).is_none()) {
+            let s = host::to_string_value(&prim)?;
+            return host::call_method(&s, method, args);
+        }
         return host::call_method(&prim, method, args);
     }
     // `thisSymbolValue`/`thisBigIntValue` (20.4.3, 21.2.3) accept a WRAPPER as
@@ -6016,6 +6025,7 @@ const NS_METHODS: &[&str] = &[
     "Math.cosh",
     "Math.exp",
     "Math.floor",
+    "Math.f16round",
     "Math.fround",
     "Math.hypot",
     "Math.imul",
@@ -6035,8 +6045,8 @@ const NS_METHODS: &[&str] = &[
     "Math.tan",
     "Math.tanh",
     "Math.trunc",
-    "JSON.stringify",
     "JSON.parse",
+    "JSON.stringify",
     "JSON.rawJSON",
     "JSON.isRawJSON",
     "Object.keys",
@@ -8141,6 +8151,9 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
         }
         // Round to the nearest single-precision float.
         "fround" => (x as f32) as f64,
+        // Round to the nearest IEEE 754 binary16 value, ties to even, straight
+        // from the double: going through `f32` first would round twice.
+        "f16round" => f16_round(x),
         _ => return Err(host::type_error(&format!("Math.{fname} is not a function"))),
     };
     Ok(Value::Float(r))
@@ -9802,6 +9815,20 @@ pub(crate) const STRING_PROTO_METHODS: &[&str] = &[
     "toLocaleLowerCase",
     "isWellFormed",
     "toWellFormed",
+    // Annex B HTML methods (B.2.2.2 CreateHTML).
+    "anchor",
+    "big",
+    "blink",
+    "bold",
+    "fixed",
+    "fontcolor",
+    "fontsize",
+    "italics",
+    "link",
+    "small",
+    "strike",
+    "sub",
+    "sup",
 ];
 
 fn is_string_method(name: &str) -> bool {
@@ -11940,6 +11967,31 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                 }
             };
             Ok(new_s(out))
+        }
+        // Annex B `CreateHTML(string, tag, attribute, value)`: the receiver
+        // wrapped in `<tag>`, with ` attribute="value"` on the open tag when
+        // the method has one — `value` is `ToString`ed even when absent
+        // (`"x".anchor()` is `<a name="undefined">x</a>`) and only `"` is
+        // escaped, as `&quot;`.
+        "anchor" | "big" | "blink" | "bold" | "fixed" | "fontcolor" | "fontsize" | "italics"
+        | "link" | "small" | "strike" | "sub" | "sup" => {
+            let (tag, attribute) = match name {
+                "anchor" => ("a", "name"),
+                "bold" => ("b", ""),
+                "fixed" => ("tt", ""),
+                "fontcolor" => ("font", "color"),
+                "fontsize" => ("font", "size"),
+                "italics" => ("i", ""),
+                "link" => ("a", "href"),
+                other => (other, ""),
+            };
+            let mut open = format!("<{tag}");
+            if !attribute.is_empty() {
+                let value = args.first().cloned().unwrap_or(Value::Undef);
+                let value = with_host(|h| h.str_of(&value)).replace('"', "&quot;");
+                open.push_str(&format!(" {attribute}=\"{value}\""));
+            }
+            Ok(new_s(format!("{open}>{s}</{tag}>")))
         }
         // ES2024 well-formedness (22.1.3.9 / 22.1.3.29). A `String` here is a
         // Rust `String`, whose `char` type EXCLUDES `U+D800..=U+DFFF`, so every
@@ -15762,4 +15814,25 @@ fn clear_timer(v: &Value) {
     let id =
         crate::stdlib::timers::handle_id(v).unwrap_or_else(|| with_host(|h| h.to_number(v)) as u64);
     with_host(|h| h.cancel_timer(id));
+}
+
+/// `Math.f16round(x)` — `x` rounded to the nearest IEEE 754 binary16 value
+/// (roundTiesToEven), returned as a double. A binary16 has 10 explicit
+/// mantissa bits, a minimum normal exponent of -14 (below which the spacing is
+/// fixed at the subnormal quantum 2^-24) and a largest finite value of 65504;
+/// anything that rounds past it is an infinity of the same sign.
+fn f16_round(x: f64) -> f64 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    let a = x.abs();
+    // Unbiased binary exponent of `a`; a double subnormal is far below the
+    // binary16 range and lands in the subnormal quantum all the same.
+    let exp = ((a.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+    let quantum = 2f64.powi(exp.max(-14) - 10);
+    // `a / quantum` is exact (a power-of-two scaling), so this is the only
+    // rounding step.
+    let r = (a / quantum).round_ties_even() * quantum;
+    let r = if r > 65504.0 { f64::INFINITY } else { r };
+    r.copysign(x)
 }
