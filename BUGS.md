@@ -2577,6 +2577,14 @@ and `examples/dates.js`.
 
 Still divergent, and why:
 
+- **An async `fs` callback runs as a microtask.** `fs.readFile(p, cb)` and the
+  `fs.promises` settlements are queued on the microtask queue when the
+  operation completes synchronously here, so `cb` runs before promise
+  reactions queued after the call, and before a `setTimeout(…, 0)`. In node the
+  work completes on the threadpool and the callback runs in the poll phase:
+  always after the current microtasks, and (timing-dependent) usually after an
+  expired 0 ms timer. Moving them needs an I/O-completion phase in the event
+  loop, which the virtual-clock loop does not model.
 - **Compound and logical assignment evaluate a computed key TWICE.**
   `o[k()] += 1` calls `k` twice where node calls it once; the parser desugars
   `a op= b` to `a = a op b`, which duplicates the target expression. Simple
