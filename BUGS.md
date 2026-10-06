@@ -901,7 +901,10 @@ forms are the errors node reports (`Invalid escape`, `Invalid decimal escape`,
 `fancy-regex` 0.18 — and the flags `g` (global), `i` (ignoreCase), `m`
 (multiline), `s` (dotAll), `u`, `y` (sticky) and `d` (hasIndices — the match
 array carries `.indices`, one `[start, end]` pair per group, with
-`.indices.groups` for the named ones).
+`.indices.groups` for the named ones), and `v` (unicodeSets: nested classes
+and the `--` / `&&` set operators, which the regex layer spells the same way;
+`\q{…}` string literals are not supported). An empty class `[]` matches
+nothing and `[^]` any character, as in JS.
 `test`/`exec`/`match`/`matchAll`/`replace`/`replaceAll`/`split`/`search` and the
 `$1`/`$&`/`` $` ``/`$'`/`$<name>`/`$$` replacement patterns + function replacers.
 
@@ -927,6 +930,9 @@ are **now supported** (see the Supported list above); verified against
   the astral character split into its two surrogate halves — and 5 here. This
   is the regex engine's alphabet, a separate axis from string indexing, and it
   runs into the same lone-surrogate boundary documented above.
+- **Case-insensitive matching without `u` folds by Unicode simple case
+  folding,** where JS uppercases: `/\u212A/i.test("k")` (KELVIN SIGN) is
+  `false` in node and `true` here. The `u`/`v` forms agree.
 ## FIXED — collection access was O(n^2), and the cause was local to node-js
 
 Per-element access to a JS array, object, or `Buffer` used to cost quadratic

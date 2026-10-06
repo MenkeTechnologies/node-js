@@ -107,7 +107,8 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     // Validate flags (Node throws on an unknown/repeated flag).
     let mut seen = String::new();
     for c in flags.chars() {
-        if !"gimsuyd".contains(c) || seen.contains(c) {
+        // `u` and `v` are mutually exclusive (22.2.3.1 step 5).
+        if !"dgimsuvy".contains(c) || seen.contains(c) || (c == 'v' && seen.contains('u')) || (c == 'u' && seen.contains('v')) {
             return Err(format!(
                 "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
             ));
@@ -119,12 +120,15 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     let multiline = flags.contains('m');
     let dot_all = flags.contains('s');
     let sticky = flags.contains('y');
-    let unicode = flags.contains('u');
+    // `v` (unicodeSets) is `u` plus nested classes and the `--` / `&&` set
+    // operators, which the regex layer spells the same way.
+    let sets = flags.contains('v');
+    let unicode = flags.contains('u') || sets;
 
     let invalid = |reason: &str| {
         format!("SyntaxError: Invalid regular expression: /{pattern}/{flags}: {reason}")
     };
-    let rust_pat = translate(pattern, unicode).map_err(|r| invalid(&r))?;
+    let rust_pat = translate(pattern, unicode, sets).map_err(|r| invalid(&r))?;
     // Assemble the inline-flag prefix fancy-regex (via the regex layer) understands.
     let mut prefixed = String::new();
     if ignore_case || multiline || dot_all {
@@ -158,7 +162,7 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
         multiline,
         dot_all,
         sticky,
-        unicode,
+        unicode: flags.contains('u'),
         last_index: U16Index::ZERO,
     };
     Ok(with_host(|h| h.alloc(JsObj::RegExp(Box::new(obj)))))
@@ -321,7 +325,7 @@ fn check_group(chars: &[char], i: usize) -> Result<(), &'static str> {
 ///     forms none of those is a literal backslash followed by `c`; `\k` with no
 ///     named group in the pattern is the letter `k`.
 ///   * In unicode mode those legacy forms are the SyntaxErrors node raises.
-fn translate(pat: &str, unicode: bool) -> Result<String, String> {
+fn translate(pat: &str, unicode: bool, sets: bool) -> Result<String, String> {
     let chars: Vec<char> = pat.chars().collect();
     let (group_count, group_names) = scan_groups(&chars);
     let mut out = String::new();
@@ -331,18 +335,33 @@ fn translate(pat: &str, unicode: bool) -> Result<String, String> {
     // empty class (`[]` / `[^]`) vs. a literal leading `]`.
     let mut in_class = false;
     let mut class_pos = 0usize;
+    // Under `v` classes nest; this counts the open ones.
+    let mut class_depth = 0usize;
     while i < chars.len() {
         let c = chars[i];
         // Character-class bookkeeping. A `\` escape is handled below and never
         // toggles class state (it consumes its own two chars).
         if c != '\\' {
-            if !in_class && c == '[' {
+            if (!in_class || sets) && c == '[' {
+                // A `]` right after the opener (and its `^`) CLOSES the class in
+                // JS: `[]` matches nothing and `[^]` matches any code unit.
+                let negated = chars.get(i + 1) == Some(&'^');
+                let close_at = i + 1 + usize::from(negated);
+                if chars.get(close_at) == Some(&']') {
+                    out.push_str(if negated { r"[\s\S]" } else { r"[^\s\S]" });
+                    if in_class {
+                        class_pos += 1;
+                    }
+                    i = close_at + 1;
+                    continue;
+                }
                 in_class = true;
+                class_depth += 1;
                 class_pos = 0;
                 out.push('[');
                 i += 1;
                 // A leading `^` is the negation, not the first member.
-                if chars.get(i) == Some(&'^') {
+                if negated {
                     out.push('^');
                     i += 1;
                 }
@@ -351,8 +370,9 @@ fn translate(pat: &str, unicode: bool) -> Result<String, String> {
             if in_class {
                 // The first char of a class, if `]`, is a literal `]` in JS; a
                 // later bare `[` must be escaped for the regex layer.
-                if c == ']' && class_pos > 0 {
-                    in_class = false;
+                if c == ']' && (class_pos > 0 || sets) {
+                    class_depth = class_depth.saturating_sub(1);
+                    in_class = class_depth > 0;
                     out.push(']');
                     i += 1;
                     continue;
@@ -542,8 +562,7 @@ pub fn regexp_property(r: &RegExpObj, name: &str) -> Option<Value> {
         "unicode" => Value::Bool(r.unicode),
         // `d` is accepted and its match-indices output ignored (BUGS.md), but
         // the flag reflector still has to report it; it read `undefined` where
-        // node says `true`/`false`. `v` is rejected at construction time, so
-        // `unicodeSets` is `false` for every regex that exists here.
+        // node says `true`/`false`.
         "hasIndices" => Value::Bool(r.flags.contains('d')),
         "unicodeSets" => Value::Bool(r.flags.contains('v')),
         "lastIndex" => Value::Float(r.last_index.get() as f64),
