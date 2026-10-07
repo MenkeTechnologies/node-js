@@ -15933,9 +15933,7 @@ fn json_property_list(replacer: Value) -> Result<Option<Vec<String>>, String> {
 fn json_gap(space: Value) -> Result<Option<String>, String> {
     let space = match wrapped_primitive(&space) {
         Some(p) if with_host(|h| h.as_str(&p).is_some()) => host::to_string_value(&space)?,
-        Some(p) if matches!(p, Value::Int(_) | Value::Float(_)) => {
-            Value::Float(host::to_number_value(&space)?)
-        }
+        Some(Value::Int(_) | Value::Float(_)) => Value::Float(host::to_number_value(&space)?),
         _ => space,
     };
     if let Value::Int(_) | Value::Float(_) = space {

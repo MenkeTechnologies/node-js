@@ -316,6 +316,9 @@ fn emit(line: &str, stderr: bool) {
 // A port of node's `Console.prototype.table` (lib/internal/console/
 // constructor.js) and of `lib/internal/cli_table.js`, which draws the box.
 
+/// The key/value pairs a Map-shaped `console.table` source is read as.
+type TableEntries = Vec<(Value, Value)>;
+
 /// `console.table(data[, properties])` as node renders it, or `Ok(None)` when
 /// `data` is not an object — the caller then logs it as `console.log` would.
 fn render_table(args: &[Value]) -> Result<Option<String>, String> {
@@ -347,7 +350,7 @@ fn render_table(args: &[Value]) -> Result<Option<String>, String> {
     // A Map, or a Map/Set iterator, is read without being consumed
     // (`previewEntries`); a Map entries iterator and a Map are key/value.
     let view = with_host(|h| crate::builtins::collection_iterator_view(h, &data));
-    let (map_entries, set_values): (Option<Vec<(Value, Value)>>, Option<Vec<Value>>) =
+    let (map_entries, set_values): (Option<TableEntries>, Option<Vec<Value>>) =
         match (view, with_host(|h| h.get(&data).cloned())) {
             (Some(("Map Entries", rest)), _) => (Some(rest), None),
             // `previewEntries` of a Set entries iterator is the flat
@@ -404,7 +407,7 @@ fn render_table(args: &[Value]) -> Result<Option<String>, String> {
         let keys: Vec<String> = match &properties {
             Some(p) => p
                 .iter()
-                .map(|v| crate::host::to_property_key(v))
+                .map(crate::host::to_property_key)
                 .collect::<Result<_, _>>()?,
             None => object_keys(&item)?,
         };
