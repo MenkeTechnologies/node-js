@@ -5244,22 +5244,6 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
             message = m.to_string();
         }
     }
-    let mut props: IndexMap<String, Value> = IndexMap::new();
-    let mv = h.new_str(message.clone());
-    props.insert("message".into(), mv);
-    if let Some(c) = &code {
-        let cv = h.new_str(c.clone());
-        props.insert("code".into(), cv);
-        for (k, v) in fields {
-            let fv = h.new_str(v);
-            props.insert(k, fv);
-        }
-        if bracketed {
-            // Marks this as a Node JS-layer error, whose `toString` brackets the
-            // code. A native-layer error has the same `.code` and does not.
-            props.insert("@@nodeError".into(), Value::Bool(true));
-        }
-    }
     let label = match (&code, bracketed) {
         (Some(c), true) => format!("{name} [{c}]"),
         _ => name.clone(),
@@ -5271,7 +5255,32 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
         format!("{label}: {message}{frames}")
     };
     let sv = h.new_str(stack);
+    // Own-key order as node reports it: the captured `stack` first; then a
+    // Node JS-layer (bracketed) error has `code` before `message`
+    // (`['stack', 'code', 'message']` for `Buffer.from(5)`), while a
+    // native-layer one has `message` before `code` and its extra fields
+    // (`['stack', 'message', 'code', 'input']` for `new URL('bad')`).
+    let mut props: IndexMap<String, Value> = IndexMap::new();
     props.insert("stack".into(), sv);
+    let cv = code.as_ref().map(|c| h.new_str(c.clone()));
+    if let (true, Some(cv)) = (bracketed, &cv) {
+        props.insert("code".into(), cv.clone());
+    }
+    let mv = h.new_str(message.clone());
+    props.insert("message".into(), mv);
+    if let Some(cv) = cv {
+        // Already placed for a bracketed error; IndexMap keeps that position.
+        props.insert("code".into(), cv);
+        for (k, v) in fields {
+            let fv = h.new_str(v);
+            props.insert(k, fv);
+        }
+        if bracketed {
+            // Marks this as a Node JS-layer error, whose `toString` brackets the
+            // code. A native-layer error has the same `.code` and does not.
+            props.insert("@@nodeError".into(), Value::Bool(true));
+        }
+    }
     // A libuv system-error message is itself the canonical encoding of the
     // error's metadata — `ENOENT: no such file or directory, open '/x'` — so a
     // filesystem/network failure recovers the enumerable `code`/`errno`/
@@ -7601,7 +7610,10 @@ fn make_error_inner(name: &str, args: &[Value]) -> Value {
     };
     with_host(|h| {
         h.ensure_error_protos();
+        // Own keys in V8's order: `stack` (captured first), `message`,
+        // `cause`, then AggregateError's `errors` (20.5.7.1.1 steps 3-5).
         let mut props: IndexMap<String, Value> = IndexMap::new();
+        props.insert("stack".into(), Value::Undef);
         let msg = args
             .first()
             .filter(|a| !matches!(a, Value::Undef))
@@ -7631,12 +7643,6 @@ fn make_error_inner(name: &str, args: &[Value]) -> Value {
         props.insert("stack".into(), sv);
         let raw = h.new_str(frames);
         props.insert("@@stackRaw".into(), raw);
-        if let Some(errs) = errors {
-            // Materialize the iterable into the own `errors` array property.
-            let items = h.iter_vec(&errs).unwrap_or_default();
-            let arr = h.new_array(items);
-            props.insert("errors".into(), arr);
-        }
         // `new Error(msg, { cause })` (ES2022): installed only when the options
         // bag actually has a `cause` key, so `new Error(m, {})` leaves none.
         let opts = args.get(1);
@@ -7645,6 +7651,12 @@ fn make_error_inner(name: &str, args: &[Value]) -> Value {
             _ => None,
         }) {
             props.insert("cause".into(), cause);
+        }
+        if let Some(errs) = errors {
+            // Materialize the iterable into the own `errors` array property.
+            let items = h.iter_vec(&errs).unwrap_or_default();
+            let arr = h.new_array(items);
+            props.insert("errors".into(), arr);
         }
         let e = h.new_object(props);
         if let Some(p) = host::error_proto_of(h, name) {
