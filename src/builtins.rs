@@ -10952,8 +10952,10 @@ fn array_method_on(
             let spreadable = |a: &Value| -> bool {
                 let flag = get_property(a, "@@isConcatSpreadable").unwrap_or(Value::Undef);
                 if matches!(flag, Value::Undef) {
-                    matches!(with_host(|h| h.get(a).cloned()), Some(JsObj::Array(_)))
-                        && !is_arguments(a)
+                    // `IsArray` sees through a proxy to its target (7.2.2 step 3).
+                    let subject = crate::proxy::ultimate_target(a).unwrap_or_else(|| a.clone());
+                    matches!(with_host(|h| h.get(&subject).cloned()), Some(JsObj::Array(_)))
+                        && !is_arguments(&subject)
                 } else {
                     with_host(|h| h.truthy(&flag))
                 }
@@ -10985,10 +10987,13 @@ fn array_method_on(
                         sources.push((a.clone(), out.len()));
                         out.extend(items);
                     }
-                    // An opted-in array-LIKE spreads by its `length` and index
-                    // properties rather than by a backing vector it has none of.
+                    // An opted-in array-LIKE (or an array proxy) spreads by its
+                    // `length` and index properties rather than by a backing
+                    // vector it has none of: 23.1.3.1 step 5.c.iv asks
+                    // `HasProperty` per index and `Get`s only the present ones,
+                    // so a missing index stays a hole.
                     _ => {
-                        let len = get_property(a, "length").unwrap_or(Value::Undef);
+                        let len = get_property(a, "length")?;
                         let n = with_host(|h| h.to_number(&len));
                         let n = if n.is_finite() {
                             n.max(0.0) as usize
@@ -10996,7 +11001,13 @@ fn array_method_on(
                             0
                         };
                         for i in 0..n {
-                            out.push(get_property(a, &i.to_string()).unwrap_or(Value::Undef));
+                            let k = i.to_string();
+                            if has_property(a, &k)? {
+                                out.push(get_property(a, &k)?);
+                            } else {
+                                holes.insert(out.len());
+                                out.push(Value::Undef);
+                            }
                         }
                     }
                 }
