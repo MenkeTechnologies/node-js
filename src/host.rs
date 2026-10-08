@@ -7310,7 +7310,12 @@ pub fn current_static_this() -> Option<Value> {
 /// callable `f`: the method runs with the PROXY as `this`. Split out so a caller
 /// that has already done the `Get` (ToPrimitive's `OrdinaryToPrimitive`) does not
 /// read the property a second time through the `get` trap.
-pub fn call_proxy_method(recv: &Value, name: &str, f: Value, args: Vec<Value>) -> Result<Value, String> {
+pub fn call_proxy_method(
+    recv: &Value,
+    name: &str,
+    f: Value,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     // `Function.prototype.call`/`apply`/`bind`/`toString` and the REFLECTIVE
     // `Object.prototype` methods are generic over `this`. node-js models each
     // as a thunk BOUND to the object it was read off — through a proxy, that

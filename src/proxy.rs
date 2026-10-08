@@ -181,7 +181,9 @@ impl Desc {
     /// `ToPropertyDescriptor(obj)` (6.2.6.5): each field read only when the
     /// object HAS it, in the spec's order, with V8's wording for each refusal.
     fn from_object(obj: &Value) -> Result<Desc, String> {
-        if !with_host(|h| matches!(obj, Value::Obj(_)) && !h.is_null(obj) && !host::is_primitive(h, obj)) {
+        if !with_host(|h| {
+            matches!(obj, Value::Obj(_)) && !h.is_null(obj) && !host::is_primitive(h, obj)
+        }) {
             return Err(host::type_error(&format!(
                 "Property description must be an object: {}",
                 shown(obj)
@@ -520,8 +522,12 @@ pub fn own_keys(v: &Value) -> Result<Option<Vec<String>>, String> {
         let r = call(&t, &handler, vec![target.clone()])?;
         // `CreateListFromArrayLike(result, « String, Symbol »)`: an array-like
         // read by `length` and index, whose every element is a property key.
-        if !with_host(|h| matches!(r, Value::Obj(_)) && !h.is_null(&r) && !host::is_primitive(h, &r)) {
-            return Err(host::type_error("CreateListFromArrayLike called on non-object"));
+        if !with_host(|h| {
+            matches!(r, Value::Obj(_)) && !h.is_null(&r) && !host::is_primitive(h, &r)
+        }) {
+            return Err(host::type_error(
+                "CreateListFromArrayLike called on non-object",
+            ));
         }
         let len = crate::builtins::length_of_array_like(&r)?;
         let mut out = Vec::with_capacity(len);
@@ -542,7 +548,9 @@ pub fn own_keys(v: &Value) -> Result<Option<Vec<String>>, String> {
         let mut seen: Vec<&String> = Vec::with_capacity(out.len());
         for k in &out {
             if seen.contains(&k) {
-                return Err(invariant("'ownKeys' on proxy: trap returned duplicate entries"));
+                return Err(invariant(
+                    "'ownKeys' on proxy: trap returned duplicate entries",
+                ));
             }
             seen.push(k);
         }
@@ -620,7 +628,8 @@ pub fn get_own_descriptor(v: &Value, key: &str) -> Result<Option<Value>, String>
 /// returned against the target, and hand back the COMPLETED descriptor the
 /// operation yields — not the trap's own object.
 fn checked_own_descriptor(target: &Value, key: &str, d: &Value) -> Result<Value, String> {
-    let is_object = with_host(|h| matches!(d, Value::Obj(_)) && !h.is_null(d) && !host::is_primitive(h, d));
+    let is_object =
+        with_host(|h| matches!(d, Value::Obj(_)) && !h.is_null(d) && !host::is_primitive(h, d));
     if !is_object && !matches!(d, Value::Undef) {
         return Err(invariant(&format!(
             "'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined for property '{key}'"
@@ -867,7 +876,9 @@ pub fn construct(v: &Value, args: Vec<Value>, new_target: &Value) -> Result<Opti
         let list = with_host(|h| h.new_array(args));
         let made = call(&t, &handler, vec![target, list, new_target.clone()])?;
         // 10.5.13 step 10: `new` always yields an object.
-        if !with_host(|h| matches!(made, Value::Obj(_)) && !h.is_null(&made) && !host::is_primitive(h, &made)) {
+        if !with_host(|h| {
+            matches!(made, Value::Obj(_)) && !h.is_null(&made) && !host::is_primitive(h, &made)
+        }) {
             return Err(invariant(&format!(
                 "'construct' on proxy: trap returned non-object ('{}')",
                 shown(&made)

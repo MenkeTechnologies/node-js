@@ -3439,9 +3439,10 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     if ctor == "RegExp" && with_host(|h| h.kind_of(recv)) != Some(ObjKind::RegExp) {
         let object = with_host(|h| is_object_like(h, recv));
         return match method {
-            "test" if object => {
-                crate::regexp::regexp_test_generic(recv, &args.first().cloned().unwrap_or(Value::Undef))
-            }
+            "test" if object => crate::regexp::regexp_test_generic(
+                recv,
+                &args.first().cloned().unwrap_or(Value::Undef),
+            ),
             "toString" if object => crate::regexp::regexp_to_string_generic(recv),
             _ => Err(crate::regexp::incompatible_receiver(method, recv)),
         };
@@ -13836,7 +13837,8 @@ fn iter_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Stri
             with_host(|h| {
                 if let Some(JsObj::Iter {
                     items, idx, array, ..
-                }) = h.get_mut(recv) {
+                }) = h.get_mut(recv)
+                {
                     *idx = if array.is_some() {
                         usize::MAX
                     } else {
