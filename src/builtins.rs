@@ -1464,6 +1464,12 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                 // write was invisible to every later read.
                 .or_else(|| with_host(|h| h.fn_prop(recv, name)))
                 .unwrap_or(Value::Undef)
+            } else if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
+                // Extra own props attached to an array (e.g. `RegExp.exec` result's
+                // `.index`/`.input`/`.groups`). An OWN property is found before
+                // the prototype's (10.1.8.1 OrdinaryGet), so `a.join = f` makes
+                // `a.join` be `f` rather than the inherited method.
+                v
             } else if name == "@@iterator"
                 || is_object_method(name)
                 // An `arguments` object is array-BACKED here but is not an
@@ -1473,10 +1479,6 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                 || (is_array_method(name) && !is_arguments(recv))
             {
                 bound_method(recv, name)
-            } else if let Some(v) = with_host(|h| h.fn_prop(recv, name)) {
-                // Extra own props attached to an array (e.g. `RegExp.exec` result's
-                // `.index`/`.input`/`.groups`).
-                v
             } else {
                 Value::Undef
             }
@@ -2083,6 +2085,9 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
                 Some(JsObj::Object(p)) => p.contains_key(&k) || h.own_accessor(recv, &k).is_some(),
                 Some(JsObj::Array(items)) => {
                     k == "length"
+                        // A named own property (`a.join = f`) lives in the side table.
+                        || h.fn_prop(recv, &k).is_some()
+                        || h.own_accessor(recv, &k).is_some()
                         || k.parse::<usize>()
                             .map(|i| i < items.len() && !h.is_hole(recv, i))
                             .unwrap_or(false)
@@ -3352,6 +3357,11 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     // `Array.prototype.slice.call(arguments)` the idiom it is. The receiver here
     // is not an Array, so `call_method` would report the method missing.
     if ctor == "Array" && with_host(|h| h.kind_of(recv)) != Some(ObjKind::Array) {
+        // `toString` is generic over `join`, not over the elements: copying an
+        // array-like into a temporary Array would lose the receiver's own `join`.
+        if method == "toString" {
+            return array_to_string(recv);
+        }
         return array_generic(recv, method, args);
     }
     // The general form of the two special cases above: a thunk taken off a native
@@ -10071,6 +10081,17 @@ fn overrides_object_method(recv: &Value, name: &str) -> bool {
 
 /// Dispatch `recv.name(args)` for the built-in prototype methods.
 pub fn call_type_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    // An OWN property of an array shadows every inherited method (10.1.8.1
+    // OrdinaryGet), so `a.join = f; a.join()` calls `f` — and a non-callable
+    // own value is not a function, whatever the prototype has.
+    if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Array) && !name.starts_with("@@") {
+        if let Some(f) = with_host(|h| h.fn_prop(recv, name)) {
+            if with_host(|h| host::is_callable(h, &f)) {
+                return host::invoke(&f, args, Some(recv.clone()));
+            }
+            return Err(host::type_error(&format!("{name} is not a function")));
+        }
+    }
     // A USER method on the receiver's prototype chain wins over the builtin of
     // the same name — that is how a `class X extends Array` method is reached,
     // since the dispatch below goes straight to the builtin table and has no
@@ -11428,11 +11449,7 @@ fn array_method_on(
         "values" | "@@iterator" => Ok(array_iterator(recv, host::ArrayIterKind::Values)),
         "entries" => Ok(array_iterator(recv, host::ArrayIterKind::Entries)),
         "splice" => array_splice(recv, args),
-        // `Array.prototype.toString` IS `join()` with the default separator
-        // (23.1.3.36), so it converts each element with `ToString` too — and
-        // shares its cycle cut, which is the whole reason it must not call
-        // `join_parts` directly: `ToString` of a nested array lands back here.
-        "toString" => join_array(recv, ","),
+        "toString" => array_to_string(recv),
         // An Array inherits from `Object.prototype` too, so the methods it does
         // not override resolve there. `[].hasOwnProperty` already read back as a
         // function through the property path, but CALLING it landed here and
@@ -11440,6 +11457,29 @@ fn array_method_on(
         _ if is_object_builtin_method(name) => object_builtin_method(recv, name, args),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
+}
+
+/// `Array.prototype.toString` (23.1.3.36): `Get(array, "join")` and call it,
+/// falling back on `Object.prototype.toString` when that is not callable — so
+/// an own or inherited `join` override is what stringifies the array. The
+/// intrinsic `join` read off an Array goes straight to [`join_array`], which
+/// shares the cycle cut with `join` itself: `ToString` of a nested array lands
+/// back here.
+fn array_to_string(recv: &Value) -> Result<Value, String> {
+    let func = get_property(recv, "join")?;
+    let intrinsic = with_host(|h| match h.get(&func) {
+        Some(JsObj::BoundMethod { recv: r, name }) => {
+            name == "join" && h.kind_of(r) == Some(ObjKind::Array)
+        }
+        _ => false,
+    });
+    if intrinsic {
+        return join_array(recv, ",");
+    }
+    if with_host(|h| host::is_callable(h, &func)) {
+        return host::invoke(&func, Vec::new(), Some(recv.clone()));
+    }
+    proto_method(recv, "Object:toString", Vec::new())
 }
 
 /// `Array.prototype.join` (23.1.3.18) and, with the default separator,
@@ -14225,6 +14265,14 @@ fn write_data_slot(obj: &Value, key: &str, v: Value) {
             }
             h.clear_hole(obj, i);
         });
+        return;
+    }
+    // A NAMED own property of an array lives in the side table, the same slot
+    // an assignment (`a.foo = 1`) writes and every read consults. Falling
+    // through to the property-map arm below wrote nowhere at all, so
+    // `Object.defineProperty([], 'foo', {value: 3}).foo` was `undefined`.
+    if with_host(|h| h.kind_of(obj)) == Some(ObjKind::Array) {
+        with_host(|h| h.set_fn_prop(obj, key, v));
         return;
     }
     with_host(|h| {
