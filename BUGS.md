@@ -1952,6 +1952,7 @@ only once the next line arrives. Piped and redirected input is unaffected.
 | was | now |
 | --- | --- |
 | a `for-of` / spread / destructuring over an array Proxy asked `has` before every `get`, read `length` once and drained the proxy up front; `Array.prototype.values.call(arrayLike)` snapshotted through `has` too | the array iterator is live over any receiver: each step is `LengthOfArrayLike` then `Get(O, i)` through the traps (23.1.5.1), and destructuring takes only the steps it binds (`parity-scripts/objects/26_array_iterator_generic_receiver.js`) |
+| `Date.prototype[Symbol.toPrimitive].call(proxyOrPlainObject, hint)` threw the Date brand error, an invalid hint on a real Date was ignored, and the default hint called the built-in `toString` instead of reading it | the method is generic: any object receiver, `Invalid hint: …` for anything but `string`/`default`/`number`, then `OrdinaryToPrimitive` through `[[Get]]` (`parity-scripts/objects/27_date_to_primitive_generic.js`) |
 
 ## Still open — found in round 7
 

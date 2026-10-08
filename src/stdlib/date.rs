@@ -216,17 +216,10 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
     let f = |ms: f64| ms; // readability alias for numeric returns
     Ok(match method {
         "getTime" | "valueOf" => Value::Float(f(ms)),
-        // Only an explicit `"number"` hint yields the timestamp; `"string"` and
-        // `"default"` both render the date, which is the rule that makes the
-        // default hint behave as `"string"`.
-        "@@toPrimitive" => {
-            let hint = with_host(|h| h.str_of(&_args.first().cloned().unwrap_or(Value::Undef)));
-            if hint == "number" {
-                Value::Float(f(ms))
-            } else {
-                return instance_call(recv, "toString", _args);
-            }
-        }
+        // `"string"` and `"default"` reach `toString` first, `"number"` reaches
+        // `valueOf` first — each read off the date, so an own override runs —
+        // and any other hint is a TypeError.
+        "@@toPrimitive" => return crate::builtins::date_to_primitive(recv, _args),
         "toISOString" | "toJSON" => {
             if ms.is_nan() {
                 if method == "toJSON" {

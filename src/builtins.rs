@@ -3081,6 +3081,10 @@ fn nullish_receiver_error(ctor: &str, method: &str, recv: &str) -> Option<String
         // An ALIAS reports the method it aliases: `toGMTString` IS `toUTCString`
         // and `Set.prototype.keys` IS `values`, one function object each.
         "Date" if method == "toGMTString" => generic("Date", "toUTCString"),
+        // V8 names this symbol-keyed builtin in brackets.
+        "Date" if method == "@@toPrimitive" => format!(
+            "Method Date.prototype [ @@toPrimitive ] called on incompatible receiver {recv}"
+        ),
         "Set" if method == "keys" => generic("Set", "values"),
         // Everything else that is brand-checked names itself. Node reaches this
         // wording from a `[[GetOwnProperty]]`-style slot check; here the check
@@ -3406,6 +3410,10 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     // rest take the ordinary branded form. Measured on node v26.8.1:
     // `Date.prototype.getTime.call({})` is the first, `.toISOString.call({})`
     // and `.setHours.call({})` the second.
+    // `Date.prototype[@@toPrimitive]` alone is generic: it accepts any object.
+    if ctor == "Date" && method == "@@toPrimitive" {
+        return date_to_primitive(recv, &args);
+    }
     if ctor == "Date" && crate::stdlib::native_tag(recv).as_deref() != Some("Date") {
         const THIS_TIME_VALUE: &[&str] = &[
             "getTime",
@@ -3606,6 +3614,31 @@ fn branded_method_label(ctor: &str, recv: &Value) -> Option<&'static str> {
 /// which is why an object with its own `toString` prints `[object Object]` and
 /// not what that method returns.
 /// [`no_side_effects_string`] for callers outside this module.
+/// `Date.prototype[@@toPrimitive](hint)` (21.4.4.45). Not branded: any OBJECT
+/// receiver is converted, a Proxy through its `get` trap. `"string"` and
+/// `"default"` try `toString` first, `"number"` tries `valueOf` first, and any
+/// other hint is a TypeError — then `OrdinaryToPrimitive` does the rest.
+pub(crate) fn date_to_primitive(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    if !with_host(|h| is_object_like(h, recv)) {
+        return Err(host::type_error(&format!(
+            "Method Date.prototype [ @@toPrimitive ] called on incompatible receiver {}",
+            no_side_effects_string(recv)
+        )));
+    }
+    let hint = args.first().cloned().unwrap_or(Value::Undef);
+    let try_first = match with_host(|h| h.as_str(&hint)).as_deref() {
+        Some("string") | Some("default") => "string",
+        Some("number") => "number",
+        _ => {
+            return Err(host::type_error(&format!(
+                "Invalid hint: {}",
+                no_side_effects_string(&hint)
+            )))
+        }
+    };
+    host::ordinary_to_primitive(recv, try_first)
+}
+
 pub(crate) fn no_side_effects_string_pub(recv: &Value) -> String {
     no_side_effects_string(recv)
 }

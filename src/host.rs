@@ -9530,6 +9530,13 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
     } else {
         hint
     };
+    ordinary_to_primitive(v, hint)
+}
+
+/// `OrdinaryToPrimitive(O, hint)` (7.1.1.1): `valueOf` then `toString`, the
+/// order reversed for the `"string"` hint, each read with `[[Get]]`; the first
+/// call that returns a primitive wins.
+pub fn ordinary_to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
     let order = if hint == "string" {
         ["toString", "valueOf"]
     } else {
