@@ -141,7 +141,9 @@ webpki-roots = "0.26"
 # the dependency graph through lsp-types.
 url = "2.5"
 # HPACK header compression for a minimal real HTTP/2 server (`http2`).
-hpack = "0.3"
+# `hpack-patched` is the drop-in fork of the unmaintained `hpack` with the
+# decoder panics on malformed input fixed (GHSA-w7hm-hmxv-pvhf).
+hpack = { package = "hpack-patched", version = "0.3" }
 
 # ── Full-stdlib round: additional native backends ────────────────────────────
 # zlib: Brotli + Zstd codecs and a CRC-32 (flate2 already covers deflate/gzip).
