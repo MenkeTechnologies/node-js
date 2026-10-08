@@ -335,7 +335,7 @@ const DIFF_MODE: &str = "simple";
 /// "expected X, got Y" from a caught `AssertionError` had nothing to report.
 /// Measured on node v26.7.0, `Object.keys(err)` is
 /// `["generatedMessage","code","actual","expected","operator","diff"]` — in that
-/// order — while `name`, `message` and `stack` are own but NOT enumerable.
+/// order — while `stack`, `message` and `name` are own but NOT enumerable.
 fn assertion_error_object(
     msg: &str,
     generated: bool,
@@ -353,17 +353,19 @@ fn assertion_error_object(
     let code_v = with_host(|h| h.new_str("ERR_ASSERTION"));
     let stack_v = with_host(|h| h.new_str(stack));
     let diff_v = with_host(|h| h.new_str(DIFF_MODE));
+    // Insertion order is `Object.getOwnPropertyNames` order, measured on node
+    // v26.10.0: `stack`, `message`, `generatedMessage`, `name`, then the
+    // enumerable rest.
     let mut props: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-    // Enumerable, in node's order, first.
+    props.insert("stack".into(), stack_v);
+    props.insert("message".into(), msg_v);
     props.insert("generatedMessage".into(), Value::Bool(generated));
+    props.insert("name".into(), name_v);
     props.insert("code".into(), code_v);
     props.insert("actual".into(), actual);
     props.insert("expected".into(), expected);
     props.insert("operator".into(), op_val);
     props.insert("diff".into(), diff_v);
-    props.insert("name".into(), name_v);
-    props.insert("message".into(), msg_v);
-    props.insert("stack".into(), stack_v);
     let obj = with_host(|h| h.new_object(props));
     with_host(|h| {
         for k in ["name", "message", "stack"] {
