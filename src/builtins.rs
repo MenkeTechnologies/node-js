@@ -7538,7 +7538,10 @@ pub(crate) fn dom_exception_with(h: &mut host::JsHost, name: &str, message: &str
     {
         let nv = h.new_str(name);
         let mv = h.new_str(message);
-        let sv = h.new_str(head);
+        // node's constructor builds the instance with `new Error()`, which captures
+        // the stack like any error, so frames follow the head.
+        let frames = h.stack_frames();
+        let sv = h.new_str(format!("{head}{frames}"));
         if let Some(JsObj::Object(p)) = h.get_mut(&e) {
             // `name`, `message` and `code` are PROTOTYPE accessors over internal
             // slots in node, so `stack` is the instance's only own property.

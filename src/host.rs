@@ -4875,6 +4875,9 @@ impl JsHost {
                 Some(JsObj::Object(_)) if self.error_to_string(v).is_some() => {
                     let mut stack = lookup_chain(self, v, "stack")
                         .map(|s| self.str_of(&s))
+                        // node's `getStackString` falls back on a FALSY stack, so
+                        // `err.stack = ""` still prints `[Error: m]`.
+                        .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| self.error_to_string(v).unwrap_or_default());
                     // A `DOMException` prints its CLASS and then its name —
                     // `DOMException [AbortError]: m` — where a plain error
@@ -4888,29 +4891,7 @@ impl JsHost {
                             );
                         }
                     }
-                    let extra: Vec<String> = self
-                        .own_enum_key_names(v)
-                        .into_iter()
-                        .filter(|k| k != "name")
-                        .map(|k| {
-                            let val = self.fn_prop(v, &k).unwrap_or_else(|| match self.get(v) {
-                                Some(JsObj::Object(p)) => {
-                                    p.get(&k).cloned().unwrap_or(Value::Undef)
-                                }
-                                _ => Value::Undef,
-                            });
-                            format!(
-                                "{}: {}",
-                                fmt_key(&k),
-                                self.inspect_lvl(&val, indent + 2, st)
-                            )
-                        })
-                        .collect();
-                    if extra.is_empty() {
-                        stack
-                    } else {
-                        format!("{stack} {{ {} }}", extra.join(", "))
-                    }
+                    self.format_error_tail(v, stack, indent, st)
                 }
                 Some(JsObj::Object(props)) => {
                     // Instances print with their constructor name as a prefix
@@ -5374,6 +5355,91 @@ impl JsHost {
         // Levels, not columns: the indent advances by two per level.
         let depth_below = (st.deepest.saturating_sub(indent)) / 2;
         (depth_below as i64) < compact
+    }
+
+    /// The rest of node's `formatError` once the stack head is settled: which
+    /// own keys print, the `[...]` brackets for a stack without frames, the
+    /// re-indentation of a nested stack, and `reduceToSingleString` with the
+    /// stack as `base` (a multi-line stack forces the multi-line brace form).
+    fn format_error_tail(
+        &self,
+        v: &Value,
+        mut stack: String,
+        indent: usize,
+        st: &mut InspectCycles,
+    ) -> String {
+        let own = |k: &str| match self.get(v) {
+            Some(JsObj::Object(p)) => p.get(k).cloned(),
+            _ => None,
+        };
+        let string_in_stack = |k: &str, stack: &str| match lookup_chain(self, v, k) {
+            Some(s) if self.type_of(&s) == "string" => stack.contains(&self.str_of(&s)),
+            _ => true,
+        };
+        // Enumerable own keys, minus `stack` and a `message`/`name` the stack
+        // already shows; then `cause` and an array `errors`, which print as
+        // hidden keys even though they are non-enumerable.
+        let mut keys: Vec<(String, bool)> = self
+            .own_enum_key_names(v)
+            .into_iter()
+            .filter(|k| match k.as_str() {
+                "stack" => false,
+                "message" | "name" => !string_in_stack(k, &stack),
+                _ => true,
+            })
+            .map(|k| (k, false))
+            .collect();
+        if own("cause").is_some() && !keys.iter().any(|(k, _)| k == "cause") {
+            keys.push(("cause".into(), true));
+        }
+        if own("errors").is_some_and(|e| matches!(self.get(&e), Some(JsObj::Array(_))))
+            && !keys.iter().any(|(k, _)| k == "errors")
+        {
+            keys.push(("errors".into(), true));
+        }
+        // Wrap the stack in brackets when no frame follows the message.
+        let message = match lookup_chain(self, v, "message") {
+            Some(m) if self.type_of(&m) == "string" => self.str_of(&m),
+            _ => String::new(),
+        };
+        let pos = match stack.find(message.as_str()) {
+            Some(i) if !message.is_empty() && i > 0 => i + message.len(),
+            _ => 0,
+        };
+        if !stack[pos..].contains("\n    at") {
+            stack = format!("[{stack}]");
+        }
+        if indent != 0 {
+            stack = stack.replace('\n', &format!("\n{}", " ".repeat(indent)));
+        }
+        if keys.is_empty() {
+            return stack;
+        }
+        let output: Vec<String> = keys
+            .iter()
+            .map(|(k, hidden)| {
+                let val = self
+                    .fn_prop(v, k)
+                    .or_else(|| own(k))
+                    .unwrap_or(Value::Undef);
+                let key = if *hidden {
+                    format!("[{k}]")
+                } else {
+                    fmt_key(k)
+                };
+                format!("{key}: {}", self.inspect_lvl(&val, indent + 2, st))
+            })
+            .collect();
+        let start = output.len() + indent + 1 + stack.chars().count() + 10;
+        if self.may_compact(indent, st)
+            && !stack.contains('\n')
+            && is_below_break_length(&output, start)
+        {
+            return format!("{stack} {{ {} }}", output.join(", "));
+        }
+        let pad = " ".repeat(indent);
+        let sep = format!(",\n{pad}  ");
+        format!("{stack} {{\n{pad}  {}\n{pad}}}", output.join(&sep))
     }
 
     fn render_object(
