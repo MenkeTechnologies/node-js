@@ -1933,6 +1933,20 @@ only once the next line arrives. Piped and redirected input is unaffected.
 | `console.table` CENTRED every cell where node 26 left-justifies, printed a Map, a Set or a collection iterator with `console.log`, ignored the table's inspect options (`[Object]` past two keys, three array items), measured width in code points (a CJK cell misaligned), accepted a non-array `properties`, and printed `properties` too for a primitive | a port of node's `Console.prototype.table` and `cli_table`: Map/Set and their iterators (read without consuming, a Set entries iterator flattened as V8 previews it), sparse columns in `ObjectKeys` order, `getStringWidth`'s East Asian and zero-width ranges, `ERR_INVALID_ARG_TYPE` for `properties` (`parity-scripts/stdlib/44_console_table.js`) |
 | a failed call named its callee by VALUE or method name for most expression shapes: `[1][0]()` reported `0 is not a function`, `(n + 1)()` `1`, `(() => 1)()()` `1`, `(function(){}).x()` `x`, `` `x`() `` `x`, and `o["has space"]()` printed bracketed | the callee is printed from source the way V8's `CallPrinter` does — `[1,n,"q"][0]`, `(n + 1)`, `(-n)`, `(n++)`, `/re/g`, `"x"`, `o.a.has space`, an assignment by its target, and `(intermediate value)` for function, class, `new`, BigInt, conditional and parenthesized optional-chain callees (`parity-scripts/lang/26_callee_text_shapes.js`) |
 
+## FIXED in round 13 — verified against node v26.10.0
+
+| was | now |
+| --- | --- |
+| `delete f()` never called `f`, and `delete o?.a.b` with a nullish `o` threw `TypeError` | a non-Reference operand is evaluated and the result is `true`; a short-circuiting optional chain makes the whole `delete` `true` (`parity-scripts/lang/37_delete_operand_eval.js`) |
+| error instances listed `message` before `stack`, and `AggregateError` put `errors` before `cause` | own keys follow V8: `stack`, then `message`, `cause`, `errors`; a Node JS-layer coded error lists `code` before `message`, a native-layer one after it (`parity-scripts/objects/20_error_own_key_order.js`) |
+| `Buffer.from(5)` threw an unbracketed `TypeError: The first argument …` | it is the JS-layer `ERR_INVALID_ARG_TYPE`, so `String(err)` reads `TypeError [ERR_INVALID_ARG_TYPE]: …` (`parity-scripts/stdlib/45_buffer_from_invalid_arg.js`) |
+| `util.inspect` of an error printed a frameless stack bare, never showed `[cause]` or `[errors]`, kept a multi-line stack's extra keys on one line, did not re-indent a nested stack, and printed an empty `stack` as nothing | port of node's `formatError`: `[Error: x]` brackets, hidden `[cause]`/`[errors]` keys, `message`/`name` dropped when the stack shows them, the multi-line brace form after a multi-line stack, nested re-indentation, and the `Error.prototype.toString` fallback for a falsy stack; `DOMException` captures frames like the `new Error()` node builds it on (`parity-scripts/objects/21_inspect_error_shapes.js`) |
+| `Promise.any([])` never settled, and its `AggregateError` carried the frames of whatever script was running | an empty iterable rejects at once; the error's `stack` is the header alone, as V8 builds it inside the builtin, so it inspects as `[AggregateError: All promises were rejected] { [errors]: […] }` (`parity-scripts/async/32_promise_any_rejection.js`) |
+| `String(proxy)` read `toString` through the `get` trap twice | `OrdinaryToPrimitive` reads each candidate once and calls what it read (`parity-scripts/objects/22_proxy_to_primitive_get_once.js`) |
+| an array's own named property never shadowed `Array.prototype` (`a.join = f; a.join()` ran the builtin), `Object.defineProperty(arr, 'foo', …)` stored nothing, `arr.hasOwnProperty('foo')` was `false`, and `Array.prototype.toString` ignored `join` | own properties win over the prototype on read and call; `defineProperty` writes them; `toString` is 23.1.3.36 — `Get(O, "join")`, call it, else `Object.prototype.toString` — for arrays, subclasses and array-likes (`parity-scripts/objects/23_array_own_props_shadow.js`) |
+| spread / `Object.assign` / `Object.entries` on a Proxy asked every descriptor before reading any value; `JSON.stringify` of an array proxy went through `Symbol.iterator` and the `has` trap | one key at a time: descriptor, then `get`; `JSON.stringify` takes every descriptor first and serializes an array proxy by `length` + index reads alone (`parity-scripts/objects/24_proxy_copy_trap_order.js`) |
+| `[].concat(arrayProxy)` appended the proxy as one element; a spread array-like turned a missing index into `undefined` and swallowed a throwing getter | `IsArray` sees through the proxy; each index is `HasProperty`-then-`Get`, so holes stay holes and getter errors propagate (`parity-scripts/objects/25_concat_spreadable.js`) |
+
 ## Still open — found in round 7
 
 | gap | node v26.7.0 | node-js |
@@ -2714,6 +2728,16 @@ Still divergent, and why:
   those names are properties of node's implementation, not of any
   specification, so transcribing them would pin this frontend to one node
   build.
+- **Node's timer and tick globals have no `length` or `prototype`.** The same
+  scope line leaves `setTimeout`, `setInterval`, `setImmediate`,
+  `clearTimeout`/`clearInterval`/`clearImmediate`, `process.nextTick` and
+  `fetch` out of `gen-arity`, so `setTimeout.length` is `undefined` (node: `2`)
+  and `Object.getOwnPropertyNames(setTimeout)` is `['name']` (node:
+  `['length', 'name', 'prototype']`). The `builtinmeta` fuzz mode reports these
+  on every run; widening the generator's global list is the open decision.
+- **`Temporal` is absent**, so `Date.prototype` lists 47 own keys where node
+  lists 48 (`toTemporalInstant`) — the remaining `examples/protolistings.js`
+  and `examples/protomembers.js` divergence under `parity`.
 - **`gen-arity` must run against the same node the corpus does.** `src/arity.rs`
   now carries four tables, all transcribed from the reference binary:
   `BUILTIN_ARITY`, `PROTO_MEMBERS`, `PROTO_ACCESSORS`, `PROTO_READONLY`.
