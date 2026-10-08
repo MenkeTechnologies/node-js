@@ -586,15 +586,121 @@ pub fn is_regexp_method(name: &str) -> bool {
         )
 }
 
+/// V8's wording for a `RegExp.prototype` method whose receiver is not a RegExp.
+pub fn incompatible_receiver(method: &str, recv: &Value) -> String {
+    host::type_error(&format!(
+        "Method RegExp.prototype.{method} called on incompatible receiver {}",
+        crate::builtins::no_side_effects_string_pub(recv)
+    ))
+}
+
+/// Whether `f` is the built-in `RegExp.prototype.exec` — read off a RegExp
+/// (a thunk bound to it) or off the prototype itself.
+fn is_builtin_exec(f: &Value) -> bool {
+    with_host(|h| match h.get(f) {
+        Some(JsObj::BoundMethod { recv, name }) => {
+            name == "exec" && matches!(h.get(recv), Some(JsObj::RegExp(_)))
+        }
+        Some(JsObj::Builtin(n)) => n == "@proto:RegExp:exec",
+        _ => false,
+    })
+}
+
+/// `RegExpExec(R, S)` (22.2.7.1). `R`'s `exec` is read with `[[Get]]`; one that
+/// is not the built-in — an own override, a subclass method, or the method of a
+/// plain object — is called and must return an object or `null`. Otherwise `R`
+/// has to be a RegExp, and the built-in matcher runs.
+pub fn regexp_exec_generic(r: &Value, s: &str) -> Result<Value, String> {
+    match user_exec(r)? {
+        Some(exec) => call_user_exec(r, &exec, s),
+        None => regexp_exec(require_regexp(r, "exec")?, s),
+    }
+}
+
+/// The `exec` `RegExpExec` must CALL: `Some` when `[[Get]](R, "exec")` is a
+/// callable other than the built-in, `None` when the built-in matcher applies.
+fn user_exec(r: &Value) -> Result<Option<Value>, String> {
+    // The common case answers without materializing the method: a RegExp with
+    // no own `exec`, linked straight to `RegExp.prototype`, whose `exec` no
+    // script has replaced (a replacement lives in the namespace's own table).
+    let untouched = with_host(|h| {
+        matches!(h.get(r), Some(JsObj::RegExp(_)))
+            && h.fn_prop(r, "exec").is_none()
+            && h.proto_of(r).is_none()
+            && h.builtin_static("RegExp.prototype", "exec").is_none()
+    });
+    if untouched {
+        return Ok(None);
+    }
+    let exec = crate::builtins::get_property(r, "exec")?;
+    Ok((!is_builtin_exec(&exec) && with_host(|h| host::is_callable(h, &exec))).then_some(exec))
+}
+
+/// Call a user `exec` and enforce `RegExpExec` step 2.b on its result.
+fn call_user_exec(r: &Value, exec: &Value, s: &str) -> Result<Value, String> {
+    let subject = with_host(|h| h.new_str(s));
+    let result = host::invoke(exec, vec![subject], Some(r.clone()))?;
+    let ok = with_host(|h| {
+        h.is_null(&result) || (matches!(result, Value::Obj(_)) && !host::is_primitive(h, &result))
+    });
+    if !ok {
+        return Err(host::type_error(
+            "RegExp exec method returned something other than an Object or null",
+        ));
+    }
+    Ok(result)
+}
+
+/// `r` itself when it is a RegExp, else V8's incompatible-receiver error for
+/// `method` — the built-in matcher needs `[[RegExpMatcher]]`.
+fn require_regexp<'a>(r: &'a Value, method: &str) -> Result<&'a Value, String> {
+    if with_host(|h| matches!(h.get(r), Some(JsObj::RegExp(_)))) {
+        Ok(r)
+    } else {
+        Err(incompatible_receiver(method, r))
+    }
+}
+
+/// `RegExp.prototype.test` (22.2.6.16): `RegExpExec` and a non-null result.
+/// Generic over any object receiver; with the built-in `exec` it runs the
+/// matcher without building a match array.
+pub fn regexp_test_generic(r: &Value, arg: &Value) -> Result<Value, String> {
+    let s = match with_host(|h| h.as_str(arg)) {
+        Some(s) => s,
+        None => {
+            let v = host::to_string_value(arg)?;
+            with_host(|h| h.str_of(&v))
+        }
+    };
+    Ok(Value::Bool(match user_exec(r)? {
+        Some(exec) => {
+            let result = call_user_exec(r, &exec, &s)?;
+            !with_host(|h| h.is_null(&result))
+        }
+        None => regexp_test(require_regexp(r, "exec")?, &s),
+    }))
+}
+
+/// `RegExp.prototype.toString` (22.2.6.17): `"/" + ToString(R.source) + "/" +
+/// ToString(R.flags)`, both read with `[[Get]]`, for any object receiver.
+pub fn regexp_to_string_generic(r: &Value) -> Result<Value, String> {
+    let read = |k: &str| -> Result<String, String> {
+        let v = crate::builtins::get_property(r, k)?;
+        let s = host::to_string_value(&v)?;
+        Ok(with_host(|h| h.str_of(&s)))
+    };
+    let source = read("source")?;
+    let flags = read("flags")?;
+    Ok(with_host(|h| h.new_str(format!("/{source}/{flags}"))))
+}
+
 /// Dispatch a `RegExp.prototype` method.
 pub fn regexp_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
-        "test" => {
-            let s = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
-            Ok(Value::Bool(regexp_test(recv, &s)))
-        }
+        "test" => regexp_test_generic(recv, &args.first().cloned().unwrap_or(Value::Undef)),
         "exec" => {
-            let s = with_host(|h| h.str_of(&args.first().cloned().unwrap_or(Value::Undef)));
+            let s = host::to_string_value(&args.first().cloned().unwrap_or(Value::Undef))?;
+            let s = with_host(|h| h.str_of(&s));
             regexp_exec(recv, &s)
         }
         "toString" => Ok(with_host(|h| {

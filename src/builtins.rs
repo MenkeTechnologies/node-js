@@ -3422,6 +3422,18 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     // rest take the ordinary branded form. Measured on node v26.8.1:
     // `Date.prototype.getTime.call({})` is the first, `.toISOString.call({})`
     // and `.setHours.call({})` the second.
+    // `RegExp.prototype.test` and `toString` are generic over any object
+    // (22.2.6.16-17); `exec`, `compile` and the rest need a real RegExp.
+    if ctor == "RegExp" && with_host(|h| h.kind_of(recv)) != Some(ObjKind::RegExp) {
+        let object = with_host(|h| is_object_like(h, recv));
+        return match method {
+            "test" if object => {
+                crate::regexp::regexp_test_generic(recv, &args.first().cloned().unwrap_or(Value::Undef))
+            }
+            "toString" if object => crate::regexp::regexp_to_string_generic(recv),
+            _ => Err(crate::regexp::incompatible_receiver(method, recv)),
+        };
+    }
     // `Date.prototype[@@toPrimitive]` alone is generic: it accepts any object.
     if ctor == "Date" && method == "@@toPrimitive" {
         return date_to_primitive(recv, &args);
