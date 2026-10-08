@@ -15754,6 +15754,12 @@ fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
     };
     let rid = with_host(|h| h.promise_id(&result).unwrap());
     let n = items.len();
+    // `Promise.any` of an empty iterable: remainingElementsCount drops to 0
+    // right after the loop (27.2.4.3.1 step 8.d), so it rejects at once.
+    if any && n == 0 {
+        host::reject_promise_val(rid, promise_any_rejection(Vec::new()));
+        return Ok(result);
+    }
     let errors = std::rc::Rc::new(std::cell::RefCell::new(vec![Value::Undef; n]));
     let remaining = std::rc::Rc::new(std::cell::RefCell::new(n));
     for (i, it) in items.into_iter().enumerate() {
@@ -15773,9 +15779,7 @@ fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
                         *r -= 1;
                         if *r == 0 {
                             // All rejected → AggregateError carrying every reason.
-                            let reasons = with_host(|h| h.new_array(errors.borrow().clone()));
-                            let msg = with_host(|h| h.new_str("All promises were rejected"));
-                            let agg = make_error_inner("AggregateError", &[reasons, msg]);
+                            let agg = promise_any_rejection(errors.borrow().clone());
                             host::reject_promise_val(rid, agg);
                         }
                     }
@@ -15789,6 +15793,24 @@ fn promise_race(args: Vec<Value>, any: bool) -> Result<Value, String> {
         );
     }
     Ok(result)
+}
+
+/// The `AggregateError` a `Promise.any` rejects with. V8 builds it inside the
+/// builtin with no JavaScript frames captured, so its `stack` is the header
+/// line alone — which is also why `util.inspect` brackets it
+/// (`[AggregateError: All promises were rejected] { [errors]: [...] }`).
+fn promise_any_rejection(reasons: Vec<Value>) -> Value {
+    let reasons = with_host(|h| h.new_array(reasons));
+    let msg = with_host(|h| h.new_str("All promises were rejected"));
+    let agg = make_error_inner("AggregateError", &[reasons, msg]);
+    with_host(|h| {
+        let header = h.new_str("AggregateError: All promises were rejected".to_string());
+        if let Some(JsObj::Object(p)) = h.get_mut(&agg) {
+            p.insert("stack".into(), header);
+            p.shift_remove("@@stackRaw");
+        }
+    });
+    agg
 }
 
 /// `.then` / `.catch` / `.finally` on a promise.
