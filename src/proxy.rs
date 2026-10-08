@@ -48,6 +48,19 @@ pub fn ultimate_target(v: &Value) -> Option<Value> {
     Some(cur)
 }
 
+/// The object `IsArray` (7.2.2) decides on: `v`, or the end of its proxy chain.
+/// Every proxy passed on the way must still be live.
+pub fn is_array_subject(v: &Value) -> Result<Value, String> {
+    let mut cur = v.clone();
+    while let Some((target, _)) = parts(&cur) {
+        if revoked(&cur) {
+            return Err(revoked_err("IsArray"));
+        }
+        cur = target;
+    }
+    Ok(cur)
+}
+
 /// V8's message for an operation attempted on a revoked proxy.
 fn revoked_err(op: &str) -> String {
     host::type_error(&format!(
@@ -135,19 +148,195 @@ fn invariant(msg: &str) -> String {
     host::type_error(msg)
 }
 
+/// V8's side-effect-free rendering of a value inside an invariant message.
+fn shown(v: &Value) -> String {
+    crate::builtins::no_side_effects_string_pub(v)
+}
+
+/// A Property Descriptor record (6.2.6): each field present or absent.
+#[derive(Default)]
+struct Desc {
+    value: Option<Value>,
+    writable: Option<bool>,
+    get: Option<Value>,
+    set: Option<Value>,
+    enumerable: Option<bool>,
+    configurable: Option<bool>,
+}
+
+impl Desc {
+    fn is_accessor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
+    }
+    fn is_data(&self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+    fn is_generic(&self) -> bool {
+        !self.is_accessor() && !self.is_data()
+    }
+    fn is_empty(&self) -> bool {
+        self.is_generic() && self.enumerable.is_none() && self.configurable.is_none()
+    }
+
+    /// `ToPropertyDescriptor(obj)` (6.2.6.5): each field read only when the
+    /// object HAS it, in the spec's order, with V8's wording for each refusal.
+    fn from_object(obj: &Value) -> Result<Desc, String> {
+        if !with_host(|h| matches!(obj, Value::Obj(_)) && !h.is_null(obj) && !host::is_primitive(h, obj)) {
+            return Err(host::type_error(&format!(
+                "Property description must be an object: {}",
+                shown(obj)
+            )));
+        }
+        let field = |k: &str| -> Result<Option<Value>, String> {
+            if crate::builtins::has_property(obj, k)? {
+                crate::builtins::get_property(obj, k).map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        let truthy = |v: Value| with_host(|h| h.truthy(&v));
+        let mut d = Desc {
+            enumerable: field("enumerable")?.map(truthy),
+            configurable: field("configurable")?.map(truthy),
+            value: field("value")?,
+            writable: field("writable")?.map(truthy),
+            ..Desc::default()
+        };
+        for (k, slot, what) in [("get", &mut d.get, "Getter"), ("set", &mut d.set, "Setter")] {
+            if let Some(f) = field(k)? {
+                if !matches!(f, Value::Undef) && !with_host(|h| host::is_callable(h, &f)) {
+                    return Err(host::type_error(&format!(
+                        "{what} must be a function: {}",
+                        shown(&f)
+                    )));
+                }
+                *slot = Some(f);
+            }
+        }
+        if d.is_accessor() && d.is_data() {
+            return Err(host::type_error(&format!(
+                "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute, {}",
+                shown(obj)
+            )));
+        }
+        Ok(d)
+    }
+
+    /// `CompletePropertyDescriptor` (6.2.6.6).
+    fn complete(mut self) -> Desc {
+        if self.is_generic() || self.is_data() {
+            self.value.get_or_insert(Value::Undef);
+            self.writable.get_or_insert(false);
+        } else {
+            self.get.get_or_insert(Value::Undef);
+            self.set.get_or_insert(Value::Undef);
+        }
+        self.enumerable.get_or_insert(false);
+        self.configurable.get_or_insert(false);
+        self
+    }
+
+    /// `FromPropertyDescriptor` (6.2.6.4): an object with the present fields,
+    /// in the spec's order.
+    fn to_object(&self) -> Value {
+        let mut m = indexmap::IndexMap::new();
+        if let Some(v) = &self.value {
+            m.insert("value".to_string(), v.clone());
+        }
+        if let Some(w) = self.writable {
+            m.insert("writable".to_string(), Value::Bool(w));
+        }
+        if let Some(g) = &self.get {
+            m.insert("get".to_string(), g.clone());
+        }
+        if let Some(s) = &self.set {
+            m.insert("set".to_string(), s.clone());
+        }
+        if let Some(e) = self.enumerable {
+            m.insert("enumerable".to_string(), Value::Bool(e));
+        }
+        if let Some(c) = self.configurable {
+            m.insert("configurable".to_string(), Value::Bool(c));
+        }
+        with_host(|h| h.new_object(m))
+    }
+}
+
+/// `target.[[GetOwnProperty]](key)` as a record, `None` when absent. A proxy
+/// target answers through its own traps.
+fn target_desc(target: &Value, key: &str) -> Result<Option<Desc>, String> {
+    let d = crate::builtins::own_descriptor_pub(target, key_value(key))?;
+    if matches!(d, Value::Undef) {
+        return Ok(None);
+    }
+    Desc::from_object(&d).map(Some)
+}
+
+/// `IsExtensible(target)`, through the target's own trap when it is a proxy.
+fn target_extensible(target: &Value) -> Result<bool, String> {
+    match is_extensible(target)? {
+        Some(b) => Ok(b),
+        None => Ok(with_host(|h| h.is_extensible(target))),
+    }
+}
+
+/// `IsCompatiblePropertyDescriptor(extensible, desc, current)` (10.1.6.2):
+/// `ValidateAndApplyPropertyDescriptor` with no object to apply it to.
+fn is_compatible(extensible: bool, desc: &Desc, current: Option<&Desc>) -> bool {
+    let Some(current) = current else {
+        return extensible;
+    };
+    if desc.is_empty() || current.configurable != Some(false) {
+        return true;
+    }
+    if desc.configurable == Some(true) {
+        return false;
+    }
+    if desc.enumerable.is_some() && desc.enumerable != current.enumerable {
+        return false;
+    }
+    if !desc.is_generic() && desc.is_accessor() != current.is_accessor() {
+        return false;
+    }
+    let differs = |a: &Option<Value>, b: &Option<Value>| match (a, b) {
+        (Some(x), Some(y)) => !crate::builtins::same_value(x, y),
+        (Some(x), None) => !matches!(x, Value::Undef),
+        _ => false,
+    };
+    if current.is_accessor() {
+        return !differs(&desc.get, &current.get) && !differs(&desc.set, &current.set);
+    }
+    if current.writable == Some(false) {
+        return desc.writable != Some(true) && !differs(&desc.value, &current.value);
+    }
+    true
+}
+
 pub fn get(v: &Value, key: &str, receiver: &Value) -> Result<Option<Value>, String> {
     if let Some((t, target, handler)) = trap(v, "get")? {
         let k = key_value(key);
         let got = call(&t, &handler, vec![target.clone(), k, receiver.clone()])?;
-        // A non-configurable non-writable data property must be reported as it
-        // is on the target.
-        if let Some((val, writable, configurable, is_accessor)) =
-            crate::builtins::own_prop_facts(&target, key)
-        {
-            if !configurable && !is_accessor && !writable && !with_host(|h| h.strict_eq(&got, &val))
+        // 10.5.8 step 9: a non-configurable property pins the answer — a
+        // read-only data property to its value, an accessor with no getter to
+        // `undefined`.
+        if let Some(d) = target_desc(&target, key)?.filter(|d| d.configurable == Some(false)) {
+            if d.is_data() && d.writable == Some(false) {
+                let val = d.value.clone().unwrap_or(Value::Undef);
+                if !crate::builtins::same_value(&got, &val) {
+                    return Err(invariant(&format!(
+                        "'get' on proxy: property '{key}' is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value (expected '{}' but got '{}')",
+                        shown(&val),
+                        shown(&got)
+                    )));
+                }
+            }
+            if d.is_accessor()
+                && matches!(d.get, Some(Value::Undef) | None)
+                && !matches!(got, Value::Undef)
             {
                 return Err(invariant(&format!(
-                    "'get' on proxy: property '{key}' is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value"
+                    "'get' on proxy: property '{key}' is a non-configurable accessor property on the proxy target and does not have a getter function, but the trap did not return 'undefined' (got '{}')",
+                    shown(&got)
                 )));
             }
         }
@@ -176,14 +365,21 @@ pub fn set(v: &Value, key: &str, val: &Value, receiver: &Value) -> Result<bool, 
         if !with_host(|h| h.truthy(&r)) {
             return Ok(false);
         }
-        // Reporting success for a write the target pins is a lie.
-        if let Some((cur, writable, configurable, is_accessor)) =
-            crate::builtins::own_prop_facts(&target, key)
-        {
-            if !configurable && !is_accessor && !writable && !with_host(|h| h.strict_eq(val, &cur))
+        // 10.5.9 step 10: reporting success for a write the target pins is a
+        // lie — a read-only data property holding another value, or an
+        // accessor with no setter.
+        if let Some(d) = target_desc(&target, key)?.filter(|d| d.configurable == Some(false)) {
+            if d.is_data()
+                && d.writable == Some(false)
+                && !crate::builtins::same_value(val, d.value.as_ref().unwrap_or(&Value::Undef))
             {
                 return Err(invariant(&format!(
                     "'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
+                )));
+            }
+            if d.is_accessor() && matches!(d.set, Some(Value::Undef) | None) {
+                return Err(invariant(&format!(
+                    "'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable accessor property without a setter"
                 )));
             }
         }
@@ -263,13 +459,18 @@ pub fn has(v: &Value, key: &str) -> Result<Option<bool>, String> {
         let k = key_value(key);
         let r = call(&t, &handler, vec![target.clone(), k])?;
         let reported = with_host(|h| h.truthy(&r));
-        // A non-configurable property, or any property of a non-extensible
-        // target, cannot be hidden from `in`.
+        // 10.5.7 step 9: a non-configurable property, or any property of a
+        // non-extensible target, cannot be hidden from `in`.
         if !reported {
-            if let Some((_, _, configurable, _)) = crate::builtins::own_prop_facts(&target, key) {
-                if !configurable || !with_host(|h| h.is_extensible(&target)) {
+            if let Some(d) = target_desc(&target, key)? {
+                if d.configurable == Some(false) {
                     return Err(invariant(&format!(
                         "'has' on proxy: trap returned falsish for property '{key}' which exists in the proxy target as non-configurable"
+                    )));
+                }
+                if !target_extensible(&target)? {
+                    return Err(invariant(&format!(
+                        "'has' on proxy: trap returned falsish for property '{key}' but the proxy target is not extensible"
                     )));
                 }
             }
@@ -288,12 +489,18 @@ pub fn delete(v: &Value, key: &str) -> Result<Option<bool>, String> {
         let k = key_value(key);
         let r = call(&t, &handler, vec![target.clone(), k])?;
         let reported = with_host(|h| h.truthy(&r));
-        // A non-configurable property cannot be reported as deleted.
+        // 10.5.10 steps 10-13: a non-configurable property, or any property of
+        // a non-extensible target, cannot be reported as deleted.
         if reported {
-            if let Some((_, _, configurable, _)) = crate::builtins::own_prop_facts(&target, key) {
-                if !configurable {
+            if let Some(d) = target_desc(&target, key)? {
+                if d.configurable == Some(false) {
                     return Err(invariant(&format!(
                         "'deleteProperty' on proxy: trap returned truish for property '{key}' which is non-configurable in the proxy target"
+                    )));
+                }
+                if !target_extensible(&target)? {
+                    return Err(invariant(&format!(
+                        "'deleteProperty' on proxy: trap returned truish for property '{key}' but the proxy target is non-extensible"
                     )));
                 }
             }
@@ -311,18 +518,31 @@ pub fn delete(v: &Value, key: &str) -> Result<Option<bool>, String> {
 pub fn own_keys(v: &Value) -> Result<Option<Vec<String>>, String> {
     if let Some((t, target, handler)) = trap(v, "ownKeys")? {
         let r = call(&t, &handler, vec![target.clone()])?;
-        let items = with_host(|h| h.iter_vec(&r))?;
-        let mut out = Vec::with_capacity(items.len());
-        for k in items {
+        // `CreateListFromArrayLike(result, « String, Symbol »)`: an array-like
+        // read by `length` and index, whose every element is a property key.
+        if !with_host(|h| matches!(r, Value::Obj(_)) && !h.is_null(&r) && !host::is_primitive(h, &r)) {
+            return Err(host::type_error("CreateListFromArrayLike called on non-object"));
+        }
+        let len = crate::builtins::length_of_array_like(&r)?;
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let k = crate::builtins::get_property(&r, &i.to_string())?;
+            let is_key = with_host(|h| {
+                h.as_str(&k).is_some() || matches!(h.get(&k), Some(JsObj::Symbol { .. }))
+            });
+            if !is_key {
+                return Err(host::type_error(&format!(
+                    "{} is not a valid property name",
+                    shown(&k)
+                )));
+            }
             out.push(host::to_property_key(&k)?);
         }
         // The list must contain no duplicates …
         let mut seen: Vec<&String> = Vec::with_capacity(out.len());
         for k in &out {
             if seen.contains(&k) {
-                return Err(invariant(&format!(
-                    "'ownKeys' on proxy: trap returned duplicate entries for property '{k}'"
-                )));
+                return Err(invariant("'ownKeys' on proxy: trap returned duplicate entries"));
             }
             seen.push(k);
         }
@@ -385,17 +605,7 @@ pub fn get_own_descriptor(v: &Value, key: &str) -> Result<Option<Value>, String>
     if let Some((t, target, handler)) = trap(v, "getOwnPropertyDescriptor")? {
         let k = key_value(key);
         let d = call(&t, &handler, vec![target.clone(), k])?;
-        // A non-configurable property cannot be reported as absent.
-        if matches!(d, Value::Undef) {
-            if let Some((_, _, configurable, _)) = crate::builtins::own_prop_facts(&target, key) {
-                if !configurable {
-                    return Err(invariant(&format!(
-                        "'getOwnPropertyDescriptor' on proxy: trap returned undefined for property '{key}' which is non-configurable in the proxy target"
-                    )));
-                }
-            }
-        }
-        return Ok(Some(d));
+        return checked_own_descriptor(&target, key, &d).map(Some);
     }
     match no_trap(v, "getOwnPropertyDescriptor")? {
         Some(target) => {
@@ -406,11 +616,65 @@ pub fn get_own_descriptor(v: &Value, key: &str) -> Result<Option<Value>, String>
     }
 }
 
-/// `[[DefineOwnProperty]]`.
+/// 10.5.5 steps 8-17: validate what a `getOwnPropertyDescriptor` trap
+/// returned against the target, and hand back the COMPLETED descriptor the
+/// operation yields — not the trap's own object.
+fn checked_own_descriptor(target: &Value, key: &str, d: &Value) -> Result<Value, String> {
+    let is_object = with_host(|h| matches!(d, Value::Obj(_)) && !h.is_null(d) && !host::is_primitive(h, d));
+    if !is_object && !matches!(d, Value::Undef) {
+        return Err(invariant(&format!(
+            "'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined for property '{key}'"
+        )));
+    }
+    let target_d = target_desc(target, key)?;
+    if !is_object {
+        if let Some(td) = &target_d {
+            if td.configurable == Some(false) {
+                return Err(invariant(&format!(
+                    "'getOwnPropertyDescriptor' on proxy: trap returned undefined for property '{key}' which is non-configurable in the proxy target"
+                )));
+            }
+            if !target_extensible(target)? {
+                return Err(invariant(&format!(
+                    "'getOwnPropertyDescriptor' on proxy: trap returned undefined for property '{key}' which exists in the non-extensible proxy target"
+                )));
+            }
+        }
+        return Ok(Value::Undef);
+    }
+    let extensible = target_extensible(target)?;
+    let result = Desc::from_object(d)?.complete();
+    if !is_compatible(extensible, &result, target_d.as_ref()) {
+        return Err(invariant(&format!(
+            "'getOwnPropertyDescriptor' on proxy: trap returned descriptor for property '{key}' that is incompatible with the existing property in the proxy target"
+        )));
+    }
+    if result.configurable == Some(false) {
+        match &target_d {
+            Some(td) if td.configurable == Some(false) => {
+                if result.writable == Some(false) && td.writable == Some(true) {
+                    return Err(invariant(&format!(
+                        "'getOwnPropertyDescriptor' on proxy: trap reported non-configurable and non-writable for property '{key}' which is non-configurable, writable in the proxy target"
+                    )));
+                }
+            }
+            _ => {
+                return Err(invariant(&format!(
+                    "'getOwnPropertyDescriptor' on proxy: trap reported non-configurability for property '{key}' which is either non-existent or configurable in the proxy target"
+                )));
+            }
+        }
+    }
+    Ok(result.to_object())
+}
+
+/// `[[DefineOwnProperty]]`. The trap receives the descriptor normalized by
+/// `ToPropertyDescriptor` → `FromPropertyDescriptor`, not the caller's object.
 pub fn define_property(v: &Value, key: &str, desc: &Value) -> Result<bool, String> {
     if let Some((t, target, handler)) = trap(v, "defineProperty")? {
         let k = key_value(key);
-        let r = call(&t, &handler, vec![target.clone(), k, desc.clone()])?;
+        let d = Desc::from_object(desc)?;
+        let r = call(&t, &handler, vec![target.clone(), k, d.to_object()])?;
         // A FALSISH return means the trap refused. Unlike `set` and
         // `deleteProperty`, this one throws from `Object.defineProperty` in
         // SLOPPY code too — only `Reflect.defineProperty` reports it as
@@ -419,13 +683,46 @@ pub fn define_property(v: &Value, key: &str, desc: &Value) -> Result<bool, Strin
         if !with_host(|h| h.truthy(&r)) {
             return Ok(false);
         }
-        // A new property cannot be added to a non-extensible target.
-        if crate::builtins::own_prop_facts(&target, key).is_none()
-            && !with_host(|h| h.is_extensible(&target))
-        {
-            return Err(invariant(&format!(
-                "'defineProperty' on proxy: trap returned truish for adding property '{key}' to the non-extensible proxy target"
-            )));
+        // 10.5.6 steps 10-16: the target must be able to hold what the trap
+        // claims to have defined.
+        let target_d = target_desc(&target, key)?;
+        let extensible = target_extensible(&target)?;
+        let setting_config_false = d.configurable == Some(false);
+        let non_configurable = || {
+            invariant(&format!(
+                "'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which is either non-existent or configurable in the proxy target"
+            ))
+        };
+        match &target_d {
+            None => {
+                if !extensible {
+                    return Err(invariant(&format!(
+                        "'defineProperty' on proxy: trap returned truish for adding property '{key}' to the non-extensible proxy target"
+                    )));
+                }
+                if setting_config_false {
+                    return Err(non_configurable());
+                }
+            }
+            Some(td) => {
+                if !is_compatible(extensible, &d, Some(td)) {
+                    return Err(invariant(&format!(
+                        "'defineProperty' on proxy: trap returned truish for adding property '{key}'  that is incompatible with the existing property in the proxy target"
+                    )));
+                }
+                if setting_config_false && td.configurable == Some(true) {
+                    return Err(non_configurable());
+                }
+                if td.is_data()
+                    && td.configurable == Some(false)
+                    && td.writable == Some(true)
+                    && d.writable == Some(false)
+                {
+                    return Err(invariant(&format!(
+                        "'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which cannot be non-writable, unless there exists a corresponding non-configurable, non-writable own property of the target object."
+                    )));
+                }
+            }
         }
         return Ok(true);
     }
@@ -462,9 +759,28 @@ pub fn get_prototype_of(v: &Value) -> Result<Option<Value>, String> {
 }
 
 /// `[[SetPrototypeOf]]`.
+///
+/// The trap's answer is the result (10.5.2): `false` is a refusal, which
+/// `Object.setPrototypeOf` turns into a TypeError and `Reflect.setPrototypeOf`
+/// reports. A non-extensible target's prototype cannot be changed, so `true`
+/// is checked against the prototype it really has.
 pub fn set_prototype_of(v: &Value, proto: &Value) -> Result<bool, String> {
     if let Some((t, target, handler)) = trap(v, "setPrototypeOf")? {
-        call(&t, &handler, vec![target, proto.clone()])?;
+        let r = call(&t, &handler, vec![target.clone(), proto.clone()])?;
+        if !with_host(|h| h.truthy(&r)) {
+            return Ok(false);
+        }
+        if !target_extensible(&target)? {
+            let actual = match get_prototype_of(&target)? {
+                Some(p) => p,
+                None => crate::builtins::prototype_of(&target),
+            };
+            if !crate::builtins::same_value(proto, &actual) {
+                return Err(invariant(
+                    "'setPrototypeOf' on proxy: trap returned truish for setting a new prototype on the non-extensible proxy target",
+                ));
+            }
+        }
         return Ok(true);
     }
     match no_trap(v, "setPrototypeOf")? {
@@ -483,10 +799,11 @@ pub fn is_extensible(v: &Value) -> Result<Option<bool>, String> {
         // target's, so a frozen target cannot be passed off as open.
         let reported = call(&t, &handler, vec![target.clone()])?;
         let reported = with_host(|h| h.truthy(&reported));
-        if reported != with_host(|h| h.is_extensible(&target)) {
-            return Err(invariant(
-                "'isExtensible' on proxy: trap result does not reflect extensibility of proxy target",
-            ));
+        let actual = target_extensible(&target)?;
+        if reported != actual {
+            return Err(invariant(&format!(
+                "'isExtensible' on proxy: trap result does not reflect extensibility of proxy target (which is '{actual}')"
+            )));
         }
         return Ok(Some(reported));
     }
@@ -497,18 +814,38 @@ pub fn is_extensible(v: &Value) -> Result<Option<bool>, String> {
 }
 
 /// `[[PreventExtensions]]`.
-pub fn prevent_extensions(v: &Value) -> Result<bool, String> {
+///
+/// `Ok(None)` → not a proxy. Otherwise the operation's boolean result
+/// (10.5.4): a trap's `false` is a refusal — a TypeError from
+/// `Object.preventExtensions`, `false` from `Reflect.preventExtensions` — and
+/// its `true` must leave the target really non-extensible.
+pub fn prevent_extensions(v: &Value) -> Result<Option<bool>, String> {
     if let Some((t, target, handler)) = trap(v, "preventExtensions")? {
-        call(&t, &handler, vec![target])?;
-        return Ok(true);
+        let r = call(&t, &handler, vec![target.clone()])?;
+        let reported = with_host(|h| h.truthy(&r));
+        if reported && target_extensible(&target)? {
+            return Err(invariant(
+                "'preventExtensions' on proxy: trap returned truish but the proxy target is extensible",
+            ));
+        }
+        return Ok(Some(reported));
     }
     match no_trap(v, "preventExtensions")? {
-        Some(target) => {
-            with_host(|h| h.prevent_extensions(&target));
-            Ok(true)
-        }
-        None => Ok(false),
+        Some(target) => match prevent_extensions(&target)? {
+            Some(b) => Ok(Some(b)),
+            None => {
+                with_host(|h| h.prevent_extensions(&target));
+                Ok(Some(true))
+            }
+        },
+        None => Ok(None),
     }
+}
+
+/// V8's TypeError for an `Object.preventExtensions`/`freeze`/`seal` whose
+/// proxy trap refused.
+pub fn prevent_extensions_refused() -> String {
+    host::type_error("'preventExtensions' on proxy: trap returned falsish")
 }
 
 /// `[[Call]]`.
@@ -528,7 +865,15 @@ pub fn apply(v: &Value, args: Vec<Value>, this: Option<Value>) -> Result<Option<
 pub fn construct(v: &Value, args: Vec<Value>, new_target: &Value) -> Result<Option<Value>, String> {
     if let Some((t, target, handler)) = trap(v, "construct")? {
         let list = with_host(|h| h.new_array(args));
-        return call(&t, &handler, vec![target, list, new_target.clone()]).map(Some);
+        let made = call(&t, &handler, vec![target, list, new_target.clone()])?;
+        // 10.5.13 step 10: `new` always yields an object.
+        if !with_host(|h| matches!(made, Value::Obj(_)) && !h.is_null(&made) && !host::is_primitive(h, &made)) {
+            return Err(invariant(&format!(
+                "'construct' on proxy: trap returned non-object ('{}')",
+                shown(&made)
+            )));
+        }
+        return Ok(Some(made));
     }
     match no_trap(v, "construct")? {
         Some(target) => host::construct_nt(&target, args, new_target.clone()).map(Some),

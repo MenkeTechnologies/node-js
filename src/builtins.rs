@@ -1917,8 +1917,8 @@ fn seal_proxy(v: &Value, freeze: bool) -> Result<bool, String> {
     if with_host(|h| h.kind_of(v)) != Some(ObjKind::Proxy) {
         return Ok(false);
     }
-    if !crate::proxy::prevent_extensions(v)? {
-        return Err(host::type_error("Object.freeze called on non-object"));
+    if crate::proxy::prevent_extensions(v)? != Some(true) {
+        return Err(crate::proxy::prevent_extensions_refused());
     }
     let keys = crate::proxy::own_keys(v)?.unwrap_or_default();
     for key in keys {
@@ -4085,20 +4085,25 @@ pub fn set_with_receiver(
     if !with_host(|h| is_object_like(h, receiver)) {
         return Ok(false);
     }
-    if let Some((_, writable, _, is_accessor)) = own_prop_facts(receiver, key) {
-        if is_accessor || !writable {
+    let existing = own_prop_facts(receiver, key);
+    if let Some((_, writable, _, is_accessor)) = &existing {
+        if *is_accessor || !writable {
             return Ok(false);
         }
     }
     // Steps 3.d.iii and 3.e both DEFINE, they do not assign: a setter inherited
     // by the receiver must not run, and a proxy receiver must reach its
-    // `defineProperty` trap rather than its `set` trap.
+    // `defineProperty` trap rather than its `set` trap. An existing property
+    // gets `{ value }` alone (3.d.iii), so its other attributes stay; a new one
+    // is a full writable/enumerable/configurable data property (3.e).
     let desc = with_host(|h| {
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("value".into(), val);
-        m.insert("writable".into(), Value::Bool(true));
-        m.insert("enumerable".into(), Value::Bool(true));
-        m.insert("configurable".into(), Value::Bool(true));
+        if existing.is_none() {
+            m.insert("writable".into(), Value::Bool(true));
+            m.insert("enumerable".into(), Value::Bool(true));
+            m.insert("configurable".into(), Value::Bool(true));
+        }
         h.new_object(m)
     });
     if crate::proxy::parts(receiver).is_some() {
@@ -6708,16 +6713,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Array.of" => construct_array_like(host::current_static_this(), args),
         // 23.1.2.2 `IsArray` follows a Proxy to its `[[ProxyTarget]]` rather than
         // consulting any trap, so `Array.isArray(new Proxy([], {}))` is `true`.
-        "Array.isArray" => {
-            let v = arg0(&args);
-            let subject = crate::proxy::ultimate_target(&v).unwrap_or(v);
-            Ok(Value::Bool(
-                matches!(
-                    with_host(|h| h.get(&subject).cloned()),
-                    Some(JsObj::Array(_))
-                ) && !is_arguments(&subject),
-            ))
-        }
+        "Array.isArray" => Ok(Value::Bool(is_array(&arg0(&args))?)),
         "Array.from" => array_from(args),
         "Array.fromAsync" => array_from_async(args),
         "Object" => Ok(object_call(args)),
@@ -6745,8 +6741,10 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Object.preventExtensions" => {
             let v = arg0(&args);
-            if crate::proxy::prevent_extensions(&v)? {
-                return Ok(v);
+            match crate::proxy::prevent_extensions(&v)? {
+                Some(true) => return Ok(v),
+                Some(false) => return Err(crate::proxy::prevent_extensions_refused()),
+                None => {}
             }
             with_host(|h| h.prevent_extensions(&v));
             Ok(v)
@@ -6811,7 +6809,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             let proto = args.get(1).cloned().unwrap_or(Value::Undef);
             if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
                 reject_bad_prototype(&proto)?;
-                crate::proxy::set_prototype_of(&obj, &proto)?;
+                // V8 names no property here, and prints that it did not.
+                if !crate::proxy::set_prototype_of(&obj, &proto)? {
+                    return Err(host::type_error(
+                        "'setPrototypeOf' on proxy: trap returned falsish for property 'undefined'",
+                    ));
+                }
                 return Ok(obj);
             }
             // 20.1.2.23: `RequireObjectCoercible` on the target, then the
@@ -6925,8 +6928,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             let obj = arg0(&args);
             let p = args.get(1).cloned().unwrap_or(Value::Undef);
             if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
-                crate::proxy::set_prototype_of(&obj, &p)?;
-                return Ok(Value::Bool(true));
+                return Ok(Value::Bool(crate::proxy::set_prototype_of(&obj, &p)?));
             }
             // 10.1.2.1: a NON-EXTENSIBLE object refuses a prototype change —
             // unless the new one is what it already has, which is a no-op. It
@@ -6951,8 +6953,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Reflect.preventExtensions" => {
             let v = arg0(&args);
-            if crate::proxy::prevent_extensions(&v)? {
-                return Ok(Value::Bool(true));
+            if let Some(b) = crate::proxy::prevent_extensions(&v)? {
+                return Ok(Value::Bool(b));
             }
             with_host(|h| h.prevent_extensions(&v));
             Ok(Value::Bool(true))
@@ -10060,6 +10062,13 @@ fn symbol_protocol(arg: &Value, sym: &str) -> Option<Value> {
 /// its `flags` — read with `[[Get]]`, so a plain object declaring itself a
 /// regexp through `Symbol.match` is held to it too, and a missing `flags` is
 /// its own TypeError. Each method has its own V8 wording for both failures.
+/// `IsArray(v)` (7.2.2): an Array exotic (an `arguments` object is not one),
+/// or a proxy whose target IsArray — a revoked proxy on the way is a TypeError.
+pub(crate) fn is_array(v: &Value) -> Result<bool, String> {
+    let subject = crate::proxy::is_array_subject(v)?;
+    Ok(with_host(|h| matches!(h.get(&subject), Some(JsObj::Array(_)))) && !is_arguments(&subject))
+}
+
 fn require_global_regexp(method: &str, arg: &Value) -> Result<(), String> {
     if with_host(|h| h.is_nullish(arg)) || !is_regexp_arg(arg) {
         return Ok(());
@@ -11043,15 +11052,12 @@ fn array_method_on(
             // `Symbol.isConcatSpreadable` (23.1.3.1) decides whether a value
             // is spread, overriding `IsArray` in BOTH directions: a plain
             // array-like opts IN, and an array opts OUT.
-            let spreadable = |a: &Value| -> bool {
-                let flag = get_property(a, "@@isConcatSpreadable").unwrap_or(Value::Undef);
+            let spreadable = |a: &Value| -> Result<bool, String> {
+                let flag = get_property(a, "@@isConcatSpreadable")?;
                 if matches!(flag, Value::Undef) {
-                    // `IsArray` sees through a proxy to its target (7.2.2 step 3).
-                    let subject = crate::proxy::ultimate_target(a).unwrap_or_else(|| a.clone());
-                    matches!(with_host(|h| h.get(&subject).cloned()), Some(JsObj::Array(_)))
-                        && !is_arguments(&subject)
+                    is_array(a)
                 } else {
-                    with_host(|h| h.truthy(&flag))
+                    Ok(with_host(|h| h.truthy(&flag)))
                 }
             };
             // Step 5 iterates `« O » ++ items`, so the receiver takes the same
@@ -11059,14 +11065,14 @@ fn array_method_on(
             // element, its `ToObject` box, not the characters `array_generic`
             // read out of it. A hole in a spread receiver or argument stays a
             // hole in the result, at its shifted position.
-            let (mut out, mut holes) = if spreadable(this_value) {
+            let (mut out, mut holes) = if spreadable(this_value)? {
                 (array_items(recv), absent_set(recv))
             } else {
                 (vec![to_object(this_value)], Default::default())
             };
             let mut sources: Vec<(Value, usize)> = Vec::new();
             for a in &args {
-                if !spreadable(a) {
+                if !spreadable(a)? {
                     out.push(a.clone());
                     continue;
                 }
@@ -16127,10 +16133,8 @@ fn f16_round(x: f64) -> f64 {
 /// is not listed twice, so `["a", "a"]` emits `a` once. `IsArray` sees through
 /// a Proxy, and the elements are read with `[[Get]]`, so its traps run.
 fn json_property_list(replacer: Value) -> Result<Option<Vec<String>>, String> {
-    let subject = crate::proxy::ultimate_target(&replacer).unwrap_or_else(|| replacer.clone());
-    let is_array =
-        with_host(|h| matches!(h.get(&subject), Some(JsObj::Array(_)))) && !is_arguments(&subject);
-    if !is_array || with_host(|h| host::is_callable(h, &replacer)) {
+    // V8 asks `IsArray` before `IsCallable`, so a revoked proxy throws here.
+    if !is_array(&replacer)? || with_host(|h| host::is_callable(h, &replacer)) {
         return Ok(None);
     }
     let len = host::to_number_value(&get_property(&replacer, "length")?)?;

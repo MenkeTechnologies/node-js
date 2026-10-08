@@ -1959,6 +1959,7 @@ only once the next line arrives. Piped and redirected input is unaffected.
 | `Map.prototype[Symbol.iterator]`, `Set.prototype[Symbol.iterator]` and `Set.prototype.keys` called on a wrong receiver reported `Method Map.prototype.@@iterator …` / `Set.prototype.keys …`, and `String.prototype[Symbol.iterator].call(null)` named `String.prototype.@@iterator` | the slots that hold `entries` / `values` brand-check under those names, and the string iterator says `String.prototype[Symbol.iterator] called on null or undefined` (`parity-scripts/objects/29_builtin_alias_method_names.js`) |
 | `RegExp.prototype.toString.call(RegExp.prototype)` overflowed the stack and aborted; `RegExp.prototype.test`/`toString` on a non-RegExp object reported `test is not a function`; `re.test` ignored an own or patched `exec`, and converted its argument without calling a user `toString` | `test` runs `RegExpExec` (a non-built-in `exec` read with `[[Get]]` is called and must return an object or null), `toString` reads `source` and `flags`, `exec`/`compile` brand-check with V8's wording (`parity-scripts/objects/30_regexp_generic_methods.js`) |
 | `'s'.replaceAll(obj, …)` / `'s'.matchAll(obj)` with an `obj` that declares itself a regexp through `Symbol.match` ignored its `flags` (replaceAll always threw "non-global", matchAll never checked) | `IsRegExp` arguments have `flags` read with `[[Get]]`: a nullish one and a missing `g` are each V8's TypeError, checked before the protocol method runs (`parity-scripts/objects/31_replaceall_matchall_flags.js`) |
+| no Proxy trap result was checked against its target beyond a few `get`/`set`/`has`/`ownKeys` cases, and those messages lacked V8's detail; `getOwnPropertyDescriptor` returned the trap's raw object; a `set` forwarded through `Reflect.set` redefined an existing property with a full descriptor; `Array.isArray` / `concat` saw through a revoked proxy | every 10.5.x invariant with V8's wording, the completed descriptor, `{ value }` alone for an existing property (10.1.9.2 step 3.d.iii), and `IsArray` / `IsConcatSpreadable` throw on a revoked proxy (`parity-scripts/objects/32_proxy_invariants.js`) |
 
 ## Still open — found in round 7
 
@@ -2381,11 +2382,14 @@ Two divergences remain, both cases where node-js is more permissive than Node:
 | `new Proxy(new Map([['a',1]]), {}).get('a')` | `TypeError: Method Map.prototype.get called on incompatible receiver #<Map>` | `1` — a builtin method read through a proxy binds to the TARGET, so the internal-slot check Node performs on `this` never runs |
 | `structuredClone(new Proxy({a:1}, {}))` | `DOMException [DataCloneError]` | `{a:1}` — `structuredClone` has no uncloneable-value rejection at all (functions and `WeakMap` clone silently too), and node-js has no `DOMException` |
 
-The spec's trap-result INVARIANT checks are not implemented: 10.5.x throws when a
-trap contradicts a non-configurable or non-extensible property of the target
-(reporting a frozen own property as absent, say). node-js reports the trap's
-answer as given. Every trap itself is real — the gap is the after-the-fact
-consistency audit, and it is listed here rather than papered over.
+The spec's trap-result INVARIANT checks (10.5.x) are implemented in
+`src/proxy.rs` with V8's wording: each trap's answer is compared with the
+target's own descriptor through `ToPropertyDescriptor` /
+`IsCompatiblePropertyDescriptor`, `ownKeys` goes through
+`CreateListFromArrayLike(…, « String, Symbol »)`, `preventExtensions` /
+`setPrototypeOf` / `isExtensible` must agree with the target, `construct` must
+return an object, and `IsArray` refuses a revoked proxy
+(`parity-scripts/objects/32_proxy_invariants.js`).
 
 ## The ES2025 set operations, the string exotic object, and the tag brand
 
