@@ -3488,27 +3488,83 @@ impl Compiler {
                     "SyntaxError: Delete of an unqualified identifier in strict mode.".to_string(),
                 );
             }
-            UnOp::Delete => match e {
-                Expr::Member {
-                    object, property, ..
-                } => {
-                    self.compile_expr(b, object)?;
-                    self.name_const(b, property);
-                    self.emit_bool(b, self.strict);
-                    b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 3), 0);
+            // `delete a?.b.c`: the operand is an optional chain, and a
+            // short-circuit anywhere along it makes the whole `delete` evaluate
+            // to `true` without touching any object (13.5.1.2 step 1 — the
+            // OptionalExpression evaluates to `undefined`, not a Reference).
+            UnOp::Delete if Self::spine_has_optional(e) => {
+                self.opt_chain.push(Vec::new());
+                let r = self.compile_delete_target(b, e);
+                let pending = self.opt_chain.pop().unwrap_or_default();
+                r?;
+                let jdone = b.emit(Op::Jump(0), 0);
+                let short = b.current_pos();
+                for j in pending {
+                    b.patch_jump(j, short);
                 }
-                Expr::Index { object, index, .. } => {
-                    self.compile_expr(b, object)?;
-                    self.compile_expr(b, index)?;
-                    self.emit_bool(b, self.strict);
-                    b.emit(Op::CallBuiltin(ops::DELITEM, 3), 0);
-                }
-                _ => {
-                    b.emit(Op::LoadTrue, 0);
-                }
-            },
+                // A short-circuit lands with `undefined` on the stack.
+                b.emit(Op::Pop, 0);
+                b.emit(Op::LoadTrue, 0);
+                let end = b.current_pos();
+                b.patch_jump(jdone, end);
+            }
+            UnOp::Delete => self.compile_delete_target(b, e)?,
         }
         Ok(())
+    }
+
+    /// Lower the operand of `delete`: a property reference deletes, anything
+    /// else evaluates to `true`. Inside an open optional chain the LAST link's
+    /// own `?.` parks its short-circuit in the chain frame like any other link.
+    fn compile_delete_target(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
+        match e {
+            Expr::Member {
+                object,
+                property,
+                optional,
+            } => {
+                self.compile_expr(b, object)?;
+                if *optional {
+                    self.park_optional_guard(b);
+                }
+                self.name_const(b, property);
+                self.emit_bool(b, self.strict);
+                b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 3), 0);
+            }
+            Expr::Index {
+                object,
+                index,
+                optional,
+            } => {
+                self.compile_expr(b, object)?;
+                if *optional {
+                    self.park_optional_guard(b);
+                }
+                self.compile_off_spine(b, index)?;
+                self.emit_bool(b, self.strict);
+                b.emit(Op::CallBuiltin(ops::DELITEM, 3), 0);
+            }
+            Expr::Ident(_) => {
+                b.emit(Op::LoadTrue, 0);
+            }
+            // 13.5.1.2 step 2: a non-Reference operand is still EVALUATED —
+            // `delete f()` calls `f` — and the result is `true`.
+            _ => {
+                self.compile_expr(b, e)?;
+                b.emit(Op::Pop, 0);
+                b.emit(Op::LoadTrue, 0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit a `?.` guard whose short-circuit jump belongs to the innermost open
+    /// chain frame. Only called with a frame open.
+    fn park_optional_guard(&mut self, b: &mut ChunkBuilder) {
+        let j = self.emit_optional_guard(b);
+        if let Some(frame) = self.opt_chain.last_mut() {
+            frame.push(j);
+        }
     }
 
     fn compile_binary(
