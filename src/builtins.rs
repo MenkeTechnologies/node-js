@@ -75,6 +75,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::TAG_TMPL, b_tag_tmpl);
     vm.register_builtin(ops::GET_ASYNC_ITER, b_get_async_iter);
     vm.register_builtin(ops::ASYNC_STEP, b_async_step);
+    vm.register_builtin(ops::ITER_RESULT, b_iter_result);
     vm.register_builtin(ops::NUM_STEP, b_num_step);
     vm.register_builtin(ops::ITER_CLOSE, b_iter_close);
     vm.register_builtin(ops::TYPEOF_NAME, b_typeof_name);
@@ -150,6 +151,17 @@ fn b_async_step(vm: &mut VM, _: u8) -> Value {
     let iter = vm.pop();
     let r = host::async_step(&iter);
     finish(vm, r)
+}
+
+/// `ITER_RESULT`: the awaited result of an async iterator's `next()` must be an
+/// object (7.4.4 step 3); a primitive one would read `done` as `undefined`
+/// forever. Leaves the record on the stack.
+fn b_iter_result(vm: &mut VM, _: u8) -> Value {
+    let step = vm.pop();
+    match host::require_iter_result(&step) {
+        Ok(()) => step,
+        Err(e) => abort(vm, e),
+    }
 }
 
 /// `MKBIGINT`: pop the canonical decimal digit string constant, allocate the heap
@@ -5658,23 +5670,12 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
         };
     }
     // A user iterator object with a `.next()` returning `{ value, done }`.
-    match host::call_method(&it, "next", Vec::new()) {
-        Ok(step) => {
-            let done = get_property(&step, "done")
-                .map(|d| with_host(|h| h.truthy(&d)))
-                .unwrap_or(true);
-            if done {
-                Value::Bool(false)
-            } else {
-                match get_property(&step, "value") {
-                    Ok(v) => {
-                        vm.push(v);
-                        Value::Bool(true)
-                    }
-                    Err(e) => abort(vm, e),
-                }
-            }
+    match host::iterator_step_value(&it) {
+        Ok(Some(v)) => {
+            vm.push(v);
+            Value::Bool(true)
         }
+        Ok(None) => Value::Bool(false),
         Err(e) => abort(vm, e),
     }
 }

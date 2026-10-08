@@ -113,6 +113,7 @@ pub fn done_step() -> Value {
 /// Pull one step from an iterator of any kind, as `(value, done)`.
 fn pull(it: &Value) -> Result<(Value, bool), String> {
     let r = call_method(it, "next", Vec::new())?;
+    crate::host::require_iter_result(&r)?;
     let done = crate::builtins::get_property(&r, "done")?;
     let done = with_host(|h| h.truthy(&done));
     let value = crate::builtins::get_property(&r, "value")?;

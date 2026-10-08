@@ -111,6 +111,7 @@ pub mod ops {
     pub const HOIST_TDZ: u16 = 76; // [name] -> declare `name` in the CURRENT scope as UNINITIALIZED (the `let`/`const`/`class` temporal dead zone)
     pub const NEW_SPREAD: u16 = 77; // [ctor, argsArray] -> instance; `new C(...xs)`, where the argument list is built at run time
     pub const SUPER_CALL_SPREAD: u16 = 78; // [argsArray] -> invoke the parent ctor with a run-time argument list (`super(...xs)`)
+    pub const ITER_RESULT: u16 = 79; // [step] -> step; TypeError unless an object (`IteratorNext` step 3, after a `for await` step's await)
 }
 
 /// Per-call-site callee SOURCE TEXT, for the `TypeError` a failed call raises.
@@ -9099,14 +9100,10 @@ pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
 fn take_from_iterator(iterator: &Value, n: usize) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     while out.len() < n {
-        let step = call_method(iterator, "next", Vec::new())?;
-        // Read first: resolving the property re-enters the host, so doing
-        // it inside the `with_host` closure double-borrows and aborts.
-        let done = get_prop_chain(&step, "done")?;
-        if with_host(|h| h.truthy(&done)) {
-            return Ok(out);
+        match iterator_step_value(iterator)? {
+            Some(v) => out.push(v),
+            None => return Ok(out),
         }
-        out.push(get_prop_chain(&step, "value")?);
     }
     // IteratorClose: `return` is optional on the protocol, and a throw from
     // it is swallowed here the way a normal (non-abrupt) completion does.
@@ -9211,7 +9208,13 @@ pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
 /// are awaited one at a time by `async_step`.
 pub fn get_async_iterator(src: &Value) -> Result<Value, String> {
     if let Some(f) = user_async_iterator_fn(src) {
-        return invoke(&f, Vec::new(), Some(src.clone()));
+        let iterator = invoke(&f, Vec::new(), Some(src.clone()))?;
+        if with_host(|h| is_primitive(h, &iterator) || h.is_nullish(&iterator)) {
+            return Err(type_error(
+                "Result of the Symbol.asyncIterator method is not an object",
+            ));
+        }
+        return Ok(iterator);
     }
     // An `async function*` object IS its own async iterator; draining it into a
     // list here would run the whole body (and any `finally`) before the consumer
@@ -9309,6 +9312,8 @@ pub fn async_step(iterator: &Value) -> Result<Value, String> {
         return Ok(step);
     }
     // Native async iterator: `iter.next()` returns the {value,done} promise.
+    // Whether what it settles to is an object is checked after the `await`
+    // (`ITER_RESULT`), which adds no microtask turn of its own.
     let r = call_method(iterator, "next", Vec::new())?;
     Ok(promise_of(&r))
 }
@@ -9379,12 +9384,9 @@ pub fn iter_for_each(
     let iterator = call_iterator_method(&iter_fn, src)?;
     let mut i = 0usize;
     loop {
-        let step = call_method(&iterator, "next", Vec::new())?;
-        let done = get_prop_chain(&step, "done")?;
-        if with_host(|h| h.truthy(&done)) {
+        let Some(value) = iterator_step_value(&iterator)? else {
             return Ok(());
-        }
-        let value = get_prop_chain(&step, "value")?;
+        };
         if let Err(e) = f(value, i) {
             // The callback's error wins over anything `return()` raises, so a
             // throwing `return` is swallowed here (7.4.9 step 6).
@@ -9406,15 +9408,40 @@ pub fn close_iterator(iterator: &Value) -> Result<(), String> {
 
 pub(crate) fn drain_iterator(iterator: &Value) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
-    loop {
-        let step = call_method(iterator, "next", Vec::new())?;
-        let done = get_prop_chain(&step, "done")?;
-        if with_host(|h| h.truthy(&done)) {
-            break;
-        }
-        out.push(get_prop_chain(&step, "value")?);
+    while let Some(v) = iterator_step_value(iterator)? {
+        out.push(v);
     }
     Ok(out)
+}
+
+/// `IteratorStepValue` (7.4.8): call `next`, refuse a result that is not an
+/// object, then read `done` and — unless done — `value`. Without the object
+/// check a `next` returning a primitive read `done` as `undefined` forever, so
+/// the loop never ended.
+pub fn iterator_step_value(iterator: &Value) -> Result<Option<Value>, String> {
+    let result = call_method(iterator, "next", Vec::new())?;
+    require_iter_result(&result)?;
+    // Read first: resolving the property re-enters the host, so doing it
+    // inside the `with_host` closure double-borrows and aborts.
+    let done = get_prop_chain(&result, "done")?;
+    if with_host(|h| h.truthy(&done)) {
+        return Ok(None);
+    }
+    get_prop_chain(&result, "value").map(Some)
+}
+
+/// 7.4.4 `IteratorNext` step 3: an iterator result must be an object.
+pub fn require_iter_result(result: &Value) -> Result<(), String> {
+    let object = with_host(|h| {
+        matches!(result, Value::Obj(_)) && !h.is_null(result) && !is_primitive(h, result)
+    });
+    if object {
+        return Ok(());
+    }
+    Err(type_error(&format!(
+        "Iterator result {} is not an object",
+        crate::builtins::no_side_effects_string_pub(result)
+    )))
 }
 
 /// Property read that walks the prototype chain (used by iteration helpers).

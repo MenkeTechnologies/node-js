@@ -1737,6 +1737,7 @@ impl Compiler {
         self.load_local(b, &iter_tmp);
         b.emit(Op::CallBuiltin(ops::ASYNC_STEP, 1), 0); // [stepPromise]
         b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0); // [step]
+        b.emit(Op::CallBuiltin(ops::ITER_RESULT, 1), 0); // [step]
         let step_tmp = self.tmp_name("astep");
         self.name_const(b, &step_tmp);
         b.emit(Op::Swap, 0);
@@ -2565,6 +2566,7 @@ impl Compiler {
             b.emit(Op::Dup, 0); // [aiter, aiter]
             b.emit(Op::CallBuiltin(ops::ASYNC_STEP, 1), 0); // [aiter, stepPromise]
             b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0); // [aiter, step]
+            b.emit(Op::CallBuiltin(ops::ITER_RESULT, 1), 0); // [aiter, step]
             b.emit(Op::Dup, 0); // [aiter, step, step]
             self.name_const(b, "done");
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0);
