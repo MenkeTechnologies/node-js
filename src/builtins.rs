@@ -6407,14 +6407,20 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
     // else the CommonJS loader resolving from the entry file's directory.
     if name == "require" {
         let spec = with_host(|h| h.str_of(&arg0(&args)));
-        return crate::module::require(&spec, &crate::module::entry_dir());
+        return crate::module::require(
+            &spec,
+            &crate::module::entry_dir(),
+            &crate::module::entry_file(),
+        );
     }
-    // `__cjs_require(spec, fromDir)`: a per-module `require` closure's dispatch
-    // into the loader, resolving `spec` against the module's own directory.
+    // `__cjs_require(spec, fromDir, fromFile)`: a per-module `require` closure's
+    // dispatch into the loader, resolving `spec` against the module's own
+    // directory; `fromFile` is the requirer a require stack names.
     if name == "__cjs_require" {
         let spec = with_host(|h| h.str_of(&arg0(&args)));
         let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
-        return crate::module::require(&spec, std::path::Path::new(&from));
+        let file = with_host(|h| h.str_of(args.get(2).unwrap_or(&Value::Undef)));
+        return crate::module::require(&spec, std::path::Path::new(&from), &file);
     }
     // `Function.prototype` is itself a function (20.2.3): it accepts any
     // arguments and returns undefined.
@@ -6451,10 +6457,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         return match crate::module::resolve(&spec, &crate::module::entry_dir()) {
             Some(p) => Ok(with_host(|h| h.new_str(p.to_string_lossy().to_string()))),
-            None => Err(crate::host::plain_coded_error(
-                "Error",
-                "MODULE_NOT_FOUND",
-                &format!("Cannot find module '{spec}'"),
+            None => Err(crate::module::not_found_error(
+                &spec,
+                &crate::module::entry_file(),
             )),
         };
     }
@@ -6463,16 +6468,13 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
     if name == "__cjs_resolve" {
         let spec = with_host(|h| h.str_of(&arg0(&args)));
         let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
+        let file = with_host(|h| h.str_of(args.get(2).unwrap_or(&Value::Undef)));
         if crate::stdlib::is_core(&spec) {
             return Ok(with_host(|h| h.new_str(spec)));
         }
         return match crate::module::resolve(&spec, std::path::Path::new(&from)) {
             Some(p) => Ok(with_host(|h| h.new_str(p.to_string_lossy().to_string()))),
-            None => Err(crate::host::plain_coded_error(
-                "Error",
-                "MODULE_NOT_FOUND",
-                &format!("Cannot find module '{spec}'"),
-            )),
+            None => Err(crate::module::not_found_error(&spec, &file)),
         };
     }
     // `Error.captureStackTrace(target[, ctor])`: V8's stack capture. Sets

@@ -21,7 +21,8 @@
 //! directory, so a `require(...)` deferred inside a function called much later
 //! still resolves against the module that defined it (a single global
 //! "current dir" would resolve against the wrong module). The closure is minted
-//! by a one-time compiled factory (`FACTORY`) invoked with the directory string;
+//! by a one-time compiled factory (`FACTORY`) invoked with the directory and the
+//! module's filename (the requirer a `Cannot find module` stack names);
 //! it dispatches back into this loader through the `__cjs_require` /
 //! `__cjs_resolve` global native builtins.
 
@@ -49,6 +50,13 @@ thread_local! {
     /// Base directory the ENTRY script's top-level `require` resolves against
     /// (the dir of `node app.js`, or cwd for `node -e`).
     static ENTRY_DIR: RefCell<PathBuf> = RefCell::new(std::env::current_dir().unwrap_or_default());
+    /// The ENTRY module's `filename` (`<cwd>/[eval]` under `-e`) — the bottom
+    /// of every require stack.
+    static ENTRY_FILE: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Each loaded module's filename → the filename of the module whose
+    /// `require` first loaded it: node's `moduleParentCache`, walked to build
+    /// the `requireStack` of a `Cannot find module` error.
+    static PARENTS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     /// The compiled per-module `require`-closure factory (see module docs),
     /// minted once per host and reused for every module.
     static FACTORY: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -62,6 +70,8 @@ thread_local! {
 pub fn reset() {
     CACHE.with(|c| c.borrow_mut().clear());
     PATH_CACHE.with(|c| c.borrow_mut().clear());
+    PARENTS.with(|c| c.borrow_mut().clear());
+    ENTRY_FILE.with(|f| f.borrow_mut().clear());
     FACTORY.with(|f| *f.borrow_mut() = None);
     CALLSITE_FACTORY.with(|f| *f.borrow_mut() = None);
     ENTRY_DIR.with(|d| *d.borrow_mut() = std::env::current_dir().unwrap_or_default());
@@ -99,6 +109,38 @@ pub fn entry_dir() -> PathBuf {
     ENTRY_DIR.with(|d| d.borrow().clone())
 }
 
+/// The ENTRY module's `filename`, the requirer the top-level `require` names.
+pub fn entry_file() -> String {
+    ENTRY_FILE.with(|f| f.borrow().clone())
+}
+
+/// Node's `Cannot find module` error (`Module._resolveFilename`): the message
+/// lists the require stack — the requiring module, then each module that first
+/// loaded the one before it — and the error carries `code` and `requireStack`
+/// as own properties, in that order.
+pub fn not_found_error(spec: &str, from_file: &str) -> String {
+    let mut stack: Vec<String> = Vec::new();
+    let mut cursor = Some(from_file.to_string()).filter(|f| !f.is_empty());
+    while let Some(file) = cursor {
+        cursor = PARENTS.with(|p| p.borrow().get(&file).cloned());
+        stack.push(file);
+    }
+    let mut msg = format!("Cannot find module '{spec}'");
+    if !stack.is_empty() {
+        msg.push_str("\nRequire stack:\n- ");
+        msg.push_str(&stack.join("\n- "));
+    }
+    let text = host::plain_coded_error("Error", "MODULE_NOT_FOUND", &msg);
+    let err = with_host(|h| crate::builtins::synth_error(h, &text));
+    let stack = with_host(|h| {
+        let items: Vec<Value> = stack.into_iter().map(|s| h.new_str(s)).collect();
+        h.new_array(items)
+    });
+    let _ = crate::builtins::set_property_pub(&err, "requireStack", stack);
+    with_host(|h| h.exc = Some(err));
+    text
+}
+
 /// Install the CJS wrapper variables the ENTRY script sees.
 ///
 /// A `require`d module already receives `exports`/`require`/`module`/`__dirname`
@@ -132,6 +174,7 @@ pub fn install_entry_globals(origin: &str) {
         (".".to_string(), origin.to_string())
     };
     let filename = crate::stdlib::path::resolve_one(origin);
+    ENTRY_FILE.with(|f| *f.borrow_mut() = filename.clone());
     let module = new_module(&id, &dirname, &filename);
     let exports = module_exports(&module);
     with_host(|h| {
@@ -315,7 +358,7 @@ pub fn resolve(spec: &str, from_dir: &Path) -> Option<PathBuf> {
 /// `require(spec)` from `from_dir`: the single entry point shared by the
 /// top-level `require` builtin and the per-module `__cjs_require`. Returns the
 /// module's exports value.
-pub fn require(spec: &str, from_dir: &Path) -> Result<Value, String> {
+pub fn require(spec: &str, from_dir: &Path, from_file: &str) -> Result<Value, String> {
     // Core module: the native namespace value, never a file (mirrors the legacy
     // `require` path — `require('events')` yields the EventEmitter ctor, etc.).
     if let Some(v) = crate::stdlib::data_module(spec) {
@@ -331,28 +374,27 @@ pub fn require(spec: &str, from_dir: &Path) -> Result<Value, String> {
     // `(specifier, from_dir)`.
     let key = (spec.to_string(), from_dir.to_path_buf());
     if let Some(hit) = PATH_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return load_file(&hit);
+        return load_file(&hit, from_file);
     }
-    let path = resolve(spec, from_dir).ok_or_else(|| {
-        crate::host::plain_coded_error(
-            "Error",
-            "MODULE_NOT_FOUND",
-            &format!("Cannot find module '{spec}'"),
-        )
-    })?;
+    let path = resolve(spec, from_dir).ok_or_else(|| not_found_error(spec, from_file))?;
     // A canonical absolute key so the same file required via different relative
     // specifiers shares one cache entry.
     let path = std::fs::canonicalize(&path).unwrap_or(path);
     PATH_CACHE.with(|c| c.borrow_mut().insert(key, path.clone()));
-    load_file(&path)
+    load_file(&path, from_file)
 }
 
 /// Load the resolved absolute file `path` (`.json` parses to its value; `.js`
 /// runs through the module wrapper) and return its exports, caching by path.
-fn load_file(path: &Path) -> Result<Value, String> {
+fn load_file(path: &Path, parent: &str) -> Result<Value, String> {
     if let Some(cached) = CACHE.with(|c| c.borrow().get(path).cloned()) {
         // Re-read `.exports` — a cached module may have reassigned it.
         return Ok(module_exports(&cached));
+    }
+    // A fresh module object records the requirer that created it.
+    if !parent.is_empty() {
+        let key = path.to_string_lossy().into_owned();
+        PARENTS.with(|p| p.borrow_mut().insert(key, parent.to_string()));
     }
     if path.extension().is_some_and(|e| e == "json") {
         let text = std::fs::read_to_string(path)
@@ -388,7 +430,7 @@ fn load_file(path: &Path) -> Result<Value, String> {
     let abs = path.to_string_lossy().into_owned();
     let module = new_module(&abs, &dir.to_string_lossy(), &abs);
     let exports = module_exports(&module);
-    let require_fn = make_require(&dir)?;
+    let require_fn = make_require(&dir, &abs)?;
     let (dirname, filename) = with_host(|h| {
         (
             h.new_str(dir.to_string_lossy().to_string()),
@@ -526,10 +568,15 @@ fn eval_binding(src: &str) -> Result<Value, String> {
 }
 
 /// Build a per-module `require` closure bound to `dir` (see module docs).
-fn make_require(dir: &Path) -> Result<Value, String> {
+fn make_require(dir: &Path, file: &str) -> Result<Value, String> {
     let factory = factory()?;
-    let dir_str = with_host(|h| h.new_str(dir.to_string_lossy().to_string()));
-    let req = host::invoke(&factory, vec![dir_str], None)?;
+    let (dir_str, file_str) = with_host(|h| {
+        (
+            h.new_str(dir.to_string_lossy().to_string()),
+            h.new_str(file.to_string()),
+        )
+    });
+    let req = host::invoke(&factory, vec![dir_str, file_str], None)?;
     // Every `require` in the process reports the same `main` — the ENTRY
     // module — which is what `require.main === module` tests against.
     if let Some(main) = with_host(|h| h.builtin_static("require", "main")) {
@@ -546,9 +593,9 @@ fn factory() -> Result<Value, String> {
     if let Some(f) = FACTORY.with(|f| f.borrow().clone()) {
         return Ok(f);
     }
-    let src = "(function (__cjs_dir) {\n\
-        var req = function (spec) { return __cjs_require(spec, __cjs_dir); };\n\
-        req.resolve = function (spec) { return __cjs_resolve(spec, __cjs_dir); };\n\
+    let src = "(function (__cjs_dir, __cjs_file) {\n\
+        var req = function (spec) { return __cjs_require(spec, __cjs_dir, __cjs_file); };\n\
+        req.resolve = function (spec) { return __cjs_resolve(spec, __cjs_dir, __cjs_file); };\n\
         req.cache = __cjs_cache;\n\
         req.main = undefined;\n\
         req.extensions = {};\n\

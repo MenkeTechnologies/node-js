@@ -92,8 +92,8 @@ const CREATE_REQUIRE_SRC: &str = "(function (p) {\n\
   if (typeof p !== 'string') { p = String(p); }\n\
   if (p.indexOf('file://') === 0) { p = require('url').fileURLToPath(p); }\n\
   var dir = require('path').dirname(p);\n\
-  var req = function (spec) { return __cjs_require(spec, dir); };\n\
-  req.resolve = function (spec) { return __cjs_resolve(spec, dir); };\n\
+  var req = function (spec) { return __cjs_require(spec, dir, p); };\n\
+  req.resolve = function (spec) { return __cjs_resolve(spec, dir, p); };\n\
   req.cache = {};\n\
   req.main = undefined;\n\
   req.extensions = {};\n\
