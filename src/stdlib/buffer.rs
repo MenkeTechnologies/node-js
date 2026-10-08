@@ -768,7 +768,9 @@ fn from(args: &[Value]) -> Result<Value, String> {
     // Anything else is a TypeError, not a stringification: `Buffer.from(5)`
     // used to produce the single byte `0x35` (the digit "5") and
     // `Buffer.from(null)` the four bytes of `"null"`.
-    Err(crate::host::plain_coded_error(
+    // It is `lib/buffer.js` throwing `new ERR_INVALID_ARG_TYPE(...)`, a JS-layer
+    // NodeError, so `String(err)` brackets the code.
+    Err(crate::host::coded_error(
         "TypeError",
         "ERR_INVALID_ARG_TYPE",
         &format!(
