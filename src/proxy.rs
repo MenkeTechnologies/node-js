@@ -581,12 +581,19 @@ pub fn own_enumerable(v: &Value, key: &str) -> Result<bool, String> {
 }
 
 /// `(key, value)` for every own enumerable string key — spread / `Object.assign`
-/// / `Object.entries` / `JSON.stringify`. Each value is read through the `get`
-/// trap, as the spec's `CreateDataPropertyOrThrow(…, Get(from, key))` requires.
+/// / `Object.entries`. Each of those (7.3.25 `CopyDataProperties`, 20.1.2.1
+/// `Object.assign`, 7.3.23 `EnumerableOwnProperties` in key+value mode) visits
+/// one key at a time: its `getOwnPropertyDescriptor` trap, then — if
+/// enumerable — its `get` trap, before the next key's descriptor is asked for.
 pub fn own_enum_entries(v: &Value) -> Result<Vec<(String, Value)>, String> {
-    let keys = own_enum_string_keys(v)?;
+    let Some(keys) = own_keys(v)? else {
+        return Ok(Vec::new());
+    };
     let mut out = Vec::with_capacity(keys.len());
     for k in keys {
+        if host::is_symbol_key(&k) || !own_enumerable(v, &k)? {
+            continue;
+        }
         let val = get(v, &k, v)?.unwrap_or(Value::Undef);
         out.push((k, val));
     }
@@ -629,32 +636,46 @@ pub fn iterate(v: &Value) -> Result<Option<Vec<Value>>, String> {
         return host::drain_iterator(&iterator).map(Some);
     }
     if array_backed {
-        let len_v = get(v, "length", v)?.unwrap_or(Value::Undef);
-        let len = with_host(|h| h.to_number(&len_v));
-        let len = if len.is_finite() && len > 0.0 {
-            len as usize
-        } else {
-            0
-        };
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            out.push(get(v, &i.to_string(), v)?.unwrap_or(Value::Undef));
-        }
-        return Ok(Some(out));
+        return length_walk(v).map(Some);
     }
     let target = no_trap(v, "get")?.expect("checked it is a proxy");
     host::iter_all(&target).map(Some)
+}
+
+/// `Get(O, "length")` once, then `Get(O, i)` for each index below it, all
+/// through the traps.
+fn length_walk(v: &Value) -> Result<Vec<Value>, String> {
+    let len_v = get(v, "length", v)?.unwrap_or(Value::Undef);
+    let len = with_host(|h| h.to_number(&len_v));
+    let len = if len.is_finite() && len > 0.0 {
+        len as usize
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        out.push(get(v, &i.to_string(), v)?.unwrap_or(Value::Undef));
+    }
+    Ok(out)
 }
 
 /// The plain value `JSON.stringify` serializes a proxy as. `SerializeJSONArray`
 /// and `SerializeJSONObject` both read every member through `[[Get]]`, so the
 /// snapshot is taken through the traps rather than off the target.
 pub fn json_snapshot(v: &Value) -> Result<Value, String> {
+    // `SerializeJSONArray` (25.5.2.6) is `LengthOfArrayLike` then `Get` per
+    // index — never `Symbol.iterator`, which a user may have replaced.
     if wraps_array(v) {
-        let items = iterate(v)?.unwrap_or_default();
+        let items = length_walk(v)?;
         return Ok(with_host(|h| h.new_array(items)));
     }
-    let entries = own_enum_entries(v)?;
+    // `SerializeJSONObject` takes `EnumerableOwnProperties(value, key)` — every
+    // descriptor first — and only then `Get`s each key while serializing.
+    let mut entries = Vec::new();
+    for k in own_enum_string_keys(v)? {
+        let val = get(v, &k, v)?.unwrap_or(Value::Undef);
+        entries.push((k, val));
+    }
     Ok(with_host(|h| {
         let mut m = indexmap::IndexMap::new();
         for (k, val) in entries {
