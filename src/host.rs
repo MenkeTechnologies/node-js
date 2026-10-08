@@ -7280,6 +7280,48 @@ pub fn current_static_this() -> Option<Value> {
     STATIC_THIS.with(|s| s.borrow().last().cloned())
 }
 
+/// The call half of `proxy.m(...)` once `Get(proxy, "m")` has produced the
+/// callable `f`: the method runs with the PROXY as `this`. Split out so a caller
+/// that has already done the `Get` (ToPrimitive's `OrdinaryToPrimitive`) does not
+/// read the property a second time through the `get` trap.
+pub fn call_proxy_method(recv: &Value, name: &str, f: Value, args: Vec<Value>) -> Result<Value, String> {
+    // `Function.prototype.call`/`apply`/`bind`/`toString` and the REFLECTIVE
+    // `Object.prototype` methods are generic over `this`. node-js models each
+    // as a thunk BOUND to the object it was read off — through a proxy, that
+    // is the target — so invoking the thunk answers for the target and skips
+    // the traps entirely: `pf.call(1, 2)` never reached the `apply` trap and
+    // `p.hasOwnProperty(k)` never reached the descriptor trap. Re-dispatch
+    // those against the PROXY, which is the `this` the real method receives.
+    //
+    // `toString`/`valueOf`/`toLocaleString` are deliberately NOT re-dispatched
+    // for a non-callable proxy: they resolve by the TARGET's kind (a proxy of
+    // an array stringifies `1,2` through `Array.prototype.toString`, not
+    // `[object Object]`), which the bound thunk already gets right.
+    if with_host(|h| matches!(h.get(&f), Some(JsObj::BoundMethod { .. }))) {
+        if with_host(|h| is_callable(h, recv)) {
+            if let Some(r) = crate::builtins::function_builtin_method(recv, name, &args)? {
+                return Ok(r);
+            }
+        }
+        if matches!(
+            name,
+            "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
+        ) {
+            return crate::builtins::object_builtin_method(recv, name, args);
+        }
+        // The three above resolve by the TARGET's kind, and the thunk is
+        // already bound to the target — so it must be invoked WITHOUT a
+        // receiver override. Passing the proxy as `this` made the
+        // `BoundMethod` arm of `invoke` prefer it over its own receiver and
+        // call straight back into this branch, so `String(new Proxy({}, {}))`
+        // recursed until the stack overflowed and the process aborted.
+        if matches!(name, "toString" | "valueOf" | "toLocaleString") {
+            return invoke(&f, args, None);
+        }
+    }
+    invoke(&f, args, Some(recv.clone()))
+}
+
 /// `recv.name(args)`.
 pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     // `undefined.foo()` is a `[[Get]]` and THEN a call (13.3.6 EvaluateCall), so
@@ -7309,41 +7351,7 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
         if !with_host(|h| is_callable(h, &f)) {
             return Err(type_error(&format!("{name} is not a function")));
         }
-        // `Function.prototype.call`/`apply`/`bind`/`toString` and the REFLECTIVE
-        // `Object.prototype` methods are generic over `this`. node-js models each
-        // as a thunk BOUND to the object it was read off — through a proxy, that
-        // is the target — so invoking the thunk answers for the target and skips
-        // the traps entirely: `pf.call(1, 2)` never reached the `apply` trap and
-        // `p.hasOwnProperty(k)` never reached the descriptor trap. Re-dispatch
-        // those against the PROXY, which is the `this` the real method receives.
-        //
-        // `toString`/`valueOf`/`toLocaleString` are deliberately NOT re-dispatched
-        // for a non-callable proxy: they resolve by the TARGET's kind (a proxy of
-        // an array stringifies `1,2` through `Array.prototype.toString`, not
-        // `[object Object]`), which the bound thunk already gets right.
-        if with_host(|h| matches!(h.get(&f), Some(JsObj::BoundMethod { .. }))) {
-            if with_host(|h| is_callable(h, recv)) {
-                if let Some(r) = crate::builtins::function_builtin_method(recv, name, &args)? {
-                    return Ok(r);
-                }
-            }
-            if matches!(
-                name,
-                "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
-            ) {
-                return crate::builtins::object_builtin_method(recv, name, args);
-            }
-            // The three above resolve by the TARGET's kind, and the thunk is
-            // already bound to the target — so it must be invoked WITHOUT a
-            // receiver override. Passing the proxy as `this` made the
-            // `BoundMethod` arm of `invoke` prefer it over its own receiver and
-            // call straight back into this branch, so `String(new Proxy({}, {}))`
-            // recursed until the stack overflowed and the process aborted.
-            if matches!(name, "toString" | "valueOf" | "toLocaleString") {
-                return invoke(&f, args, None);
-            }
-        }
-        return invoke(&f, args, Some(recv.clone()));
+        return call_proxy_method(recv, name, f, args);
     }
     // Namespace builtins (`console`, `Math`, `JSON`, ...): dispatch by qualified
     // name.
@@ -9526,10 +9534,11 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
         // On a Proxy the resolved method is a thunk bound to the TARGET, so
         // invoking it directly would stringify the target — `String(new
         // Proxy(function f(){}, {}))` reported `f`'s source where V8 reports the
-        // native-code form. `call_method` re-dispatches the generic
-        // `Function.prototype`/`Object.prototype` methods against the proxy.
+        // native-code form. `call_proxy_method` re-dispatches the generic
+        // `Function.prototype`/`Object.prototype` methods against the proxy,
+        // reusing the method already read here (the `get` trap fires once).
         let r = if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
-            call_method(v, m, Vec::new())?
+            call_proxy_method(v, m, f, Vec::new())?
         } else {
             invoke(&f, Vec::new(), Some(v.clone()))?
         };
