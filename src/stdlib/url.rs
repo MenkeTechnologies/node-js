@@ -976,6 +976,7 @@ pub fn search_params_call(recv: &Value, method: &str, args: &[Value]) -> Result<
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("URLSearchParams Iterator"),
                 })
             }))
         }
@@ -987,6 +988,7 @@ pub fn search_params_call(recv: &Value, method: &str, args: &[Value]) -> Result<
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("URLSearchParams Iterator"),
                 })
             }))
         }
@@ -1004,6 +1006,7 @@ pub fn search_params_call(recv: &Value, method: &str, args: &[Value]) -> Result<
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("URLSearchParams Iterator"),
                 })
             }))
         }

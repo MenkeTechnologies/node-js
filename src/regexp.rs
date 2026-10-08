@@ -887,6 +887,7 @@ pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
             items,
             idx: 0,
             array: None,
+            brand: Some("RegExp String Iterator"),
         })
     }))
 }

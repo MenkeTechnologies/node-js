@@ -3806,6 +3806,7 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             // An array iterator and a Map/Set iterator carry the tags of their
             // prototypes (23.1.5.2.2, 24.1.5.2.2, 24.2.6.2.2).
             Some(JsObj::Iter { array: Some(_), .. }) => "Array Iterator".into(),
+            Some(JsObj::Iter { brand: Some(b), .. }) => (*b).into(),
             Some(JsObj::Object(_)) if collection_iterator_view(h, v).is_some() => {
                 match collection_iterator_view(h, v).map(|(b, _)| b) {
                     Some(b) if b.starts_with("Map") => "Map Iterator".into(),
@@ -5488,6 +5489,7 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
                 items,
                 idx: 0,
                 array: None,
+                brand: None,
             })
         }),
         // V8 names the SOURCE EXPRESSION, not the value: `for (const x of a)`
@@ -12055,6 +12057,7 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("String Iterator"),
                 })
             }))
         }
@@ -13644,6 +13647,7 @@ pub(crate) fn array_iterator(arr: &Value, kind: host::ArrayIterKind) -> Value {
             items: Vec::new(),
             idx: 0,
             array: Some((arr.clone(), kind)),
+            brand: None,
         })
     })
 }
@@ -13672,6 +13676,7 @@ pub(crate) fn iter_step(it: &Value) -> Option<Result<Option<Value>, String>> {
                 items,
                 idx,
                 array: None,
+                ..
             }) => {
                 let v = items.get(*idx).cloned();
                 if v.is_some() {
@@ -13781,7 +13786,9 @@ fn iter_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, Stri
         "return" => {
             // Exhaust the cursor and report done.
             with_host(|h| {
-                if let Some(JsObj::Iter { items, idx, array }) = h.get_mut(recv) {
+                if let Some(JsObj::Iter {
+                    items, idx, array, ..
+                }) = h.get_mut(recv) {
                     *idx = if array.is_some() {
                         usize::MAX
                     } else {

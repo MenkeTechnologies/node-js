@@ -648,6 +648,7 @@ pub fn get_iterator(v: &Value) -> Result<Option<Value>, String> {
             items,
             idx: 0,
             array: None,
+            brand: None,
         })
     })))
 }

@@ -1842,6 +1842,7 @@ pub fn mime_params_instance_call(
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("Generator"),
                 })
             }))
         }
@@ -1853,6 +1854,7 @@ pub fn mime_params_instance_call(
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("Generator"),
                 })
             }))
         }
@@ -1870,6 +1872,7 @@ pub fn mime_params_instance_call(
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("Generator"),
                 })
             }))
         }

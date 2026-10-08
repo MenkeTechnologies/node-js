@@ -451,10 +451,17 @@ pub enum JsObj {
     /// and every step reads the array as it is then (23.1.5.1), so a `for-of`
     /// sees an element pushed or written during the loop and stops at a length
     /// that shrank. `items` is empty for those.
+    ///
+    /// `brand` names the built-in iterator prototype a snapshot stands for —
+    /// `"String Iterator"`, `"URLSearchParams Iterator"`, … — which is its
+    /// `Symbol.toStringTag` and its `util.inspect` prefix. `None` is an
+    /// iterator the runtime makes for its own iteration and never hands out.
+    /// An array iterator is always `"Array Iterator"`, whatever this says.
     Iter {
         items: Vec<Value>,
         idx: usize,
         array: Option<(Value, ArrayIterKind)>,
+        brand: Option<&'static str>,
     },
     /// A bound function (`fn.bind(thisArg, ...preargs)`).
     BoundFunc {
@@ -5166,6 +5173,24 @@ impl JsHost {
                 }
                 Some(JsObj::Generator { .. }) => "Object [Generator] {}".into(),
                 Some(JsObj::Iter { array: Some(_), .. }) => "Object [Array Iterator] {}".into(),
+                // node lists what a URLSearchParams iterator has left; every other
+                // built-in iterator prints as an empty object under its brand.
+                Some(JsObj::Iter {
+                    items,
+                    idx,
+                    brand: Some(b),
+                    ..
+                }) => {
+                    if *b == "URLSearchParams Iterator" {
+                        let rest: Vec<String> = items[(*idx).min(items.len())..]
+                            .iter()
+                            .map(|v| self.inspect_lvl(v, indent + 2, st))
+                            .collect();
+                        format!("{b} {{ {} }}", rest.join(", "))
+                    } else {
+                        format!("Object [{b}] {{}}")
+                    }
+                }
                 Some(JsObj::Promise { id }) => match self.promises.get(*id as usize) {
                     Some(c) => {
                         // `P2 [Promise] { 3 }` for an instance of a subclass.
@@ -9202,6 +9227,7 @@ pub fn get_async_iterator(src: &Value) -> Result<Value, String> {
             items,
             idx: 0,
             array: None,
+            brand: None,
         })
     }))
 }

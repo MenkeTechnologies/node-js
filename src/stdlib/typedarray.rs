@@ -1880,6 +1880,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("Array Iterator"),
                 })
             }))
         }

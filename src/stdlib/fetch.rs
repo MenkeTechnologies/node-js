@@ -354,6 +354,7 @@ pub fn headers_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value,
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("Headers Iterator"),
                 })
             }))
         }
@@ -768,6 +769,7 @@ pub fn form_data_call(recv: &Value, method: &str, args: &[Value]) -> Result<Valu
                     items,
                     idx: 0,
                     array: None,
+                    brand: Some("FormData Iterator"),
                 })
             }))
         }
