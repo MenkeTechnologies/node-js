@@ -3362,6 +3362,17 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         if method == "toString" {
             return array_to_string(recv);
         }
+        // The iterator factories copy nothing: the iterator they return reads
+        // `length` and each index off the receiver at every step (23.1.5.1).
+        let kind = match method {
+            "keys" => Some(host::ArrayIterKind::Keys),
+            "values" | "@@iterator" => Some(host::ArrayIterKind::Values),
+            "entries" => Some(host::ArrayIterKind::Entries),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return Ok(array_iterator(recv, kind));
+        }
         return array_generic(recv, method, args);
     }
     // The general form of the two special cases above: a thunk taken off a native
@@ -5382,17 +5393,12 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
     if with_host(|h| h.is_generator_val(&v)) {
         return v;
     }
-    // A Proxy's iterator comes from its traps, materialized eagerly: the
-    // `lookup_chain` probe below reads the property map a proxy does not have.
+    // A Proxy's iterator comes from its traps (`crate::proxy::get_iterator`):
+    // the `lookup_chain` probe below reads the property map a proxy does not
+    // have. It is stepped like any other, so the body runs between steps.
     if with_host(|h| h.kind_of(&v)) == Some(ObjKind::Proxy) {
-        return match crate::proxy::iterate(&v) {
-            Ok(Some(items)) => with_host(|h| {
-                h.alloc(JsObj::Iter {
-                    items,
-                    idx: 0,
-                    array: None,
-                })
-            }),
+        return match crate::proxy::get_iterator(&v) {
+            Ok(Some(it)) => it,
             Ok(None) => abort(vm, "internal: kind_of said Proxy".into()),
             Err(e) => abort(vm, e),
         };
@@ -5568,11 +5574,12 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
     // an array.
     if let Some(step) = iter_step(&it) {
         return match step {
-            Some(v) => {
+            Ok(Some(v)) => {
                 vm.push(v);
                 Value::Bool(true)
             }
-            None => Value::Bool(false),
+            Ok(None) => Value::Bool(false),
+            Err(e) => abort(vm, e),
         };
     }
     // Generator: resume one step.
@@ -13614,7 +13621,12 @@ pub(crate) fn array_iterator(arr: &Value, kind: host::ArrayIterKind) -> Value {
 /// pushed during a `for-of` is visited and one popped is not, and the element
 /// is read as `a[i]` reads it — an accessor runs, a hole reads through the
 /// prototype. Once it reports done it stays done, even if the array grows.
-pub(crate) fn iter_step(it: &Value) -> Option<Option<Value>> {
+///
+/// The array may be any object — `Array.prototype.values.call(arrayLike)`, or a
+/// `for-of` over a Proxy of an array. For anything but a plain Array the step is
+/// the spec's own: `LengthOfArrayLike(O)` read afresh, then `Get(O, i)`, both
+/// through the object's `[[Get]]`, and a throw from either propagates.
+pub(crate) fn iter_step(it: &Value) -> Option<Result<Option<Value>, String>> {
     use host::ArrayIterKind;
     // One host borrow for the common case — a snapshot, or an array slot that
     // is neither a hole nor an accessor. `Err` carries what only `[[Get]]` can
@@ -13641,11 +13653,14 @@ pub(crate) fn iter_step(it: &Value) -> Option<Option<Value>> {
         };
         // `usize::MAX` marks an iterator that has already reported done, and
         // it stays done even if the array grows.
+        if i == usize::MAX {
+            return Some(Ok(None));
+        }
         let len = match h.get(&arr) {
             Some(JsObj::Array(items)) => items.len(),
-            _ => 0,
+            _ => return Some(Err((arr, kind, i, true))),
         };
-        let done = i == usize::MAX || i >= len;
+        let done = i >= len;
         if let Some(JsObj::Iter { idx, .. }) = h.get_mut(it) {
             *idx = if done { usize::MAX } else { i + 1 };
         }
@@ -13660,29 +13675,71 @@ pub(crate) fn iter_step(it: &Value) -> Option<Option<Value>> {
             {
                 items[i].clone()
             }
-            _ => return Some(Err((arr, kind, i))),
+            _ => return Some(Err((arr, kind, i, false))),
         };
         Some(Ok(Some(match kind {
             ArrayIterKind::Entries => h.new_array(vec![key, slot]),
             _ => slot,
         })))
     })?;
-    let (arr, kind, i) = match step {
-        Ok(step) => return Some(step),
+    let (arr, kind, i, generic) = match step {
+        Ok(step) => return Some(Ok(step)),
         Err(slow) => slow,
     };
-    let value = get_property(&arr, &i.to_string()).unwrap_or(Value::Undef);
-    Some(Some(match kind {
+    Some(array_iter_slow_step(it, &arr, kind, i, generic))
+}
+
+/// The `[[Get]]`-driven half of [`iter_step`]: an element that is a hole or an
+/// accessor, or (`generic`) a receiver that is not a plain Array, whose length
+/// is then re-read and compared here rather than off the backing vector.
+fn array_iter_slow_step(
+    it: &Value,
+    arr: &Value,
+    kind: host::ArrayIterKind,
+    i: usize,
+    generic: bool,
+) -> Result<Option<Value>, String> {
+    use host::ArrayIterKind;
+    if generic {
+        let len = length_of_array_like(arr)?;
+        let done = i >= len;
+        with_host(|h| {
+            if let Some(JsObj::Iter { idx, .. }) = h.get_mut(it) {
+                *idx = if done { usize::MAX } else { i + 1 };
+            }
+        });
+        if done {
+            return Ok(None);
+        }
+        if kind == ArrayIterKind::Keys {
+            return Ok(Some(Value::Float(i as f64)));
+        }
+    }
+    let value = get_property(arr, &i.to_string())?;
+    Ok(Some(match kind {
         ArrayIterKind::Entries => with_host(|h| h.new_array(vec![Value::Float(i as f64), value])),
         _ => value,
     }))
+}
+
+/// `LengthOfArrayLike(O)` (7.3.18): `ToLength(Get(O, "length"))`, the
+/// `ToNumber` running any user `valueOf`, a throw from either propagating.
+pub(crate) fn length_of_array_like(o: &Value) -> Result<usize, String> {
+    let len = get_property(o, "length")?;
+    let n = host::to_number_value(&len)?;
+    // ToLength: ToIntegerOrInfinity, clamped to [0, 2^53 - 1].
+    Ok(if n.is_nan() || n <= 0.0 {
+        0
+    } else {
+        n.trunc().min(9007199254740991.0) as usize
+    })
 }
 
 /// Built-in iterator object (`arr.values()`, `arr[Symbol.iterator]()`): a
 /// cursor over a snapshot, or live over an array ([`iter_step`]).
 fn iter_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
-        "next" => Ok(match iter_step(recv).flatten() {
+        "next" => Ok(match iter_step(recv).transpose()?.flatten() {
             Some(v) => iter_result(v, false),
             None => iter_result(Value::Undef, true),
         }),

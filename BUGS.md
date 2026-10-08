@@ -1947,6 +1947,12 @@ only once the next line arrives. Piped and redirected input is unaffected.
 | spread / `Object.assign` / `Object.entries` on a Proxy asked every descriptor before reading any value; `JSON.stringify` of an array proxy went through `Symbol.iterator` and the `has` trap | one key at a time: descriptor, then `get`; `JSON.stringify` takes every descriptor first and serializes an array proxy by `length` + index reads alone (`parity-scripts/objects/24_proxy_copy_trap_order.js`) |
 | `[].concat(arrayProxy)` appended the proxy as one element; a spread array-like turned a missing index into `undefined` and swallowed a throwing getter | `IsArray` sees through the proxy; each index is `HasProperty`-then-`Get`, so holes stay holes and getter errors propagate (`parity-scripts/objects/25_concat_spreadable.js`) |
 
+## FIXED in round 14 — verified against node v26.10.0
+
+| was | now |
+| --- | --- |
+| a `for-of` / spread / destructuring over an array Proxy asked `has` before every `get`, read `length` once and drained the proxy up front; `Array.prototype.values.call(arrayLike)` snapshotted through `has` too | the array iterator is live over any receiver: each step is `LengthOfArrayLike` then `Get(O, i)` through the traps (23.1.5.1), and destructuring takes only the steps it binds (`parity-scripts/objects/26_array_iterator_generic_receiver.js`) |
+
 ## Still open — found in round 7
 
 | gap | node v26.7.0 | node-js |
@@ -2342,10 +2348,12 @@ Iteration deserves a note. `Array.prototype[Symbol.iterator]` is generic: it
 reads `length` and then each index through `[[Get]]`. node-js models it as a
 thunk BOUND to the array it was read off, which read through a proxy would walk
 the target and ignore every answer the `get` trap gave. An array-backed proxy
-still holding that default therefore takes an explicit length-driven walk, so
-`[...new Proxy([1,2,3], { get: (t,k) => k === 'length' ? 2 : t[k] })]` is
-`[1, 2]` as in Node. A user-installed `Symbol.iterator` is an ordinary function
-and keeps the direct path.
+still holding that default therefore gets the generic array iterator over the
+PROXY: each step re-reads `length` and then the index through `[[Get]]`, never
+`has`, so `[...new Proxy([1,2,3], { get: (t,k) => k === 'length' ? 2 : t[k] })]`
+is `[1, 2]` as in Node, a `for-of` body runs between steps, and `const [a, b] =
+proxy` takes two steps rather than draining it. A user-installed
+`Symbol.iterator` is an ordinary function and is called with the proxy as `this`.
 
 The same "generic method modeled as a bound thunk" correction applies to
 `Function.prototype.call`/`apply`/`bind`/`toString` and to the reflective

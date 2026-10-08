@@ -609,14 +609,16 @@ fn wraps_array(v: &Value) -> bool {
     }
 }
 
-/// `[...proxy]` / `for (… of proxy)`. `Ok(None)` → not a proxy.
+/// `GetIterator(proxy, sync)` → the iterator object. `Ok(None)` → not a proxy.
 ///
 /// Three cases, in the order `GetIterator` reaches them:
-/// a user `Symbol.iterator` read THROUGH the `get` trap; an array target, whose
-/// `Array.prototype[Symbol.iterator]` observably does `Get(O, "length")` then
-/// `Get(O, i)` (so a `get` trap that lies about either is honored); and anything
-/// else (Map/Set/string/generator target), which iterates as the target does.
-pub fn iterate(v: &Value) -> Result<Option<Vec<Value>>, String> {
+/// a user `Symbol.iterator` read THROUGH the `get` trap, called with the proxy
+/// as `this`; an array target still holding the default, whose
+/// `Array.prototype[Symbol.iterator]` is a live array iterator over the PROXY —
+/// each step re-reads `length` and then `Get(O, i)` through the traps
+/// (23.1.5.1), never `has`; and anything else (Map/Set/string/generator
+/// target), which iterates as the target does.
+pub fn get_iterator(v: &Value) -> Result<Option<Value>, String> {
     if parts(v).is_none() {
         return Ok(None);
     }
@@ -626,22 +628,43 @@ pub fn iterate(v: &Value) -> Result<Option<Vec<Value>>, String> {
     // array it was read off, where the real method is generic over `this`. Read
     // through a proxy, that thunk would walk the TARGET and ignore every answer
     // the `get` trap gave — so an array-backed proxy still holding the default
-    // falls through to the length-driven walk, which is what the generic method
-    // observably does. A user-installed iterator is an ordinary function value
-    // and keeps the fast path.
+    // gets the generic iterator over the proxy itself. A user-installed iterator
+    // is an ordinary function value and is called.
     let default_array_iter =
         array_backed && with_host(|h| matches!(h.get(&iter_fn), Some(JsObj::BoundMethod { .. })));
     if !default_array_iter && with_host(|h| host::is_callable(h, &iter_fn)) {
-        let iterator = host::invoke(&iter_fn, Vec::new(), Some(v.clone()))?;
-        return host::drain_iterator(&iterator).map(Some);
+        return host::call_iterator_method(&iter_fn, v).map(Some);
     }
     if array_backed {
-        return length_walk(v).map(Some);
+        return Ok(Some(crate::builtins::array_iterator(
+            v,
+            host::ArrayIterKind::Values,
+        )));
     }
     let target = no_trap(v, "get")?.expect("checked it is a proxy");
-    host::iter_all(&target).map(Some)
+    let items = host::iter_all(&target)?;
+    Ok(Some(with_host(|h| {
+        h.alloc(JsObj::Iter {
+            items,
+            idx: 0,
+            array: None,
+        })
+    })))
 }
 
+/// `[...proxy]` and the other consumers that drain: [`get_iterator`], stepped
+/// to the end. `Ok(None)` → not a proxy.
+pub fn iterate(v: &Value) -> Result<Option<Vec<Value>>, String> {
+    let Some(iterator) = get_iterator(v)? else {
+        return Ok(None);
+    };
+    if with_host(|h| matches!(h.get(&iterator), Some(JsObj::Iter { .. }))) {
+        return host::iter_all(&iterator).map(Some);
+    }
+    host::drain_iterator(&iterator).map(Some)
+}
+
+/// `[...proxy]` / `for (… of proxy)`. `Ok(None)` → not a proxy.
 /// `Get(O, "length")` once, then `Get(O, i)` for each index below it, all
 /// through the traps.
 fn length_walk(v: &Value) -> Result<Vec<Value>, String> {

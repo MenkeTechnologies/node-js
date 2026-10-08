@@ -9025,10 +9025,21 @@ fn norm_num_bits(f: f64) -> u64 {
 /// A `...rest` element genuinely consumes the remainder, so those patterns keep
 /// using `iter_all` and an unbounded source hangs there in node too.
 pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
-    // A Proxy iterates through its traps, which materialize eagerly; there is
-    // no step-wise form to bound, so this keeps the draining behaviour.
-    if let Some(items) = crate::proxy::iterate(v)? {
-        return Ok(items.into_iter().take(n).collect());
+    // A Proxy's iterator comes from its traps and is stepped like any other:
+    // only `n` steps run, so `const [a, b] = proxy` reads `length` three times
+    // rather than once per element.
+    if let Some(iterator) = crate::proxy::get_iterator(v)? {
+        if with_host(|h| matches!(h.get(&iterator), Some(JsObj::Iter { .. }))) {
+            let mut out = Vec::new();
+            while out.len() < n {
+                match crate::builtins::iter_step(&iterator).transpose()?.flatten() {
+                    Some(x) => out.push(x),
+                    None => break,
+                }
+            }
+            return Ok(out);
+        }
+        return take_from_iterator(&iterator, n);
     }
     if with_host(|h| h.is_generator_val(v)) {
         let mut out = Vec::new();
@@ -9044,25 +9055,7 @@ pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
     }
     if let Some(iter_fn) = user_iterator_fn(v) {
         let iterator = call_iterator_method(&iter_fn, v)?;
-        let mut out = Vec::new();
-        while out.len() < n {
-            let step = call_method(&iterator, "next", Vec::new())?;
-            // Read first: resolving the property re-enters the host, so doing
-            // it inside the `with_host` closure double-borrows and aborts.
-            let done = get_prop_chain(&step, "done")?;
-            if with_host(|h| h.truthy(&done)) {
-                return Ok(out);
-            }
-            out.push(get_prop_chain(&step, "value")?);
-        }
-        // IteratorClose: `return` is optional on the protocol, and a throw from
-        // it is swallowed here the way a normal (non-abrupt) completion does.
-        if let Ok(ret) = get_prop_chain(&iterator, "return") {
-            if with_host(|h| is_callable(h, &ret)) {
-                let _ = invoke(&ret, Vec::new(), Some(iterator.clone()));
-            }
-        }
-        return Ok(out);
+        return take_from_iterator(&iterator, n);
     }
     // Arrays, strings, Map/Set: already materialized, and their built-in
     // iterators carry no `return`, so there is nothing to close. The same
@@ -9074,6 +9067,30 @@ pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
         return Err(type_error(&format!("{shown} is not iterable")));
     }
     with_host(|h| h.iter_vec(v)).map(|items| items.into_iter().take(n).collect())
+}
+
+/// Up to `n` steps of a protocol iterator object, then IteratorClose if it did
+/// not run out on its own.
+fn take_from_iterator(iterator: &Value, n: usize) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        let step = call_method(iterator, "next", Vec::new())?;
+        // Read first: resolving the property re-enters the host, so doing
+        // it inside the `with_host` closure double-borrows and aborts.
+        let done = get_prop_chain(&step, "done")?;
+        if with_host(|h| h.truthy(&done)) {
+            return Ok(out);
+        }
+        out.push(get_prop_chain(&step, "value")?);
+    }
+    // IteratorClose: `return` is optional on the protocol, and a throw from
+    // it is swallowed here the way a normal (non-abrupt) completion does.
+    if let Ok(ret) = get_prop_chain(iterator, "return") {
+        if with_host(|h| is_callable(h, &ret)) {
+            let _ = invoke(&ret, Vec::new(), Some(iterator.clone()));
+        }
+    }
+    Ok(out)
 }
 
 /// `GetIteratorFromMethod` (7.4.3): call `@@iterator` on `src` and refuse a
@@ -9123,7 +9140,7 @@ pub fn iter_all(v: &Value) -> Result<Vec<Value>, String> {
     // leaves it in node.
     if with_host(|h| matches!(h.get(v), Some(JsObj::Iter { array: Some(_), .. }))) {
         let mut out = Vec::new();
-        while let Some(Some(x)) = crate::builtins::iter_step(v) {
+        while let Some(x) = crate::builtins::iter_step(v).transpose()?.flatten() {
             out.push(x);
         }
         return Ok(out);
