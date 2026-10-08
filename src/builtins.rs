@@ -3054,6 +3054,9 @@ fn nullish_receiver_error(ctor: &str, method: &str, recv: &str) -> Option<String
         "String" if method == "trimStart" => named("String").replace("trimStart", "trimLeft"),
         "String" if method == "trimEnd" => named("String").replace("trimEnd", "trimRight"),
         "String" if matches!(method, "toString" | "valueOf") => branded("String", "String"),
+        "String" if method == "@@iterator" => {
+            "String.prototype[Symbol.iterator] called on null or undefined".to_string()
+        }
         "String" => named("String"),
         "Number" => branded("Number", "Number"),
         "Boolean" => branded("Boolean", "Boolean"),
@@ -3147,6 +3150,15 @@ fn this_primitive_value(ctor: &str, recv: &Value) -> Option<Value> {
 
 pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result<Value, String> {
     let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
+    // A prototype slot that holds ANOTHER method's function object (24.1.3.12,
+    // 24.2.3.8, 24.2.3.10: `Map.prototype[@@iterator]` is `entries`,
+    // `Set.prototype.keys` and `[@@iterator]` are `values`) runs, and fails its
+    // brand check, under that method's name.
+    let method = match (ctor, method) {
+        ("Set", "keys" | "@@iterator") => "values",
+        ("Map", "@@iterator") => "entries",
+        _ => method,
+    };
     // A prototype ACCESSOR installed by `ensure_ctor_proto`: it reads or writes
     // the instance's hidden `@@<name>` slot, which is where the value lives now
     // that the public name is a getter rather than an own property.
