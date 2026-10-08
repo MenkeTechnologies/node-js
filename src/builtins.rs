@@ -10055,6 +10055,32 @@ fn symbol_protocol(arg: &Value, sym: &str) -> Option<Value> {
     with_host(|h| host::is_callable(h, &f)).then_some(f)
 }
 
+/// 22.1.3.13 / 22.1.3.20 step 2.b: before `matchAll`/`replaceAll` consult the
+/// argument's protocol method, an argument that `IsRegExp` must carry a `g` in
+/// its `flags` — read with `[[Get]]`, so a plain object declaring itself a
+/// regexp through `Symbol.match` is held to it too, and a missing `flags` is
+/// its own TypeError. Each method has its own V8 wording for both failures.
+fn require_global_regexp(method: &str, arg: &Value) -> Result<(), String> {
+    if with_host(|h| h.is_nullish(arg)) || !is_regexp_arg(arg) {
+        return Ok(());
+    }
+    let flags = get_property(arg, "flags")?;
+    if with_host(|h| h.is_nullish(&flags)) {
+        return Err(host::type_error(if method == "replaceAll" {
+            "String.prototype.replaceAll called on null or undefined"
+        } else {
+            "The .flags property of the argument to String.prototype.matchAll cannot be null or undefined"
+        }));
+    }
+    let flags = host::to_string_value(&flags)?;
+    if !with_host(|h| h.str_of(&flags)).contains('g') {
+        return Err(host::type_error(&format!(
+            "String.prototype.{method} called with a non-global RegExp argument"
+        )));
+    }
+    Ok(())
+}
+
 fn is_regexp_arg(v: &Value) -> bool {
     // 7.2.8 `IsRegExp` asks `Symbol.match` FIRST, so an object can declare
     // itself a regexp — or a real one can disown the label. Only the heap kind
@@ -12064,6 +12090,9 @@ fn coerce_string_args(name: &str, args: Vec<Value>) -> Result<Vec<Value>, String
 
 fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String> {
     reject_symbol_args(name, &args)?;
+    if matches!(name, "replaceAll" | "matchAll") {
+        require_global_regexp(name, &arg0(&args))?;
+    }
     let args = coerce_string_args(name, args)?;
     // Every index-bearing method below counts UTF-16 code units, so they all
     // work off this one decoding rather than off `s.chars()` (code points),
@@ -12352,21 +12381,9 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         "padStart" => Ok(new_s(pad(s, &args, true)?)),
         "padEnd" => Ok(new_s(pad(s, &args, false)?)),
         // Regex-taking string methods: dispatch to the regexp module when the
-        // argument is a RegExp; otherwise keep the plain-string behavior.
-        // 22.1.3.20 step 2.a: `replaceAll` validates the `g` flag BEFORE it
-        // consults `Symbol.replace`, so a non-global regexp is a TypeError even
-        // though a RegExp does define that method. Delegating first skipped the
-        // check and silently did a single replacement.
-        "replaceAll"
-            if is_regexp_arg(&arg0(&args))
-                && !with_host(
-                    |h| matches!(h.get(&arg0(&args)), Some(JsObj::RegExp(r)) if r.global),
-                ) =>
-        {
-            Err(host::type_error(
-                "String.prototype.replaceAll called with a non-global RegExp argument",
-            ))
-        }
+        // argument is a RegExp; otherwise keep the plain-string behavior. The
+        // `g`-flag check `replaceAll`/`matchAll` make first is
+        // `require_global_regexp`, run before the arguments are coerced.
         "match" | "matchAll" | "search" | "split" | "replace" | "replaceAll"
             if symbol_protocol(
                 &arg0(&args),
