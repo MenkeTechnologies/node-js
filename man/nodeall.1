@@ -39,7 +39,7 @@ evaluates a one\-liner instead of a file; with no
 and no
 .IR FILE ,
 .B node
-reads a script from standard input.
+starts the REPL on a terminal and otherwise reads a script from standard input.
 .B \-\-lsp
 and
 .B \-\-dap
@@ -62,7 +62,7 @@ JavaScript source \[->] lexer \[->] parser (AST) \[->] lower to fusevm bytecode 
 .EE
 .PP
 There is no bespoke VM or JIT; execution and codegen live in fusevm, the shared
-engine behind zshrs, stryke, awkrs, elisp, ruby, arb, pythonrs, and php.
+engine every fusevm frontend runs on.
 .SH 4. TOOLING
 .SS Language server (\-\-lsp)
 .B node \-\-lsp
@@ -93,12 +93,15 @@ FFI runtime), and its exports become callable by name from JavaScript
 .B \-\-dump\-tokens
 prints the token stream,
 .B \-\-dump\-ast
-the parsed AST, and
+the parsed AST,
+.B \-\-dump\-bytecode
+the lowered fusevm bytecode, and
 .B \-\-disasm
 a fusevm bytecode disassembly \(em each then exits.
 .SH 5. DIAGNOSTICS
-Errors are written to standard error. The process exits non\-zero on an unhandled
-error and 0 on success.
+Errors are written to standard error. The process exits 1 on an unhandled
+error unless an exit listener assigns another code, and 0 on success unless
+the program set process.exitCode.
 .SH SEE ALSO
 .BR node (1)
 The focused invocation page. Source and issue tracker:

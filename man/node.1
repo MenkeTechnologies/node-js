@@ -21,7 +21,8 @@ and no
 .I FILE
 argument,
 .B node
-reads a script from standard input and runs it.
+starts the REPL when standard input is a terminal, and otherwise reads a
+script from standard input and runs it.
 .SH OPTIONS
 .TP
 .B \-e \fISRC\fR, \-\-eval \fISRC\fR
@@ -52,7 +53,9 @@ Speak the Debug Adapter Protocol over stdio. Takes no
 .B \-\-build
 Ahead\-of\-time compile
 .I FILE
-to a standalone native executable instead of running it.
+to a standalone native executable instead of running it. The executable is
+written next to the source, named by the source file stem (\fIfoo.js\fR
+becomes \fIfoo\fR), and the bytecode cache is warmed.
 .TP
 .B \-\-dump\-bytecode
 Print the compiled fusevm bytecode for
@@ -106,16 +109,19 @@ Print version and exit.
 .I FILE
 The
 .I .js
-script to run. Omit it to read from standard input, or when
+script to run. Omit it to read from standard input (a terminal starts the REPL), or when
 .B \-e
-is given.
+is given. A lone
+.B \-
+also selects standard input.
 .TP
 .I ARGS
 Trailing arguments passed through to the JavaScript program.
 .SH EXIT STATUS
-Exits 0 on success. On error, a terse
+Exits 0 on success, or with \fIprocess.exitCode\fR if the program set one. On error, a terse
 .RB \(dq node:\ <reason> \(dq
-message is written to standard error and the exit status is 1.
+message is written to standard error and the exit status is 1 (an uncaught
+exception exits 1 unless an \fIexit\fR listener assigns another code).
 .SH EXAMPLES
 Evaluate a one\-liner:
 .PP
