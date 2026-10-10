@@ -23,12 +23,8 @@
 frontend — a lexer/parser and compiler that lowers JavaScript to `fusevm::Chunk`
 bytecode running on fusevm's bytecode VM + Cranelift JIT, over a `JsHost` object
 heap. There is no bespoke interpreter loop: node-js is a pure front end;
-execution and codegen live in `fusevm` — the same engine behind
-[`zshrs`](https://github.com/MenkeTechnologies/zshrs),
-[`strykelang`](https://github.com/MenkeTechnologies/strykelang),
-[`awkrs`](https://github.com/MenkeTechnologies/awkrs),
-[`pythonrs`](https://github.com/MenkeTechnologies/pythonrs), and
-[`rubylang`](https://github.com/MenkeTechnologies/rubylang).
+execution and codegen live in `fusevm` — the same engine every other fusevm
+frontend runs on.
 
 The binary is `node`.
 
