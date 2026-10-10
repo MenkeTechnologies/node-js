@@ -70,6 +70,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Round-two generator modes (see the module doc there).
+#[path = "parity_fuzz/round2.rs"]
+mod round2;
+
 // ---------------------------------------------------------------------------
 // Deterministic PRNG (splitmix64) — no `rand` dependency.
 // ---------------------------------------------------------------------------
@@ -3871,6 +3875,18 @@ enum Mode {
     RegexSyntax,
     RegexProtocol,
     TypedCoerce,
+    DateParse,
+    JsonEdge,
+    NumFmt,
+    Unicode,
+    ArrSpecies,
+    ProxyInv,
+    AsyncOrder,
+    ClassField,
+    IterClose,
+    Completion,
+    ProtoGet,
+    SymProto,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -3926,6 +3942,18 @@ const REAL_MODES: &[Mode] = &[
     Mode::RegexSyntax,
     Mode::RegexProtocol,
     Mode::TypedCoerce,
+    Mode::DateParse,
+    Mode::JsonEdge,
+    Mode::NumFmt,
+    Mode::Unicode,
+    Mode::ArrSpecies,
+    Mode::ProxyInv,
+    Mode::AsyncOrder,
+    Mode::ClassField,
+    Mode::IterClose,
+    Mode::Completion,
+    Mode::ProtoGet,
+    Mode::SymProto,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -3988,6 +4016,18 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::RegexSyntax => gen_regexsyntax(seed),
         Mode::RegexProtocol => gen_regexprotocol(seed),
         Mode::TypedCoerce => gen_typedcoerce(seed),
+        Mode::DateParse => round2::gen_dateparse(seed),
+        Mode::JsonEdge => round2::gen_jsonedge(seed),
+        Mode::NumFmt => round2::gen_numfmt(seed),
+        Mode::Unicode => round2::gen_unicode(seed),
+        Mode::ArrSpecies => round2::gen_arrspecies(seed),
+        Mode::ProxyInv => round2::gen_proxyinv(seed),
+        Mode::AsyncOrder => round2::gen_asyncorder(seed),
+        Mode::ClassField => round2::gen_classfield(seed),
+        Mode::IterClose => round2::gen_iterclose(seed),
+        Mode::Completion => round2::gen_completion(seed),
+        Mode::ProtoGet => round2::gen_protoget(seed),
+        Mode::SymProto => round2::gen_symproto(seed),
     }
 }
 
@@ -4046,6 +4086,18 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::RegexSyntax => "regexsyntax",
         Mode::RegexProtocol => "regexprotocol",
         Mode::TypedCoerce => "typedcoerce",
+        Mode::DateParse => "dateparse",
+        Mode::JsonEdge => "jsonedge",
+        Mode::NumFmt => "numfmt",
+        Mode::Unicode => "unicode",
+        Mode::ArrSpecies => "arrspecies",
+        Mode::ProxyInv => "proxyinv",
+        Mode::AsyncOrder => "asyncorder",
+        Mode::ClassField => "classfield",
+        Mode::IterClose => "iterclose",
+        Mode::Completion => "completion",
+        Mode::ProtoGet => "protoget",
+        Mode::SymProto => "symproto",
     }
 }
 
@@ -4103,6 +4155,18 @@ const ALL_MODES: &[Mode] = &[
     Mode::RegexSyntax,
     Mode::RegexProtocol,
     Mode::TypedCoerce,
+    Mode::DateParse,
+    Mode::JsonEdge,
+    Mode::NumFmt,
+    Mode::Unicode,
+    Mode::ArrSpecies,
+    Mode::ProxyInv,
+    Mode::AsyncOrder,
+    Mode::ClassField,
+    Mode::IterClose,
+    Mode::Completion,
+    Mode::ProtoGet,
+    Mode::SymProto,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {
