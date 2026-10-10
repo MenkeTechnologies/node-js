@@ -297,9 +297,7 @@ impl Lexer {
         loop {
             match self.peek() {
                 None | Some('\n') => {
-                    return Err(
-                        format!("SyntaxError: Invalid regular expression: missing /").to_string(),
-                    )
+                    return Err("SyntaxError: Invalid regular expression: missing /".to_string())
                 }
                 Some('\\') => {
                     // Keep the escape verbatim (the translator interprets it).

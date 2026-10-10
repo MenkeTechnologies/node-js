@@ -1889,9 +1889,7 @@ impl Parser {
             Tok::Regex(pat, flags) => {
                 // A regex LITERAL's flags and pattern are early errors (13.2.7.3),
                 // reported before anything in the program runs.
-                if let Err(reason) = crate::regexp::check_literal(&pat, &flags) {
-                    return Err(reason);
-                }
+                crate::regexp::check_literal(&pat, &flags)?;
                 self.advance();
                 Ok(Expr::Regex(pat, flags))
             }
