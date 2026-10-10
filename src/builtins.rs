@@ -4,6 +4,7 @@
 //! return the result value, which the VM pushes back.
 
 use crate::host::{self, ops, with_host, FuncVal, JsObj, ObjKind};
+use crate::ieee754;
 use fusevm::{NumOp, Value, VM};
 use indexmap::IndexMap;
 
@@ -87,6 +88,18 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::COPY_SCOPE, b_copy_scope);
     vm.register_builtin(ops::DECLARE_VAR, b_declare_var);
     vm.register_builtin(ops::HOIST_VAR, b_hoist_var);
+    vm.register_builtin(ops::MAP_ARGS, b_map_args);
+    vm.register_builtin(ops::YIELD_DELEGATE, b_yield_delegate);
+    vm.register_builtin(ops::DELEGATE_STEP, b_delegate_step);
+    vm.register_builtin(ops::SUPER_SET, b_super_set);
+    vm.register_builtin(ops::WITH_PUSH, b_with_push);
+    vm.register_builtin(ops::WITH_GET, b_with_get);
+    vm.register_builtin(ops::WITH_SET, b_with_set);
+    vm.register_builtin(ops::WITH_SET_STRICT, b_with_set_strict);
+    vm.register_builtin(ops::WITH_TYPEOF, b_with_typeof);
+    vm.register_builtin(ops::WITH_FN, b_with_fn);
+    vm.register_builtin(ops::CALL_THIS, b_call_this);
+    vm.register_builtin(ops::APPLY_THIS, b_apply_this);
     vm.register_builtin(ops::NAMED_EVAL, b_named_eval);
 }
 
@@ -104,7 +117,10 @@ pub(crate) fn close_iterator(it: &Value) -> Result<(), String> {
     if matches!(with_host(|h| h.get(it).cloned()), Some(JsObj::Object(_))) {
         if let Some(f) = with_host(|h| host::lookup_chain(h, it, "return")) {
             if with_host(|h| host::is_callable(h, &f)) {
-                host::invoke(&f, Vec::new(), Some(it.clone()))?;
+                // 7.4.11 IteratorClose step 9: the result of `return()` must be
+                // an object, or the close itself is a TypeError.
+                let result = host::invoke(&f, Vec::new(), Some(it.clone()))?;
+                host::require_iter_result(&result)?;
             }
         }
     }
@@ -117,7 +133,7 @@ fn b_iter_close(vm: &mut VM, _: u8) -> Value {
     // it raises still propagates.
     match close_iterator(&it) {
         Ok(()) => Value::Undef,
-        Err(e) => abort(vm, e),
+        Err(e) => abort_without_closing(vm, e),
     }
 }
 
@@ -423,6 +439,9 @@ fn super_call_with(vm: &mut VM, args: Vec<Value>) -> Value {
         );
     }
     // Run this (derived) class's own instance-field initializers after super.
+    if let Some(proto) = with_host(|h| h.current_home_proto()) {
+        host::install_private_methods(&proto, &this);
+    }
     for (name, thunk, name_anon) in fields {
         if let Err(e) = host::init_one_field(&this, &name, &thunk, name_anon) {
             return abort(vm, e);
@@ -446,6 +465,35 @@ fn b_super_get(vm: &mut VM, _: u8) -> Value {
     }
 }
 
+/// `super.name = value`: a setter found on the parent chain runs with the
+/// current `this`; otherwise the value is stored on `this` itself.
+fn b_super_set(vm: &mut VM, _: u8) -> Value {
+    let val = vm.pop();
+    let name = sval(&vm.pop());
+    let this = with_host(|h| h.current_this()).unwrap_or(Value::Undef);
+    match with_host(|h| h.super_setter(&name)) {
+        Some(Some(setter)) => match host::invoke(&setter, vec![val.clone()], Some(this)) {
+            Ok(_) => val,
+            Err(e) => abort(vm, e),
+        },
+        Some(None) => {
+            if with_host(|h| h.current_strict()) {
+                return abort(
+                    vm,
+                    host::type_error(&format!(
+                        "Cannot set property {name} of #<Object> which has only a getter"
+                    )),
+                );
+            }
+            val
+        }
+        None => match set_property(&this, &name, val.clone()) {
+            Ok(()) => val,
+            Err(e) => abort(vm, e),
+        },
+    }
+}
+
 /// Close every loop iterator parked on `vm`'s stack at the op now executing,
 /// innermost first. Called where a chunk is about to be halted abruptly, since
 /// the code that would ordinarily close them is being jumped over.
@@ -455,6 +503,10 @@ fn b_super_get(vm: &mut VM, _: u8) -> Value {
 /// that caused the unwind.
 fn close_parked_iters(vm: &mut VM) {
     let n = host::parked_iters(vm);
+    close_n_parked_iters(vm, n);
+}
+
+fn close_n_parked_iters(vm: &mut VM, n: usize) {
     if n == 0 {
         return;
     }
@@ -462,7 +514,7 @@ fn close_parked_iters(vm: &mut VM) {
     // Closing an iterator resumes ANOTHER generator, which settles its own
     // signal/error state, so the pending one is saved across the close and put
     // back — otherwise the outer `.return()` would be lost.
-    let saved = with_host(|h| (h.signal.take(), h.error.take()));
+    let saved = with_host(|h| (h.signal.take(), h.error.take(), h.exc.take()));
     for _ in 0..n {
         let it = vm.pop();
         let _ = close_iterator(&it);
@@ -470,6 +522,7 @@ fn close_parked_iters(vm: &mut VM) {
     with_host(|h| {
         h.signal = saved.0;
         h.error = saved.1;
+        h.exc = saved.2;
     });
 }
 
@@ -500,6 +553,110 @@ fn b_yield(vm: &mut VM, _: u8) -> Value {
             abort(vm, e)
         }
     }
+}
+
+/// `yield*`'s suspension. A `.return(v)` / `.throw(e)` forced onto the
+/// generator while it is delegating is NOT raised here — 15.5.5 hands it to
+/// the delegate (`return` / `throw` on the inner iterator), which may refuse
+/// it, absorb it, or yield again. So the completion is parked on the host for
+/// `DELEGATE_STEP`, and execution simply continues.
+fn b_yield_delegate(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    with_host(|h| h.delegate_resume = None);
+    match host::gen_yield(v) {
+        Ok(sent) => {
+            if let Some(host::Signal::Return(rv)) = with_host(|h| h.signal.take()) {
+                with_host(|h| h.delegate_resume = Some(host::DelegateResume::Return(rv)));
+                return Value::Undef;
+            }
+            sent
+        }
+        Err(_) => {
+            let ev = with_host(|h| h.exc.take()).unwrap_or(Value::Undef);
+            with_host(|h| h.delegate_resume = Some(host::DelegateResume::Throw(ev)));
+            Value::Undef
+        }
+    }
+}
+
+/// One step of a sync `yield*` (15.5.5 steps 7.a-7.c): the delegate is on top of
+/// the stack, `sent` is what resumed the generator. Leaves the delegate and the
+/// step result, which the compiled loop then tests for `done`.
+fn b_delegate_step(vm: &mut VM, _: u8) -> Value {
+    let sent = vm.pop();
+    let it = match vm.stack.last() {
+        Some(v) => v.clone(),
+        None => return abort(vm, "internal: DELEGATE_STEP with empty stack".into()),
+    };
+    let resume = with_host(|h| h.delegate_resume.take());
+    // `return` / `throw` of the delegate; a generator always has both.
+    let method = |name: &str| -> Result<Option<Value>, String> {
+        if with_host(|h| h.is_generator_val(&it)) {
+            return Ok(Some(Value::Undef));
+        }
+        let f = host::get_prop_chain(&it, name)?;
+        Ok(with_host(|h| host::is_callable(h, &f)).then_some(f))
+    };
+    let call = |name: &str, arg: Value| -> Result<Value, String> {
+        let r = host::call_method(&it, name, vec![arg])?;
+        host::require_iter_result(&r)?;
+        Ok(r)
+    };
+    let step = match resume {
+        None => call("next", sent),
+        Some(host::DelegateResume::Throw(ev)) => match method("throw") {
+            Err(e) => Err(e),
+            Ok(Some(_)) => call("throw", ev),
+            // No `throw`: the delegate is closed, and the generator gets a
+            // TypeError at the `yield*` (7.4.11 IteratorClose, then step 7.b.iii.5).
+            Ok(None) => {
+                return match close_iterator(&it) {
+                    Ok(()) => abort_iterator_error(
+                        vm,
+                        host::type_error("The iterator does not provide a 'throw' method."),
+                    ),
+                    Err(e) => abort_iterator_error(vm, e),
+                };
+            }
+        },
+        Some(host::DelegateResume::Return(rv)) => match method("return") {
+            Err(e) => Err(e),
+            // No `return`: the generator itself returns `rv`.
+            Ok(None) => return halt_generator_return(vm, rv),
+            Ok(Some(_)) => match call("return", rv) {
+                Err(e) => Err(e),
+                Ok(r) => {
+                    let done = get_property(&r, "done").map(|d| with_host(|h| h.truthy(&d)));
+                    match done {
+                        Err(e) => Err(e),
+                        Ok(true) => match get_property(&r, "value") {
+                            Ok(v) => return halt_generator_return(vm, v),
+                            Err(e) => Err(e),
+                        },
+                        Ok(false) => Ok(r),
+                    }
+                }
+            },
+        },
+    };
+    match step {
+        Ok(r) => r,
+        Err(e) => abort_iterator_error(vm, e),
+    }
+}
+
+/// Complete the running generator with a `return` of `value`: the delegate on
+/// top of the stack is finished (not closed), the iterators outside it are, and
+/// the chunk halts with a pending Return so `finally` blocks run.
+fn halt_generator_return(vm: &mut VM, value: Value) -> Value {
+    let n = host::parked_iters(vm);
+    if n > 0 {
+        vm.pop();
+        close_n_parked_iters(vm, n - 1);
+    }
+    with_host(|h| h.signal = Some(host::Signal::Return(value)));
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
 }
 
 /// `PROPKEY` — ToPropertyKey (7.1.19) for an object literal's COMPUTED key.
@@ -668,7 +825,36 @@ fn sname(v: &Value) -> std::sync::Arc<String> {
     }
 }
 
+/// Raise `e` out of the running chunk. A throw abandons every `for…of` /
+/// `yield*` iterator parked on the stack beneath the op that raised it, and
+/// each is closed first (14.7.5.7 `ForIn/OfBodyEvaluation` step: on a throw
+/// completion `IteratorClose` runs, its own failure suppressed so `e` wins).
 fn abort(vm: &mut VM, e: String) -> Value {
+    close_parked_iters(vm);
+    with_host(|h| h.error = Some(e));
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
+}
+
+/// [`abort`] for an error the ITERATOR PROTOCOL itself raised (`next` threw, or
+/// its result had no `done`/`value`): that iterator is already finished and is
+/// not closed — only the loops outside it are. The failing iterator is the top
+/// of the stack.
+fn abort_iterator_error(vm: &mut VM, e: String) -> Value {
+    let n = host::parked_iters(vm);
+    if n > 0 {
+        vm.pop();
+        close_n_parked_iters(vm, n - 1);
+    }
+    with_host(|h| h.error = Some(e));
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
+}
+
+/// [`abort`] when the op itself has already taken its own iterator off the
+/// stack (`ITER_CLOSE`): nothing is closed, since the count the compiler
+/// recorded includes the iterator this op just consumed.
+fn abort_without_closing(vm: &mut VM, e: String) -> Value {
     with_host(|h| h.error = Some(e));
     vm.ip = vm.chunk.ops.len();
     Value::Undef
@@ -898,6 +1084,168 @@ fn b_hoist_var(vm: &mut VM, _: u8) -> Value {
     Value::Undef
 }
 
+// ── `with` ─────────────────────────────────────────────────────────────────
+
+/// The object of the innermost enclosing `with` scope that binds `name`, if any
+/// (9.1.1.2.1 HasBinding): the object has the property, and its
+/// `@@unscopables` does not mask it. A scope that binds `name` ordinarily
+/// shadows every `with` object beyond it.
+fn with_binding_object(name: &str) -> Result<Option<Value>, String> {
+    for obj in with_host(|h| h.with_objects_before_binding(name)) {
+        if !has_property(&obj, name)? {
+            continue;
+        }
+        let unscopables = get_property(&obj, "@@unscopables")?;
+        let masked = if matches!(unscopables, Value::Obj(_))
+            && !with_host(|h| host::is_primitive(h, &unscopables))
+        {
+            let flag = get_property(&unscopables, name)?;
+            with_host(|h| h.truthy(&flag))
+        } else {
+            false
+        };
+        if !masked {
+            return Ok(Some(obj));
+        }
+    }
+    Ok(None)
+}
+
+/// `with (obj) body`: `ToObject(obj)` (nullish throws), then a scope that
+/// answers names from it.
+fn b_with_push(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    if with_host(|h| h.is_nullish(&v)) {
+        return abort(
+            vm,
+            host::type_error("Cannot convert undefined or null to object"),
+        );
+    }
+    let obj = to_object(&v);
+    with_host(|h| h.push_with_scope(obj));
+    Value::Undef
+}
+
+fn b_with_get(vm: &mut VM, _: u8) -> Value {
+    let name_val = vm.pop();
+    let name = sname(&name_val);
+    match with_binding_object(&name) {
+        Err(e) => abort(vm, e),
+        Ok(Some(obj)) => {
+            let r = get_property(&obj, &name);
+            finish(vm, r)
+        }
+        Ok(None) => {
+            vm.push(name_val);
+            b_getlocal(vm, 0)
+        }
+    }
+}
+
+fn with_set(vm: &mut VM, strict: bool) -> Value {
+    let val = vm.pop();
+    let name_val = vm.pop();
+    let name = sname(&name_val);
+    match with_binding_object(&name) {
+        Err(e) => abort(vm, e),
+        Ok(Some(obj)) => match set_property(&obj, &name, val.clone()) {
+            Ok(()) => val,
+            Err(e) => abort(vm, e),
+        },
+        Ok(None) => {
+            vm.push(name_val);
+            vm.push(val);
+            if strict {
+                b_setlocal_strict(vm, 0)
+            } else {
+                b_setlocal(vm, 0)
+            }
+        }
+    }
+}
+
+fn b_with_set(vm: &mut VM, _: u8) -> Value {
+    with_set(vm, false)
+}
+
+fn b_with_set_strict(vm: &mut VM, _: u8) -> Value {
+    with_set(vm, true)
+}
+
+fn b_with_typeof(vm: &mut VM, _: u8) -> Value {
+    let name_val = vm.pop();
+    let name = sname(&name_val);
+    match with_binding_object(&name) {
+        Err(e) => abort(vm, e),
+        Ok(Some(obj)) => match get_property(&obj, &name) {
+            Ok(v) => with_host(|h| {
+                let t = h.type_of(&v);
+                h.new_str(t)
+            }),
+            Err(e) => abort(vm, e),
+        },
+        Ok(None) => {
+            vm.push(name_val);
+            b_typeof_name(vm, 0)
+        }
+    }
+}
+
+/// The callee of an identifier call inside `with`: when the object supplies the
+/// name it is also the `this` of the call (13.3.6.1 step 1.b — a reference whose
+/// base is an Object Environment Record with `withEnvironment` set).
+fn b_with_fn(vm: &mut VM, _: u8) -> Value {
+    let name_val = vm.pop();
+    let name = sname(&name_val);
+    match with_binding_object(&name) {
+        Err(e) => abort(vm, e),
+        Ok(Some(obj)) => match get_property(&obj, &name) {
+            Ok(f) => {
+                vm.push(f);
+                obj
+            }
+            Err(e) => abort(vm, e),
+        },
+        Ok(None) => {
+            vm.push(name_val);
+            let f = b_getlocal(vm, 0);
+            vm.push(f);
+            Value::Undef
+        }
+    }
+}
+
+fn b_call_this(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_n(vm, argc as usize);
+    let callable = args.remove(0);
+    let this = args.remove(0);
+    let this = (!matches!(this, Value::Undef)).then_some(this);
+    let r = host::invoke(&callable, args, this).map_err(|e| {
+        let shown = with_host(|h| h.str_of(&callable));
+        host::name_call_site(vm, &shown, e)
+    });
+    finish(vm, r)
+}
+
+fn b_apply_this(vm: &mut VM, _: u8) -> Value {
+    let args_arr = vm.pop();
+    let this = vm.pop();
+    let callable = vm.pop();
+    let this = (!matches!(this, Value::Undef)).then_some(this);
+    let args = host::iter_all(&args_arr).unwrap_or_default();
+    let r = host::invoke(&callable, args, this);
+    finish(vm, r)
+}
+
+/// `MAP_ARGS`: alias the running sloppy function's parameters to its
+/// `arguments` object. The name list is the compiler's, comma-joined.
+fn b_map_args(vm: &mut VM, _: u8) -> Value {
+    let names = sname(&vm.pop());
+    let names: Vec<String> = names.split(',').map(str::to_string).collect();
+    with_host(|h| h.map_arguments(&names));
+    Value::Undef
+}
+
 fn b_declare_var(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = sname(&vm.pop());
@@ -1026,7 +1374,7 @@ pub fn get_property(recv: &Value, name: &str) -> Result<Value, String> {
     // A `#`-prefixed key is a PRIVATE name. `[[PrivateGet]]` (7.3.31) throws
     // when the receiver carries no such private element — it does NOT read back
     // as `undefined`, which is what `C.prototype.method.call({})` used to do.
-    if name.starts_with('#') && !with_host(|h| h.has_private(recv, name)) {
+    if name.starts_with('#') && !with_host(|h| h.is_nullish(recv) || h.has_private(recv, name)) {
         return Err(private_brand_message(name, false));
     }
     get_property_recv(recv, name, recv)
@@ -2009,6 +2357,9 @@ fn to_string_tag(recv: &Value) -> Result<Option<String>, String> {
         || with_host(|h| {
             host::lookup_chain(h, recv, "@@toStringTag").is_some()
                 || host::lookup_accessor(h, recv, "@@toStringTag").is_some()
+                // An exotic with no property map (a Map, a Promise) keeps its
+                // own symbol-keyed properties in the side table.
+                || h.fn_prop(recv, "@@toStringTag").is_some()
         });
     if !tagged {
         return Ok(None);
@@ -2156,6 +2507,9 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             // tagged object branded itself `[object T]` when asked one way and
             // `[object Object]` when converted the other (`String(o)`, `${o}`,
             // `o + ''`, `o.toString()`), which is the path ordinary code takes.
+            // 20.1.3.6 step 5 begins with IsArray, which a revoked proxy
+            // throws from; V8 reports it under this method's name.
+            crate::proxy::require_live(recv, "Object.prototype.toString")?;
             if let Some(t) = to_string_tag(recv)? {
                 return Ok(with_host(|h| h.new_str(format!("[object {t}]"))));
             }
@@ -3244,6 +3598,12 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         crate::stdlib::instance_accessor_written(ctor, key, recv, &v)?;
         return Ok(Value::Undef);
     }
+    // `Function.prototype[Symbol.hasInstance](V)` is OrdinaryHasInstance(this,
+    // V): the prototype walk alone, never the receiver's own `@@hasInstance`.
+    if ctor == "Function" && method == "@@hasInstance" {
+        let obj = arg0(&args);
+        return Ok(Value::Bool(host::ordinary_has_instance(&obj, recv, false)?));
+    }
     if with_host(|h| h.is_nullish(recv)) {
         let shown = if with_host(|h| h.is_null(recv)) {
             "null"
@@ -3385,6 +3745,7 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         // `Get(O, @@toStringTag)`, so the `get` trap decides. Probing first (as
         // the ordinary receiver does, to keep the read off objects that have no
         // tag) would always miss and brand every tagged proxy `[object Object]`.
+        crate::proxy::require_live(recv, "Object.prototype.toString")?;
         if let Some(s) = to_string_tag(recv)? {
             return Ok(with_host(|h| h.new_str(format!("[object {s}]"))));
         }
@@ -4183,7 +4544,19 @@ fn is_primitive_arg(args: &[Value]) -> bool {
 /// Adding a key to a non-extensible object reports differently from assigning
 /// to a read-only one, and the object is named by its brand — `#<Object>` for a
 /// plain object, `[object Array]` for an array.
+/// A property key as V8 prints it in a message: a symbol key as `Symbol(desc)`
+/// rather than its internal `@@…` spelling.
+fn display_key(name: &str) -> String {
+    if name.starts_with("@@") {
+        if let Some(sym) = with_host(|h| h.symbol_of_key(name)) {
+            return with_host(|h| h.str_of(&sym));
+        }
+    }
+    name.to_string()
+}
+
 fn write_refused(recv: &Value, name: &str) -> String {
+    let shown = display_key(name);
     let extensible = with_host(|h| h.is_extensible(recv));
     // Which of the two messages applies turns on whether the key already
     // EXISTS. Every shape that keeps its own properties in the fn-prop side
@@ -4202,7 +4575,7 @@ fn write_refused(recv: &Value, name: &str) -> String {
     });
     if !extensible && !has_own {
         return host::type_error(&format!(
-            "Cannot add property {name}, object is not extensible"
+            "Cannot add property {shown}, object is not extensible"
         ));
     }
     // The receiver renders the way every other brand-check message renders one
@@ -4210,7 +4583,7 @@ fn write_refused(recv: &Value, name: &str) -> String {
     // class instance, `Error: m` for an error. Only Array was special-cased, so
     // every other exotic reported `#<Object>`.
     host::type_error(&format!(
-        "Cannot assign to read only property '{name}' of object '{}'",
+        "Cannot assign to read only property '{shown}' of object '{}'",
         no_side_effects_string(recv)
     ))
 }
@@ -4464,6 +4837,9 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             with_host(|h| h.set_fn_prop(recv, name, val));
             return Ok(());
         }
+        if is_arguments(recv) {
+            with_host(|h| h.write_mapped_argument(recv, i, &val));
+        }
     }
     // Typed-array element write (`ta[i] = v`): coerce + store into `@@elems`.
     if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
@@ -4680,6 +5056,9 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
     }
     if !with_host(|h| h.prop_attrs(recv, key).configurable) {
         return Ok(false);
+    }
+    if let Ok(i) = key.parse::<usize>() {
+        with_host(|h| h.unmap_argument(recv, i));
     }
     // An accessor lives in its own table, not the property map, so removing it
     // has to be explicit — otherwise `delete` reported success while the getter
@@ -4925,6 +5304,11 @@ fn b_mkfunc(vm: &mut VM, _: u8) -> Value {
     with_host(|h| {
         let mut env = h.current_env_capture();
         let this = h.current_this();
+        let new_target = if is_arrow {
+            h.current_new_target()
+        } else {
+            None
+        };
         // An arrow has no `super` of its own: it uses the enclosing METHOD's,
         // exactly as it uses the enclosing `this`. Nothing was captured, so
         // `super.m()` inside an arrow reported the method missing — in a class
@@ -4948,6 +5332,7 @@ fn b_mkfunc(vm: &mut VM, _: u8) -> Value {
             home_class,
             home_static,
             home_object,
+            new_target,
         }));
         if let Some(n) = self_name {
             env.borrow_mut().vars.insert(n, f.clone());
@@ -5609,15 +5994,20 @@ fn b_forin_keys(vm: &mut VM, _: u8) -> Value {
         // is visited — so the `getOwnPropertyDescriptor` traps interleave with
         // the body the way node's do, instead of all firing up front.
         return match crate::proxy::own_keys(&v) {
-            Ok(keys) => with_host(|h| {
-                let out: Vec<Value> = keys
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|k| !host::is_symbol_key(k))
-                    .map(|k| h.new_str(k))
-                    .collect();
-                h.new_array(out)
-            }),
+            // EnumerateObjectProperties reaches the prototype next
+            // (`[[GetPrototypeOf]]`, through the trap), which is observable.
+            Ok(keys) => match crate::proxy::get_prototype_of(&v) {
+                Err(e) => abort(vm, e),
+                Ok(_) => with_host(|h| {
+                    let out: Vec<Value> = keys
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|k| !host::is_symbol_key(k))
+                        .map(|k| h.new_str(k))
+                        .collect();
+                    h.new_array(out)
+                }),
+            },
             Err(e) => abort(vm, e),
         };
     }
@@ -5710,7 +6100,7 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
                 Value::Bool(true)
             }
             Ok(None) => Value::Bool(false),
-            Err(e) => abort(vm, e),
+            Err(e) => abort_iterator_error(vm, e),
         };
     }
     // Generator: resume one step.
@@ -5721,7 +6111,7 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
                 Value::Bool(true)
             }
             Ok(host::GenStep::Done(_)) => Value::Bool(false),
-            Err(e) => abort(vm, e),
+            Err(e) => abort_iterator_error(vm, e),
         };
     }
     // A user iterator object with a `.next()` returning `{ value, done }`.
@@ -5731,7 +6121,7 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
             Value::Bool(true)
         }
         Ok(None) => Value::Bool(false),
-        Err(e) => abort(vm, e),
+        Err(e) => abort_iterator_error(vm, e),
     }
 }
 
@@ -5763,11 +6153,13 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
             // reports the TYPE instead, with the property note. Measured across
             // twelve shapes rather than guessed.
             let msg = match host::call_site_text(vm) {
-                Some(text) => host::type_error(&format!("{text} is not iterable")),
+                Some(text) if e.ends_with(" is not iterable") => {
+                    host::type_error(&format!("{text} is not iterable"))
+                }
                 None if e.ends_with(" is not iterable") => {
                     host::type_error(&not_iterable_typed(&iterable))
                 }
-                None => e,
+                _ => e,
             };
             return abort(vm, msg);
         }
@@ -6495,6 +6887,7 @@ pub fn eval_source(arg: Option<&Value>, direct: bool) -> Result<Value, String> {
         &src,
         caller_strict,
         allow_super,
+        direct && with_host(|h| h.in_with_scope()),
     )?);
     if !direct {
         return host::run_chunk_in_global_scope(chunk);
@@ -6766,7 +7159,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             }
         })),
         "BigInt" => bigint_ctor(&arg0(&args)),
-        "RegExp" => regexp_ctor(&args),
+        "RegExp" => regexp_ctor(&args, true),
         "BigInt.asIntN" | "BigInt.asUintN" => bigint_as_n(name.ends_with("asUintN"), &args),
         "Boolean" => Ok(Value::Bool(with_host(|h| h.truthy(&arg0(&args))))),
         // Each argument is truncated to a uint16 and taken as one code UNIT, so
@@ -6908,9 +7301,19 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
                 reject_bad_prototype(&proto)?;
                 // V8 names no property here, and prints that it did not.
                 if !crate::proxy::set_prototype_of(&obj, &proto)? {
-                    return Err(host::type_error(
-                        "'setPrototypeOf' on proxy: trap returned falsish for property 'undefined'",
-                    ));
+                    // A refusing TRAP is the proxy's doing; a handler without
+                    // the trap forwards to the target, whose own refusal is
+                    // the ordinary non-extensible one.
+                    if crate::proxy::has_trap(&obj, "setPrototypeOf") {
+                        return Err(host::type_error(
+                            "'setPrototypeOf' on proxy: trap returned falsish for property 'undefined'",
+                        ));
+                    }
+                    let target = crate::proxy::ultimate_target(&obj).unwrap_or(obj.clone());
+                    return Err(host::type_error(&format!(
+                        "{} is not extensible",
+                        no_side_effects_string(&target)
+                    )));
                 }
                 return Ok(obj);
             }
@@ -6985,7 +7388,17 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // description read: it answers only for symbols `Symbol.for` created.
         // Returning the description made every symbol look registered —
         // `Symbol.keyFor(Symbol("k"))` was `"k"` where node says `undefined`.
-        "Symbol.keyFor" => Ok(with_host(|h| h.symbol_registry_key(&arg0(&args)))),
+        "Symbol.keyFor" => {
+            // 20.4.2.6 step 1: the argument must be a Symbol.
+            let sym = arg0(&args);
+            if !with_host(|h| matches!(h.get(&sym), Some(JsObj::Symbol { .. }))) {
+                return Err(host::type_error(&format!(
+                    "{} is not a symbol",
+                    no_side_effects_string(&sym)
+                )));
+            }
+            Ok(with_host(|h| h.symbol_registry_key(&sym)))
+        }
         // These constructors have no [[Call]] behaviour: a plain call throws.
         "Promise" => Err(host::type_error(
             "Promise constructor cannot be invoked without 'new'",
@@ -7372,7 +7785,46 @@ fn bigint_ctor(v: &Value) -> Result<Value, String> {
 
 /// `new RegExp(source[, flags])` / `RegExp(...)`. A first `RegExp` argument copies
 /// its source (and flags, unless new ones are given).
-fn regexp_ctor(args: &[Value]) -> Result<Value, String> {
+fn regexp_ctor(args: &[Value], called_as_function: bool) -> Result<Value, String> {
+    let pattern_is_regexp = is_regexp_arg(&arg0(args));
+    let flags_given = args.get(1).is_some_and(|v| !matches!(v, Value::Undef));
+    // 22.2.4.1 step 4.b: called as a function with a regexp-like pattern and no
+    // flags, a pattern whose `constructor` is this very function is returned
+    // as it is.
+    if called_as_function && pattern_is_regexp && !flags_given {
+        let ctor = get_property(&arg0(args), "constructor")?;
+        let me = global_binding("RegExp").unwrap_or(Value::Undef);
+        if with_host(|h| h.strict_eq(&ctor, &me)) {
+            return Ok(arg0(args));
+        }
+    }
+    // Any other regexp-LIKE object (its `Symbol.match` is truthy) supplies its
+    // `source` and `flags` by property read (step 6.b-c).
+    if pattern_is_regexp && !with_host(|h| matches!(h.get(&arg0(args)), Some(JsObj::RegExp(_)))) {
+        let p = arg0(args);
+        let source = get_property(&p, "source")?;
+        let source = if matches!(source, Value::Undef) {
+            String::new()
+        } else {
+            host::to_string_value(&source).map(|s| with_host(|h| h.str_of(&s)))?
+        };
+        let flags = if flags_given {
+            arg_to_string(args, 1)?
+        } else {
+            let f = get_property(&p, "flags")?;
+            if matches!(f, Value::Undef) {
+                String::new()
+            } else {
+                host::to_string_value(&f).map(|s| with_host(|h| h.str_of(&s)))?
+            }
+        };
+        let src = if source.is_empty() {
+            "(?:)".to_string()
+        } else {
+            source
+        };
+        return crate::regexp::build_regexp(&src, &flags);
+    }
     let (source, existing_flags) = match with_host(|h| h.get(&arg0(args)).cloned()) {
         Some(JsObj::RegExp(r)) => (r.source.clone(), Some(r.flags.clone())),
         _ => {
@@ -7700,7 +8152,7 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
         // deprecation wrapper this way, so `require('body-parser')` — and with it
         // `require('express')` — dies at load without it.
         "Function" => function_ctor(&args),
-        "RegExp" => regexp_ctor(&args),
+        "RegExp" => regexp_ctor(&args, false),
         "BigInt" => Err(host::type_error("BigInt is not a constructor")),
         "Error" => make_error_checked(name, &args),
         // `new DOMException(message, name)` — the name is an ARGUMENT, and the
@@ -8185,24 +8637,7 @@ fn parse_int_str(s: &str, args: &[Value]) -> f64 {
     if valid.is_empty() {
         return f64::NAN;
     }
-    // Accumulate in `f64`, not `i64`. `i64::from_str_radix` OVERFLOWS past ~19
-    // digits and the error was mapped to `NaN`, so
-    // `parseInt("999999999999999999999999")` was NaN instead of 1e+24. The spec
-    // asks for the mathematical value rounded to a Number, which is what
-    // repeated multiply-accumulate in `f64` produces.
-    let n = if radix == 10 {
-        // Rust's decimal float parser is correctly rounded; digit-by-digit
-        // multiply-accumulate is not, and drifted a ULP on long inputs
-        // (`parseInt("999999999999999999999999")` came out
-        // 1.0000000000000003e+24 rather than 1e+24).
-        valid.parse::<f64>().unwrap_or(f64::NAN)
-    } else {
-        let mut n = 0.0f64;
-        for c in valid.chars() {
-            n = n * radix as f64 + c.to_digit(radix).unwrap_or(0) as f64;
-        }
-        n
-    };
+    let n = host::digits_to_number(&valid, radix);
     if neg {
         -n
     } else {
@@ -8371,18 +8806,18 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
         "sqrt" => x.sqrt(),
-        "cbrt" => x.cbrt(),
-        "exp" => x.exp(),
-        "log" => x.ln(),
-        "log2" => x.log2(),
-        "log10" => x.log10(),
-        "sin" => x.sin(),
-        "cos" => x.cos(),
-        "tan" => x.tan(),
-        "asin" => x.asin(),
-        "acos" => x.acos(),
-        "atan" => x.atan(),
-        "atan2" => x.atan2(arg_num(args, 1)),
+        "cbrt" => ieee754::cbrt(x),
+        "exp" => ieee754::exp(x),
+        "log" => ieee754::log(x),
+        "log2" => ieee754::log2(x),
+        "log10" => ieee754::log10(x),
+        "sin" => ieee754::sin(x),
+        "cos" => ieee754::cos(x),
+        "tan" => ieee754::tan(x),
+        "asin" => ieee754::asin(x),
+        "acos" => ieee754::acos(x),
+        "atan" => ieee754::atan(x),
+        "atan2" => ieee754::atan2(x, arg_num(args, 1)),
         // Rust `powf` is IEEE-754 `pow`, which is NOT JS `**`/`Math.pow`: IEEE
         // makes `pow(x, ±0)` and `pow(±1, y)` return 1 unconditionally, so
         // `(-1) ** Infinity` and `1 ** NaN` come back 1 where the spec
@@ -8390,14 +8825,14 @@ fn math_fn(fname: &str, args: &[Value]) -> Result<Value, String> {
         // clause is shared.
         "pow" => js_pow(x, arg_num(args, 1)),
         // Hyperbolics and the two precision-preserving log/exp forms.
-        "sinh" => x.sinh(),
-        "cosh" => x.cosh(),
-        "tanh" => x.tanh(),
-        "asinh" => x.asinh(),
-        "acosh" => x.acosh(),
-        "atanh" => x.atanh(),
-        "log1p" => x.ln_1p(),
-        "expm1" => x.exp_m1(),
+        "sinh" => ieee754::sinh(x),
+        "cosh" => ieee754::cosh(x),
+        "tanh" => ieee754::tanh(x),
+        "asinh" => ieee754::asinh(x),
+        "acosh" => ieee754::acosh(x),
+        "atanh" => ieee754::atanh(x),
+        "log1p" => ieee754::log1p(x),
+        "expm1" => ieee754::expm1(x),
         // C-style 32-bit integer multiply: ToInt32 both operands, multiply with
         // wraparound, reinterpret as a signed 32-bit result.
         "imul" => (host::to_int32(x).wrapping_mul(host::to_int32(arg_num(args, 1)))) as f64,
@@ -8822,18 +9257,31 @@ fn object_assign(args: Vec<Value>) -> Result<Value, String> {
         // — symbol-keyed ones included (7.3.25).
         let entries = host::own_enum_entries_deep(src)?;
         let syms = with_host(|h| h.own_symbol_entries(src));
-        // A plain object target is filled in place (one borrow, then a single
-        // re-canonicalization of the integer-index keys).
-        let filled = with_host(|h| {
-            if let Some(JsObj::Object(p)) = h.get_mut(&target) {
-                for (k, v) in entries.iter().cloned().chain(syms.iter().cloned()) {
-                    p.insert(k, v);
-                }
-                host::canonicalize_own_keys(p);
-                return true;
-            }
-            false
+        // A plain, open object target with no accessors and no read-only keys is
+        // filled in place (one borrow, then a single re-canonicalization of the
+        // integer-index keys). Anything else needs `Set` proper: a frozen or
+        // non-extensible target, a setter, a read-only property all refuse or
+        // intercept the write.
+        let plain_target = with_host(|h| {
+            matches!(h.get(&target), Some(JsObj::Object(_)))
+                && h.is_extensible(&target)
+                && h.own_accessor_keys(&target).is_empty()
+                && entries
+                    .iter()
+                    .chain(syms.iter())
+                    .all(|(k, _)| h.prop_attrs(&target, k).writable)
         });
+        let filled = plain_target
+            && with_host(|h| {
+                if let Some(JsObj::Object(p)) = h.get_mut(&target) {
+                    for (k, v) in entries.iter().cloned().chain(syms.iter().cloned()) {
+                        p.insert(k, v);
+                    }
+                    host::canonicalize_own_keys(p);
+                    return true;
+                }
+                false
+            });
         // Any OTHER target — an array being the common one — goes through the
         // ordinary Set path. The in-place branch above matched `JsObj::Object`
         // only, so `Object.assign([1,2], {extra:9})` silently copied NOTHING and
@@ -8841,9 +9289,12 @@ fn object_assign(args: Vec<Value>) -> Result<Value, String> {
         // Set path is what an `arr.extra = 9` assignment already used, so index
         // and non-index keys land where they do for a direct write.
         if !filled {
-            for (k, v) in entries.into_iter().chain(syms) {
-                set_property(&target, &k, v)?;
-            }
+            host::JsHost::with_forced_strict(|| {
+                for (k, v) in entries.into_iter().chain(syms) {
+                    set_property(&target, &k, v)?;
+                }
+                Ok::<(), String>(())
+            })?;
         }
     }
     Ok(target)
@@ -9280,6 +9731,11 @@ fn json_walk_children(
     // the plain array/object `SerializeJSONArray`/`SerializeJSONObject` describe
     // — which read every member through `[[Get]]`, exactly as the snapshot does.
     if with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy) {
+        // A callable proxy is a function to the serializer (25.5.2.1 step 9:
+        // `IsCallable` → undefined), whatever its target's keys are.
+        if with_host(|h| host::is_callable(h, v)) {
+            return Ok(Value::Undef);
+        }
         let snap = crate::proxy::json_snapshot(v)?;
         path.push((via.to_string(), v.clone()));
         let out = json_walk_children(&snap, path, via, rep);
@@ -9436,10 +9892,18 @@ fn json_str(
                     .into_iter()
                     .filter(|(k, _)| !k.starts_with("@@") && !host::is_symbol_key(k))
                     .filter_map(|(k, val)| {
+                        // A replacer array restricts these exactly as it does an
+                        // ordinary object's keys.
+                        if keys.is_some_and(|allow| !allow.contains(&k)) {
+                            return None;
+                        }
                         json_str(h, &val, indent, depth + 1, keys)
                             .map(|s| format!("{}{sep}{s}", json_quote(&k)))
                     })
                     .collect();
+                if parts.is_empty() {
+                    return Some("{}".into());
+                }
                 Some(wrap(&parts, "{", "}", indent, depth))
             }
             // A NON-callable builtin is a namespace object, not a function, so
@@ -9455,6 +9919,9 @@ fn json_str(
                             .map(|s| format!("{}{sep}{s}", json_quote(&k)))
                     })
                     .collect();
+                if parts.is_empty() {
+                    return Some("{}".into());
+                }
                 Some(wrap(&parts, "{", "}", indent, depth))
             }
             // Functions and symbols are omitted (undefined) as values.
@@ -9476,24 +9943,39 @@ fn json_str(
                     .collect();
                 Some(wrap(&parts, "[", "]", indent, depth))
             }
-            Some(JsObj::Object(props)) if props.contains_key("@@primitive") => {
-                // 25.5.2.2 step 4: a String/Number/Boolean wrapper serializes as
-                // the primitive it boxes, not as the object holding it —
-                // `JSON.stringify(new Number(1))` is `1`, not `{}`.
+            // 25.5.2.2 step 4: a String/Number/Boolean/BigInt wrapper serializes
+            // as the primitive it boxes, not as the object holding it —
+            // `JSON.stringify(new Number(1))` is `1`, not `{}`. A Symbol wrapper
+            // is not on that list: it is an ordinary object, `{}`.
+            Some(JsObj::Object(props))
+                if props.contains_key("@@primitive")
+                    && !matches!(h.get(&props["@@primitive"]), Some(JsObj::Symbol { .. })) =>
+            {
                 json_str(h, &props["@@primitive"].clone(), indent, depth, keys)
             }
             Some(JsObj::Object(props)) => {
                 // A replacer array restricts (and orders) which keys are emitted.
                 let parts: Vec<String> = match keys {
-                    Some(allow) => allow
-                        .iter()
-                        .filter_map(|k| {
-                            props.get(k).and_then(|val| {
-                                json_str(h, val, indent, depth + 1, keys)
+                    // `[[Get]]` of each listed name (25.5.2.5 step 5.a): own
+                    // elements the property map does not hold (a typed array's)
+                    // and inherited data properties answer too.
+                    Some(allow) => {
+                        let own = h.own_enum_entries(v);
+                        allow
+                            .iter()
+                            .filter_map(|k| {
+                                let val = props
+                                    .get(k)
+                                    .cloned()
+                                    .or_else(|| {
+                                        own.iter().find(|(ek, _)| ek == k).map(|(_, x)| x.clone())
+                                    })
+                                    .or_else(|| host::lookup_chain(h, v, k))?;
+                                json_str(h, &val, indent, depth + 1, keys)
                                     .map(|vs| format!("{}{sep}{vs}", json_quote(k)))
                             })
-                        })
-                        .collect(),
+                            .collect()
+                    }
                     None => h
                         .own_enum_entries(v)
                         .iter()
@@ -9780,6 +10262,23 @@ impl JsonParser {
         self.chars.get(self.pos).copied()
     }
 
+    fn peek_at(&self, at: usize) -> Option<char> {
+        self.chars.get(at).copied()
+    }
+
+    /// The four hex digits of a `\uXXXX` escape starting at `at`; a short or
+    /// non-hex run is V8's "Bad Unicode escape" at the offending character.
+    fn hex4(&self, at: usize) -> Result<u32, String> {
+        let mut n = 0u32;
+        for k in 0..4 {
+            match self.peek_at(at + k).and_then(|c| c.to_digit(16)) {
+                Some(d) => n = n * 16 + d,
+                None => return Err(self.err_at("Bad Unicode escape", at + k)),
+            }
+        }
+        Ok(n)
+    }
+
     /// `at position N (line L column C)` — the location suffix V8 appends to the
     /// positional JSON parse errors. Positions are in UTF-16-ish code units;
     /// node-js counts `char`s, which agree for the BMP.
@@ -9965,18 +10464,31 @@ impl JsonParser {
                         Some('b') => out.push('\u{08}'),
                         Some('f') => out.push('\u{0C}'),
                         Some('u') => {
-                            let h: String = self.chars
-                                [self.pos + 1..(self.pos + 5).min(self.chars.len())]
-                                .iter()
-                                .collect();
-                            if let Ok(n) = u32::from_str_radix(&h, 16) {
-                                if let Some(ch) = char::from_u32(n) {
-                                    out.push(ch);
+                            let n = self.hex4(self.pos + 1)?;
+                            self.pos += 4;
+                            // A high surrogate escape followed by a low one is
+                            // one astral code point; a lone half has no scalar
+                            // value (a Rust `String` cannot hold it) and reads
+                            // as U+FFFD, as the lexer does for a `"\ud800"`
+                            // literal.
+                            if (0xD800..0xDC00).contains(&n)
+                                && self.peek_at(self.pos + 1) == Some('\\')
+                                && self.peek_at(self.pos + 2) == Some('u')
+                            {
+                                if let Ok(lo) = self.hex4(self.pos + 3) {
+                                    if (0xDC00..0xE000).contains(&lo) {
+                                        let cp = 0x10000 + ((n - 0xD800) << 10) + (lo - 0xDC00);
+                                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                                        self.pos += 6;
+                                        self.pos += 1;
+                                        continue;
+                                    }
                                 }
                             }
-                            self.pos += 4;
+                            out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
                         }
-                        _ => {}
+                        None => return Err("SyntaxError: Unexpected end of JSON input".into()),
+                        Some(_) => return Err(self.err_at("Bad escaped character", self.pos)),
                     }
                     self.pos += 1;
                 }
@@ -10940,8 +11452,27 @@ fn write_elements(out: &Value, items: Vec<Value>) {
     });
 }
 
-fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String> {
+/// How a species-built result is written: the length the constructor is called
+/// with (it differs per method — `map` passes the receiver's, `filter` and
+/// `concat` 0, `slice` the count) and whether the method then `Set`s `length`
+/// (`slice`, `splice` and `concat` do; `map`, `filter` and `flat` do not).
+struct SpeciesWrite {
+    ctor_len: usize,
+    set_length: bool,
+}
+
+fn array_species_create(
+    recv: &Value,
+    items: Vec<Value>,
+    how: SpeciesWrite,
+) -> Result<Value, String> {
     let plain = || with_host(|h| h.new_array(items.clone()));
+    // 23.1.3.4 step 3: only an Array has a species; any other receiver (an
+    // array-like reached through `.call`) gets a plain Array.
+    let subject = crate::proxy::is_array_subject(recv).unwrap_or(Value::Undef);
+    if with_host(|h| h.kind_of(&subject)) != Some(ObjKind::Array) {
+        return Ok(plain());
+    }
     // Only a subclass instance can have a species of its own: a plain array's
     // `constructor` is the `Array` builtin, whose species is `Array`.
     // A chain lookup, not `get_property`: an Array receiver resolves its
@@ -10955,11 +11486,15 @@ fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String
     } else {
         with_host(|h| host::lookup_chain(h, recv, "constructor")).unwrap_or(Value::Undef)
     };
-    if !matches!(
-        with_host(|h| h.kind_of(&ctor)),
-        Some(ObjKind::Class) | Some(ObjKind::Func)
-    ) {
+    // `constructor` that is not an object is not consulted for a species; it
+    // only has to be a constructor if it is to be called (steps 4-7).
+    if with_host(|h| h.is_nullish(&ctor)) {
         return Ok(plain());
+    }
+    if !matches!(ctor, Value::Obj(_)) || with_host(|h| host::is_primitive(h, &ctor)) {
+        return Err(host::type_error(
+            "object.constructor[Symbol.species] is not a constructor",
+        ));
     }
     // `C[@@species]` (23.1.3.4 step 5): a subclass that does not override the
     // accessor reads back ITSELF (the `@@species` arm of the class static
@@ -10971,22 +11506,51 @@ fn array_species_create(recv: &Value, items: Vec<Value>) -> Result<Value, String
         s if with_host(|h| h.is_null(&s)) => return Ok(plain()),
         s => s,
     };
-    if !matches!(
-        with_host(|h| h.kind_of(&species)),
-        Some(ObjKind::Class) | Some(ObjKind::Func)
-    ) {
+    // Step 7: the species must be a constructor. A builtin namespace object, a
+    // number or an arrow function is not, and that is a TypeError — not a
+    // quiet fall back to a plain Array.
+    if !host::is_constructor(&species) {
+        return Err(host::type_error(
+            "object.constructor[Symbol.species] is not a constructor",
+        ));
+    }
+    // The plain `Array` itself builds a plain Array.
+    let is_array_ctor = matches!(
+        with_host(|h| h.get(&species).cloned()),
+        Some(JsObj::Builtin(n)) if n == "Array"
+    );
+    if is_array_ctor {
         return Ok(plain());
     }
-    let out = host::construct(&species, vec![Value::Float(items.len() as f64)])?;
+    let out = host::construct(&species, vec![Value::Float(how.ctor_len as f64)])?;
     // The constructor is called with the LENGTH, so the elements are written
     // afterwards — which is also what lets a subclass constructor observe the
     // allocation, as node's does.
-    write_elements(&out, items);
+    if with_host(|h| matches!(h.get(&out), Some(JsObj::Array(_)))) {
+        write_elements(&out, items);
+        return Ok(out);
+    }
+    // Any other object is filled the way the spec does it: one
+    // `CreateDataPropertyOrThrow` per element, then (for the methods that do)
+    // a `Set(length)`.
+    let n = items.len();
+    for (i, v) in items.into_iter().enumerate() {
+        set_property(&out, &i.to_string(), v)?;
+    }
+    if how.set_length {
+        set_property(&out, "length", Value::Float(n as f64))?;
+    }
     Ok(out)
 }
 
 fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
-    array_method_on(recv, recv, name, args)
+    let r = array_method_on(recv, recv, name, args);
+    // A mutator ran directly on a mapped `arguments` object: its elements are
+    // aliases of the parameters, so the parameters follow.
+    if ARRAY_MUTATORS.contains(&name) && is_arguments(recv) {
+        with_host(|h| h.sync_arguments_to_params(recv));
+    }
+    r
 }
 
 /// The `Array.prototype` methods that WRITE to their receiver, and so need the
@@ -11016,9 +11580,24 @@ const ARRAY_MUTATORS: &[&str] = &[
 /// An index the receiver does not own is a HOLE in the temporary, so the
 /// methods that skip holes skip it here too, exactly as `HasProperty` makes them.
 fn array_generic(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
-    let len = match get_property(recv, "length") {
-        Ok(v) => host::to_array_length(&v).unwrap_or(0),
-        Err(_) => 0,
+    // A string has a read-only `length` and read-only indices, so every
+    // mutator's `Set` fails — V8 names the wrapper `[object String]`.
+    if ARRAY_MUTATORS.contains(&method) && with_host(|h| h.as_str(recv)).is_some() {
+        return Err(host::type_error(
+            "Cannot assign to read only property 'length' of object '[object String]'",
+        ));
+    }
+    // `LengthOfArrayLike` (7.3.18) is `ToLength(Get(O, "length"))`: truncate
+    // toward zero, NaN and negatives are 0, capped at 2^53-1. (`length: 1.9` is
+    // 1; the array-length setter's range check is not this conversion.)
+    let len = {
+        let l = get_property(recv, "length")?;
+        let n = host::to_number_value(&l)?;
+        if n.is_nan() || n <= 0.0 {
+            0
+        } else {
+            n.trunc().min(9_007_199_254_740_991.0) as usize
+        }
     };
     // A STRING receiver owns every index of its length; `has_property` answers
     // for objects and reports none of them, which made `[].map.call('abc', f)`
@@ -11046,10 +11625,29 @@ fn array_generic(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, 
             Some(JsObj::Array(items)) => items.clone(),
             _ => Vec::new(),
         });
-        for (i, v) in result.iter().enumerate() {
-            set_property(recv, &i.to_string(), v.clone())?;
-        }
-        set_property(recv, "length", Value::Float(result.len() as f64))?;
+        let result_holes = with_host(|h| h.hole_indices(&tmp));
+        // Each mutator `Set`s (or `Delete`s, for a hole) the indices it touched
+        // and then `length`, all with `throw = true`; indices past the new
+        // length are deleted. The holes the temporary kept stay absent on the
+        // receiver rather than becoming `undefined` properties.
+        host::JsHost::with_forced_strict(|| -> Result<(), String> {
+            for (i, v) in result.iter().enumerate() {
+                if result_holes.contains(&i) {
+                    delete_property(recv, &i.to_string())?;
+                } else {
+                    set_property(recv, &i.to_string(), v.clone())?;
+                }
+            }
+            // Only the methods that resize touch `length`: `reverse`, `sort`,
+            // `fill` and `copyWithin` leave it exactly as the receiver had it.
+            if !matches!(method, "push" | "pop" | "shift" | "unshift" | "splice") {
+                return Ok(());
+            }
+            for i in result.len()..len {
+                delete_property(recv, &i.to_string())?;
+            }
+            set_property(recv, "length", Value::Float(result.len() as f64))
+        })?;
     }
     Ok(out)
 }
@@ -11238,7 +11836,14 @@ fn array_method_on(
         "slice" => {
             let items = array_items(recv);
             let (lo, hi) = slice_bounds(&args, items.len());
-            let out = array_species_create(this_value, items[lo..hi].to_vec())?;
+            let out = array_species_create(
+                this_value,
+                items[lo..hi].to_vec(),
+                SpeciesWrite {
+                    ctor_len: hi - lo,
+                    set_length: true,
+                },
+            )?;
             with_host(|h| h.copy_holes(recv, &out, |i| (i >= lo && i < hi).then(|| i - lo)));
             Ok(out)
         }
@@ -11314,7 +11919,14 @@ fn array_method_on(
                         .map(|i| i + base),
                 );
             }
-            let arr = array_species_create(this_value, out)?;
+            let arr = array_species_create(
+                this_value,
+                out,
+                SpeciesWrite {
+                    ctor_len: 0,
+                    set_length: true,
+                },
+            )?;
             with_host(|h| h.install_holes(&arr, holes));
             Ok(arr)
         }
@@ -11433,7 +12045,17 @@ fn array_method_on(
                 }
                 Ok(None::<()>)
             })?;
-            let arr = array_species_create(this_value, out)?;
+            let arr = {
+                let n = out.len();
+                array_species_create(
+                    this_value,
+                    out,
+                    SpeciesWrite {
+                        ctor_len: n,
+                        set_length: false,
+                    },
+                )?
+            };
             with_host(|h| h.install_holes(&arr, holes));
             Ok(arr)
         }
@@ -11453,7 +12075,14 @@ fn array_method_on(
                 }
                 Ok(None::<()>)
             })?;
-            array_species_create(this_value, out)
+            array_species_create(
+                this_value,
+                out,
+                SpeciesWrite {
+                    ctor_len: 0,
+                    set_length: false,
+                },
+            )
         }
         "filter" => {
             let cb = arg0(&args);
@@ -11469,7 +12098,14 @@ fn array_method_on(
                 }
                 Ok(None::<()>)
             })?;
-            array_species_create(this_value, out)
+            array_species_create(
+                this_value,
+                out,
+                SpeciesWrite {
+                    ctor_len: 0,
+                    set_length: false,
+                },
+            )
         }
         "forEach" => {
             let cb = arg0(&args);
@@ -11747,7 +12383,14 @@ fn array_method_on(
             };
             let mut out = Vec::new();
             flatten_into(recv, depth, &mut out)?;
-            array_species_create(this_value, out)
+            array_species_create(
+                this_value,
+                out,
+                SpeciesWrite {
+                    ctor_len: 0,
+                    set_length: false,
+                },
+            )
         }
         // Live over the array (23.1.5.1): each step reads it as it is then.
         "keys" => Ok(array_iterator(recv, host::ArrayIterKind::Keys)),
@@ -12056,7 +12699,15 @@ fn array_splice(recv: &Value, args: Vec<Value>) -> Result<Value, String> {
     // The REMOVED elements come back as an array of the receiver's species
     // (23.1.3.31 step 8), so a subclass gets one of its own kind.
     let (removed, holes) = spliced;
-    let out = array_species_create(recv, removed)?;
+    let removed_len = removed.len();
+    let out = array_species_create(
+        recv,
+        removed,
+        SpeciesWrite {
+            ctor_len: removed_len,
+            set_length: true,
+        },
+    )?;
     with_host(|h| {
         h.install_holes(
             &out,
@@ -12226,7 +12877,7 @@ fn regexp_from_arg(v: &Value, flags: &str) -> Result<Value, String> {
     };
     let fv = with_host(|h| h.new_str(flags.to_string()));
     let sv = with_host(|h| h.new_str(src));
-    regexp_ctor(&[sv, fv])
+    regexp_ctor(&[sv, fv], false)
 }
 
 fn coerce_string_args(name: &str, args: Vec<Value>) -> Result<Vec<Value>, String> {
@@ -13027,6 +13678,11 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
                 None | Some(Value::Undef) => None,
                 Some(_) => {
                     let d = arg_num(&args, 0).trunc();
+                    // 21.1.3.2 step 4 answers a non-finite receiver BEFORE the
+                    // range check, so `Infinity.toExponential(-1)` is a string.
+                    if !n.is_finite() {
+                        return Ok(new_s(host::fmt_number(n)));
+                    }
                     if !(0.0..=100.0).contains(&d) {
                         return Err(host::range_error(
                             "toExponential() argument must be between 0 and 100",
@@ -13064,6 +13720,11 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
                 None | Some(Value::Undef) => Ok(new_s(host::fmt_number(n))),
                 Some(_) => {
                     let p = arg_num(&args, 0).trunc();
+                    // 21.1.3.5 step 4: a non-finite receiver is answered
+                    // before the precision is range-checked.
+                    if !n.is_finite() {
+                        return Ok(new_s(host::fmt_number(n)));
+                    }
                     if !(1.0..=100.0).contains(&p) {
                         return Err(host::range_error(
                             "toPrecision() argument must be between 1 and 100",
@@ -13221,13 +13882,10 @@ fn to_exponential(n: f64, f: Option<usize>) -> String {
         match f {
             Some(f) => round_significant(a, f + 1),
             None => {
-                // Shortest round-tripping digits (Rust's `{:e}` is shortest).
-                let sci = format!("{a:e}");
-                let (mant, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
-                let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+                let (digits, exp) = host::shortest_digits(a);
                 let trimmed = digits.trim_end_matches('0');
                 let digits = if trimmed.is_empty() { "0" } else { trimmed };
-                (digits.to_string(), exp_str.parse().unwrap_or(0))
+                (digits.to_string(), exp)
             }
         }
     };
@@ -14223,6 +14881,10 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
 /// built a ring. Nothing hung, because every chain walk in this host carries a
 /// hop limit, but a lookup then silently gave up instead of finding a property
 /// that really was there.
+pub(crate) fn would_cycle_pub(obj: &Value, p: &Value) -> bool {
+    would_cycle(obj, p)
+}
+
 fn would_cycle(obj: &Value, p: &Value) -> bool {
     let mut cur = Some(p.clone());
     for _ in 0..1000 {
@@ -15452,7 +16114,7 @@ fn deep_clone_seen(
         _ => None,
     }) {
         let args = with_host(|h| vec![h.new_str(src), h.new_str(flags)]);
-        let out = regexp_ctor(&args)?;
+        let out = regexp_ctor(&args, false)?;
         seen.insert(idx, out.clone());
         return Ok(out);
     }

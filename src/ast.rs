@@ -362,6 +362,12 @@ pub enum StmtKind {
         test: Expr,
         body: Box<Stmt>,
     },
+    /// `with (object) body` (sloppy mode only): `body` resolves identifiers
+    /// against `object` first.
+    With {
+        object: Expr,
+        body: Box<Stmt>,
+    },
     DoWhile {
         body: Box<Stmt>,
         test: Expr,

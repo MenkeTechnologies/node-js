@@ -183,6 +183,9 @@ fn stmt_slot_safe(s: &Stmt) -> bool {
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
             expr_slot_safe(test) && stmt_slot_safe(body)
         }
+        // A `with` body resolves names against an object chosen at run time, so no
+        // identifier in the chunk can be pinned to a slot.
+        StmtKind::With { .. } => false,
         StmtKind::For {
             init,
             test,
@@ -384,6 +387,10 @@ impl Planner {
             }
             StmtKind::While { test, body } => {
                 self.walk_expr(test);
+                self.walk_stmt(body);
+            }
+            StmtKind::With { object, body } => {
+                self.walk_expr(object);
                 self.walk_stmt(body);
             }
             StmtKind::DoWhile { body, test } => {
@@ -601,6 +608,10 @@ fn collect_escaping_stmt(s: &Stmt, out: &mut FxHashSet<String>) {
             collect_escaping_expr(test, out);
             collect_escaping_stmt(body, out);
         }
+        StmtKind::With { object, body } => {
+            collect_escaping_expr(object, out);
+            collect_escaping_stmt(body, out);
+        }
         StmtKind::For {
             init,
             test,
@@ -747,6 +758,10 @@ fn collect_all_idents_stmt(s: &Stmt, out: &mut FxHashSet<String>) {
         }
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
             collect_all_idents_expr(test, out);
+            collect_all_idents_stmt(body, out);
+        }
+        StmtKind::With { object, body } => {
+            collect_all_idents_expr(object, out);
             collect_all_idents_stmt(body, out);
         }
         StmtKind::For {
@@ -932,4 +947,17 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
         Expr::Assign { target, .. } => collect_idents(target, out),
         _ => {}
     }
+}
+
+/// Whether `body` can observe the `arguments` object: it names `arguments`
+/// anywhere (a nested arrow shares it) or calls a direct `eval`, which can.
+/// Conservative — a nested ordinary function naming its own `arguments` counts
+/// — because a false positive only costs the slots and an alias, never an
+/// answer.
+pub fn mentions_arguments(body: &[Stmt]) -> bool {
+    let mut names = FxHashSet::default();
+    for s in body {
+        collect_all_idents_stmt(s, &mut names);
+    }
+    names.contains("arguments") || names.contains("eval")
 }

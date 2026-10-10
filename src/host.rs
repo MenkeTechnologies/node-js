@@ -111,6 +111,18 @@ pub mod ops {
     pub const HOIST_TDZ: u16 = 76; // [name] -> declare `name` in the CURRENT scope as UNINITIALIZED (the `let`/`const`/`class` temporal dead zone)
     pub const NEW_SPREAD: u16 = 77; // [ctor, argsArray] -> instance; `new C(...xs)`, where the argument list is built at run time
     pub const SUPER_CALL_SPREAD: u16 = 78; // [argsArray] -> invoke the parent ctor with a run-time argument list (`super(...xs)`)
+    pub const SUPER_SET: u16 = 89; // [name, value] -> value; `super.name = value` (setter on the parent chain, else a data write on `this`)
+    pub const YIELD_DELEGATE: u16 = 90; // [v] -> sent; `yield*`'s suspension: a forced return/throw is recorded for DELEGATE_STEP instead of raised
+    pub const DELEGATE_STEP: u16 = 91; // [iterator, sent] -> [iterator, step]; one step of `yield*` applying next / throw / return to the delegate
+    pub const MAP_ARGS: u16 = 80; // [names] -> undefined; alias a sloppy function's parameters (comma-joined) to its `arguments` object
+    pub const WITH_PUSH: u16 = 81; // [obj] -> undefined; enter a `with` scope (ToObject; nullish throws)
+    pub const WITH_GET: u16 = 82; // [name] -> value; like GETLOCAL, but a `with` object that has `name` answers first
+    pub const WITH_SET: u16 = 83; // [name, value] -> value; like SETLOCAL, `with`-aware
+    pub const WITH_SET_STRICT: u16 = 84; // [name, value] -> value; like SETLOCAL_STRICT, `with`-aware
+    pub const WITH_TYPEOF: u16 = 85; // [name] -> str; like TYPEOF_NAME, `with`-aware
+    pub const WITH_FN: u16 = 86; // [name] -> [fn, this]; the callee of `name(...)` and the `with` object that is its `this`
+    pub const CALL_THIS: u16 = 87; // [callable, this, args...] -> call with an explicit `this`
+    pub const APPLY_THIS: u16 = 88; // [callable, this, argsArray] -> call with an explicit `this` and spread args
     pub const ITER_RESULT: u16 = 79; // [step] -> step; TypeError unless an object (`IteratorNext` step 3, after a `for await` step's await)
 }
 
@@ -416,6 +428,10 @@ pub struct FuncVal {
     /// is the `[[HomeObject]]` an ordinary `{ m() { super.x } }` needs, and
     /// without it there was nothing to resolve against.
     pub home_object: Option<Value>,
+    /// `new.target` captured at definition (arrow functions): an arrow has none
+    /// of its own, so `new.target` and a `super()` call inside it use the
+    /// enclosing constructor's.
+    pub new_target: Option<Value>,
 }
 
 /// What an array iterator yields at each index: `keys()`, `values()` (and
@@ -624,7 +640,7 @@ pub struct RegExpObj {
     /// `RegExpObj` on every evaluation — it has to, since `lastIndex` is
     /// per-object mutable state — while the compiled engine behind it is
     /// immutable and identical every time. See `regexp::compiled`.
-    pub re: std::rc::Rc<fancy_regex::Regex>,
+    pub re: std::rc::Rc<crate::regexp::Engine>,
     pub source: String,
     pub flags: String,
     pub global: bool,
@@ -702,6 +718,14 @@ pub enum SuperRef {
     Data(Value),
 }
 
+/// How a `yield*` was resumed when it was not by an ordinary `.next(x)`: the
+/// completion a `.return(v)` or `.throw(e)` forced onto the suspended generator,
+/// which 15.5.5 hands to the DELEGATE rather than raising at the `yield*`.
+pub enum DelegateResume {
+    Return(Value),
+    Throw(Value),
+}
+
 /// A `Map`/`Set` key under SameValueZero: `NaN` collapses to one key, `-0` and
 /// `+0` are the same key, primitives compare by value, objects by heap identity.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -742,6 +766,25 @@ pub struct EnvData {
     /// where `is_empty()` settles it without hashing the name a second time.
     pub consts: rustc_hash::FxHashSet<String>,
     pub parent: Option<Env>,
+    /// Sloppy-mode mapped `arguments` for the activation this env holds the
+    /// parameters of (10.4.4). `None` for every other scope, which keeps the
+    /// per-write check in `set_name` to one pointer test.
+    pub mapped: Option<Box<MappedArgs>>,
+    /// The binding object of a `with` statement: this scope has no variables of
+    /// its own, and a name is looked up on the object before the scopes beyond.
+    pub with_obj: Option<Value>,
+}
+
+/// The aliasing between a sloppy function's `arguments` object and its
+/// parameter bindings: while `names[i]` is non-empty, `arguments[i]` and that
+/// parameter are two names for one slot. A write through either side shows on
+/// the other until `delete arguments[i]` removes the link.
+pub struct MappedArgs {
+    pub arguments: Value,
+    /// `names[i]` is the parameter `arguments[i]` aliases, or empty when index
+    /// `i` is unmapped (past the passed arguments, a shadowed duplicate name,
+    /// or deleted).
+    pub names: Vec<String>,
 }
 pub type Env = Rc<RefCell<EnvData>>;
 
@@ -788,6 +831,8 @@ fn new_env(parent: Option<Env>) -> Env {
         vars: VarMap::default(),
         consts: rustc_hash::FxHashSet::default(),
         parent,
+        mapped: None,
+        with_obj: None,
     }))
 }
 
@@ -881,6 +926,9 @@ pub struct JsHost {
     /// Module-top-level names still in their temporal dead zone. Kept out of
     /// `globals` so the marker is never reachable as `globalThis.<name>`.
     tdz_globals: rustc_hash::FxHashSet<String>,
+    /// The call environment behind each mapped `arguments` object, by heap
+    /// index: the route a write to `arguments[i]` takes to reach its parameter.
+    mapped_arg_envs: rustc_hash::FxHashMap<u32, Env>,
     /// Top-level `const` names (a module frame declares into `globals`), so an
     /// assignment to one throws the same way a block-scoped `const` does.
     global_consts: rustc_hash::FxHashSet<String>,
@@ -907,6 +955,12 @@ pub struct JsHost {
     /// The in-flight thrown value, if any (JS `throw`).
     pub exc: Option<Value>,
     pub signal: Option<Signal>,
+    /// A forced `.return(v)` / `.throw(e)` that arrived at a `yield*`, waiting
+    /// for the delegate step that applies it to the delegate (see
+    /// `DelegateResume`).
+    pub delegate_resume: Option<DelegateResume>,
+    /// Nesting count of [`JsHost::with_forced_strict`].
+    forced_strict: u32,
     /// Promises that settled REJECTED this tick. Drained at each microtask
     /// checkpoint: any still without a handler is an unhandled rejection.
     pub pending_rejections: Vec<u32>,
@@ -1231,6 +1285,7 @@ impl JsHost {
         let mut h = JsHost {
             tdz: None,
             tdz_globals: Default::default(),
+            mapped_arg_envs: Default::default(),
             heap: Vec::new(),
             funcs: Vec::new(),
             scripts: Vec::new(),
@@ -1268,6 +1323,8 @@ impl JsHost {
             array_holes: HashMap::new(),
             super_replacement: None,
             derived_ctor_next: false,
+            delegate_resume: None,
+            forced_strict: 0,
             module_scope: false,
             builtin_statics: HashMap::new(),
             object_proto: Value::Undef,
@@ -2296,7 +2353,18 @@ impl JsHost {
         }
     }
     pub fn current_strict(&self) -> bool {
-        self.frame().strict
+        self.frame().strict || self.forced_strict > 0
+    }
+
+    /// Run `f` with every write refusal treated as in strict code, whatever the
+    /// running function's own mode: a builtin that performs `Set(O, P, V, true)`
+    /// (`Object.assign`) throws on a refused write even when called from sloppy
+    /// code.
+    pub fn with_forced_strict<T>(f: impl FnOnce() -> T) -> T {
+        with_host(|h| h.forced_strict += 1);
+        let r = f();
+        with_host(|h| h.forced_strict -= 1);
+        r
     }
 
     /// Mark the frame about to run as STRICT — used for a program whose own top
@@ -2322,23 +2390,26 @@ impl JsHost {
         }
     }
 
-    /// Whether `recv` — or anything on its prototype chain — carries the private
-    /// name `key`. A private FIELD is an own property of the instance; a private
-    /// METHOD lives on the class prototype, one link up.
+    /// Whether `recv` itself carries the private name `key`. Private elements
+    /// are never inherited — `Object.create(instance)` has none of its
+    /// prototype's — so a private METHOD is installed on every instance when it
+    /// is constructed (see [`install_private_methods`]) rather than found one
+    /// link up on the class prototype.
     pub fn has_private(&self, recv: &Value, key: &str) -> bool {
-        let mut cur = Some(recv.clone());
-        while let Some(v) = cur {
-            let owns = match self.get(&v) {
-                Some(JsObj::Object(p)) => p.contains_key(key),
-                Some(JsObj::Class(c)) => c.statics.contains_key(key),
-                _ => false,
-            };
-            if owns || self.own_accessor(&v, key).is_some() || self.fn_prop(&v, key).is_some() {
-                return true;
-            }
-            cur = self.proto_of(&v);
+        let owns = match self.get(recv) {
+            Some(JsObj::Object(p)) => p.contains_key(key),
+            Some(JsObj::Class(c)) => c.statics.contains_key(key),
+            _ => false,
+        };
+        owns || self.own_accessor(recv, key).is_some() || self.fn_prop(recv, key).is_some()
+    }
+
+    /// `C.prototype` of the class whose method is running.
+    pub fn current_home_proto(&self) -> Option<Value> {
+        match self.get(&self.current_home_class()?) {
+            Some(JsObj::Class(c)) => Some(c.proto.clone()),
+            _ => None,
         }
-        false
     }
 
     // ── array holes ──────────────────────────────────────────────────────
@@ -2701,8 +2772,17 @@ impl JsHost {
                 if !b.consts.is_empty() && b.consts.contains(name) {
                     return false;
                 }
+                let alias = Self::arguments_alias(&b, name);
+                let (stored, mirror) = match alias {
+                    Some(_) => (val.clone(), Some(val)),
+                    None => (val, None),
+                };
                 if let Some(slot) = b.vars.get_mut(name) {
-                    *slot = val;
+                    *slot = stored;
+                }
+                drop(b);
+                if let (Some((args, i)), Some(v)) = (alias, mirror) {
+                    self.set_argument_slot(&args, i, v);
                 }
                 return true;
             }
@@ -2830,7 +2910,156 @@ impl JsHost {
             return;
         }
         let base = self.frame().base_env.clone();
+        let alias = Self::arguments_alias(&base.borrow(), name);
+        if let Some((args, i)) = alias {
+            self.set_argument_slot(&args, i, val.clone());
+        }
         base.borrow_mut().vars.insert(name.to_string(), val);
+    }
+
+    /// Enter a `with` scope whose binding object is `obj`.
+    pub fn push_with_scope(&mut self, obj: Value) {
+        let child = child_env(self.cur_env());
+        child.borrow_mut().with_obj = Some(obj);
+        self.frames.last_mut().unwrap().env = child;
+    }
+
+    /// Whether the running code sits inside a `with` body.
+    pub fn in_with_scope(&self) -> bool {
+        let mut env = Some(self.cur_env());
+        while let Some(e) = env {
+            if e.borrow().with_obj.is_some() {
+                return true;
+            }
+            env = e.borrow().parent.clone();
+        }
+        false
+    }
+
+    /// The `with` binding objects `name` would be looked up on, innermost first,
+    /// stopping at the first ordinary scope that binds it: an inner binding
+    /// shadows every object beyond it.
+    pub fn with_objects_before_binding(&self, name: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut env = Some(self.cur_env());
+        while let Some(e) = env {
+            let b = e.borrow();
+            match &b.with_obj {
+                Some(o) => out.push(o.clone()),
+                None if b.vars.contains_key(name) => break,
+                None => {}
+            }
+            let parent = b.parent.clone();
+            drop(b);
+            env = parent;
+        }
+        out
+    }
+
+    /// The `arguments` slot `name` is aliased to in `env`, as `(arguments, index)`.
+    fn arguments_alias(env: &EnvData, name: &str) -> Option<(Value, usize)> {
+        let m = env.mapped.as_ref()?;
+        let i = m.names.iter().position(|n| n == name)?;
+        Some((m.arguments.clone(), i))
+    }
+
+    /// Store `val` into element `i` of the `arguments` array `args`.
+    fn set_argument_slot(&mut self, args: &Value, i: usize, val: Value) {
+        if let Some(JsObj::Array(items)) = self.get_mut(args) {
+            if let Some(slot) = items.get_mut(i) {
+                *slot = val;
+            }
+        }
+    }
+
+    /// Alias the parameters named by `names` (in order) to the `arguments`
+    /// object bound in the nearest scope that has one — 10.4.4.7
+    /// `CreateMappedArgumentsObject`. Only indices the caller supplied are
+    /// mapped, and a name that repeats is mapped at its LAST occurrence only.
+    pub fn map_arguments(&mut self, names: &[String]) {
+        let mut env = Some(self.cur_env());
+        while let Some(e) = env {
+            let args = e.borrow().vars.get("arguments").cloned();
+            if let Some(args) = args {
+                let Value::Obj(id) = args else { return };
+                let Some(JsObj::Array(items)) = self.heap.get(id as usize) else {
+                    return;
+                };
+                let argc = items.len();
+                let mapped: Vec<String> = names
+                    .iter()
+                    .enumerate()
+                    .take(argc)
+                    .map(|(i, n)| {
+                        if names[i + 1..].contains(n) {
+                            String::new()
+                        } else {
+                            n.clone()
+                        }
+                    })
+                    .collect();
+                e.borrow_mut().mapped = Some(Box::new(MappedArgs {
+                    arguments: args,
+                    names: mapped,
+                }));
+                self.mapped_arg_envs.insert(id, e.clone());
+                return;
+            }
+            env = e.borrow().parent.clone();
+        }
+    }
+
+    /// `arguments[i] = v` on a mapped object: write the aliased parameter too.
+    pub fn write_mapped_argument(&mut self, args: &Value, i: usize, val: &Value) {
+        let Value::Obj(id) = args else { return };
+        let Some(env) = self.mapped_arg_envs.get(id).cloned() else {
+            return;
+        };
+        let name = match env.borrow().mapped.as_ref() {
+            Some(m) => m.names.get(i).filter(|n| !n.is_empty()).cloned(),
+            None => None,
+        };
+        if let Some(n) = name {
+            if let Some(slot) = env.borrow_mut().vars.get_mut(&n) {
+                *slot = val.clone();
+            }
+        }
+    }
+
+    /// After an `Array.prototype` mutator rewrote a mapped `arguments` object's
+    /// elements in place, push every still-aliased element into its parameter.
+    pub fn sync_arguments_to_params(&mut self, args: &Value) {
+        let Value::Obj(id) = args else { return };
+        let Some(env) = self.mapped_arg_envs.get(id).cloned() else {
+            return;
+        };
+        let items = match self.heap.get(*id as usize) {
+            Some(JsObj::Array(items)) => items.clone(),
+            _ => return,
+        };
+        let names = match env.borrow().mapped.as_ref() {
+            Some(m) => m.names.clone(),
+            None => return,
+        };
+        for (i, n) in names.iter().enumerate() {
+            if let (false, Some(v)) = (n.is_empty(), items.get(i)) {
+                if let Some(slot) = env.borrow_mut().vars.get_mut(n) {
+                    *slot = v.clone();
+                }
+            }
+        }
+    }
+
+    /// `delete arguments[i]`: the index stops aliasing its parameter.
+    pub fn unmap_argument(&mut self, args: &Value, i: usize) {
+        let Value::Obj(id) = args else { return };
+        if let Some(env) = self.mapped_arg_envs.get(id) {
+            if let Some(m) = env.borrow_mut().mapped.as_mut() {
+                if let Some(n) = m.names.get_mut(i) {
+                    n.clear();
+                }
+            }
+        }
     }
 
     /// Enter a fresh block scope.
@@ -3104,39 +3333,46 @@ impl JsHost {
 
     /// Resolve `super.name` to either the parent-prototype getter (to be invoked
     /// by the caller, outside any host borrow) or a directly-usable value.
-    pub fn super_resolve(&self, name: &str) -> SuperRef {
-        // A shorthand method in an OBJECT LITERAL resolves `super` through its
-        // home object's prototype; only a class method has a home CLASS. With
-        // nothing tracked for the literal case, `{ m() { super.x() } }` had no
-        // parent to look in and reported the method missing.
+    /// The object `super.x` is looked up on: the prototype of the running
+    /// method's home object.
+    ///
+    /// A shorthand method in an OBJECT LITERAL resolves `super` through its
+    /// home object's prototype; only a class method has a home CLASS. A STATIC
+    /// method's home object is the constructor, so `super.x` reads off the
+    /// parent CONSTRUCTOR; an instance method's is the prototype object, so it
+    /// reads off the parent's prototype.
+    fn super_target(&self) -> Option<Value> {
         if let Some(home) = self.frame().home_object.clone() {
-            let target = self.proto_of(&home).unwrap_or(Value::Undef);
-            if let Some((Some(getter), _)) = lookup_accessor(self, &target, name) {
-                return SuperRef::Getter(getter);
-            }
-            return SuperRef::Data(lookup_chain(self, &target, name).unwrap_or(Value::Undef));
+            return Some(self.proto_of(&home).unwrap_or(Value::Undef));
         }
-        let parent = match self
+        let parent = self
             .current_home_class()
             .and_then(|cv| match self.get(&cv) {
                 Some(JsObj::Class(c)) => c.parent.clone(),
                 _ => None,
-            }) {
-            Some(p) => p,
-            None => return SuperRef::Data(Value::Undef),
-        };
-        // A STATIC method's home object is the constructor, so `super.x` reads
-        // off the parent CONSTRUCTOR; an instance method's is the prototype
-        // object, so it reads off the parent's prototype. Always taking the
-        // prototype meant `static s() { return super.s(); }` found nothing and
-        // then tried to call it.
-        let target = if self.frame().home_static {
-            parent.clone()
+            })?;
+        Some(if self.frame().home_static {
+            parent
         } else {
             match self.get(&parent) {
                 Some(JsObj::Class(pc)) => pc.proto.clone(),
                 _ => self.fn_prop(&parent, "prototype").unwrap_or(Value::Undef),
             }
+        })
+    }
+
+    /// The accessor `super.name = v` finds: `Some(Some(setter))` runs,
+    /// `Some(None)` is a getter-only property that refuses the write, and
+    /// `None` means no accessor, so the write lands on `this` as a data
+    /// property (OrdinarySet with the receiver, 10.1.9.2).
+    pub fn super_setter(&self, name: &str) -> Option<Option<Value>> {
+        let target = self.super_target()?;
+        lookup_accessor(self, &target, name).map(|(_, setter)| setter)
+    }
+
+    pub fn super_resolve(&self, name: &str) -> SuperRef {
+        let Some(target) = self.super_target() else {
+            return SuperRef::Data(Value::Undef);
         };
         if let Some((Some(getter), _)) = lookup_accessor(self, &target, name) {
             return SuperRef::Getter(getter);
@@ -3920,6 +4156,48 @@ pub fn canonicalize_own_keys(props: &mut IndexMap<String, Value>) {
     }
 }
 
+/// The shortest round-trip decimal digits of a positive finite `a` and its
+/// decimal exponent: `a == d1.d2…dk × 10^e` with `d1 != 0`.
+///
+/// Rust's `{:e}` yields the shortest digit string closest to `a`, but on an
+/// exact tie between two equally close candidates it rounds UP, where
+/// ECMA-262 Number::toString (and V8's bignum-dtoa) take the EVEN last digit:
+/// `25577030267034.8125` prints `25577030267034.812` in node. A tie needs the
+/// value to sit exactly halfway, i.e. to terminate one digit past the shortest
+/// form with a `5`, so it is detected with an exact expansion, and only for
+/// 16+ digit results (the only ones whose rounding interval can hold two
+/// candidates).
+pub fn shortest_digits(a: f64) -> (String, i32) {
+    let sci = format!("{a:e}");
+    let (mant, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
+    let e: i32 = exp_str.parse().expect("LowerExp exponent is an integer");
+    let mut s: String = mant.chars().filter(|c| *c != '.').collect();
+    let k = s.len();
+    let last = s.as_bytes()[k - 1];
+    if k >= 16 && last % 2 == 1 && is_exact_midpoint(a, k, e) {
+        let lower = format!("{}{}", &s[..k - 1], (last - 1) as char);
+        let reparsed: f64 = format!("{lower}e{}", e - (k as i32 - 1))
+            .parse()
+            .unwrap_or(f64::NAN);
+        if reparsed == a {
+            s = lower;
+        }
+    }
+    (s, e)
+}
+
+/// True when `a` is exactly `k + 1` significant digits long ending in `5`,
+/// i.e. it lies exactly halfway between two `k`-digit decimals.
+fn is_exact_midpoint(a: f64, k: usize, e: i32) -> bool {
+    let exact = format!("{a:.1100e}");
+    let (mant, exp_str) = exact.split_once('e').expect("LowerExp always has 'e'");
+    if exp_str.parse::<i32>().ok() != Some(e) {
+        return false;
+    }
+    let digits: Vec<u8> = mant.bytes().filter(u8::is_ascii_digit).collect();
+    digits.get(k) == Some(&b'5') && digits[k + 1..].iter().all(|&d| d == b'0')
+}
+
 /// ECMAScript `Number::toString` layout for a positive, finite, nonzero value.
 ///
 /// Rust's `Display`/`LowerExp` give the shortest round-trip decimal digits, but
@@ -3930,12 +4208,7 @@ pub fn canonicalize_own_keys(props: &mut IndexMap<String, Value>) {
 /// decimal exponent `n` (value = s × 10^(n−k)); exponential form only when
 /// `n > 21` or `n ≤ -6`.
 fn js_number_repr(a: f64) -> String {
-    // `{:e}` yields `d[.ddd]e<exp>` with the mantissa in [1, 10) and shortest
-    // round-trip digits. Split it into the digit string `s` and exponent `E`.
-    let sci = format!("{a:e}");
-    let (mant, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
-    let e: i32 = exp_str.parse().expect("LowerExp exponent is an integer");
-    let s: String = mant.chars().filter(|c| *c != '.').collect();
+    let (s, e) = shortest_digits(a);
     let k = s.len() as i32; // number of significant digits
     let n = e + 1; // value = s × 10^(n−k), 10^(k−1) ≤ s < 10^k
 
@@ -6225,26 +6498,155 @@ pub(crate) fn to_uint32(f: f64) -> u32 {
     f.trunc().rem_euclid(4294967296.0) as u32
 }
 
+/// The value of a run of digits in `radix` (2..=36), the way V8 computes it —
+/// which is exact for decimal and the power-of-two radixes and deliberately
+/// approximate for the rest, so a faithful result needs V8's own algorithm:
+///
+/// * radix 10: the correctly rounded decimal value;
+/// * radix 2, 4, 8, 16, 32 (`InternalStringToIntDouble`): the digits are
+///   accumulated into 53 bits and the dropped tail rounds half to even;
+/// * any other radix (`HandleGenericCase`): 32-bit multiply-and-add over the
+///   longest part that fits, parts combined in a double. 19.2.5 allows an
+///   implementation-approximated value there, and `parseInt('…', 36)` of a long
+///   string differs in the last digit between algorithms.
+///
+/// The caller passes only valid digits for `radix`.
+pub(crate) fn digits_to_number(digits: &str, radix: u32) -> f64 {
+    if digits.is_empty() {
+        return f64::NAN;
+    }
+    if radix == 10 {
+        return digits.parse::<f64>().unwrap_or(f64::NAN);
+    }
+    let ds: Vec<u32> = digits
+        .chars()
+        .map(|c| c.to_digit(radix).unwrap_or(0))
+        .collect();
+    if radix.is_power_of_two() {
+        let log2 = radix.trailing_zeros();
+        let mut number: u64 = 0;
+        let mut exponent: i32 = 0;
+        let mut i = 0;
+        while i < ds.len() {
+            number = number * u64::from(radix) + u64::from(ds[i]);
+            let mut overflow = number >> 53;
+            if overflow != 0 {
+                // The value no longer fits 53 bits: drop the low bits and round
+                // them half to even, counting every further digit as exponent.
+                let mut overflow_bits = 1;
+                while overflow > 1 {
+                    overflow_bits += 1;
+                    overflow >>= 1;
+                }
+                let dropped = number & ((1u64 << overflow_bits) - 1);
+                number >>= overflow_bits;
+                exponent = overflow_bits;
+                let mut zero_tail = true;
+                i += 1;
+                while i < ds.len() {
+                    exponent += log2 as i32;
+                    zero_tail = zero_tail && ds[i] == 0;
+                    i += 1;
+                }
+                let middle = 1u64 << (overflow_bits - 1);
+                if dropped > middle || (dropped == middle && (number & 1 != 0 || !zero_tail)) {
+                    number += 1;
+                }
+                if number & (1u64 << 53) != 0 {
+                    exponent += 1;
+                    number >>= 1;
+                }
+                break;
+            }
+            i += 1;
+        }
+        return number as f64 * 2f64.powi(exponent);
+    }
+    // Leading zeros are skipped first, which moves where the parts begin.
+    let mut result = 0.0f64;
+    let mut i = ds.iter().take_while(|&&d| d == 0).count();
+    const MAX_MULTIPLIER: u32 = 0xFFFF_FFFF / 36;
+    while i < ds.len() {
+        let (mut part, mut multiplier) = (0u32, 1u32);
+        while i < ds.len() {
+            let m = multiplier * radix;
+            if m > MAX_MULTIPLIER {
+                break;
+            }
+            part = part * radix + ds[i];
+            multiplier = m;
+            i += 1;
+        }
+        // One fused multiply-add per part: the reference build contracts
+        // `result * multiplier + part`, which rounds once rather than twice
+        // (see `crate::ieee754` on contraction).
+        result = result.mul_add(f64::from(multiplier), f64::from(part));
+    }
+    result
+}
+
+/// `StringNumericLiteral` (7.1.4.1.1) decimal grammar: `Infinity`, or digits
+/// with an optional fraction and exponent — what Rust's own float parser
+/// accepts a superset of (`inf`, `nan`, `infinity`, any case).
+fn is_decimal_numeric_literal(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    if matches!(b.first(), Some(b'+' | b'-')) {
+        i = 1;
+    }
+    if &s[i..] == "Infinity" {
+        return true;
+    }
+    let int_start = i;
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    let mut digits = i - int_start;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let frac_start = i;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        digits += i - frac_start;
+    }
+    if digits == 0 {
+        return false;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let exp_start = i;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if i == exp_start {
+            return false;
+        }
+    }
+    i == b.len()
+}
+
 /// Parse a string in numeric context (`ToNumber`): trimmed, empty -> 0.
 fn str_to_number(s: &str) -> f64 {
     let t = crate::utf16::js_trim(s);
     if t.is_empty() {
         return 0.0;
     }
-    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return i64::from_str_radix(hex, 16)
-            .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
+    // A radix prefix takes no sign and at least one digit, any length.
+    for (prefixes, radix) in [(["0x", "0X"], 16), (["0o", "0O"], 8), (["0b", "0B"], 2)] {
+        if let Some(digits) = prefixes.iter().find_map(|p| t.strip_prefix(p)) {
+            return if !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix)) {
+                digits_to_number(digits, radix)
+            } else {
+                f64::NAN
+            };
+        }
     }
-    if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return i64::from_str_radix(oct, 8)
-            .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
-    }
-    if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return i64::from_str_radix(bin, 2)
-            .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
+    if !is_decimal_numeric_literal(t) {
+        return f64::NAN;
     }
     match t {
         "Infinity" | "+Infinity" => f64::INFINITY,
@@ -7523,10 +7925,10 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
             | Some(ObjKind::BoundMethod)
             | Some(ObjKind::Builtin)
     ) {
-        if let Some(r) = crate::builtins::function_builtin_method(recv, name, &args)? {
-            return Ok(r);
-        }
         // A static method (own or inherited): `this` is the constructor (`recv`).
+        // It is looked up BEFORE `Function.prototype`'s `call`/`apply`/`bind`/
+        // `toString`, since an own property shadows an inherited one — `static
+        // call(o) {}` is the class's, not `Function.prototype.call`.
         let stat = if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Class) {
             with_host(|h| h.class_static(recv, name))
         } else {
@@ -7536,6 +7938,9 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
             if with_host(|h| is_callable(h, &f)) {
                 return invoke(&f, args, Some(recv.clone()));
             }
+        }
+        if let Some(r) = crate::builtins::function_builtin_method(recv, name, &args)? {
+            return Ok(r);
         }
         // `class_static` only walks user-class `extends` links, so a chain that
         // bottoms out in a BUILTIN constructor (`class D extends Array {}`)
@@ -7602,6 +8007,14 @@ pub fn invoke(callable: &Value, args: Vec<Value>, this: Option<Value>) -> Result
     // `[[Call]]` on a Proxy runs the `apply` trap (or forwards to the target).
     // Probed by kind first so the ordinary call path never clones its arguments.
     if with_host(|h| h.kind_of(callable)) == Some(ObjKind::Proxy) {
+        // 10.5.12: a proxy has `[[Call]]` only when its target does, and that is
+        // settled before the handler is consulted — revoked or not.
+        if !with_host(|h| is_callable(h, callable)) {
+            return Err(type_error(&format!(
+                "{} is not a function",
+                with_host(|h| h.str_of(callable))
+            )));
+        }
         return crate::proxy::apply(callable, args, this).map(|r| r.expect("kind_of said Proxy"));
     }
     let obj = with_host(|h| h.get(callable).cloned());
@@ -7817,6 +8230,11 @@ fn run_user_func_full(
     );
     // Arrow functions capture `this` lexically; regular functions receive it.
     let mut this_val = if fv.is_arrow { fv.this.clone() } else { this };
+    let new_target = if fv.is_arrow {
+        fv.new_target.clone()
+    } else {
+        new_target
+    };
     // 10.2.1.2 OrdinaryCallBindThis: in SLOPPY mode an absent or nullish `this`
     // becomes the global object. Only a strict function keeps `undefined`, and
     // an arrow has no `this` of its own to substitute. Leaving it undefined
@@ -7998,6 +8416,9 @@ pub fn construct(ctor: &Value, args: Vec<Value>) -> Result<Value, String> {
 pub fn construct_nt(ctor: &Value, args: Vec<Value>, new_target: Value) -> Result<Value, String> {
     // `new proxy(…)` runs the `construct` trap (or forwards to the target).
     if with_host(|h| h.kind_of(ctor)) == Some(ObjKind::Proxy) {
+        if !is_constructor(ctor) {
+            return Err(not_a_constructor(ctor));
+        }
         return crate::proxy::construct(ctor, args, &new_target)
             .map(|r| r.expect("kind_of said Proxy"));
     }
@@ -8080,7 +8501,9 @@ pub(crate) fn is_constructor(v: &Value) -> bool {
         Some(JsObj::Builtin(name)) => {
             !name.contains('.') && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         }
-        _ => with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy),
+        // A proxy is a constructor exactly when its target is (10.5.14 step 8).
+        Some(JsObj::Proxy { target, .. }) => is_constructor(&target),
+        _ => false,
     }
 }
 
@@ -8201,8 +8624,42 @@ fn run_class_ctor(
     Ok(None)
 }
 
+/// `InitializeInstanceElements` step 1 (15.7.14): give `inst` every private
+/// method and accessor of the class whose prototype is `proto`, before any
+/// field initializer runs. They are held on the class prototype as a template;
+/// the instance's own copy is what the brand check finds.
+pub fn install_private_methods(proto: &Value, inst: &Value) {
+    with_host(|h| {
+        let methods: Vec<(String, Value)> = match h.get(proto) {
+            Some(JsObj::Object(p)) => p
+                .iter()
+                .filter(|(k, _)| k.starts_with('#'))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let accessors: Vec<(String, Accessor)> = h
+            .own_accessor_keys(proto)
+            .into_iter()
+            .filter(|k| k.starts_with('#'))
+            .filter_map(|k| h.own_accessor(proto, &k).map(|a| (k, a)))
+            .collect();
+        for (k, v) in methods {
+            if let Some(JsObj::Object(p)) = h.get_mut(inst) {
+                p.insert(k.clone(), v);
+            }
+            h.hide_prop(inst, &k);
+        }
+        for (k, (getter, setter)) in accessors {
+            h.set_accessor(inst, &k, getter, setter);
+            h.hide_prop(inst, &k);
+        }
+    });
+}
+
 /// Evaluate and assign a class's instance-field initializers on `inst`.
 fn init_fields(cv: &ClassVal, inst: &Value) -> Result<(), String> {
+    install_private_methods(&cv.proto, inst);
     for (name, thunk, name_anon) in &cv.fields {
         init_one_field(inst, name, thunk, *name_anon)?;
     }
@@ -8622,6 +9079,19 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
             _ => {}
         }
     }
+    ordinary_has_instance(obj, ctor, true)
+}
+
+/// `OrdinaryHasInstance(C, O)` (7.3.21) behind `instanceof`: the
+/// prototype-chain walk with no `Symbol.hasInstance` lookup. `validate_rhs` is
+/// the operator's own step 4 — a right-hand side that is not callable is a
+/// TypeError; reached through `Function.prototype[Symbol.hasInstance]` instead,
+/// a non-callable `C` is simply `false`.
+pub fn ordinary_has_instance(
+    obj: &Value,
+    ctor: &Value,
+    validate_rhs: bool,
+) -> Result<bool, String> {
     // 13.10.2 InstanceofOperator validates the RIGHT-hand side FIRST, so
     // `1 instanceof 3` throws even though the left side could never match.
     // Returning early on the left side skipped that check entirely.
@@ -8634,6 +9104,9 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
                 | Some(JsObj::BoundFunc { .. })
         )
     });
+    if !ctor_callable && !validate_rhs {
+        return Ok(false);
+    }
     if !ctor_callable {
         // V8 has TWO messages here and they are not interchangeable: a primitive
         // right-hand side is "not an object", an object that is merely not
@@ -8752,7 +9225,26 @@ pub fn instance_of(obj: &Value, ctor: &Value) -> Result<bool, String> {
     with_host(|h| h.ensure_native_protos());
     let target = match with_host(|h| ctor_prototype(h, ctor)) {
         Some(p) => p,
-        None => return Ok(false),
+        None => {
+            // 7.3.21 step 5: `C.prototype` that is not an object is a
+            // TypeError. A function with no `[[Construct]]` (an arrow, a
+            // method, an async function) has no `prototype` at all.
+            let no_ctor = with_host(|h| match h.get(ctor) {
+                Some(JsObj::Func(fv)) => {
+                    fv.is_arrow
+                        || h.funcs
+                            .get(fv.def_id)
+                            .is_some_and(|d| d.is_async || d.is_method)
+                }
+                _ => false,
+            });
+            if no_ctor {
+                return Err(type_error(
+                    "Function has non-object prototype 'undefined' in instanceof check",
+                ));
+            }
+            return Ok(false);
+        }
     };
     let mut cur = with_host(|h| h.proto_of(obj));
     while let Some(p) = cur {
@@ -9115,8 +9607,10 @@ pub fn iter_take(v: &Value, n: usize) -> Result<Vec<Value>, String> {
                 _ => return Ok(out), // ran out on its own; nothing left to close
             }
         }
-        // Stopped early: `.return()` resumes it at the yield so `finally` runs.
-        let _ = gen_return(v, Value::Undef);
+        // Stopped early: `.return()` resumes it at the yield so `finally` runs,
+        // and a throw from that `finally` is the destructuring's (7.4.11 with a
+        // normal completion).
+        gen_return(v, Value::Undef)?;
         return Ok(out);
     }
     if let Some(iter_fn) = user_iterator_fn(v) {
@@ -9145,11 +9639,13 @@ fn take_from_iterator(iterator: &Value, n: usize) -> Result<Vec<Value>, String> 
             None => return Ok(out),
         }
     }
-    // IteratorClose: `return` is optional on the protocol, and a throw from
-    // it is swallowed here the way a normal (non-abrupt) completion does.
+    // IteratorClose (7.4.11) for a NORMAL completion: `return` is optional on
+    // the protocol, but when present its throw propagates and its result must
+    // be an object.
     if let Ok(ret) = get_prop_chain(iterator, "return") {
         if with_host(|h| is_callable(h, &ret)) {
-            let _ = invoke(&ret, Vec::new(), Some(iterator.clone()));
+            let result = invoke(&ret, Vec::new(), Some(iterator.clone()))?;
+            require_iter_result(&result)?;
         }
     }
     Ok(out)
@@ -9459,6 +9955,13 @@ pub(crate) fn drain_iterator(iterator: &Value) -> Result<Vec<Value>, String> {
 /// check a `next` returning a primitive read `done` as `undefined` forever, so
 /// the loop never ended.
 pub fn iterator_step_value(iterator: &Value) -> Result<Option<Value>, String> {
+    // `GetIteratorFromMethod` reads `next` once and every step CALLS that
+    // value, so a missing one is `undefined is not a function`, not a method
+    // lookup failure on the iterator.
+    let next = get_prop_chain(iterator, "next")?;
+    if !with_host(|h| is_callable(h, &next)) {
+        return Err(type_error(&not_a_function_message(&next)));
+    }
     let result = call_method(iterator, "next", Vec::new())?;
     require_iter_result(&result)?;
     // Read first: resolving the property re-enters the host, so doing it
@@ -9614,6 +10117,14 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
             }
             return Err(type_error("Cannot convert object to primitive value"));
         }
+        // 7.3.11 GetMethod: a present, non-nullish, non-callable value is a
+        // TypeError, worded the way V8 words a bad callee (type, then value).
+        if !with_host(|h| h.is_nullish(&f)) {
+            return Err(type_error(&format!(
+                "{} is not a function",
+                describe_non_callable(&f)
+            )));
+        }
     }
     // `Date.prototype[@@toPrimitive]` (21.4.4.45) treats the DEFAULT hint as
     // `"string"`, which is why `new Date() + 1` concatenates while
@@ -9624,6 +10135,20 @@ pub fn to_primitive(v: &Value, hint: &str) -> Result<Value, String> {
         hint
     };
     ordinary_to_primitive(v, hint)
+}
+
+/// V8's rendering of a non-callable value in an "is not a function" message
+/// for a `GetMethod` failure: `number 7`, `string "s"`, `boolean true`, and the
+/// bare type name for everything else.
+fn describe_non_callable(v: &Value) -> String {
+    with_host(|h| {
+        let t = h.type_of(v);
+        match t {
+            "number" | "boolean" => format!("{t} {}", h.str_of(v)),
+            "string" => format!("string \"{}\"", h.str_of(v)),
+            _ => t.to_string(),
+        }
+    })
 }
 
 /// `OrdinaryToPrimitive(O, hint)` (7.1.1.1): `valueOf` then `toString`, the

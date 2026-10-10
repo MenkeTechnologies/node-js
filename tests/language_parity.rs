@@ -761,3 +761,674 @@ console.log((0.5).toFixed(), (2.5).toFixed(), (1.45).toFixed(undefined), (5).toF
 "##;
     assert_eq!(run(src), expected.trim_matches('\n'));
 }
+
+// ── round 2: fdlibm Math, with, mapped arguments, capture reset, iterator close … ──
+
+// ── round 2: fdlibm Math, with, mapped arguments, capture reset, iterator close ──
+
+/// Math transcendentals are V8's own fdlibm port (with the reference build's fused multiply-adds), not the platform libm.
+#[test]
+fn r2_math_fdlibm() {
+    let src = r##"
+// V8's own fdlibm port, not the platform libm: the last digit differs from the
+// OS routines on a few percent of inputs (and between operating systems).
+const pts = {
+  acos: [0.5, 0.2, 0.3], acosh: [3, 1.4697952512651682, 1.2531569674611092],
+  asin: [0.5, -0.5, 0.3], asinh: [1.0000001, 0.6745, 1.0986122886681098],
+  atan: [0.5, -0.5, 2], atanh: [0.5, 0.00001, 0.7],
+  cbrt: [3.141592653589793, -3.141592653589793, 20],
+  cos: [20, 0.1, 1000, 1e10, 7839423874.3931055, 2442368315.5328035],
+  cosh: [2.356194490192345, 709.7827, 710],
+  exp: [0.99, 1.0986122886681098, -5.97647409270798, 1],
+  expm1: [1, 0.9, 1.0986122886681098],
+  log: [2.356194490192345, 710.4758600739439, 3],
+  log10: [3.141592653589793, 2.589974375417494, 1e-5],
+  log1p: [2, 0.2, -0.3014574636015158],
+  log2: [1.512998185120523, 1.3936608489602804, 10],
+  sin: [3.7495980865629996, -43097.51377654933, -204.9476324098623, 1e10, 7839423874.3931055, 1e22],
+  sinh: [2, -2, 3.141592653589793],
+  tan: [1, -1, 20, 5938765876.926481, 6631970780.435949, 1.5707963267948966],
+  tanh: [0.7, 0.99, 1.0000001],
+};
+for (const [fn, xs] of Object.entries(pts)) console.log(fn, xs.map((x) => Math[fn](x)).join(' '));
+console.log(Math.atan2(1, 2), Math.atan2(-3.5, 0.25), Math.atan2(0.1, -7), Math.atan2(-0, -0), Math.atan2(5, Infinity));
+console.log(Math.pow(2, 0.5), Math.hypot(3, 4), Math.sqrt(2), Math.exp(710), Math.exp(-746), Math.sinh(710.4758600739439), Math.cosh(-710.4758600739439));
+"##;
+    let expected = r##"
+acos 1.0471975511965979 1.369438406004566 1.2661036727794992
+acosh 1.7627471740390859 0.9349030762674887 0.6973417958547874
+asin 0.5235987755982989 -0.5235987755982989 0.3046926540153975
+asinh 0.8813736577302195 0.6316510591428517 0.9494131316918537
+atan 0.4636476090008061 -0.4636476090008061 1.1071487177940904
+atanh 0.5493061443340548 0.000010000000000333335 0.8673005276940531
+cbrt 1.4645918875615231 -1.4645918875615231 2.7144176165949063
+cos 0.40808206181339196 0.9950041652780257 0.5623790762907029 0.873119622676856 -0.8005125160765673 -0.11330348615670452
+cosh 5.322752149519959 8.988349783319008e+307 1.1169973830808557e+308
+exp 2.6912344723492625 3 0.002537758436996749 2.718281828459045
+expm1 1.718281828459045 1.4596031111569499 2
+log 0.8570478133976192 6.565934970990844 1.0986122886681096
+log10 0.4971498726941338 0.41329546729753175 -5
+log1p 1.0986122886681096 0.18232155679395462 -0.3587592053626123
+log2 0.5974102570066053 0.4788795202784467 3.321928094887362
+sin -0.5712314787562416 -0.9110215292098485 0.6773172597438981 -0.4875060250875107 -0.5993160364989106 -0.8522008497671888
+sinh 3.626860407847019 -3.626860407847019 11.548739357257748
+tan 1.5574077246549023 -1.5574077246549023 2.237160944224742 2.0682905512269794 1.3300676088320986 16331239353195370
+tanh 0.6043677771171636 0.7573623242165262 0.7615941979531959
+0.4636476090008061 -1.4994888620096063 3.1273079110023967 -3.141592653589793 0
+1.4142135623730951 5 1.4142135623730951 Infinity 0 1.7976931348621744e+308 1.7976931348621744e+308
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// Shortest round-trip digits: an exact tie takes the even last digit.
+#[test]
+fn r2_number_tostring_ties() {
+    let src = r##"
+// Shortest round-trip digits: an exact tie between two candidates takes the EVEN last digit.
+console.log(25577030267034.8125, 6.0487079387530684 ** 17, 8.869114365428686 ** 14.62094928137958);
+console.log((25577030267034.8125).toExponential(), (25577030267034.8125).toPrecision(17), String(1124215372052873.25));
+console.log(0.1 + 0.2, 1 / 3, 2 ** 70, 5e-324, 1.7976931348623157e308, 123456789.12345678);
+"##;
+    let expected = r##"
+25577030267034.812 19420681127215.562 72261859708629.62
+2.5577030267034812e+13 25577030267034.813 1124215372052873.2
+0.30000000000000004 0.3333333333333333 1.1805916207174113e+21 5e-324 1.7976931348623157e+308 123456789.12345678
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// parseInt/Number radix algorithms and the StringNumericLiteral grammar.
+#[test]
+fn r2_number_parse_radix() {
+    let src = r##"
+// parseInt past 2^53 in radixes 2/4/8/16/32 rounds half-to-even exactly; the other radixes use V8's
+// 32-bit chunked accumulation, which is only approximately the true value.
+const s = ['9007199254740993', '123456789012345678901234567890', 'zzzzzzzzzzzzzzzzzzzz', 'ffffffffffffffffffffff',
+  '0x1fffffffffffff1', '0x20000000000001', '0x20000000000003', '0b' + '1'.repeat(70), '0o' + '7'.repeat(30)];
+for (const x of s) console.log(JSON.stringify(x), Number(x), parseInt(x, 36), parseInt(x, 16), parseInt(x, 8), parseInt(x, 32), parseInt(x, 7), parseInt(x));
+// StringNumericLiteral grammar: Rust's float parser accepts more than JS does.
+for (const x of ['infinity', 'inf', 'nan', '1e', '.5', '5.', '+.5e1', '-.5', '1_0', '0x', '+0x10', '1e+', '  12\n', 'Infinity', '-Infinity', '+Infinity', '0b102', '0o8'])
+  console.log(JSON.stringify(x), Number(x));
+console.log(Infinity.toPrecision(-1), NaN.toExponential(200), Infinity.toExponential(-3));
+"##;
+    let expected = r##"
+"9007199254740993" 9007199254740992 1.9896986116031812e+24 10378291982571407000 NaN 3.400185036980776e+23 NaN 9007199254740992
+"123456789012345678901234567890" 1.2345678901234568e+29 1.436287679432363e+45 9.452287968736547e+34 342391 4.752541744701159e+43 22875 1.2345678901234568e+29
+"zzzzzzzzzzzzzzzzzzzz" NaN 1.3367494538843734e+31 NaN NaN NaN NaN NaN
+"ffffffffffffffffffffff" NaN 7.424688395289205e+33 3.094850098213451e+26 NaN 6.2810042643566465e+32 NaN NaN
+"0x1fffffffffffff1" 144115188075855860 7.304212125376293e+24 144115188075855860 0 0 0 144115188075855860
+"0x20000000000001" 9007199254740992 2.0299225653369807e+23 9007199254740992 0 0 0 9007199254740992
+"0x20000000000003" 9007199254740996 2.0299225653369807e+23 9007199254740996 0 0 0 9007199254740996
+"0b1111111111111111111111111111111111111111111111111111111111111111111111" 1.1805916207174113e+21 9.63150853960049e+109 2.1498869073964735e+85 0 2.530246860221305e+106 0 0
+"0o777777777777777777777777777777" 1.2379400392853803e+27 1.18274300713268e+48 0 0 3.4576226362005674e+46 0 0
+"infinity" NaN
+"inf" NaN
+"nan" NaN
+"1e" NaN
+".5" 0.5
+"5." 5
+"+.5e1" 5
+"-.5" -0.5
+"1_0" NaN
+"0x" NaN
+"+0x10" NaN
+"1e+" NaN
+"  12\n" 12
+"Infinity" Infinity
+"-Infinity" -Infinity
+"+Infinity" Infinity
+"0b102" NaN
+"0o8" NaN
+Infinity NaN Infinity
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// JSON.parse escape errors; JSON.stringify with a property list over exotics, boxed symbols and empty results.
+#[test]
+fn r2_json_edges() {
+    let src = r##"
+const P = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } };
+for (const s of ['"\\x41"', '"\\u00"', '"\\u00zz"', '"\\ud83d\\ude00"', '"a\\', '"\\u004', '"\\q"', '"\\uD83D\\uDE00!"', '"\\u0041\\u00e9"'])
+  console.log(JSON.stringify(s), P(() => JSON.stringify(JSON.parse(s))));
+console.log(P(() => JSON.stringify(new Set([1]), ['1', 0], 1)));
+console.log(P(() => JSON.stringify(/re/g, (k, v) => v, '\t')));
+console.log(P(() => JSON.stringify(Object(Symbol('b')))), P(() => JSON.stringify([Object(Symbol('b'))])), P(() => JSON.stringify({ k: Object(Symbol('b')) })));
+console.log(P(() => JSON.stringify(new Uint8Array([1, 2]), ['1', 0])));
+console.log(P(() => JSON.stringify(new Uint8Array([1, 2]), ['1', 0], 2)));
+console.log(P(() => JSON.stringify(Object.create({ a: 1 }), ['a'])), P(() => JSON.stringify(Object.defineProperty({}, 'x', { value: 1 }), ['x'])));
+console.log(P(() => JSON.stringify(Object.assign(new Map(), { a: 1 }), null, 1)), P(() => JSON.stringify(Math, null, 2)));
+"##;
+    let expected = r##"
+"\"\\x41\"" SyntaxError: Bad escaped character in JSON at position 2 (line 1 column 3)
+"\"\\u00\"" SyntaxError: Bad Unicode escape in JSON at position 5 (line 1 column 6)
+"\"\\u00zz\"" SyntaxError: Bad Unicode escape in JSON at position 5 (line 1 column 6)
+"\"\\ud83d\\ude00\"" "😀"
+"\"a\\" SyntaxError: Unexpected end of JSON input
+"\"\\u004" SyntaxError: Bad Unicode escape in JSON at position 6 (line 1 column 7)
+"\"\\q\"" SyntaxError: Bad escaped character in JSON at position 2 (line 1 column 3)
+"\"\\uD83D\\uDE00!\"" "😀!"
+"\"\\u0041\\u00e9\"" "Aé"
+{}
+{}
+{} [{}] {"k":{}}
+{"1":2,"0":1}
+{
+  "1": 2,
+  "0": 1
+}
+{"a":1} {"x":1}
+{
+ "a": 1
+} {}
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// Array mutators on array-likes keep holes and length rules; ArraySpeciesCreate with non-array constructors.
+#[test]
+fn r2_array_generic_species() {
+    let src = r##"
+const P = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } };
+for (const lk of [{ length: 1.9, 0: 4 }, { length: 3, 0: 1, 2: 3 }, { length: '2', 0: 'a', 1: 'b' }, { length: -1 }, { length: NaN, 0: 1 }, { length: 3, 1: 'x' }]) {
+  for (const m of ['push', 'pop', 'shift', 'unshift', 'reverse', 'sort', 'splice', 'fill', 'copyWithin']) {
+    const o = Object.assign({}, lk);
+    const args = { push: [9], unshift: [0], splice: [0, 1], fill: ['f'], copyWithin: [0, 1] }[m] || [];
+    console.log(JSON.stringify(lk), m, P(() => Array.prototype[m].apply(o, args)), JSON.stringify(o), Object.keys(o).join());
+  }
+}
+console.log(P(() => Array.prototype.push.call('abc', 1)));
+class MyArr extends Array {}
+const mkB = (S) => { class B extends Array { static get [Symbol.species]() { return S; } } return B.from([1, 2, 3]); };
+const desc = (d) => Object.prototype.toString.call(d) + ':' + (d instanceof Array) + ':' + d.length + ':' + Object.keys(d).join();
+for (const [label, S] of [['Object', Object], ['one', 1], ['fnLen', function (n) { return { length: n }; }], ['fn0', function () { return { length: 0 }; }], ['Array', Array], ['undef', undefined], ['null', null], ['arrow', () => {}]]) {
+  for (const m of ['map((x) => x)', 'filter(() => true)', 'slice()', 'splice(0, 1)', 'concat([1])', 'flat()', 'flatMap((x) => [x])']) {
+    console.log(label, m, P(() => desc(eval('mkB(S).' + m))));
+  }
+}
+"##;
+    let expected = r##"
+{"0":4,"length":1.9} push 2 {"0":4,"1":9,"length":2} 0,1,length
+{"0":4,"length":1.9} pop 4 {"length":0} length
+{"0":4,"length":1.9} shift 4 {"length":0} length
+{"0":4,"length":1.9} unshift 2 {"0":0,"1":4,"length":2} 0,1,length
+{"0":4,"length":1.9} reverse [object Object] {"0":4,"length":1.9} 0,length
+{"0":4,"length":1.9} sort [object Object] {"0":4,"length":1.9} 0,length
+{"0":4,"length":1.9} splice 4 {"length":0} length
+{"0":4,"length":1.9} fill [object Object] {"0":"f","length":1.9} 0,length
+{"0":4,"length":1.9} copyWithin [object Object] {"0":4,"length":1.9} 0,length
+{"0":1,"2":3,"length":3} push 4 {"0":1,"2":3,"3":9,"length":4} 0,2,3,length
+{"0":1,"2":3,"length":3} pop 3 {"0":1,"length":2} 0,length
+{"0":1,"2":3,"length":3} shift 1 {"1":3,"length":2} 1,length
+{"0":1,"2":3,"length":3} unshift 4 {"0":0,"1":1,"3":3,"length":4} 0,1,3,length
+{"0":1,"2":3,"length":3} reverse [object Object] {"0":3,"2":1,"length":3} 0,2,length
+{"0":1,"2":3,"length":3} sort [object Object] {"0":1,"1":3,"length":3} 0,1,length
+{"0":1,"2":3,"length":3} splice 1 {"1":3,"length":2} 1,length
+{"0":1,"2":3,"length":3} fill [object Object] {"0":"f","1":"f","2":"f","length":3} 0,1,2,length
+{"0":1,"2":3,"length":3} copyWithin [object Object] {"1":3,"2":3,"length":3} 1,2,length
+{"0":"a","1":"b","length":"2"} push 3 {"0":"a","1":"b","2":9,"length":3} 0,1,2,length
+{"0":"a","1":"b","length":"2"} pop b {"0":"a","length":1} 0,length
+{"0":"a","1":"b","length":"2"} shift a {"0":"b","length":1} 0,length
+{"0":"a","1":"b","length":"2"} unshift 3 {"0":0,"1":"a","2":"b","length":3} 0,1,2,length
+{"0":"a","1":"b","length":"2"} reverse [object Object] {"0":"b","1":"a","length":"2"} 0,1,length
+{"0":"a","1":"b","length":"2"} sort [object Object] {"0":"a","1":"b","length":"2"} 0,1,length
+{"0":"a","1":"b","length":"2"} splice a {"0":"b","length":1} 0,length
+{"0":"a","1":"b","length":"2"} fill [object Object] {"0":"f","1":"f","length":"2"} 0,1,length
+{"0":"a","1":"b","length":"2"} copyWithin [object Object] {"0":"b","1":"b","length":"2"} 0,1,length
+{"length":-1} push 1 {"0":9,"length":1} 0,length
+{"length":-1} pop undefined {"length":0} length
+{"length":-1} shift undefined {"length":0} length
+{"length":-1} unshift 1 {"0":0,"length":1} 0,length
+{"length":-1} reverse [object Object] {"length":-1} length
+{"length":-1} sort [object Object] {"length":-1} length
+{"length":-1} splice  {"length":0} length
+{"length":-1} fill [object Object] {"length":-1} length
+{"length":-1} copyWithin [object Object] {"length":-1} length
+{"0":1,"length":null} push 1 {"0":9,"length":1} 0,length
+{"0":1,"length":null} pop undefined {"0":1,"length":0} 0,length
+{"0":1,"length":null} shift undefined {"0":1,"length":0} 0,length
+{"0":1,"length":null} unshift 1 {"0":0,"length":1} 0,length
+{"0":1,"length":null} reverse [object Object] {"0":1,"length":null} 0,length
+{"0":1,"length":null} sort [object Object] {"0":1,"length":null} 0,length
+{"0":1,"length":null} splice  {"0":1,"length":0} 0,length
+{"0":1,"length":null} fill [object Object] {"0":1,"length":null} 0,length
+{"0":1,"length":null} copyWithin [object Object] {"0":1,"length":null} 0,length
+{"1":"x","length":3} push 4 {"1":"x","3":9,"length":4} 1,3,length
+{"1":"x","length":3} pop undefined {"1":"x","length":2} 1,length
+{"1":"x","length":3} shift undefined {"0":"x","length":2} 0,length
+{"1":"x","length":3} unshift 4 {"0":0,"2":"x","length":4} 0,2,length
+{"1":"x","length":3} reverse [object Object] {"1":"x","length":3} 1,length
+{"1":"x","length":3} sort [object Object] {"0":"x","length":3} 0,length
+{"1":"x","length":3} splice  {"0":"x","length":2} 0,length
+{"1":"x","length":3} fill [object Object] {"0":"f","1":"f","2":"f","length":3} 0,1,2,length
+{"1":"x","length":3} copyWithin [object Object] {"0":"x","length":3} 0,length
+TypeError: Cannot assign to read only property 'length' of object '[object String]'
+Object map((x) => x) [object Number]:false:undefined:0,1,2
+Object filter(() => true) [object Number]:false:undefined:0,1,2
+Object slice() [object Number]:false:3:0,1,2,length
+Object splice(0, 1) [object Number]:false:1:0,length
+Object concat([1]) [object Number]:false:4:0,1,2,3,length
+Object flat() [object Number]:false:undefined:0,1,2
+Object flatMap((x) => [x]) [object Number]:false:undefined:0,1,2
+one map((x) => x) TypeError: object.constructor[Symbol.species] is not a constructor
+one filter(() => true) TypeError: object.constructor[Symbol.species] is not a constructor
+one slice() TypeError: object.constructor[Symbol.species] is not a constructor
+one splice(0, 1) TypeError: object.constructor[Symbol.species] is not a constructor
+one concat([1]) TypeError: object.constructor[Symbol.species] is not a constructor
+one flat() TypeError: object.constructor[Symbol.species] is not a constructor
+one flatMap((x) => [x]) TypeError: object.constructor[Symbol.species] is not a constructor
+fnLen map((x) => x) [object Object]:false:3:0,1,2,length
+fnLen filter(() => true) [object Object]:false:0:0,1,2,length
+fnLen slice() [object Object]:false:3:0,1,2,length
+fnLen splice(0, 1) [object Object]:false:1:0,length
+fnLen concat([1]) [object Object]:false:4:0,1,2,3,length
+fnLen flat() [object Object]:false:0:0,1,2,length
+fnLen flatMap((x) => [x]) [object Object]:false:0:0,1,2,length
+fn0 map((x) => x) [object Object]:false:0:0,1,2,length
+fn0 filter(() => true) [object Object]:false:0:0,1,2,length
+fn0 slice() [object Object]:false:3:0,1,2,length
+fn0 splice(0, 1) [object Object]:false:1:0,length
+fn0 concat([1]) [object Object]:false:4:0,1,2,3,length
+fn0 flat() [object Object]:false:0:0,1,2,length
+fn0 flatMap((x) => [x]) [object Object]:false:0:0,1,2,length
+Array map((x) => x) [object Array]:true:3:0,1,2
+Array filter(() => true) [object Array]:true:3:0,1,2
+Array slice() [object Array]:true:3:0,1,2
+Array splice(0, 1) [object Array]:true:1:0
+Array concat([1]) [object Array]:true:4:0,1,2,3
+Array flat() [object Array]:true:3:0,1,2
+Array flatMap((x) => [x]) [object Array]:true:3:0,1,2
+undef map((x) => x) [object Array]:true:3:0,1,2
+undef filter(() => true) [object Array]:true:3:0,1,2
+undef slice() [object Array]:true:3:0,1,2
+undef splice(0, 1) [object Array]:true:1:0
+undef concat([1]) [object Array]:true:4:0,1,2,3
+undef flat() [object Array]:true:3:0,1,2
+undef flatMap((x) => [x]) [object Array]:true:3:0,1,2
+null map((x) => x) [object Array]:true:3:0,1,2
+null filter(() => true) [object Array]:true:3:0,1,2
+null slice() [object Array]:true:3:0,1,2
+null splice(0, 1) [object Array]:true:1:0
+null concat([1]) [object Array]:true:4:0,1,2,3
+null flat() [object Array]:true:3:0,1,2
+null flatMap((x) => [x]) [object Array]:true:3:0,1,2
+arrow map((x) => x) TypeError: object.constructor[Symbol.species] is not a constructor
+arrow filter(() => true) TypeError: object.constructor[Symbol.species] is not a constructor
+arrow slice() TypeError: object.constructor[Symbol.species] is not a constructor
+arrow splice(0, 1) TypeError: object.constructor[Symbol.species] is not a constructor
+arrow concat([1]) TypeError: object.constructor[Symbol.species] is not a constructor
+arrow flat() TypeError: object.constructor[Symbol.species] is not a constructor
+arrow flatMap((x) => [x]) TypeError: object.constructor[Symbol.species] is not a constructor
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// Sloppy-mode mapped arguments object aliases the parameters.
+#[test]
+fn r2_mapped_arguments() {
+    let src = r##"
+function f(a, b) { arguments[0] = 7; b = 9; return [a, arguments[1], arguments.length]; }
+console.log(f(1, 2), f(1), f());
+function g(a) { a = 5; return arguments[0]; }
+console.log(g(1), g());
+function h(a) { 'use strict'; arguments[0] = 7; a = 3; return [a, arguments[0]]; }
+console.log(h(1));
+function k(a, a2) { delete arguments[0]; a = 9; return [arguments[0], a]; }
+console.log(k(1, 2));
+function d(a, a) { arguments[0] = 'x'; arguments[1] = 'y'; return a; }
+console.log(d(1, 2));
+function c(a) { const cl = () => { a = 11; }; cl(); return arguments[0]; }
+console.log(c(1));
+function dflt(a, b = 2) { arguments[0] = 9; return a; }
+console.log(dflt(1));
+function va(a) { var a = 4; return arguments[0]; }
+console.log(va(1));
+function ev(a) { eval('a = 8'); return arguments[0]; }
+console.log(ev(1));
+function ar(a) { return (() => { arguments[0] = 6; return a; })(); }
+console.log(ar(1));
+function sw(a, b) { [].reverse.call(arguments); return [a, b, arguments[0], arguments[1]]; }
+console.log(sw(1, 2));
+"##;
+    let expected = r##"
+[ 7, 9, 2 ] [ 7, undefined, 1 ] [ undefined, undefined, 0 ]
+5 undefined
+[ 3, 7 ]
+[ undefined, 9 ]
+y
+11
+1
+4
+8
+6
+[ 2, 1, 2, 1 ]
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// The with statement, Symbol.unscopables and direct eval inside it.
+#[test]
+fn r2_with_statement() {
+    let src = r##"
+var o = { a: 1, b: 2, f() { return this === o; } };
+var a = 'outer', c = 'c';
+with (o) {
+  console.log(a, b, c, typeof a, typeof zzz);
+  a = 10; c = 'C2';
+  var d = 5;
+  console.log(f(), (() => a)());
+  var a = 77;
+}
+console.log(o.a, c, d, a);
+with ({ x: 1 }) { var x = 2; }
+console.log(x);
+with ([1, 2, 3]) { console.log(length, typeof push, join('-')); }
+with ('abc') { console.log(length, toUpperCase()); }
+try { with (null) {} } catch (e) { console.log(e.constructor.name, e.message); }
+var p = { v: 1 };
+function g() { with (p) { v++; v += 2; return function () { return v; }; } }
+var h = g(); p.v = 100; console.log(h(), p.v);
+with ({ [Symbol.unscopables]: { hid: true }, hid: 5, vis: 6 }) { var hid = 'x'; console.log(typeof vis, typeof hid, hid); }
+console.log(hid);
+with (Math) { console.log(max(1, 2), PI > 3, floor(2.5)); }
+function k(arg) { with (arg) { return z; } }
+try { k({}); } catch (e) { console.log(e.name + ': ' + e.message); }
+label: with ({}) { break label; }
+for (var i = 0; i < 3; i++) { with ({ i2: i }) { if (i2 == 1) continue; console.log(i2); } }
+var q = { a: 1 };
+with (q) { console.log(eval('a'), eval('a = 5; a'), q.a); eval('var qq = 9'); }
+console.log(qq);
+function s() { 'use strict'; try { eval('with ({}) {}'); } catch (e) { console.log(e.name, e.message); } }
+s();
+try { eval('"use strict"; with ({}) {}'); } catch (e) { console.log(e.name, e.message); }
+console.log(new Function('o', 'with (o) { return x + 1 }')({ x: 4 }));
+with ({ g: function () { return typeof this; } }) console.log(g());
+"##;
+    let expected = r##"
+1 2 c number undefined
+true 10
+77 C2 5 outer
+undefined
+3 function 1-2-3
+3 ABC
+TypeError Cannot convert undefined or null to object
+100 100
+number string x
+x
+2 true 2
+ReferenceError: z is not defined
+0
+2
+1 5 5
+9
+SyntaxError Strict mode code may not include a with statement
+SyntaxError Strict mode code may not include a with statement
+5
+object
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// super.x = v, compound and update forms, static and object-literal homes.
+#[test]
+fn r2_super_assignment() {
+    let src = r##"
+class A { get v() { return this._v; } set v(x) { this._v = x; } static set sv(x) { A._sv = x; } }
+class B extends A {
+  set v(x) { super.v = x + '!'; }
+  get v() { return 'B>' + super.v; }
+  inc() { super.v += 5; super['v'] *= 2; return this._v; }
+  upd() { super.v++; return this._v; }
+  setNew() { super.fresh = 1; return Object.keys(this).join(); }
+  static st() { super.sv = 'S'; return A._sv; }
+}
+const b = new B(); b._v = 1;
+console.log(b.inc(), b.upd(), b.setNew(), B.st());
+b.v = 'x'; console.log(b._v, b.v);
+const o = { __proto__: { set p(x) { this.got = x; } }, m() { super.p = 7; return this.got; } };
+console.log(o.m());
+class R { get ro() { return 1; } }
+class S extends R { w() { 'use strict'; try { super.ro = 2; } catch (e) { return e.constructor.name; } return 'no throw'; } }
+console.log(new S().w());
+"##;
+    let expected = r##"
+12 13 _v,fresh S
+x! B>x!
+7
+TypeError
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// Captures inside a quantified group reset on every iteration; empty iterations are rejected under min 0.
+#[test]
+fn r2_regexp_capture_reset() {
+    let src = r##"
+// RepeatMatcher step 4 clears the captures inside a group at the start of every iteration.
+console.log(/(z)((a+)?(b+)?(c))*/.exec('zaacbbbcac'));
+console.log(/(?:(a)|b)*/.exec('ab'));
+console.log(/(?:(a)|(b))+/.exec('ab'));
+console.log(/(a)|b/.exec('b'));
+console.log(/(?:(a)|b){2}/.exec('ab'), /(?:(a)|b){2}/.exec('ba'));
+console.log('aab'.replace(/(?:(a)|(b))+/, '[$1|$2]'));
+console.log(/(?<x>a)|(?<y>b)/.exec('b').groups);
+console.log(/(?:(?:(a)|b)c)*/.exec('acbc'));
+console.log(/(a*)*/.exec('b'), /(a*)+/.exec('b'), /(a*)?/.exec('b'), /(?:(a*))?/.exec('b'));
+console.log(/(?:(a)|(b)){0,2}x/.exec('abx'));
+console.log('abc'.split(/(?:(a)|(b))+/));
+console.log([...'ab'.matchAll(/(?:(a)|(b))+/g)].map((m) => m.slice()));
+console.log(/(?:a(b)?)+/.exec('aba'), /(?:(?=(a))a|b)+/.exec('ab'));
+console.log(/(a*)*b/.exec('aab'), /(a|)*/.exec('ab'), /(a*){2,}/.exec('aa'));
+"##;
+    let expected = r##"
+[
+  'zaacbbbcac',
+  'z',
+  'ac',
+  'a',
+  undefined,
+  'c',
+  index: 0,
+  input: 'zaacbbbcac',
+  groups: undefined
+]
+[ 'ab', undefined, index: 0, input: 'ab', groups: undefined ]
+[ 'ab', undefined, 'b', index: 0, input: 'ab', groups: undefined ]
+[ 'b', undefined, index: 0, input: 'b', groups: undefined ]
+[ 'ab', undefined, index: 0, input: 'ab', groups: undefined ] [ 'ba', 'a', index: 0, input: 'ba', groups: undefined ]
+[|b]
+[Object: null prototype] { x: undefined, y: 'b' }
+[ 'acbc', undefined, index: 0, input: 'acbc', groups: undefined ]
+[ '', undefined, index: 0, input: 'b', groups: undefined ] [ '', '', index: 0, input: 'b', groups: undefined ] [ '', undefined, index: 0, input: 'b', groups: undefined ] [ '', undefined, index: 0, input: 'b', groups: undefined ]
+[ 'abx', undefined, 'b', index: 0, input: 'abx', groups: undefined ]
+[ '', undefined, 'b', 'c' ]
+[ [ 'ab', undefined, 'b' ] ]
+[ 'aba', undefined, index: 0, input: 'aba', groups: undefined ] [ 'ab', undefined, index: 0, input: 'ab', groups: undefined ]
+[ 'aab', 'aa', index: 0, input: 'aab', groups: undefined ] [ 'a', 'a', index: 0, input: 'ab', groups: undefined ] [ 'aa', '', index: 0, input: 'aa', groups: undefined ]
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// Computed field keys evaluate in source order; static initializers see this; private names are own-only; super() from an arrow.
+#[test]
+fn r2_class_fields_order() {
+    let src = r##"
+const log = [];
+const key = (n) => { log.push('key:' + n); return n; };
+class C { [key('a')] = 1; static [key('s')] = 2; [key('b')]() {} static { log.push('blk'); } static [key('t')] = log.push('init t'); get [key('g')]() { return 1; } }
+console.log(log.join());
+console.log(Object.getOwnPropertyNames(new C()).join(), Object.getOwnPropertyNames(C).join());
+class A { static x = 1; static y = this.x + 1; static f = () => this.y; static g() { return this.x; } static { this.z = this.f() + 1; } static #p = this.x + 100; static getP() { return A.#p; } static fn = function () {}; static #pf = () => 1; static pfn() { return A.#pf.name; } }
+class B extends A { static x = 10; static { this.w = super.g() + this.z; } static s = super.g(); }
+console.log(A.x, A.y, A.f(), A.z, B.x, B.y, B.z, B.w, B.s, A.getP(), A.fn.name, A.pfn());
+class P { #x = 1; static read(o) { return o.#x; } static write(o) { o.#x = 2; } static call(o) { return o.#m(); } #m() { return 1; } }
+const P1 = (f) => { try { return String(f()); } catch (e) { return e.constructor.name + ': ' + e.message; } };
+console.log(P1(() => P.read({})), P1(() => P.write({})), P1(() => P.call({})), P1(() => P.read(Object.create(new P()))), P1(() => P.read(null)), P1(() => P.read(new P())), P1(() => P.call(new P())));
+const L = [];
+class Base { constructor() { L.push('A:' + new.target.name); } }
+class Der extends Base { f = L.push('Der.f'); constructor() { const g = () => super(); L.push('pre'); g(); L.push('post'); } }
+new Der();
+console.log(L.join(' | '));
+"##;
+    let expected = r##"
+key:a,key:s,key:b,key:t,key:g,blk,init t
+a length,name,prototype,s,t
+1 2 2 3 10 2 3 13 10 101 fn #pf
+TypeError: Cannot read private member #x from an object whose class did not declare it TypeError: Cannot write private member #x to an object whose class did not declare it TypeError: Receiver must be an instance of class P TypeError: Cannot read private member #x from an object whose class did not declare it TypeError: Cannot read properties of null (reading '#x') 1 1
+pre | A:Der | Der.f | post
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// try/finally completion values when the finally block breaks.
+#[test]
+fn r2_completion_values() {
+    let src = r##"
+for (const src of ['1; do { 2; try { 5; } finally { break; } } while (false)', '1; l: do { 2; try { 5; } finally { break l; } } while (true)',
+  '1; do { try { 2; break; } finally { 3; } } while (false)', '1; do { 2; try { break; } finally { 3; } } while (false)',
+  '1; for (var i = 0; i < 3; i++) { try { i; } finally { continue; } }', '1; try { 2; } finally { 3; }', 'do { 4; try { 5; } finally { 6; break; } } while (0)'])
+  console.log(JSON.stringify(src), (0, eval)(src));
+"##;
+    let expected = r##"
+"1; do { 2; try { 5; } finally { break; } } while (false)" undefined
+"1; l: do { 2; try { 5; } finally { break l; } } while (true)" undefined
+"1; do { try { 2; break; } finally { 3; } } while (false)" 2
+"1; do { 2; try { break; } finally { 3; } } while (false)" undefined
+"1; for (var i = 0; i < 3; i++) { try { i; } finally { continue; } }" undefined
+"1; try { 2; } finally { 3; }" 2
+"do { 4; try { 5; } finally { 6; break; } } while (0)" 6
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// IteratorClose on throw/break/destructuring, and yield* delegating return/throw.
+#[test]
+fn r2_iterator_close() {
+    let src = r##"
+const log = [];
+const mk = (n, o = {}) => ({ [Symbol.iterator]() { let i = 0; return { next() { log.push('next' + i); return i < n ? { value: i++, done: false } : { value: undefined, done: true }; }, return(v) { log.push('return'); if (o.throwReturn) throw new Error('rt'); return o.bad ? 1 : { done: true }; } }; } });
+let tn = 0;
+const T = (f) => { log.length = 0; let r; try { r = f(); } catch (e) { r = 'E:' + e.message; } console.log(++tn, r, log.join(' ')); };
+T(() => { for (const x of mk(3)) { throw new Error('body'); } });
+T(() => { for (const x of mk(3, { throwReturn: true })) { throw new Error('body'); } });
+T(() => { for (const x of mk(3, { throwReturn: true })) { break; } });
+T(() => { for (const x of mk(3, { bad: true })) { break; } });
+T(() => { const [a] = mk(3); return a; });
+T(() => { const [a] = mk(3, { throwReturn: true }); return a; });
+T(() => { const [a, b, c, d] = mk(3, { throwReturn: true }); return a; });
+T(() => { const [a, ...r] = mk(3, { throwReturn: true }); return a; });
+T(() => { const [{ x }] = [null]; });
+T(() => { const [a] = mk(1, { bad: true }); return a; });
+T(() => { function* g() { try { yield 1; yield 2; } finally { log.push('gfin'); } } const [a] = g(); return a; });
+T(() => { function* g() { try { yield 1; } finally { log.push('gfin'); } } for (const x of g()) { throw new Error('b'); } });
+T(() => { return Array.from(mk(3), (x) => { if (x == 1) throw new Error('m'); return x; }); });
+T(() => { const [x, y] = mk(2, { throwReturn: true }); return x + y; });
+T(() => { const it = { [Symbol.iterator]: () => ({}) }; const [a] = it; });
+T(() => { const it = { [Symbol.iterator]: () => ({ next: () => 1 }) }; for (const x of it); });
+function* g1() { try { yield* mk(3, { throwReturn: false }); } finally { log.push('g-finally'); } }
+function* g2() { try { yield* mk(3, { throwReturn: true }); } finally { log.push('g-finally'); } }
+for (const [name, g, how] of [['ret', g1, (it) => it.return(9)], ['retThrow', g2, (it) => it.return(9)], ['thr', g1, (it) => it.throw(new Error('t'))], ['thrThrow', g2, (it) => it.throw(new Error('t'))]]) {
+  T(() => { log.length = 0; const it = g(); it.next(); return JSON.stringify(how(it)); });
+}
+T(() => { function* inner() { try { yield 1; yield 2; } catch (e) { yield 'caught ' + e; } } function* outer() { const r = yield* inner(); yield 'r:' + r; } const it = outer(); it.next(); return JSON.stringify([it.throw('X'), it.next(), it.next()]); });
+"##;
+    let expected = r##"
+1 E:body next0 return
+2 E:body next0 return
+3 E:rt next0 return
+4 E:Iterator result 1 is not an object next0 return
+5 0 next0 return
+6 E:rt next0 return
+7 0 next0 next1 next2 next3
+8 0 next0 next1 next2 next3
+9 E:Cannot read properties of null (reading 'x') 
+10 E:Iterator result 1 is not an object next0 return
+11 1 gfin
+12 E:b gfin
+13 E:m next0 next1 return
+14 E:rt next0 next1 return
+15 E:undefined is not a function 
+16 E:Iterator result 1 is not an object 
+17 {"done":true} next0 return g-finally
+18 E:rt next0 return g-finally
+19 E:The iterator does not provide a 'throw' method. next0 return g-finally
+20 E:rt next0 return g-finally
+21 [{"value":"caught X","done":false},{"value":"r:undefined","done":false},{"done":true}] 
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// Revoked and non-callable proxies, setPrototypeOf forwarding, for-in and construct trap order.
+#[test]
+fn r2_proxy_invariants() {
+    let src = r##"
+const P = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } };
+const r1 = Proxy.revocable({ a: 1 }, {});
+r1.revoke();
+console.log(P(() => r1.proxy()), P(() => new r1.proxy()), P(() => typeof r1.proxy), P(() => Array.isArray(r1.proxy)), P(() => Object.prototype.toString.call(r1.proxy)));
+const r2 = Proxy.revocable(function () { return 1; }, {});
+console.log(P(() => r2.proxy()));
+r2.revoke();
+console.log(P(() => r2.proxy()), P(() => new r2.proxy()));
+const frozen = new Proxy(Object.freeze({ k: 1 }), {});
+console.log(P(() => Object.setPrototypeOf(frozen, {})), P(() => Reflect.setPrototypeOf(frozen, {})), P(() => Reflect.setPrototypeOf(frozen, Object.prototype)));
+const log = [];
+const h = new Proxy({}, { get(_, trap) { log.push(trap); return undefined; } });
+const p = new Proxy({ a: 1 }, h);
+for (const k in p) {}
+try { p(); } catch (e) {}
+try { new p(); } catch (e) {}
+console.log(log.join());
+log.length = 0;
+const pf = new Proxy(function () {}, h);
+try { new pf(); } catch (e) {}
+console.log(log.join(), JSON.stringify(new Proxy(function () {}, {})), JSON.stringify({ f: new Proxy(function () {}, {}) }));
+"##;
+    let expected = r##"
+TypeError: r1.proxy is not a function TypeError: r1.proxy is not a constructor object TypeError: Cannot perform 'IsArray' on a proxy that has been revoked TypeError: Cannot perform 'Object.prototype.toString' on a proxy that has been revoked
+1
+TypeError: Cannot perform 'apply' on a proxy that has been revoked TypeError: Cannot perform 'construct' on a proxy that has been revoked
+TypeError: #<Object> is not extensible false true
+ownKeys,getPrototypeOf,getOwnPropertyDescriptor
+construct,get undefined {}
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// toPrimitive method checks, hasInstance, keyFor, RegExp(regexp-like), Object.assign refusals, static call/apply.
+#[test]
+fn r2_symbol_protocols() {
+    let src = r##"
+const P = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } };
+for (const v of [7, 'str', {}, true, 1n, Symbol('q')]) {
+  console.log(P(() => +{ [Symbol.toPrimitive]: v }), P(() => new Date({ [Symbol.toPrimitive]: v })));
+}
+console.log(new Date({ [Symbol.toPrimitive]: () => 5 }).getTime(), new Date({ valueOf() { return 6; } }).getTime(), new Date({ toString() { return '2020-01-01'; } }).getTime(), new Date({ [Symbol.toPrimitive]: () => '2020-01-02' }).getTime());
+console.log(P(() => Symbol.keyFor('x')), P(() => Symbol.keyFor(Symbol.for('k'))));
+class Even { static [Symbol.hasInstance](n) { return n % 2 === 0; } }
+console.log(P(() => 2 instanceof Even), P(() => 3 instanceof Even), P(() => Function.prototype[Symbol.hasInstance].call(Even, 4)), P(() => Function.prototype[Symbol.hasInstance].call(Even, new Even())), P(() => Function.prototype[Symbol.hasInstance].call({}, {})));
+console.log(P(() => ({}) instanceof (() => {})), P(() => ({}) instanceof (async function () {})), P(() => ({ m() {} }).m instanceof Object));
+const re = /a/; re[Symbol.match] = true;
+console.log(RegExp(re) === re, new RegExp(re) === re, RegExp({ [Symbol.match]: true, source: 'q', flags: 'g', constructor: RegExp }).flags, RegExp(/x/g, 'i').flags);
+const m = new Map();
+console.log(P(() => Object.assign(m, { [Symbol.toStringTag]: 'X' })), P(() => Object.assign(Object.freeze({}), { a: 1 })), P(() => { 'use strict'; m[Symbol.toStringTag] = 'Y'; }));
+class S1 { static call(o) { return 'static call ' + o; } static apply() { return 'static apply'; } static bind() { return 'static bind'; } }
+console.log(S1.call(1), S1.apply(), S1.bind());
+"##;
+    let expected = r##"
+TypeError: number 7 is not a function TypeError: '7' returned for property 'Symbol(Symbol.toPrimitive)' of object '#<Object>' is not a function
+TypeError: string "str" is not a function TypeError: 'str' returned for property 'Symbol(Symbol.toPrimitive)' of object '#<Object>' is not a function
+TypeError: object is not a function TypeError: '#<Object>' returned for property 'Symbol(Symbol.toPrimitive)' of object '#<Object>' is not a function
+TypeError: boolean true is not a function TypeError: 'true' returned for property 'Symbol(Symbol.toPrimitive)' of object '#<Object>' is not a function
+TypeError: bigint is not a function TypeError: '1' returned for property 'Symbol(Symbol.toPrimitive)' of object '#<Object>' is not a function
+TypeError: symbol is not a function TypeError: 'Symbol(q)' returned for property 'Symbol(Symbol.toPrimitive)' of object '#<Object>' is not a function
+5 6 1577836800000 1577923200000
+TypeError: x is not a symbol k
+true false false true false
+TypeError: Function has non-object prototype 'undefined' in instanceof check TypeError: Function has non-object prototype 'undefined' in instanceof check true
+true false g i
+TypeError: Cannot assign to read only property 'Symbol(Symbol.toStringTag)' of object '#<Map>' TypeError: Cannot add property a, object is not extensible TypeError: Cannot assign to read only property 'Symbol(Symbol.toStringTag)' of object '#<Map>'
+static call 1 static apply static bind
+"##;
+    assert_eq!(run(src), expected.trim());
+}

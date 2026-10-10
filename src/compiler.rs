@@ -197,6 +197,33 @@ pub struct Compiler {
     /// textually identical arrow bodies are separate chunks, and this operand is
     /// what makes their bytecode — and therefore their chunk hashes — differ.
     tmpl_sites: u64,
+    /// Set by `build_arrow` for the one `build_function` call it makes: an arrow
+    /// has no `arguments` object of its own to alias.
+    arrow_next: bool,
+    /// Counter for the hidden slots static-field initializers are called
+    /// through (see `emit_static_initializer`).
+    static_init_n: usize,
+    /// While a `finally` block is compiled inside a completion-valued program:
+    /// `(its own register, the enclosing register)`. A `finally` that completes
+    /// normally discards its value (14.15.3), so its statements write a
+    /// register of their own; a `break`/`continue` that LEAVES it completes the
+    /// whole `try` statement with the value the block had produced so far
+    /// (`undefined` if none), so that register is copied outward just before
+    /// the jump.
+    finalizer_completion: Option<(String, String)>,
+    /// The register expression statements write while `completion` is on;
+    /// empty means the program-level [`COMPLETION_SLOT`].
+    completion_slot: String,
+    /// `(op index, parked-iterator depth)` at every point of the chunk being
+    /// emitted where that depth changes, so `finish_chunk` can record the depth
+    /// for every builtin call — the error path needs it to close the iterators a
+    /// throw abandons.
+    iter_events: Vec<(usize, usize)>,
+    /// How many `with` bodies enclose the code being emitted, nested functions
+    /// included. Inside one, an identifier may resolve to a property of the
+    /// `with` object, so every name access goes through the `WITH_*` ops and no
+    /// local lives in a frame slot.
+    with_depth: usize,
 }
 
 // ── early errors: duplicate lexical declarations ─────────────────────────────
@@ -297,6 +324,7 @@ fn check_nested(k: &StmtKind) -> Result<(), String> {
         }
         StmtKind::While { body, .. }
         | StmtKind::DoWhile { body, .. }
+        | StmtKind::With { body, .. }
         | StmtKind::Labeled { body, .. } => one(body),
         // A `for (let …)` head is its own scope, and a `var` in the body hoists
         // THROUGH it onto the same name — a collision no block-level check sees.
@@ -382,7 +410,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
 /// stack (the program's completion value), for `eval`/`vm.runInThisContext`. A
 /// non-expression final statement leaves nothing (→ `undefined`).
 pub fn compile_completion(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
-    compile_completion_strict(stmts, debug, false)
+    compile_completion_strict(stmts, debug, false, false)
 }
 
 /// As [`compile_completion`], but with the CALLER's strictness folded in.
@@ -394,11 +422,15 @@ pub fn compile_completion_strict(
     stmts: &[Stmt],
     debug: bool,
     caller_strict: bool,
+    in_with: bool,
 ) -> Result<Program, String> {
     let mut c = Compiler {
         opt_chain: Vec::new(),
         debug,
         strict: caller_strict || has_use_strict(stmts),
+        // A direct `eval` inside a `with` body names things through the `with`
+        // object too.
+        with_depth: usize::from(in_with),
         ..Default::default()
     };
     check_early_errors(stmts)?;
@@ -433,11 +465,32 @@ impl Compiler {
     /// `undefined`, not 1, and a `break` out of a loop body discards what
     /// earlier iterations accumulated. A block, a labelled statement, `;` and
     /// every declaration propagate empty instead and are not reset here.
+    fn reset_completion_for_finalizer_exit(&mut self, b: &mut ChunkBuilder, line: u32) {
+        let Some((own, outer)) = self.finalizer_completion.clone() else {
+            return;
+        };
+        self.name_const(b, &outer);
+        self.name_const(b, &own);
+        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), line);
+        b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), line);
+        b.emit(Op::Pop, line);
+    }
+
+    /// The register the running statement list accumulates its value in.
+    fn cslot(&self) -> String {
+        if self.completion_slot.is_empty() {
+            COMPLETION_SLOT.to_string()
+        } else {
+            self.completion_slot.clone()
+        }
+    }
+
     fn reset_completion(&mut self, b: &mut ChunkBuilder, line: u32) {
         if !self.completion {
             return;
         }
-        self.name_const(b, COMPLETION_SLOT);
+        let slot = self.cslot();
+        self.name_const(b, &slot);
         b.emit(Op::LoadUndef, line);
         b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), line);
         b.emit(Op::Pop, line);
@@ -823,7 +876,8 @@ impl Compiler {
             StmtKind::Expr(e) => {
                 self.compile_expr(b, e)?;
                 if self.completion {
-                    self.name_const(b, COMPLETION_SLOT);
+                    let slot = self.cslot();
+                    self.name_const(b, &slot);
                     b.emit(Op::Swap, line);
                     b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), line);
                 }
@@ -903,6 +957,18 @@ impl Compiler {
                 self.reset_completion(b, line);
                 self.compile_while(b, test, body)?
             }
+            StmtKind::With { object, body } => {
+                self.reset_completion(b, line);
+                self.compile_expr(b, object)?;
+                b.emit(Op::CallBuiltin(ops::WITH_PUSH, 1), line);
+                b.emit(Op::Pop, line);
+                self.scope_depth += 1;
+                self.with_depth += 1;
+                let r = self.compile_stmt(b, body);
+                self.with_depth -= 1;
+                r?;
+                self.emit_pop_scope(b);
+            }
             StmtKind::DoWhile { body, test } => {
                 self.reset_completion(b, line);
                 self.compile_do_while(b, body, test)?
@@ -981,6 +1047,7 @@ impl Compiler {
                     let j = b.emit(Op::Jump(0), line);
                     self.loops[idx].breaks.push(j);
                 } else {
+                    self.reset_completion_for_finalizer_exit(b, line);
                     self.emit_signal_jump(b, ops::SIG_BREAK, label.as_deref(), line);
                 }
             }
@@ -1017,6 +1084,7 @@ impl Compiler {
                     let j = b.emit(Op::Jump(0), line);
                     self.loops[idx].continues.push(j);
                 } else {
+                    self.reset_completion_for_finalizer_exit(b, line);
                     self.emit_signal_jump(b, ops::SIG_CONTINUE, label.as_deref(), line);
                 }
             }
@@ -1106,7 +1174,11 @@ impl Compiler {
                 b.emit(Op::SetSlot(slot), 0);
                 return;
             }
+            // `var x = v` inside `with` is a PutValue on the resolved reference
+            // (14.3.2.1): the object may supply `x`. The binding itself was
+            // created when the function was entered.
             let op = match mode {
+                BindMode::Var if self.with_depth > 0 => ops::WITH_SET,
                 BindMode::Var => ops::DECLARE_VAR,
                 BindMode::Const => ops::DECLARE_CONST,
                 _ => ops::DECLARE,
@@ -1230,12 +1302,30 @@ impl Compiler {
                 b.emit(Op::Swap, 0);
                 // `PutValue` (6.2.5.6) on an unresolvable reference: strict code
                 // throws `ReferenceError`, sloppy code creates a global.
-                let op = if self.strict {
-                    ops::SETLOCAL_STRICT
-                } else {
-                    ops::SETLOCAL
+                let op = match (self.with_depth > 0, self.strict) {
+                    (true, true) => ops::WITH_SET_STRICT,
+                    (true, false) => ops::WITH_SET,
+                    (false, true) => ops::SETLOCAL_STRICT,
+                    (false, false) => ops::SETLOCAL,
                 };
                 b.emit(Op::CallBuiltin(op, 2), 0);
+                b.emit(Op::Pop, 0);
+            }
+            // `super.x = v` / `super[k] = v`: the parent chain's setter, else a
+            // data write on `this` — never a write to the `super` object.
+            Expr::Member {
+                object, property, ..
+            } if matches!(**object, Expr::Super) => {
+                self.name_const(b, property); // [value, name]
+                b.emit(Op::Swap, 0); // [name, value]
+                b.emit(Op::CallBuiltin(ops::SUPER_SET, 2), 0);
+                b.emit(Op::Pop, 0);
+            }
+            Expr::Index { object, index, .. } if matches!(**object, Expr::Super) => {
+                self.compile_expr(b, index)?; // [value, key]
+                b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
+                b.emit(Op::Swap, 0); // [key, value]
+                b.emit(Op::CallBuiltin(ops::SUPER_SET, 2), 0);
                 b.emit(Op::Pop, 0);
             }
             Expr::Member {
@@ -1460,7 +1550,12 @@ impl Compiler {
             return;
         }
         self.name_const(b, name);
-        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+        let op = if self.with_depth > 0 {
+            ops::WITH_GET
+        } else {
+            ops::GETLOCAL
+        };
+        b.emit(Op::CallBuiltin(op, 1), 0);
     }
 
     /// The frame slot holding `name` in the chunk being emitted, if it has one.
@@ -1789,8 +1884,10 @@ impl Compiler {
             _ => self.note_call_site(at, iter),
         }
         self.iter_depth += 1;
+        self.note_iter_depth(b);
         let r = self.loop_over(b, declare, target, body);
         self.iter_depth -= 1;
+        self.note_iter_depth(b);
         r
     }
 
@@ -1815,8 +1912,10 @@ impl Compiler {
         b.emit(Op::CallBuiltin(ops::FORIN_KEYS, 1), 0); // [keys_array]
         b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
         self.iter_depth += 1;
+        self.note_iter_depth(b);
         let r = self.loop_over_inner(b, declare, target, body, Some(obj_tmp));
         self.iter_depth -= 1;
+        self.note_iter_depth(b);
         r
     }
 
@@ -2116,8 +2215,30 @@ impl Compiler {
                 // 6 while the block updated the completion register like any
                 // other.
                 let saved = std::mem::take(&mut self.completion);
-                let chunk = self.compile_block_chunk(f);
+                let outer_slot = self.cslot();
+                let saved_slot = std::mem::take(&mut self.completion_slot);
+                let (saved_fin, body): (_, Vec<Stmt>) = if saved {
+                    // The block tracks its own value in a register of its own,
+                    // starting `undefined`.
+                    let own = self.tmp_name("fin");
+                    self.completion = true;
+                    self.completion_slot = own.clone();
+                    let mut body = vec![Stmt::from(StmtKind::Decl {
+                        kind: DeclKind::Let,
+                        decls: vec![Declarator {
+                            target: Expr::Ident(own.clone()),
+                            init: Some(Expr::Undefined),
+                        }],
+                    })];
+                    body.extend(f.iter().cloned());
+                    (self.finalizer_completion.replace((own, outer_slot)), body)
+                } else {
+                    (self.finalizer_completion.take(), f.to_vec())
+                };
+                let chunk = self.compile_block_chunk(&body);
+                self.finalizer_completion = saved_fin;
                 self.completion = saved;
+                self.completion_slot = saved_slot;
                 Some(chunk?)
             }
             None => None,
@@ -2164,6 +2285,7 @@ impl Compiler {
         let iters = std::mem::take(&mut self.iter_depth);
         let sites = std::mem::take(&mut self.call_sites);
         let yields = std::mem::take(&mut self.yield_sites);
+        let events = std::mem::take(&mut self.iter_events);
         let r = (|| {
             prelude(self, &mut cb)?;
             self.hoist_lexical(&mut cb, stmts);
@@ -2181,6 +2303,7 @@ impl Compiler {
         let chunk = self.finish_chunk(cb);
         self.call_sites = sites;
         self.yield_sites = yields;
+        self.iter_events = events;
         Ok(chunk)
     }
 
@@ -2200,14 +2323,34 @@ impl Compiler {
         // ahead of the body, which is the order they are emitted in.
         let mut planned: Vec<Stmt> = prologue.clone();
         planned.extend_from_slice(body);
+        // A sloppy function with a simple parameter list gets a MAPPED
+        // `arguments` object (10.4.4): the parameters and `arguments[i]` alias
+        // each other. The aliasing lives in the parameter bindings, so those
+        // must stay bindings — the chunk gets no frame slots — and a prologue op
+        // links them. Only a body that can name `arguments` pays for any of it.
+        let is_arrow = std::mem::take(&mut self.arrow_next);
+        let simple_params = params
+            .iter()
+            .all(|p| !p.rest && p.default.is_none() && matches!(p.pattern, Expr::Ident(_)));
+        let maps_arguments = !is_arrow
+            && !params.is_empty()
+            && simple_params
+            && !(self.strict || has_use_strict(body))
+            && crate::slots::mentions_arguments(&planned);
         let saved_slot_table = std::mem::replace(
             &mut self.slots,
-            if self.debug || is_generator || is_async {
+            if self.debug || is_generator || is_async || maps_arguments || self.with_depth > 0 {
                 Default::default()
             } else {
                 crate::slots::plan(params, &planned, false)
             },
         );
+        if maps_arguments {
+            let names: Vec<String> = crate::slots::param_names(params);
+            self.name_const(&mut fb, &names.join(","));
+            fb.emit(Op::CallBuiltin(ops::MAP_ARGS, 1), 0);
+            fb.emit(Op::Pop, 0);
+        }
         // Prologue: a parameter arrives in the call environment (`bind_params`
         // ran before this chunk), so copy each slotted one into its slot once,
         // and everything after it is a bare `GetSlot`.
@@ -2233,6 +2376,8 @@ impl Compiler {
         // A nested function's statements are not the SCRIPT's, so none of them
         // may touch the completion register.
         let saved_completion = std::mem::take(&mut self.completion);
+        let saved_finalizer = std::mem::take(&mut self.finalizer_completion);
+        let saved_cslot = std::mem::take(&mut self.completion_slot);
         // Captured before the restore below, since the FuncDef is built after
         // `self.strict` has been put back to the enclosing value.
         let body_strict = self.strict;
@@ -2240,6 +2385,7 @@ impl Compiler {
         // `op_hash`; the enclosing chunk's pending ones must not be swept in.
         let saved_sites = std::mem::take(&mut self.call_sites);
         let saved_yields = std::mem::take(&mut self.yield_sites);
+        let saved_events = std::mem::take(&mut self.iter_events);
         let r = (|| {
             // Function-body hoisting: `var` bindings first, so a same-named
             // function declaration below overwrites the `undefined` rather than
@@ -2260,6 +2406,8 @@ impl Compiler {
         self.in_async_generator = saved_agen;
         self.strict = saved_strict;
         self.completion = saved_completion;
+        self.finalizer_completion = saved_finalizer;
+        self.completion_slot = saved_cslot;
         self.slots = saved_slot_table;
         r?;
         let def = FuncDef {
@@ -2277,6 +2425,7 @@ impl Compiler {
         };
         self.call_sites = saved_sites;
         self.yield_sites = saved_yields;
+        self.iter_events = saved_events;
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
     }
@@ -2311,6 +2460,7 @@ impl Compiler {
             FnBody::Block(b) => b.clone(),
             FnBody::Expr(e) => vec![Stmt::from(StmtKind::Return(Some((**e).clone())))],
         };
+        self.arrow_next = true;
         let id = self.build_function("", params, &stmts, false, is_async)?;
         // Mark the template as an arrow so `this` is captured lexically.
         self.functions[id].1.is_arrow = true;
@@ -2396,13 +2546,36 @@ impl Compiler {
         // the deferred group with the field initializers and runs interleaved
         // with them in source order (both filters are stable over `members`).
         let deferred = |k: &MemberKind| matches!(k, MemberKind::Field | MemberKind::StaticBlock);
-        let ordered = node
-            .members
-            .iter()
-            .filter(|m| !deferred(&m.kind))
-            .chain(node.members.iter().filter(|m| deferred(&m.kind)));
+        // Computed keys are evaluated in SOURCE order across every element
+        // (15.7.14 ClassElementEvaluation runs top to bottom), although the
+        // fields they name are installed later. So a field's computed key is
+        // evaluated and parked in a hidden binding during the first pass, at
+        // its position among the methods, and read back by the second.
+        let mut events: Vec<(usize, bool)> = Vec::new();
+        for (i, m) in node.members.iter().enumerate() {
+            if !deferred(&m.kind) {
+                events.push((i, false));
+            } else if m.computed && m.kind == MemberKind::Field {
+                events.push((i, true));
+            }
+        }
+        for (i, m) in node.members.iter().enumerate() {
+            if deferred(&m.kind) {
+                events.push((i, false));
+            }
+        }
+        let mut stash: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
         let mut static_block_n = 0usize;
-        for m in ordered {
+        for (idx, park_key) in events {
+            let m = &node.members[idx];
+            if park_key {
+                let tmp = self.tmp_name("ckey");
+                self.compile_expr(b, &m.key)?;
+                b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
+                self.declare_as(b, &Expr::Ident(tmp.clone()), BindMode::Lexical);
+                stash.insert(idx, tmp);
+                continue;
+            }
             match m.kind {
                 MemberKind::Constructor => {}
                 // A PRIVATE static field declares a private element, so it
@@ -2412,40 +2585,60 @@ impl Compiler {
                 // it directly, which is what a declaration is.
                 MemberKind::Field if m.is_static && Self::private_key(m).is_some() => {
                     let key = Self::private_key(m).expect("guarded above");
-                    self.name_const(b, &key); // [class, name]
-                    b.emit(Op::LoadInt(member::STATIC_FIELD), 0);
-                    b.emit(Op::LoadTrue, 0); // is_static
-                    match &m.field_init {
-                        Some(e) => self.emit_keyed_value(b, &m.key, e, false, member::METHOD)?,
-                        None => {
-                            b.emit(Op::LoadUndef, 0);
-                        }
+                    // The initializer runs with `this` the class, so it is
+                    // evaluated by a hidden static method (as a static block
+                    // is) and its value taken from the call.
+                    let slot = self.emit_static_initializer(b, m.field_init.as_ref());
+                    b.emit(Op::Dup, 0);
+                    self.name_const(b, &slot);
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), 0); // [class, val]
+                    if let Some(e) = m.field_init.as_ref().filter(|e| Self::is_anon_fn_def(e)) {
+                        self.infer_name(b, e, &key);
                     }
+                    self.name_const(b, &key); // [class, val, name]
+                    b.emit(Op::Swap, 0); // [class, name, val]
+                    b.emit(Op::LoadInt(member::STATIC_FIELD), 0);
+                    b.emit(Op::Swap, 0); // [class, name, kind, val]
+                    b.emit(Op::LoadTrue, 0); // is_static
+                    b.emit(Op::Swap, 0); // [class, name, kind, static, val]
                     b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0); // -> [class]
+                    self.emit_drop_slot(b, &slot);
                 }
                 MemberKind::Field if m.is_static => {
                     // A static field is evaluated once at class-definition time and
                     // set as an own property of the constructor: `[class]` stays on
                     // the stack, `Dup` it as the SETATTR receiver.
-                    b.emit(Op::Dup, 0); // [class, class]
-                    self.emit_member_key(b, m)?; // [class, class, name]
-                    match &m.field_init {
-                        // 15.7.10: a static field's initializer is named after
-                        // the field (`static s = function(){}` → `s`).
-                        Some(e) => {
-                            self.emit_keyed_value(b, &m.key, e, m.computed, member::METHOD)?
-                        }
-                        None => {
-                            b.emit(Op::LoadUndef, 0);
+                    let slot = self.emit_static_initializer(b, m.field_init.as_ref());
+                    b.emit(Op::Dup, 0);
+                    b.emit(Op::Dup, 0); // [class, class, class]
+                    self.emit_field_key(b, m, stash.get(&idx))?; // [class, class, class, name]
+                    b.emit(Op::Swap, 0); // [class, class, name, class]
+                    self.name_const(b, &slot);
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), 0); // [class, class, name, val]
+                                                                     // 15.7.10: a static field's initializer is named after the
+                                                                     // field (`static s = function(){}` → `s`).
+                    if let Some(e) = m.field_init.as_ref().filter(|e| Self::is_anon_fn_def(e)) {
+                        match (&m.key, m.computed) {
+                            (Expr::Str(s), false) => self.infer_name(b, e, s),
+                            _ => {
+                                // [.., name, val] -> [.., name, fn] via NAMED_EVAL.
+                                b.emit(Op::Swap, 0); // [.., val, name]
+                                b.emit(Op::Dup, 0); // [.., val, name, name]
+                                b.emit(Op::Rot, 0); // [.., name, name, val]
+                                b.emit(Op::LoadInt(member::METHOD), 0);
+                                b.emit(Op::Swap, 0); // [.., name, name, kind, val]
+                                b.emit(Op::CallBuiltin(ops::NAMED_EVAL, 3), 0);
+                            }
                         }
                     }
                     // [class, class, name, val] -> SETATTR sets on the class -> [class, val]
                     b.emit(Op::CallBuiltin(ops::SETATTR, 3), 0);
                     b.emit(Op::Pop, 0); // drop the returned value -> [class]
+                    self.emit_drop_slot(b, &slot);
                 }
                 MemberKind::Field => {
                     // [class] name thunk name_anon -> DEF_FIELD -> [class]
-                    self.emit_member_key(b, m)?;
+                    self.emit_field_key(b, m, stash.get(&idx))?;
                     let init = m.field_init.clone().unwrap_or(Expr::Undefined);
                     // 15.7.10: `class C { f = function(){} }` names the function
                     // `f`. An instance field's initializer runs per-instance from
@@ -2570,6 +2763,54 @@ impl Compiler {
             self.emit_pop_scope(b);
         }
         Ok(())
+    }
+
+    /// Install a hidden static method whose body is `return <init>` and leave
+    /// `[class]` as it was; the name of its slot is returned. A static field's
+    /// initializer is called through it so that `this` is the class and `super`
+    /// property accesses see the class's home object, as for a static method.
+    fn emit_static_initializer(&mut self, b: &mut ChunkBuilder, init: Option<&Expr>) -> String {
+        self.static_init_n += 1;
+        let slot = format!("@@staticInit:{}", self.static_init_n);
+        self.name_const(b, &slot);
+        b.emit(Op::LoadInt(member::METHOD), 0);
+        b.emit(Op::LoadTrue, 0);
+        let body = vec![Stmt::from(StmtKind::Return(Some(
+            init.cloned().unwrap_or(Expr::Undefined),
+        )))];
+        let def_id = self
+            .build_function("", &[], &body, false, false)
+            .expect("a `return <expr>` body always compiles if the initializer did");
+        self.functions[def_id].1.is_method = true;
+        self.emit_mkfunc(b, def_id);
+        b.emit(Op::CallBuiltin(ops::DEF_MEMBER, 5), 0);
+        slot
+    }
+
+    /// Remove the hidden slot [`Self::emit_static_initializer`] created.
+    fn emit_drop_slot(&mut self, b: &mut ChunkBuilder, slot: &str) {
+        b.emit(Op::Dup, 0);
+        self.name_const(b, slot);
+        self.emit_bool(b, false);
+        b.emit(Op::CallBuiltin(ops::DELPROP_NAME, 3), 0);
+        b.emit(Op::Pop, 0);
+    }
+
+    /// A field's key: the parked value of a computed one, else
+    /// [`Self::emit_member_key`].
+    fn emit_field_key(
+        &mut self,
+        b: &mut ChunkBuilder,
+        m: &ClassMember,
+        parked: Option<&String>,
+    ) -> Result<(), String> {
+        match parked {
+            Some(tmp) => {
+                self.load_local(b, tmp);
+                Ok(())
+            }
+            None => self.emit_member_key(b, m),
+        }
     }
 
     /// `IsAnonymousFunctionDefinition(expr)` — the SYNTACTIC predicate that
@@ -2714,15 +2955,16 @@ impl Compiler {
                                                          // into the OUTER generator has to close it (7.4.9 IteratorClose),
                                                          // which is what runs the delegate's pending `finally`.
             self.iter_depth += 1;
+            self.note_iter_depth(b);
             self.name_const(b, &sent_tmp);
             b.emit(Op::LoadUndef, 0);
             b.emit(Op::CallBuiltin(ops::DECLARE, 2), 0);
             b.emit(Op::Pop, 0);
             let start = b.current_pos();
-            b.emit(Op::Dup, 0); // [iterator, iterator]
-            self.name_const(b, "next");
+            // One delegation step: `next(sent)`, or — after a forced
+            // `.return()`/`.throw()` — the delegate's `return`/`throw`.
             self.load_local(b, &sent_tmp);
-            b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0); // [iterator, step]
+            b.emit(Op::CallBuiltin(ops::DELEGATE_STEP, 1), 0); // [iterator, step]
             b.emit(Op::Dup, 0);
             self.name_const(b, "done");
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0);
@@ -2730,7 +2972,7 @@ impl Compiler {
             let jdone = b.emit(Op::JumpIfTrue(0), 0); // [iterator, step]
             self.name_const(b, "value");
             b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0); // [iterator, value]
-            let at = b.emit(Op::CallBuiltin(ops::YIELD, 1), 0); // [iterator, sent]
+            let at = b.emit(Op::CallBuiltin(ops::YIELD_DELEGATE, 1), 0); // [iterator, sent]
             self.yield_sites.push((at, self.iter_depth));
             self.name_const(b, &sent_tmp);
             b.emit(Op::Swap, 0);
@@ -2744,6 +2986,7 @@ impl Compiler {
             b.emit(Op::Swap, 0);
             b.emit(Op::Pop, 0); // [returnValue]
             self.iter_depth -= 1;
+            self.note_iter_depth(b);
         } else {
             match arg {
                 Some(e) => self.compile_expr(b, e)?,
@@ -2955,6 +3198,19 @@ impl Compiler {
                 // already-incremented index. Both builtins return the value they
                 // stored, which is also the value of the assignment expression,
                 // so the `Dup`/`Rot`/`Pop` the generic path needed all fall away.
+                Expr::Member {
+                    object, property, ..
+                } if matches!(**object, Expr::Super) => {
+                    self.name_const(b, property); // [name]
+                    self.compile_expr(b, value)?; // [name, value]
+                    b.emit(Op::CallBuiltin(ops::SUPER_SET, 2), 0); // [value]
+                }
+                Expr::Index { object, index, .. } if matches!(**object, Expr::Super) => {
+                    self.compile_expr(b, index)?; // [key]
+                    b.emit(Op::CallBuiltin(ops::PROPKEY, 1), 0);
+                    self.compile_expr(b, value)?; // [key, value]
+                    b.emit(Op::CallBuiltin(ops::SUPER_SET, 2), 0); // [value]
+                }
                 Expr::Member {
                     object, property, ..
                 } => {
@@ -3440,6 +3696,14 @@ impl Compiler {
         // The reference: leave `[recv, key]` on the stack, and report which
         // builtin pair reads and writes through it.
         let (get, set) = match target {
+            // `super.x op= v` has no `[recv, key]` pair to keep: `super` is not
+            // a value. Reading it twice is unobservable, so it takes the
+            // identifier lowering (`super.x = super.x op v`).
+            Expr::Member { object, .. } | Expr::Index { object, .. }
+                if matches!(**object, Expr::Super) =>
+            {
+                return self.compile_compound_ident(b, target, aop, value);
+            }
             Expr::Member {
                 object, property, ..
             } => {
@@ -3608,7 +3872,12 @@ impl Compiler {
                         return Ok(());
                     }
                     self.name_const(b, n);
-                    b.emit(Op::CallBuiltin(ops::TYPEOF_NAME, 1), 0);
+                    let op = if self.with_depth > 0 {
+                        ops::WITH_TYPEOF
+                    } else {
+                        ops::TYPEOF_NAME
+                    };
+                    b.emit(Op::CallBuiltin(op, 1), 0);
                 } else {
                     self.compile_expr(b, e)?;
                     b.emit(Op::CallBuiltin(ops::TYPEOF, 1), 0);
@@ -3984,11 +4253,37 @@ impl Compiler {
     /// `op_hash` `build()` computes.
     fn finish_chunk(&mut self, b: ChunkBuilder) -> Chunk {
         let sites = std::mem::take(&mut self.call_sites);
-        let yields = std::mem::take(&mut self.yield_sites);
+        let mut yields = std::mem::take(&mut self.yield_sites);
+        let events = std::mem::take(&mut self.iter_events);
         let chunk = b.build();
+        // Every builtin call inside a `for…of` / `for…in` body can raise, and a
+        // raise abandons the iterators parked beneath it. The depth recorded
+        // per yield op is what closes them there; the same table answers for
+        // any other op once it is filled in here.
+        if !events.is_empty() {
+            let known: std::collections::HashSet<usize> =
+                yields.iter().map(|(ip, _)| *ip).collect();
+            let mut at = 0;
+            let mut depth = 0;
+            for (ip, op) in chunk.ops.iter().enumerate() {
+                while at < events.len() && events[at].0 <= ip {
+                    depth = events[at].1;
+                    at += 1;
+                }
+                if depth > 0 && matches!(op, Op::CallBuiltin(..)) && !known.contains(&ip) {
+                    yields.push((ip, depth));
+                }
+            }
+        }
         crate::host::register_call_sites(chunk.op_hash, sites);
         crate::host::register_yield_sites(chunk.op_hash, yields);
         chunk
+    }
+
+    /// Record that the parked-iterator depth is now `self.iter_depth`, from the
+    /// next op to be emitted onward.
+    fn note_iter_depth(&mut self, b: &ChunkBuilder) {
+        self.iter_events.push((b.current_pos(), self.iter_depth));
     }
 
     /// Record the callee's source text for the call op just emitted at `at`, so
@@ -4467,6 +4762,22 @@ impl Compiler {
                     b.patch_jump(j, end);
                 }
             }
+            // Inside `with` the callee may be a method of the object, which is
+            // then its `this`: resolve `[fn, this]` and call with both.
+            Expr::Ident(n) if self.with_depth > 0 && n != "eval" => {
+                self.name_const(b, n);
+                b.emit(Op::CallBuiltin(ops::WITH_FN, 1), 0); // [fn, this]
+                if has_spread {
+                    self.compile_spread_args(b, args)?;
+                    b.emit(Op::CallBuiltin(ops::APPLY_THIS, 3), 0);
+                } else {
+                    for a in args {
+                        self.compile_expr(b, a)?;
+                    }
+                    let at = b.emit(Op::CallBuiltin(ops::CALL_THIS, argc(2 + args.len())?), 0);
+                    self.note_call_site(at, func);
+                }
+            }
             // A slotted callee has no name to resolve at run time: it falls
             // through to the value path below, which reads the slot and calls
             // through `CALL_VALUE`.
@@ -4595,6 +4906,7 @@ fn collect_var_names(s: &Stmt, out: &mut Vec<String>) {
             }
         }
         StmtKind::While { body, .. }
+        | StmtKind::With { body, .. }
         | StmtKind::DoWhile { body, .. }
         | StmtKind::Labeled { body, .. } => collect_var_names(body, out),
         StmtKind::For { init, body, .. } => {

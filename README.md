@@ -284,8 +284,15 @@ rather than its values: `numlit` (numeric-literal lexing), `syntaxerr` (early
 errors and the wording of each), `regexsyntax` and `regexprotocol` (pattern
 grammar errors, the ASCII-only class escapes, sticky/global `lastIndex`
 behaviour), and `reflect`, `datefield`, `bigintwrap` and `typedcoerce` (argument
-checks and coercions at the edge of each builtin). `parity-fuzz --help` lists
-every mode. Select one with `--mode <name>`.
+checks and coercions at the edge of each builtin). A further group covers
+Date parsing and formatting (`dateparse`), `JSON.stringify`/`parse` edges
+(`jsonedge`), `Number` formatting and parsing (`numfmt`), Unicode string methods
+(`unicode`), array holes, array-likes and species (`arrspecies`), Proxy
+invariants (`proxyinv`), microtask/timer ordering (`asyncorder`), class fields,
+private names and static blocks (`classfield`), iterator closing
+(`iterclose`), completion values (`completion`), accessors on prototype chains
+(`protoget`) and the `Symbol.*` protocols (`symproto`). `parity-fuzz --help`
+lists every mode. Select one with `--mode <name>`.
 
 The run summary reports four counts next to the divergence total: **ref timeout**
 (the reference timed out, so the case is skipped entirely), **ref failed** (the

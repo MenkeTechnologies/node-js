@@ -142,18 +142,11 @@ impl Decimal {
                 point: 0,
             };
         }
-        // `{:e}` is Rust's shortest round-trip form: `1.005e0`, `1e21`.
-        let s = format!("{x:e}");
-        let (mant, exp) = s.split_once('e').expect("{:e} has an exponent");
-        let exp: i64 = exp.parse().expect("integer exponent");
-        let digits: Vec<u8> = mant
-            .bytes()
-            .filter(u8::is_ascii_digit)
-            .map(|b| b - b'0')
-            .collect();
+        let (s, exp) = crate::host::shortest_digits(x);
+        let digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
         let mut d = Decimal {
             digits,
-            point: exp + 1,
+            point: i64::from(exp) + 1,
         };
         d.trim();
         d

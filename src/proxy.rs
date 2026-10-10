@@ -51,10 +51,20 @@ pub fn ultimate_target(v: &Value) -> Option<Value> {
 /// The object `IsArray` (7.2.2) decides on: `v`, or the end of its proxy chain.
 /// Every proxy passed on the way must still be live.
 pub fn is_array_subject(v: &Value) -> Result<Value, String> {
+    subject_through(v, "IsArray")
+}
+
+/// [`is_array_subject`] for an operation that begins with `IsArray` but reports
+/// itself by its own name (`Object.prototype.toString`).
+pub fn require_live(v: &Value, op: &str) -> Result<(), String> {
+    subject_through(v, op).map(|_| ())
+}
+
+fn subject_through(v: &Value, op: &str) -> Result<Value, String> {
     let mut cur = v.clone();
     while let Some((target, _)) = parts(&cur) {
         if revoked(&cur) {
-            return Err(revoked_err("IsArray"));
+            return Err(revoked_err(op));
         }
         cur = target;
     }
@@ -793,7 +803,20 @@ pub fn set_prototype_of(v: &Value, proto: &Value) -> Result<bool, String> {
         return Ok(true);
     }
     match no_trap(v, "setPrototypeOf")? {
+        // `target.[[SetPrototypeOf]]` (10.5.2 step 7): an ordinary object
+        // refuses a change when it is non-extensible and agrees to a no-op,
+        // and refuses a cycle.
         Some(target) => {
+            if !target_extensible(&target)? {
+                let actual = match get_prototype_of(&target)? {
+                    Some(p) => p,
+                    None => crate::builtins::prototype_of(&target),
+                };
+                return Ok(crate::builtins::same_value(proto, &actual));
+            }
+            if crate::builtins::would_cycle_pub(&target, proto) {
+                return Ok(false);
+            }
             with_host(|h| h.set_proto(&target, proto.clone()));
             Ok(true)
         }
@@ -887,7 +910,26 @@ pub fn construct(v: &Value, args: Vec<Value>, new_target: &Value) -> Result<Opti
         return Ok(Some(made));
     }
     match no_trap(v, "construct")? {
-        Some(target) => host::construct_nt(&target, args, new_target.clone()).map(Some),
+        Some(target) => {
+            // 10.1.13 OrdinaryCreateFromConstructor reads `newTarget.prototype`
+            // with `[[Get]]` — through this proxy's `get` trap when it is the
+            // new.target — and the object it builds inherits from the answer.
+            let proto = if parts(new_target).is_some() {
+                Some(crate::builtins::get_property(new_target, "prototype")?)
+            } else {
+                None
+            };
+            let made = host::construct_nt(&target, args, new_target.clone())?;
+            if let Some(p) = proto {
+                let plain = matches!(p, Value::Obj(_))
+                    && with_host(|h| !h.is_null(&p) && !host::is_primitive(h, &p));
+                let fresh = matches!(with_host(|h| h.get(&made).cloned()), Some(JsObj::Object(_)));
+                if plain && fresh {
+                    with_host(|h| h.set_proto(&made, p));
+                }
+            }
+            Ok(Some(made))
+        }
         None => Ok(None),
     }
 }

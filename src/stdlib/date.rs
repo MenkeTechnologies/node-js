@@ -130,7 +130,26 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
                         "Cannot convert a Symbol value to a number",
                     ));
                 }
-                with_host(|h| h.to_number(a))
+                // 21.4.2.1 step 3.c: `ToPrimitive(value)` first, and a string
+                // result is PARSED, a Date-string object included.
+                // The Date constructor reads `@@toPrimitive` itself and words a
+                // non-callable one as a bad PROPERTY, not as a bad callee.
+                if let Some(f) = crate::host::protocol_lookup(a, "@@toPrimitive")? {
+                    let bad = with_host(|h| !h.is_nullish(&f) && !crate::host::is_callable(h, &f));
+                    if bad {
+                        return Err(crate::host::type_error(&format!(
+                            "'{}' returned for property 'Symbol(Symbol.toPrimitive)' of object '{}' is not a function",
+                            crate::builtins::no_side_effects_string_pub(&f),
+                            crate::builtins::no_side_effects_string_pub(a)
+                        )));
+                    }
+                }
+                let prim = crate::host::to_primitive(a, "default")?;
+                if with_host(|h| h.as_str(&prim).is_some()) {
+                    parse_str(&with_host(|h| h.str_of(&prim)))
+                } else {
+                    crate::host::to_number_value(&prim)?
+                }
             }
         }
         // (year, month[, day, hours, minutes, seconds, ms]) — LOCAL time

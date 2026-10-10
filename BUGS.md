@@ -2896,23 +2896,27 @@ fuzz modes (`numlit`, `syntaxerr`, `regexsyntax`, `regexprotocol`, `reflect`,
 
 Each needs substrate this frontend does not have; none is approximated.
 
-- **`Math.cos`/`sin`/`tan`/`atan`/`exp`/`expm1`/`cbrt`/`sinh`/`cosh`/`atanh` can
-  differ in the last digit.** V8 uses its own port of fdlibm (`ieee754.cc`);
-  this runtime calls the platform libm (Rust `std`). The `libm` crate is not a
-  substitute — it is musl's rearrangement and disagrees with V8 on values such
-  as `Math.cos(0.1)`. Faithful results need a port of V8's `ieee754.cc`.
-- **Sloppy-mode `arguments` is not mapped to the parameters.** `function f(a)
-  { arguments[0] = 7; return a }` is `7` in node and `1` here (and the converse).
+- **`Math.pow`/`**` use the platform `pow`.** V8 calls `std::pow` of its own
+  build; the other transcendental functions are a port of `ieee754.cc`
+  (`src/ieee754.rs`), written with the fused multiply-adds clang emits for
+  AArch64, so results match node on arm64 and may differ in the last digit from
+  a node built for a target without FMA contraction.
+- **Mapped `arguments` is an Array with an alias table**, not an exotic object:
+  `Object.defineProperty` on an `arguments` index does not unmap it, and
+  `Object.freeze(arguments)` leaves the alias live.
 - **`(0, eval)(src)` sees the module's top-level bindings**, because the entry
   source is compiled as global code rather than as the CommonJS wrapper function
   (see the entry-point table above).
-- **`Event`, `EventTarget`, `Intl`, `Atomics`, `SharedArrayBuffer` and the `with`
-  statement are absent.** `AbortController`/`AbortSignal` exist; the base
-  classes they extend in node do not.
-- **A non-`u` regexp steps by code point, not code unit**, and a capture inside
-  a quantified group is not reset on each iteration
-  (`/(z)((a+)?(b+)?(c))*/.exec('zaacbbbcac')` keeps `'bbb'` where node has
-  `undefined`). Both are the `fancy-regex` engine's semantics.
+- **`Event`, `EventTarget`, `Intl`, `Atomics` and `SharedArrayBuffer` are
+  absent.** `AbortController`/`AbortSignal` exist; the base classes they extend
+  in node do not.
+- **A non-`u` regexp steps by code point, not code unit** (the engine's
+  semantics). A capture inside a quantified group is corrected after the match
+  (`regexp::CaptureMap`): it is dropped unless it lies inside the span of the
+  group's last iteration, and an empty capture under a `min == 0` quantifier is
+  dropped. Not seen by that correction: an empty capture left at the start of
+  the last iteration, and a backreference read inside the loop. A lazy
+  quantifier whose iteration may be empty (`/(a*?)*/`) also matches differently.
 - **`RegExp.prototype[Symbol.match|matchAll|replace|search|split]` are absent as
   properties** (the instance forms work). They are not in the generated
   `src/arity.rs` table, whose well-known-symbol set is fixed in `gen-arity`.
@@ -2931,3 +2935,25 @@ Each needs substrate this frontend does not have; none is approximated.
   `({ m() { return super.toString } }).m()` is not `Object.prototype.toString`.
 - **`new Function('a', '/*', '*/){')`** is accepted; node rejects a parameter
   list that does not parse on its own.
+
+### Still open — found by the round-2 modes, not fixed
+
+- **A lone surrogate cannot be represented** (`'\ud800'` reads as U+FFFD), so
+  `isWellFormed`, `encodeURIComponent`, `JSON.stringify` of one and
+  `normalize` disagree; the new Unicode and JSON modes do not generate them.
+- **Array destructuring closes the iterator BEFORE binding the elements**, so
+  when binding itself throws (`const [[x]] = it`) the throw is reported after
+  `return()` has run, and a throwing `return()` wins over the binding error.
+  The defaults and nested patterns also run after every `next()` rather than
+  interleaved with them.
+- **Spreading or destructuring an iterator that has no `next`** is
+  `undefined is not a function`; V8 words array spread and call spread
+  differently (`it is not iterable`, `Math.max is not a function`).
+- **`Array.prototype.join`/`Object.fromEntries` over a Proxy of an array**
+  consult `has` and read every index eagerly; node reads `Get` only, lazily.
+- **`Object.defineProperty(map, Symbol.toStringTag, …)`** does not change
+  `Object.prototype.toString.call(map)`.
+- **`Object.assign('abc', {0: 'z'})`** words its refusal for the primitive,
+  not the String wrapper.
+- **`Object.getOwnPropertyDescriptor(Array, 'prototype').value`** inspects as
+  `Object [Array] {}` where node prints `Object(0) []`.

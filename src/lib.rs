@@ -20,6 +20,7 @@ pub mod compiler;
 pub mod dap;
 pub mod datefmt;
 pub mod host;
+pub mod ieee754;
 pub mod lexer;
 pub mod lsp;
 pub mod module;
@@ -93,7 +94,7 @@ pub fn compile_completion_strict(
     src: &str,
     caller_strict: bool,
 ) -> Result<compiler::Program, String> {
-    compile_completion_in(src, caller_strict, false)
+    compile_completion_in(src, caller_strict, false, false)
 }
 
 /// As [`compile_completion_strict`], for a direct `eval` that may be running
@@ -102,10 +103,11 @@ pub fn compile_completion_in(
     src: &str,
     caller_strict: bool,
     allow_super: bool,
+    in_with: bool,
 ) -> Result<compiler::Program, String> {
-    let stmts = parser::parse_eval(src, allow_super)?;
+    let stmts = parser::parse_eval(src, allow_super, caller_strict)?;
     with_source(
-        compiler::compile_completion_strict(&stmts, false, caller_strict),
+        compiler::compile_completion_strict(&stmts, false, caller_strict, in_with),
         src,
     )
 }

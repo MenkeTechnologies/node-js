@@ -145,17 +145,22 @@ struct Parser {
 /// Parse a complete JS program into a statement list. Inline `rust { ... }` FFI
 /// blocks are desugared to `__rust_compile(...)` calls before lexing.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
-    parse_source(src, false, false)
+    parse_source(src, false, false, false)
 }
 
 /// Parse the source text of an `eval` / `vm` script. Identical to [`parse`]
 /// except that `super` is accepted at the top level when `allow_super` says the
 /// code runs inside a method (a direct `eval` there may use it).
-pub fn parse_eval(src: &str, allow_super: bool) -> Result<Vec<Stmt>, String> {
-    parse_source(src, allow_super, true)
+pub fn parse_eval(src: &str, allow_super: bool, caller_strict: bool) -> Result<Vec<Stmt>, String> {
+    parse_source(src, allow_super, true, caller_strict)
 }
 
-fn parse_source(src: &str, allow_super: bool, in_eval: bool) -> Result<Vec<Stmt>, String> {
+fn parse_source(
+    src: &str,
+    allow_super: bool,
+    in_eval: bool,
+    caller_strict: bool,
+) -> Result<Vec<Stmt>, String> {
     let desugared = crate::rust_ffi::desugar(src);
     // A `rust { … }` block is rewritten before lexing, so offsets would point
     // into text the caller never sees; record spans only when nothing moved.
@@ -176,7 +181,7 @@ fn parse_source(src: &str, allow_super: bool, in_eval: bool) -> Result<Vec<Stmt>
         in_binding: false,
         spans,
     };
-    p.strict = p.leading_use_strict(0);
+    p.strict = caller_strict || p.leading_use_strict(0);
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.parse_stmt()?);
@@ -537,6 +542,7 @@ impl Parser {
             }
             Tok::Ident(kw) if kw == "if" => self.parse_if()?,
             Tok::Ident(kw) if kw == "while" => self.parse_while()?,
+            Tok::Ident(kw) if kw == "with" => self.parse_with()?,
             Tok::Ident(kw) if kw == "do" => self.parse_do_while()?,
             Tok::Ident(kw) if kw == "for" => self.parse_for()?,
             Tok::Ident(kw) if kw == "switch" => self.parse_switch()?,
@@ -1169,6 +1175,20 @@ impl Parser {
         self.expect_punct(")")?;
         let body = Box::new(self.parse_sub_stmt(false)?);
         Ok(StmtKind::While { test, body })
+    }
+
+    fn parse_with(&mut self) -> Result<StmtKind, String> {
+        if self.strict {
+            return Err(
+                "SyntaxError: Strict mode code may not include a with statement".to_string(),
+            );
+        }
+        self.advance();
+        self.expect_punct("(")?;
+        let object = self.parse_expr()?;
+        self.expect_punct(")")?;
+        let body = Box::new(self.parse_sub_stmt(false)?);
+        Ok(StmtKind::With { object, body })
     }
 
     fn parse_do_while(&mut self) -> Result<StmtKind, String> {

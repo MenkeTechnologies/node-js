@@ -29,7 +29,7 @@
 
 use crate::host::{self, with_host, JsObj, RegExpObj};
 use crate::utf16::{self, U16Index};
-use fancy_regex::{Captures, Regex};
+use fancy_regex::{Captures, Match, Regex};
 use fusevm::Value;
 use indexmap::IndexMap;
 use rustc_hash::FxHashMap;
@@ -153,7 +153,7 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
         format!("SyntaxError: Invalid regular expression: /{pattern}/{flags}: {reason}")
     };
     crate::regexp_syntax::validate(pattern, unicode, sets).map_err(|r| invalid(&r))?;
-    let rust_pat =
+    let (rust_pat, capture_map) =
         translate(pattern, unicode, sets, dot_all, multiline).map_err(|r| invalid(&r))?;
     // Assemble the inline-flag prefix fancy-regex (via the regex layer) understands.
     let mut prefixed = String::new();
@@ -180,7 +180,10 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     // A `RegExpObj` is unavoidably fresh per evaluation (`lastIndex` is
     // per-object mutable state), but the engine inside it is not.
     let obj = RegExpObj {
-        re,
+        re: Rc::new(Engine {
+            re,
+            map: Rc::new(capture_map),
+        }),
         source: escape_regexp_pattern(pattern),
         flags: flags.to_string(),
         global,
@@ -270,6 +273,293 @@ fn scan_groups(chars: &[char]) -> (usize, Vec<(String, usize)>) {
         i += 1;
     }
     (count, names)
+}
+
+/// What a JS capture group number means to the engine, and which captures are
+/// STALE.
+///
+/// The engine keeps a capture from an earlier iteration of a quantified group
+/// when the last iteration did not set it, where 22.2.2.5.1 RepeatMatcher step
+/// 4 clears every capture inside the group at the start of each iteration:
+/// `/(z)((a+)?(b+)?(c))*/.exec('zaacbbbcac')` is `bbb` in the engine and
+/// `undefined` in JS. The engine cannot be told to reset, so the match is
+/// corrected afterwards: a capture inside a repeating group is valid only when
+/// it lies within the span the group's LAST iteration matched. A quantified
+/// group that is not itself capturing is made capturing in the translated
+/// pattern for exactly that reason, which shifts the engine's numbering —
+/// `fancy_of_js` maps JS numbers to it.
+///
+/// The same spans carry the other half of RepeatMatcher: an iteration that
+/// matches the empty string is rejected while the minimum is already met
+/// (step 2.b), so a group under a quantifier whose minimum is 0 never holds an
+/// empty capture — `/(a*)?/.exec('b')[1]` is `undefined`, where the engine
+/// reports `''`.
+///
+/// What this cannot see: an empty capture left at the start of the last
+/// iteration, and a backreference read inside the loop. A capture made inside
+/// a lookaround is judged by where it STARTS (lookahead) or ENDS (lookbehind),
+/// since the rest of its span may lie outside the iteration.
+pub struct CaptureMap {
+    /// Engine group number for each JS group number; index 0 is the whole match.
+    fancy_of_js: Vec<usize>,
+    /// Per ENGINE group number: the quantified groups enclosing it (engine
+    /// numbers), outermost first, with how its span must sit inside theirs.
+    guards: Vec<Vec<(usize, Within)>>,
+    /// Per ENGINE group number: whether an empty capture is impossible.
+    never_empty: Vec<bool>,
+    /// Named groups with their JS group numbers.
+    names: Vec<(String, usize)>,
+}
+
+/// How a capture's span is judged against the span of an enclosing group's
+/// iteration.
+#[derive(Clone, Copy)]
+enum Within {
+    /// The whole span lies inside.
+    Whole,
+    /// The span starts inside (a capture within a lookahead).
+    Start,
+    /// The span ends inside (a capture within a lookbehind).
+    End,
+}
+
+impl CaptureMap {
+    /// The identity numbering of a pattern with `count` capturing groups.
+    fn identity(count: usize, names: Vec<(String, usize)>) -> CaptureMap {
+        CaptureMap {
+            fancy_of_js: (0..=count).collect(),
+            guards: vec![Vec::new(); count + 1],
+            never_empty: vec![false; count + 1],
+            names,
+        }
+    }
+}
+
+/// A group's role while the pattern is scanned for repetition.
+#[derive(Clone, Copy, PartialEq)]
+enum GroupKind {
+    Capture,
+    /// `(?:…)`, the only kind that is rewritten into a capture.
+    Plain,
+    LookAhead,
+    LookBehind,
+    /// Anything else behind `(?` (modifier groups).
+    Other,
+}
+
+/// The pre-pass result for one pattern: which `(?:` groups `translate` must
+/// emit as captures, in `(` order, and the numbering that results.
+struct GroupPlan {
+    hidden: Vec<bool>,
+    map: CaptureMap,
+}
+
+/// Whether a quantifier at `chars[at..]` can run its operand more than once:
+/// `*`, `+`, `{n,}` and `{n,m}` with `m > 1`, `{n}` with `n > 1`.
+fn quantifier_repeats(chars: &[char], at: usize) -> bool {
+    match chars.get(at) {
+        Some('*' | '+') => true,
+        Some('{') => {
+            let body: String = chars[at + 1..].iter().take_while(|c| **c != '}').collect();
+            if chars.get(at + 1 + body.chars().count()) != Some(&'}') {
+                return false;
+            }
+            match body.split_once(',') {
+                None => body.parse::<u64>().is_ok_and(|n| n > 1),
+                Some((lo, "")) => lo.parse::<u64>().is_ok(),
+                Some((lo, hi)) => {
+                    lo.parse::<u64>().is_ok() && hi.parse::<u64>().is_ok_and(|n| n > 1)
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Scan a pattern's group structure (the same notion of "a group" as
+/// [`scan_groups`]) and decide the numbering described on [`CaptureMap`].
+fn plan_groups(chars: &[char], names: Vec<(String, usize)>) -> GroupPlan {
+    let mut kind: Vec<GroupKind> = Vec::new();
+    let mut parent: Vec<Option<usize>> = Vec::new();
+    let mut repeats: Vec<bool> = Vec::new();
+    let mut min_zero: Vec<bool> = Vec::new();
+    let mut has_capture: Vec<bool> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => {
+                let k = if chars.get(i + 1) != Some(&'?') {
+                    GroupKind::Capture
+                } else {
+                    match (chars.get(i + 2), chars.get(i + 3)) {
+                        (Some(':'), _) => GroupKind::Plain,
+                        (Some('=' | '!'), _) => GroupKind::LookAhead,
+                        (Some('<'), Some('=' | '!')) => GroupKind::LookBehind,
+                        (Some('<'), _) => GroupKind::Capture,
+                        _ => GroupKind::Other,
+                    }
+                };
+                parent.push(open.last().copied());
+                open.push(kind.len());
+                kind.push(k);
+                repeats.push(false);
+                min_zero.push(false);
+                has_capture.push(false);
+            }
+            ')' if !in_class => {
+                if let Some(id) = open.pop() {
+                    repeats[id] = quantifier_repeats(chars, i + 1);
+                    min_zero[id] = quantifier_at(chars, i + 1).is_some_and(|(_, min)| min == 0);
+                    if kind[id] == GroupKind::Capture || has_capture[id] {
+                        if let Some(p) = parent[id] {
+                            has_capture[p] = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let hidden: Vec<bool> = (0..kind.len())
+        .map(|g| kind[g] == GroupKind::Plain && (repeats[g] || min_zero[g]) && has_capture[g])
+        .collect();
+    // Engine numbers follow `(` order over capturing and rewritten groups.
+    let mut fancy: Vec<usize> = vec![0; kind.len()];
+    let mut fancy_of_js = vec![0usize];
+    let mut next = 0;
+    for g in 0..kind.len() {
+        if kind[g] == GroupKind::Capture || hidden[g] {
+            next += 1;
+            fancy[g] = next;
+            if kind[g] == GroupKind::Capture {
+                fancy_of_js.push(next);
+            }
+        }
+    }
+    let mut guards: Vec<Vec<(usize, Within)>> = vec![Vec::new(); next + 1];
+    let mut never_empty = vec![false; next + 1];
+    for g in 0..kind.len() {
+        if fancy[g] == 0 {
+            continue;
+        }
+        never_empty[fancy[g]] = min_zero[g];
+        let mut chain = Vec::new();
+        let mut within = Within::Whole;
+        let mut p = parent[g];
+        while let Some(a) = p {
+            // A capture in a lookaround is judged at one end only, and a
+            // lookahead inside a lookbehind (or the reverse) at neither end.
+            within = match (kind[a], within) {
+                (GroupKind::LookAhead, Within::Whole | Within::Start) => Within::Start,
+                (GroupKind::LookBehind, Within::Whole | Within::End) => Within::End,
+                (GroupKind::LookAhead | GroupKind::LookBehind, _) => break,
+                _ => within,
+            };
+            if fancy[a] != 0 && (repeats[a] || min_zero[a]) {
+                chain.push((fancy[a], within));
+            }
+            p = parent[a];
+        }
+        chain.reverse();
+        guards[fancy[g]] = chain;
+    }
+    GroupPlan {
+        hidden,
+        map: CaptureMap {
+            fancy_of_js,
+            guards,
+            never_empty,
+            names,
+        },
+    }
+}
+
+/// A compiled pattern together with its [`CaptureMap`]. Derefs to the engine
+/// for everything that does not look at captures.
+pub struct Engine {
+    re: Rc<Regex>,
+    map: Rc<CaptureMap>,
+}
+
+impl std::ops::Deref for Engine {
+    type Target = Regex;
+    fn deref(&self) -> &Regex {
+        &self.re
+    }
+}
+
+impl Engine {
+    pub fn captures_from_pos<'t>(
+        &self,
+        s: &'t str,
+        pos: usize,
+    ) -> Result<Option<Caps<'t>>, fancy_regex::Error> {
+        Ok(self.re.captures_from_pos(s, pos)?.map(|inner| Caps {
+            inner,
+            map: self.map.clone(),
+        }))
+    }
+
+    pub fn captures<'t>(&self, s: &'t str) -> Result<Option<Caps<'t>>, fancy_regex::Error> {
+        Ok(self.re.captures(s)?.map(|inner| Caps {
+            inner,
+            map: self.map.clone(),
+        }))
+    }
+}
+
+/// The captures of one match, numbered and filtered as JS sees them.
+pub struct Caps<'t> {
+    inner: Captures<'t>,
+    map: Rc<CaptureMap>,
+}
+
+impl<'t> Caps<'t> {
+    /// Number of JS groups, including the whole match.
+    pub fn len(&self) -> usize {
+        self.map.fancy_of_js.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Capture `i` as JS numbers it, or `None` if it did not participate in
+    /// the last iteration of every repeating group around it.
+    pub fn get(&self, i: usize) -> Option<Match<'t>> {
+        let f = *self.map.fancy_of_js.get(i)?;
+        self.valid(f).then(|| self.inner.get(f)).flatten()
+    }
+
+    pub fn name(&self, name: &str) -> Option<Match<'t>> {
+        let (_, i) = self.map.names.iter().find(|(n, _)| n == name)?;
+        self.get(*i)
+    }
+
+    fn valid(&self, f: usize) -> bool {
+        let Some(m) = self.inner.get(f) else {
+            return false;
+        };
+        if self.map.never_empty[f] && m.start() == m.end() {
+            return false;
+        }
+        self.map.guards[f].iter().all(|&(q, within)| {
+            self.inner.get(q).is_some_and(|g| {
+                let inside = |at: usize| g.start() <= at && at <= g.end();
+                match within {
+                    Within::Whole => inside(m.start()) && inside(m.end()),
+                    Within::Start => inside(m.start()),
+                    Within::End => inside(m.end()),
+                }
+            }) && self.valid(q)
+        })
+    }
 }
 
 /// A code point as the fixed `\x{..}` spelling the regex layer accepts both in
@@ -431,9 +721,40 @@ fn translate(
     sets: bool,
     dot_all: bool,
     multiline: bool,
-) -> Result<String, String> {
+) -> Result<(String, CaptureMap), String> {
+    match translate_with(pat, unicode, sets, dot_all, multiline, true)? {
+        (out, map, true) => Ok((out, map)),
+        // The pre-pass and the walk disagreed about the number of groups (a
+        // `v`-mode class holding a `(`), which would misnumber every capture
+        // after it: translate again with the engine's own numbering, which is
+        // merely un-filtered.
+        _ => translate_with(pat, unicode, sets, dot_all, multiline, false).map(|(o, m, _)| (o, m)),
+    }
+}
+
+/// [`translate`] with `allow_hidden` choosing whether repeating `(?:…)` groups
+/// are rewritten into captures. The flag in the result says the group count the
+/// pre-pass planned for matched the one the walk saw.
+fn translate_with(
+    pat: &str,
+    unicode: bool,
+    sets: bool,
+    dot_all: bool,
+    multiline: bool,
+    allow_hidden: bool,
+) -> Result<(String, CaptureMap, bool), String> {
     let chars: Vec<char> = pat.chars().collect();
     let (group_count, group_names) = scan_groups(&chars);
+    let mut plan = plan_groups(&chars, group_names.clone());
+    if !allow_hidden {
+        plan = GroupPlan {
+            hidden: vec![false; plan.hidden.len()],
+            map: CaptureMap::identity(group_count, group_names.clone()),
+        };
+    }
+    // How many source `(` have been seen, to index `plan.hidden` in step with
+    // the pre-pass.
+    let mut paren_seen = 0usize;
     let mut out = String::new();
     let mut i = 0;
     // Track whether we're inside a `[...]` class. `class_pos` is how many chars
@@ -608,6 +929,7 @@ fn translate(
                                 .collect();
                             let n = digits.parse::<usize>().unwrap_or(usize::MAX);
                             if n <= group_count {
+                                let n = plan.map.fancy_of_js[n];
                                 out.push_str(&format!("(?({n})\\{n}|)"));
                                 i += 1 + digits.len();
                                 continue;
@@ -650,6 +972,7 @@ fn translate(
                         let Some((_, index)) = group_names.iter().find(|(n, _)| *n == name) else {
                             return Err("Invalid named capture referenced".into());
                         };
+                        let index = plan.map.fancy_of_js[*index];
                         out.push_str(&format!("(?({index})\\{index}|)"));
                         i += 4 + close;
                         continue;
@@ -698,6 +1021,16 @@ fn translate(
                 }
             }
             '(' if !in_class => {
+                let source_paren = paren_seen;
+                paren_seen += 1;
+                // A repeating `(?:…)` that holds captures becomes a capture so
+                // its last iteration's span is known (see `CaptureMap`).
+                if plan.hidden.get(source_paren) == Some(&true) {
+                    group_open.push(None);
+                    out.push('(');
+                    i += 3;
+                    continue;
+                }
                 let lookahead =
                     chars.get(i + 1) == Some(&'?') && matches!(chars.get(i + 2), Some('=' | '!'));
                 group_open.push(lookahead.then_some(out.len()));
@@ -761,7 +1094,7 @@ fn translate(
             }
         }
     }
-    Ok(out)
+    Ok((out, plan.map, paren_seen == plan.hidden.len()))
 }
 
 /// The flags string in the spec's canonical order (22.2.6.4 reads the six
@@ -965,7 +1298,7 @@ pub fn regexp_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value
 }
 
 /// Snapshot the fields we need without holding the host borrow across a match.
-fn regexp_snapshot(recv: &Value) -> Option<(Rc<Regex>, bool, bool, U16Index)> {
+fn regexp_snapshot(recv: &Value) -> Option<(Rc<Engine>, bool, bool, U16Index)> {
     with_host(|h| match h.get(recv) {
         Some(JsObj::RegExp(r)) => Some((r.re.clone(), r.global, r.sticky, r.last_index)),
         _ => None,
@@ -1074,7 +1407,7 @@ pub fn regexp_exec(recv: &Value, s: &str) -> Result<Value, String> {
 /// Build the JS match-result array from a `Captures`, attaching `.index`,
 /// `.input`, and (named-group) `.groups` — plus `.indices` when the regexp
 /// carried the `d` flag (22.2.7.2 step 34, `MakeMatchIndicesIndexPairArray`).
-fn build_match_array(re: &Regex, caps: &Captures, s: &str, indices: bool) -> Value {
+fn build_match_array(re: &Engine, caps: &Caps, s: &str, indices: bool) -> Value {
     let mut items: Vec<Value> = Vec::with_capacity(caps.len());
     for i in 0..caps.len() {
         items.push(match caps.get(i) {
@@ -1123,7 +1456,7 @@ fn build_match_array(re: &Regex, caps: &Captures, s: &str, indices: bool) -> Val
 /// capture — `null` for one that did not participate — with a null-prototype
 /// `.groups` mirroring the named groups. Offsets are UTF-16 indices, the same
 /// units `.index` uses.
-fn attach_indices(caps: &Captures, s: &str, arr: &Value, names: &[&str]) {
+fn attach_indices(caps: &Caps, s: &str, arr: &Value, names: &[&str]) {
     let pair = |m: Option<fancy_regex::Match>| match m {
         Some(m) => {
             let (a, b) = (index_of_byte(s, m.start()), index_of_byte(s, m.end()));
@@ -1165,7 +1498,7 @@ fn attach_indices(caps: &Captures, s: &str, arr: &Value, names: &[&str]) {
 /// where the last match ended, an EMPTY match steps one character further, and
 /// under `y` a match must begin exactly where the search does — so a sticky
 /// scan ends at the first gap rather than skipping over it.
-fn collect_matches<'s>(re: &Regex, s: &'s str, start: usize, sticky: bool) -> Vec<Captures<'s>> {
+fn collect_matches<'s>(re: &Engine, s: &'s str, start: usize, sticky: bool) -> Vec<Caps<'s>> {
     let mut out = Vec::new();
     let mut pos = start;
     while pos <= s.len() {
@@ -1219,7 +1552,7 @@ pub fn str_match(s: &str, re_val: &Value) -> Result<Value, String> {
 }
 
 /// Non-global exec searching from offset 0 (for `str.match` without `g`).
-fn regexp_exec_from_zero(re: &Regex, s: &str, indices: bool) -> Result<Value, String> {
+fn regexp_exec_from_zero(re: &Engine, s: &str, indices: bool) -> Result<Value, String> {
     match re.captures(s).ok().flatten() {
         Some(caps) => Ok(build_match_array(re, &caps, s, indices)),
         None => Ok(with_host(|h| h.null())),
@@ -1403,7 +1736,7 @@ pub fn str_replace_regex(
     // sticky one that is not global makes ONE `exec` at `lastIndex` and moves
     // `lastIndex` to its end (or back to 0 on failure); a plain one takes the
     // first match from the start.
-    let found: Vec<Captures> = if global {
+    let found: Vec<Caps> = if global {
         collect_matches(&re, s, 0, sticky)
     } else if sticky {
         let all_from_here = if last_index.get() <= utf16::len(s) {
@@ -1411,7 +1744,7 @@ pub fn str_replace_regex(
         } else {
             Vec::new()
         };
-        let first: Vec<Captures> = all_from_here.into_iter().take(1).collect();
+        let first: Vec<Caps> = all_from_here.into_iter().take(1).collect();
         let next = first
             .first()
             .and_then(|c| c.get(0))
@@ -1468,7 +1801,7 @@ pub fn str_replace_regex(
 /// Expand a replacement template's `$` patterns against a match.
 /// The `groups` object for a match — `OrdinaryObjectCreate(null)` carrying each
 /// named capture (22.2.7.2 step 30), or `None` when the pattern names none.
-fn named_groups_object(re: &Regex, caps: &Captures) -> Option<Value> {
+fn named_groups_object(re: &Engine, caps: &Caps) -> Option<Value> {
     let names: Vec<&str> = re.capture_names().flatten().collect();
     if names.is_empty() {
         return None;
@@ -1489,7 +1822,7 @@ fn named_groups_object(re: &Regex, caps: &Captures) -> Option<Value> {
     }))
 }
 
-fn expand_replacement(templ: &str, caps: &Captures, s: &str, has_named_groups: bool) -> String {
+fn expand_replacement(templ: &str, caps: &Caps, s: &str, has_named_groups: bool) -> String {
     let chars: Vec<char> = templ.chars().collect();
     let mut out = String::new();
     let mut i = 0;

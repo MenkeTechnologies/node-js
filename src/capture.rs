@@ -42,6 +42,7 @@ pub fn stmt_captures(s: &Stmt) -> bool {
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
             expr_captures(test) || stmt_captures(body)
         }
+        StmtKind::With { object, body } => expr_captures(object) || stmt_captures(body),
         StmtKind::For {
             init,
             test,
