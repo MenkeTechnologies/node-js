@@ -115,20 +115,29 @@ pub fn bytes_per_element(kind: &str) -> usize {
 /// Coerce a JS number into the value stored for `kind` (integer wrap, unsigned
 /// clamp, or float), mirroring the `ToInt8`/`ToUint8Clamp`/… abstract ops.
 fn coerce(kind: &str, n: f64) -> f64 {
+    // `ToInt8` … `ToUint32` (7.1.6-7.1.11) all reduce `n` modulo 2^32 first, and
+    // a non-finite number is 0 — `n as i64` saturates instead, which made
+    // `new Int8Array([Infinity])` hold -1 and `new Uint8Array([Infinity])` 255.
+    let wrapped = if n.is_finite() {
+        n.trunc().rem_euclid(4_294_967_296.0) as u32
+    } else {
+        0
+    };
     match kind {
-        "Int8Array" => (n as i64 as i8) as f64,
-        "Uint8Array" => (n as i64 as u8) as f64,
+        "Int8Array" => (wrapped as u8 as i8) as f64,
+        "Uint8Array" => (wrapped as u8) as f64,
         "Uint8ClampedArray" => {
             if n.is_nan() {
                 0.0
             } else {
-                n.round().clamp(0.0, 255.0)
+                // ToUint8Clamp rounds a tie to the EVEN neighbour: 2.5 is 2, 3.5 is 4.
+                n.clamp(0.0, 255.0).round_ties_even()
             }
         }
-        "Int16Array" => (n as i64 as i16) as f64,
-        "Uint16Array" => (n as i64 as u16) as f64,
-        "Int32Array" => (n as i64 as i32) as f64,
-        "Uint32Array" => (n as i64 as u32) as f64,
+        "Int16Array" => (wrapped as u16 as i16) as f64,
+        "Uint16Array" => (wrapped as u16) as f64,
+        "Int32Array" => (wrapped as i32) as f64,
+        "Uint32Array" => wrapped as f64,
         "Float32Array" => n as f32 as f64,
         _ => n, // Float64Array
     }
@@ -146,7 +155,7 @@ pub fn is_bigint_kind(kind: &str) -> bool {
 /// wrap through `ToBigInt64`/`ToBigUint64` and keep a BigInt.
 fn coerce_val(kind: &str, v: &Value) -> Result<Value, String> {
     if !is_bigint_kind(kind) {
-        return Ok(Value::Float(coerce(kind, with_host(|h| h.to_number(v)))));
+        return Ok(Value::Float(coerce(kind, crate::host::to_number_value(v)?)));
     }
     // 7.1.15/7.1.16 route through `ToBigInt`, which is not "must already be a
     // BigInt": a boolean, a string and any object that converts to one are all
@@ -754,7 +763,25 @@ fn build_elems(kind: &str, args: &[Value]) -> Result<Vec<Value>, String> {
             // iterable → coerce each entry.
             let items = match super::native_tag(v).as_deref() {
                 Some("TypedArray") | Some("Buffer") => elem_values(v),
-                _ => crate::host::iter_all(v).unwrap_or_default(),
+                // 23.2.5.1.2: an object with an `@@iterator` is iterated; any
+                // other is an ARRAY-LIKE, read as `length` then each index.
+                _ if crate::builtins::get_property(v, "@@iterator")
+                    .map_or(true, |m| !matches!(m, Value::Undef)) =>
+                {
+                    crate::host::iter_all(v).unwrap_or_default()
+                }
+                _ => {
+                    let len = crate::builtins::get_property(v, "length")?;
+                    let n = with_host(|h| h.to_number(&len));
+                    let n = if n.is_finite() && n > 0.0 {
+                        n as usize
+                    } else {
+                        0
+                    };
+                    (0..n)
+                        .map(|i| crate::builtins::get_property(v, &i.to_string()))
+                        .collect::<Result<Vec<_>, _>>()?
+                }
             };
             items.iter().map(|x| coerce_val(kind, x)).collect()
         }
@@ -1580,10 +1607,12 @@ fn sort_elements(elems: &mut Vec<Value>, kind: &str, cmp: Option<&Value>) -> Res
         idx.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
         *elems = idx.into_iter().map(|i| elems[i].clone()).collect();
     } else {
-        elems.sort_by(|a, b| {
-            num(a)
-                .partial_cmp(&num(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
+        // 23.2.4.7 TypedArray SortCompare: NaN sorts last and -0 before +0, which
+        // is `total_cmp` once NaN is taken out (a NaN comparing `Equal` to
+        // everything made the whole sort order unspecified).
+        elems.sort_by(|a, b| match (num(a), num(b)) {
+            (x, y) if x.is_nan() || y.is_nan() => x.is_nan().cmp(&y.is_nan()),
+            (x, y) => x.total_cmp(&y),
         });
     }
     Ok(())

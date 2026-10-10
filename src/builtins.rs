@@ -2177,6 +2177,50 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
     }
 }
 
+/// The `TypeError` for calling a constructor that is not callable. V8 words it
+/// differently for the classes node implements in JavaScript (`URL`,
+/// `TextEncoder`, the fetch classes) and for the engine-native ones.
+fn requires_new(name: &str) -> String {
+    if crate::stdlib::fetch::is_class(name)
+        || matches!(
+            name,
+            "URL"
+                | "URLSearchParams"
+                | "TextEncoder"
+                | "TextDecoder"
+                | "AbortController"
+                | "AbortSignal"
+        )
+    {
+        return host::type_error(&format!(
+            "Class constructor {name} cannot be invoked without 'new'"
+        ));
+    }
+    host::type_error(&format!("Constructor {name} requires 'new'"))
+}
+
+/// Native constructors whose call form is a TypeError rather than a conversion
+/// or a second entry point (`String`, `Number`, `Error`, `Date`… are all
+/// callable and are matched by their own arms above).
+fn is_new_only_ctor(name: &str) -> bool {
+    crate::stdlib::typedarray::is_ctor(name)
+        || crate::stdlib::fetch::is_class(name)
+        || matches!(
+            name,
+            "ArrayBuffer"
+                | "DataView"
+                | "WeakRef"
+                | "FinalizationRegistry"
+                | "Iterator"
+                | "URL"
+                | "URLSearchParams"
+                | "TextEncoder"
+                | "TextDecoder"
+                | "AbortController"
+                | "AbortSignal"
+        )
+}
+
 /// `Function.prototype` methods (`call`/`apply`/`bind`) plus `Symbol.prototype`/
 /// generator handling done elsewhere. Returns `Ok(None)` if `name` is not one of
 /// these (so the caller can try statics).
@@ -4568,6 +4612,16 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
     if let Some(b) = crate::proxy::delete(recv, key)? {
         return Ok(b);
     }
+    // 10.4.5.4: a typed array's in-range index is not configurable, so
+    // `delete u8[0]` is false; an index past the end does not exist, so true.
+    if crate::stdlib::native_tag(recv).as_deref() == Some("TypedArray") {
+        if let Ok(i) = key.parse::<usize>() {
+            let len = get_property(recv, "length")
+                .ok()
+                .map_or(0.0, |l| with_host(|h| h.to_number(&l)));
+            return Ok((i as f64) >= len);
+        }
+    }
     // `delete globalThis.x` removes a global a script created. It lives in the
     // globals map, not the object's property map, so the ordinary path reported
     // success and removed nothing — the binding stayed readable afterwards.
@@ -6267,7 +6321,37 @@ pub fn builtin_meta(key: &str) -> Option<(&'static str, u32)> {
             let (_, name, len) = crate::arity::BUILTIN_ARITY[i];
             (name, len)
         })
+        .or_else(|| {
+            TIMER_ARITY
+                .iter()
+                .find(|(k, _, _)| *k == key)
+                .map(|(_, name, len)| (*name, *len))
+        })
 }
+
+/// `name` and `length` of the timer functions, which no ECMAScript table covers:
+/// they are Node's own (`lib/timers.js`, `lib/internal/process/task_queues.js`).
+/// Measured against node v26 — `setTimeout.length` is 2 although its source
+/// declares more parameters, which is why this is a table and not derived. The
+/// `timers` module and the globals are the same functions.
+const TIMER_ARITY: &[(&str, &str, u32)] = &[
+    ("setTimeout", "setTimeout", 2),
+    ("setInterval", "setInterval", 2),
+    ("setImmediate", "setImmediate", 1),
+    ("clearTimeout", "clearTimeout", 1),
+    ("clearInterval", "clearInterval", 1),
+    ("clearImmediate", "clearImmediate", 1),
+    ("process.nextTick", "nextTick", 1),
+    ("timers.setTimeout", "setTimeout", 2),
+    ("timers.setInterval", "setInterval", 2),
+    ("timers.setImmediate", "setImmediate", 1),
+    ("timers.clearTimeout", "clearTimeout", 1),
+    ("timers.clearInterval", "clearInterval", 1),
+    ("timers.clearImmediate", "clearImmediate", 1),
+    ("timers/promises.setTimeout", "setTimeout", 2),
+    ("timers/promises.setInterval", "setInterval", 2),
+    ("timers/promises.setImmediate", "setImmediate", 1),
+];
 
 /// The `name` a builtin function reports. The table answers for an intrinsic;
 /// anything else falls back to the last segment of the key, which is what the
@@ -6401,7 +6485,17 @@ pub fn eval_source(arg: Option<&Value>, direct: bool) -> Result<Value, String> {
     // decides both the early errors the COMPILE raises and the variable
     // environment below. An INDIRECT one is global-scope sloppy code.
     let caller_strict = direct && with_host(|h| h.current_strict());
-    let chunk = crate::load_merged(crate::compile_completion_strict(&src, caller_strict)?);
+    // A direct eval inside a method (or an arrow in one) may use `super`.
+    let allow_super = direct
+        && with_host(|h| {
+            let (class, _, home) = h.current_home();
+            class.is_some() || home.is_some()
+        });
+    let chunk = crate::load_merged(crate::compile_completion_in(
+        &src,
+        caller_strict,
+        allow_super,
+    )?);
     if !direct {
         return host::run_chunk_in_global_scope(chunk);
     }
@@ -6639,6 +6733,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             crate::stdlib::construct("Buffer", &args)
                 .unwrap_or_else(|| Err(host::type_error("Buffer is not a function")))
         }
+        "Date" => Ok(crate::stdlib::date::call_as_function()),
         "Number.isInteger" => Ok(Value::Bool(is_integer(arg0(&args)))),
         "Number.isSafeInteger" => Ok(Value::Bool(is_safe_integer(arg0(&args)))),
         "Number.isNaN" => Ok(Value::Bool(
@@ -6891,7 +6986,11 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // Returning the description made every symbol look registered —
         // `Symbol.keyFor(Symbol("k"))` was `"k"` where node says `undefined`.
         "Symbol.keyFor" => Ok(with_host(|h| h.symbol_registry_key(&arg0(&args)))),
-        "Map" | "WeakMap" | "Set" | "WeakSet" | "Promise" => construct_builtin(name, args),
+        // These constructors have no [[Call]] behaviour: a plain call throws.
+        "Promise" => Err(host::type_error(
+            "Promise constructor cannot be invoked without 'new'",
+        )),
+        "Map" | "WeakMap" | "Set" | "WeakSet" => Err(requires_new(name)),
         // `Proxy` has no `[[Call]]` slot: it is constructor-only (28.2.1).
         "Proxy" => Err(host::type_error("Constructor Proxy requires 'new'")),
         "Proxy.revocable" => crate::proxy::revocable(&args),
@@ -6912,13 +7011,32 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             all.extend(syms);
             Ok(with_host(|h| h.new_array(all)))
         }
-        "Reflect.getOwnPropertyDescriptor" => object_get_own_descriptor(args),
+        "Reflect.getOwnPropertyDescriptor" => {
+            reflect_require_object(&arg0(&args), "getOwnPropertyDescriptor")?;
+            object_get_own_descriptor(args)
+        }
         // `Reflect.defineProperty` REPORTS success as a boolean where
         // `Object.defineProperty` throws (28.1.3). It was propagating the
         // throw, so the whole point of the reflective form was lost.
         "Reflect.defineProperty" => {
             reflect_require_object(&arg0(&args), "defineProperty")?;
-            Ok(Value::Bool(object_define_property(args).is_ok()))
+            // Only a REFUSED definition is `false`. A malformed descriptor, or a
+            // getter on it that throws, is still an exception (28.1.3 step 5
+            // runs `ToPropertyDescriptor` before `[[DefineOwnProperty]]`).
+            match object_define_property(args) {
+                Ok(_) => Ok(Value::Bool(true)),
+                Err(e)
+                    if e.starts_with("TypeError: Cannot redefine property")
+                        || e.starts_with("TypeError: Cannot define property")
+                        || e.starts_with("TypeError: Invalid typed array index")
+                        || e.starts_with(
+                            "TypeError: 'defineProperty' on proxy: trap returned falsish",
+                        ) =>
+                {
+                    Ok(Value::Bool(false))
+                }
+                Err(e) => Err(e),
+            }
         }
         "Reflect.deleteProperty" => {
             let obj = arg0(&args);
@@ -6929,6 +7047,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "Reflect.setPrototypeOf" => {
             let obj = arg0(&args);
             let p = args.get(1).cloned().unwrap_or(Value::Undef);
+            reflect_require_object(&obj, "setPrototypeOf")?;
+            reject_bad_prototype(&p)?;
             if with_host(|h| h.kind_of(&obj)) == Some(ObjKind::Proxy) {
                 return Ok(Value::Bool(crate::proxy::set_prototype_of(&obj, &p)?));
             }
@@ -6948,6 +7068,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Reflect.isExtensible" => {
             let v = arg0(&args);
+            reflect_require_object(&v, "isExtensible")?;
             match crate::proxy::is_extensible(&v)? {
                 Some(b) => Ok(Value::Bool(b)),
                 None => Ok(Value::Bool(with_host(|h| h.is_extensible(&v)))),
@@ -6955,6 +7076,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "Reflect.preventExtensions" => {
             let v = arg0(&args);
+            reflect_require_object(&v, "preventExtensions")?;
             if let Some(b) = crate::proxy::prevent_extensions(&v)? {
                 return Ok(Value::Bool(b));
             }
@@ -6964,6 +7086,19 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `Reflect.apply(target, thisArg, argsList)` / `Reflect.construct(t, a)`.
         "Reflect.apply" => {
             let f = arg0(&args);
+            // 28.1.1 step 1 is `IsCallable(target)`, ahead of reading the list.
+            if !with_host(|h| host::is_callable(h, &f)) {
+                let kind = with_host(|h| match h.type_of(&f) {
+                    _ if h.is_null(&f) => "null".to_string(),
+                    "object" => "an object".to_string(),
+                    "undefined" => "undefined".to_string(),
+                    other => format!("a {other}"),
+                });
+                return Err(host::type_error(&format!(
+                    "Function.prototype.apply was called on {}, which is {kind} and not a function",
+                    no_side_effects_string(&f)
+                )));
+            }
             let this = args.get(1).cloned();
             let list = create_list_from_array_like(&args.get(2).cloned().unwrap_or(Value::Undef))?;
             host::invoke(&f, list, this.filter(|t| !with_host(|h| h.is_nullish(t))))
@@ -6974,6 +7109,18 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         // `target` and `instanceof newTarget` was false.
         "Reflect.construct" => {
             let f = arg0(&args);
+            // 28.1.2 steps 1-2: the target, then an EXPLICIT newTarget, must
+            // both have a `[[Construct]]` slot — checked before the list is read.
+            for candidate in std::iter::once(&f).chain(args.get(2)) {
+                if !host::is_constructor(candidate) {
+                    // Reflect names the VALUE (a function by its source text), where
+                    // `new f()` names the call site.
+                    return Err(host::type_error(&format!(
+                        "{} is not a constructor",
+                        no_side_effects_string(candidate)
+                    )));
+                }
+            }
             let list = create_list_from_array_like(&args.get(1).cloned().unwrap_or(Value::Undef))?;
             let new_target = args.get(2).cloned().unwrap_or_else(|| f.clone());
             host::construct_nt(&f, list, new_target)
@@ -7116,6 +7263,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             with_host(|h| h.exc = Some(reason.clone()));
             Err(with_host(|h| error_string(h, &reason)))
         }
+        // A native constructor reached by a plain call (`Uint8Array(1)`,
+        // `DataView(buf)`): V8 names the missing `new`, not a missing function.
+        _ if is_new_only_ctor(name) => Err(requires_new(name)),
         _ => Err(host::type_error(&format!("{name} is not a function"))),
     }
 }
@@ -7176,6 +7326,10 @@ pub fn to_bigint(v: &Value) -> Result<num_bigint::BigInt, String> {
 
 fn bigint_ctor(v: &Value) -> Result<Value, String> {
     use num_bigint::BigInt;
+    // 21.2.1.1 step 2: the argument is `ToPrimitive(value, number)` FIRST, so an
+    // object converts through its `valueOf`/`toString` (`BigInt([7])` is `7n`).
+    let prim = host::to_primitive(v, "number")?;
+    let v = &prim;
     let big = match v {
         Value::Bool(b) => BigInt::from(*b as i64),
         Value::Int(n) => BigInt::from(*n),
@@ -7248,21 +7402,39 @@ fn regexp_ctor(args: &[Value]) -> Result<Value, String> {
 }
 
 /// `BigInt.asIntN(bits, x)` / `BigInt.asUintN(bits, x)`: wrap `x` to a `bits`-wide
-/// two's-complement (signed) or unsigned integer.
+/// two's-complement (signed) or unsigned integer (21.2.2.1 / 21.2.2.2).
+///
+/// `bits` goes through `ToIndex` (a RangeError outside 0..=2^53-1) and `x`
+/// through `ToBigInt`, so a Number is a TypeError and a string parses. A width
+/// at or beyond the operand's own bit length needs no modular reduction, which
+/// also keeps `asUintN(2 ** 40, 1n)` from materialising a 2^40-bit modulus.
 fn bigint_as_n(unsigned: bool, args: &[Value]) -> Result<Value, String> {
     use num_bigint::BigInt;
     use num_traits::Signed;
-    let bits = with_host(|h| h.to_number(&arg0(args))) as i64;
-    if bits < 0 {
+    /// V8's BigInt size ceiling, in bits (`BigInt::kMaxLengthBits`).
+    const MAX_BIGINT_BITS: u64 = 1 << 30;
+    let prim = host::to_primitive(&arg0(args), "number")?;
+    let n = with_host(|h| h.to_number(&prim));
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    if !(0.0..=9_007_199_254_740_991.0).contains(&n) {
         return Err("RangeError: Invalid value: not (convertible to) a safe integer".into());
     }
-    let x = match with_host(|h| h.as_bigint(&args.get(1).cloned().unwrap_or(Value::Undef))) {
-        Some(b) => b,
-        None => return Err(host::type_error("Cannot convert to a BigInt")),
-    };
-    let bits = bits as u32;
+    let bits = n as u64;
+    let x = to_bigint(&args.get(1).cloned().unwrap_or(Value::Undef))?;
     if bits == 0 {
         return Ok(with_host(|h| h.new_bigint(BigInt::from(0))));
+    }
+    let magnitude_bits = x.bits();
+    let fits = if unsigned {
+        !x.is_negative() && magnitude_bits <= bits
+    } else {
+        magnitude_bits < bits
+    };
+    if fits {
+        return Ok(with_host(|h| h.new_bigint(x)));
+    }
+    if bits > MAX_BIGINT_BITS {
+        return Err("RangeError: Maximum BigInt size exceeded".into());
     }
     let modulus = BigInt::from(1) << bits; // 2^bits
                                            // Reduce into [0, 2^bits); for the signed form fold the top half negative.
@@ -7669,6 +7841,15 @@ pub(crate) fn make_error_pub(name: &str, msg: &str) -> Value {
 /// refuses it (20.5.1.1 step 3), so `new Error(sym)` is a TypeError where this
 /// rendered `Symbol(desc)` into `.message`.
 fn make_error_checked(name: &str, args: &[Value]) -> Result<Value, String> {
+    // 20.5.7.1.1 step 5: `errors` is `IterableToList(errors)`, so a value with no
+    // `@@iterator` — including the absent one — refuses before anything exists.
+    if name == "AggregateError" {
+        let errors = arg0(args);
+        let iter_fn = get_property(&errors, "@@iterator").unwrap_or(Value::Undef);
+        if !with_host(|h| host::is_callable(h, &iter_fn)) {
+            return Err(host::type_error(&not_iterable_typed(&errors)));
+        }
+    }
     if let Some(m) = args.first().filter(|m| !matches!(m, Value::Undef)) {
         // AggregateError's message is its SECOND argument.
         let idx = usize::from(name == "AggregateError");
@@ -9118,6 +9299,17 @@ fn json_walk_children(
             // array would hand the serializer back the stale backing vector.
             let had_accessor = resolve_index_accessors(v, &mut resolved);
             let items = resolved;
+            // An arguments object is array-LIKE, not an Array (`IsArray` is
+            // false), so SerializeJSONObject writes `{"0":..,"1":..}` — it is
+            // the indices as enumerable own properties, and nothing else.
+            if is_arguments(v) {
+                let mut props = IndexMap::new();
+                for (i, it) in items.iter().enumerate() {
+                    let nv = apply_to_json(v, &i.to_string(), it, path, rep)?;
+                    props.insert(i.to_string(), nv);
+                }
+                return Ok(with_host(|h| h.new_object(props)));
+            }
             let mut out = Vec::with_capacity(items.len());
             let mut changed = had_accessor;
             for (i, it) in items.iter().enumerate() {
@@ -12819,7 +13011,9 @@ fn number_method(n: f64, name: &str, args: Vec<Value>) -> Result<Value, String> 
     let args = coerce_numeric_args(NUMBER_METHOD_NUMERIC_ARGS, name, args)?;
     match name {
         "toFixed" => {
+            // ToIntegerOrInfinity: a missing or NaN fractionDigits is 0.
             let digits = arg_num(&args, 0);
+            let digits = if digits.is_nan() { 0.0 } else { digits };
             if !(0.0..=100.0).contains(&digits.trunc()) {
                 return Err(host::range_error(
                     "toFixed() digits argument must be between 0 and 100",
@@ -14133,39 +14327,55 @@ struct Requested {
 }
 
 impl Requested {
-    /// Reads through the prototype chain, as `ToPropertyDescriptor`'s
-    /// `HasProperty`/`Get` pairs do — a descriptor built with
-    /// `Object.create({ value: 1 })` is legal.
-    fn read(desc: &Value) -> Self {
-        let has = |k: &str| {
-            with_host(|h| {
-                host::lookup_chain(h, desc, k).is_some()
-                    || host::lookup_accessor(h, desc, k).is_some()
-            })
+    /// `ToPropertyDescriptor` (6.2.6.5): each field is read only when the
+    /// descriptor HAS it (through the prototype chain, so a descriptor built with
+    /// `Object.create({ value: 1 })` is legal), in the spec's order, and a getter
+    /// that throws propagates. A `get`/`set` that is neither callable nor
+    /// `undefined`, and a descriptor naming both an accessor and a data field,
+    /// are the two TypeErrors the abstract operation raises.
+    fn read(desc: &Value) -> Result<Self, String> {
+        let field = |k: &str| -> Result<Option<Value>, String> {
+            if has_property(desc, k)? {
+                get_property(desc, k).map(Some)
+            } else {
+                Ok(None)
+            }
         };
-        let val = |k: &str| get_property(desc, k).unwrap_or(Value::Undef);
-        // Resolve the value BEFORE the borrow: `val` re-enters the host, and
-        // doing it inside the `with_host` closure aborts on the double borrow.
-        let flag = |k: &str| {
-            has(k).then(|| {
-                let v = val(k);
-                with_host(|h| h.truthy(&v))
-            })
+        let flag = |k: &str| -> Result<Option<bool>, String> {
+            Ok(field(k)?.map(|v| with_host(|h| h.truthy(&v))))
         };
-        Requested {
-            value: has("value").then(|| val("value")),
-            get: has("get").then(|| match val("get") {
-                Value::Undef => None,
-                g => Some(g),
-            }),
-            set: has("set").then(|| match val("set") {
-                Value::Undef => None,
-                st => Some(st),
-            }),
-            writable: flag("writable"),
-            enumerable: flag("enumerable"),
-            configurable: flag("configurable"),
+        let enumerable = flag("enumerable")?;
+        let configurable = flag("configurable")?;
+        let value = field("value")?;
+        let writable = flag("writable")?;
+        let accessor = |k: &str, what: &str| -> Result<Option<Option<Value>>, String> {
+            match field(k)? {
+                None => Ok(None),
+                Some(Value::Undef) => Ok(Some(None)),
+                Some(f) if with_host(|h| host::is_callable(h, &f)) => Ok(Some(Some(f))),
+                Some(f) => Err(host::type_error(&format!(
+                    "{what} must be a function: {}",
+                    no_side_effects_string(&f)
+                ))),
+            }
+        };
+        let get = accessor("get", "Getter")?;
+        let set = accessor("set", "Setter")?;
+        let req = Requested {
+            value,
+            get,
+            set,
+            writable,
+            enumerable,
+            configurable,
+        };
+        if req.is_accessor() && req.is_data() {
+            return Err(host::type_error(&format!(
+                "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute, {}",
+                no_side_effects_string(desc)
+            )));
         }
+        Ok(req)
     }
 
     fn is_accessor(&self) -> bool {
@@ -14255,7 +14465,7 @@ pub(crate) fn same_value(a: &Value, b: &Value) -> bool {
 /// value was written but the accessor stayed in its side table, and accessors
 /// win on read, so the getter kept answering.
 fn apply_descriptor(obj: &Value, key: &str, desc: &Value) -> Result<(), String> {
-    let req = Requested::read(desc);
+    let req = Requested::read(desc)?;
     let cur = existing_property(obj, key);
 
     // An array's `length` is the exotic own property whose write resizes the
@@ -14286,6 +14496,27 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) -> Result<(), String> 
         && key.parse::<usize>().is_ok())
         || (key == "lastIndex" && with_host(|h| matches!(h.get(obj), Some(JsObj::RegExp(_)))));
     if exotic_own {
+        // A typed array element is `{ writable, enumerable, configurable: true }`
+        // and stays that way (10.4.5.3): naming any of the three as false, or
+        // an accessor, is a refused definition.
+        if crate::stdlib::native_tag(obj).as_deref() == Some("TypedArray") {
+            let len = get_property(obj, "length")
+                .ok()
+                .map_or(0.0, |l| with_host(|h| h.to_number(&l)));
+            if key.parse::<usize>().is_ok_and(|i| (i as f64) >= len) {
+                return Err(host::type_error("Invalid typed array index"));
+            }
+        }
+        if crate::stdlib::native_tag(obj).as_deref() == Some("TypedArray")
+            && (req.is_accessor()
+                || req.configurable == Some(false)
+                || req.enumerable == Some(false)
+                || req.writable == Some(false))
+        {
+            return Err(host::type_error(&format!(
+                "Cannot redefine property: {key}"
+            )));
+        }
         if let Some(v) = req.value.clone() {
             return set_property_pub(obj, key, v);
         }
@@ -14382,9 +14613,12 @@ fn apply_descriptor(obj: &Value, key: &str, desc: &Value) -> Result<(), String> 
         }
     }
 
-    let Some(v) = req.value else {
-        // Nothing to write: a flags-only redefinition of a data property.
-        return Ok(());
+    // A flags-only descriptor redefines an EXISTING property in place, but on a
+    // new key it still creates one (10.1.6.3 step 2.a), holding `undefined`.
+    let v = match req.value {
+        Some(v) => v,
+        None if cur.is_none() => Value::Undef,
+        None => return Ok(()),
     };
     write_data_slot(obj, key, v);
     Ok(())

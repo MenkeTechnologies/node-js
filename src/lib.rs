@@ -27,6 +27,7 @@ pub mod numfmt;
 pub mod parser;
 pub mod proxy;
 pub mod regexp;
+pub mod regexp_syntax;
 pub mod repl;
 pub mod rust_ffi;
 pub mod slots;
@@ -92,7 +93,17 @@ pub fn compile_completion_strict(
     src: &str,
     caller_strict: bool,
 ) -> Result<compiler::Program, String> {
-    let stmts = parser::parse(src)?;
+    compile_completion_in(src, caller_strict, false)
+}
+
+/// As [`compile_completion_strict`], for a direct `eval` that may be running
+/// inside a method, where the evaluated code may use `super`.
+pub fn compile_completion_in(
+    src: &str,
+    caller_strict: bool,
+    allow_super: bool,
+) -> Result<compiler::Program, String> {
+    let stmts = parser::parse_eval(src, allow_super)?;
     with_source(
         compiler::compile_completion_strict(&stmts, false, caller_strict),
         src,

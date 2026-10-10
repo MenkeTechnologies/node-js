@@ -165,6 +165,13 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
     Ok(from_ms(time_clip(ms)))
 }
 
+/// `Date()` called as a function (21.4.2.1 step 1): the current time as a string,
+/// ignoring every argument.
+pub fn call_as_function() -> Value {
+    let ms = time_clip(now_ms());
+    with_host(|h| h.new_str(format!("{} {}", date_string(local_ms(ms)), time_string(ms))))
+}
+
 /// `Date.now()` / `Date.parse(str)` / `Date.UTC(...)`.
 pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
@@ -180,7 +187,7 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
             if (0.0..=99.0).contains(&year.trunc()) {
                 year = year.trunc() + 1900.0;
             }
-            Ok(Value::Float(utc_from_fields(
+            Ok(Value::Float(time_clip(utc_from_fields(
                 year,
                 n(1, 0.0),
                 n(2, 1.0),
@@ -188,7 +195,7 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
                 n(4, 0.0),
                 n(5, 0.0),
                 n(6, 0.0),
-            )))
+            ))))
         }
         _ => return None,
     })
@@ -489,11 +496,11 @@ fn utc_string(ms: f64) -> String {
     let (y, mo, d) = civil_from_days(day);
     let wd = (((day % 7) + 4 + 7) % 7) as usize;
     format!(
-        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
         DAYS[wd],
         d,
         MONTHS[mo as usize],
-        y,
+        year_text(y),
         field(ms, Field::Hours) as i64,
         field(ms, Field::Minutes) as i64,
         field(ms, Field::Seconds) as i64,
@@ -569,7 +576,9 @@ fn time_clip(ms: f64) -> f64 {
     if !ms.is_finite() || ms.abs() > 8.64e15 {
         return f64::NAN;
     }
-    ms.trunc()
+    // `+ 0.0` turns a truncated `-0.5` into `+0`: TimeClip yields a +0 time
+    // value, never -0.
+    ms.trunc() + 0.0
 }
 
 /// Write a time value into the receiver's hidden `@@ms` slot, returning it (as
@@ -639,6 +648,9 @@ fn set_fields_value(ms: f64, start: usize, args: &[Value], legacy_year: bool) ->
     for (i, slot) in f.iter_mut().enumerate().take(end).skip(start) {
         match args.get(i - start) {
             Some(v) => *slot = with_host(|h| h.to_number(v)).trunc(),
+            // The first argument is required: `setUTCMinutes()` is
+            // `ToNumber(undefined)`, NaN, and so an Invalid Date.
+            None if i == start => *slot = f64::NAN,
             None => break,
         }
     }
@@ -646,6 +658,14 @@ fn set_fields_value(ms: f64, start: usize, args: &[Value], legacy_year: bool) ->
         f[0] += 1900.0;
     }
     utc_from_fields(f[0], f[1], f[2], f[3], f[4], f[5], f[6])
+}
+
+/// The year of the human-readable forms (`toString`, `toDateString`,
+/// `toUTCString`): at least four digits, with a `-` OUTSIDE the padding, so year
+/// -1 is `-0001`. Rust's `{:04}` counts the sign inside the width and gives
+/// `-001`.
+fn year_text(y: i64) -> String {
+    format!("{}{:04}", if y < 0 { "-" } else { "" }, y.abs())
 }
 
 /// `Wed Oct 21 2015` — the `toDateString` form.
@@ -656,7 +676,13 @@ fn date_string(ms: f64) -> String {
     let (day, _) = split_day(ms);
     let (y, mo, d) = civil_from_days(day);
     let wd = (((day % 7) + 4 + 7) % 7) as usize;
-    format!("{} {} {:02} {:04}", DAYS[wd], MONTHS[mo as usize], d, y)
+    format!(
+        "{} {} {:02} {}",
+        DAYS[wd],
+        MONTHS[mo as usize],
+        d,
+        year_text(y)
+    )
 }
 
 /// The year field of an ISO-8601 date (21.4.4.36 `Date.prototype.toISOString`).

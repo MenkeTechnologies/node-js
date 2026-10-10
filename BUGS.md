@@ -538,10 +538,12 @@ inherits them. The one strict-SHAPED behavior with no directive is
 section above) rather than a mode. `with` is rejected, but with a generic parse
 error, which is a parser gap and not a strict-mode rejection.
 
-A legacy OCTAL literal is still accepted in strict code, where node raises
-`SyntaxError: Octal literals are not allowed in strict mode.` — the lexer runs
-over the whole file before anything knows whether the directive prologue makes
-it strict, so the rejection has nowhere to live yet.
+A legacy OCTAL literal, a decimal with a leading zero, and a legacy octal or
+`\8`/`\9` string escape are rejected in strict code with node's wording. The
+lexer cannot know the mode — it runs over the whole file before the directive
+prologue is read — so it records the form on the token and the parser, which
+tracks strictness (a `'use strict'` prologue, or a class body), reports it when
+it consumes the token.
 
 The remaining rows follow from one thing: node-js runs the entry
 source directly rather than through the CommonJS wrapper function.
@@ -919,10 +921,13 @@ are **now supported** (see the Supported list above); verified against
 
 **Known behavioral divergences within the supported subset:**
 
-- **Unicode class semantics.** Rust `regex` runs in Unicode mode, so `\d`/`\w`/
-  `\s` match Unicode digit/word/space code points, whereas JS *without* the `u`
-  flag matches only the ASCII sets. Identical on ASCII input (the fuzzer's
-  `regex` mode uses ASCII inputs).
+- **Class escapes are JavaScript's, not Unicode's.** `\d \D \w \W \s \S`, `\b`
+  and `\B` are translated to explicit ASCII sets (and `\s` to the spec's
+  WhiteSpace + LineTerminator list), `.` stops at all four LineTerminators, and
+  `^`/`$` under `m` also sit beside `\r`, U+2028 and U+2029. `\b` is spelled
+  with lookaround, since the regex layer's own `\b` is Unicode-aware and its
+  ASCII form is refused by `fancy-regex`; patterns using it therefore run on
+  the backtracking engine.
 - **The match alphabet is code points, not code units.** `.index`, `lastIndex`
   and a replace callback's offset are now UTF-16 code-unit offsets and agree
   with node on astral input. What still differs is what a single-character
@@ -2699,12 +2704,19 @@ Still divergent, and why:
 - **The `with` statement does not parse.** A sloppy-mode-only form, and the
   one statement that makes a scope lookup dynamic, so nothing in this frontend
   is shaped for it — `eval("with({a:1}){ a }")` is a SyntaxError here.
-- **Parser SyntaxError messages are this parser's, not node's.** A syntax error
-  reports the token that broke the parse in its own vocabulary — `expected ';'
-  but found Punct(")")` where node says `Unexpected token ')'` — so any record
-  that pins a syntax error's TEXT cannot match. `examples/earlyerrors.js` pins
-  the errors this frontend raises deliberately (which do match); this is about
-  the ordinary parse failures.
+- **Parser SyntaxError messages follow V8's token vocabulary.** A token the
+  grammar has no place for is reported as `Unexpected token ')'`, `Unexpected
+  identifier 'x'`, `Unexpected number`, `Unexpected string`, `Unexpected end of
+  input` and so on; the early errors node raises (labels, jumps, assignment
+  targets, `const` without an initialiser, duplicate parameters under a strict
+  body, `??` mixed with `||`, a regex literal's pattern, strict-only forms)
+  carry its wording as well (`parity-scripts/lang/38_syntax_error_wording.js`).
+  Still different: a stray `await`/`yield` operand outside its function kind is
+  worded by V8 only in the cases handled, an invalid escape in an UNTAGGED
+  template literal is not an early error, `new.target` at the top level of a
+  `-e`/stdin script is accepted (node rejects it there; the CommonJS wrapper
+  makes it legal in a file), and the cover-grammar position of `({ a: 1 }) = 1`
+  is recognised only when the whole target is parenthesised.
 - **`for-of` does not close its iterator when the body THROWS.** `break`,
   `return` and a labeled break all call `return()` (pinned in
   `examples/iterclose.js`), and so does an abrupt callback in the consumers
@@ -2829,3 +2841,93 @@ Still divergent, and why:
   on `AsymmetricKeyObject.prototype` and answers `undefined`; node reports the
   modulus length, public exponent, curve name and the rest, which needs the key
   material parsed rather than held as PEM text.
+
+## FIXED in round 15 — the lexer, the early-error pass and builtin argument checks, verified against node v26.11.1
+
+Found by reading what the existing corpus did not exercise, then by the new
+fuzz modes (`numlit`, `syntaxerr`, `regexsyntax`, `regexprotocol`, `reflect`,
+`datefield`, `bigintwrap`, `typedcoerce`). Each row is pinned in
+`tests/language_parity.rs` (CI, no `node`) and in a `parity-scripts/` file
+(live reference).
+
+| Case | node | was |
+|---|---|---|
+| `5..toString()`, `1.e3`, `1.5.5` | `"5"`, `1000`, `SyntaxError` after `1.5` | `SyntaxError: bad number` for every literal with a second `.` |
+| `1_`, `1__0`, `0_1`, `3in []`, `0b12`, `07e1` | the distinct V8 errors | accepted (`1_` was `1`) |
+| `` `'${s.replace(/'/g, `'\\''`)}'` `` | the string | `SyntaxError: Unexpected end of input` — the field was cut at a quote inside a regex literal |
+| `var ab = 3; ab` | `3` | `unexpected character '\\'` |
+| `"\101"`, `"\1\12"`; a malformed `\x`/`\u` | `A`; `SyntaxError` | the digits left in place; accepted |
+| `<!-- c`, `--> c` at a line start | comments | `SyntaxError` |
+| `throw\n1`, `do ; while (0) 1`, `yield\n* 2` | `SyntaxError`, `1`, `SyntaxError` | `1` thrown, `SyntaxError`, a delegation |
+| `a: a: 1`, `class { constructor(){} constructor(){} }`, `({ __proto__: 1, __proto__: 2 })`, `({ get a(x) {} })`, `class A { #a; #a }` | `SyntaxError` | all accepted |
+| `let x; let x` inside `eval` | `SyntaxError` | accepted (the check ran for a script, not for `eval`) |
+| `for (let i of []) { var i }`, `for (const x = 1 of [])`, `for (let i, j of [])` | `SyntaxError` | accepted / worded differently |
+| `1 = 2`, `x?.y = 1`, `f() = 1` | `SyntaxError`; `SyntaxError`; the call runs, then `ReferenceError` | `invalid assignment target`; evaluated (`x` is not defined); `SyntaxError` for the whole script even in dead code |
+| `({ a = 1 })`, `({ a: 1 }) = 1`, `[a, ...b, c] = []` | `SyntaxError` | accepted |
+| `function f(a, a) { 'use strict' }`, `function f(a = 1) { 'use strict' }`, `(a, a) => 1` | `SyntaxError` | accepted |
+| `a ?? b \|\| c`, `export default 1`, `import x from 'y'`, `const x`, `let let = 1`, `class { }`, `return 1` in `eval` | `SyntaxError` with V8's wording | accepted or a different message |
+| a regex LITERAL with a bad pattern or flags inside code that never runs | `SyntaxError` before the program starts | a runtime error, only if reached |
+| `globalThis.parseInt("5")`, `globalThis["Number"]("7")` | `5`, `7` | `TypeError: … is not a function` for every builtin global called through the global object |
+| `Map()`, `Set()`, `WeakMap()`, `Promise()` | `TypeError: Constructor Map requires 'new'` | constructed a collection |
+| `Uint8Array(1)`, `DataView(buf)`, `URL('x')` | the `requires 'new'` / `Class constructor … cannot be invoked` wordings | `Uint8Array is not a function` |
+| `new AggregateError()`, `new AggregateError(1)` | `TypeError: … is not iterable` | an empty `errors` |
+| `new Int8Array([Infinity])`, `new Uint8Array([Infinity])`, `new Int32Array([1e20])` | `0`, `0`, `1661992960` | `-1`, `255`, `-1` (the conversion saturated through `i64`) |
+| `new Uint8ClampedArray([2.5, 0.5])` | `2,0` (ties to even) | `3,1` |
+| `new Uint8Array([1n])`, `new Int8Array({ length: 2 })` | `TypeError`, length 2 | `[1]`, length 0 |
+| `new Float32Array([3, NaN, -0, 0]).sort()` | `-0,0,3,NaN` | an unordered result (NaN compared equal to everything) |
+| `delete u8[0]`, `Object.defineProperty(u8, 0, { writable: false })`, `Reflect.defineProperty(u8, 9, {})` | `false`, `TypeError`, `false` | `true`, accepted, `true` |
+| `Reflect.isExtensible(1)`, `Reflect.getOwnPropertyDescriptor(1, 'a')`, `Reflect.setPrototypeOf({}, 1)`, `Reflect.defineProperty({}, 'k', 1)` | `TypeError` | `true`, `undefined`, `true`, `true` |
+| `Reflect.apply(1)`, `Reflect.construct(function () {}, [], 1)` | the callable / constructor wording | `CreateListFromArrayLike called on non-object`, `{}` |
+| `Object.defineProperty({}, 'k', { get() {}, value: 1 })`, `{ get: 1 }` | `TypeError` | defined; a throwing descriptor getter was swallowed |
+| `Object.defineProperty({}, 'k', {})` | a property holding `undefined` | no property |
+| `BigInt.asUintN(2**53, 1n)`, `asIntN(8, 1)`, `asUintN(2**40, 1n)` | `RangeError`, `TypeError`, `1n` | `0n`, a different message, `0n` (the width was truncated to 32 bits) |
+| `BigInt([7])`, `BigInt(Object(3n))` | `7n`, `3n` | `TypeError` (no ToPrimitive) |
+| `new Date(0).setUTCMinutes()`, `Date.UTC(275760, 8, 13, 0, 0, 0, 1)`, `new Date(-0.5).getTime()` | `NaN`, `NaN`, `0` | a number, `8640000000000001`, `-0` |
+| `new Date(-62198755200000).toUTCString()`, `Date()` | `… -0001 …`, a string | `-001`, `TypeError: Date is not a function` |
+| `(0.5).toFixed()` | `1` | `RangeError` (a missing argument was NaN) |
+| `/\w/.test('é')`, `/\s/.test('\x85')`, `/\./.test(' ')`, `/^b/m.test('a\rb')` | `false`, `false`, `false`, `true` | `true`, `true`, `true`, `false` |
+| `/[\d-x]/`, `/\u{61}/` without `u`, `/\x4/`, `/\p{Foo}/` without `u`, `/(?=a)+/` | valid (Annex B) | a regex-layer error |
+| `/(/`, `/a{2,1}/`, `/\-/u`, `/{/u`, `/(?<a>.)(?<a>.)/` | V8's reasons | the regex layer's own text, or accepted |
+| `'aaba'.replace(/a/y, 'X')`, `'aaba'.match(/a/gy)`, `[...'aaaaa'.matchAll(r)]` with `r.lastIndex = 3` | `Xaba`, `['a','a']`, two matches | `XXbX`, three matches, five |
+| `'abc'.replace(/b/, '$<x>')` | `a$<x>c` | `ac` |
+| `setTimeout.length`, `process.nextTick.length`, `timers.setImmediate.length` | `2`, `1`, `1` | `undefined` |
+
+### Still open — found in round 15, not fixed
+
+Each needs substrate this frontend does not have; none is approximated.
+
+- **`Math.cos`/`sin`/`tan`/`atan`/`exp`/`expm1`/`cbrt`/`sinh`/`cosh`/`atanh` can
+  differ in the last digit.** V8 uses its own port of fdlibm (`ieee754.cc`);
+  this runtime calls the platform libm (Rust `std`). The `libm` crate is not a
+  substitute — it is musl's rearrangement and disagrees with V8 on values such
+  as `Math.cos(0.1)`. Faithful results need a port of V8's `ieee754.cc`.
+- **Sloppy-mode `arguments` is not mapped to the parameters.** `function f(a)
+  { arguments[0] = 7; return a }` is `7` in node and `1` here (and the converse).
+- **`(0, eval)(src)` sees the module's top-level bindings**, because the entry
+  source is compiled as global code rather than as the CommonJS wrapper function
+  (see the entry-point table above).
+- **`Event`, `EventTarget`, `Intl`, `Atomics`, `SharedArrayBuffer` and the `with`
+  statement are absent.** `AbortController`/`AbortSignal` exist; the base
+  classes they extend in node do not.
+- **A non-`u` regexp steps by code point, not code unit**, and a capture inside
+  a quantified group is not reset on each iteration
+  (`/(z)((a+)?(b+)?(c))*/.exec('zaacbbbcac')` keeps `'bbb'` where node has
+  `undefined`). Both are the `fancy-regex` engine's semantics.
+- **`RegExp.prototype[Symbol.match|matchAll|replace|search|split]` are absent as
+  properties** (the instance forms work). They are not in the generated
+  `src/arity.rs` table, whose well-known-symbol set is fixed in `gen-arity`.
+- **`v`-mode class set operations are not validated** (`[a-z&&[^aeiou]]`,
+  `[a&&&b]`), and `\q{…}` is rejected by the engine.
+- **`%TypedArray%` is not an intrinsic** (`Object.getPrototypeOf(Int8Array)` is
+  `Function.prototype`), a view over a resizable `ArrayBuffer` does not track
+  its length, and a typed array does not keep expando string-keyed properties.
+- **A function's own `length` and `name` are synthesized and fixed.**
+  `Reflect.deleteProperty(fn, 'length')` does not remove the property, a
+  `defineProperty` that makes one writable is not honoured by a later
+  assignment.
+- **Annex B function-in-`if` hoisting is absent**: `if (1) function f() {};
+  typeof f` leaves `f` undefined outside the statement.
+- **An object-literal method's `super`** resolves against the wrong object:
+  `({ m() { return super.toString } }).m()` is not `Object.prototype.toString`.
+- **`new Function('a', '/*', '*/){')`** is accepted; node rejects a parameter
+  list that does not parse on its own.

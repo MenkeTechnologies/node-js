@@ -103,6 +103,26 @@ fn escape_regexp_pattern(pattern: &str) -> String {
     out
 }
 
+/// The early errors of a regex LITERAL (13.2.7.3): its flags and its pattern
+/// grammar, in the wording V8 gives a literal. The flag message differs from
+/// the constructor's, which names the argument.
+pub fn check_literal(pattern: &str, flags: &str) -> Result<(), String> {
+    let mut seen = String::new();
+    for c in flags.chars() {
+        if !"dgimsuvy".contains(c) || seen.contains(c) {
+            return Err("SyntaxError: Invalid regular expression flags".to_string());
+        }
+        seen.push(c);
+    }
+    if flags.contains('u') && flags.contains('v') {
+        return Err("SyntaxError: Invalid regular expression flags".to_string());
+    }
+    let sets = flags.contains('v');
+    crate::regexp_syntax::validate(pattern, flags.contains('u') || sets, sets).map_err(|reason| {
+        format!("SyntaxError: Invalid regular expression: /{pattern}/{flags}: {reason}")
+    })
+}
+
 pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     // Validate flags (Node throws on an unknown/repeated flag).
     let mut seen = String::new();
@@ -132,7 +152,9 @@ pub fn build_regexp(pattern: &str, flags: &str) -> Result<Value, String> {
     let invalid = |reason: &str| {
         format!("SyntaxError: Invalid regular expression: /{pattern}/{flags}: {reason}")
     };
-    let rust_pat = translate(pattern, unicode, sets).map_err(|r| invalid(&r))?;
+    crate::regexp_syntax::validate(pattern, unicode, sets).map_err(|r| invalid(&r))?;
+    let rust_pat =
+        translate(pattern, unicode, sets, dot_all, multiline).map_err(|r| invalid(&r))?;
     // Assemble the inline-flag prefix fancy-regex (via the regex layer) understands.
     let mut prefixed = String::new();
     if ignore_case || multiline || dot_all {
@@ -310,6 +332,80 @@ fn check_group(chars: &[char], i: usize) -> Result<(), &'static str> {
     Err("Invalid group")
 }
 
+/// `\b` and `\B` over the ASCII word set JS defines (22.2.2.9 IsWordChar). The
+/// regex layer's own `\b` is Unicode-aware and its `(?-u:\b)` is refused by
+/// fancy-regex, so the assertion is spelled out with lookaround.
+const WORD_BOUNDARY: &str =
+    "(?:(?<=[0-9A-Za-z_])(?![0-9A-Za-z_])|(?<![0-9A-Za-z_])(?=[0-9A-Za-z_]))";
+const NOT_WORD_BOUNDARY: &str =
+    "(?:(?<=[0-9A-Za-z_])(?=[0-9A-Za-z_])|(?<![0-9A-Za-z_])(?![0-9A-Za-z_]))";
+
+/// A quantifier at `chars[at..]` — `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}`, each
+/// with an optional lazy `?` — as (index past it, its minimum count).
+fn quantifier_at(chars: &[char], at: usize) -> Option<(usize, u64)> {
+    let (mut end, min) = match chars.get(at)? {
+        '*' | '?' => (at + 1, 0),
+        '+' => (at + 1, 1),
+        '{' => {
+            let mut j = at + 1;
+            let lo_start = j;
+            while chars.get(j).is_some_and(char::is_ascii_digit) {
+                j += 1;
+            }
+            if j == lo_start {
+                return None;
+            }
+            let min: u64 = chars[lo_start..j]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(u64::MAX);
+            if chars.get(j) == Some(&',') {
+                j += 1;
+                while chars.get(j).is_some_and(char::is_ascii_digit) {
+                    j += 1;
+                }
+            }
+            if chars.get(j) != Some(&'}') {
+                return None;
+            }
+            (j + 1, min)
+        }
+        _ => return None,
+    };
+    if chars.get(end) == Some(&'?') {
+        end += 1;
+    }
+    Some((end, min))
+}
+
+/// Whether four hex digits sit at `chars[at..]` — the `\uXXXX` form.
+fn four_hex(chars: &[char], at: usize) -> bool {
+    chars
+        .get(at..at + 4)
+        .is_some_and(|h| h.iter().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The JS meaning of `\d \D \w \W \s \S` (22.2.2.9) in the regex layer's
+/// syntax. Inside a class the positive forms are bare members and the negated
+/// ones nested classes, which the regex layer unions.
+fn class_escape(e: char, in_class: bool) -> String {
+    /// WhiteSpace and LineTerminator (12.2, 12.3) — which is NOT Unicode's
+    /// `White_Space`: it has U+FEFF and lacks U+0085.
+    const WS: &str = r"\t\n\x{B}\x{C}\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}";
+    const WORD: &str = "0-9A-Za-z_";
+    let members = match e.to_ascii_lowercase() {
+        'd' => "0-9",
+        'w' => WORD,
+        _ => WS,
+    };
+    match (e.is_ascii_lowercase(), in_class) {
+        (true, true) => members.to_string(),
+        (true, false) => format!("[{members}]"),
+        (false, _) => format!("[^{members}]"),
+    }
+}
+
 /// Translate a JS regex source into fancy-regex syntax, or the reason node's
 /// parser would reject it (the caller adds the `Invalid regular expression:
 /// /…/flags: ` frame).
@@ -329,7 +425,13 @@ fn check_group(chars: &[char], i: usize) -> Result<(), &'static str> {
 ///     forms none of those is a literal backslash followed by `c`; `\k` with no
 ///     named group in the pattern is the letter `k`.
 ///   * In unicode mode those legacy forms are the SyntaxErrors node raises.
-fn translate(pat: &str, unicode: bool, sets: bool) -> Result<String, String> {
+fn translate(
+    pat: &str,
+    unicode: bool,
+    sets: bool,
+    dot_all: bool,
+    multiline: bool,
+) -> Result<String, String> {
     let chars: Vec<char> = pat.chars().collect();
     let (group_count, group_names) = scan_groups(&chars);
     let mut out = String::new();
@@ -341,8 +443,16 @@ fn translate(pat: &str, unicode: bool, sets: bool) -> Result<String, String> {
     let mut class_pos = 0usize;
     // Under `v` classes nest; this counts the open ones.
     let mut class_depth = 0usize;
+    // Whether the previous class member was a set escape (`\d`): a `-` after one
+    // is a literal, which the regex layer would otherwise read as a range.
+    let mut prev_set = false;
+    // One entry per open group: where its `(` landed in `out` when it is a
+    // lookahead (which Annex B lets take a quantifier — the regex layer does not,
+    // so it is wrapped in `(?:…)` once its close is seen).
+    let mut group_open: Vec<Option<usize>> = Vec::new();
     while i < chars.len() {
         let c = chars[i];
+        let after_set = std::mem::take(&mut prev_set);
         // Character-class bookkeeping. A `\` escape is handled below and never
         // toggles class state (it consumes its own two chars).
         if c != '\\' {
@@ -395,7 +505,19 @@ fn translate(pat: &str, unicode: bool, sets: bool) -> Result<String, String> {
             '\\' => {
                 class_pos += 1;
                 match chars.get(i + 1).copied() {
-                    // `\uXXXX` / `\u{...}` → `\x{...}` (surrogates remapped).
+                    // `\uXXXX` / `\u{...}` → `\x{...}` (surrogates remapped). Outside the
+                    // `u` flag only the four-digit form is an escape: `\u{61}` is `u`
+                    // repeated 61 times, and a malformed `\u` is the letter itself.
+                    Some('u') if !unicode && !four_hex(&chars, i + 2) => {
+                        out.push('u');
+                        i += 2;
+                        continue;
+                    }
+                    Some('u') if !unicode && chars.get(i + 2) == Some(&'{') => {
+                        out.push('u');
+                        i += 2;
+                        continue;
+                    }
                     Some('u') => {
                         i += 2;
                         let cp_hex: String;
@@ -418,6 +540,26 @@ fn translate(pat: &str, unicode: bool, sets: bool) -> Result<String, String> {
                             // Not valid hex — emit the code point literally so the
                             // engine surfaces its own error rather than us guessing.
                             Err(_) => out.push_str(&format!("\\x{{{cp_hex}}}")),
+                        }
+                        continue;
+                    }
+                    // `\xHH`; a malformed one outside `u` is the letter `x` (B.1.2).
+                    Some('x') => {
+                        let hex: String = chars
+                            .get(i + 2..i + 4)
+                            .map(|h| h.iter().collect())
+                            .unwrap_or_default();
+                        match u32::from_str_radix(&hex, 16) {
+                            Ok(v)
+                                if hex.len() == 2 && hex.chars().all(|c| c.is_ascii_hexdigit()) =>
+                            {
+                                out.push_str(&hex_escape(v));
+                                i += 4;
+                            }
+                            _ => {
+                                out.push('x');
+                                i += 2;
+                            }
                         }
                         continue;
                     }
@@ -512,7 +654,37 @@ fn translate(pat: &str, unicode: bool, sets: bool) -> Result<String, String> {
                         i += 4 + close;
                         continue;
                     }
-                    // Everything else (`\d \w \s \b \n \. \\` …) passes through.
+                    // `\p{…}` is a property escape only under `u`/`v`; without them it
+                    // is the letter itself, followed by whatever `{…}` is.
+                    Some(pc @ ('p' | 'P')) if !unicode => {
+                        out.push(pc);
+                        i += 2;
+                        continue;
+                    }
+                    // The class escapes are ASCII-only in JS (and `\s` is the spec's
+                    // WhiteSpace + LineTerminator list), where the regex layer's own
+                    // `\d \w \s \b` are Unicode-aware.
+                    Some(e @ ('d' | 'D' | 'w' | 'W' | 's' | 'S')) => {
+                        out.push_str(&class_escape(e, in_class));
+                        prev_set = in_class;
+                        i += 2;
+                        continue;
+                    }
+                    Some('b') if in_class => {
+                        out.push_str(&hex_escape(8));
+                        i += 2;
+                        continue;
+                    }
+                    Some(b @ ('b' | 'B')) => {
+                        out.push_str(if b == 'b' {
+                            WORD_BOUNDARY
+                        } else {
+                            NOT_WORD_BOUNDARY
+                        });
+                        i += 2;
+                        continue;
+                    }
+                    // Everything else (`\n \. \\` …) passes through.
                     Some(other) => {
                         out.push('\\');
                         out.push(other);
@@ -524,6 +696,61 @@ fn translate(pat: &str, unicode: bool, sets: bool) -> Result<String, String> {
                         i += 1;
                     }
                 }
+            }
+            '(' if !in_class => {
+                let lookahead =
+                    chars.get(i + 1) == Some(&'?') && matches!(chars.get(i + 2), Some('=' | '!'));
+                group_open.push(lookahead.then_some(out.len()));
+                out.push('(');
+                i += 1;
+            }
+            ')' if !in_class => {
+                out.push(')');
+                i += 1;
+                // A quantified lookahead (Annex B) cannot be handed to the regex
+                // layer, which refuses to repeat a zero-width assertion. It does
+                // not need to: an iteration that matches the empty string is
+                // rejected once the minimum is met (22.2.2.3.1 RepeatMatcher
+                // step 2.b), so the quantifier can only ever run the assertion
+                // ONCE when its minimum is 1 or more, and never when it is 0.
+                if let Some(Some(at)) = group_open.pop() {
+                    if let Some((next, min)) = quantifier_at(&chars, i).filter(|_| !unicode) {
+                        if min == 0 {
+                            // Kept as a group that can never match, so the
+                            // numbering of any capture inside is unchanged.
+                            out.insert_str(at, "(?:(?!)");
+                            out.push_str(")?");
+                        }
+                        i = next;
+                    }
+                }
+            }
+            // `.` excludes all four LineTerminators, not just `\n`.
+            '.' if !in_class && !dot_all => {
+                out.push_str(r"[^\n\r\x{2028}\x{2029}]");
+                i += 1;
+            }
+            // Under `m`, `^`/`$` also sit beside `\r`, LS and PS; the engine's own
+            // multi-line anchors know only `\n`.
+            '^' if !in_class && multiline => {
+                out.push_str(r"(?:^|(?<=[\r\x{2028}\x{2029}]))");
+                i += 1;
+            }
+            '$' if !in_class && multiline => {
+                out.push_str(r"(?:$|(?=[\r\x{2028}\x{2029}]))");
+                i += 1;
+            }
+            '-' if in_class
+                && (after_set
+                    || (chars.get(i + 1) == Some(&'\\')
+                        && matches!(
+                            chars.get(i + 2),
+                            Some('d' | 'D' | 'w' | 'W' | 's' | 'S')
+                        ))) =>
+            {
+                out.push_str("\\-");
+                class_pos += 1;
+                i += 1;
             }
             _ => {
                 if in_class {
@@ -933,25 +1160,56 @@ fn attach_indices(caps: &Captures, s: &str, arr: &Value, names: &[&str]) {
 
 // ── String.prototype regex methods (called from builtins::string_method) ──────
 
+/// Every match `RegExpBuiltinExec` produces when driven in a loop from byte
+/// offset `start` (22.2.6.9 / 22.2.6.11 / 22.2.9.1): each next search begins
+/// where the last match ended, an EMPTY match steps one character further, and
+/// under `y` a match must begin exactly where the search does — so a sticky
+/// scan ends at the first gap rather than skipping over it.
+fn collect_matches<'s>(re: &Regex, s: &'s str, start: usize, sticky: bool) -> Vec<Captures<'s>> {
+    let mut out = Vec::new();
+    let mut pos = start;
+    while pos <= s.len() {
+        let Some(caps) = re.captures_from_pos(s, pos).ok().flatten() else {
+            break;
+        };
+        let m = caps.get(0).expect("group 0 always participates");
+        if sticky && m.start() != pos {
+            break;
+        }
+        pos = match m.end() == m.start() {
+            true => match s[m.end()..].chars().next() {
+                Some(c) => m.end() + c.len_utf8(),
+                None => s.len() + 1,
+            },
+            false => m.end(),
+        };
+        out.push(caps);
+    }
+    out
+}
+
 /// `str.match(re)`: without `g`, same as `exec` (array or null); with `g`, an
 /// array of every whole-match string (or null if none).
 pub fn str_match(s: &str, re_val: &Value) -> Result<Value, String> {
-    let Some((re, global, _, _)) = regexp_snapshot(re_val) else {
+    let Some((re, global, sticky, _)) = regexp_snapshot(re_val) else {
         return Ok(with_host(|h| h.null()));
     };
     if !global {
-        // Non-global match ignores lastIndex and searches from the start.
-        set_last_index(re_val, U16Index::ZERO);
+        // A sticky match is an `exec`: it starts at, and advances, `lastIndex`.
+        if sticky {
+            return regexp_exec(re_val, s);
+        }
+        // Otherwise it ignores `lastIndex`, searches from the start and — it
+        // being neither `g` nor `y` — leaves it exactly where it was.
         return regexp_exec_from_zero(&re, s, has_indices(re_val));
     }
     // 22.2.6.9 step 6.a: a global match sets `lastIndex` to 0 before it starts,
     // so it always collects from the beginning and leaves it there. It was
     // being left wherever the caller had put it.
     set_last_index(re_val, U16Index::ZERO);
-    let matches: Vec<Value> = re
-        .find_iter(s)
-        .filter_map(|m| m.ok())
-        .map(|m| with_host(|h| h.new_str(m.as_str().to_string())))
+    let matches: Vec<Value> = collect_matches(&re, s, 0, sticky)
+        .iter()
+        .map(|c| with_host(|h| h.new_str(c.get(0).map_or("", |m| m.as_str()).to_string())))
         .collect();
     if matches.is_empty() {
         Ok(with_host(|h| h.null()))
@@ -971,7 +1229,7 @@ fn regexp_exec_from_zero(re: &Regex, s: &str, indices: bool) -> Result<Value, St
 /// `str.matchAll(re)`: an iterator over every match array (requires the `g` flag
 /// in Node, but we accept a non-global regex too and still iterate all matches).
 pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
-    let Some((re, global, _, _)) = regexp_snapshot(re_val) else {
+    let Some((re, global, sticky, last)) = regexp_snapshot(re_val) else {
         return Ok(with_host(|h| h.new_array(Vec::new())));
     };
     let indices = has_indices(re_val);
@@ -983,9 +1241,14 @@ pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
             "String.prototype.matchAll called with a non-global RegExp argument",
         ));
     }
+    // 22.2.6.9 `@@matchAll` clones the regexp with the ORIGINAL's `lastIndex`,
+    // so the scan begins there rather than at 0.
     let mut items = Vec::new();
-    for caps in re.captures_iter(s).flatten() {
-        items.push(build_match_array(&re, &caps, s, indices));
+    if last.get() <= utf16::len(s) {
+        let start = byte_of_index(s, last);
+        for caps in collect_matches(&re, s, start, sticky) {
+            items.push(build_match_array(&re, &caps, s, indices));
+        }
     }
     // Return a live iterator so `for-of`/spread/`Array.from` all work.
     Ok(with_host(|h| {
@@ -1000,12 +1263,16 @@ pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
 
 /// `str.search(re)`: char index of the first match, or -1.
 pub fn str_search(s: &str, re_val: &Value) -> Result<Value, String> {
-    let Some((re, _, _, _)) = regexp_snapshot(re_val) else {
+    let Some((re, _, sticky, _)) = regexp_snapshot(re_val) else {
         return Ok(Value::Float(-1.0));
     };
+    // 22.2.6.12 runs the exec with `lastIndex` 0, so a sticky regexp can only
+    // match AT the start; `lastIndex` itself is restored afterwards.
     Ok(match re.find(s).ok().flatten() {
-        Some(m) => Value::Float(index_of_byte(s, m.start()).get() as f64),
-        None => Value::Float(-1.0),
+        Some(m) if !sticky || m.start() == 0 => {
+            Value::Float(index_of_byte(s, m.start()).get() as f64)
+        }
+        _ => Value::Float(-1.0),
     })
 }
 
@@ -1122,16 +1389,39 @@ pub fn str_replace_regex(
     repl: &Value,
     all: bool,
 ) -> Result<Value, String> {
-    let Some((re, global, _, _)) = regexp_snapshot(re_val) else {
+    let Some((re, global, sticky, last_index)) = regexp_snapshot(re_val) else {
         return Ok(with_host(|h| h.new_str(s.to_string())));
     };
     let replace_all = all || global;
+    let has_named_groups = re.capture_names().flatten().next().is_some();
     let is_fn = with_host(|h| host::is_callable(h, repl));
 
     let mut out = String::new();
     let mut last = 0usize;
     let mut count = 0;
-    for caps in re.captures_iter(s).flatten() {
+    // Which matches the replace sees. A global one collects them all from 0; a
+    // sticky one that is not global makes ONE `exec` at `lastIndex` and moves
+    // `lastIndex` to its end (or back to 0 on failure); a plain one takes the
+    // first match from the start.
+    let found: Vec<Captures> = if global {
+        collect_matches(&re, s, 0, sticky)
+    } else if sticky {
+        let all_from_here = if last_index.get() <= utf16::len(s) {
+            collect_matches(&re, s, byte_of_index(s, last_index), true)
+        } else {
+            Vec::new()
+        };
+        let first: Vec<Captures> = all_from_here.into_iter().take(1).collect();
+        let next = first
+            .first()
+            .and_then(|c| c.get(0))
+            .map_or(U16Index::ZERO, |m| index_of_byte(s, m.end()));
+        set_last_index(re_val, next);
+        first
+    } else {
+        collect_matches(&re, s, 0, false)
+    };
+    for caps in found {
         let m = caps.get(0).unwrap();
         out.push_str(&s[last..m.start()]);
         if is_fn {
@@ -1156,7 +1446,7 @@ pub fn str_replace_regex(
             out.push_str(&with_host(|h| h.str_of(&r)));
         } else {
             let repl_str = with_host(|h| h.str_of(repl));
-            out.push_str(&expand_replacement(&repl_str, &caps, s));
+            out.push_str(&expand_replacement(&repl_str, &caps, s, has_named_groups));
         }
         last = m.end();
         count += 1;
@@ -1199,7 +1489,7 @@ fn named_groups_object(re: &Regex, caps: &Captures) -> Option<Value> {
     }))
 }
 
-fn expand_replacement(templ: &str, caps: &Captures, s: &str) -> String {
+fn expand_replacement(templ: &str, caps: &Captures, s: &str, has_named_groups: bool) -> String {
     let chars: Vec<char> = templ.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -1224,18 +1514,16 @@ fn expand_replacement(templ: &str, caps: &Captures, s: &str) -> String {
                     out.push_str(&s[whole.end()..]);
                     i += 2;
                 }
-                '<' => {
-                    // `$<name>` named-group reference.
-                    let mut j = i + 2;
-                    let mut name = String::new();
-                    while j < chars.len() && chars[j] != '>' {
-                        name.push(chars[j]);
-                        j += 1;
-                    }
+                // `$<name>` is a named-group reference only when the pattern has
+                // named groups (22.1.3.19.1 GetSubstitution): without any, `$<`
+                // is literal text, and so is `$<` with no closing `>`.
+                '<' if has_named_groups && chars[i + 2..].contains(&'>') => {
+                    let close = i + 2 + chars[i + 2..].iter().position(|c| *c == '>').unwrap_or(0);
+                    let name: String = chars[i + 2..close].iter().collect();
                     if let Some(m) = caps.name(&name) {
                         out.push_str(m.as_str());
                     }
-                    i = j + 1; // consume '>'
+                    i = close + 1;
                 }
                 d if d.is_ascii_digit() => {
                     // `$1`..`$99`: prefer a two-digit group if it exists.

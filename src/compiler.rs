@@ -297,9 +297,31 @@ fn check_nested(k: &StmtKind) -> Result<(), String> {
         }
         StmtKind::While { body, .. }
         | StmtKind::DoWhile { body, .. }
-        | StmtKind::Labeled { body, .. }
-        | StmtKind::ForOf { body, .. }
-        | StmtKind::ForIn { body, .. } => one(body),
+        | StmtKind::Labeled { body, .. } => one(body),
+        // A `for (let …)` head is its own scope, and a `var` in the body hoists
+        // THROUGH it onto the same name — a collision no block-level check sees.
+        StmtKind::ForOf {
+            decl_kind: Some(kind),
+            target,
+            body,
+            ..
+        }
+        | StmtKind::ForIn {
+            decl_kind: Some(kind),
+            target,
+            body,
+            ..
+        } if !matches!(kind, DeclKind::Var) => {
+            let mut head = Vec::new();
+            pattern_names(target, &mut head);
+            let mut vars = Vec::new();
+            collect_var_names(body, &mut vars);
+            if let Some(n) = head.iter().find(|n| vars.contains(n)) {
+                return Err(already_declared(n));
+            }
+            one(body)
+        }
+        StmtKind::ForOf { body, .. } | StmtKind::ForIn { body, .. } => one(body),
         StmtKind::For { body, .. } => one(body),
         StmtKind::Try {
             block,
@@ -379,6 +401,7 @@ pub fn compile_completion_strict(
         strict: caller_strict || has_use_strict(stmts),
         ..Default::default()
     };
+    check_early_errors(stmts)?;
     let mut b = ChunkBuilder::new();
     // The completion register, declared before anything can write it. A name no
     // source text can spell, like the `.param<n>` slots a destructured
@@ -950,7 +973,7 @@ impl Compiler {
                         .loops
                         .len()
                         .checked_sub(1)
-                        .ok_or("SyntaxError: 'break' outside loop")?,
+                        .ok_or("SyntaxError: Illegal break statement")?,
                 };
                 if idx >= self.chunk_loop_base {
                     self.emit_unwind_scopes(b, self.loops[idx].break_depth);
@@ -972,13 +995,21 @@ impl Compiler {
                             c.catches_continue && c.label.as_deref() == Some(name.as_str())
                         })
                         .ok_or_else(|| {
-                            format!("SyntaxError: Undefined label '{name}' for continue")
+                            // A label that exists but names a non-loop is a different
+                            // error from one that does not exist.
+                            if self.loops.iter().any(|c| c.label.as_deref() == Some(name.as_str())) {
+                                format!(
+                                    "SyntaxError: Illegal continue statement: '{name}' does not denote an iteration statement"
+                                )
+                            } else {
+                                format!("SyntaxError: Undefined label '{name}'")
+                            }
                         })?,
                     None => self
                         .loops
                         .iter()
                         .rposition(|c| c.catches_continue)
-                        .ok_or("SyntaxError: 'continue' outside loop")?,
+                        .ok_or("SyntaxError: Illegal continue statement: no surrounding iteration statement")?,
                 };
                 if idx >= self.chunk_loop_base {
                     self.emit_unwind_scopes(b, self.loops[idx].continue_depth);
@@ -1055,7 +1086,7 @@ impl Compiler {
                 b.patch_jump(jf, end);
                 self.compile_bind(b, target, declare)?;
             }
-            _ => return Err("SyntaxError: invalid assignment target".into()),
+            _ => return Err("SyntaxError: Invalid destructuring assignment target".into()),
         }
         Ok(())
     }
@@ -1094,14 +1125,84 @@ impl Compiler {
     /// has to catch it. Emitting the throw in place of the store gives exactly
     /// that, and costs nothing for every store that is not to a const.
     fn throw_const_assignment(&mut self, b: &mut ChunkBuilder) {
+        self.throw_error(b, "TypeError", "Assignment to constant variable.");
+    }
+
+    /// Bind the value on TOS to a `for-in`/`for-of` head target. Only the
+    /// assignment form (`for (x of …)`) has a target that can be wrong: a
+    /// non-reference is an early SyntaxError, and a CALL is evaluated and then
+    /// refused at run time (B.3.6), once the loop has produced a value.
+    fn bind_loop_target(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        declare: BindMode,
+    ) -> Result<(), String> {
+        const MSG: &str = "Invalid left-hand side in for-loop";
+        if matches!(declare, BindMode::Assign) {
+            match target {
+                Expr::Ident(_)
+                | Expr::Member { .. }
+                | Expr::Index { .. }
+                | Expr::Array(_)
+                | Expr::Object(_)
+                    if !Self::spine_has_optional(target) => {}
+                Expr::Call { .. } if !Self::spine_has_optional(target) => {
+                    b.emit(Op::Pop, 0); // the iteration value
+                    self.compile_expr(b, target)?;
+                    b.emit(Op::Pop, 0);
+                    self.throw_error(b, "ReferenceError", MSG);
+                    return Ok(());
+                }
+                _ => return Err(format!("SyntaxError: {MSG}")),
+            }
+        }
+        self.compile_bind(b, target, declare)
+    }
+
+    /// Emit `throw new <ctor>(<message>)` in place.
+    fn throw_error(&mut self, b: &mut ChunkBuilder, ctor: &str, message: &str) {
         let e = Expr::New {
-            callee: Box::new(Expr::Ident("TypeError".into())),
-            args: vec![Expr::Str("Assignment to constant variable.".into())],
+            callee: Box::new(Expr::Ident(ctor.into())),
+            args: vec![Expr::Str(message.into())],
         };
         // `New` of a known builtin with a literal argument cannot fail to
         // compile, so the error path is unreachable rather than swallowed.
         if self.compile_expr(b, &e).is_ok() {
             b.emit(Op::CallBuiltin(ops::THROW, 1), 0);
+        }
+    }
+
+    /// 13.15.1 / 13.4.1: whether `target` may be assigned or updated.
+    ///
+    /// A non-reference target (`1 = 2`, `a + b = 1`, `x?.y = 1`) is an early
+    /// SyntaxError. A CALL is the one web-compat exception (B.3.6): it parses,
+    /// is evaluated, and only then throws a ReferenceError, so it is lowered
+    /// here as call, pop, throw. `Ok(true)` means the throw was emitted and the
+    /// caller must not store; `patterns` admits `[a] = …` / `{a} = …`.
+    fn reject_bad_target(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        patterns: bool,
+        message: &str,
+    ) -> Result<bool, String> {
+        let syntax_error = || Err(format!("SyntaxError: {message}"));
+        match target {
+            Expr::Ident(_) | Expr::Member { .. } | Expr::Index { .. }
+                if Self::spine_has_optional(target) =>
+            {
+                syntax_error()
+            }
+            Expr::Ident(_) | Expr::Member { .. } | Expr::Index { .. } => Ok(false),
+            Expr::Array(_) | Expr::Object(_) if patterns => Ok(false),
+            Expr::Call { .. } if !Self::spine_has_optional(target) => {
+                self.compile_expr(b, target)?;
+                b.emit(Op::Pop, 0);
+                self.throw_error(b, "ReferenceError", message);
+                Ok(true)
+            }
+            _ => syntax_error(),
         }
     }
 
@@ -1153,7 +1254,7 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0);
                 b.emit(Op::Pop, 0);
             }
-            _ => return Err("SyntaxError: invalid assignment target".into()),
+            _ => return Err("SyntaxError: Invalid destructuring assignment target".into()),
         }
         Ok(())
     }
@@ -1169,6 +1270,10 @@ impl Compiler {
             .position(|e| matches!(e, Expr::Spread(_)))
             .map(|i| i as i64)
             .unwrap_or(-1);
+        // 13.15.5.2 / 14.3.3: a rest element is the LAST element of a pattern.
+        if star_idx >= 0 && star_idx as usize + 1 != items.len() {
+            return Err("SyntaxError: Rest element must be last element".to_string());
+        }
         b.emit(Op::LoadInt(items.len() as i64), 0);
         b.emit(Op::LoadInt(star_idx), 0);
         let at = b.current_pos();
@@ -1214,6 +1319,13 @@ impl Compiler {
         props: &[Prop],
         declare: BindMode,
     ) -> Result<(), String> {
+        if props
+            .iter()
+            .rposition(|p| matches!(p, Prop::Spread(_)))
+            .is_some_and(|i| i + 1 != props.len())
+        {
+            return Err("SyntaxError: Rest element must be last element".to_string());
+        }
         // A NULLISH source: node names the pattern's first property and the
         // source expression rather than reporting the property read that failed.
         // Which of the two wordings it uses is decided by that first element —
@@ -1757,7 +1869,7 @@ impl Compiler {
         if per_iteration {
             self.emit_push_scope(b);
         }
-        self.compile_bind(b, target, declare)?;
+        self.bind_loop_target(b, target, declare)?;
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
@@ -1839,7 +1951,7 @@ impl Compiler {
         if per_iteration {
             self.emit_push_scope(b);
         }
-        self.compile_bind(b, target, declare)?; // consumes value -> [iterator]
+        self.bind_loop_target(b, target, declare)?; // consumes value -> [iterator]
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
@@ -2790,6 +2902,35 @@ impl Compiler {
             // reference once. Handled ahead of the plain-`=` arms below because
             // it must keep that reference on the stack across the read, the
             // computation and the write, which a plain assignment never does.
+            // An unassignable target is rejected (or, for a call, deferred to a
+            // runtime ReferenceError) before anything else looks at it. A
+            // destructuring pattern is only legal for plain `=`.
+            Expr::Assign { target, op, .. }
+                if self.reject_bad_target(
+                    b,
+                    target,
+                    op.is_none(),
+                    "Invalid left-hand side in assignment",
+                )? =>
+            {
+                // The throw is already emitted; leave a value for the
+                // expression's consumer (never reached).
+                b.emit(Op::LoadUndef, 0);
+            }
+            Expr::Update { target, prefix, .. }
+                if self.reject_bad_target(
+                    b,
+                    target,
+                    false,
+                    if *prefix {
+                        "Invalid left-hand side expression in prefix operation"
+                    } else {
+                        "Invalid left-hand side expression in postfix operation"
+                    },
+                )? =>
+            {
+                b.emit(Op::LoadUndef, 0);
+            }
             Expr::Assign {
                 target,
                 op: Some(aop),

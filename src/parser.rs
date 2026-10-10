@@ -8,7 +8,7 @@
 //! the lexer captured.
 
 use crate::ast::*;
-use crate::lexer::{lex, Tok, Token};
+use crate::lexer::{lex, Legacy, Tok, Token};
 
 const KEYWORDS: &[&str] = &[
     "var",
@@ -54,6 +54,43 @@ struct PrivateScope {
     used: Vec<String>,
 }
 
+/// The names a binding pattern introduces.
+fn pattern_idents(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Ident(n) => out.push(n.clone()),
+        Expr::Array(items) => items.iter().for_each(|i| pattern_idents(i, out)),
+        Expr::Spread(inner) => pattern_idents(inner, out),
+        Expr::Assign { target, .. } => pattern_idents(target, out),
+        Expr::Object(props) => {
+            for pr in props {
+                match pr {
+                    Prop::KeyValue { value, .. } => pattern_idents(value, out),
+                    Prop::Spread(inner) => pattern_idents(inner, out),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 15.4.1: a getter takes no parameters and a setter exactly one, which is not
+/// a rest parameter.
+fn check_accessor_arity(kind: MemberKind, params: &[Param]) -> Result<(), String> {
+    match kind {
+        MemberKind::Get if !params.is_empty() => {
+            Err("SyntaxError: Getter must not have any formal parameters.".to_string())
+        }
+        MemberKind::Set if params.len() != 1 => {
+            Err("SyntaxError: Setter must have exactly one formal parameter.".to_string())
+        }
+        MemberKind::Set if params[0].rest => {
+            Err("SyntaxError: Setter function argument must not be a rest parameter".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn private_not_declared(name: &str) -> String {
     format!("SyntaxError: Private field '{name}' must be declared in an enclosing class")
 }
@@ -79,11 +116,46 @@ struct Parser {
     /// Whether token offsets point into the script text, so a function's
     /// [`Span`] can be recorded. Off for a re-parsed template field.
     spans: bool,
+    /// The labels of the statements enclosing the current one, innermost last,
+    /// reset at each function boundary: a label may not be declared twice in
+    /// one nest (14.13.1).
+    labels: Vec<String>,
+    /// Whether the code being parsed is strict (a `'use strict'` directive
+    /// prologue, or a class body). Decides the early errors that only strict
+    /// code has: legacy octal forms, `let`/`yield`/… as names, a function
+    /// declaration as an `if`/loop body.
+    strict: bool,
+    /// Whether `super` may appear here: a method, an accessor, a class field
+    /// initialiser or a static block, and an arrow inside one. An `eval`'s
+    /// source starts out true, since it may be running inside a method.
+    super_ok: bool,
+    /// Whether a `return` is legal here: inside a function body, or at the top
+    /// of a file (which Node wraps in one). An `eval`'s top level is not.
+    in_function: bool,
+    /// Token positions of `{ a = 1 }` shorthand initialisers seen in an
+    /// expression. They are legal only if the object turns out to be a pattern
+    /// (an assignment target, a `for` head); anything left when the statement
+    /// ends is the `Invalid shorthand property initializer` early error.
+    cover_init: Vec<usize>,
+    /// Set while parsing a binding pattern, where `{ a = 1 }` is simply a
+    /// default and never a cover grammar.
+    in_binding: bool,
 }
 
 /// Parse a complete JS program into a statement list. Inline `rust { ... }` FFI
 /// blocks are desugared to `__rust_compile(...)` calls before lexing.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
+    parse_source(src, false, false)
+}
+
+/// Parse the source text of an `eval` / `vm` script. Identical to [`parse`]
+/// except that `super` is accepted at the top level when `allow_super` says the
+/// code runs inside a method (a direct `eval` there may use it).
+pub fn parse_eval(src: &str, allow_super: bool) -> Result<Vec<Stmt>, String> {
+    parse_source(src, allow_super, true)
+}
+
+fn parse_source(src: &str, allow_super: bool, in_eval: bool) -> Result<Vec<Stmt>, String> {
     let desugared = crate::rust_ffi::desugar(src);
     // A `rust { … }` block is rewritten before lexing, so offsets would point
     // into text the caller never sees; record spans only when nothing moved.
@@ -96,8 +168,15 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         in_async: false,
         no_in: false,
         class_scopes: Vec::new(),
+        labels: Vec::new(),
+        strict: false,
+        super_ok: allow_super,
+        in_function: !in_eval,
+        cover_init: Vec::new(),
+        in_binding: false,
         spans,
     };
+    p.strict = p.leading_use_strict(0);
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.parse_stmt()?);
@@ -118,9 +197,16 @@ impl Parser {
     /// parsed as if at the top level, so `` `${await x}` `` was a
     /// `ReferenceError` and `` `${this.#c}` `` a `SyntaxError`.
     fn parse_field(&mut self, src: &str, at: u32) -> Result<Expr, String> {
+        // `${}`: the field is empty, so the first thing wrong is its `}`.
+        if src.trim().is_empty() {
+            return Err("SyntaxError: Unexpected token '}'".to_string());
+        }
         let mut p = field_parser(src, self.spans.then_some(at))?;
         p.in_generator = self.in_generator;
         p.in_async = self.in_async;
+        p.strict = self.strict;
+        p.super_ok = self.super_ok;
+        p.in_function = self.in_function;
         if !self.class_scopes.is_empty() {
             p.class_scopes.push(PrivateScope::default());
         }
@@ -187,15 +273,179 @@ impl Parser {
             false
         }
     }
+    /// V8's message for a token the grammar has no place for. Which wording
+    /// depends on the token's class — a reserved word and a punctuator are
+    /// `Unexpected token 'x'`, an identifier names itself, and a literal says
+    /// only what kind it is — so every "this token cannot go here" error site
+    /// shares one function rather than describing the token its own way.
+    fn unexpected(&self) -> String {
+        /// The ReservedWords (13.1.1) V8 reports as a bare token.
+        const RESERVED: &[&str] = &[
+            "break",
+            "case",
+            "catch",
+            "class",
+            "const",
+            "continue",
+            "debugger",
+            "default",
+            "delete",
+            "do",
+            "else",
+            "export",
+            "extends",
+            "false",
+            "finally",
+            "for",
+            "function",
+            "if",
+            "import",
+            "in",
+            "instanceof",
+            "new",
+            "null",
+            "return",
+            "super",
+            "switch",
+            "this",
+            "throw",
+            "true",
+            "try",
+            "typeof",
+            "var",
+            "void",
+            "while",
+            "with",
+        ];
+        // V8 explains a stray `await` operand by the missing `async`, not by
+        // the operand: `await 1` outside an async function reaches the `1`.
+        if self.pos > 0
+            && !self.in_async
+            && matches!(&self.toks[self.pos - 1].tok, Tok::Ident(s) if s == "await")
+            && !matches!(self.tok(), Tok::Punct(p) if p == ")" || p == ";" || p == ",")
+        {
+            return "SyntaxError: await is only valid in async functions and the top level bodies of modules".to_string();
+        }
+        let what = match self.tok() {
+            Tok::Eof => "Unexpected end of input".to_string(),
+            Tok::Num(_) | Tok::BigInt(_) => "Unexpected number".to_string(),
+            Tok::Str(_) => "Unexpected string".to_string(),
+            Tok::Template { .. } => "Unexpected template string".to_string(),
+            Tok::Regex(..) => "Unexpected regular expression".to_string(),
+            Tok::Ident(s) if s == "enum" => "Unexpected reserved word".to_string(),
+            Tok::Ident(s) if RESERVED.contains(&s.as_str()) => {
+                format!("Unexpected token '{s}'")
+            }
+            Tok::Ident(s) => format!("Unexpected identifier '{s}'"),
+            Tok::Punct(p) => format!("Unexpected token '{p}'"),
+        };
+        format!("SyntaxError: {what}")
+    }
+
+    /// The parameter-list early errors that depend on how the function is
+    /// written (15.2.1, 15.1.1): a repeated name is allowed only in sloppy code
+    /// with a plain list of simple names, and a `'use strict'` body needs a
+    /// simple list. `unique` is set for arrows, methods and accessors, which
+    /// never allow a repeat; `body_strict` for a body that begins with the
+    /// directive (strictness inherited from outside is `self.strict`).
+    fn check_params(
+        &self,
+        params: &[Param],
+        body_strict: bool,
+        unique: bool,
+    ) -> Result<(), String> {
+        let simple = params
+            .iter()
+            .all(|p| !p.rest && p.default.is_none() && matches!(p.pattern, Expr::Ident(_)));
+        if body_strict && !simple {
+            return Err(
+                "SyntaxError: Illegal 'use strict' directive in function with \
+                        non-simple parameter list"
+                    .to_string(),
+            );
+        }
+        let strict = self.strict || body_strict;
+        let mut names: Vec<String> = Vec::new();
+        for p in params {
+            pattern_idents(&p.pattern, &mut names);
+        }
+        if strict && names.iter().any(|n| n == "eval" || n == "arguments") {
+            return Err("SyntaxError: Unexpected eval or arguments in strict mode".to_string());
+        }
+        let repeats = names
+            .iter()
+            .enumerate()
+            .any(|(i, n)| names[..i].contains(n));
+        if repeats && (strict || unique || !simple) {
+            return Err(
+                "SyntaxError: Duplicate parameter name not allowed in this context".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the directive prologue starting at token `from` contains
+    /// `'use strict'` (14.1.1): the leading run of string-literal expression
+    /// statements, each ended by `;`, a newline or the end of the block.
+    fn leading_use_strict(&self, from: usize) -> bool {
+        let mut i = from;
+        while let Some(Token {
+            tok: Tok::Str(s), ..
+        }) = self.toks.get(i)
+        {
+            let ends = match self.toks.get(i + 1) {
+                Some(t) => {
+                    matches!(&t.tok, Tok::Punct(p) if p == ";" || p == "}")
+                        || t.newline_before
+                        || matches!(t.tok, Tok::Eof)
+                }
+                None => true,
+            };
+            if !ends {
+                return false;
+            }
+            if s == "use strict" {
+                return true;
+            }
+            i += 1;
+            if matches!(self.toks.get(i), Some(Token { tok: Tok::Punct(p), .. }) if p == ";") {
+                i += 1;
+            }
+        }
+        false
+    }
+
+    /// Run `f` with `super` allowed or not.
+    fn with_super<T>(&mut self, ok: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = std::mem::replace(&mut self.super_ok, ok);
+        let out = f(self);
+        self.super_ok = saved;
+        out
+    }
+
+    /// The strict-mode-only restriction the current token trips, if the code
+    /// is strict.
+    fn check_legacy(&self) -> Result<(), String> {
+        if !self.strict {
+            return Ok(());
+        }
+        let msg = match self.cur().legacy {
+            Legacy::None => return Ok(()),
+            Legacy::OctalLiteral => "Octal literals are not allowed in strict mode.",
+            Legacy::LeadingZeroDecimal => {
+                "Decimals with leading zeros are not allowed in strict mode."
+            }
+            Legacy::OctalEscape => "Octal escape sequences are not allowed in strict mode.",
+            Legacy::NonOctalEscape => "\\8 and \\9 are not allowed in strict mode.",
+        };
+        Err(format!("SyntaxError: {msg}"))
+    }
+
     fn expect_punct(&mut self, s: &str) -> Result<(), String> {
         if self.eat_punct(s) {
             Ok(())
         } else {
-            Err(format!(
-                "SyntaxError: expected '{s}' but found {:?} (line {})",
-                self.tok(),
-                self.line()
-            ))
+            Err(self.unexpected())
         }
     }
 
@@ -207,10 +457,7 @@ impl Parser {
                 self.advance();
                 Ok(s)
             }
-            other => Err(format!(
-                "SyntaxError: expected identifier but found {other:?} (line {})",
-                self.line()
-            )),
+            _ => Err(self.unexpected()),
         }
     }
 
@@ -222,15 +469,21 @@ impl Parser {
         if self.newline_before() || self.is_punct("}") || self.at_eof() {
             return Ok(());
         }
-        Err(format!(
-            "SyntaxError: expected ';' but found {:?} (line {})",
-            self.tok(),
-            self.line()
-        ))
+        Err(self.unexpected())
     }
 
     // ── statements ───────────────────────────────────────────────────────
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
+        let stmt = self.parse_stmt_inner()?;
+        // Whatever `{ a = 1 }` is still unclaimed by a pattern is an error
+        // (13.2.5.1): report it where V8 does, at the statement's end.
+        if !self.cover_init.is_empty() {
+            return Err("SyntaxError: Invalid shorthand property initializer".to_string());
+        }
+        Ok(stmt)
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, String> {
         let line = self.line();
         let kind = match self.tok().clone() {
             Tok::Punct(p) if p == "{" => {
@@ -241,9 +494,22 @@ impl Parser {
                 self.advance();
                 StmtKind::Empty
             }
+            // A script has no `export`, and `import` is only the call form
+            // `import(…)` and the meta property `import.meta`.
+            Tok::Ident(kw) if kw == "export" => return Err(self.unexpected()),
+            Tok::Ident(kw)
+                if kw == "import"
+                    && !matches!(
+                        self.toks.get(self.pos + 1).map(|t| &t.tok),
+                        Some(Tok::Punct(p)) if p == "(" || p == "."
+                    ) =>
+            {
+                return Err("SyntaxError: Cannot use import statement outside a module".to_string());
+            }
             Tok::Ident(kw) if kw == "var" || kw == "let" || kw == "const" => {
                 let k = self.parse_decl_kind();
                 let decls = self.parse_declarators()?;
+                self.check_declarators(&k, &decls)?;
                 self.semicolon()?;
                 StmtKind::Decl { kind: k, decls }
             }
@@ -257,6 +523,15 @@ impl Parser {
                 self.parse_func_decl(true)?
             }
             Tok::Ident(kw) if kw == "class" => {
+                // A class DECLARATION needs a binding name (15.7.1).
+                if matches!(
+                    self.toks.get(self.pos + 1).map(|t| &t.tok),
+                    Some(Tok::Punct(p)) if p == "{"
+                ) || self.peek_kw(1, "extends")
+                {
+                    self.advance();
+                    return Err(self.unexpected());
+                }
                 let node = self.parse_class(true)?;
                 StmtKind::ClassDecl(node)
             }
@@ -266,6 +541,9 @@ impl Parser {
             Tok::Ident(kw) if kw == "for" => self.parse_for()?,
             Tok::Ident(kw) if kw == "switch" => self.parse_switch()?,
             Tok::Ident(kw) if kw == "return" => {
+                if !self.in_function {
+                    return Err("SyntaxError: Illegal return statement".to_string());
+                }
                 self.advance();
                 let arg = if self.is_punct(";")
                     || self.is_punct("}")
@@ -293,6 +571,10 @@ impl Parser {
             }
             Tok::Ident(kw) if kw == "throw" => {
                 self.advance();
+                // 14.14: no LineTerminator between `throw` and its operand.
+                if self.newline_before() {
+                    return Err("SyntaxError: Illegal newline after throw".to_string());
+                }
                 let e = self.parse_expr()?;
                 self.semicolon()?;
                 StmtKind::Throw(e)
@@ -304,10 +586,28 @@ impl Parser {
             // labels are parsed inside `parse_switch`).
             Tok::Ident(name) if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == ":") =>
             {
+                if self.labels.contains(&name) {
+                    return Err(format!(
+                        "SyntaxError: Label '{name}' has already been declared"
+                    ));
+                }
                 self.advance(); // the label identifier
                 self.advance(); // the ':'
-                let body = Box::new(self.parse_stmt()?);
-                StmtKind::Labeled { label: name, body }
+                self.labels.push(name.clone());
+                // 14.13.1 / B.3.2: a labelled FunctionDeclaration is sloppy-only.
+                let body = if self.strict
+                    && (self.is_kw("function")
+                        || self.is_kw("async") && self.peek_kw(1, "function"))
+                {
+                    Err("SyntaxError: In strict mode code, functions can only be declared at top level or inside a block.".to_string())
+                } else {
+                    self.parse_stmt()
+                };
+                self.labels.pop();
+                StmtKind::Labeled {
+                    label: name,
+                    body: Box::new(body?),
+                }
             }
             _ => {
                 let e = self.parse_expr()?;
@@ -337,10 +637,14 @@ impl Parser {
         let start = self.start_at(if is_async { self.pos - 1 } else { self.pos });
         self.advance(); // function
         let is_generator = self.eat_punct("*");
+        if self.is_punct("(") {
+            return Err("SyntaxError: Function statements require a function name".to_string());
+        }
         let name = self.ident_name()?;
         let params = self.parse_params()?;
+        self.check_params(&params, self.leading_use_strict(self.pos + 1), false)?;
         self.expect_punct("{")?;
-        let body = self.parse_fn_body_block(is_generator, is_async)?;
+        let body = self.with_super(false, |p| p.parse_fn_body_block(is_generator, is_async))?;
         Ok(StmtKind::FuncDecl {
             name,
             params,
@@ -358,10 +662,28 @@ impl Parser {
         is_generator: bool,
         is_async: bool,
     ) -> Result<Vec<Stmt>, String> {
+        self.parse_body_block(is_generator, is_async, true)
+    }
+
+    /// [`Self::parse_fn_body_block`] with `return` admitted or not: a class
+    /// static block is a body in every other respect but may not `return`.
+    fn parse_body_block(
+        &mut self,
+        is_generator: bool,
+        is_async: bool,
+        returns: bool,
+    ) -> Result<Vec<Stmt>, String> {
         let (pg, pa) = (self.in_generator, self.in_async);
         self.in_generator = is_generator;
         self.in_async = is_async;
+        let outer_labels = std::mem::take(&mut self.labels);
+        let outer_strict = self.strict;
+        let outer_in_function = std::mem::replace(&mut self.in_function, returns);
+        self.strict = outer_strict || self.leading_use_strict(self.pos);
         let body = self.parse_block_body();
+        self.in_function = outer_in_function;
+        self.strict = outer_strict;
+        self.labels = outer_labels;
         self.in_generator = pg;
         self.in_async = pa;
         body
@@ -385,8 +707,9 @@ impl Parser {
             None
         };
         let params = self.parse_params()?;
+        self.check_params(&params, self.leading_use_strict(self.pos + 1), false)?;
         self.expect_punct("{")?;
-        let body = self.parse_fn_body_block(is_generator, is_async)?;
+        let body = self.with_super(false, |p| p.parse_fn_body_block(is_generator, is_async))?;
         Ok(Expr::Function {
             params,
             body: FnBody::Block(body),
@@ -460,14 +783,47 @@ impl Parser {
             None
         };
         self.expect_punct("{")?;
+        // 11.2.2: every part of a class is strict code.
+        let outer_strict = std::mem::replace(&mut self.strict, true);
         let mut members = Vec::new();
         while !self.is_punct("}") && !self.at_eof() {
             if self.eat_punct(";") {
                 continue; // stray semicolons between members
             }
-            let member = self.parse_class_member()?;
+            let member = self.with_super(true, |p| p.parse_class_member());
+            let member = match member {
+                Ok(m) => m,
+                Err(e) => {
+                    self.strict = outer_strict;
+                    return Err(e);
+                }
+            };
+            if member.kind == MemberKind::Constructor
+                && members
+                    .iter()
+                    .any(|m: &ClassMember| m.kind == MemberKind::Constructor)
+            {
+                return Err("SyntaxError: A class may only have one constructor".to_string());
+            }
             if let Expr::Str(k) = &member.key {
                 if k.starts_with('#') {
+                    // A name is declared once — except a getter and a setter of
+                    // the same staticness, which together are one accessor.
+                    let pair = |a: &MemberKind, b: &MemberKind| {
+                        matches!(
+                            (a, b),
+                            (MemberKind::Get, MemberKind::Set) | (MemberKind::Set, MemberKind::Get)
+                        )
+                    };
+                    let clash = members.iter().any(|m: &ClassMember| {
+                        matches!(&m.key, Expr::Str(n) if n == k)
+                            && !(pair(&m.kind, &member.kind) && m.is_static == member.is_static)
+                    });
+                    if clash {
+                        return Err(format!(
+                            "SyntaxError: Identifier '{k}' has already been declared"
+                        ));
+                    }
                     if let Some(scope) = self.class_scopes.last_mut() {
                         scope.declared.push(k.clone());
                     }
@@ -475,6 +831,7 @@ impl Parser {
             }
             members.push(member);
         }
+        self.strict = outer_strict;
         self.expect_punct("}")?;
         Ok(ClassNode {
             name,
@@ -500,7 +857,7 @@ impl Parser {
             self.advance();
             // Its own function context: `yield`/`await` are plain identifiers
             // inside a static block, whatever encloses the class.
-            let body = self.parse_fn_body_block(false, false)?;
+            let body = self.parse_body_block(false, false, false)?;
             return Ok(ClassMember {
                 key: Expr::Str(String::new()),
                 computed: false,
@@ -563,6 +920,8 @@ impl Parser {
             && matches!(&key, Expr::Str(s) if s == "constructor")
             && kind == MemberKind::Method;
         let params = self.parse_params()?;
+        check_accessor_arity(kind, &params)?;
+        self.check_params(&params, self.leading_use_strict(self.pos + 1), true)?;
         self.expect_punct("{")?;
         let body = self.parse_fn_body_block(is_generator, is_async)?;
         Ok(ClassMember {
@@ -614,10 +973,7 @@ impl Parser {
                     self.advance();
                     Ok((Expr::Str(s), false))
                 }
-                other => Err(format!(
-                    "SyntaxError: bad member key {other:?} (line {})",
-                    self.line()
-                )),
+                _ => Err(self.unexpected()),
             }
         }
     }
@@ -645,6 +1001,83 @@ impl Parser {
         }
         self.expect_punct("}")?;
         Ok(out)
+    }
+
+    /// Early errors of a `var`/`let`/`const` statement's declarator list: a
+    /// `const` or a destructuring pattern needs an initialiser, `let` may not
+    /// be a lexically bound name, and `enum` is never a binding.
+    fn check_declarators(&self, kind: &DeclKind, decls: &[Declarator]) -> Result<(), String> {
+        for d in decls {
+            if d.init.is_none() {
+                if !matches!(d.target, Expr::Ident(_)) {
+                    return Err(
+                        "SyntaxError: Missing initializer in destructuring declaration".to_string(),
+                    );
+                }
+                if matches!(kind, DeclKind::Const) {
+                    return Err("SyntaxError: Missing initializer in const declaration".to_string());
+                }
+            }
+            if !matches!(kind, DeclKind::Var) {
+                if let Expr::Ident(n) = &d.target {
+                    if n == "let" {
+                        return Err(
+                            "SyntaxError: let is disallowed as a lexically bound name".to_string()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A statement in a single-statement position — the body of a loop or the
+    /// arm of an `if`. Declarations are not statements there (14.6, 14.7);
+    /// V8 words the refusal by what the declaration was and by strictness.
+    /// Sloppy code keeps B.3.3's one allowance: a plain function declaration
+    /// as an `if` arm.
+    fn parse_sub_stmt(&mut self, is_if_arm: bool) -> Result<Stmt, String> {
+        let is_async_fn =
+            self.is_kw("async") && self.peek_kw(1, "function") && !self.peek_newline(1);
+        if self.is_kw("function") || is_async_fn {
+            let generator = self.peek_punct_after_function();
+            if is_async_fn {
+                return Err("SyntaxError: Async functions can only be declared at the top level or inside a block.".to_string());
+            }
+            if generator {
+                return Err("SyntaxError: Generators can only be declared at the top level or inside a block.".to_string());
+            }
+            if self.strict {
+                return Err("SyntaxError: In strict mode code, functions can only be declared at top level or inside a block.".to_string());
+            }
+            if !is_if_arm {
+                return Err("SyntaxError: In non-strict mode code, functions can only be declared at top level, inside a block, or as the body of an if statement.".to_string());
+            }
+        }
+        if self.is_kw("class") {
+            return Err(self.unexpected());
+        }
+        if self.is_kw("const") {
+            return Err(self.unexpected());
+        }
+        if self.is_kw("let")
+            && matches!(
+                self.toks.get(self.pos + 1).map(|t| &t.tok),
+                Some(Tok::Punct(p)) if p == "[" || p == "{"
+            )
+        {
+            return Err(
+                "SyntaxError: Lexical declaration cannot appear in a single-statement context"
+                    .to_string(),
+            );
+        }
+        self.parse_stmt()
+    }
+
+    /// Whether the `function` keyword at the cursor is `function*`.
+    fn peek_punct_after_function(&self) -> bool {
+        let at = if self.is_kw("async") { 2 } else { 1 };
+        matches!(self.toks.get(self.pos + at).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "*")
     }
 
     fn parse_decl_kind(&mut self) -> DeclKind {
@@ -676,13 +1109,43 @@ impl Parser {
 
     /// A binding target: identifier or array/object destructuring pattern.
     fn parse_binding_target(&mut self) -> Result<Expr, String> {
-        if self.is_punct("[") {
-            self.parse_array_literal()
-        } else if self.is_punct("{") {
-            self.parse_object_literal()
+        if self.is_punct("[") || self.is_punct("{") {
+            let outer = std::mem::replace(&mut self.in_binding, true);
+            let pattern = if self.is_punct("[") {
+                self.parse_array_literal()
+            } else {
+                self.parse_object_literal()
+            };
+            self.in_binding = outer;
+            pattern
         } else {
-            Ok(Expr::Ident(self.ident_name()?))
+            let name = self.ident_name()?;
+            self.check_binding_name(&name)?;
+            Ok(Expr::Ident(name))
         }
+    }
+
+    /// Words that may not be bound: `enum` always, and the future-reserved
+    /// words (plus `let`, `static`, `yield`) in strict code (13.1.1).
+    fn check_binding_name(&self, name: &str) -> Result<(), String> {
+        const STRICT_RESERVED: &[&str] = &[
+            "implements",
+            "interface",
+            "let",
+            "package",
+            "private",
+            "protected",
+            "public",
+            "static",
+            "yield",
+        ];
+        if name == "enum" {
+            return Err("SyntaxError: Unexpected reserved word".to_string());
+        }
+        if self.strict && STRICT_RESERVED.contains(&name) {
+            return Err("SyntaxError: Unexpected strict mode reserved word".to_string());
+        }
+        Ok(())
     }
 
     fn parse_if(&mut self) -> Result<StmtKind, String> {
@@ -690,9 +1153,9 @@ impl Parser {
         self.expect_punct("(")?;
         let test = self.parse_expr()?;
         self.expect_punct(")")?;
-        let cons = Box::new(self.parse_stmt()?);
+        let cons = Box::new(self.parse_sub_stmt(true)?);
         let alt = if self.eat_kw("else") {
-            Some(Box::new(self.parse_stmt()?))
+            Some(Box::new(self.parse_sub_stmt(true)?))
         } else {
             None
         };
@@ -704,23 +1167,22 @@ impl Parser {
         self.expect_punct("(")?;
         let test = self.parse_expr()?;
         self.expect_punct(")")?;
-        let body = Box::new(self.parse_stmt()?);
+        let body = Box::new(self.parse_sub_stmt(false)?);
         Ok(StmtKind::While { test, body })
     }
 
     fn parse_do_while(&mut self) -> Result<StmtKind, String> {
         self.advance();
-        let body = Box::new(self.parse_stmt()?);
+        let body = Box::new(self.parse_sub_stmt(false)?);
         if !self.eat_kw("while") {
-            return Err(format!(
-                "SyntaxError: expected 'while' (line {})",
-                self.line()
-            ));
+            return Err(self.unexpected());
         }
         self.expect_punct("(")?;
         let test = self.parse_expr()?;
         self.expect_punct(")")?;
-        self.semicolon()?;
+        // 12.10.1 rule 3: a `;` is inserted after `do … while ( … )` even with no
+        // line break, so `do ; while (0) 1` is two statements.
+        self.eat_punct(";");
         Ok(StmtKind::DoWhile { body, test })
     }
 
@@ -746,10 +1208,14 @@ impl Parser {
         } else {
             self.parse_expr_no_in()?
         };
+        if self.is_kw("of") || self.is_kw("in") {
+            // `for ({ a = 1 } of xs)`: the head is a pattern.
+            self.cover_init.clear();
+        }
         if self.eat_kw("of") {
             let iter = self.parse_assign()?;
             self.expect_punct(")")?;
-            let body = Box::new(self.parse_stmt()?);
+            let body = Box::new(self.parse_sub_stmt(false)?);
             return Ok(StmtKind::ForOf {
                 decl_kind,
                 target: first_target,
@@ -761,7 +1227,7 @@ impl Parser {
         if self.eat_kw("in") {
             let object = self.parse_assign()?;
             self.expect_punct(")")?;
-            let body = Box::new(self.parse_stmt()?);
+            let body = Box::new(self.parse_sub_stmt(false)?);
             return Ok(StmtKind::ForIn {
                 decl_kind,
                 target: first_target,
@@ -788,6 +1254,16 @@ impl Parser {
                     None
                 };
                 decls.push(Declarator { target, init });
+            }
+            // `for (let a, b of …)` / `for (let a = 1 of …)` are for-of headers
+            // that carry more than a bare binding.
+            if self.is_kw("of") {
+                return Err(if decls.len() > 1 {
+                    "SyntaxError: Invalid left-hand side in for-of loop: Must have a single binding."
+                } else {
+                    "SyntaxError: for-of loop variable declaration may not have an initializer."
+                }
+                .to_string());
             }
             StmtKind::Decl { kind: k, decls }
         } else {
@@ -821,7 +1297,7 @@ impl Parser {
             Some(self.parse_expr()?)
         };
         self.expect_punct(")")?;
-        let body = Box::new(self.parse_stmt()?);
+        let body = Box::new(self.parse_sub_stmt(false)?);
         Ok(StmtKind::For {
             init: init.map(Box::new),
             test,
@@ -844,10 +1320,7 @@ impl Parser {
             } else if self.eat_kw("default") {
                 None
             } else {
-                return Err(format!(
-                    "SyntaxError: expected 'case' or 'default' (line {})",
-                    self.line()
-                ));
+                return Err(self.unexpected());
             };
             self.expect_punct(":")?;
             let mut body = Vec::new();
@@ -947,17 +1420,60 @@ impl Parser {
         r
     }
 
+    /// `yield [no LineTerminator here] [*] [expr]` (15.5): a YieldExpression is
+    /// an AssignmentExpression, so nothing binds to it from the right — `yield
+    /// * 2` is a bare `yield` and then a stray `*`.
+    fn parse_yield(&mut self) -> Result<Expr, String> {
+        self.advance(); // yield
+        let delegate = !self.newline_before() && self.eat_punct("*");
+        // `yield` with no argument (before `)`, `]`, `}`, `,`, `;`, `:`,
+        // newline, or EOF).
+        let arg = if delegate
+            || !(self.is_punct(")")
+                || self.is_punct("]")
+                || self.is_punct("}")
+                || self.is_punct(",")
+                || self.is_punct(";")
+                || self.is_punct(":")
+                || self.newline_before()
+                || self.at_eof())
+        {
+            Some(Box::new(self.parse_assign()?))
+        } else {
+            None
+        };
+        Ok(Expr::Yield { arg, delegate })
+    }
+
     fn parse_assign(&mut self) -> Result<Expr, String> {
+        if self.in_generator && self.is_kw("yield") {
+            return self.parse_yield();
+        }
         // Arrow function detection.
         if let Some(arrow) = self.try_parse_arrow()? {
             return Ok(arrow);
         }
+        let start = self.pos;
         let left = self.parse_conditional()?;
         // Assignment operators (right-associative).
         let op = match self.tok() {
             Tok::Punct(p) => p.clone(),
             _ => return Ok(left),
         };
+        // `{ a = 1 } = v`: the shorthand initialisers just parsed belong to a
+        // pattern, so they are defaults and not an error.
+        if op == "=" {
+            // A parenthesised literal is a value, never a pattern (13.15.1):
+            // `({ a }) = 1` and `([a]) = 1` are early errors, where `(a) = 1` is
+            // fine.
+            if matches!(left, Expr::Object(_) | Expr::Array(_))
+                && matches!(&self.toks[start].tok, Tok::Punct(p) if p == "(")
+                && self.matching_paren(start) == Some(self.pos - 1)
+            {
+                return Err("SyntaxError: Invalid left-hand side in assignment".to_string());
+            }
+            self.cover_init.retain(|&at| at < start);
+        }
         let compound = match op.as_str() {
             "=" => None,
             "+=" => Some(BinOp::Add),
@@ -1021,13 +1537,29 @@ impl Parser {
     /// Precedence-climbing binary parser. Handles `&& || ??` as logical nodes.
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, String> {
         let mut left = self.parse_unary()?;
+        // The logical operator that built `left` in THIS loop. A parenthesised
+        // operand arrives from `parse_unary` and is None, which is what makes
+        // `(a || b) ?? c` legal while `a || b ?? c` is not (13.12).
+        let mut left_logical: Option<LogicalOp> = None;
         while let Some((prec, right_assoc, logical, bin)) = self.bin_info() {
             if prec < min_prec {
                 break;
             }
+            if let Some(lop) = logical {
+                let nullish = |o: LogicalOp| matches!(o, LogicalOp::Nullish);
+                if left_logical.is_some_and(|l| nullish(l) != nullish(lop)) {
+                    return Err(self.unexpected());
+                }
+            }
             self.advance();
-            let next_min = if right_assoc { prec } else { prec + 1 };
+            // `??` takes BitwiseOR-level operands (prec 4), never `||`/`&&`.
+            let next_min = match logical {
+                Some(LogicalOp::Nullish) => 4,
+                _ if right_assoc => prec,
+                _ => prec + 1,
+            };
             let right = self.parse_binary(next_min)?;
+            left_logical = logical;
             left = if let Some(lop) = logical {
                 Expr::Logical(lop, Box::new(left), Box::new(right))
             } else {
@@ -1089,12 +1621,10 @@ impl Parser {
     /// SyntaxError rather than a silently-reassociated `-(x ** y)`.
     fn reject_unary_before_pow(&mut self) -> Result<(), String> {
         if self.is_punct("**") {
-            return Err(format!(
-                "SyntaxError: Unary operator used immediately before exponentiation \
-                 expression. Parenthesis must be used to disambiguate operator \
-                 precedence (line {})",
-                self.line()
-            ));
+            return Err("SyntaxError: Unary operator used immediately before \
+                 exponentiation expression. Parenthesis must be used to \
+                 disambiguate operator precedence"
+                .to_string());
         }
         Ok(())
     }
@@ -1163,10 +1693,7 @@ impl Parser {
                 self.advance();
                 let prop = self.ident_name()?;
                 if prop != "target" {
-                    return Err(format!(
-                        "SyntaxError: expected 'target' (line {})",
-                        self.line()
-                    ));
+                    return Err(self.unexpected());
                 }
                 Expr::NewTarget
             } else {
@@ -1204,6 +1731,11 @@ impl Parser {
                     optional: false,
                 };
             } else if self.eat_punct("?.") {
+                if matches!(self.tok(), Tok::Template { .. }) {
+                    return Err(
+                        "SyntaxError: Invalid tagged template on optional chain".to_string()
+                    );
+                }
                 if self.is_punct("(") {
                     let args = self.parse_args()?;
                     e = Expr::Call {
@@ -1335,13 +1867,18 @@ impl Parser {
             }
             Ok(args)
         })?;
-        self.expect_punct(")")?;
+        // V8 reserves its own wording for a call whose argument list does not
+        // close, whatever token stopped it (`f(1 2)`, `f(`).
+        if !self.eat_punct(")") {
+            return Err("SyntaxError: missing ) after argument list".to_string());
+        }
         Ok(args)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.tok().clone() {
             Tok::Num(n) => {
+                self.check_legacy()?;
                 self.advance();
                 Ok(Expr::Number(n))
             }
@@ -1350,10 +1887,16 @@ impl Parser {
                 Ok(Expr::BigInt(s))
             }
             Tok::Regex(pat, flags) => {
+                // A regex LITERAL's flags and pattern are early errors (13.2.7.3),
+                // reported before anything in the program runs.
+                if let Err(reason) = crate::regexp::check_literal(&pat, &flags) {
+                    return Err(reason);
+                }
                 self.advance();
                 Ok(Expr::Regex(pat, flags))
             }
             Tok::Str(s) => {
+                self.check_legacy()?;
                 self.advance();
                 Ok(Expr::Str(s))
             }
@@ -1418,6 +1961,9 @@ impl Parser {
                         Ok(Expr::This)
                     }
                     "super" => {
+                        if !self.super_ok {
+                            return Err("SyntaxError: 'super' keyword unexpected here".to_string());
+                        }
                         self.advance();
                         Ok(Expr::Super)
                     }
@@ -1427,27 +1973,10 @@ impl Parser {
                         self.advance(); // async
                         self.parse_function_expr(true)
                     }
-                    "yield" if self.in_generator => {
-                        self.advance();
-                        let delegate = self.eat_punct("*");
-                        // `yield` with no argument (before `)`, `]`, `}`, `,`, `;`,
-                        // newline, or EOF).
-                        let arg = if delegate
-                            || !(self.is_punct(")")
-                                || self.is_punct("]")
-                                || self.is_punct("}")
-                                || self.is_punct(",")
-                                || self.is_punct(";")
-                                || self.is_punct(":")
-                                || self.newline_before()
-                                || self.at_eof())
-                        {
-                            Some(Box::new(self.parse_assign()?))
-                        } else {
-                            None
-                        };
-                        Ok(Expr::Yield { arg, delegate })
-                    }
+                    // `yield` in a generator is an AssignmentExpression and is
+                    // parsed by `parse_assign`; reaching it here means it sat
+                    // where only a higher-precedence operand may (`a + yield`).
+                    "yield" if self.in_generator => Err(self.unexpected()),
                     "await" if self.in_async => {
                         self.advance();
                         let e = self.parse_unary()?;
@@ -1456,20 +1985,21 @@ impl Parser {
                         self.reject_unary_before_pow()?;
                         Ok(Expr::Await(Box::new(e)))
                     }
-                    _ if is_keyword(&s) => Err(format!(
-                        "SyntaxError: unexpected keyword '{s}' (line {})",
-                        self.line()
-                    )),
+                    _ if is_keyword(&s) => Err(self.unexpected()),
+                    // The future-reserved words are not identifiers in strict code.
+                    "implements" | "interface" | "package" | "private" | "protected" | "public"
+                    | "static" | "yield"
+                        if self.strict =>
+                    {
+                        Err("SyntaxError: Unexpected strict mode reserved word".to_string())
+                    }
                     _ => {
                         self.advance();
                         Ok(Expr::Ident(s))
                     }
                 }
             }
-            other => Err(format!(
-                "SyntaxError: unexpected token {other:?} (line {})",
-                self.line()
-            )),
+            _ => Err(self.unexpected()),
         }
     }
 
@@ -1500,6 +2030,7 @@ impl Parser {
     fn parse_object_literal(&mut self) -> Result<Expr, String> {
         self.expect_punct("{")?;
         let mut props = Vec::new();
+        let mut proto_seen = false;
         while !self.is_punct("}") {
             if self.eat_punct("...") {
                 let e = self.parse_assign()?;
@@ -1520,8 +2051,17 @@ impl Parser {
                 self.advance();
                 let (key, computed) = self.parse_property_key()?;
                 let params = self.parse_params()?;
+                check_accessor_arity(
+                    if is_getter {
+                        MemberKind::Get
+                    } else {
+                        MemberKind::Set
+                    },
+                    &params,
+                )?;
+                self.check_params(&params, self.leading_use_strict(self.pos + 1), true)?;
                 self.expect_punct("{")?;
-                let body = self.parse_block_body()?;
+                let body = self.with_super(true, |p| p.parse_fn_body_block(false, false))?;
                 let func = Expr::Function {
                     params,
                     body: FnBody::Block(body),
@@ -1563,8 +2103,9 @@ impl Parser {
             // Method shorthand `key(params) { }` (incl. `*gen(){}`, `async m(){}`).
             if self.is_punct("(") {
                 let params = self.parse_params()?;
+                self.check_params(&params, self.leading_use_strict(self.pos + 1), true)?;
                 self.expect_punct("{")?;
-                let body = self.parse_fn_body_block(m_gen, m_async)?;
+                let body = self.with_super(true, |p| p.parse_fn_body_block(m_gen, m_async))?;
                 let f = Expr::Function {
                     params,
                     body: FnBody::Block(body),
@@ -1581,6 +2122,17 @@ impl Parser {
                     computed,
                 });
             } else if self.eat_punct(":") {
+                // 13.2.5.1: a second `__proto__: v` in one literal is an early error
+                // (the shorthand and method forms do not set the prototype).
+                if !computed && matches!(&key, Expr::Str(k) if k == "__proto__") {
+                    if proto_seen {
+                        return Err(
+                            "SyntaxError: Duplicate __proto__ fields are not allowed in object literals"
+                                .to_string(),
+                        );
+                    }
+                    proto_seen = true;
+                }
                 let value = self.parse_assign()?;
                 props.push(Prop::KeyValue {
                     key,
@@ -1594,7 +2146,11 @@ impl Parser {
                     Expr::Str(s) => s.clone(),
                     _ => return Err(format!("SyntaxError: bad shorthand (line {})", self.line())),
                 };
-                let value = if self.eat_punct("=") {
+                let value = if self.is_punct("=") {
+                    if !self.in_binding {
+                        self.cover_init.push(self.pos);
+                    }
+                    self.advance();
                     // Pattern default; represent as Assign so destructuring reads it.
                     let d = self.parse_assign()?;
                     Expr::Assign {
@@ -1699,6 +2255,7 @@ impl Parser {
                         self.advance(); // async
                     }
                     let params = self.parse_params()?;
+                    self.check_params(&params, false, true)?;
                     self.expect_punct("=>")?;
                     let body = self.parse_arrow_body(is_async)?;
                     return Ok(Some(Expr::Function {
@@ -1721,12 +2278,19 @@ impl Parser {
         let (pg, pa) = (self.in_generator, self.in_async);
         self.in_generator = false;
         self.in_async = is_async;
+        let outer_labels = std::mem::take(&mut self.labels);
+        let outer_strict = self.strict;
+        let outer_in_function = std::mem::replace(&mut self.in_function, true);
         let r = if self.is_punct("{") {
             self.advance();
+            self.strict = outer_strict || self.leading_use_strict(self.pos);
             self.parse_block_body().map(FnBody::Block)
         } else {
             self.parse_assign().map(|e| FnBody::Expr(Box::new(e)))
         };
+        self.in_function = outer_in_function;
+        self.strict = outer_strict;
+        self.labels = outer_labels;
         self.in_generator = pg;
         self.in_async = pa;
         r
@@ -1780,6 +2344,12 @@ fn field_parser(src: &str, base: Option<u32>) -> Result<Parser, String> {
         in_async: false,
         no_in: false,
         class_scopes: Vec::new(),
+        labels: Vec::new(),
+        strict: false,
+        super_ok: false,
+        in_function: true,
+        cover_init: Vec::new(),
+        in_binding: false,
         spans: base.is_some(),
     })
 }

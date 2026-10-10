@@ -47,6 +47,24 @@ pub struct Token {
     /// last, in the text handed to [`lex`].
     pub start: u32,
     pub end: u32,
+    /// A legacy form this token spelled, which only STRICT code rejects — and
+    /// strictness is not known until the parser has seen the directive
+    /// prologue, so the lexer records the fact and the parser decides.
+    pub legacy: Legacy,
+}
+
+/// The strict-mode-only restrictions a token can trip (B.1.1, B.1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Legacy {
+    None,
+    /// `010`: a legacy octal integer literal.
+    OctalLiteral,
+    /// `08`, `09.5`: a decimal literal with a leading zero.
+    LeadingZeroDecimal,
+    /// `"\101"`, `"\01"`: a legacy octal escape in a string.
+    OctalEscape,
+    /// `"\8"`, `"\9"`.
+    NonOctalEscape,
 }
 
 struct Lexer {
@@ -59,6 +77,9 @@ struct Lexer {
     line: u32,
     out: Vec<Token>,
     pending_newline: bool,
+    /// The legacy form the token being scanned has used so far; moved into
+    /// the token by `push`.
+    legacy: Legacy,
 }
 
 /// Multi-char operators, longest first so the scanner is greedy.
@@ -83,6 +104,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         line: 1,
         out: Vec::new(),
         pending_newline: false,
+        legacy: Legacy::None,
     };
     lx.run()?;
     Ok(lx.out)
@@ -112,6 +134,7 @@ impl Lexer {
             newline_before: self.pending_newline,
             start: self.byte_at[self.tok_start.min(self.pos)],
             end: self.byte_at[self.pos],
+            legacy: std::mem::replace(&mut self.legacy, Legacy::None),
         });
         self.pending_newline = false;
     }
@@ -124,15 +147,23 @@ impl Lexer {
                 self.bump();
             }
         }
-        loop {
+        while self.lex_step()? {}
+        self.tok_start = self.pos;
+        self.push(Tok::Eof);
+        Ok(())
+    }
+
+    /// Consume one whitespace run, comment or token. `false` at end of input.
+    fn lex_step(&mut self) -> Result<bool, String> {
+        {
             match self.peek() {
-                None => break,
+                None => return Ok(false),
                 Some('\n') => {
                     self.bump();
                     self.pending_newline = true;
                 }
-                // LS and PS are line terminators (12.3) just as LF is.
-                Some('\u{2028}' | '\u{2029}') => {
+                // CR, LS and PS are line terminators (12.3) just as LF is.
+                Some('\r' | '\u{2028}' | '\u{2029}') => {
                     self.bump();
                     self.pending_newline = true;
                 }
@@ -140,7 +171,6 @@ impl Lexer {
                 Some(
                     ' '
                     | '\t'
-                    | '\r'
                     | '\u{0B}'
                     | '\u{0C}'
                     | '\u{FEFF}'
@@ -154,26 +184,43 @@ impl Lexer {
                     self.bump();
                 }
                 Some('/') if self.peek_at(1) == Some('/') => {
-                    while let Some(c) = self.peek() {
-                        if c == '\n' {
-                            break;
-                        }
-                        self.bump();
-                    }
+                    self.skip_line_comment();
+                }
+                // B.1.1 HTML-like comments: `<!--` opens a single-line comment
+                // anywhere, `-->` only where a line begins (start of input, or
+                // after a line terminator).
+                Some('<')
+                    if self.peek_at(1) == Some('!')
+                        && self.peek_at(2) == Some('-')
+                        && self.peek_at(3) == Some('-') =>
+                {
+                    self.skip_line_comment();
+                }
+                Some('-')
+                    if (self.pending_newline || self.out.is_empty())
+                        && self.peek_at(1) == Some('-')
+                        && self.peek_at(2) == Some('>') =>
+                {
+                    self.skip_line_comment();
                 }
                 Some('/') if self.peek_at(1) == Some('*') => {
                     self.bump();
                     self.bump();
+                    let mut closed = false;
                     while let Some(c) = self.peek() {
                         if c == '*' && self.peek_at(1) == Some('/') {
                             self.bump();
                             self.bump();
+                            closed = true;
                             break;
                         }
-                        if c == '\n' {
+                        if matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
                             self.pending_newline = true;
                         }
                         self.bump();
+                    }
+                    if !closed {
+                        return Err("SyntaxError: Invalid or unexpected token".to_string());
                     }
                 }
                 // A `/` in expression-start position is a regex literal, not the
@@ -188,9 +235,19 @@ impl Lexer {
                 }
             }
         }
-        self.tok_start = self.pos;
-        self.push(Tok::Eof);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Consume to the end of a single-line comment, stopping AT the line
+    /// terminator (the main loop then records the newline). All four
+    /// LineTerminators end one — not only `\n`.
+    fn skip_line_comment(&mut self) {
+        while let Some(c) = self.peek() {
+            if matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+                break;
+            }
+            self.bump();
+        }
     }
 
     /// Whether a `/` here begins a regex literal (expression-start position)
@@ -240,10 +297,9 @@ impl Lexer {
         loop {
             match self.peek() {
                 None | Some('\n') => {
-                    return Err(format!(
-                        "SyntaxError: unterminated regular expression (line {})",
-                        self.line
-                    ))
+                    return Err(
+                        format!("SyntaxError: Invalid regular expression: missing /").to_string(),
+                    )
                 }
                 Some('\\') => {
                     // Keep the escape verbatim (the translator interprets it).
@@ -297,7 +353,8 @@ impl Lexer {
         // IdentifierStart (12.7) is any Unicode letter, not only ASCII:
         // `const é = 1` and `let Δx` are ordinary names. `scan_name` already
         // continues on any alphanumeric.
-        if c.is_alphabetic() || c == '_' || c == '$' {
+        if c.is_alphabetic() || c == '_' || c == '$' || (c == '\\' && self.peek_at(1) == Some('u'))
+        {
             return self.scan_name();
         }
         // Private class member (`#name`): scanned as an identifier keeping the `#`.
@@ -328,6 +385,26 @@ impl Lexer {
             if c.is_alphanumeric() || c == '_' || c == '$' {
                 s.push(c);
                 self.pos += 1;
+            } else if c == '\\' && self.peek_at(1) == Some('u') {
+                // A `\uXXXX` / `\u{…}` escape spells one identifier character
+                // (12.7); the name it forms is the decoded one.
+                self.pos += 2;
+                let mut decoded = String::new();
+                push_escape(&mut decoded, 'u', self)?;
+                let first = s.is_empty() || s == "#";
+                let ok = decoded.chars().next().is_some_and(|d| {
+                    d == '_'
+                        || d == '$'
+                        || if first {
+                            d.is_alphabetic()
+                        } else {
+                            d.is_alphanumeric()
+                        }
+                });
+                if !ok {
+                    return Err("SyntaxError: Invalid Unicode escape sequence".to_string());
+                }
+                s.push_str(&decoded);
             } else {
                 break;
             }
@@ -341,12 +418,7 @@ impl Lexer {
         let mut raw = String::new();
         loop {
             match self.peek() {
-                None => {
-                    return Err(format!(
-                        "SyntaxError: unterminated string (line {})",
-                        self.line
-                    ))
-                }
+                None => return Err("SyntaxError: Invalid or unexpected token".to_string()),
                 Some(c) if c == quote => {
                     self.bump();
                     break;
@@ -354,15 +426,10 @@ impl Lexer {
                 Some('\\') => {
                     self.bump();
                     if let Some(e) = self.bump() {
-                        push_escape(&mut raw, e, self);
+                        push_escape(&mut raw, e, self)?;
                     }
                 }
-                Some('\n') => {
-                    return Err(format!(
-                        "SyntaxError: unterminated string literal (line {})",
-                        self.line
-                    ))
-                }
+                Some('\n') => return Err("SyntaxError: Invalid or unexpected token".to_string()),
                 Some(c) => {
                     raw.push(c);
                     self.bump();
@@ -371,6 +438,40 @@ impl Lexer {
         }
         self.push(Tok::Str(raw));
         Ok(())
+    }
+
+    /// Lex a template's `${ … }` field to its closing brace and return its
+    /// source text. The cursor starts just past `${` and ends just past the
+    /// matching `}`; the tokens of the field are scanned (so nested templates,
+    /// regex literals and comments are understood) and then discarded, since
+    /// the parser re-reads the text.
+    fn scan_field(&mut self) -> Result<String, String> {
+        let start = self.pos;
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_newline = std::mem::replace(&mut self.pending_newline, false);
+        let mut depth = 0usize;
+        let end = loop {
+            let before = self.out.len();
+            if !self.lex_step()? {
+                return Err("SyntaxError: Unexpected end of input".to_string());
+            }
+            if self.out.len() == before {
+                continue;
+            }
+            match self.out.last().map(|t| &t.tok) {
+                Some(Tok::Punct(p)) if p == "{" => depth += 1,
+                Some(Tok::Punct(p)) if p == "}" => {
+                    if depth == 0 {
+                        break self.tok_start;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        };
+        self.out = saved_out;
+        self.pending_newline = saved_newline;
+        Ok(self.src[start..end].iter().collect())
     }
 
     /// Scan a `` `...${expr}...` `` template. Cooked quasis are decoded; each
@@ -386,12 +487,7 @@ impl Lexer {
         let mut cur_raw = String::new();
         loop {
             match self.peek() {
-                None => {
-                    return Err(format!(
-                        "SyntaxError: unterminated template (line {})",
-                        self.line
-                    ))
-                }
+                None => return Err("SyntaxError: Unexpected end of input".to_string()),
                 Some('`') => {
                     self.bump();
                     break;
@@ -402,7 +498,7 @@ impl Lexer {
                     let start = self.pos;
                     self.bump();
                     if let Some(e) = self.bump() {
-                        push_escape(&mut cur, e, self);
+                        let _ = push_escape(&mut cur, e, self);
                     }
                     for c in &self.src[start..self.pos] {
                         cur_raw.push(*c);
@@ -413,54 +509,11 @@ impl Lexer {
                     self.bump();
                     quasis.push(std::mem::take(&mut cur));
                     raws.push(std::mem::take(&mut cur_raw));
-                    // Capture raw source until the matching `}` (brace-balanced,
-                    // skipping strings).
+                    // The field's extent is found by LEXING it, not by counting
+                    // braces and skipping quotes: a regex literal, a comment or a
+                    // nested template may each hold a `}` or a quote of their own.
                     expr_at.push(self.byte_at[self.pos]);
-                    let mut depth = 1;
-                    let mut src = String::new();
-                    loop {
-                        match self.peek() {
-                            None => {
-                                return Err(format!(
-                                    "SyntaxError: unterminated template expression (line {})",
-                                    self.line
-                                ))
-                            }
-                            Some('{') => {
-                                depth += 1;
-                                src.push('{');
-                                self.bump();
-                            }
-                            Some('}') => {
-                                depth -= 1;
-                                self.bump();
-                                if depth == 0 {
-                                    break;
-                                }
-                                src.push('}');
-                            }
-                            Some(q) if q == '"' || q == '\'' || q == '`' => {
-                                src.push(q);
-                                self.bump();
-                                while let Some(cc) = self.peek() {
-                                    src.push(cc);
-                                    self.bump();
-                                    if cc == '\\' {
-                                        if let Some(n) = self.peek() {
-                                            src.push(n);
-                                            self.bump();
-                                        }
-                                    } else if cc == q {
-                                        break;
-                                    }
-                                }
-                            }
-                            Some(cc) => {
-                                src.push(cc);
-                                self.bump();
-                            }
-                        }
-                    }
+                    let src = self.scan_field()?;
                     exprs.push(src);
                 }
                 Some(c) => {
@@ -481,6 +534,63 @@ impl Lexer {
         Ok(())
     }
 
+    /// A run of digits of `radix`, with `_` numeric separators (12.9.4), appended
+    /// to `out`. A separator must sit BETWEEN two digits; V8 words each way of
+    /// breaking that differently.
+    fn read_digits(&mut self, out: &mut String, radix: u32) -> Result<(), String> {
+        const INVALID: &str = "SyntaxError: Invalid or unexpected token";
+        let mut prev_digit = false;
+        while let Some(c) = self.peek() {
+            if c.is_digit(radix) {
+                out.push(c);
+                self.pos += 1;
+                prev_digit = true;
+            } else if c == '_' {
+                if !prev_digit {
+                    return Err(
+                        if out.is_empty() || !out.ends_with(|d: char| d.is_digit(radix)) {
+                            INVALID.to_string()
+                        } else {
+                            "SyntaxError: Only one underscore is allowed as numeric separator"
+                                .to_string()
+                        },
+                    );
+                }
+                match self.peek_at(1) {
+                    Some(n) if n.is_digit(radix) => {
+                        self.pos += 1;
+                        prev_digit = false;
+                    }
+                    Some('_') => {
+                        return Err(
+                            "SyntaxError: Only one underscore is allowed as numeric separator"
+                                .to_string(),
+                        )
+                    }
+                    _ => {
+                        return Err("SyntaxError: Numeric separators are not allowed at the \
+                                    end of numeric literals"
+                            .to_string())
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// 12.9.1: the character right after a NumericLiteral may not start an
+    /// identifier or be a digit (`3in x`, `0b12`, `1a`).
+    fn reject_trailing_ident(&self) -> Result<(), String> {
+        match self.peek() {
+            Some(c) if c.is_alphanumeric() || c == '_' || c == '$' || c == '\\' => {
+                Err("SyntaxError: Invalid or unexpected token".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn scan_number(&mut self) -> Result<(), String> {
         // Radix prefixes: 0x / 0o / 0b.
         if self.peek() == Some('0') {
@@ -494,31 +604,23 @@ impl Lexer {
                         _ => 2,
                     };
                     let mut digits = String::new();
-                    while let Some(c) = self.peek() {
-                        if c == '_' {
-                            self.pos += 1;
-                        } else if c.is_digit(radix) {
-                            digits.push(c);
-                            self.pos += 1;
-                        } else {
-                            break;
-                        }
+                    self.read_digits(&mut digits, radix)?;
+                    if digits.is_empty() {
+                        return Err("SyntaxError: Invalid or unexpected token".to_string());
                     }
-                    // `0x..n` / `0o..n` / `0b..n` BigInt literal: the digits carry
-                    // arbitrary precision, so parse them as a bignum (radix-aware)
-                    // rather than through `i64`.
+                    let big = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
+                        .ok_or_else(|| "SyntaxError: Invalid or unexpected token".to_string())?;
+                    // `0x..n` / `0o..n` / `0b..n` BigInt literal: arbitrary
+                    // precision, kept as a bignum rather than squeezed through
+                    // `i64` (which also refused a plain literal past 2^63).
                     if self.peek() == Some('n') {
                         self.pos += 1;
-                        let big = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
-                            .ok_or_else(|| {
-                                format!("SyntaxError: bad bigint (line {})", self.line)
-                            })?;
+                        self.reject_trailing_ident()?;
                         self.push(Tok::BigInt(big.to_string()));
                         return Ok(());
                     }
-                    let n = i64::from_str_radix(&digits, radix)
-                        .map_err(|_| format!("SyntaxError: bad number (line {})", self.line))?;
-                    self.push(Tok::Num(n as f64));
+                    self.reject_trailing_ident()?;
+                    self.push(Tok::Num(crate::host::bigint_to_f64(&big)));
                     return Ok(());
                 }
             }
@@ -534,52 +636,79 @@ impl Lexer {
                 n += 1;
             }
             let run: String = (0..n).filter_map(|i| self.peek_at(i)).collect();
-            let terminated = !self
-                .peek_at(n)
-                .is_some_and(|c| matches!(c, '.' | 'e' | 'E' | 'n'));
-            if n > 1 && terminated && run.chars().all(|c| ('0'..='7').contains(&c)) {
+            // All-octal digits make it a legacy OCTAL literal whatever follows; what
+            // follows is then judged as for any literal (`07e1`, `07n`, `07_` are
+            // errors, `07.5` is `07` and a number).
+            if n > 1 && run.chars().all(|c| ('0'..='7').contains(&c)) {
                 self.pos += n;
                 let v = u64::from_str_radix(&run, 8).unwrap_or(0);
+                self.reject_trailing_ident()?;
+                self.legacy = Legacy::OctalLiteral;
                 self.push(Tok::Num(v as f64));
                 return Ok(());
             }
-        }
-        let mut s = String::new();
-        while let Some(c) = self.peek() {
-            match c {
-                '0'..='9' => {
-                    s.push(c);
-                    self.pos += 1;
-                }
-                '_' => {
-                    self.pos += 1;
-                }
-                '.' => {
-                    s.push(c);
-                    self.pos += 1;
-                }
-                'e' | 'E' => {
-                    s.push('e');
-                    self.pos += 1;
-                    if matches!(self.peek(), Some('+') | Some('-')) {
-                        s.push(self.peek().unwrap());
-                        self.pos += 1;
-                    }
-                }
-                _ => break,
+            // `0_1`: a separator may not follow the leading zero.
+            if self.peek_at(1) == Some('_') {
+                return Err(
+                    "SyntaxError: Numeric separator can not be used after leading 0.".to_string(),
+                );
             }
         }
-        // Decimal `BigInt` literal (`123n`): only integer digit runs may carry the
-        // `n` suffix (a `.`/`e` makes it an ordinary number, and `1.5n` is a
-        // SyntaxError in JS — we leave the `n` as a stray identifier so it fails).
-        if self.peek() == Some('n') && !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+        // DecimalLiteral (12.9.3): `1`, `1.`, `1.5`, `.5`, each with an optional
+        // exponent. Exactly ONE `.` belongs to the literal — `5..toString()` is
+        // `5.` then member access, and `1.5.5` is a number followed by `.5`.
+        let mut s = String::new();
+        let legacy_zero =
+            self.peek() == Some('0') && self.peek_at(1).is_some_and(|c| c.is_ascii_digit());
+        if legacy_zero {
+            self.legacy = Legacy::LeadingZeroDecimal;
+            // `08`, `09.5`: a NonOctalDecimalIntegerLiteral takes no separators.
+            while let Some(c) = self.peek().filter(char::is_ascii_digit) {
+                s.push(c);
+                self.pos += 1;
+            }
+            if self.peek() == Some('_') {
+                return Err("SyntaxError: Invalid or unexpected token".to_string());
+            }
+        } else if self.peek() != Some('.') {
+            self.read_digits(&mut s, 10)?;
+        }
+        let mut is_integer = true;
+        if self.peek() == Some('.') {
+            is_integer = false;
+            s.push('.');
             self.pos += 1;
+            self.read_digits(&mut s, 10)?;
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            is_integer = false;
+            s.push('e');
+            self.pos += 1;
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                s.push(self.peek().unwrap());
+                self.pos += 1;
+            }
+            let before = s.len();
+            self.read_digits(&mut s, 10)?;
+            if s.len() == before {
+                return Err("SyntaxError: Invalid or unexpected token".to_string());
+            }
+        }
+        // Decimal `BigInt` literal (`123n`): only an integer digit run may carry
+        // the `n` suffix, and `01n` (a legacy-leading-zero run) may not.
+        if self.peek() == Some('n') && is_integer && !legacy_zero {
+            self.pos += 1;
+            self.reject_trailing_ident()?;
             self.push(Tok::BigInt(s));
             return Ok(());
         }
-        let v: f64 = s
-            .parse()
-            .map_err(|_| format!("SyntaxError: bad number '{s}' (line {})", self.line))?;
+        self.reject_trailing_ident()?;
+        let v: f64 = s.parse().map_err(|_| {
+            format!(
+                "SyntaxError: Invalid or unexpected token (line {})",
+                self.line
+            )
+        })?;
         self.push(Tok::Num(v));
         Ok(())
     }
@@ -614,10 +743,7 @@ impl Lexer {
             self.push(Tok::Punct(c.to_string()));
             Ok(())
         } else {
-            Err(format!(
-                "SyntaxError: unexpected character {c:?} (line {})",
-                self.line
-            ))
+            Err("SyntaxError: Invalid or unexpected token".to_string())
         }
     }
 }
@@ -652,8 +778,15 @@ fn push_code_point(out: &mut String, n: u32) {
     }
 }
 
-/// `\uNNNN` / `\u{...}` are decoded; unknown escapes keep the literal char.
-fn push_escape(out: &mut String, e: char, lx: &mut Lexer) {
+/// Decode the escape sequence whose introducing char `e` follows a `\` (12.9.4).
+///
+/// A malformed `\x`, `\u` or `\u{}` is a SyntaxError carrying V8's wording; the
+/// template scanner discards it, since an untagged-template error is reported
+/// by its own rules and a tagged one cooks to `undefined`. Unknown escapes keep
+/// the literal char, which is what NonEscapeCharacter means.
+fn push_escape(out: &mut String, e: char, lx: &mut Lexer) -> Result<(), String> {
+    const BAD_HEX: &str = "SyntaxError: Invalid hexadecimal escape sequence";
+    const BAD_UNICODE: &str = "SyntaxError: Invalid Unicode escape sequence";
     match e {
         'n' => out.push('\n'),
         't' => out.push('\t'),
@@ -661,72 +794,103 @@ fn push_escape(out: &mut String, e: char, lx: &mut Lexer) {
         'b' => out.push('\u{08}'),
         'f' => out.push('\u{0C}'),
         'v' => out.push('\u{0B}'),
-        '0' => out.push('\0'),
-        '\\' => out.push('\\'),
-        '\'' => out.push('\''),
-        '"' => out.push('"'),
-        '`' => out.push('`'),
-        '\n' => {} // line continuation
-        'x' => {
-            let mut h = String::new();
-            for _ in 0..2 {
-                if let Some(c) = lx.peek() {
-                    if c.is_ascii_hexdigit() {
-                        h.push(c);
-                        lx.bump();
+        // A LineContinuation contributes nothing; `\r\n` is one terminator.
+        '\n' | '\u{2028}' | '\u{2029}' => {}
+        '\r' => {
+            if lx.peek() == Some('\n') {
+                lx.bump();
+            }
+        }
+        // `\0` not followed by a digit is NUL; otherwise this is a LEGACY OCTAL
+        // escape (B.1.2): up to three digits when the first is 0-3, else two.
+        '0'..='7' => {
+            if e == '0' && !lx.peek().is_some_and(|c| c.is_ascii_digit()) {
+                out.push('\0');
+            } else {
+                lx.legacy = Legacy::OctalEscape;
+                let mut n = e.to_digit(8).unwrap();
+                let max_len = if e <= '3' { 3 } else { 2 };
+                for _ in 1..max_len {
+                    match lx.peek().and_then(|c| c.to_digit(8)) {
+                        Some(d) => {
+                            n = n * 8 + d;
+                            lx.bump();
+                        }
+                        None => break,
                     }
                 }
+                out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
             }
-            if let Ok(n) = u32::from_str_radix(&h, 16) {
-                if let Some(ch) = char::from_u32(n) {
-                    out.push(ch);
+        }
+        'x' => {
+            let mut n = 0u32;
+            for _ in 0..2 {
+                match lx.peek().and_then(|c| c.to_digit(16)) {
+                    Some(d) => {
+                        n = n * 16 + d;
+                        lx.bump();
+                    }
+                    None => return Err(BAD_HEX.to_string()),
                 }
             }
+            push_code_point(out, n);
         }
         'u' => {
             if lx.peek() == Some('{') {
                 lx.bump();
-                let mut h = String::new();
-                while let Some(c) = lx.peek() {
-                    if c == '}' {
-                        lx.bump();
-                        break;
-                    }
-                    h.push(c);
-                    lx.bump();
-                }
-                if let Ok(n) = u32::from_str_radix(&h, 16) {
-                    push_code_point(out, n);
-                }
-            } else {
-                let mut h = String::new();
-                for _ in 0..4 {
-                    if let Some(c) = lx.peek() {
-                        if c.is_ascii_hexdigit() {
-                            h.push(c);
+                let mut n = 0u32;
+                let mut digits = 0;
+                loop {
+                    match lx.peek() {
+                        Some('}') if digits > 0 => {
+                            lx.bump();
+                            break;
+                        }
+                        Some(c) if c.is_ascii_hexdigit() => {
+                            n = n.saturating_mul(16).saturating_add(c.to_digit(16).unwrap());
+                            digits += 1;
                             lx.bump();
                         }
+                        _ => return Err(BAD_UNICODE.to_string()),
+                    }
+                    if n > 0x10FFFF {
+                        return Err("SyntaxError: Undefined Unicode code-point".to_string());
                     }
                 }
-                if let Ok(n) = u32::from_str_radix(&h, 16) {
-                    // A HIGH surrogate followed by a `\uXXXX` LOW surrogate is one
-                    // astral character, and `"\ud83d\ude00"` is the ordinary
-                    // ASCII-safe way to write one. Decoding each half on its own
-                    // turned every such literal into two `U+FFFD`s.
-                    if (0xD800..=0xDBFF).contains(&n) {
-                        if let Some(lo) = peek_low_surrogate(lx) {
-                            for _ in 0..6 {
-                                lx.bump();
-                            }
-                            let cp = 0x10000 + ((n - 0xD800) << 10) + (lo - 0xDC00);
-                            push_code_point(out, cp);
-                            return;
+                push_code_point(out, n);
+            } else {
+                let mut n = 0u32;
+                for _ in 0..4 {
+                    match lx.peek().and_then(|c| c.to_digit(16)) {
+                        Some(d) => {
+                            n = n * 16 + d;
+                            lx.bump();
                         }
+                        None => return Err(BAD_UNICODE.to_string()),
                     }
-                    push_code_point(out, n);
                 }
+                // A HIGH surrogate followed by a `\uXXXX` LOW surrogate is one
+                // astral character, and `"😀"` is the ordinary
+                // ASCII-safe way to write one. Decoding each half on its own
+                // turned every such literal into two `U+FFFD`s.
+                if (0xD800..=0xDBFF).contains(&n) {
+                    if let Some(lo) = peek_low_surrogate(lx) {
+                        for _ in 0..6 {
+                            lx.bump();
+                        }
+                        let cp = 0x10000 + ((n - 0xD800) << 10) + (lo - 0xDC00);
+                        push_code_point(out, cp);
+                        return Ok(());
+                    }
+                }
+                push_code_point(out, n);
             }
+        }
+        '8' | '9' => {
+            lx.legacy = Legacy::NonOctalEscape;
+            out.push(e);
         }
         other => out.push(other),
     }
+    Ok(())
 }

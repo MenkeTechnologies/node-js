@@ -7501,6 +7501,16 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
                 return r;
             }
         }
+        // The global object serves every builtin global as a property
+        // (`globalThis.parseInt`, `globalThis["Map"]`) through the property
+        // read, not through the chain walk above; `[[Get]]` then call is the
+        // definition of a method call, so use it before giving up.
+        if with_host(|h| h.is_global_object(recv)) {
+            let f = crate::builtins::get_property(recv, name)?;
+            if with_host(|h| is_callable(h, &f)) {
+                return invoke(&f, args, Some(recv.clone()));
+            }
+        }
         return Err(type_error(&format!("{name} is not a function")));
     }
     // Function value methods: call / apply / bind, then any static method stored
@@ -8049,13 +8059,38 @@ pub fn construct_nt(ctor: &Value, args: Vec<Value>, new_target: Value) -> Result
     }
 }
 
+/// `IsConstructor` (7.2.4): whether `v` has a `[[Construct]]` slot. An arrow, a
+/// generator, an async function and a method are callable but not constructors;
+/// a bound function and a proxy follow their target. Builtins have no slot
+/// table here, so one counts when it is a bare capitalised global (`Map`,
+/// `Symbol`) and not a namespaced static (`Math.max`) or a lowercase function.
+pub(crate) fn is_constructor(v: &Value) -> bool {
+    match with_host(|h| h.get(v).cloned()) {
+        Some(JsObj::Class(_)) => true,
+        Some(JsObj::Func(fv)) => {
+            !fv.is_arrow
+                && !with_host(|h| {
+                    h.funcs
+                        .get(fv.def_id)
+                        .map(|d| d.is_generator || d.is_async || d.is_method)
+                        .unwrap_or(false)
+                })
+        }
+        Some(JsObj::BoundFunc { target, .. }) => is_constructor(&target),
+        Some(JsObj::Builtin(name)) => {
+            !name.contains('.') && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        }
+        _ => with_host(|h| h.kind_of(v)) == Some(ObjKind::Proxy),
+    }
+}
+
 /// `TypeError: <callee> is not a constructor`.
 ///
 /// V8 names the callee by its SOURCE TEXT (`new g()` reports `g`, `new o.m()`
 /// reports `o.m`); node-js keeps no spans, so a named callable is reported by
 /// its name — the same string in the common case — and anything else by its
 /// value.
-fn not_a_constructor(ctor: &Value) -> String {
+pub(crate) fn not_a_constructor(ctor: &Value) -> String {
     let name = with_host(|h| match h.callable_name(ctor) {
         n if n.is_empty() => h.str_of(ctor),
         n => n,
@@ -9688,6 +9723,12 @@ pub fn to_number_value(v: &Value) -> Result<f64, String> {
     // and `+Symbol()` are both `TypeError` on node v26.7.0.
     if with_host(|h| matches!(h.get(v), Some(JsObj::Symbol { .. }))) {
         return Err(type_error("Cannot convert a Symbol value to a number"));
+    }
+    // A BigInt PRIMITIVE is refused here too (7.1.4 step 2 is only about symbols
+    // and BigInts together: `ToNumber(1n)` throws). Only the post-`ToPrimitive`
+    // check below caught a boxed one.
+    if with_host(|h| matches!(h.get(v), Some(JsObj::BigInt(_)))) {
+        return Err(type_error("Cannot convert a BigInt value to a number"));
     }
     if let Some(n) = with_host(|h| is_primitive(h, v).then(|| h.to_number(v))) {
         return Ok(n);
