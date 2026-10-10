@@ -3084,6 +3084,734 @@ fn gen_arraylate(seed: u64) -> Vec<String> {
     }
 }
 
+/// The `try`/`catch` probe every later generator prints through: the value as a
+/// string (a BigInt with its `n`, `-0` kept distinct), or `Name: message`.
+const PROBE: &str = "const P = (f) => { try { const v = f(); \
+return typeof v === 'bigint' ? v + 'n' : Object.is(v, -0) ? '-0' : String(v); } \
+catch (e) { return e.name + ': ' + e.message; } };";
+
+/// `Reflect.*` — never reached by a generator before: zero of the generated
+/// programs named `Reflect`, so every one of its argument checks went untried.
+///
+/// Each case prints the RESULT or the `TypeError` wording. The interesting
+/// edges are the ones where `Reflect` diverges from the `Object.*` it mirrors:
+/// a refusal is a `false` where `Object.defineProperty` throws, yet a
+/// MALFORMED descriptor still throws; `apply` and `construct` check their
+/// target before they read the argument list; and a primitive target is a
+/// TypeError for every method.
+fn gen_reflect(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const TARGETS: &[&str] = &[
+        "{}",
+        "{ a: 1 }",
+        "[1, 2]",
+        "Object.freeze({ a: 1 })",
+        "Object.preventExtensions({ a: 1 })",
+        "function f() {}",
+        "1",
+        "'s'",
+        "null",
+        "undefined",
+        "Symbol('q')",
+    ];
+    const DESCS: &[&str] = &[
+        "{ value: 1 }",
+        "{ value: 1, writable: true, enumerable: true, configurable: true }",
+        "{ get() { return 1; } }",
+        "{ get: 1 }",
+        "{ set: 'x' }",
+        "{ get() {}, value: 1 }",
+        "{ set() {}, writable: true }",
+        "{ get: undefined }",
+        "1",
+        "'d'",
+        "null",
+        "undefined",
+        "[]",
+    ];
+    const KEYS: &[&str] = &["'a'", "'x'", "0", "'length'", "Symbol.iterator"];
+    let t = pick(r, TARGETS);
+    let k = pick(r, KEYS);
+    let mut out = vec![PROBE.to_string(), format!("const t = {t};")];
+    let probes: &[String] = &[
+        format!("console.log(P(() => Reflect.defineProperty(t, {k}, {})));", pick(r, DESCS)),
+        format!("console.log(P(() => Reflect.set(t, {k}, 5)), P(() => Reflect.get(t, {k})));"),
+        format!("console.log(P(() => Reflect.has(t, {k})), P(() => Reflect.deleteProperty(t, {k})));"),
+        "console.log(P(() => Reflect.getPrototypeOf(t) === Object.prototype), P(() => Reflect.isExtensible(t)));".to_string(),
+        format!(
+            "console.log(P(() => Reflect.setPrototypeOf(t, {})));",
+            pick(r, &["null", "{}", "1", "undefined", "Array.prototype", "'s'"])
+        ),
+        "console.log(P(() => Reflect.ownKeys(t).length), P(() => Reflect.preventExtensions(t)));".to_string(),
+        format!("console.log(P(() => Reflect.getOwnPropertyDescriptor(t, {k}) !== undefined));"),
+    ];
+    out.push(pick(r, probes).clone());
+    out.push(pick(r, probes).clone());
+    // apply / construct: target and newTarget validated before the list is read.
+    out.push(format!(
+        "console.log(P(() => Reflect.apply({}, null, {})));",
+        pick(
+            r,
+            &[
+                "Math.max",
+                "1",
+                "undefined",
+                "() => 7",
+                "class C {}",
+                "Symbol"
+            ]
+        ),
+        pick(
+            r,
+            &[
+                "[1, 3]",
+                "1",
+                "undefined",
+                "{ length: 2, 0: 4, 1: 9 }",
+                "null"
+            ]
+        )
+    ));
+    out.push(format!(
+        "console.log(P(() => typeof Reflect.construct({}, [], {})));",
+        pick(
+            r,
+            &[
+                "Date",
+                "function () {}",
+                "() => {}",
+                "1",
+                "class C {}",
+                "async function g() {}",
+                "Math.max",
+                "Map"
+            ]
+        ),
+        pick(
+            r,
+            &[
+                "Object",
+                "function () {}",
+                "() => {}",
+                "1",
+                "Array",
+                "class D {}",
+                "undefined"
+            ]
+        )
+    ));
+    out
+}
+
+/// BigInt WIDTH wrapping and the conversions that feed it
+/// (`asIntN`/`asUintN`, `BigInt()`, `toString(radix)`).
+///
+/// `bits` goes through `ToIndex` and the operand through `ToBigInt`, so a
+/// Number operand is a TypeError, a huge width is not an allocation, and a
+/// negative or non-safe-integer width is a RangeError.
+fn gen_bigintwrap(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const BITS: &[&str] = &[
+        "0",
+        "1",
+        "3",
+        "8",
+        "53",
+        "64",
+        "65",
+        "100",
+        "-1",
+        "2 ** 53",
+        "2 ** 53 - 1",
+        "1.9",
+        "'8'",
+        "NaN",
+        "undefined",
+        "Infinity",
+    ];
+    const VALS: &[&str] = &[
+        "0n",
+        "1n",
+        "-1n",
+        "255n",
+        "256n",
+        "-129n",
+        "2n ** 64n",
+        "-(2n ** 63n)",
+        "2n ** 100n - 1n",
+        "-(2n ** 100n)",
+        "5",
+        "'12'",
+        "true",
+        "null",
+        "undefined",
+        "'0x1f'",
+        "' 7 '",
+        "'1.5'",
+        "Object(3n)",
+        "[]",
+        "[7]",
+    ];
+    let bits = pick(r, BITS);
+    let v = pick(r, VALS);
+    vec![
+        PROBE.to_string(),
+        format!("console.log(P(() => BigInt.asUintN({bits}, {v})), P(() => BigInt.asIntN({bits}, {v})));"),
+        format!("console.log(P(() => BigInt({v})), P(() => ({v}) + 1n));"),
+        format!(
+            "console.log(P(() => (-255n).toString({})), P(() => (2n ** 70n).toString({})));",
+            pick(r, &["2", "16", "36", "1", "37", "undefined", "10"]),
+            pick(r, &["2", "7", "36", "0", "'8'"])
+        ),
+    ]
+}
+
+/// DATE fields, setters and the clip at the edge of the representable range.
+///
+/// The census had `Date` only under the locale mode. Here: a setter called with
+/// no argument is `ToNumber(undefined)` and so NaN; `Date.UTC` clips
+/// (`TimeClip`) at ±8.64e15 where `new Date` does too; the readable string forms
+/// pad a NEGATIVE year as `-0001`; and `Date()` without `new` is a string.
+fn gen_datefield(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const TIMES: &[&str] = &[
+        "0",
+        "-1",
+        "1e12",
+        "8.64e15",
+        "-8.64e15",
+        "8.64e15 + 1",
+        "951782400000",
+        "-62198755200000",
+        "-62167219200000",
+        "253402300799999",
+        "-1e14",
+        "NaN",
+        "1583020800000",
+    ];
+    const SETTERS: &[&str] = &[
+        "setUTCMilliseconds",
+        "setUTCSeconds",
+        "setUTCMinutes",
+        "setUTCHours",
+        "setUTCDate",
+        "setUTCMonth",
+        "setUTCFullYear",
+        "setTime",
+    ];
+    const ARGS: &[&str] = &[
+        "",
+        "0",
+        "1",
+        "-1",
+        "59",
+        "61",
+        "25",
+        "1e10",
+        "NaN",
+        "undefined",
+        "'7'",
+        "1.9",
+        "-0.5, 3",
+    ];
+    let t = pick(r, TIMES);
+    match r.below(4) {
+        0 => vec![
+            PROBE.to_string(),
+            format!("const d = new Date({t});"),
+            format!("console.log(P(() => d.{}({})), P(() => d.toISOString()));", pick(r, SETTERS), pick(r, ARGS)),
+            "console.log(P(() => String(d)), P(() => d.toUTCString()), P(() => d.toDateString()));".into(),
+        ],
+        1 => vec![
+            PROBE.to_string(),
+            format!(
+                "console.log(P(() => Date.UTC({})), P(() => new Date(Date.UTC({})).toISOString()));",
+                pick(r, &["275760, 8, 13", "275760, 8, 13, 0, 0, 0, 1", "-271821, 3, 20", "-271821, 3, 19, 23, 59, 59, 999", "99", "100, 0", "2020, 1, 30", "NaN", "", "2020.9, 1.9, 1.9", "1970, 0, 1, 0, 0, 0, 0.9"]),
+                pick(r, &["275760, 8, 13", "275760, 8, 13, 0, 0, 0, 1", "0", "99, 11", "1e6"])
+            ),
+        ],
+        2 => vec![
+            PROBE.to_string(),
+            format!("const d = new Date({t});"),
+            "console.log(P(() => d.getTime()), P(() => d.getUTCFullYear()), P(() => d.getUTCDay()), P(() => d.toJSON()));".into(),
+            "console.log(P(() => d.toISOString()), P(() => JSON.stringify({ d })), P(() => d.valueOf() === +d));".into(),
+        ],
+        _ => vec![
+            PROBE.to_string(),
+            "console.log(typeof Date(), typeof Date(0), Date(0) === Date(1e12), Date.length, Date.name);".into(),
+            format!(
+                "console.log(P(() => new Date({}).getTime()), P(() => new Date({}).getTime()));",
+                pick(r, &["undefined", "null", "true", "'5'", "1.9", "-1.9", "new Date(7)", "''", "2020, 0", "2020, 12", "99, 0", "100, 0"]),
+                pick(r, &["8.64e15", "-8.64e15", "8.64e15 + 1", "NaN", "Infinity", "'2020-02-30'", "'2020-02-29T24:00:00Z'", "'+275760-09-13T00:00:00.001Z'"])
+            ),
+        ],
+    }
+}
+
+/// NUMERIC LITERAL lexing: separators, the single `.`, exponents, legacy octal,
+/// radix prefixes, the `n` suffix and what may follow a literal.
+///
+/// Each literal is `eval`'d, so a SyntaxError is a printed message, not a dead
+/// program. `5..toString()` and `1.e3` are valid and `1.5.5`, `3in x`, `0b12`
+/// and `1_` are not — which side of that line a lexer lands on is invisible to
+/// every generator whose literals come from a fixed list.
+fn gen_numlit(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let digits = |r: &mut Rng, radix: u32, sep: bool| -> String {
+        let n = 1 + r.below(5) as usize;
+        let mut s = String::new();
+        for i in 0..n {
+            let d = r.below(radix as u64) as u32;
+            s.push(char::from_digit(d, radix).unwrap_or('0'));
+            if sep && i + 1 < n && r.below(4) == 0 {
+                s.push('_');
+            }
+        }
+        s
+    };
+    let sep = r.below(3) == 0;
+    let mut lit = match r.below(9) {
+        0 => format!("0x{}", digits(r, 16, sep)),
+        1 => format!("0b{}", digits(r, 2, sep)),
+        2 => format!("0o{}", digits(r, 8, sep)),
+        3 => format!("0{}", digits(r, 8, false)),
+        4 => format!("{}.{}", digits(r, 10, sep), digits(r, 10, sep)),
+        5 => format!(".{}", digits(r, 10, sep)),
+        6 => format!(
+            "{}e{}{}",
+            digits(r, 10, sep),
+            pick(r, &["", "+", "-"]),
+            digits(r, 10, false)
+        ),
+        7 => format!("{}.", digits(r, 10, sep)),
+        _ => digits(r, 10, sep),
+    };
+    // Malformed variants: a stray separator, a doubled dot, a letter after.
+    match r.below(10) {
+        0 => lit.push('_'),
+        1 => lit.insert(lit.len().min(1), '_'),
+        2 => lit.push('.'),
+        3 => lit.push_str(".5"),
+        4 => lit.push('n'),
+        5 => lit.push_str("in []"),
+        6 => lit.push('a'),
+        7 => lit.push_str(".toString()"),
+        8 => lit.push_str("..toString()"),
+        _ => {}
+    }
+    vec![
+        PROBE.to_string(),
+        format!("console.log(P(() => eval({})));", js_quote(&lit)),
+        format!(
+            "console.log(P(() => eval({})));",
+            js_quote(&format!("[{lit}, 1]"))
+        ),
+    ]
+}
+
+/// Quote `s` as a JS string literal (only the characters the generators use).
+fn js_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// SYNTAX ERRORS — which early errors a parser reports and with what wording.
+///
+/// A program that is a SyntaxError dies before printing, and an `eval`'d one
+/// is a catchable message, so each snippet goes through `eval` and the message
+/// is the observation. The pool pairs token-level mistakes (a number where an
+/// identifier belongs, an unclosed call, `enum`) with the early errors that are
+/// not about tokens at all: a duplicate label, `break` outside a loop, an
+/// assignment to a non-reference, a second constructor, a getter with a
+/// parameter. A valid sibling sits beside each so a parser that REJECTS too
+/// much is as visible as one that accepts too much.
+fn gen_syntaxerr(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const POOL: &[&str] = &[
+        "var 1",
+        "f(1 2)",
+        "f(",
+        "a b",
+        "let x = ;",
+        "1 +",
+        "x = {a b}",
+        "[1 2]",
+        "if (",
+        "for (;;",
+        "else",
+        "var enum",
+        "if (1) else 2",
+        "a: a: 1",
+        "a: { a: 1 }",
+        "a: { (function () { a: 1 })() }",
+        "break",
+        "continue",
+        "a: { continue a }",
+        "a: { break b }",
+        "do ; while (0) 1",
+        "do x; while (0) y",
+        "throw\n1",
+        "1 = 2",
+        "a + b = 1",
+        "this = 1",
+        "x?.y = 1",
+        "x?.y++",
+        "++1",
+        "1++",
+        "function f() {} f() = 1",
+        "class A { constructor() {} constructor() {} }",
+        "class A { get a(x) {} }",
+        "class A { set a() {} }",
+        "({ get a(x) {} })",
+        "({ set a(...x) {} })",
+        "({ __proto__: 1, __proto__: 2 })",
+        "({ __proto__: 1, ['__proto__']: 2 })",
+        "class { }",
+        "class extends A {}",
+        "function () {}",
+        "var \\u0061b = 3; ab",
+        "'\\x4'",
+        "'\\u12'",
+        "'\\u{110000}'",
+        "'\\101' + '\\08'",
+        "`${}`",
+        "`a${1`",
+        "/(/",
+        "/a/gg",
+        "5..toString()",
+        "1.5.toFixed(1)",
+        "1.toString()",
+        "0.5.toFixed()",
+        "'abc",
+        "/abc",
+        "/* x",
+        "@",
+        "#",
+        "<!-- c\n1",
+        "1\n--> c\n2",
+        "x\n++\ny",
+        "var a = 1\n/foo/g.test('foo')",
+        "var x = 1, 2",
+        "({a:1,,})",
+        "super.x",
+        "yield 1",
+        "await 1",
+        "async () => await",
+        "let let = 1",
+        "const x",
+        "for (let i, j of []) ;",
+        "label: function f() {}",
+        "if (1) function f() {}",
+        "while (0) function f() {}",
+        "({ a: 1 }) = 1",
+        "[a, ...b, c] = []",
+        "({ ...a, b } = {})",
+        "delete x",
+        "typeof",
+        "void",
+        "a ?? b || c",
+        "a || b ?? c",
+        "-1 ** 2",
+        "(-1) ** 2",
+        "async function f() { await }",
+        "function* g() { yield\n* 2 }",
+        "import x from 'y'",
+        "export default 1",
+    ];
+    let src = pick(r, POOL);
+    // Half the cases wrap the snippet in a function, a class body or a block,
+    // which changes whether `break`, `return`, `super` and labels are legal.
+    let wrapped = match r.below(5) {
+        0 => format!("function w() {{ {src} }}"),
+        1 => format!("{{ {src} }}"),
+        2 => format!("while (false) {{ {src} }}"),
+        3 => format!("'use strict'; {src}"),
+        _ => src.to_string(),
+    };
+    vec![
+        PROBE.to_string(),
+        format!(
+            "console.log(P(() => String(typeof eval({}))));",
+            js_quote(&wrapped)
+        ),
+    ]
+}
+
+/// REGEXP PATTERN SYNTAX and the escapes whose meaning is NOT Unicode's.
+///
+/// Two halves. The first compiles a generated pattern/flags pair and prints the
+/// `source` or the SyntaxError wording: unterminated groups, lone quantifier
+/// braces and identity escapes under `u`, duplicate group names, out-of-order
+/// ranges, malformed `\x`/`\u`. The second runs `\w \d \s \b . ^ $` over a
+/// subject built from characters on which JavaScript and Unicode DISAGREE —
+/// `é`, `٣`, U+0085, U+FEFF, `\r`, U+2028 — plus the sticky/global
+/// String-method protocol and `$<name>` expansion.
+fn gen_regexsyntax(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    match r.below(2) {
+        0 => {
+            // A `let`, not a `const`: several entries are lone brackets, which the
+            // name-table scanner in tests/name_registry.rs counts as nesting.
+            let pats: &[&str] = &[
+                "(",
+                ")",
+                "(a",
+                "a)",
+                "[",
+                "[a",
+                "[b-a]",
+                "[\\\\d-x]",
+                "a{2,1}",
+                "a{1",
+                "{",
+                "}",
+                "]",
+                "{1}",
+                "*",
+                "a**",
+                "a|*",
+                "^*",
+                "\\\\b+",
+                "(?=a)+",
+                "(?<=a)+",
+                "(?:a)+",
+                "\\\\",
+                "\\\\c",
+                "\\\\x4",
+                "\\\\u12",
+                "\\\\u{110000}",
+                "\\\\u{61}",
+                "\\\\-",
+                "\\\\_",
+                "\\\\1",
+                "\\\\01",
+                "\\\\k<a>",
+                "(?<a>.)\\\\k<a>",
+                "(?<a>.)(?<a>.)",
+                "(?<a>.)|(?<a>.)",
+                "(?<>a)",
+                "(?<1a>a)",
+                "(?<a",
+                "\\\\p{L}",
+                "\\\\p{Foo}",
+                "[\\\\p{Foo}]",
+                "\\\\p{Script=Greek}",
+                "(?i)",
+                "(?i:a)",
+                "(?P<n>a)",
+                "(?#c)",
+                "(?>a)",
+                "[\\\\b]",
+                "[\\\\B]",
+                "\\\\0",
+                "\\\\00",
+                "[\\\\0]",
+                "a{,5}",
+                "x{2}{3}",
+                "\\\\/",
+                "[/]",
+                "\\\\ud83d\\\\ude00",
+                "[\\\\u{1F600}-\\\\u{1F64F}]",
+            ];
+            let flags = pick(
+                r,
+                &["", "u", "i", "g", "v", "m", "s", "y", "iu", "gg", "uv", "x"],
+            );
+            vec![
+                PROBE.to_string(),
+                format!(
+                    "console.log(P(() => new RegExp('{}', '{flags}')));",
+                    pick(r, pats)
+                ),
+            ]
+        }
+        _ => {
+            const SUBJECTS: &[&str] = &[
+                "'caf\\u00e9 \\u0663x'",
+                "'a\\u0085b\\ufeffc'",
+                "'a\\rb\\nc'",
+                "'a\\u2028b\\u2029c'",
+                "'ab cd_ef-gh'",
+                "'x1y22z'",
+                "'\\u00a0\\u3000a'",
+            ];
+            const OPS: &[&str] = &[
+                "/\\w+/g",
+                "/\\W+/g",
+                "/\\d+/g",
+                "/\\D/g",
+                "/\\s+/g",
+                "/\\S+/g",
+                "/\\b/g",
+                "/\\B/g",
+                "/./g",
+                "/./gs",
+                "/^./gm",
+                "/.$/gm",
+                "/^/gm",
+                "/$/gm",
+                "/[\\w-]+/g",
+                "/[^\\d]+/g",
+                "/[\\s\\S]/g",
+                "/[\\d-x]/g",
+                "/\\bc/g",
+                "/a$/m",
+                "/(?:)/g",
+                "/x?/g",
+            ];
+            let s = pick(r, SUBJECTS);
+            let re = pick(r, OPS);
+            let m = r.below(5);
+            let body = match m {
+                0 => format!("JSON.stringify({s}.match({re}))"),
+                1 => format!("JSON.stringify({s}.replace({re}, '[$&]'))"),
+                2 => format!(
+                    "JSON.stringify({s}.split({}))",
+                    re.replace("/g", "/")
+                        .replace("/gs", "/s")
+                        .replace("/gm", "/m")
+                ),
+                3 => format!("JSON.stringify([...{s}.matchAll({re})].map(m => m.index))"),
+                _ => format!("{s}.search({re})"),
+            };
+            vec![PROBE.to_string(), format!("console.log(P(() => {body}));")]
+        }
+    }
+}
+
+/// STICKY and GLOBAL regexps through the String methods (22.2.6), and the
+/// replacement template's `$<name>` / `$n` expansion.
+///
+/// A sticky match must begin where the search begins and a failed one resets
+/// `lastIndex`; `match`/`replace`/`matchAll` all read `lastIndex` (`matchAll`
+/// from the ORIGINAL regexp); a non-global, non-sticky `match` leaves it alone.
+fn gen_regexprotocol(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const FLAGS: &[&str] = &["", "g", "y", "gy", "d", "gd"];
+    const PATS: &[&str] = &["a", "a+", "b", "(?:)", "a|b", "(?<x>a)", "\\\\w", "a*?"];
+    const SUBJ: &[&str] = &["'aaba'", "'baa'", "'aab'", "'abab'", "''", "'xaay'"];
+    const REPL: &[&str] = &[
+        "'X'",
+        "'[$&]'",
+        "'$<x>'",
+        "'$<x'",
+        "'$1$2'",
+        "'$$'",
+        "'$`|$\\''",
+        "(m) => m.toUpperCase()",
+    ];
+    let flags = pick(r, FLAGS);
+    let pat = pick(r, PATS);
+    let s = pick(r, SUBJ);
+    let li = pick(r, &["0", "1", "2", "3", "9"]);
+    let call = match r.below(5) {
+        0 => format!("{s}.match(re)"),
+        1 => format!("{s}.replace(re, {})", pick(r, REPL)),
+        2 => format!("[...{s}.matchAll(re)].map(m => m.index)"),
+        3 => format!("{s}.search(re)"),
+        _ => format!("re.exec({s})"),
+    };
+    let call = if r.below(5) == 2 && !flags.contains('g') {
+        // `matchAll` requires `g`; keep the case meaningful.
+        format!("{s}.replace(re, {})", pick(r, REPL))
+    } else {
+        call
+    };
+    vec![
+        PROBE.to_string(),
+        format!("const re = new RegExp('{pat}', '{flags}');"),
+        format!("re.lastIndex = {li};"),
+        format!("console.log(P(() => JSON.stringify({call})), re.lastIndex);"),
+    ]
+}
+
+/// TYPED-ARRAY element coercion, ordering and the constructors' call forms.
+///
+/// `Uint8ClampedArray` rounds a tie to EVEN, a `Number` view refuses a BigInt
+/// element and a BigInt view refuses a Number, `sort()` puts NaN last and `-0`
+/// before `+0`, and calling a view constructor without `new` is a TypeError
+/// naming the missing `new`.
+fn gen_typedcoerce(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const KINDS: &[&str] = &[
+        "Int8Array",
+        "Uint8Array",
+        "Uint8ClampedArray",
+        "Int16Array",
+        "Uint16Array",
+        "Int32Array",
+        "Uint32Array",
+        "Float32Array",
+        "Float64Array",
+    ];
+    const ELEMS: &[&str] = &[
+        "0.5",
+        "1.5",
+        "2.5",
+        "3.5",
+        "254.5",
+        "255.5",
+        "-0.5",
+        "256",
+        "-1",
+        "1e10",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "-0",
+        "1.1",
+        "16777217",
+        "2 ** 31",
+        "'12'",
+        "'x'",
+        "null",
+        "undefined",
+        "true",
+        "[]",
+        "{}",
+        "1n",
+    ];
+    let kind = pick(r, KINDS);
+    match r.below(4) {
+        0 => vec![
+            PROBE.to_string(),
+            format!("console.log(P(() => Array.from(new {kind}([{}, {}, {}]))));", pick(r, ELEMS), pick(r, ELEMS), pick(r, ELEMS)),
+        ],
+        1 => vec![
+            PROBE.to_string(),
+            format!(
+                "console.log(P(() => Array.from(new {kind}([{}, {}, {}, {}, {}]).sort()).map(x => Object.is(x, -0) ? '-0' : x).join()));",
+                pick(r, &["3", "NaN", "-0", "0", "-Infinity", "1", "Infinity", "2.5"]),
+                pick(r, &["3", "NaN", "-0", "0", "-Infinity", "1"]),
+                pick(r, &["3", "NaN", "-0", "0", "1"]),
+                pick(r, &["-0", "0", "NaN", "7"]),
+                pick(r, &["1", "NaN", "-1"])
+            ),
+        ],
+        2 => vec![
+            PROBE.to_string(),
+            format!("const a = new {kind}(2);"),
+            format!("a[0] = {};", pick(r, ELEMS)),
+            "console.log(P(() => a[0]), P(() => a.length));".into(),
+            format!("console.log(P(() => {{ a.fill({}); return a.join(); }}));", pick(r, ELEMS)),
+        ],
+        _ => vec![
+            PROBE.to_string(),
+            format!("console.log(P(() => {}({})));", pick(r, &["Uint8Array", "Float64Array", "BigInt64Array", "ArrayBuffer", "DataView", "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "Promise", "Proxy"]), pick(r, &["1", "", "[]"])),
+            format!("console.log(P(() => new {kind}({}).length));", pick(r, &["-1", "1.5", "'3'", "undefined", "null", "2 ** 53", "{ length: 2 }", "[1, 2, 3]", "new ArrayBuffer(8)", "new ArrayBuffer(7)"])),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -3135,6 +3863,14 @@ enum Mode {
     ProxyTrap,
     Microtask,
     ArrayLate,
+    Reflect,
+    BigintWrap,
+    DateField,
+    NumLit,
+    SyntaxErr,
+    RegexSyntax,
+    RegexProtocol,
+    TypedCoerce,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -3182,6 +3918,14 @@ const REAL_MODES: &[Mode] = &[
     Mode::ProxyTrap,
     Mode::Microtask,
     Mode::ArrayLate,
+    Mode::Reflect,
+    Mode::BigintWrap,
+    Mode::DateField,
+    Mode::NumLit,
+    Mode::SyntaxErr,
+    Mode::RegexSyntax,
+    Mode::RegexProtocol,
+    Mode::TypedCoerce,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -3236,6 +3980,14 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::ProxyTrap => gen_proxytrap(seed),
         Mode::WellKnown => gen_wellknown(seed),
         Mode::Tagged => gen_tagged(seed),
+        Mode::Reflect => gen_reflect(seed),
+        Mode::BigintWrap => gen_bigintwrap(seed),
+        Mode::DateField => gen_datefield(seed),
+        Mode::NumLit => gen_numlit(seed),
+        Mode::SyntaxErr => gen_syntaxerr(seed),
+        Mode::RegexSyntax => gen_regexsyntax(seed),
+        Mode::RegexProtocol => gen_regexprotocol(seed),
+        Mode::TypedCoerce => gen_typedcoerce(seed),
     }
 }
 
@@ -3286,6 +4038,14 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::ProxyTrap => "proxytrap",
         Mode::WellKnown => "wellknown",
         Mode::Tagged => "tagged",
+        Mode::Reflect => "reflect",
+        Mode::BigintWrap => "bigintwrap",
+        Mode::DateField => "datefield",
+        Mode::NumLit => "numlit",
+        Mode::SyntaxErr => "syntaxerr",
+        Mode::RegexSyntax => "regexsyntax",
+        Mode::RegexProtocol => "regexprotocol",
+        Mode::TypedCoerce => "typedcoerce",
     }
 }
 
@@ -3335,6 +4095,14 @@ const ALL_MODES: &[Mode] = &[
     Mode::ProxyTrap,
     Mode::Microtask,
     Mode::ArrayLate,
+    Mode::Reflect,
+    Mode::BigintWrap,
+    Mode::DateField,
+    Mode::NumLit,
+    Mode::SyntaxErr,
+    Mode::RegexSyntax,
+    Mode::RegexProtocol,
+    Mode::TypedCoerce,
 ];
 
 fn mode_from_name(s: &str) -> Option<Mode> {

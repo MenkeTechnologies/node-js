@@ -279,7 +279,13 @@ messages, property descriptors and the enumeration surface that depends on them,
 `freeze`/`seal` write and `delete` outcomes, builtin identity and prototype-chain
 reads, `structuredClone`'s reference graph, error own-property shape, abrupt
 completions (`unwind`), and promise-resolution / async-iteration microtask
-ordering (`thenable`). Select one with `--mode <name>`.
+ordering (`thenable`). Several modes read the SOURCE side of the language
+rather than its values: `numlit` (numeric-literal lexing), `syntaxerr` (early
+errors and the wording of each), `regexsyntax` and `regexprotocol` (pattern
+grammar errors, the ASCII-only class escapes, sticky/global `lastIndex`
+behaviour), and `reflect`, `datefield`, `bigintwrap` and `typedcoerce` (argument
+checks and coercions at the edge of each builtin). `parity-fuzz --help` lists
+every mode. Select one with `--mode <name>`.
 
 The run summary reports four counts next to the divergence total: **ref timeout**
 (the reference timed out, so the case is skipped entirely), **ref failed** (the
