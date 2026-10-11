@@ -2966,3 +2966,6 @@ Each row is pinned in `tests/language_parity.rs`.
 | `class B { static m() { return super.call } }` | `Function.prototype.call` | `undefined` |
 | `class C extends Map { get(k) { return super.get(k) } }`, likewise `Array`/`Set`/`Promise` | the inherited method runs | `TypeError: Cannot read properties of undefined (reading 'call')` |
 | `Map.prototype.get.call(c, k)` with `c` a subclass instance that overrides `get` | the native `get` | the override, recursing until `RangeError: Maximum call stack size exceeded` |
+| `class S extends Set { add(v) {…} }; new S().add === S.prototype.add`, likewise `Map`/`Array`/`Promise` | `true` | `false` — the kind's native method names were answered before the subclass prototype was consulted, so the READ and the CALL disagreed |
+| `class D extends Map { set(k, v) { return super.set(k, v * 2) } }; new D([[1, 2]])` | `1 => 4` — the constructor adds each entry through `this.set` (`this.add` for a Set) | `1 => 2`: the native loop never called the override |
+| `class B extends Map {}; B.prototype.set = 5; new B([[1, 2]])` | `TypeError: '5' returned for property 'set' of object '#<B>' is not a function` | constructed |

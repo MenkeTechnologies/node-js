@@ -1636,6 +1636,29 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
         }
     }
     let kind = with_host(|h| h.kind_of(recv));
+    // A subclass of a builtin exotic (`class C extends Map { get(k) {…} }`)
+    // owns methods on `C.prototype`, which sits BEFORE the builtin prototype on
+    // the chain. The kind arms below answer native method names first, so
+    // `c.get` read `Map.prototype.get` while `c.get(k)` called the override —
+    // the read and the call disagreeing. A prototype-method THUNK does not
+    // count: the shared `Object.prototype` carries them, and its `toString`
+    // must not shadow `Array.prototype.toString`.
+    if matches!(
+        kind,
+        Some(ObjKind::Map | ObjKind::Set | ObjKind::Promise | ObjKind::Array)
+    ) && name != "length"
+        && name.parse::<usize>().is_err()
+        && with_host(|h| h.fn_prop(recv, name)).is_none()
+    {
+        if let Some(f) = with_host(|h| host::lookup_chain(h, recv, name)) {
+            let thunk = with_host(
+                |h| matches!(h.get(&f), Some(JsObj::Builtin(n)) if n.starts_with("@proto")),
+            );
+            if !thunk {
+                return Ok(f);
+            }
+        }
+    }
     #[allow(unused_mut)]
     let mut out = match kind {
         Some(ObjKind::Object) => {
@@ -8100,6 +8123,52 @@ pub fn to_object(v: &Value) -> Value {
 }
 
 /// Construct via `new` for the builtin constructors.
+/// One `[key, value]` entry of a Map's source iterable (24.1.1.2 steps 8.d-8.f).
+fn map_entry(p: &Value) -> Result<(Value, Value), String> {
+    // Step 8.d: each entry must be an OBJECT. A string is iterable, so without
+    // this check `new Map(["ab"])` happily stored `'a' => 'b'` instead of
+    // throwing — and over an infinite source it never stopped.
+    if !with_host(|h| is_object_like(h, p)) {
+        let shown = with_host(|h| h.str_of(p));
+        return Err(host::type_error(&format!(
+            "Iterator value {shown} is not an entry object"
+        )));
+    }
+    // The entry is read by INDEX with `[[Get]]` (step 8.e), not iterated: an
+    // object with a `Symbol.iterator` but no `0`/`1` gives `undefined =>
+    // undefined`, and an array-LIKE entry works. Iterating it instead accepted
+    // a string as a pair and rejected the array-like.
+    Ok((get_property(p, "0")?, get_property(p, "1")?))
+}
+
+/// `super(iterable)` in `class C extends Map` (or `Set`, `WeakMap`,
+/// `WeakSet`): the source loop of 24.1.1.1 / 24.2.1.1 / 24.3.1.1 / 24.4.1.1
+/// run against the subclass instance `inst`. The adder is `Get(inst, "set")`
+/// (`"add"` for the sets), so a subclass override sees every initial entry —
+/// the base constructor's own loop calls the native method and never did.
+pub fn add_entries_via_adder(inst: &Value, ctor: &str, init: &Value) -> Result<(), String> {
+    let is_map = matches!(ctor, "Map" | "WeakMap");
+    let key = if is_map { "set" } else { "add" };
+    let adder = get_property(inst, key)?;
+    if !with_host(|h| host::is_callable(h, &adder)) {
+        return Err(host::type_error(&format!(
+            "'{}' returned for property '{key}' of object '{}' is not a function",
+            no_side_effects_string(&adder),
+            no_side_effects_string(inst)
+        )));
+    }
+    host::iter_for_each_for_builtin(init, |p, _| {
+        let args = if is_map {
+            let (k, v) = map_entry(&p)?;
+            vec![k, v]
+        } else {
+            vec![p]
+        };
+        host::invoke(&adder, args, Some(inst.clone()))?;
+        Ok(())
+    })
+}
+
 pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
     // Native stdlib constructors (`new URL(...)`, `new EventEmitter()`, `new Buffer(...)`).
     if let Some(r) = crate::stdlib::construct(name, &args) {
@@ -8159,23 +8228,7 @@ pub fn construct_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> 
                 // (24.1.1.2 step 8). Materializing first meant a bad entry in an
                 // infinite source was never reached and the constructor HUNG.
                 host::iter_for_each_for_builtin(init, |p, _| {
-                    // 24.1.1.2 step 8.d: each entry must be an OBJECT. A string
-                    // is iterable, so without this check `new Map(["ab"])`
-                    // happily stored `'a' => 'b'` instead of throwing — and over
-                    // an infinite source it never stopped.
-                    if !with_host(|h| is_object_like(h, &p)) {
-                        let shown = with_host(|h| h.str_of(&p));
-                        return Err(host::type_error(&format!(
-                            "Iterator value {shown} is not an entry object"
-                        )));
-                    }
-                    // The entry is read by INDEX with `[[Get]]` (step 8.e), not
-                    // iterated: an object with a `Symbol.iterator` but no `0`/`1`
-                    // gives `undefined => undefined`, and an array-LIKE entry
-                    // works. Iterating it instead accepted a string as a pair
-                    // and rejected the array-like.
-                    let k = get_property(&p, "0")?;
-                    let v = get_property(&p, "1")?;
+                    let (k, v) = map_entry(&p)?;
                     map_method(&m, "set", vec![k, v])?;
                     Ok(())
                 })?;

@@ -8730,6 +8730,19 @@ pub fn super_construct(
             Ok(Some(r).filter(|r| returns_object(r) && !with_host(|h| h.strict_eq(r, inst))))
         }
         Some(JsObj::Builtin(name)) => {
+            // A keyed collection fills itself through `this.set`/`this.add`,
+            // looked up on the SUBCLASS instance, so the instance has to be the
+            // collection before the first entry goes in.
+            let init = args.first().filter(|a| !with_host(|h| h.is_nullish(a)));
+            if let (true, Some(init)) = (
+                matches!(name.as_str(), "Map" | "WeakMap" | "Set" | "WeakSet"),
+                init,
+            ) {
+                let built = crate::builtins::construct_builtin(&name, Vec::new())?;
+                become_exotic(inst, &built);
+                crate::builtins::add_entries_via_adder(inst, &name, init)?;
+                return Ok(None);
+            }
             let built = crate::builtins::construct_builtin(&name, args)?;
             // An EXOTIC parent (`class A extends Array`) keeps its behaviour in
             // the heap variant, not in a property map, so copying own props

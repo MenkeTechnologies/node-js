@@ -1465,3 +1465,38 @@ then 5
 "##;
     assert_eq!(run(src), expected.trim());
 }
+
+/// A subclass of `Map`/`Set`/`Array`/`Promise` owns methods that shadow the
+/// builtin ones for a READ as well as for a call, and `super(iterable)` in a
+/// keyed-collection subclass fills the instance through `this.set`/`this.add`.
+#[test]
+fn builtin_subclass_overrides_and_collection_adder() {
+    let src = r##"
+class Doubling extends Map { set(k, v) { return super.set(k, v * 2); } }
+const d = new Doubling([[1, 2]]); d.set(3, 4);
+console.log([...d], d.set === Doubling.prototype.set, d.get === Map.prototype.get);
+class Strings extends Set { add(v) { return super.add(String(v)); } }
+console.log([...new Strings([1, 2, 1])], new Strings().add === Strings.prototype.add);
+class Seen extends WeakSet { add(v) { this.n = (this.n || 0) + 1; return super.add(v); } }
+console.log(new Seen([{}, {}]).n);
+class Order extends Set { add(v) { console.log('add', v, this instanceof Order, this.size); return super.add(v); } }
+new Order('ab');
+class Bad extends Map {} Bad.prototype.set = 5;
+try { new Bad([[1, 2]]); } catch (e) { console.log(e.constructor.name, e.message); }
+console.log(new Bad().size);
+class A extends Array { pop() { return 'mine'; } }
+class P extends Promise { then(a, b) { return super.then(a, b); } }
+console.log(new A().pop === A.prototype.pop, new A().push === Array.prototype.push, new A().toString === Array.prototype.toString, P.resolve().then === P.prototype.then);
+"##;
+    let expected = r##"
+[ [ 1, 4 ], [ 3, 8 ] ] true true
+[ '1', '2' ] true
+2
+add a true 0
+add b true 1
+TypeError '5' returned for property 'set' of object '#<Bad>' is not a function
+0
+true true true true
+"##;
+    assert_eq!(run(src), expected.trim());
+}
