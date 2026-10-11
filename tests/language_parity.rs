@@ -1432,3 +1432,36 @@ static call 1 static apply static bind
 "##;
     assert_eq!(run(src), expected.trim());
 }
+
+/// `super.x` that resolves to a method a builtin prototype supplies natively:
+/// `Object.prototype` under an object literal or a base class, `Function.prototype`
+/// under a static method, and the builtin parent of a subclass. Calling the
+/// native method with a subclass instance must not re-dispatch to the override.
+#[test]
+fn super_reaches_builtin_prototype_methods() {
+    let src = r##"
+const lit = { toString() { return 'lit:' + super.toString(); }, own(k) { return super.hasOwnProperty.call(this, k); } };
+console.log(String(lit), lit.own('own'), lit.own('nope'));
+class Base { toString() { return 'Base:' + super.toString(); } static kind() { return typeof super.call + ' ' + typeof super.apply; } }
+console.log(String(new Base()), Base.kind());
+const viaArr = Object.setPrototypeOf({ m() { return super.join.call([1, 2], '-'); } }, Array.prototype);
+console.log(viaArr.m());
+class Stack extends Array { push(...v) { return super.push(...v.map(x => x * 10)); } join() { return '<' + super.join('|') + '>'; } }
+const st = Stack.from([1]); st.push(2, 3);
+console.log(st.join(), st.length, Array.prototype.join.call(st, ','));
+class DefaultMap extends Map { get(k) { return super.has(k) ? super.get(k) : 'none'; } }
+const dm = new DefaultMap([[1, 'one']]);
+console.log(dm.get(1), dm.get(2), Map.prototype.get.call(dm, 2));
+class Lazy extends Promise { then(f, r) { return super.then(f, r); } }
+Lazy.resolve(5).then(v => console.log('then', v));
+"##;
+    let expected = r##"
+lit:[object Object] true false
+Base:[object Object] function function
+1-2
+<1|20|30> 3 1,20,30
+one none undefined
+then 5
+"##;
+    assert_eq!(run(src), expected.trim());
+}

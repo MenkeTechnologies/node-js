@@ -2931,8 +2931,6 @@ Each needs substrate this frontend does not have; none is approximated.
   assignment.
 - **Annex B function-in-`if` hoisting is absent**: `if (1) function f() {};
   typeof f` leaves `f` undefined outside the statement.
-- **An object-literal method's `super`** resolves against the wrong object:
-  `({ m() { return super.toString } }).m()` is not `Object.prototype.toString`.
 - **`new Function('a', '/*', '*/){')`** is accepted; node rejects a parameter
   list that does not parse on its own.
 
@@ -2957,3 +2955,14 @@ Each needs substrate this frontend does not have; none is approximated.
   not the String wrapper.
 - **`Object.getOwnPropertyDescriptor(Array, 'prototype').value`** inspects as
   `Object [Array] {}` where node prints `Object(0) []`.
+
+## FIXED in round 16 — builtin subclasses and `super`, verified against node v26.11.1
+
+Each row is pinned in `tests/language_parity.rs`.
+
+| Case | node | was |
+|---|---|---|
+| `({ m() { return super.toString } }).m()`, `class A { m() { return super.toString } }` | `Object.prototype.toString` | `undefined` — the host's chain walk reads only the property maps it owns, and the builtin prototype methods are native |
+| `class B { static m() { return super.call } }` | `Function.prototype.call` | `undefined` |
+| `class C extends Map { get(k) { return super.get(k) } }`, likewise `Array`/`Set`/`Promise` | the inherited method runs | `TypeError: Cannot read properties of undefined (reading 'call')` |
+| `Map.prototype.get.call(c, k)` with `c` a subclass instance that overrides `get` | the native `get` | the override, recursing until `RangeError: Maximum call stack size exceeded` |

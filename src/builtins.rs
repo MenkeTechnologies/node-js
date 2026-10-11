@@ -454,6 +454,20 @@ fn super_call_with(vm: &mut VM, args: Vec<Value>) -> Value {
 fn b_super_get(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     match with_host(|h| h.super_resolve(&name)) {
+        // The host walks only the property maps it owns. A member a builtin
+        // prototype supplies natively — `Object.prototype.toString`, `Map
+        // .prototype.get`, `Array.prototype.push` — is not in any of them, so
+        // finish the `[[Get]]` on the super base with an ordinary property read.
+        host::SuperRef::Data(Value::Undef) => {
+            let Some(base) = super_builtin_base() else {
+                return Value::Undef;
+            };
+            let this = with_host(|h| h.current_this()).unwrap_or(Value::Undef);
+            match get_property_recv(&base, &name, &this) {
+                Ok(v) => v,
+                Err(e) => abort(vm, e),
+            }
+        }
         host::SuperRef::Data(v) => v,
         host::SuperRef::Getter(getter) => {
             let this = with_host(|h| h.current_this());
@@ -462,6 +476,33 @@ fn b_super_get(vm: &mut VM, _: u8) -> Value {
                 Err(e) => abort(vm, e),
             }
         }
+    }
+}
+
+/// The object a `super.x` read continues on once the host's own chain walk has
+/// come up empty: `HomeObject.[[GetPrototypeOf]]()` (13.3.7.3), where that
+/// prototype is a builtin one the host does not model as a property map.
+///
+/// - an object-literal method: its home object's prototype (`Object.prototype`
+///   for a plain literal);
+/// - a static method: the class constructor's prototype (`Function.prototype`
+///   for a base class, the parent constructor otherwise);
+/// - an instance method of a class whose chain bottoms out in a builtin
+///   (`class C extends Map`): that builtin's `prototype`, since `C.prototype`
+///   is not linked to it as a real object;
+/// - any other instance method: the home prototype's own prototype.
+fn super_builtin_base() -> Option<Value> {
+    let (class, is_static, home_object) = with_host(|h| h.super_home());
+    if let Some(home) = home_object {
+        return Some(prototype_of(&home));
+    }
+    let class = class?;
+    if is_static {
+        return Some(prototype_of(&class));
+    }
+    match with_host(|h| h.class_builtin_ancestor(&class)) {
+        Some(builtin) => get_property(&builtin, "prototype").ok(),
+        None => Some(prototype_of(&with_host(|h| h.current_home_proto())?)),
     }
 }
 
@@ -3996,6 +4037,21 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
             "Method {label}.prototype.{method} called on incompatible receiver {}",
             no_side_effects_string(recv)
         )));
+    }
+    // The brand check passed, so the receiver IS an instance of `ctor`: run the
+    // kind's native method directly. `call_method` resolves the name off the
+    // receiver's chain first, where a subclass override of the same name sits —
+    // `class C extends Map { get(k) { return super.get(k) } }` and
+    // `Map.prototype.get.call(this, k)` inside it both found `C.prototype.get`
+    // again and recursed until the stack overflowed.
+    if !method.starts_with("@@") {
+        match (ctor, with_host(|h| h.kind_of(recv))) {
+            ("Array", Some(ObjKind::Array)) => return array_method(recv, method, args),
+            ("Map" | "WeakMap", Some(ObjKind::Map)) => return map_method(recv, method, args),
+            ("Set" | "WeakSet", Some(ObjKind::Set)) => return set_method(recv, method, args),
+            ("Promise", Some(ObjKind::Promise)) => return promise_method(recv, method, args),
+            _ => {}
+        }
     }
     host::call_method(recv, method, args)
 }

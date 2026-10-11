@@ -3319,6 +3319,13 @@ impl JsHost {
         self.frame().home_class.clone()
     }
 
+    /// The running method's `(home_class, is_static, home_object)`, for the
+    /// `super.x` lookup that has to leave the host borrow (see `b_super_get`).
+    pub fn super_home(&self) -> (Option<Value>, bool, Option<Value>) {
+        let f = self.frame();
+        (f.home_class.clone(), f.home_static, f.home_object.clone())
+    }
+
     /// The `(parent_ctor, this_class_fields)` for a running constructor's
     /// `super(...)`, derived from the frame's home class.
     pub fn super_context(&self) -> (Option<Value>, Vec<(String, Value, bool)>) {
