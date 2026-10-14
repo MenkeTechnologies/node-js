@@ -257,7 +257,11 @@ differs between macOS and Linux above `SIGTERM` (`SIGUSR1` is 30 on Darwin, 10
 on Linux). `os.constants.signals` still reports the Darwin numbers and is the
 remaining literal table.
 
-## Sloppy-mode `this` in a plain CALL is `undefined`, not `globalThis`
+## FIXED — sloppy-mode `this` in a plain CALL is `globalThis`, not `undefined`
+
+Re-measured at node-js 0.1.14 against node v26.11.1: the repro below now prints
+`[ 'object', 'object', 'object' ]` in both, from a file and from `-e`. The
+history as it was recorded:
 
 A plain (unbound, non-method) function call binds `this` to `undefined` here; in
 sloppy mode Node binds it to `globalThis` and boxes a primitive `this`
@@ -268,7 +272,11 @@ sloppy mode Node binds it to `globalThis` and boxes a primitive `this`
 Scoped to a CALL. The TOP-LEVEL `this` was `undefined` too and is now correct at
 all three entry points — see the FIXED section below.
 
-## The temporal dead zone is a missing binding, not a poisoned one
+## FIXED — the temporal dead zone is a poisoned binding, not a missing one
+
+Re-measured at node-js 0.1.14 against node v26.11.1: both halves below now match
+(`Cannot access 'd' before initialization`, and `typeof d` in the dead zone
+throws), from a file and from `-e`. The history as it was recorded:
 
 A `let`/`const`/`class` binding is created where its declaration runs rather
 than where its block is entered, so the dead zone before it is indistinguishable
@@ -670,8 +678,10 @@ Two divergences remain:
    implements a subset of those methods and marks them non-enumerable, so
    `for (k in buf)` yields the indices only. Emitting our shorter list instead
    would advertise methods Node has that node-js does not.
-2. **There is no shared backing store, so `.buffer` is absent and views do not
-   alias.** `buf.buffer` is `undefined` where Node hands back the `ArrayBuffer`,
+2. **There is no shared backing store, so `.buffer` does not work and views do not
+   alias.** `buf.buffer` throws `TypeError: Method get TypedArray.prototype.buffer
+   called on incompatible receiver [object Uint8Array]` (node-js 0.1.14; it used to
+   read `undefined`) where Node hands back the `ArrayBuffer`,
    and `buf.slice(1,3)`/`subarray(1,3)` copy where Node returns a window over
    the same memory (so writing through the result does not show up in the
    parent, and two views over one `ArrayBuffer` are independent). An
@@ -1976,7 +1986,7 @@ only once the next line arrives. Piped and redirected input is unaffected.
 | `JSON.stringify` of a 20 000-deep object | prints promptly | killed at 60s (5 000 deep completes) |
 | `async function f(){ return f() }; f()` | `RangeError: Maximum call stack size exceeded` | hangs — each call starts a coroutine and returns a promise, so the recursion is an unbounded MICROTASK chain rather than stack growth, and the stack guard never sees it |
 | `new o.m()` where `o.m` is a `function*` | message names the callee's SOURCE TEXT (`o.m is not a constructor`) | names it by function NAME (`m is not a constructor`) — the class, `.name` and catchability all match |
-| `eval('await 1')` | `SyntaxError: await is only valid in async functions …` | `SyntaxError: expected ';' but found Num(1.0) (line 1)` |
+| `eval('await 1')` (FIXED — the same message as node at 0.1.14, re-measured against node v26.11.1) | `SyntaxError: await is only valid in async functions …` | was `SyntaxError: expected ';' but found Num(1.0) (line 1)` |
 | `Object.getPrototypeOf("ab"[Symbol.iterator]())` (found in round 10; the BRAND was fixed in round 14) | `%StringIteratorPrototype%`, whose only own key is `next` | the shared iterator prototype carrying the helper methods, so `Object.getOwnPropertyNames` of it lists `constructor`, `map`, `filter`, … and `typeof proto.next` is `undefined` — likewise for the other snapshot iterators |
 | `Atomics` (found in round 10) | the namespace object: `typeof Atomics` is `object`, `String(Atomics)` is `[object Atomics]` | absent: `typeof Atomics` is `undefined` and a reference is `ReferenceError: Atomics is not defined` |
 
@@ -2969,3 +2979,16 @@ Each row is pinned in `tests/language_parity.rs`.
 | `class S extends Set { add(v) {…} }; new S().add === S.prototype.add`, likewise `Map`/`Array`/`Promise` | `true` | `false` — the kind's native method names were answered before the subclass prototype was consulted, so the READ and the CALL disagreed |
 | `class D extends Map { set(k, v) { return super.set(k, v * 2) } }; new D([[1, 2]])` | `1 => 4` — the constructor adds each entry through `this.set` (`this.add` for a Set) | `1 => 2`: the native loop never called the override |
 | `class B extends Map {}; B.prototype.set = 5; new B([[1, 2]])` | `TypeError: '5' returned for property 'set' of object '#<B>' is not a function` | constructed |
+
+### Still open — found after round 16, not fixed
+
+Measured at node-js 0.1.14 against node v26.11.1.
+
+| Case | node | node-js |
+|---|---|---|
+| `{ let inner = 1; } console.log(typeof inner, inner)`; likewise `const`, an `if (1) { let z = 3 }` block, and an inner block of a function body | `undefined`, then `ReferenceError: inner is not defined` | `number 1` — a block's `let`/`const` binding outlives the block (a read inside a later `try` body does throw `z is not defined`) |
+| `var of; console.log(of)`, `let of = 1; console.log(of)`, `function of() {}; of()` | `undefined`, `1`, the call runs | `SyntaxError: Unexpected identifier 'of'` — `of` is rejected as an identifier REFERENCE (the declaration `var of = 1;` and the property `o.of` parse) |
+| an uncaught throw from a file: `throw new Error("boom")` | `file:1`, the source line, a `^` caret, a blank line, `Error: boom` with its stack, a blank line, `Node.js v26.11.1`; exit 1 | `node: Uncaught Error: boom`; exit 1 |
+| an uncaught `throw new TypeError("x")`, `throw new RangeError("r")` (file or `-e`) | `TypeError: x` / `RangeError: r` in the format above | `node: Uncaught Error: x` / `node: Uncaught Error: r` — the subclass name is lost as well (a caught one reports `e.name` `TypeError` correctly) |
+| `throw 5` | the source header, `5`, then the one-line `--trace-uncaught` hint and `Node.js v26.11.1` | `node: Uncaught 5` |
+| `node --lsp`, `didOpen` of `let a = 1;\nlet b = 2;\nlet c = ;\n` | — (the diagnostic belongs on line 3) | `publishDiagnostics` puts `SyntaxError: Unexpected token ';'` on LSP line 0 (editor line 1) — every syntax error lands there. `compute_diagnostics` (`src/lsp.rs`) reads the line from a `(line N)` suffix that the parser's V8-worded messages no longer carry, and `parse_error_line` defaults to 1 |
