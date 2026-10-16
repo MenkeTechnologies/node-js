@@ -1553,3 +1553,44 @@ join=1,2,3/0 includes=true/0 at=1/0 find=2/0 findIndex=1/0 findLast=2/0 findLast
 "##;
     assert_eq!(run(src), expected.trim());
 }
+
+/// A function's own `length` and `name` are read-only until deleted or
+/// redefined: assignment is ignored (a TypeError in strict code, worded for a
+/// function), `delete` removes the own property so the reads fall through to
+/// `Function.prototype` (0 and ""), and `defineProperty` restores one. A bound
+/// function keeps ordinary own properties too. Expected values captured from
+/// system `node`.
+#[test]
+fn function_length_name_are_readonly_deletable_and_bound_functions_hold_props() {
+    let src = r##"
+const P = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } };
+function f(a, b) {}
+class C { static m() {} }
+const b = f.bind(null);
+const o = { m() {}, k: function () {}, a: () => 1 };
+console.log(o.m.name, o.k.name, o.a.name, b.name, b.length);
+for (const [n, t] of [['f', f], ['C', C], ['b', b]]) {
+  const r = [];
+  t.length = 7; t.name = 'zz';
+  r.push(t.length, t.name);
+  r.push(P(() => { 'use strict'; t.length = 1; }));
+  r.push(delete t.length, delete t.name, t.hasOwnProperty('length'), t.hasOwnProperty('name'));
+  r.push(t.length, JSON.stringify(t.name), Object.getOwnPropertyNames(t).join(), Object.getOwnPropertyDescriptor(t, 'length'));
+  t.length = 5;
+  r.push(t.length);
+  Object.defineProperty(t, 'length', { value: 9, configurable: true });
+  r.push(t.length, t.hasOwnProperty('length'));
+  console.log(n, r.join(' | '));
+}
+b.tag = 1; Object.defineProperty(b, 'hid', { value: 2 });
+console.log(b.tag, b.hid, Object.keys(b).join());
+"##;
+    let expected = r##"
+m k a bound f 2
+f 2 | f | TypeError: Cannot assign to read only property 'length' of function 'function f(a, b) {}' | true | true | false | false | 0 | "" | prototype |  | 0 | 9 | true
+C 0 | C | TypeError: Cannot assign to read only property 'length' of function 'class C { static m() {} }' | true | true | false | false | 0 | "" | prototype,m |  | 0 | 9 | true
+b 2 | bound f | TypeError: Cannot assign to read only property 'length' of function 'function () { [native code] }' | true | true | false | false | 0 | "" |  |  | 0 | 9 | true
+1 2 tag
+"##;
+    assert_eq!(run(src), expected.trim());
+}

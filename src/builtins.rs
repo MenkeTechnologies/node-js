@@ -2723,6 +2723,15 @@ fn is_generator_method(name: &str) -> bool {
 /// A property read on a function/class value: own fn-props (statics, name,
 /// prototype, length) plus inherited statics and `call`/`apply`/`bind`.
 fn function_property(recv: &Value, name: &str) -> Value {
+    // After `delete fn.length` / `delete fn.name` the read falls through to
+    // `Function.prototype`, whose `length` is 0 and `name` is "".
+    if with_host(|h| h.fn_intrinsic_deleted(recv, name)) {
+        return if name == "name" {
+            new_s(String::new())
+        } else {
+            Value::Float(0.0)
+        };
+    }
     // A class static, inherited down the constructor chain.
     if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Class) {
         if let Some(v) = with_host(|h| h.class_static(recv, name)) {
@@ -4661,8 +4670,13 @@ fn write_refused(recv: &Value, name: &str) -> String {
     // — `#<Object>`, `[object Array]`, `[object RegExp]`, `#<Map>`, `#<C>` for a
     // class instance, `Error: m` for an error. Only Array was special-cased, so
     // every other exotic reported `#<Object>`.
+    let kind = if with_host(|h| host::is_callable(h, recv)) {
+        "function"
+    } else {
+        "object"
+    };
     host::type_error(&format!(
-        "Cannot assign to read only property '{shown}' of object '{}'",
+        "Cannot assign to read only property '{shown}' of {kind} '{}'",
         no_side_effects_string(recv)
     ))
 }
@@ -4840,7 +4854,10 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     // TypeError, and the ASSIGNMENT SITE decides which — not the object. Every
     // refusal used to be silent, so `'use strict'` did not catch a write to a
     // frozen object, which is most of the reason to freeze one.
-    if !with_host(|h| h.can_write_prop(recv, name)) {
+    // A function's own `length` and `name` are read-only (10.2.8-9) until
+    // redefined or deleted, so an assignment to the synthesized one is refused.
+    let readonly_intrinsic = with_host(|h| h.fn_intrinsic_readonly(recv, name));
+    if readonly_intrinsic || !with_host(|h| h.can_write_prop(recv, name)) {
         if with_host(|h| h.current_strict()) {
             return Err(write_refused(recv, name));
         }
@@ -4849,7 +4866,7 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     // Writing `name`/`prototype`/statics on a function value.
     if matches!(
         with_host(|h| h.kind_of(recv)),
-        Some(ObjKind::Func) | Some(ObjKind::Class)
+        Some(ObjKind::Func) | Some(ObjKind::Class) | Some(ObjKind::BoundFunc)
     ) {
         with_host(|h| h.set_fn_prop(recv, name, val));
         return Ok(());
@@ -5169,6 +5186,9 @@ pub fn delete_property(recv: &Value, key: &str) -> Result<bool, String> {
         // A non-index key on an array (`arr.foo`, `arr[sym]`), or any own key on
         // a function/class, is an ordinary own property kept in the side table.
         h.remove_fn_prop(recv, key);
+        // A function's `length`/`name` are synthesized rather than stored, so
+        // deleting one leaves a tombstone for the readers to honour.
+        h.mark_fn_intrinsic_deleted(recv, key);
     });
     Ok(true)
 }
@@ -15442,7 +15462,7 @@ fn write_data_slot(obj: &Value, key: &str, v: Value) {
     // (express `mixin(app, proto)` defines methods onto the `app` *function*).
     if matches!(
         with_host(|h| h.get(obj).cloned()),
-        Some(JsObj::Func(_)) | Some(JsObj::Class(_))
+        Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. })
     ) || uses_side_table(obj)
     {
         with_host(|h| h.set_fn_prop(obj, key, v));
@@ -15520,6 +15540,9 @@ fn synthesized_own_descriptor(obj: &Value, key: &str) -> Option<(Value, host::Pr
     // `prototype` is writable and NOT configurable, and a class's is neither.
     // An arrow, a method and a bound function own no `prototype` at all.
     if with_host(|h| host::is_callable(h, obj)) && !matches!(key, "length" | "name" | "prototype") {
+        return None;
+    }
+    if with_host(|h| h.fn_intrinsic_deleted(obj, key)) {
         return None;
     }
     if with_host(|h| host::is_callable(h, obj)) {

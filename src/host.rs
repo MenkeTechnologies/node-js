@@ -1575,7 +1575,10 @@ impl JsHost {
         // 10.2.5), so `Object.keys(fn)` and `for (k in fn)` report only what a
         // script assigned. An ARRAY receiver reaching the same side table has no
         // such exotic keys — `arr.name = 'x'` is an ordinary enumerable property.
-        if !matches!(self.kind_of(v), Some(ObjKind::Func) | Some(ObjKind::Class)) {
+        if !matches!(
+            self.kind_of(v),
+            Some(ObjKind::Func) | Some(ObjKind::Class) | Some(ObjKind::BoundFunc)
+        ) {
             return;
         }
         let attrs = match name {
@@ -1635,6 +1638,45 @@ impl JsHost {
                 .unwrap_or(false),
             _ => false,
         }
+    }
+    /// Whether `key` is one of the synthesized own properties (`length`,
+    /// `name`) of a function, class or bound function.
+    fn is_fn_intrinsic_key(&self, v: &Value, key: &str) -> bool {
+        matches!(key, "length" | "name")
+            && matches!(
+                self.kind_of(v),
+                Some(ObjKind::Func) | Some(ObjKind::Class) | Some(ObjKind::BoundFunc)
+            )
+    }
+    /// The tombstone key recording `delete fn.<key>` for a synthesized property.
+    fn fn_deleted_key(key: &str) -> String {
+        format!("@@deleted:{key}")
+    }
+    /// `delete fn.length` / `delete fn.name`: remember that the synthesized own
+    /// property is gone so every reader falls through to `Function.prototype`.
+    pub fn mark_fn_intrinsic_deleted(&mut self, v: &Value, key: &str) {
+        if self.is_fn_intrinsic_key(v, key) {
+            self.set_fn_prop(v, &Self::fn_deleted_key(key), Value::Bool(true));
+        }
+    }
+    /// Whether the synthesized `length`/`name` of `v` has been deleted and not
+    /// since redefined (a redefinition stores a real side-table entry).
+    pub fn fn_intrinsic_deleted(&self, v: &Value, key: &str) -> bool {
+        self.is_fn_intrinsic_key(v, key)
+            && self.fn_prop(v, &Self::fn_deleted_key(key)).is_some()
+            && self.fn_prop(v, key).is_none()
+    }
+    /// Whether a write to `key` hits a read-only `length`/`name`: still
+    /// synthesized (no stored redefinition) and, for `name`, already non-empty.
+    /// An EMPTY name is left writable because the compiler's NamedEvaluation
+    /// (SetFunctionName on an anonymous function) assigns it through the same
+    /// store as a script assignment.
+    pub fn fn_intrinsic_readonly(&self, v: &Value, key: &str) -> bool {
+        self.is_fn_intrinsic_key(v, key)
+            && self.fn_prop(v, key).is_none()
+            && (key == "length"
+                || self.fn_intrinsic_deleted(v, key)
+                || !self.callable_name(v).is_empty())
     }
     pub fn fn_prop_keys(&self, v: &Value) -> Vec<String> {
         if let Value::Obj(i) = v {
@@ -7422,8 +7464,12 @@ impl JsHost {
             Some(JsObj::Func(_)) | Some(JsObj::Class(_)) | Some(JsObj::BoundFunc { .. }) => {
                 let mut keys: Vec<String> = Vec::new();
                 if !enum_only {
-                    keys.push("length".into());
-                    keys.push("name".into());
+                    if !self.fn_intrinsic_deleted(v, "length") {
+                        keys.push("length".into());
+                    }
+                    if !self.fn_intrinsic_deleted(v, "name") {
+                        keys.push("name".into());
+                    }
                     if self.owns_prototype(v) {
                         keys.push("prototype".into());
                     }
