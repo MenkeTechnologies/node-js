@@ -1500,3 +1500,56 @@ true true true true
 "##;
     assert_eq!(run(src), expected.trim());
 }
+
+/// `replace`/`replaceAll` with an EMPTY string pattern: it matches at every UTF-16
+/// code-unit boundary (only index 0 for `replace`), a function replacer is called
+/// for each of those matches, and every offset handed to a function replacer is a
+/// UTF-16 index rather than a UTF-8 byte offset. Expected values captured from
+/// system `node`.
+#[test]
+fn string_replace_empty_pattern_and_utf16_offsets() {
+    let src = r##"
+const f = (m, o) => '[' + o + ']';
+console.log('abc'.replace('', f), 'abc'.replaceAll('', f));
+console.log('éxéx'.replace('x', f), 'éxéx'.replaceAll('x', f));
+console.log('\u{1F600}x\u{1F600}x'.replaceAll('x', f));
+console.log('\u{1F600}ab'.replaceAll('', '-').length, 'ab'.replaceAll('', '-'));
+"##;
+    let expected = r##"
+[0]abc [0]a[1]b[2]c[3]
+é[1]éx é[1]é[3]
+😀[2]😀[5]
+9 -a-b-
+"##;
+    assert_eq!(run(src), expected.trim());
+}
+
+/// The `Array.prototype` methods whose algorithm is `Get`-only must not consult a
+/// Proxy's `has` trap while reading the receiver, while the `HasProperty`-driven
+/// ones (`map`, `forEach`) must. Expected values captured from system `node`.
+#[test]
+fn proxy_array_get_only_methods_skip_the_has_trap() {
+    let src = r##"
+const log = [];
+const p = new Proxy([1, 2, 3], {
+  has(t, k) { log.push('has:' + String(k)); return Reflect.has(t, k); },
+});
+const out = [];
+for (const m of ['join', 'includes', 'at', 'find', 'findIndex', 'findLast', 'findLastIndex', 'toReversed', 'toSorted', 'toLocaleString']) {
+  log.length = 0;
+  const r = m === 'at' ? p[m](0) : m === 'includes' ? p[m](2) : m.startsWith('find') ? p[m](x => x === 2) : p[m]();
+  out.push(m + '=' + String(r) + '/' + log.length);
+}
+log.length = 0;
+p.map(x => x); p.forEach(() => {});
+out.push('has-methods=' + log.length);
+console.log(out.join(' '));
+log.length = 0;
+console.log(String(p), log.length);
+"##;
+    let expected = r##"
+join=1,2,3/0 includes=true/0 at=1/0 find=2/0 findIndex=1/0 findLast=2/0 findLastIndex=1/0 toReversed=3,2,1/0 toSorted=1,2,3/0 toLocaleString=1,2,3/0 has-methods=6
+1,2,3 0
+"##;
+    assert_eq!(run(src), expected.trim());
+}

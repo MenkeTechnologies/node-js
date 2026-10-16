@@ -10920,20 +10920,40 @@ fn is_regexp_arg(v: &Value) -> bool {
 
 /// `str.replace(strPattern, fn)` — a function replacer against a literal (string)
 /// pattern: replace the first (or all) occurrence, calling `fn(match, offset, s)`.
+/// Calls `repl(matched, offset, subject)` and returns its string. `offset` is a
+/// UTF-16 index, as in node.
+fn call_replacer(repl: &Value, pat: &str, offset: usize, s: &str) -> Result<String, String> {
+    let m = with_host(|h| h.new_str(pat.to_string()));
+    let str_arg = with_host(|h| h.new_str(s.to_string()));
+    let r = host::invoke(repl, vec![m, Value::Float(offset as f64), str_arg], None)?;
+    Ok(with_host(|h| h.str_of(&r)))
+}
+
 fn replace_str_fn(s: &str, pat: &str, repl: &Value, all: bool) -> Result<String, String> {
     if pat.is_empty() {
-        return Ok(s.to_string());
+        // The empty pattern matches at every code-unit boundary (just index 0
+        // for `replace`); the unit between two matches is copied through.
+        let u = crate::utf16::Units::of(s);
+        let last = if all { u.len() } else { 0 };
+        let mut out = String::new();
+        for i in 0..=last {
+            out.push_str(&call_replacer(repl, pat, i, s)?);
+            if all && i < u.len() {
+                out.push_str(&u.unit_str(i).unwrap_or_default());
+            }
+        }
+        if !all {
+            out.push_str(s);
+        }
+        return Ok(out);
     }
     let mut out = String::new();
     let mut rest = s;
     let mut base = 0usize;
     while let Some(pos) = rest.find(pat) {
         out.push_str(&rest[..pos]);
-        let offset = base + pos;
-        let m = with_host(|h| h.new_str(pat.to_string()));
-        let str_arg = with_host(|h| h.new_str(s.to_string()));
-        let r = host::invoke(repl, vec![m, Value::Float(offset as f64), str_arg], None)?;
-        out.push_str(&with_host(|h| h.str_of(&r)));
+        let offset = crate::utf16::index_of_byte(s, base + pos).get();
+        out.push_str(&call_replacer(repl, pat, offset, s)?);
         let consumed = pos + pat.len();
         base += consumed;
         rest = &rest[consumed..];
@@ -11676,6 +11696,23 @@ const ARRAY_MUTATORS: &[&str] = &[
     "copyWithin",
 ];
 
+/// The non-mutating `Array.prototype` methods whose spec text reads each index
+/// with `Get` alone (no `HasProperty` step), so a hole is observed as a plain
+/// `undefined` and a Proxy `has` trap must not fire while the receiver is read.
+const ARRAY_GET_ONLY: &[&str] = &[
+    "join",
+    "toLocaleString",
+    "includes",
+    "at",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "toReversed",
+    "toSorted",
+    "with",
+];
+
 /// Run `Array.prototype.<method>` against an array-LIKE (`{0: 'a', length: 1}`,
 /// a DOM-ish collection, `arguments`).
 ///
@@ -11711,7 +11748,7 @@ fn array_generic(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, 
     // A STRING receiver owns every index of its length; `has_property` answers
     // for objects and reports none of them, which made `[].map.call('abc', f)`
     // an array of three holes.
-    let dense = with_host(|h| h.as_str(recv)).is_some();
+    let dense = with_host(|h| h.as_str(recv)).is_some() || ARRAY_GET_ONLY.contains(&method);
     let mut items = Vec::with_capacity(len);
     let mut holes: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     for i in 0..len {
@@ -13545,6 +13582,19 @@ fn replace_str_plain(s: &str, from: &str, to: &str, all: bool) -> String {
     if from.is_empty() && !all {
         return format!("{}{s}", substitute_plain(to, "", 0, s));
     }
+    if from.is_empty() {
+        // `replaceAll("")` matches at every code-unit boundary; the unit between
+        // two matches is copied through (a half of a pair becomes U+FFFD, the
+        // documented lone-surrogate boundary).
+        let u = crate::utf16::Units::of(s);
+        let mut out = String::new();
+        for i in 0..=u.len() {
+            let at = crate::utf16::byte_of_index(s, crate::utf16::U16Index::new(i));
+            out.push_str(&substitute_plain(to, from, at, s));
+            out.push_str(&u.unit_str(i).unwrap_or_default());
+        }
+        return out;
+    }
     let mut out = String::new();
     let mut rest = 0usize;
     while let Some(rel) = s[rest..].find(from) {
@@ -13554,16 +13604,6 @@ fn replace_str_plain(s: &str, from: &str, to: &str, all: bool) -> String {
         rest = at + from.len();
         if !all {
             break;
-        }
-        // An empty pattern matches between every character; step one along so
-        // the scan terminates.
-        if from.is_empty() {
-            if rest >= s.len() {
-                break;
-            }
-            let step = s[rest..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-            out.push_str(&s[rest..rest + step]);
-            rest += step;
         }
     }
     out.push_str(&s[rest..]);
