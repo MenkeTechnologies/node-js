@@ -1594,3 +1594,22 @@ b 2 | bound f | TypeError: Cannot assign to read only property 'length' of funct
 "##;
     assert_eq!(run(src), expected.trim());
 }
+
+/// `of` is contextual, not reserved: it is a legal binding, reference, function
+/// name and parameter, and still introduces a for-of when it follows a head.
+#[test]
+fn of_is_a_contextual_identifier() {
+    let src = r##"
+var of; console.log(of);
+let o2 = 1; { let of = 5; console.log(of + o2); }
+function f(of) { return of * 2; } console.log(f(4));
+console.log(typeof of, (of => of + 1)(1));
+var acc = []; for (of of [1, 2]) acc.push(of); console.log(acc.join(), of);
+for (var of of [7]) console.log(of);
+for (const [of] of [[4]]) console.log(of);
+for (let of = 0; of < 2; of++) console.log(of);
+console.log(({ of: 1 }).of);
+"##;
+    let expected = "undefined\n6\n8\nundefined 2\n1,2 2\n7\n4\n0\n1\n1";
+    assert_eq!(run(src), expected);
+}
