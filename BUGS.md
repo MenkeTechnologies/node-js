@@ -2986,7 +2986,6 @@ Measured at node-js 0.1.14 against node v26.11.1.
 
 | Case | node | node-js |
 |---|---|---|
-| `{ let inner = 1; } console.log(typeof inner, inner)`; likewise `const`, an `if (1) { let z = 3 }` block, and an inner block of a function body | `undefined`, then `ReferenceError: inner is not defined` | `number 1` — a block's `let`/`const` binding outlives the block (a read inside a later `try` body does throw `z is not defined`) |
 | an uncaught throw from a file: `throw new Error("boom")` | `file:1`, the source line, a `^` caret, a blank line, `Error: boom` with its stack, a blank line, `Node.js v26.11.1`; exit 1 | `node: Uncaught Error: boom`; exit 1 |
 | an uncaught `throw new TypeError("x")`, `throw new RangeError("r")` (file or `-e`) | `TypeError: x` / `RangeError: r` in the format above | `node: Uncaught Error: x` / `node: Uncaught Error: r` — the subclass name is lost as well (a caught one reports `e.name` `TypeError` correctly) |
 | `throw 5` | the source header, `5`, then the one-line `--trace-uncaught` hint and `Node.js v26.11.1` | `node: Uncaught 5` |

@@ -95,6 +95,8 @@ pub fn plan(params: &[Param], body: &[Stmt], top_level: bool) -> Plan {
         consts: FxHashSet::default(),
         top_level,
         next: 0,
+        lexical_log: Vec::new(),
+        closed: FxHashSet::default(),
     };
     // Parameters are declared and assigned before the first statement runs.
     // Their incoming type is whatever the caller passed, so they are never in
@@ -275,6 +277,12 @@ struct Planner {
     consts: FxHashSet<String>,
     top_level: bool,
     next: u16,
+    /// Every `let`/`const` declaration seen so far, in source order, so a
+    /// scope that ends can retire the names it introduced (see `close_scope`).
+    lexical_log: Vec<String>,
+    /// Names whose declaring block has ended. A later mention names an OUTER or
+    /// global binding, never the slot, so the name is given back to the host.
+    closed: FxHashSet<String>,
 }
 
 impl Planner {
@@ -305,6 +313,9 @@ impl Planner {
     /// A mention of `name` that is not its declaration (rule 3): if the name has
     /// no slot yet, its first mention is a read, so it never gets one.
     fn mention(&mut self, name: &str) {
+        if self.closed.contains(name) {
+            self.reject(name);
+        }
         if !self.candidates.contains_key(name) {
             self.reject(name);
         }
@@ -329,6 +340,9 @@ impl Planner {
             Some(DeclKind::Var) if self.top_level => self.reject(n),
             Some(k) => {
                 self.declare(n);
+                if k != DeclKind::Var {
+                    self.lexical_log.push(n.clone());
+                }
                 if init.is_some_and(is_number_literal) {
                     self.numeric.insert(n.clone());
                 }
@@ -350,7 +364,24 @@ impl Planner {
         }
     }
 
+    /// Walk one statement; a statement that opens a lexical scope retires the
+    /// `let`/`const` names it declared once it ends.
     fn walk_stmt(&mut self, s: &Stmt) {
+        let mark = self.lexical_log.len();
+        self.walk_stmt_inner(s);
+        if matches!(
+            s.kind,
+            StmtKind::Block(_)
+                | StmtKind::For { .. }
+                | StmtKind::ForOf { .. }
+                | StmtKind::ForIn { .. }
+                | StmtKind::Switch { .. }
+        ) {
+            self.closed.extend(self.lexical_log.drain(mark..));
+        }
+    }
+
+    fn walk_stmt_inner(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::Decl { kind, decls } => {
                 for d in decls {

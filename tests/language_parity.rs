@@ -1613,3 +1613,24 @@ console.log(({ of: 1 }).of);
     let expected = "undefined\n6\n8\nundefined 2\n1,2 2\n7\n4\n0\n1\n1";
     assert_eq!(run(src), expected);
 }
+
+/// A block's `let`/`const` binding ends with the block, including bindings the
+/// slot planner keeps in frame slots (declared once, never captured).
+#[test]
+fn block_lexical_bindings_end_with_their_block() {
+    let src = r##"
+{ let a = 1; const b = 2; console.log(a + b); }
+console.log(typeof a, typeof b);
+if (1) { const z = 3; }
+console.log(typeof z);
+for (let i = 0; i < 2; i++) { let k = i; }
+console.log(typeof i, typeof k);
+switch (1) { case 1: let s = 1; }
+console.log(typeof s);
+function f() { { let q = 1; } return typeof q; }
+console.log(f());
+try { { let w = 1; } w; } catch (e) { console.log(e.message); }
+"##;
+    let expected = "3\nundefined undefined\nundefined\nundefined undefined\nundefined\nundefined\nw is not defined";
+    assert_eq!(run(src), expected);
+}
