@@ -103,11 +103,11 @@ node -e 'console.log(1 + 1)'         # evaluate a one-liner
 node -p '6 * 7'                      # evaluate and print the result
 echo 'console.log(6 * 7)' | node     # read a script from stdin
 node --tiers script.js               # run it, then report which fusevm tiers took it
-node --repl                         # interactive REPL
-node --lsp                         # Language Server Protocol over stdio
-node --dap                         # Debug Adapter Protocol over stdio
-node --build script.js             # AOT-compile to a standalone native executable
-node --dump-tokens script.js       # print the lexer token stream (also --dump-ast, --dump-bytecode, --disasm)
+node --repl                          # interactive REPL
+node --lsp                           # Language Server Protocol over stdio
+node --dap                           # Debug Adapter Protocol over stdio
+node --build script.js               # AOT-compile to a standalone native executable
+node --dump-tokens script.js         # print the lexer token stream (also --dump-ast, --dump-bytecode, --disasm)
 ```
 
 `--no-warnings`, `--no-deprecation`, `--trace-warnings` and `--trace-deprecation`
