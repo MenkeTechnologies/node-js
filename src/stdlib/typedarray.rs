@@ -1487,6 +1487,15 @@ pub fn elems_display(h: &crate::host::JsHost, v: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The raw bytes a typed array VIEWS — `length * BYTES_PER_ELEMENT` of them
+/// from its `byteOffset` — as opposed to its element values. A
+/// `Uint16Array([0x4142])` is the two bytes `42 41`, never the one byte its
+/// element truncates to. `None` for anything that is not a typed array.
+pub fn raw_view_bytes(v: &Value) -> Option<Vec<u8>> {
+    let kind = super::util_types::ta_kind(v)?;
+    view_bytes(v, 0, view_len(v) * bytes_per_element(&kind))
+}
+
 /// The element count a view exposes, from its own `length` slot.
 fn view_len(v: &Value) -> usize {
     // A view over a DETACHED buffer has length 0 — its own `length` property
@@ -2018,12 +2027,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         }
         "set" => {
             // `ta.set(src[, offset])` — write `src`'s values in place.
-            let arg = args.first().cloned().unwrap_or(Value::Undef);
-            let src = match super::native_tag(&arg).as_deref() {
-                Some("TypedArray") | Some("Buffer") => elem_values(&arg),
-                _ => crate::host::iter_all(&arg)
-                    .unwrap_or_else(|_| crate::builtins::array_like_items(&arg)),
-            };
+            let src = set_source(args.first());
             // 23.2.3.26: a negative offset, or a source that runs past the
             // end, is a RangeError. Neither may write a partial prefix.
             let off = super::arg_num(args, 1);
@@ -2050,6 +2054,27 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             "{method} is not a function"
         ))),
     }
+}
+
+/// The values `ta.set(source)` writes, before element coercion: a typed array's
+/// (or Buffer's) elements, else the source's iterated or array-like items. A
+/// `Buffer` receiver shares this — it read a non-Buffer source as zero bytes.
+pub fn set_source(arg: Option<&Value>) -> Vec<Value> {
+    let arg = arg.cloned().unwrap_or(Value::Undef);
+    match super::native_tag(&arg).as_deref() {
+        Some("TypedArray") | Some("Buffer") => elem_values(&arg),
+        _ => {
+            crate::host::iter_all(&arg).unwrap_or_else(|_| crate::builtins::array_like_items(&arg))
+        }
+    }
+}
+
+/// [`set_source`] coerced to `Uint8` elements, for a `Buffer` receiver.
+pub fn set_source_bytes(arg: Option<&Value>) -> Result<Vec<u8>, String> {
+    set_source(arg)
+        .iter()
+        .map(|v| coerce_val("Uint8Array", v).map(|e| with_host(|h| h.to_number(&e)) as u8))
+        .collect()
 }
 
 // ── WeakRef (strong-ref approximation) ────────────────────────────────────────
@@ -2219,8 +2244,17 @@ pub fn construct_text_encoder() -> Result<Value, String> {
 pub fn text_encoder_call(_recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         // `encode(str)` → a Uint8Array of the UTF-8 bytes.
+        // `encode(input = '')`: an absent or `undefined` input is the empty
+        // string (it encoded the text "undefined"), anything else is
+        // `ToString`ed — a `toString` runs and a symbol throws.
         "encode" => {
-            let s = super::arg_str(args, 0);
+            let s = match args.first() {
+                None | Some(Value::Undef) => String::new(),
+                Some(v) => {
+                    let s = crate::host::to_string_value(v)?;
+                    with_host(|h| h.str_of(&s))
+                }
+            };
             Ok(make(
                 "Uint8Array",
                 s.as_bytes()
@@ -2228,6 +2262,46 @@ pub fn text_encoder_call(_recv: &Value, method: &str, args: &[Value]) -> Result<
                     .map(|b| Value::Float(*b as f64))
                     .collect(),
             ))
+        }
+        // `encodeInto(src, dest)`: the UTF-8 of as many WHOLE characters of
+        // `src` as fit in `dest`, written in place; `{read, written}` counts
+        // UTF-16 code units consumed and bytes produced. It was absent.
+        "encodeInto" => {
+            let src = args.first().cloned().unwrap_or(Value::Undef);
+            let Some(s) = with_host(|h| h.as_str(&src)) else {
+                return Err(crate::host::invalid_arg_type(
+                    "src", "argument", "string", &src,
+                ));
+            };
+            let dest = args.get(1).cloned().unwrap_or(Value::Undef);
+            if super::util_types::ta_kind(&dest).as_deref() != Some("Uint8Array") {
+                return Err(crate::host::coded_error(
+                    "TypeError",
+                    "ERR_INVALID_ARG_TYPE",
+                    &format!(
+                        "The \"dest\" argument must be an instance of Uint8Array. Received {}",
+                        super::received_desc(&dest)
+                    ),
+                ));
+            }
+            let mut out = super::buffer::view_bytes(&dest).unwrap_or_default();
+            let (mut read, mut written) = (0, 0);
+            for c in s.chars() {
+                let n = c.len_utf8();
+                if written + n > out.len() {
+                    break;
+                }
+                c.encode_utf8(&mut out[written..written + n]);
+                written += n;
+                read += c.len_utf16();
+            }
+            super::buffer::write_view(&dest, &out);
+            Ok(with_host(|h| {
+                let mut m = IndexMap::new();
+                m.insert("read".into(), Value::Float(read as f64));
+                m.insert("written".into(), Value::Float(written as f64));
+                h.new_object(m)
+            }))
         }
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
@@ -2298,15 +2372,45 @@ const CP1252_HIGH: [char; 32] = [
     '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}', '\u{178}',
 ];
 
+/// How many trailing bytes of `bytes` are an INCOMPLETE sequence in `enc` — a
+/// prefix of a character the next streamed chunk may finish. For UTF-8 that is
+/// a valid lead byte followed by fewer continuation bytes than it announces;
+/// for UTF-16LE an odd final byte. A malformed tail is not incomplete: it is
+/// decoded (or rejected) now.
+fn incomplete_tail(bytes: &[u8], enc: &str) -> usize {
+    match enc {
+        "utf-16le" => bytes.len() % 2,
+        "utf-8" => match std::str::from_utf8(bytes) {
+            Err(e) if e.error_len().is_none() => bytes.len() - e.valid_up_to(),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
 pub fn text_decoder_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         // `decode(bytes)` → a string from the buffer's UTF-8 (or latin1) bytes.
         "decode" => {
-            let bytes: Vec<u8> = elems_of(&args.first().cloned().unwrap_or(Value::Undef))
-                .unwrap_or_default()
-                .iter()
-                .map(|n| *n as u8)
-                .collect();
+            // The input is a BufferSource — any byte view or an ArrayBuffer —
+            // read as the BYTES it views. It used to be the element values of a
+            // typed array only, so a `Uint16Array` decoded its truncated
+            // elements and an `ArrayBuffer` or `DataView` decoded as "".
+            let input = args.first().cloned().unwrap_or(Value::Undef);
+            let fresh = match &input {
+                Value::Undef => Vec::new(),
+                v => super::buffer::view_bytes(v).ok_or_else(|| {
+                    crate::host::coded_error(
+                        "TypeError",
+                        "ERR_INVALID_ARG_TYPE",
+                        "The \"list\" argument must be an instance of SharedArrayBuffer, \
+                         ArrayBuffer or ArrayBufferView.",
+                    )
+                })?,
+            };
+            let stream = args
+                .get(1)
+                .map(|o| crate::builtins::get_property(o, "stream").unwrap_or(Value::Undef))
+                .is_some_and(|v| with_host(|h| h.truthy(&v)));
             let slot = |key: &str| {
                 with_host(|h| match h.get(recv) {
                     Some(JsObj::Object(p)) => p.get(key).cloned(),
@@ -2317,6 +2421,39 @@ pub fn text_decoder_call(recv: &Value, method: &str, args: &[Value]) -> Result<V
                 .map(|v| with_host(|h| h.str_of(&v)))
                 .unwrap_or_else(|| "utf-8".into());
             let flag = |key: &str| matches!(slot(key), Some(Value::Bool(true)));
+            // `{stream: true}` holds back an incomplete trailing sequence for the
+            // next call (WHATWG "do not flush"); the bytes it held last time go
+            // in front of this chunk. Without it a character split across two
+            // chunks decoded as two U+FFFD.
+            let mut bytes: Vec<u8> = slot("@@pending")
+                .map(|v| {
+                    with_host(|h| h.str_of(&v))
+                        .chars()
+                        .map(|c| c as u8)
+                        .collect()
+                })
+                .unwrap_or_default();
+            bytes.extend(fresh);
+            let keep = if stream {
+                incomplete_tail(&bytes, &enc)
+            } else {
+                0
+            };
+            let held: String = bytes
+                .split_off(bytes.len() - keep)
+                .iter()
+                .map(|b| *b as char)
+                .collect();
+            // The BOM is stripped only at the START of a stream, so remember
+            // whether this call continues one.
+            let continuing = flag("@@streaming");
+            with_host(|h| {
+                let held = h.new_str(held);
+                if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                    p.insert("@@pending".into(), held);
+                    p.insert("@@streaming".into(), Value::Bool(stream));
+                }
+            });
             let s = match enc.as_str() {
                 "windows-1252" => bytes
                     .iter()
@@ -2350,7 +2487,7 @@ pub fn text_decoder_call(recv: &Value, method: &str, args: &[Value]) -> Result<V
             };
             // A leading BOM is REMOVED unless `ignoreBOM` asked to keep it.
             let s = match s.strip_prefix('\u{feff}') {
-                Some(rest) if !flag("@@ignoreBOM") => rest.to_string(),
+                Some(rest) if !continuing && !flag("@@ignoreBOM") => rest.to_string(),
                 _ => s,
             };
             Ok(with_host(|h| h.new_str(s)))

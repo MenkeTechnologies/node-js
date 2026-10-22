@@ -26,6 +26,7 @@ use indexmap::IndexMap;
 /// implement — the exact drift this list exists to prevent.
 pub const STATIC_METHODS: &[&str] = &[
     "from",
+    "copyBytesFrom",
     "alloc",
     "allocUnsafe",
     "allocUnsafeSlow",
@@ -110,32 +111,141 @@ pub const INSTANCE_METHODS: &[&str] = &[
 /// Free functions of the `buffer` module itself (`require('buffer').atob`, …), as
 /// opposed to the `Buffer` constructor's static methods above. Needs the parent
 /// `"buffer"` routing arm (see final report).
-pub const MODULE_METHODS: &[&str] = &["atob", "btoa", "isAscii", "isUtf8", "transcode"];
+pub const MODULE_METHODS: &[&str] = &["atob", "btoa", "isAscii", "isLatin1", "isUtf8", "transcode"];
+
+/// The data members of the `buffer` module, next to its functions.
+/// `MAX_STRING_LENGTH` is V8's `String::kMaxLength` on a 64-bit build, the
+/// figure node reports; node-js does not itself cap a string at it.
+pub fn module_constant(name: &str) -> Option<Value> {
+    const MAX_STRING_LENGTH: f64 = 536_870_888.0;
+    match name {
+        "kMaxLength" => Some(Value::Float(K_MAX_LENGTH)),
+        "kStringMaxLength" => Some(Value::Float(MAX_STRING_LENGTH)),
+        "INSPECT_MAX_BYTES" => Some(Value::Float(50.0)),
+        "constants" => Some(with_host(|h| {
+            let mut m = IndexMap::new();
+            m.insert("MAX_LENGTH".into(), Value::Float(K_MAX_LENGTH));
+            m.insert("MAX_STRING_LENGTH".into(), Value::Float(MAX_STRING_LENGTH));
+            h.new_object(m)
+        })),
+        _ => None,
+    }
+}
+
+/// `atob`/`btoa`'s one argument: absent is `ERR_MISSING_ARGS`, anything else
+/// goes through `ToString` (so `btoa(undefined)` encodes `"undefined"`, a
+/// `toString` method runs, and a symbol throws).
+fn string_input(args: &[Value]) -> Result<String, String> {
+    let v = args.first().ok_or_else(|| {
+        crate::host::coded_error(
+            "TypeError",
+            "ERR_MISSING_ARGS",
+            "The \"input\" argument must be specified",
+        )
+    })?;
+    let s = crate::host::to_string_value(v)?;
+    Ok(with_host(|h| h.str_of(&s)))
+}
+
+/// The bytes `isAscii`/`isUtf8` inspect: an `ArrayBuffer` or a typed array
+/// (a Buffer is one), read as the bytes it views. A string, a number or a
+/// `DataView` is `ERR_INVALID_ARG_TYPE` — they were answered as if they were
+/// byte sequences.
+fn validated_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    match super::native_tag(&v).as_deref() {
+        Some("Buffer" | "TypedArray" | "ArrayBuffer") => Ok(view_bytes(&v).unwrap_or_default()),
+        _ => Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"input\" argument must be an instance of ArrayBuffer, Buffer, or TypedArray. Received {}",
+                super::received_desc(&v)
+            ),
+        )),
+    }
+}
+
+/// WHATWG forgiving-base64 decode, with the two failures node's `atob`
+/// distinguishes: a character outside the alphabet (or misplaced padding) is
+/// "Invalid character", and a data length of `4n + 1` is "not correctly
+/// encoded". ASCII whitespace is skipped, up to two trailing `=` are allowed
+/// when they complete a quantum, and non-zero trailing bits are accepted.
+fn forgiving_base64(s: &str) -> Result<Vec<u8>, String> {
+    let invalid = || crate::host::dom_error("InvalidCharacterError", "Invalid character");
+    let chars: Vec<char> = s
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' '))
+        .collect();
+    let pad = chars.iter().rev().take_while(|c| **c == '=').count();
+    let data = &chars[..chars.len() - pad];
+    let mut vals = Vec::with_capacity(data.len());
+    for c in data {
+        match B64_ALPHABET.find(*c) {
+            Some(i) => vals.push(i as u32),
+            None => return Err(invalid()),
+        }
+    }
+    if pad > 2 {
+        return Err(invalid());
+    }
+    if vals.len() % 4 == 1 {
+        return Err(crate::host::dom_error(
+            "InvalidCharacterError",
+            "The string to be decoded is not correctly encoded.",
+        ));
+    }
+    if pad > 0 && chars.len() % 4 != 0 {
+        return Err(invalid());
+    }
+    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
+    for q in vals.chunks(4) {
+        let n = q
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, v)| n | v << (18 - 6 * i));
+        out.extend_from_slice(&n.to_be_bytes()[1..q.len()]);
+    }
+    Ok(out)
+}
+
+const B64_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Dispatch a `require('buffer').<method>` free function.
 pub fn module_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
-        // atob: base64 → a binary (latin1) string.
-        "atob" => {
-            let s = arg_str(args, 0);
-            let bytes = from_base64(&s);
+        // atob: forgiving base64 → a binary (latin1) string.
+        "atob" => (|| {
+            let bytes = forgiving_base64(&string_input(args)?)?;
             let bin: String = bytes.iter().map(|b| *b as char).collect();
             Ok(with_host(|h| h.new_str(bin)))
-        }
-        // btoa: a binary string → base64 (each char's low byte is one octet).
-        "btoa" => {
-            let s = arg_str(args, 0);
-            let bytes: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
-            let b64 = to_base64(&bytes);
-            Ok(with_host(|h| h.new_str(b64)))
-        }
-        "isAscii" => {
-            let bytes = input_bytes(args.first());
-            Ok(Value::Bool(bytes.iter().all(|b| *b < 0x80)))
-        }
-        "isUtf8" => {
-            let bytes = input_bytes(args.first());
-            Ok(Value::Bool(std::str::from_utf8(&bytes).is_ok()))
+        })(),
+        // btoa: a binary string → base64. A code point above U+00FF has no
+        // octet, so it is an `InvalidCharacterError` — it used to encode the
+        // character's low byte.
+        "btoa" => (|| {
+            let s = string_input(args)?;
+            let bytes = s
+                .chars()
+                .map(|c| u8::try_from(c as u32))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| {
+                    crate::host::dom_error("InvalidCharacterError", "Invalid character")
+                })?;
+            Ok(with_host(|h| h.new_str(to_base64(&bytes))))
+        })(),
+        "isAscii" => validated_bytes(args).map(|b| Value::Bool(b.is_ascii())),
+        "isUtf8" => validated_bytes(args).map(|b| Value::Bool(std::str::from_utf8(&b).is_ok())),
+        // isLatin1 takes a STRING in node v26: whether every code unit fits a
+        // byte.
+        "isLatin1" => {
+            let v = args.first().cloned().unwrap_or(Value::Undef);
+            match with_host(|h| h.as_str(&v)) {
+                Some(s) => Ok(Value::Bool(s.chars().all(|c| (c as u32) < 0x100))),
+                None => Err(crate::host::invalid_arg_type(
+                    "input", "argument", "string", &v,
+                )),
+            }
         }
         // transcode(source, fromEnc, toEnc): re-encode bytes between utf8/latin1/
         // ascii/utf16le (best-effort; hex/base64 are not transcode encodings).
@@ -532,7 +642,7 @@ fn validate_size(args: &[Value]) -> Result<usize, String> {
 /// through `addNumericalSeparator` (`_` every three characters from the right,
 /// applied to the printed text, so `1e21` becomes `1e_+21` exactly as in node),
 /// anything else as `inspect` would.
-fn out_of_range_received(n: f64) -> String {
+pub(crate) fn out_of_range_received(n: f64) -> String {
     let shown = crate::host::fmt_number(n);
     if n.fract() != 0.0 || n.abs() <= 4_294_967_296.0 {
         return shown;
@@ -550,6 +660,7 @@ fn out_of_range_received(n: f64) -> String {
 pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
         "from" => from(args),
+        "copyBytesFrom" => copy_bytes_from(args),
         "alloc" => {
             let n = match validate_size(args) {
                 Ok(n) => n,
@@ -608,13 +719,15 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         ))),
         // Static `Buffer.compare(a, b)` — the sort comparator form.
         "compare" => {
-            let a = bytes_of(&args.first().cloned().unwrap_or(Value::Undef));
-            let b = bytes_of(&args.get(1).cloned().unwrap_or(Value::Undef));
-            Ok(Value::Float(match a.cmp(&b) {
-                std::cmp::Ordering::Less => -1.0,
-                std::cmp::Ordering::Equal => 0.0,
-                std::cmp::Ordering::Greater => 1.0,
-            }))
+            let a = match uint8_arg(args.first(), "buf1") {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+            let b = match uint8_arg(args.get(1), "buf2") {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+            Ok(ordering_value(a.cmp(&b)))
         }
         "isBuffer" => Ok(Value::Bool(
             super::native_tag(&args.first().cloned().unwrap_or(Value::Undef)).as_deref()
@@ -674,7 +787,10 @@ pub fn view_bytes(v: &Value) -> Option<Vec<u8>> {
             .unwrap_or(0);
             crate::stdlib::typedarray::view_bytes(v, 0, n)
         }
-        Some("Buffer") | Some("TypedArray") | Some("ArrayBuffer") => bytes_like(v),
+        // A typed array contributes the bytes it views, not its truncated
+        // elements: `hash.update(new Uint16Array([0x4142]))` hashes `42 41`.
+        Some("TypedArray") => crate::stdlib::typedarray::raw_view_bytes(v),
+        Some("Buffer") | Some("ArrayBuffer") => bytes_like(v),
         _ => None,
     }
 }
@@ -853,6 +969,12 @@ fn concat(args: &[Value]) -> Result<Value, String> {
 /// `validateOffset(value, name)` from `lib/buffer.js`: a Number, an integer,
 /// and within `[0, kMaxLength]`.
 fn validate_offset(v: &Value, name: &str) -> Result<usize, String> {
+    validate_offset_in(v, name, K_MAX_LENGTH)
+}
+
+/// `validateOffset(value, name, 0, max)`: [`validate_offset`] with an explicit
+/// upper bound.
+fn validate_offset_in(v: &Value, name: &str, max: f64) -> Result<usize, String> {
     if with_host(|h| h.type_of(v)) != "number" {
         return Err(crate::host::invalid_arg_type(name, "argument", "number", v));
     }
@@ -870,13 +992,40 @@ fn validate_offset(v: &Value, name: &str) -> Result<usize, String> {
     if n.is_nan() || n.fract() != 0.0 {
         return Err(out_of_range("an integer".to_string()));
     }
-    if !(0.0..=K_MAX_LENGTH).contains(&n) {
+    if !(0.0..=max).contains(&n) {
         return Err(out_of_range(format!(
             ">= 0 && <= {}",
-            crate::host::fmt_number(K_MAX_LENGTH)
+            crate::host::fmt_number(max)
         )));
     }
     Ok(n as usize)
+}
+
+/// The bytes of a `compare` operand, which `lib/buffer.js` requires to be a
+/// Uint8Array (a Buffer is one): anything else is `ERR_INVALID_ARG_TYPE` naming
+/// the parameter, never a comparison against the bytes of its stringification.
+fn uint8_arg(v: Option<&Value>, name: &str) -> Result<Vec<u8>, String> {
+    let v = v.cloned().unwrap_or(Value::Undef);
+    if super::util_types::ta_kind(&v).as_deref() != Some("Uint8Array") {
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"{name}\" argument must be an instance of Buffer or Uint8Array. Received {}",
+                super::received_desc(&v)
+            ),
+        ));
+    }
+    Ok(view_bytes(&v).unwrap_or_default())
+}
+
+/// A byte-order comparison as the `-1` / `0` / `1` that `compare` returns.
+fn ordering_value(o: std::cmp::Ordering) -> Value {
+    Value::Float(match o {
+        std::cmp::Ordering::Less => -1.0,
+        std::cmp::Ordering::Equal => 0.0,
+        std::cmp::Ordering::Greater => 1.0,
+    })
 }
 
 /// Buffer instance methods.
@@ -917,9 +1066,10 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             h.new_object(m)
         })),
         "equals" => {
-            // Comparable against any typed array, not just another Buffer.
-            let other = bytes_like(&args.first().cloned().unwrap_or(Value::Undef));
-            Ok(Value::Bool(other.is_some_and(|o| bytes == o)))
+            // `otherBuffer` must be a Uint8Array (a Buffer is one); any other
+            // view or value is `ERR_INVALID_ARG_TYPE`, never a plain `false`.
+            let other = uint8_arg(args.first(), "otherBuffer")?;
+            Ok(Value::Bool(bytes == other))
         }
         "slice" | "subarray" => {
             let (s, e) = slice_bounds(args, bytes.len());
@@ -942,13 +1092,30 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 _ => (Some(super::arg_num(args, 1)), arg_str(args, 2)),
             };
             let enc = if enc.is_empty() { "utf8".into() } else { enc };
-            // The needle is a string, a byte value, or another Buffer.
+            // The needle is a number (its `>>> 0` low byte, so 353 finds 97),
+            // a string in `enc`, or a Uint8Array's bytes; anything else — an
+            // array, a boolean, `null`, a `Uint16Array` — is the TypeError
+            // `bidirectionalIndexOf` throws.
             let target = args.first().cloned().unwrap_or(Value::Undef);
-            let needle = match &target {
-                Value::Int(_) | Value::Float(_) => vec![super::arg_num(args, 0) as u8],
-                // A Buffer or any other typed array searches by its bytes.
-                _ if bytes_like(&target).is_some() => bytes_like(&target).unwrap_or_default(),
-                _ => decode_str(&arg_str(args, 0), &enc),
+            let needle = match with_host(|h| h.type_of(&target)) {
+                "number" => {
+                    let n = super::arg_num(args, 0);
+                    vec![crate::host::to_int32(n) as u32 as u8]
+                }
+                "string" => decode_str(&arg_str(args, 0), &enc),
+                _ if super::util_types::ta_kind(&target).as_deref() == Some("Uint8Array") => {
+                    view_bytes(&target).unwrap_or_default()
+                }
+                _ => {
+                    return Err(crate::host::coded_error(
+                        "TypeError",
+                        "ERR_INVALID_ARG_TYPE",
+                        &format!(
+                            "The \"value\" argument must be one of type number or string or an instance of Buffer or Uint8Array. Received {}",
+                            super::received_desc(&target)
+                        ),
+                    ))
+                }
             };
             // A negative offset counts back from the end; NaN is 0. Out of range
             // means "no room to match" forwards, and "whole buffer" backwards.
@@ -984,14 +1151,30 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                 Ok(Value::Float(pos.map(|p| p as f64).unwrap_or(-1.0)))
             }
         }
-        // Lexicographic byte comparison → -1 / 0 / 1.
+        // compare(target[, targetStart[, targetEnd[, sourceStart[, sourceEnd]]]])
+        // — `lib/buffer.js`: each bound is `validateOffset`ed (an end against its
+        // own buffer's length), an empty source range is `0`/`-1` and an empty
+        // target range `1` before any byte is read, and the two ranges are then
+        // compared lexicographically. The bounds used to be ignored entirely.
         "compare" => {
-            let other = bytes_of(&args.first().cloned().unwrap_or(Value::Undef));
-            Ok(Value::Float(match bytes.cmp(&other) {
-                std::cmp::Ordering::Less => -1.0,
-                std::cmp::Ordering::Equal => 0.0,
-                std::cmp::Ordering::Greater => 1.0,
-            }))
+            let target = uint8_arg(args.first(), "target")?;
+            let bound = |i: usize, name: &str, default: usize, max: f64| match args.get(i) {
+                None | Some(Value::Undef) => Ok(default),
+                Some(v) => validate_offset_in(v, name, max),
+            };
+            let t_start = bound(1, "targetStart", 0, K_MAX_LENGTH)?;
+            let t_end = bound(2, "targetEnd", target.len(), target.len() as f64)?;
+            let s_start = bound(3, "sourceStart", 0, K_MAX_LENGTH)?;
+            let s_end = bound(4, "sourceEnd", bytes.len(), bytes.len() as f64)?;
+            if s_start >= s_end {
+                return Ok(Value::Float(if t_start >= t_end { 0.0 } else { -1.0 }));
+            }
+            if t_start >= t_end {
+                return Ok(Value::Float(1.0));
+            }
+            Ok(ordering_value(
+                bytes[s_start..s_end].cmp(&target[t_start..t_end]),
+            ))
         }
         // Big-endian / little-endian integer reads.
         "readUInt16BE" => {
@@ -1311,15 +1494,13 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         // `TypedArray.prototype.set(source[, offset])` — copy `source`'s bytes in
         // at `offset`, throwing when they would not fit (as Node does).
         "set" => {
-            let src = bytes_of(&args.first().cloned().unwrap_or(Value::Undef));
-            let offset = if args.len() > 1 {
-                super::arg_num(args, 1).max(0.0) as usize
-            } else {
-                0
-            };
-            if offset + src.len() > bytes.len() {
+            let src = crate::stdlib::typedarray::set_source_bytes(args.first())?;
+            let off = super::arg_num(args, 1);
+            let off = if off.is_nan() { 0.0 } else { off.trunc() };
+            if off < 0.0 || off + src.len() as f64 > bytes.len() as f64 {
                 return Err(crate::host::range_error("offset is out of bounds"));
             }
+            let offset = off as usize;
             let mut out = bytes.clone();
             out[offset..offset + src.len()].copy_from_slice(&src);
             set_bytes(recv, &out);
@@ -1387,6 +1568,20 @@ fn range_error_out_of_bounds() -> String {
         "ERR_OUT_OF_RANGE",
         "Attempt to access memory outside buffer bounds",
     )
+}
+
+/// Overwrite the bytes a byte VIEW (or an `ArrayBuffer`) exposes, from its
+/// first byte — the write-side twin of [`view_bytes`], so an API that fills a
+/// caller's view (`randomFillSync`, `readSync`) reaches every view kind and
+/// the memory it aliases.
+pub fn write_view(v: &Value, bytes: &[u8]) {
+    match super::native_tag(v).as_deref() {
+        Some("Buffer" | "ArrayBuffer") => set_bytes(v, bytes),
+        Some("TypedArray" | "DataView") => {
+            crate::stdlib::typedarray::write_view_bytes(v, 0, bytes);
+        }
+        _ => {}
+    }
 }
 
 fn set_bytes(recv: &Value, new: &[u8]) {
@@ -1744,4 +1939,43 @@ fn checked_offset(arg: Option<&Value>, size: usize, len: usize) -> Result<usize,
         ));
     }
     Ok(off as usize)
+}
+
+/// `Buffer.copyBytesFrom(view[, offset[, length]])`, a port of `lib/buffer.js`:
+/// a NEW Buffer holding a copy of the bytes behind `view`'s elements
+/// `[offset, offset + length)` — `offset`/`length` count ELEMENTS, so a
+/// `Uint16Array` contributes two bytes per element. It was absent.
+fn copy_bytes_from(args: &[Value]) -> Result<Value, String> {
+    let view = args.first().cloned().unwrap_or(Value::Undef);
+    let Some(kind) = super::util_types::ta_kind(&view) else {
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"view\" argument must be an instance of TypedArray. Received {}",
+                super::received_desc(&view)
+            ),
+        ));
+    };
+    let bytes = view_bytes(&view).unwrap_or_default();
+    let bpe = crate::stdlib::typedarray::bytes_per_element(&kind);
+    let len = bytes.len() / bpe;
+    if len == 0 {
+        return Ok(from_bytes(&[]));
+    }
+    let arg = |i: usize| args.get(i).filter(|v| !matches!(v, Value::Undef));
+    let offset = match arg(1) {
+        Some(v) => super::validate_integer(v, "offset", 0.0)? as usize,
+        None => 0,
+    };
+    if offset >= len {
+        return Ok(from_bytes(&[]));
+    }
+    let end = match arg(2) {
+        Some(v) => {
+            (offset as f64 + super::validate_integer(v, "length", 0.0)?).min(len as f64) as usize
+        }
+        None => len,
+    };
+    Ok(from_bytes(&bytes[offset * bpe..end * bpe]))
 }

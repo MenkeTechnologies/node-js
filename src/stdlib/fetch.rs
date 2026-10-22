@@ -479,10 +479,12 @@ fn body_init_bytes(v: Option<&Value>) -> Vec<u8> {
     }
     match super::native_tag(v).as_deref() {
         Some("Blob") | Some("File") | Some("Response") | Some("Request") => return body_bytes(v),
-        Some("TypedArray") | Some("Buffer") => {
-            if let Some(e) = super::typedarray::elems_of(v) {
-                return e.iter().map(|x| *x as u8).collect();
-            }
+        // A byte view or an ArrayBuffer contributes the bytes it VIEWS: a
+        // `Uint16Array` part is two bytes per element (it was its truncated
+        // elements), and an `ArrayBuffer` or `DataView` is its bytes rather
+        // than the text `[object ArrayBuffer]`.
+        Some("TypedArray" | "Buffer" | "DataView" | "ArrayBuffer") => {
+            return super::buffer::view_bytes(v).unwrap_or_default();
         }
         _ => {}
     }
@@ -626,11 +628,23 @@ fn new_blob(bytes: &[u8], content_type: &str, file_name: Option<&str>) -> Value 
     obj
 }
 
+/// One `BlobPart`: a `body_init_bytes` source, except that a `null` part is
+/// the text `"null"` (a null BODY is no body, but a part is stringified, as is `undefined`).
+fn blob_part_bytes(p: &Value) -> Vec<u8> {
+    if matches!(p, Value::Undef) {
+        return b"undefined".to_vec();
+    }
+    if with_host(|h| h.is_null(p)) {
+        return b"null".to_vec();
+    }
+    body_init_bytes(Some(p))
+}
+
 pub fn construct_blob(args: &[Value]) -> Result<Value, String> {
     let mut bytes = Vec::new();
     if let Some(parts) = args.first() {
         for p in crate::host::iter_all(parts).unwrap_or_default() {
-            bytes.extend(body_init_bytes(Some(&p)));
+            bytes.extend(blob_part_bytes(&p));
         }
     }
     let ct = args
@@ -646,7 +660,7 @@ pub fn construct_file(args: &[Value]) -> Result<Value, String> {
     let mut bytes = Vec::new();
     if let Some(parts) = args.first() {
         for p in crate::host::iter_all(parts).unwrap_or_default() {
-            bytes.extend(body_init_bytes(Some(&p)));
+            bytes.extend(blob_part_bytes(&p));
         }
     }
     let name = super::arg_str(args, 1);

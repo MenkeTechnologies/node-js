@@ -49,24 +49,47 @@ pub fn construct(args: &[Value]) -> Result<Value, String> {
     }))
 }
 
-/// The byte content of a Buffer / typed array / array argument.
-fn bytes_of(v: &Value) -> Vec<u8> {
-    with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => {
-            if p.contains_key("@@buffer") {
-                return crate::stdlib::typedarray::elems_with_host(h, v)
-                    .iter()
-                    .map(|x| h.to_number(x) as u8)
-                    .collect();
-            }
-            match p.get("@@bytes").and_then(|a| h.get(a)) {
-                Some(JsObj::Array(items)) => items.iter().map(|x| h.to_number(x) as u8).collect(),
-                _ => Vec::new(),
-            }
+/// One chunk handed to `write`/`end`: a string passes through untouched (it is
+/// already decoded, and the held-back bytes stay held), and a byte view
+/// contributes the bytes it VIEWS — a `Uint16Array` two per element, a
+/// `DataView` its window. Anything else — an array, a number, an
+/// `ArrayBuffer`, nothing at all — is `ERR_INVALID_ARG_TYPE`, as in node.
+enum Chunk {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+fn chunk_of(v: &Value) -> Result<Chunk, String> {
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        return Ok(Chunk::Text(s));
+    }
+    match crate::stdlib::native_tag(v).as_deref() {
+        Some("Buffer" | "TypedArray" | "DataView") => Ok(Chunk::Bytes(
+            crate::stdlib::buffer::view_bytes(v).unwrap_or_default(),
+        )),
+        _ => Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"buf\" argument must be an instance of Buffer, TypedArray, or DataView. Received {}",
+                crate::stdlib::received_desc(v)
+            ),
+        )),
+    }
+}
+
+/// `write(buf)`: the text decoded so far, holding back an incomplete tail.
+fn write_chunk(recv: &Value, enc: &str, v: &Value) -> Result<String, String> {
+    match chunk_of(v)? {
+        Chunk::Text(s) => Ok(s),
+        Chunk::Bytes(bytes) => {
+            let mut buf = pending_of(recv);
+            buf.extend(bytes);
+            let (decoded, tail) = decode(enc, &buf);
+            set_pending(recv, &tail);
+            Ok(decoded)
         }
-        Some(JsObj::Array(items)) => items.iter().map(|x| h.to_number(x) as u8).collect(),
-        _ => Vec::new(),
-    })
+    }
 }
 
 fn encoding_of(recv: &Value) -> String {
@@ -102,21 +125,20 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
     let enc = encoding_of(recv);
     match method {
         "write" => {
-            let mut buf = pending_of(recv);
-            buf.extend(bytes_of(&args.first().cloned().unwrap_or(Value::Undef)));
-            let (decoded, tail) = decode(&enc, &buf);
-            set_pending(recv, &tail);
-            Ok(with_host(|h| h.new_str(decoded)))
+            let s = write_chunk(recv, &enc, &args.first().cloned().unwrap_or(Value::Undef))?;
+            Ok(with_host(|h| h.new_str(s)))
         }
+        // `end([buf])` is `write(buf)` (when given) and then a flush of
+        // whatever is still held back.
         "end" => {
-            let mut buf = pending_of(recv);
-            if let Some(v) = args.first() {
-                buf.extend(bytes_of(v));
-            }
+            let mut out = match args.first() {
+                None | Some(Value::Undef) => String::new(),
+                Some(v) => write_chunk(recv, &enc, v)?,
+            };
+            let tail = pending_of(recv);
             set_pending(recv, &[]);
-            let (mut decoded, tail) = decode(&enc, &buf);
-            decoded.push_str(&flush(&enc, &tail));
-            Ok(with_host(|h| h.new_str(decoded)))
+            out.push_str(&flush(&enc, &tail));
+            Ok(with_host(|h| h.new_str(out)))
         }
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"

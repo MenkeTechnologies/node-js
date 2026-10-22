@@ -452,6 +452,7 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         "buffer" if matches!(name, "Blob" | "File") => {
             Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
         }
+        "buffer" => buffer::module_constant(name),
         "url" if name == "URL" => Some(with_host(|h| h.alloc(JsObj::Builtin("URL".into())))),
         "net" => net::constant(name),
         "tty" => tty::constant(name),
@@ -1207,16 +1208,15 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Decode a hex string to bytes (ignoring a trailing odd nibble, like Node).
+/// Decode a hex string to bytes as node's `StringBytes` does: pair by pair
+/// from the start, STOPPING at the first pair that is not two hex digits, and
+/// dropping a trailing odd nibble. `Buffer.from('12zz34', 'hex')` is the one
+/// byte `12`, not `12 34` — a non-digit is a terminator, never skipped.
 pub(crate) fn from_hex(s: &str) -> Vec<u8> {
-    let digits: Vec<u8> = s
-        .bytes()
-        .filter_map(|c| (c as char).to_digit(16).map(|d| d as u8))
-        .collect();
-    digits
-        .chunks(2)
-        .filter(|c| c.len() == 2)
-        .map(|c| (c[0] << 4) | c[1])
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    s.as_bytes()
+        .chunks_exact(2)
+        .map_while(|p| Some((digit(p[0])? << 4) | digit(p[1])?))
         .collect()
 }
 
@@ -1301,4 +1301,35 @@ pub(crate) fn from_base64(s: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+/// node's `validateInteger(value, name, min)` (`max` is
+/// `Number.MAX_SAFE_INTEGER`): a Number, an integer, and within range — each
+/// failure with node's own code and wording.
+pub(crate) fn validate_integer(v: &Value, name: &str, min: f64) -> Result<f64, String> {
+    if with_host(|h| h.type_of(v)) != "number" {
+        return Err(crate::host::invalid_arg_type(name, "argument", "number", v));
+    }
+    let n = with_host(|h| h.to_number(v));
+    if n.fract() != 0.0 || !n.is_finite() {
+        return Err(out_of_range(name, "an integer", n));
+    }
+    if n < min || n > 9_007_199_254_740_991.0 {
+        let must = format!(">= {} && <= 9007199254740991", crate::host::fmt_number(min));
+        return Err(out_of_range(name, &must, n));
+    }
+    Ok(n)
+}
+
+/// node's `ERR_OUT_OF_RANGE` for a numeric `name`: `It must be <must>.
+/// Received <n>`, the received value rendered as node renders it.
+pub(crate) fn out_of_range(name: &str, must: &str, n: f64) -> String {
+    crate::host::coded_error(
+        "RangeError",
+        "ERR_OUT_OF_RANGE",
+        &format!(
+            "The value of \"{name}\" is out of range. It must be {must}. Received {}",
+            buffer::out_of_range_received(n)
+        ),
+    )
 }

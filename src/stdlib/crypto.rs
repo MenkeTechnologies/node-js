@@ -271,25 +271,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "createDecipheriv" => make_cipher("Decipheriv", args),
         // ── Random fill ─────────────────────────────────────────────────
         "randomFillSync" => random_fill(args),
-        "randomFill" => {
-            let cb = trailing_cb(args);
-            let res = random_fill(args);
-            match (cb, res) {
-                (Some(cb), Ok(buf)) => {
-                    with_host(|h| {
-                        let nullv = h.null();
-                        h.queue_micro(cb, vec![nullv, buf]);
-                    });
-                    Ok(Value::Undef)
-                }
-                (Some(cb), Err(e)) => {
-                    let errv = with_host(|h| h.new_str(e));
-                    with_host(|h| h.queue_micro(cb, vec![errv]));
-                    Ok(Value::Undef)
-                }
-                (None, r) => r,
-            }
-        }
+        // randomFill(buf[, offset[, size]], callback): the callback is the
+        // first function among `offset`/`size`/`callback`, and every argument
+        // error throws SYNCHRONOUSLY — it used to reach the callback as a bare
+        // string, and a callback in the `offset` slot was read as the offset.
+        "randomFill" => random_fill_async(args),
         // ── Constant-time compare ───────────────────────────────────────
         "timingSafeEqual" => {
             let a = val_bytes_at(args, 0);
@@ -1214,44 +1200,122 @@ fn cipher_info(algo: &str) -> Result<Value, String> {
     }))
 }
 
-/// `randomFillSync`/`randomFill` core: fill `buf[offset..offset+size]` with
-/// CSPRNG bytes in place, returning the same Buffer.
+/// `randomFill`: [`random_fill`], then the callback with `(null, buf)`.
+fn random_fill_async(args: &[Value]) -> Result<Value, String> {
+    let buf = args.first().cloned().unwrap_or(Value::Undef);
+    fill_element_size(&buf)?;
+    let callable = |i: usize| {
+        args.get(i)
+            .filter(|v| with_host(|h| is_callable(h, v)))
+            .cloned()
+    };
+    let (cb, n) = match (callable(1), callable(2)) {
+        (Some(cb), _) => (cb, 1),
+        (None, Some(cb)) => (cb, 2),
+        (None, None) => {
+            let cb = args.get(3).cloned().unwrap_or(Value::Undef);
+            if !with_host(|h| is_callable(h, &cb)) {
+                return Err(crate::host::invalid_arg_type(
+                    "callback", "argument", "function", &cb,
+                ));
+            }
+            (cb, 3)
+        }
+    };
+    let filled = random_fill(&args[..n])?;
+    with_host(|h| {
+        let nullv = h.null();
+        h.queue_micro(cb, vec![nullv, filled]);
+    });
+    Ok(Value::Undef)
+}
+
+/// The `BYTES_PER_ELEMENT` `randomFill`'s `offset`/`size` are scaled by — 1 for
+/// a Buffer, `DataView` or `ArrayBuffer` — or `ERR_INVALID_ARG_TYPE` when `buf`
+/// is not a buffer at all.
+fn fill_element_size(buf: &Value) -> Result<usize, String> {
+    match super::native_tag(buf).as_deref() {
+        Some("TypedArray") => Ok(super::util_types::ta_kind(buf)
+            .map(|k| crate::stdlib::typedarray::bytes_per_element(&k))
+            .unwrap_or(1)),
+        Some("Buffer" | "DataView" | "ArrayBuffer") => Ok(1),
+        _ => Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"buf\" argument must be an instance of ArrayBuffer or ArrayBufferView. Received {}",
+                super::received_desc(buf)
+            ),
+        )),
+    }
+}
+
+/// `randomFillSync`/`randomFill` core, a port of `lib/internal/crypto/random.js`:
+/// `buf` is any `ArrayBuffer` or view, and `offset`/`size` count ELEMENTS of
+/// it (scaled by `BYTES_PER_ELEMENT`, so a `Uint32Array`'s `offset` of 1 is
+/// byte 4). The bytes are written through the view, so the memory it aliases
+/// sees them. Only a Buffer was accepted before, and the bounds were clamped
+/// instead of validated.
 fn random_fill(args: &[Value]) -> Result<Value, String> {
     let buf = args.first().cloned().unwrap_or(Value::Undef);
-    if super::native_tag(&buf).as_deref() != Some("Buffer") {
-        return Err("Error: The \"buf\" argument must be a Buffer".into());
+    let elem = fill_element_size(&buf)?;
+    let mut out = super::buffer::view_bytes(&buf).unwrap_or_default();
+    let len = out.len() as f64;
+    // `validateNumber` then the scaled range check, as `assertOffset` /
+    // `assertSize` do; the rejection reports the SCALED value.
+    let scaled = |i: usize, name: &str| -> Result<Option<f64>, String> {
+        match args.get(i) {
+            None | Some(Value::Undef) => Ok(None),
+            Some(v) if with_host(|h| h.type_of(v)) != "number" => {
+                Err(crate::host::invalid_arg_type(name, "argument", "number", v))
+            }
+            Some(v) => Ok(Some(with_host(|h| h.to_number(v)) * elem as f64)),
+        }
+    };
+    let out_of_range = |name: &str, must: String, n: f64| {
+        crate::host::coded_error(
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            &format!(
+                "The value of \"{name}\" is out of range. It must be {must}. Received {}",
+                crate::host::fmt_number(n)
+            ),
+        )
+    };
+    let offset = scaled(1, "offset")?.unwrap_or(0.0);
+    if offset.is_nan() || !(0.0..=len).contains(&offset) {
+        return Err(out_of_range("offset", format!(">= 0 && <= {len}"), offset));
     }
-    let cur = val_bytes(&buf);
-    let len = cur.len();
-    let offset = if args.len() > 1 {
-        super::arg_num(args, 1).max(0.0) as usize
-    } else {
-        0
+    let offset = offset.trunc();
+    let size = match scaled(2, "size")? {
+        None => len - offset,
+        Some(size) => {
+            const MAX_POSSIBLE_LENGTH: f64 = 2_147_483_647.0;
+            if size.is_nan() || !(0.0..=MAX_POSSIBLE_LENGTH).contains(&size) {
+                return Err(out_of_range(
+                    "size",
+                    format!(
+                        ">= 0 && <= {}",
+                        crate::host::fmt_number(MAX_POSSIBLE_LENGTH)
+                    ),
+                    size,
+                ));
+            }
+            if size + offset > len {
+                return Err(out_of_range(
+                    "size + offset",
+                    format!("<= {len}"),
+                    size + offset,
+                ));
+            }
+            size.trunc()
+        }
     };
-    let offset = offset.min(len);
-    let size = if args.len() > 2 {
-        super::arg_num(args, 2).max(0.0) as usize
-    } else {
-        len - offset
-    };
-    let end = (offset + size).min(len);
-    let mut rnd = vec![0u8; end.saturating_sub(offset)];
-    if let Err(e) = getrandom::getrandom(&mut rnd) {
+    let (start, end) = (offset as usize, (offset + size) as usize);
+    if let Err(e) = getrandom::getrandom(&mut out[start..end]) {
         return Err(format!("Error: failed to generate random bytes: {e}"));
     }
-    let mut out = cur;
-    out[offset..end].copy_from_slice(&rnd);
-    with_host(|h| {
-        let arr = match h.get(&buf) {
-            Some(JsObj::Object(p)) => p.get("@@bytes").cloned(),
-            _ => None,
-        };
-        if let Some(a) = arr {
-            if let Some(JsObj::Array(items)) = h.get_mut(&a) {
-                *items = out.iter().map(|b| Value::Float(*b as f64)).collect();
-            }
-        }
-    });
+    super::buffer::write_view(&buf, &out);
     Ok(buf)
 }
 

@@ -1029,6 +1029,30 @@ raw      1 true
 chain    true
 removeAll 0
 subclass 1 true
+==== fdread.js ====
+u16        4 Uint16Array(3) [ 16640, 17218, 68 ]
+dataView   4 43444546
+arrayBuf   TypeError ERR_INVALID_ARG_TYPE The "buffer" argument must be an instance of Buffer, TypedArray, or DataView. Received an instance of ArrayBuffer
+tooLong    RangeError ERR_OUT_OF_RANGE The value of "length" is out of range. It must be <= 2. Received 4
+offsetPast RangeError ERR_OUT_OF_RANGE The value of "length" is out of range. It must be <= -1. Received 1
+empty      TypeError ERR_INVALID_ARG_VALUE The argument 'buffer' is empty and cannot be written. Received <Buffer >
+emptyZero  0
+offsetStr  TypeError ERR_INVALID_ARG_TYPE The "offset" argument must be of type number. Received type string ('1')
+offsetFrac RangeError ERR_OUT_OF_RANGE The value of "offset" is out of range. It must be an integer. Received 1.5
+lengthNeg  RangeError ERR_OUT_OF_RANGE The value of "length" is out of range. It must be >= 0. Received -1
+posNeg     RangeError ERR_OUT_OF_RANGE The value of "position" is out of range. It must be >= -1 && <= 9007199254740991. Received -2
+posStr     TypeError ERR_INVALID_ARG_TYPE The "position" argument must be of type bigint or integer. Received type string ('3')
+optsNum    TypeError ERR_INVALID_ARG_TYPE The "options" argument must be of type object. Received type number (0)
+pread      EF AB
+optsPos    4 EFGH
+optsAll    2 <Buffer 00 41 42 00>
+optsLenStr 1 <Buffer 48 00>
+readv      5 [ <Buffer 41 42>, Uint8Array(3) [ 67, 68, 69 ] ]
+readNoCb   TypeError ERR_INVALID_ARG_TYPE The "cb" argument must be of type function. Received undefined
+readAB     TypeError ERR_INVALID_ARG_TYPE The "buffer" argument must be an instance of Buffer, TypedArray, or DataView. Received an instance of ArrayBuffer
+read       null 4 Uint16Array(2) [ 16961, 17475 ]
+readParams null 3 FGH
+readOpts   null 2 GH
 ==== fib.js ====
 fib: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
 1 2 3
@@ -2906,6 +2930,68 @@ args     [object Arguments]|false|true|undefined|undefined
 usable   2|7|7,8|7,8|7,8|0,1
 iterate  9 false false
 custom   symbol true Symbol(nodejs.util.promisify.custom)
+==== viewbytes.js ====
+hash       "cb08ca4a7bb5f9683c19133a84872ca7"
+hmacKey    "8c6501c84f596e76b9c0dae8119750968cd01d78"
+isAscii    [false,true]
+isUtf8     true
+isUtf8Str  TypeError ERR_INVALID_ARG_TYPE The "input" argument must be an instance of ArrayBuffer, Buffer, or TypedArray. Received type string ('a')
+isAsciiDV  TypeError ERR_INVALID_ARG_TYPE The "input" argument must be an instance of ArrayBuffer, Buffer, or TypedArray. Received an instance of DataView
+isLatin1   [true,false]
+isLatin1Bf TypeError ERR_INVALID_ARG_TYPE The "input" argument must be of type string. Received an instance of Buffer
+decode16   "ABCD"
+decodeAB   "ABC"
+decodeDV   "BC"
+decodeStr  TypeError ERR_INVALID_ARG_TYPE The "list" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView.
+utf16le    "AB"
+stream     ["","€"]
+streamBOM  ["a","﻿"]
+encodeInto [{"read":3,"written":5},[97,226,130,172,98]]
+intoShort  {"read":0,"written":0}
+intoU16    TypeError ERR_INVALID_ARG_TYPE The "dest" argument must be an instance of Uint8Array. Received an instance of Uint16Array
+intoSrc    TypeError ERR_INVALID_ARG_TYPE The "src" argument must be of type string. Received type number (5)
+encodeNone [0,0,4]
+blob       23
+decoder    "ABCD"
+decoderHex "4142"
+decoderArr TypeError ERR_INVALID_ARG_TYPE The "buf" argument must be an instance of Buffer, TypedArray, or DataView. Received an instance of Array
+decoderEnd ["","xy�"]
+set16      "41070000"
+setArray   "41070102"
+setRange   RangeError undefined offset is out of bounds
+equals16   TypeError ERR_INVALID_ARG_TYPE The "otherBuffer" argument must be an instance of Buffer or Uint8Array. Received an instance of Uint16Array
+indexOf16  TypeError ERR_INVALID_ARG_TYPE The "value" argument must be one of type number or string or an instance of Buffer or Uint8Array. Received an instance of Uint16Array
+indexOfArr TypeError ERR_INVALID_ARG_TYPE The "value" argument must be one of type number or string or an instance of Buffer or Uint8Array. Received an instance of Array
+indexOfNum [0,0]
+copyFrom   ["ABCD","CD","AB"]
+copyFromAB TypeError ERR_INVALID_ARG_TYPE The "view" argument must be an instance of TypedArray. Received an instance of ArrayBuffer
+copyOffset RangeError ERR_OUT_OF_RANGE The value of "offset" is out of range. It must be an integer. Received 1.5
+compare    [0,1,1,1,-1]
+compareEnd RangeError ERR_OUT_OF_RANGE The value of "targetEnd" is out of range. It must be >= 0 && <= 5. Received 9
+compareTyp TypeError ERR_INVALID_ARG_TYPE The "targetStart" argument must be of type number. Received type string ('1')
+compareStr TypeError ERR_INVALID_ARG_TYPE The "target" argument must be an instance of Buffer or Uint8Array. Received type string ('x')
+compareSt  TypeError ERR_INVALID_ARG_TYPE The "buf2" argument must be an instance of Buffer or Uint8Array. Received type number (5)
+hex        ["","12","12","abcd"]
+btoa       InvalidCharacterError 5 Invalid character
+btoaToStr  ["dW5kZWZpbmVk","YWI="]
+btoaNone   TypeError ERR_MISSING_ARGS The "input" argument must be specified
+atob "aGk" "hi"
+atob "aG k=\n" "hi"
+atob "a" InvalidCharacterError 5 The string to be decoded is not correctly encoded.
+atob "a=" InvalidCharacterError 5 The string to be decoded is not correctly encoded.
+atob "ab=" InvalidCharacterError 5 Invalid character
+atob "abcde=" InvalidCharacterError 5 The string to be decoded is not correctly encoded.
+atob "abcd=" InvalidCharacterError 5 Invalid character
+atob "a!b=" InvalidCharacterError 5 Invalid character
+atob "YR==" "a"
+constants  [9007199254740991,536870888,{"MAX_LENGTH":9007199254740991,"MAX_STRING_LENGTH":536870888},50]
+fill32     [0,0]
+fillAB     [0,0,0,0]
+fillRange  RangeError ERR_OUT_OF_RANGE The value of "offset" is out of range. It must be >= 0 && <= 16. Received 20
+fillSize   RangeError ERR_OUT_OF_RANGE The value of "size + offset" is out of range. It must be <= 16. Received 20
+fillStr    TypeError ERR_INVALID_ARG_TYPE The "buf" argument must be an instance of ArrayBuffer or ArrayBufferView. Received type string ('x')
+fillCb     TypeError ERR_INVALID_ARG_TYPE The "callback" argument must be of type function. Received undefined
+fillAsync  null Uint16Array 2
 ==== wordcount.js ====
 the: 3
 fox: 2

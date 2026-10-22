@@ -266,7 +266,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // ── fd, async ──
         "open" => async_cb(args, open_impl(args)),
         "close" => async_cb(args, close_impl(args)),
-        "read" => return Some(read_write_async(args, read_impl(args))),
+        "read" => read_async(args),
         "write" => return Some(read_write_async(args, write_impl(args))),
         "readv" => async_cb(args, readv_impl(args).map(|n| Value::Float(n as f64))),
         "writev" => async_cb(args, writev_impl(args).map(|n| Value::Float(n as f64))),
@@ -879,38 +879,251 @@ fn close_impl(args: &[Value]) -> Result<Value, String> {
     }
 }
 
+/// `fs.readSync(fd, buffer[, offset[, length[, position]]])` and its options
+/// form, a port of `lib/fs.js`. Validation errors are the OUTER error (they
+/// throw, even from the callback form); the read's own failure is the inner.
 fn read_impl(args: &[Value]) -> Result<usize, String> {
-    let fd = arg_num(args, 0) as i32;
     let buffer = args.get(1).cloned().unwrap_or(Value::Undef);
-    let cap = buf_len(&buffer);
-    let offset = num_or(args, 2, 0.0) as usize;
-    let length = num_or(args, 3, (cap.saturating_sub(offset)) as f64) as usize;
-    let position = position_arg(args, 4);
-    // Descriptor 0 is standard input, which `openSync` never registers: a
-    // `readSync(0, buf)` loop is how a script reads its input in pieces.
-    if fd == 0 {
-        let mut buf = vec![0u8; length];
-        return match std::io::stdin().lock().read(&mut buf) {
-            Ok(n) => Ok(write_into_buffer(&buffer, offset, &buf[..n])),
-            Err(e) => Err(err_str("read", "", &e)),
-        };
-    }
-    let n = with_file(fd, |file| {
-        let mut fr: &File = file;
-        if let Some(pos) = position {
-            fr.seek(SeekFrom::Start(pos)).ok();
+    let third = args.get(2).cloned().unwrap_or(Value::Undef);
+    let req = if args.len() <= 3 || with_host(|h| h.type_of(&third)) == "object" {
+        read_options(&buffer, &third)?
+    } else {
+        ReadArgs {
+            offset: third,
+            length: args.get(3).cloned().unwrap_or(Value::Undef),
+            position: args.get(4).cloned().unwrap_or(Value::Undef),
         }
-        let mut buf = vec![0u8; length];
-        fr.read(&mut buf).map(|n| {
-            buf.truncate(n);
-            buf
-        })
-    });
-    match n {
-        Some(Ok(data)) => Ok(write_into_buffer(&buffer, offset, &data)),
-        Some(Err(e)) => Err(err_str("read", "", &e)),
-        None => Err("Error: EBADF: bad file descriptor, read".to_string()),
+    };
+    read_validated(arg_num(args, 0) as i32, &buffer, &req)?
+}
+
+/// The three operands of a read, before validation.
+struct ReadArgs {
+    offset: Value,
+    length: Value,
+    position: Value,
+}
+
+/// The `{offset = 0, length = buffer.byteLength - offset, position = null}`
+/// destructuring of a read's options object (`null`/`undefined` mean `{}`).
+fn read_options(buffer: &Value, opts: &Value) -> Result<ReadArgs, String> {
+    let nullish = matches!(opts, Value::Undef) || with_host(|h| h.is_null(opts));
+    if !nullish && with_host(|h| h.type_of(opts)) != "object" {
+        return Err(crate::host::invalid_arg_type(
+            "options", "argument", "object", opts,
+        ));
     }
+    let field = |k: &str| -> Result<Value, String> {
+        if nullish {
+            Ok(Value::Undef)
+        } else {
+            crate::builtins::get_property(opts, k)
+        }
+    };
+    let offset = match field("offset")? {
+        Value::Undef => Value::Float(0.0),
+        v => v,
+    };
+    let length = match field("length")? {
+        Value::Undef => {
+            let len = super::buffer::view_bytes(buffer).map_or(0, |b| b.len()) as f64;
+            Value::Float(len - with_host(|h| h.to_number(&offset)))
+        }
+        v => v,
+    };
+    let position = field("position")?;
+    Ok(ReadArgs {
+        offset,
+        length,
+        position,
+    })
+}
+
+/// Validate a read's operands as `readSync` does, then read. The outer error
+/// is a validation failure; the inner one the read itself. The bytes land at
+/// `offset` BYTES into whatever view `buffer` is — a `Uint16Array` or a
+/// `DataView` receives them exactly as a Buffer does — and a `position` reads
+/// with `pread`, leaving the descriptor's own offset where it was.
+fn read_validated(
+    fd: i32,
+    buffer: &Value,
+    req: &ReadArgs,
+) -> Result<Result<usize, String>, String> {
+    validate_read_buffer(buffer)?;
+    let offset = match req.offset {
+        Value::Undef => 0.0,
+        ref v => super::validate_integer(v, "offset", 0.0)?,
+    };
+    let length = crate::host::to_number_value(&req.length)?;
+    let length = crate::host::to_int32(length) as f64;
+    if length == 0.0 {
+        return Ok(Ok(0));
+    }
+    let mut bytes = super::buffer::view_bytes(buffer).unwrap_or_default();
+    if bytes.is_empty() {
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_VALUE",
+            &format!(
+                "The argument 'buffer' is empty and cannot be written. Received {}",
+                with_host(|h| h.inspect(buffer))
+            ),
+        ));
+    }
+    if length < 0.0 {
+        return Err(super::out_of_range("length", ">= 0", length));
+    }
+    let cap = bytes.len() as f64;
+    if offset + length > cap {
+        return Err(super::out_of_range(
+            "length",
+            &format!("<= {}", cap - offset),
+            length,
+        ));
+    }
+    let position = read_position(&req.position, length)?;
+    let (offset, length) = (offset as usize, length as usize);
+    let dest = &mut bytes[offset..offset + length];
+    let got = if fd == 0 && position.is_none() {
+        std::io::stdin().lock().read(dest)
+    } else {
+        use std::os::unix::fs::FileExt;
+        match with_file(fd, |file| match position {
+            Some(pos) => file.read_at(dest, pos),
+            None => {
+                let mut fr: &File = file;
+                fr.read(dest)
+            }
+        }) {
+            Some(r) => r,
+            None => return Ok(Err("Error: EBADF: bad file descriptor, read".to_string())),
+        }
+    };
+    Ok(match got {
+        Ok(n) => {
+            super::buffer::write_view(buffer, &bytes);
+            Ok(n)
+        }
+        Err(e) => Err(err_str("read", "", &e)),
+    })
+}
+
+/// node's `validatePosition`: `null`/`undefined`/`-1` read from the current
+/// offset; otherwise an integer or a bigint at least `-1`.
+fn read_position(v: &Value, length: f64) -> Result<Option<u64>, String> {
+    if matches!(v, Value::Undef) || with_host(|h| h.is_null(v)) {
+        return Ok(None);
+    }
+    let pos = match with_host(|h| h.type_of(v)) {
+        "number" => super::validate_integer(v, "position", -1.0)?,
+        "bigint" => {
+            let p: i128 = with_host(|h| h.str_of(v)).parse().unwrap_or(-2);
+            let max = i64::MAX as i128 - length as i128;
+            if !(-1..=max).contains(&p) {
+                return Err(crate::host::coded_error(
+                    "RangeError",
+                    "ERR_OUT_OF_RANGE",
+                    &format!(
+                        "The value of \"position\" is out of range. It must be >= -1n && <= {max}n. Received {p}n"
+                    ),
+                ));
+            }
+            p as f64
+        }
+        _ => {
+            return Err(crate::host::invalid_arg_type(
+                "position",
+                "argument",
+                "bigint or integer",
+                v,
+            ))
+        }
+    };
+    Ok((pos >= 0.0).then_some(pos as u64))
+}
+
+/// `validateBuffer`: a read's destination must be a Buffer, typed array or
+/// `DataView` — an `ArrayBuffer` is not a view.
+fn validate_read_buffer(buffer: &Value) -> Result<(), String> {
+    if matches!(
+        native_tag(buffer).as_deref(),
+        Some("Buffer" | "TypedArray" | "DataView")
+    ) {
+        return Ok(());
+    }
+    Err(crate::host::coded_error(
+        "TypeError",
+        "ERR_INVALID_ARG_TYPE",
+        &format!(
+            "The \"buffer\" argument must be an instance of Buffer, TypedArray, or DataView. Received {}",
+            super::received_desc(buffer)
+        ),
+    ))
+}
+
+/// `fs.read`, whose callback is `(err, bytesRead, buffer)`. The argument forms
+/// are `lib/fs.js`'s, counted with the descriptor: `(fd, cb)` reads into a fresh
+/// 16 KiB Buffer, `(fd, bufferOrOptions, cb)`, `(fd, buffer, options, cb)`, and
+/// the positional `(fd, buffer, offset, length, position, cb)`. A bad argument
+/// throws here, synchronously; only the read's own failure reaches `cb`.
+fn read_async(args: &[Value]) -> Result<Value, String> {
+    let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Undef);
+    let fresh = || super::buffer::from_bytes(&[0u8; 16384]);
+    let (buffer, req, cb) = match args.len() {
+        0..=2 => {
+            let buffer = fresh();
+            let req = read_options(&buffer, &Value::Undef)?;
+            (buffer, req, arg(1))
+        }
+        3 if !matches!(
+            native_tag(&arg(1)).as_deref(),
+            Some("Buffer" | "TypedArray" | "DataView")
+        ) =>
+        {
+            let params = arg(1);
+            let nullish = matches!(params, Value::Undef) || with_host(|h| h.is_null(&params));
+            let buffer = match nullish {
+                true => Value::Undef,
+                false => crate::builtins::get_property(&params, "buffer")?,
+            };
+            let buffer = if matches!(buffer, Value::Undef) {
+                fresh()
+            } else {
+                buffer
+            };
+            let req = read_options(&buffer, &params)?;
+            (buffer, req, arg(2))
+        }
+        3 => (arg(1), read_options(&arg(1), &Value::Undef)?, arg(2)),
+        4 => (arg(1), read_options(&arg(1), &arg(2))?, arg(3)),
+        _ => (
+            arg(1),
+            ReadArgs {
+                offset: arg(2),
+                length: arg(3),
+                position: arg(4),
+            },
+            arg(5),
+        ),
+    };
+    validate_read_buffer(&buffer)?;
+    if !is_fn(&cb) {
+        return Err(crate::host::invalid_arg_type(
+            "cb", "argument", "function", &cb,
+        ));
+    }
+    let result = read_validated(arg_num(args, 0) as i32, &buffer, &req)?;
+    with_host(|h| match result {
+        Ok(n) => {
+            let nul = h.null();
+            h.queue_micro(cb, vec![nul, Value::Float(n as f64), buffer]);
+        }
+        Err(e) => {
+            let ev = crate::builtins::synth_error(h, &e);
+            h.queue_micro(cb, vec![ev]);
+        }
+    });
+    Ok(Value::Undef)
 }
 
 fn write_impl(args: &[Value]) -> Result<usize, String> {
@@ -949,35 +1162,41 @@ fn write_impl(args: &[Value]) -> Result<usize, String> {
     }
 }
 
+/// `fs.readvSync(fd, buffers[, position])`: fill each view in turn, stopping at
+/// end of file. Any byte view takes part (a `Uint8Array` used to be skipped as
+/// zero-capacity), and a numeric `position` reads with `pread`, leaving the
+/// descriptor's offset where it was.
 fn readv_impl(args: &[Value]) -> Result<usize, String> {
+    use std::os::unix::fs::FileExt;
     let fd = arg_num(args, 0) as i32;
     let buffers = array_items(args.get(1));
-    let position = position_arg(args, 2);
-    let total = with_file(fd, |file| {
-        let mut fr: &File = file;
-        if let Some(pos) = position {
-            fr.seek(SeekFrom::Start(pos)).ok();
-        }
-        let mut chunks: Vec<(Value, Vec<u8>)> = Vec::new();
-        for b in &buffers {
-            let cap = buf_len(b);
-            let mut buf = vec![0u8; cap];
-            match fr.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf.truncate(n);
-                    chunks.push((b.clone(), buf));
-                }
-                Err(e) => return Err(e),
+    let mut position = position_arg(args, 2);
+    let mut total = 0;
+    for b in &buffers {
+        let mut bytes = super::buffer::view_bytes(b).unwrap_or_default();
+        let got = with_file(fd, |file| match position {
+            Some(pos) => file.read_at(&mut bytes, pos),
+            None => {
+                let mut fr: &File = file;
+                fr.read(&mut bytes)
             }
+        });
+        let n = match got {
+            Some(Ok(n)) => n,
+            Some(Err(e)) => return Err(err_str("readv", "", &e)),
+            None => return Err("Error: EBADF: bad file descriptor, readv".to_string()),
+        };
+        if n == 0 {
+            break;
         }
-        Ok(chunks)
-    });
-    match total {
-        Some(Ok(chunks)) => Ok(chunks.iter().map(|(b, d)| write_into_buffer(b, 0, d)).sum()),
-        Some(Err(e)) => Err(err_str("readv", "", &e)),
-        None => Err("Error: EBADF: bad file descriptor, readv".to_string()),
+        super::buffer::write_view(b, &bytes);
+        total += n;
+        position = position.map(|p| p + n as u64);
+        if n < bytes.len() {
+            break;
+        }
     }
+    Ok(total)
 }
 
 fn writev_impl(args: &[Value]) -> Result<usize, String> {
@@ -1842,40 +2061,6 @@ fn buf_bytes(v: &Value) -> Vec<u8> {
             _ => Vec::new(),
         },
         _ => Vec::new(),
-    })
-}
-
-fn buf_len(v: &Value) -> usize {
-    with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
-            Some(JsObj::Array(items)) => items.len(),
-            _ => 0,
-        },
-        _ => 0,
-    })
-}
-
-/// Write `data` into a Buffer's backing byte array at `offset`; returns the count
-/// actually written (bounded by the buffer capacity).
-fn write_into_buffer(buf: &Value, offset: usize, data: &[u8]) -> usize {
-    let Some(arr) = get_prop(buf, "@@bytes") else {
-        return 0;
-    };
-    with_host(|h| {
-        if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
-            let mut n = 0;
-            for (i, b) in data.iter().enumerate() {
-                let idx = offset + i;
-                if idx >= items.len() {
-                    break;
-                }
-                items[idx] = Value::Float(*b as f64);
-                n += 1;
-            }
-            n
-        } else {
-            0
-        }
     })
 }
 

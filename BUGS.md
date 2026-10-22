@@ -665,10 +665,14 @@ own brand. A Buffer inherits the typed-array methods it does not implement
 itself (`every`/`some`/`map`/`filter`/`find*`/`reduce*`/`forEach`/`sort`/
 `reverse`/`copyWithin`/`join`/`at`/`lastIndexOf`), and a derivation keeps the
 receiver's type: `buf.map(f)` is a Buffer, `int32.map(f)` an `Int32Array`.
-Anything that accepts a Buffer accepts any typed array — `Buffer.from`,
-`buf.equals` and `buf.indexOf` share one byte-source helper (`Buffer.concat`
-takes only Buffers and Uint8Arrays, as node's `isUint8Array` check does),
-and `Buffer.byteLength` reports the VIEW size (12 for three `Int32Array`
+A byte-taking API reads any typed array as the BYTES it views
+(`buffer::view_bytes`), never as its truncated elements: a
+`Uint16Array([0x4241])` hashes, decodes, compresses and writes as `41 42`.
+`Buffer.from` takes any array-like by element, as node does. The operands
+node checks with `isUint8Array` — `Buffer.concat`, `Buffer.compare`,
+`buf.compare`, `buf.equals`, a non-number non-string `buf.indexOf` needle —
+take only Buffers and Uint8Arrays and reject anything else with
+`ERR_INVALID_ARG_TYPE`, and `Buffer.byteLength` reports the VIEW size (12 for three `Int32Array`
 elements, not 3). A typed array sorts numerically, unlike `Array`.
 
 Two divergences remain:
@@ -2990,3 +2994,55 @@ Measured at node-js 0.1.14 against node v26.11.1.
 | an uncaught `throw new TypeError("x")`, `throw new RangeError("r")` (file or `-e`) | `TypeError: x` / `RangeError: r` in the format above | `node: Uncaught Error: x` / `node: Uncaught Error: r` — the subclass name is lost as well (a caught one reports `e.name` `TypeError` correctly) |
 | `throw 5` | the source header, `5`, then the one-line `--trace-uncaught` hint and `Node.js v26.11.1` | `node: Uncaught 5` |
 | `node --lsp`, `didOpen` of `let a = 1;\nlet b = 2;\nlet c = ;\n` | — (the diagnostic belongs on line 3) | `publishDiagnostics` puts `SyntaxError: Unexpected token ';'` on LSP line 0 (editor line 1) — every syntax error lands there. `compute_diagnostics` (`src/lsp.rs`) reads the line from a `(line N)` suffix that the parser's V8-worded messages no longer carry, and `parse_error_line` defaults to 1 |
+
+## FIXED in round 17 — byte views, verified against node v26.12.0
+
+Each row is pinned in `examples/viewbytes.js` or `examples/fdread.js`.
+
+| Case | node | was |
+|---|---|---|
+| `hash.update(u16)`, `createHmac(alg, u16)`, `zlib.gzipSync(u16)`, `fs.writeFileSync(p, u16)`, `TextDecoder.decode(u16)` with `u16 = new Uint16Array([0x4241])` | the bytes `41 42` | the one byte `41`: `buffer::view_bytes` read a typed array's ELEMENTS truncated to a byte |
+| `new TextDecoder().decode(arrayBuffer)`, `.decode(dataView)` | the bytes | `""` |
+| `td.decode('abc')`, `.decode(null)` | `ERR_INVALID_ARG_TYPE` | `""` |
+| `td.decode(new Uint8Array([0xe2, 0x82]), {stream: true})` then `td.decode(new Uint8Array([0xac]))` | `""` then `"€"` | two U+FFFD — `stream` was ignored; the BOM is now stripped only at the start of a stream |
+| `new TextEncoder().encodeInto(src, dest)` | `{read, written}`, whole characters only | `encodeInto is not a function` |
+| `new TextEncoder().encode()`, `.encode(undefined)` | an empty array | the 9 bytes of `"undefined"` |
+| `new Blob([u16, arrayBuffer, dataView, 5, null, undefined])` | each part's viewed bytes; `null`/`undefined` stringified | elements truncated, an `ArrayBuffer` as `[object ArrayBuffer]`, `null` empty |
+| `buffer.isAscii('a')`, `isUtf8(5)`, `isAscii(dataView)` | `ERR_INVALID_ARG_TYPE` | answered `true` |
+| `buffer.isLatin1(str)` | whether every code unit is below `0x100` (it takes a STRING) | absent |
+| `buffer.kMaxLength`, `kStringMaxLength`, `constants`, `INSPECT_MAX_BYTES` | `2**53-1`, `536870888`, `{MAX_LENGTH, MAX_STRING_LENGTH}`, `50` | `undefined` |
+| `btoa('€')` | `InvalidCharacterError: Invalid character` | `"rA=="` (the low byte) |
+| `btoa()`, `atob()` / `btoa({toString})` | `ERR_MISSING_ARGS` / the `toString` result | encoded `"undefined"` / `"[object Object]"` |
+| `atob('a')`, `atob('ab=')`, `atob('a!b=')`, `atob('abcd=')` | WHATWG forgiving-base64: "not correctly encoded" / "Invalid character" | decoded leniently |
+| `Buffer.from('12zz34', 'hex')` | `<Buffer 12>` — decoding stops at the first non-hex pair | `<Buffer 12 34>` (skipped the bad digits) |
+| `buf.compare(target, tStart, tEnd, sStart, sEnd)` | compares the two ranges, each bound `validateOffset`ed | ignored every bound |
+| `Buffer.compare('x', b)`, `buf.compare('x')` | `ERR_INVALID_ARG_TYPE` naming `buf1`/`target` | compared against nothing |
+| `buf.set([1, 2])`, `buf.set(new Uint8Array([3]), 2)`, `buf.set(u16)` | element-wise copy, `ToUint8` per element | wrote nothing unless the source was a Buffer |
+| `buf.equals(u16)`, `buf.indexOf(u16)`, `buf.indexOf([97])`, `buf.indexOf(null)` | `ERR_INVALID_ARG_TYPE` | `false` / searched |
+| `Buffer.from('abab').indexOf(353)` | `0` (the needle is `353 >>> 0 & 0xff`) | `-1` (Rust's saturating `as u8` made it 255) |
+| `Buffer.copyBytesFrom(view[, offset[, length]])` | a copy of the elements' bytes | absent |
+| `crypto.randomFillSync(new Uint32Array(4), 1, 2)`, `(arrayBuffer)`, `(dataView)` | fills elements 1..3 (offset/size scaled by `BYTES_PER_ELEMENT`) | `Error: The "buf" argument must be a Buffer` |
+| `randomFillSync(buf, 5)` / `(buf, 1, 4)` on a 4-element view | `ERR_OUT_OF_RANGE` for `offset` / `size + offset` | clamped silently |
+| `crypto.randomFill(view, cb)` | `cb(null, view)` | the callback was read as the offset, and argument errors went to `cb` as a bare string instead of throwing |
+| `fs.readSync(fd, u16, 1, 4, 0)`, into a `DataView` | the bytes land `offset` BYTES into the view | read 0 bytes |
+| `fs.readSync(fd, buf, {offset, length, position})` | the options are honoured (`length` through `| 0`) | ignored — the object was read as an offset |
+| `fs.readSync(fd, buf, 0, 2, 4)` then a position-less read | the second read starts where the descriptor was: a positioned read is `pread` | the descriptor had been `seek`ed |
+| `readSync` with a bad `buffer`/`offset`/`length`/`position` or an empty buffer | node's `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE` / `ERR_INVALID_ARG_VALUE` | clamped or read 0 |
+| `fs.readvSync(fd, [buf, new Uint8Array(3)])` | fills both views | skipped every non-Buffer view |
+| `fs.read(fd, buf, 0, 2, 0)` with no callback, `fs.read(fd, arrayBuffer, …, cb)` | throws `ERR_INVALID_ARG_TYPE` synchronously | returned `undefined` / handed `cb` the error |
+| `fs.read(fd, {buffer, position}, cb)`, `fs.read(fd, buf, {position}, cb)` | the params / options forms | positional only |
+| `new StringDecoder().write(u16)`, `.write(dataView)` | the viewed bytes | elements truncated / `""` |
+| `decoder.write([65])`, `.write(5)`, `.write()` | `ERR_INVALID_ARG_TYPE` | decoded |
+| `decoder.end('xy')` after a held-back byte | `'xy'` then the flushed `U+FFFD` — a string chunk passes through untouched | the string's bytes were decoded after the held byte |
+
+The two `examples/protolistings.js` / `examples/protomembers.js` lines that
+count `Date.prototype` keep their v26.11.1 transcript: node v26.12.0 adds
+`toTemporalInstant` (see the `Temporal` entry above), which node-js does not
+have; re-blessing them would record a divergence as a target.
+
+### Still open — found in round 17, not fixed
+
+| Case | node | node-js |
+|---|---|---|
+| `require('fs/promises').open(p)` / `fs.promises.open` | a `FileHandle` (`read`, `write`, `readFile`, `stat`, `close`, …) | `open is not a function` — there is no `FileHandle` class; every other `fs/promises` member delegates to its sync twin |
+| `fs.readSync(fd, big.subarray(2), 0, 2, 0)` | the bytes appear in `big` | they land in the subarray only — the documented no-aliasing Buffer model above, reached through a write-into-view API |
