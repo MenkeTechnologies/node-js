@@ -12,6 +12,9 @@ c.on('close', (code) => { log.push(`close ${code}`); console.log(log.join(' | ')
 c.stdout.on('data', (d) => log.push('data ' + JSON.stringify(String(d))));
 const p = util.promisify(cp.exec)('echo z');
 console.log(typeof p.child, p.child && typeof p.child.pid);
-p.then((r) => console.log('prom', JSON.stringify(r)));
+// Two children finish in whichever order the OS runs them, so the promised
+// result is printed only after the first child has closed.
+const closed = new Promise((r) => c.on('close', r));
+Promise.all([p, closed]).then(([r]) => console.log('prom', JSON.stringify(r)));
 const c2 = cp.exec('true'); console.log('nocb', typeof c2.pid);
 console.log(new (require('net').Socket)() instanceof require('events'), require('net').createServer() instanceof require('events'));
