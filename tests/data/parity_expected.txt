@@ -727,6 +727,23 @@ total 12
 negative zero positive
 caught: failure
 done
+==== coremodulearity.js ====
+fs               readFileSync/2 writeFile/4 open/4 createReadStream/2 existsSync/1 readSync/5
+path             join/0 resolve/0 relative/2 parse/1
+util             format/0 inspect/2 promisify/1 inherits/2 deprecate/3 isDeepStrictEqual/3 parseArgs/0
+events           once/2 getEventListeners/2
+os               platform/0 cpus/0 userInfo/1
+crypto           createHash/2 randomBytes/2 pbkdf2Sync/5
+child_process    spawn/3 exec/3 execFileSync/3
+url              fileURLToPath/1 urlFormat/2 urlParse/3
+querystring      parse/4 stringify/4 qsEscape/1
+zlib             syncBufferWrapper/2 asyncBufferWrapper/3
+buffer           isUtf8/1 atob/1
+fs/promises      readFile/2 open/3 mkdtemp/2
+timers/promises  setTimeout/2
+stream           pipeline/0 eos/3
+own keys         true,true
+bound            1
 ==== cryptostate.js ====
 update-num   THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (5)"]
 update-null  THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received null"]
@@ -1043,6 +1060,12 @@ raw      1 true
 chain    true
 removeAll 0
 subclass 1 true
+==== existsdeprecation.js ====
+nul     false
+object  false
+number  false
+sync    logged before the warning
+warning DeprecationWarning DEP0187 Passing invalid argument types to fs.existsSync is deprecated
 ==== fdargs.js ====
 pwrite   ZWUdXYQV
 fd str   TypeError ERR_INVALID_ARG_TYPE undefined true The "fd" argument must be of type number. Received type string ('x')
@@ -1216,6 +1239,15 @@ cb-b64   null "aGVsbG8="
 cb-buf   null true
 prom-hex "68656c6c6f"
 cleanup  false
+==== finallythrow.js ====
+sync      true
+builtin   SyntaxError true
+callback  true
+rethrown  true
+return    r
+generator G gm
+await     RangeError ERR_OUT_OF_RANGE
+async     H hm
 ==== forin.js ====
 deleted  x,y
 proto    a
@@ -1306,6 +1338,8 @@ stat-dates    [true,true,true,true]
 stat-methods  [true,false,false,2]
 stat-dir      [false,true]
 roundtrip     ["abc!",false]
+==== fspromiseorder.js ====
+tick micro micro2 | await readFile stat ENOENT
 ==== generators.js ====
 range [ 2, 3, 4, 5, 6 ]
 fib [ 0, 1, 1, 2, 3, 5 ]
@@ -2208,6 +2242,17 @@ hrtime   true 2 bigint
 cpu      number number
 uptime   number true
 os       true number
+==== promisifycustom.js ====
+true true true true true
+true true true
+exists 1 setTimeout exec execFile true
+true true false undefined undefined
+true true
+exists true false
+st v
+exec {"stdout":"hi\n","stderr":""}
+execerr 3 "out\n" "err\n"
+execFile {"stdout":"x\n","stderr":""}
 ==== properties.js ====
 order    1,2,b,a,01
 reflect  6
@@ -2539,6 +2584,21 @@ arity     1 rawJSON 1
 argc      3
 escapes   "\u0041"
 drop      {"a":{},"b":3}
+==== readstreamwindow.js ====
+all   ["abcdefghijklmnopqrstuvwxyz"] 26
+start ["defghijklmnopqrstuvwxyz"] 23
+end   ["abcde"] 5
+both  ["cdef"] 4
+hwm   ["abcdefghij","klmnopqrst","uvwxyz"] 26
+hwm+e ["bcde","fghi","j"] 9
+neg   ERR_OUT_OF_RANGE The value of "start" is out of range. It must be >= 0 && <= 9007199254740991. Received -1
+str   ERR_INVALID_ARG_TYPE The "start" argument must be of type number. Received type string ('x')
+s>e   ERR_OUT_OF_RANGE The value of "start" is out of range. It must be <= "end" (here: 2). Received 5
+past  [] 0
+utf8  ["é","éé","é","é"] 10
+fdpos ["éé","éé"] 8
+b64   ["4oKs","QfCf","mIA="] true
+pipe  82ac41f09f9880
 ==== reflection.js ====
 set-data 1 9
 set-accs undefined 5
@@ -2740,6 +2800,57 @@ ok-arguments  [1,2]
 ok-custom     [7]
 ok-method     [1,2]
 ok-mixed      [0,1,2,3]
+==== statsshape.js ====
+Stats {
+  dev: N,
+  mode: N,
+  nlink: N,
+  uid: N,
+  gid: N,
+  rdev: N,
+  blksize: N,
+  ino: N,
+  size: N,
+  blocks: N,
+  atimeMs: N,
+  mtimeMs: N,
+  ctimeMs: N,
+  birthtimeMs: N,
+  Symbol(partialAtimeNs): N,
+  Symbol(partialMtimeNs): N,
+  Symbol(partialCtimeNs): N,
+  Symbol(kPartialBirthtimeNs): N
+}
+BigIntStats {
+  dev: N,
+  mode: N,
+  nlink: N,
+  uid: N,
+  gid: N,
+  rdev: N,
+  blksize: N,
+  ino: N,
+  size: N,
+  blocks: N,
+  atimeMs: N,
+  mtimeMs: N,
+  ctimeMs: N,
+  birthtimeMs: N,
+  atimeNs: N,
+  mtimeNs: N,
+  ctimeNs: N,
+  birthtimeNs: N
+}
+dev,mode,nlink,uid,gid,rdev,blksize,ino,size,blocks,atimeMs,mtimeMs,ctimeMs,birthtimeMs | dev,mode,nlink,uid,gid,rdev,blksize,ino,size,blocks,atimeMs,mtimeMs,ctimeMs,birthtimeMs,atimeNs,mtimeNs,ctimeNs,birthtimeNs
+Symbol(partialAtimeNs),Symbol(partialMtimeNs),Symbol(partialCtimeNs),Symbol(kPartialBirthtimeNs) 0
+Stats BigIntStats object true true function bigint bigint
+true true true
+true,true,true,true
+false Do not know how to serialize a BigInt
+bigint bigint
+function true false true true true
+cb bigint
+pr bigint
 ==== streams.js ====
 transform A,B,C
 filter    keep,last
@@ -3124,6 +3235,12 @@ usp-forof a=1,b=2 2
 hdr-forof x-one:1,x-two:2
 usp-views a,b 1,2 2
 others   a,b,104,105,7,g
+==== utilnamespace.js ====
+dotted  0
+types   true object [object Object]
+same    true false
+member  function true true
+procdot 0
 ==== utiltypes.js ====
 proxy    true true false
 boxed    true true false false

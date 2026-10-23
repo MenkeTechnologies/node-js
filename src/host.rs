@@ -10120,6 +10120,7 @@ pub fn builtin_is_callable(n: &str) -> bool {
             | "path"
             | "os"
             | "util"
+            | "util/types"
             | "crypto"
             | "webcrypto"
             | "SubtleCrypto"
@@ -11147,6 +11148,11 @@ impl JsHost {
     /// first) and with a full microtask checkpoint after it.
     pub fn queue_io_callback(&mut self, cb: Value, args: Vec<Value>) {
         self.io_completions.push_back(Task::Js { cb, args });
+    }
+    /// A native step delivered as an I/O completion, in the same poll-phase
+    /// queue as [`JsHost::queue_io_callback`] (a `fs/promises` settlement).
+    pub fn queue_io_native(&mut self, f: Box<dyn FnOnce() -> Result<(), String>>) {
+        self.io_completions.push_back(Task::Native(f));
     }
     pub fn queue_nexttick(&mut self, cb: Value, args: Vec<Value>) {
         self.nextticks.push_back(Task::Js { cb, args });

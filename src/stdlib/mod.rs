@@ -267,7 +267,7 @@ pub fn namespace_ctors(ns: &str) -> &'static [&'static str] {
         "assert" => &["AssertionError"],
         "console" => &["Console"],
         "vm" => &["Script"],
-        "fs" => &["promises"],
+        "fs" => &["promises", "Dirent", "Stats"],
         // `stream/web` exports nothing BUT classes (`METHODS` is empty), so
         // without this arm the namespace had no enumerable key at all: measured
         // against node v26.7.0, `Object.keys(require('stream/web')).length` was
@@ -326,7 +326,10 @@ pub fn namespace_keys(ns: &str) -> Vec<String> {
         .map(|s| s.to_string())
         .collect();
     for m in namespace_methods(ns) {
-        if !out.iter().any(|k| k == m) {
+        // A dotted entry (`util`'s `types.isMap`, `process`'s `hrtime.bigint`)
+        // is a dispatch path into a member's own namespace, not a key of this
+        // one; `Object.keys(util)` listed seven of them.
+        if !m.contains('.') && !out.iter().any(|k| k == m) {
             out.push((*m).to_string());
         }
     }
@@ -447,6 +450,11 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         // which libraries pass straight through to `open` and to RSA — read as
         // `undefined`.
         "fs" | "fs/promises" if name == "constants" => Some(constants::object(&constants::fs())),
+        // `fs.Stats` / `fs.Dirent`: the classes of `statSync` and of a
+        // `withFileTypes` entry, so `stat instanceof fs.Stats` holds.
+        "fs" if matches!(name, "Stats" | "Dirent") => {
+            Some(with_host(|h| h.alloc(JsObj::Builtin(name.into()))))
+        }
         "crypto" if name == "constants" => Some(constants::object(&constants::crypto())),
         // `crypto.webcrypto` is the WHATWG surface; `globalThis.crypto` is the
         // same object. Only its two random helpers and `subtle.digest` are
@@ -1021,7 +1029,7 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         "Agent" => &["destroy", "getName"],
         "Blob" | "File" => buffer::BLOB_METHODS,
         "ReadStream" => tty::READ_STREAM_METHODS,
-        "Dirent" => fs::DIRENT_METHODS,
+        "Dirent" | "Stats" | "BigIntStats" => fs::DIRENT_METHODS,
         "Dir" => fs::DIR_METHODS,
         "FSReadStream" => fs::READ_STREAM_METHODS,
         "FSWriteStream" => fs::WRITE_STREAM_METHODS,
@@ -1188,7 +1196,7 @@ pub fn instance_call(
         }
         "EventEmitter" => events::instance_call(recv, method, args),
         "URL" => url::instance_call(recv, method, &args),
-        "Stats" => fs::stats_call(recv, method),
+        "Stats" | "BigIntStats" => fs::stats_call(recv, method),
         "Dirent" => fs::dirent_call(recv, method),
         "Dir" => fs::dir_call(recv, method, args),
         "FSReadStream" => fs::read_stream_call(recv, method, args),

@@ -192,11 +192,21 @@ fn close_fd(fd: i32) -> bool {
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let op = method.strip_suffix("Sync").unwrap_or(method);
     // `existsSync` reports an unusable path as absent rather than throwing.
-    if op == "exists" && validated_paths("exists", args).is_err() {
-        return Some(match method {
-            "existsSync" => Ok(Value::Bool(false)),
-            _ => exists_async(&[Value::Undef, args.get(1).cloned().unwrap_or(Value::Undef)]),
-        });
+    if op == "exists" {
+        if let Err(e) = validated_paths("exists", args) {
+            // A wrongly-TYPED path to `existsSync` is deprecated (DEP0187),
+            // announced once; a string with a NUL is merely absent.
+            if method == "existsSync" && e.contains("[ERR_INVALID_ARG_TYPE]") {
+                super::process::emit_deprecation_warning(
+                    "DEP0187",
+                    "Passing invalid argument types to fs.existsSync is deprecated",
+                );
+            }
+            return Some(match method {
+                "existsSync" => Ok(Value::Bool(false)),
+                _ => exists_async(&[Value::Undef, args.get(1).cloned().unwrap_or(Value::Undef)]),
+            });
+        }
     }
     let normalized = match validated_paths(op, args) {
         Ok(Some(a)) => a,
@@ -1608,7 +1618,10 @@ fn fstat_impl(args: &[Value]) -> Result<Value, String> {
     let fd = arg_num(args, 0) as i32;
     let md = with_file(fd, |file| file.metadata());
     match md {
-        Some(Ok(md)) => Ok(with_host(|h| build_stats(h, &md))),
+        Some(Ok(md)) => {
+            let bigint = bigint_opt(args);
+            Ok(with_host(|h| build_stats(h, &md, bigint)))
+        }
         Some(Err(e)) => Err(err_str("fstat", "", &e)),
         None => Err("Error: EBADF: bad file descriptor, fstat".to_string()),
     }
@@ -1691,7 +1704,10 @@ fn stat_impl(op: &str, args: &[Value], follow: bool) -> Result<Value, String> {
         std::fs::symlink_metadata(&path)
     };
     match md {
-        Ok(md) => Ok(with_host(|h| build_stats(h, &md))),
+        Ok(md) => {
+            let bigint = bigint_opt(args);
+            Ok(with_host(|h| build_stats(h, &md, bigint)))
+        }
         Err(e) => Err(err_str(op, &path, &e)),
     }
 }
@@ -1717,58 +1733,112 @@ fn statfs_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Build a full `fs.Stats` object from `Metadata` (unix fields via `MetadataExt`).
-fn build_stats(h: &mut crate::host::JsHost, md: &std::fs::Metadata) -> Value {
-    let ns = |s: i64, n: i64| s as f64 * 1000.0 + n as f64 / 1_000_000.0;
-    let atime_ms = ns(md.atime(), md.atime_nsec());
-    let mtime_ms = ns(md.mtime(), md.mtime_nsec());
-    let ctime_ms = ns(md.ctime(), md.ctime_nsec());
-    let birth_ms = md
+/// Whether a stat call's options ask for `BigIntStats` (`{ bigint: true }`).
+fn bigint_opt(args: &[Value]) -> bool {
+    match args.get(1) {
+        Some(o) if !is_fn(o) && with_host(|h| h.type_of(o)) == "object" => {
+            let v = crate::builtins::get_property(o, "bigint").unwrap_or(Value::Undef);
+            with_host(|h| h.truthy(&v))
+        }
+        _ => false,
+    }
+}
+
+/// A `Stats` — or, with `bigint`, a `BigIntStats` — for `md`, in node's own-key
+/// order.
+///
+/// `Stats` carries the four sub-millisecond remainders as own symbol-keyed
+/// properties (`Symbol(partialAtimeNs)` …), which is how node keeps the
+/// nanoseconds without a BigInt. `BigIntStats` has every number as a BigInt,
+/// whole milliseconds in `*Ms`, and the full nanosecond times in `*Ns`. The
+/// `is*` methods and the four Date accessors live on the prototype.
+fn build_stats(h: &mut crate::host::JsHost, md: &std::fs::Metadata, bigint: bool) -> Value {
+    let birth = md
         .created()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .unwrap_or(mtime_ms);
+        .map(|d| (d.as_secs() as i64, i64::from(d.subsec_nanos())))
+        .unwrap_or((md.mtime(), md.mtime_nsec()));
+    let times = [
+        ("atime", (md.atime(), md.atime_nsec()), "partialAtimeNs"),
+        ("mtime", (md.mtime(), md.mtime_nsec()), "partialMtimeNs"),
+        ("ctime", (md.ctime(), md.ctime_nsec()), "partialCtimeNs"),
+        ("birthtime", birth, "kPartialBirthtimeNs"),
+    ];
     let ft = md.file_type();
-    let date = |h: &mut crate::host::JsHost, ms: f64| {
-        let mut d = IndexMap::new();
-        d.insert("@@native".into(), h.new_str("Date"));
-        d.insert("@@ms".into(), Value::Float(ms));
-        h.new_object(d)
-    };
     let mut m = IndexMap::new();
-    m.insert("@@native".into(), h.new_str("Stats"));
+    let tag = if bigint { "BigIntStats" } else { "Stats" };
+    m.insert("@@native".into(), h.new_str(tag));
     m.insert("@@isFile".into(), Value::Bool(md.is_file()));
     m.insert("@@isDir".into(), Value::Bool(md.is_dir()));
     m.insert("@@isSymlink".into(), Value::Bool(ft.is_symlink()));
-    m.insert("dev".into(), Value::Float(md.dev() as f64));
-    m.insert("mode".into(), Value::Float(md.mode() as f64));
-    m.insert("nlink".into(), Value::Float(md.nlink() as f64));
-    m.insert("uid".into(), Value::Float(md.uid() as f64));
-    m.insert("gid".into(), Value::Float(md.gid() as f64));
-    m.insert("rdev".into(), Value::Float(md.rdev() as f64));
-    m.insert("blksize".into(), Value::Float(md.blksize() as f64));
-    m.insert("ino".into(), Value::Float(md.ino() as f64));
-    m.insert("size".into(), Value::Float(md.len() as f64));
-    m.insert("blocks".into(), Value::Float(md.blocks() as f64));
-    m.insert("atimeMs".into(), Value::Float(atime_ms));
-    m.insert("mtimeMs".into(), Value::Float(mtime_ms));
-    m.insert("ctimeMs".into(), Value::Float(ctime_ms));
-    m.insert("birthtimeMs".into(), Value::Float(birth_ms));
-    let atime = date(h, atime_ms);
-    m.insert("atime".into(), atime);
-    let mtime = date(h, mtime_ms);
-    m.insert("mtime".into(), mtime);
-    let ctime = date(h, ctime_ms);
-    m.insert("ctime".into(), ctime);
-    let birthtime = date(h, birth_ms);
-    m.insert("birthtime".into(), birthtime);
+    let fields: [(&str, i128); 10] = [
+        ("dev", md.dev() as i128),
+        ("mode", i128::from(md.mode())),
+        ("nlink", md.nlink() as i128),
+        ("uid", i128::from(md.uid())),
+        ("gid", i128::from(md.gid())),
+        ("rdev", md.rdev() as i128),
+        ("blksize", md.blksize() as i128),
+        ("ino", i128::from(md.ino())),
+        ("size", i128::from(md.len())),
+        ("blocks", md.blocks() as i128),
+    ];
+    let int = |h: &mut crate::host::JsHost, n: i128| {
+        if bigint {
+            h.new_bigint(num_bigint::BigInt::from(n))
+        } else {
+            Value::Float(n as f64)
+        }
+    };
+    for (k, n) in fields {
+        let v = int(h, n);
+        m.insert(k.into(), v);
+    }
+    let ns_of = |(s, n): (i64, i64)| i128::from(s) * 1_000_000_000 + i128::from(n);
+    // The Date fields: fractional milliseconds for `Stats`, whole ones for
+    // `BigIntStats` (`Number(this.atimeMs)`).
+    let mut date_ms = Vec::new();
+    for (k, t, _) in times {
+        let ms = if bigint {
+            let whole = ns_of(t).div_euclid(1_000_000);
+            m.insert(format!("{k}Ms"), int(h, whole));
+            whole as f64
+        } else {
+            let ms = t.0 as f64 * 1000.0 + t.1 as f64 / 1_000_000.0;
+            m.insert(format!("{k}Ms"), Value::Float(ms));
+            ms
+        };
+        date_ms.push((k, ms));
+    }
+    if bigint {
+        for (k, t, _) in times {
+            let v = int(h, ns_of(t));
+            m.insert(format!("{k}Ns"), v);
+        }
+    } else {
+        for (_, t, sym) in times {
+            let key = {
+                let s = h.internal_symbol(sym);
+                h.property_key(&s)
+            };
+            m.insert(key, Value::Float(t.1 as f64));
+        }
+    }
+    for (k, ms) in &date_ms {
+        let mut d = IndexMap::new();
+        d.insert("@@native".into(), h.new_str("Date"));
+        d.insert("@@ms".into(), Value::Float(*ms));
+        let date = h.new_object(d);
+        m.insert((*k).to_string(), date);
+    }
     let obj = h.new_object(m);
     // The four Date fields are ACCESSORS on `Stats.prototype` in node, so they
-    // are not own enumerable keys: `Object.keys(statSync(f))` is the fourteen
-    // numeric fields and nothing else. They are stored here rather than
-    // computed, so the equivalent is to hide them — a `JSON.stringify(stat)`
-    // or an `{...stat}` carried four extra entries node does not.
-    for k in ["atime", "mtime", "ctime", "birthtime"] {
+    // are not own enumerable keys: `Object.keys(statSync(f))` is the numeric
+    // fields and nothing else. They are stored here rather than computed, so
+    // the equivalent is to hide them — a `JSON.stringify(stat)` or an
+    // `{...stat}` carried four extra entries node does not.
+    for (k, _) in &date_ms {
         h.hide_prop(&obj, k);
     }
     obj
@@ -1907,12 +1977,85 @@ fn stats_from_parts(h: &mut crate::host::JsHost, exists: bool, mtime_ms: i64, si
 
 // ── read / write streams ─────────────────────────────────────────────────────
 
+/// The byte window and chunk size of a read stream: `start`/`end` (inclusive,
+/// absolute offsets) and `highWaterMark`, checked as `lib/internal/fs/streams`
+/// checks them, synchronously.
+struct ReadWindow {
+    start: Option<u64>,
+    end: Option<u64>,
+    high_water_mark: usize,
+}
+
+fn read_window(args: &[Value]) -> Result<ReadWindow, String> {
+    let int_opt = |key: &str| -> Result<Option<f64>, String> {
+        match option_value(args, key) {
+            None | Some(Value::Undef) => Ok(None),
+            Some(v) => super::validate_integer(&v, key, 0.0).map(Some),
+        }
+    };
+    let start = int_opt("start")?;
+    let end = match option_value(args, "end") {
+        // `end` may be `Infinity` (the default).
+        Some(Value::Float(f)) if f == f64::INFINITY => None,
+        _ => int_opt("end")?,
+    };
+    if let (Some(s), Some(e)) = (start, end) {
+        if s > e {
+            let must = format!("<= \"end\" (here: {})", crate::host::fmt_number(e));
+            return Err(super::out_of_range("start", &must, s));
+        }
+    }
+    let high_water_mark = match option_value(args, "highWaterMark") {
+        Some(v @ (Value::Float(_) | Value::Int(_))) => {
+            (with_host(|h| h.to_number(&v)).max(1.0)) as usize
+        }
+        _ => 64 * 1024,
+    };
+    Ok(ReadWindow {
+        start: start.map(|s| s as u64),
+        end: end.map(|e| e as u64),
+        high_water_mark,
+    })
+}
+
+/// The bytes of `file` the window covers: from `start` with positioned reads
+/// (the descriptor's offset untouched), else from the current offset; cut at
+/// `end` inclusive.
+fn read_window_bytes(file: &File, w: &ReadWindow) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = Vec::new();
+    match w.start {
+        Some(mut pos) => {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = file.read_at(&mut buf, pos)?;
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                pos += n as u64;
+            }
+        }
+        None => {
+            let mut fr: &File = file;
+            fr.read_to_end(&mut bytes)?;
+        }
+    }
+    if let Some(end) = w.end {
+        let max = (end + 1).saturating_sub(w.start.unwrap_or(0)) as usize;
+        bytes.truncate(max);
+    }
+    Ok(bytes)
+}
+
 fn create_read_stream(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
     let enc = encoding_arg(args, 1);
+    let window = read_window(args)?;
     let stream = with_host(|h| {
         let mut extra = IndexMap::new();
         extra.insert("path".into(), h.new_str(path.clone()));
+        extra.insert("bytesRead".into(), Value::Float(0.0));
         if let Some(e) = &enc {
             extra.insert("@@encoding".into(), h.new_str(e.clone()));
         }
@@ -1920,19 +2063,15 @@ fn create_read_stream(args: &[Value]) -> Result<Value, String> {
     });
     let stream = super::net::new_emitter_object("FSReadStream", stream);
     with_host(|h| h.incr_handle());
-    // `{ fd }`: the stream reads an already-open descriptor from its current
-    // offset and opens nothing (so no `open`/`ready`). `autoClose` (default
-    // true) closes it after `end`; with it off the stream never emits `close`.
+    // `{ fd }`: the stream reads an already-open descriptor and opens nothing
+    // (so no `open`/`ready`). `autoClose` (default true) closes it after
+    // `end`; with it off the stream never emits `close`.
     let fd = option_value(args, "fd").filter(|v| matches!(v, Value::Float(_) | Value::Int(_)));
     let auto_close = option_value(args, "autoClose").map_or(true, |v| with_host(|h| h.truthy(&v)));
     let recv = stream.clone();
-    let p = path;
     with_host(|h| {
         h.queue_micro_native(Box::new(move || {
-            match fd {
-                Some(fd) => read_fd_stream_pump(&recv, arg_num(&[fd], 0) as i32, auto_close),
-                None => read_stream_pump(&recv, &p),
-            }
+            read_stream_pump(&recv, &path, fd, auto_close, &window);
             Ok(())
         }))
     });
@@ -1949,31 +2088,44 @@ fn option_value(args: &[Value], key: &str) -> Option<Value> {
     })
 }
 
-/// `read_stream_pump` for a stream over a caller's descriptor.
-fn read_fd_stream_pump(recv: &Value, fd: i32, auto_close: bool) {
+/// Read the stream's window and drive its events on the microtask tick after
+/// creation (so synchronously-attached `on('data')`/`on('end')` listeners
+/// fire): `open`/`ready` for a path, a `data` event per `highWaterMark`
+/// bytes, `end`, then — with `autoClose` — the descriptor closed and `close`.
+fn read_stream_pump(
+    recv: &Value,
+    path: &str,
+    given_fd: Option<Value>,
+    auto_close: bool,
+    window: &ReadWindow,
+) {
     with_host(|h| h.decr_handle());
-    let read = with_file(fd, |file| {
-        let mut bytes = Vec::new();
-        let mut fr: &File = file;
-        fr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let bytes = match read {
-        Some(Ok(b)) => b,
-        failed => {
-            let msg = match failed {
-                Some(Err(e)) => err_str("read", "", &e),
-                _ => "Error: EBADF: bad file descriptor, read".to_string(),
-            };
-            let ev = with_host(|h| crate::builtins::synth_error(h, &msg));
-            let _ = super::events::instance_call(
-                recv,
-                "emit",
-                vec![with_host(|h| h.new_str("error")), ev],
-            );
-            return;
-        }
+    let fd = match given_fd {
+        Some(v) => arg_num(&[v], 0) as i32,
+        None => match File::open(path) {
+            Ok(file) => {
+                let fd = register_fd(file);
+                let open = with_host(|h| h.new_str("open"));
+                let _ =
+                    super::events::instance_call(recv, "emit", vec![open, Value::Float(fd as f64)]);
+                let ready = with_host(|h| h.new_str("ready"));
+                let _ = super::events::instance_call(recv, "emit", vec![ready]);
+                fd
+            }
+            Err(e) => {
+                emit_stream_error(recv, &err_str("open", path, &e));
+                return;
+            }
+        },
     };
-    emit_stream_bytes(recv, &bytes);
+    let bytes = match with_file(fd, |file| read_window_bytes(file, window)) {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return emit_stream_error(recv, &err_str("read", "", &e)),
+        None => return emit_stream_error(recv, "Error: EBADF: bad file descriptor, read"),
+    };
+    emit_stream_bytes(recv, &bytes, window.high_water_mark);
+    // `end` and then `close` each follow on a later tick, as node schedules
+    // them, so what a `data` listener queued runs before the stream ends.
     let target = recv.clone();
     with_host(|h| {
         h.queue_micro_native(Box::new(move || {
@@ -1994,73 +2146,58 @@ fn read_fd_stream_pump(recv: &Value, fd: i32, auto_close: bool) {
     });
 }
 
-/// Hand a read stream's bytes to its pipe destination, or emit them as one
-/// `data` chunk in the stream's encoding.
-fn emit_stream_bytes(recv: &Value, bytes: &[u8]) {
-    let enc = get_prop(recv, "@@encoding").map(|v| with_host(|h| h.str_of(&v)));
-    let chunk = match enc.as_deref() {
-        Some(e) if e != "buffer" => {
-            with_host(|h| h.new_str(String::from_utf8_lossy(bytes).into_owned()))
-        }
-        _ => super::buffer::from_bytes(bytes),
-    };
-    if let Some(dest) = get_prop(recv, "@@pipeDest") {
-        let _ = crate::host::call_method(&dest, "write", vec![chunk]);
-        let _ = crate::host::call_method(&dest, "end", vec![]);
-    } else {
-        let name = with_host(|h| h.new_str("data"));
-        let _ = super::events::instance_call(recv, "emit", vec![name, chunk]);
-    }
+fn emit_stream_error(recv: &Value, msg: &str) {
+    let ev = with_host(|h| crate::builtins::synth_error(h, msg));
+    let _ = super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("error")), ev]);
 }
 
-/// Read the whole file and drive the stream's events on the microtask tick after
-/// creation (so synchronously-attached `on('data')`/`on('end')` listeners fire).
-fn read_stream_pump(recv: &Value, path: &str) {
-    with_host(|h| h.decr_handle());
-    let opened = File::open(path).and_then(|f| {
-        let mut bytes = Vec::new();
-        (&f).read_to_end(&mut bytes).map(|_| (f, bytes))
-    });
-    let bytes = match opened {
-        Ok((file, b)) => {
-            // `open` hands listeners the descriptor, then `ready`; the
-            // descriptor is real and closed again once the data is out.
-            let fd = register_fd(file);
-            let open = with_host(|h| h.new_str("open"));
-            let _ = super::events::instance_call(recv, "emit", vec![open, Value::Float(fd as f64)]);
-            let _ =
-                super::events::instance_call(recv, "emit", vec![with_host(|h| h.new_str("ready"))]);
-            close_fd(fd);
-            b
+/// Hand a read stream's bytes to its pipe destination, or emit them as `data`
+/// events of at most `high_water_mark` bytes, decoded in the stream's encoding
+/// by a `StringDecoder` so a character split across two chunks arrives whole.
+/// `bytesRead` counts the bytes delivered so far.
+fn emit_stream_bytes(recv: &Value, bytes: &[u8], high_water_mark: usize) {
+    let enc = get_prop(recv, "@@encoding").map(|v| with_host(|h| h.str_of(&v)));
+    let decoder = match enc.as_deref() {
+        Some(e) if e != "buffer" => {
+            let e = with_host(|h| h.new_str(e));
+            super::string_decoder::construct(&[e]).ok()
         }
-
-        Err(e) => {
-            let ev = with_host(|h| crate::builtins::synth_error(h, &err_str("open", path, &e)));
-            let _ = super::events::instance_call(
-                recv,
-                "emit",
-                vec![with_host(|h| h.new_str("error")), ev],
-            );
-            return;
+        _ => None,
+    };
+    let dest = get_prop(recv, "@@pipeDest");
+    let deliver = |chunk: Value| match &dest {
+        Some(d) => {
+            let _ = crate::host::call_method(d, "write", vec![chunk]);
+        }
+        None => {
+            let name = with_host(|h| h.new_str("data"));
+            let _ = super::events::instance_call(recv, "emit", vec![name, chunk]);
         }
     };
-    emit_stream_bytes(recv, &bytes);
-    // `end` and then `close` each follow on a later tick, as node schedules
-    // them, so what a `data` listener queued runs before the stream ends.
-    let target = recv.clone();
-    with_host(|h| {
-        h.queue_micro_native(Box::new(move || {
-            let end = with_host(|h| h.new_str("end"));
-            super::events::instance_call(&target, "emit", vec![end])?;
-            with_host(|h| {
-                h.queue_micro_native(Box::new(move || {
-                    let close = with_host(|h| h.new_str("close"));
-                    super::events::instance_call(&target, "emit", vec![close]).map(|_| ())
-                }))
-            });
-            Ok(())
-        }))
-    });
+    let decode = |method: &str, args: Vec<Value>| -> Option<Value> {
+        let d = decoder.as_ref()?;
+        let s = super::string_decoder::instance_call(d, method, &args).ok()?;
+        (with_host(|h| h.as_str(&s)).is_some_and(|s| !s.is_empty())).then_some(s)
+    };
+    let mut read = 0usize;
+    for part in bytes.chunks(high_water_mark.max(1)) {
+        read += part.len();
+        set_prop(recv, "bytesRead", Value::Float(read as f64));
+        let buf = super::buffer::from_bytes(part);
+        if decoder.is_some() {
+            if let Some(s) = decode("write", vec![buf]) {
+                deliver(s);
+            }
+        } else {
+            deliver(buf);
+        }
+    }
+    if let Some(s) = decode("end", Vec::new()) {
+        deliver(s);
+    }
+    if let Some(d) = &dest {
+        let _ = crate::host::call_method(d, "end", vec![]);
+    }
 }
 
 pub const READ_STREAM_METHODS: &[&str] = &[

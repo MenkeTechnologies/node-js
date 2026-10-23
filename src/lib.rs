@@ -17,6 +17,7 @@ pub mod cache;
 pub mod capture;
 pub mod cli;
 pub mod compiler;
+pub mod core_arity;
 pub mod dap;
 pub mod datefmt;
 pub mod host;

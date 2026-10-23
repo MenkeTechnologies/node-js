@@ -3207,6 +3207,36 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     if let Some(v) = with_host(|h| h.builtin_static(ns, name)) {
         return v;
     }
+    // `require('timers').setTimeout` IS the global `setTimeout` (and likewise
+    // the other five); it was a distinct function, so `===` said false.
+    if ns == "timers"
+        && matches!(
+            name,
+            "setTimeout"
+                | "setInterval"
+                | "setImmediate"
+                | "clearTimeout"
+                | "clearInterval"
+                | "clearImmediate"
+        )
+    {
+        return with_host(|h| h.alloc(JsObj::Builtin(name.to_string())));
+    }
+    // `fn[util.promisify.custom]` on the builtins node gives a custom
+    // promisified form (`setTimeout`, `fs.exists`, `child_process.exec`, …):
+    // the same function `util.promisify(fn)` returns. The read answered
+    // `undefined` while `promisify` itself knew the form.
+    if name.starts_with("@@sym:")
+        && name
+            == with_host(|h| {
+                let s = h.symbol_for("nodejs.util.promisify.custom");
+                h.property_key(&s)
+            })
+    {
+        if let Some(Ok(v)) = crate::stdlib::util::custom_promisified(ns) {
+            return v;
+        }
+    }
     // The ENTRY script's `require` is this builtin rather than the per-module
     // closure, so its `cache` has to be handed out here too.
     // `require.extensions` — the legacy loader map. Deprecated but still read
@@ -5816,6 +5846,13 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
     // finally always runs; a finally error/signal supersedes.
     if has_finalizer {
         let sig_before = with_host(|h| h.signal.take());
+        // The pending throw's VALUE lives in the host, not in `pending`'s
+        // message, and any throw the finalizer catches for itself overwrites
+        // it (a nested `try` clears it once handled). It is set aside here and
+        // put back below when the finalizer completes normally; without that,
+        // `try { throw o } finally { try { throw 2 } catch {} }` rethrew an
+        // error synthesized from the message, so `e !== o` and `e.code` was gone.
+        let pending_thrown = with_host(|h| (h.exc.take(), h.error.take()));
         with_host(|h| h.push_scope()); // ditto for `finally`
         let fres = host::run_chunk_keyed(host::try_key(id, 2), || {
             with_host(|h| h.try_chunk(id, 2)).expect("finalizer exists")
@@ -5825,8 +5862,11 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
             Ok(_) => {
                 if with_host(|h| h.signal.is_none()) {
                     // The finalizer completed normally: the try/catch block's own
-                    // abrupt completion resumes.
-                    with_host(|h| h.signal = sig_before);
+                    // abrupt completion resumes, its thrown value included.
+                    with_host(|h| {
+                        h.signal = sig_before;
+                        (h.exc, h.error) = pending_thrown;
+                    });
                 } else {
                     // ECMA-262 14.15.3 TryStatement evaluation: when the finalizer's
                     // completion is abrupt (`return`/`break`/`continue` inside
@@ -6862,6 +6902,15 @@ pub fn builtin_meta(key: &str) -> Option<(&'static str, u32)> {
                 .iter()
                 .find(|(k, _, _)| *k == key)
                 .map(|(_, name, len)| (*name, *len))
+        })
+        // A core-module function (`fs.readFileSync`): measured from the
+        // reference binary by `gen-core-arity`. `.length` read `undefined` for
+        // every one of them.
+        .or_else(|| {
+            let t = crate::core_arity::CORE_ARITY;
+            t.binary_search_by(|(k, _, _)| (*k).cmp(key))
+                .ok()
+                .map(|i| (t[i].1, t[i].2))
         })
 }
 

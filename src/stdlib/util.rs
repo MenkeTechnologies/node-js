@@ -599,6 +599,66 @@ const EXISTS_PROMISIFIED_SRC: &str = "(function exists(path){\n\
   return new Promise(function(resolve){ require('fs').exists(path, resolve); });\n\
 })";
 
+/// `child_process`'s `customPromiseExecFunction(orig)`: resolves
+/// `{ stdout, stderr }`, or rejects with the error carrying both, and exposes
+/// the child as `promise.child`.
+const CUSTOM_EXEC_SRC: &str = "(function(orig, name){\n\
+  const f = function(...args) {\n\
+    const { promise, resolve, reject } = Promise.withResolvers();\n\
+    promise.child = orig(...args, (err, stdout, stderr) => {\n\
+      if (err !== null) {\n\
+        err.stdout = stdout;\n\
+        err.stderr = stderr;\n\
+        reject(err);\n\
+      } else {\n\
+        resolve({ stdout, stderr });\n\
+      }\n\
+    });\n\
+    return promise;\n\
+  };\n\
+  Object.defineProperty(f, 'name', { value: name });\n\
+  return f;\n\
+})";
+
+/// The function node keeps under `[util.promisify.custom]` on one of its own
+/// builtins (`kCustomPromisifiedSymbol`), keyed by the builtin's name here,
+/// or `None` for a builtin that has none. It is ONE value per builtin, so a
+/// read of `setTimeout[util.promisify.custom]`, `util.promisify(setTimeout)`
+/// and `require('timers/promises').setTimeout` are the same function.
+pub(crate) fn custom_promisified(builtin: &str) -> Option<Result<Value, String>> {
+    let alias = |target: &str| Some(Ok(with_host(|h| h.alloc(JsObj::Builtin(target.into())))));
+    match builtin {
+        "setTimeout" => return alias("timers/promises.setTimeout"),
+        "setImmediate" => return alias("timers/promises.setImmediate"),
+        "stream.pipeline" | "Stream.pipeline" => return alias("stream/promises.pipeline"),
+        "stream.finished" | "Stream.finished" => return alias("stream/promises.finished"),
+        "fs.exists" | "child_process.exec" | "child_process.execFile" => {}
+        _ => return None,
+    }
+    thread_local! {
+        static MADE: std::cell::RefCell<std::collections::HashMap<String, Value>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(v) = MADE.with(|m| m.borrow().get(builtin).cloned()) {
+        return Some(Ok(v));
+    }
+    let made = (|| {
+        if builtin == "fs.exists" {
+            return run_completion(EXISTS_PROMISIFIED_SRC);
+        }
+        let factory = run_completion(CUSTOM_EXEC_SRC)?;
+        let (orig, name) = with_host(|h| {
+            let short = builtin.trim_start_matches("child_process.");
+            (h.alloc(JsObj::Builtin(builtin.into())), h.new_str(short))
+        });
+        crate::host::invoke(&factory, vec![orig, name], None)
+    })();
+    if let Ok(v) = &made {
+        MADE.with(|m| m.borrow_mut().insert(builtin.to_string(), v.clone()));
+    }
+    Some(made)
+}
+
 const CALLBACKIFY_SRC: &str = "(function(original){\n\
   return function(){\n\
     var self = this;\n\
@@ -664,14 +724,8 @@ fn promisify(args: &[Value]) -> Result<Value, String> {
         _ => None,
     });
     let custom = match builtin.as_deref() {
-        Some("setTimeout") => Some(with_host(|h| {
-            h.alloc(JsObj::Builtin("timers/promises.setTimeout".into()))
-        })),
-        Some("setImmediate") => Some(with_host(|h| {
-            h.alloc(JsObj::Builtin("timers/promises.setImmediate".into()))
-        })),
-        Some("fs.exists") => Some(run_completion(EXISTS_PROMISIFIED_SRC)?),
-        _ => None,
+        Some(name) => custom_promisified(name).transpose()?,
+        None => None,
     };
     let arg_names: Option<&[&str]> = match builtin.as_deref() {
         Some("fs.read") | Some("fs.readv") => Some(&["bytesRead", "buffer"]),
@@ -679,7 +733,6 @@ fn promisify(args: &[Value]) -> Result<Value, String> {
         Some("fs.writev") => Some(&["bytesWritten", "buffers"]),
         Some("dns.lookup") => Some(&["address", "family"]),
         Some("dns.lookupService") => Some(&["hostname", "service"]),
-        Some("child_process.exec") | Some("child_process.execFile") => Some(&["stdout", "stderr"]),
         _ => None,
     };
     let (custom, names, sym) = with_host(|h| {

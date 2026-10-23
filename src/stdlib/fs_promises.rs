@@ -13,9 +13,8 @@
 //! `writeFile` and `appendFile` also route through when handed one.
 //!
 //! The work is performed synchronously (node-js has no thread-pooled `fs` at this
-//! layer); the Promise is already settled when returned, so `await`/`.then`
-//! observe the result on the next microtask tick — the observable contract
-//! callers rely on.
+//! layer), and the Promise settles in the loop's poll phase, as an I/O
+//! completion — ordered with the callback forms' completions, as in node.
 
 use crate::host::with_host;
 use fusevm::Value;
@@ -157,12 +156,23 @@ fn sync(sync_method: &str, args: &[Value]) -> Result<Value, String> {
 fn settled(result: Result<Value, String>) -> Value {
     let p = with_host(|h| h.new_promise());
     let id = with_host(|h| h.promise_id(&p).unwrap_or(0));
-    match result {
-        Ok(v) => crate::host::resolve_promise_val(id, v),
-        Err(e) => {
-            let ev = with_host(|h| crate::builtins::synth_error(h, &e));
-            crate::host::reject_promise_val(id, ev);
-        }
-    }
+    // The error is built now, while the stack it records is the caller's.
+    let outcome = match result {
+        Ok(v) => Ok(v),
+        Err(e) => Err(with_host(|h| crate::builtins::synth_error(h, &e))),
+    };
+    // node settles the promise when the thread-pool job completes, in the
+    // loop's poll phase — the same queue as a callback-form completion. It
+    // was settled here and now, so `fs.readFile(p, cb)` started before
+    // `fsPromises.readFile(p)` saw its callback run second.
+    with_host(|h| {
+        h.queue_io_native(Box::new(move || {
+            match outcome {
+                Ok(v) => crate::host::resolve_promise_val(id, v),
+                Err(ev) => crate::host::reject_promise_val(id, ev),
+            }
+            Ok(())
+        }))
+    });
     p
 }
