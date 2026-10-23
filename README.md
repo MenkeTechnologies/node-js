@@ -250,7 +250,11 @@ src/arity.rs`). The core-module surface is a different question: `fs
 .readFileSync.length` is a property of node's own JavaScript, not of any
 specification, so **`gen-core-arity`** MEASURES it from the reference binary
 into its own table, `src/core_arity.rs` (`cargo run --bin gen-core-arity >
-src/core_arity.rs`), keyed `<namespace>.<member>`.
+src/core_arity.rs && cargo fmt`), keyed `<namespace>.<member>`. The same run
+measures which of those functions own a `prototype`, each module's
+`Object.keys` order, and — for the web and node classes modelled as native
+prototypes (`ReadableStream`, `Performance`, `Crypto`, …) — each prototype's
+member order and its methods' `name`/`length`.
 
 The two tools deliberately drive DIFFERENT entry points — the corpus runs each
 case as a script FILE, the fuzzer through `-e` — because Node itself answers

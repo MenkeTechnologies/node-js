@@ -3211,7 +3211,6 @@ was upgraded to mid-round), pinned in `examples/perfinstance.js`,
 |---|---|---|
 | `new ReadableStream({ type: 'bytes', pull(c) { c.byobRequest.view } })` | a BYOB request per pull | `byobRequest` is `null` |
 | `Object.getOwnPropertyNames(SubtleCrypto.prototype)` | every WebCrypto method (`encrypt`, `sign`, `importKey`, …) | `digest` only — the one implemented |
-| `Object.getOwnPropertyNames(ReadableStream.prototype)` order | `constructor, locked, cancel, …` | the accessor after the methods |
 | `Object.getOwnPropertyNames(Performance.prototype)` | also `toJSON`, `timeOrigin`, `nodeTiming`, `markResourceTiming`, … | the implemented methods only |
 
 ## FIXED in round 21 — verified against node v26.12.1
@@ -3243,3 +3242,13 @@ record went red.
 | `util.inspect(os.freemem)`, `util.inspect(setTimeout)` | the function's own symbol-keyed properties (`Symbol(Symbol.toPrimitive)`, the `promisify.custom` getter) | the bare function |
 | module exports node defines as GETTERS (`timers.promises`) | `[Getter]` under inspect | the value |
 | `parity-scripts/stdlib/40_event_target.js` | — | the REFERENCE is non-deterministic here: node itself prints `after` before or after the uncaught-exception line run to run (measured 6/10 and 4/10), so the harness reports it intermittently |
+
+Also in round 21, pinned in `examples/protoshape.js`:
+
+| Case | node | was |
+|---|---|---|
+| `Object.getOwnPropertyNames(ReadableStream.prototype)` and the other modelled class prototypes | node's order (measured: `CLASS_PROTO_ORDER`) | methods first, accessors after |
+| a reader's `closed`, a writer's `closed`/`desiredSize`/`ready`, a controller's `desiredSize`/`byobRequest`, a strategy's `highWaterMark` | prototype getters | own data properties |
+| a native accessor's getter `name` (`ReadableStream.prototype` `locked`, `AbortSignal.prototype` `aborted`) | `get locked` | `@get@locked` |
+| `ReadableStream.prototype.getReader.length` and every modelled class method's `length` | the arity (measured: `CLASS_PROTO_ARITY`) | `undefined` |
+| `performance.clearResourceTimings()`, `setResourceTimingBufferSize(n)`, `Performance.prototype.timeOrigin` | methods (no-ops for a process that records no resource timings, which node-js never does) and an accessor | absent; `timeOrigin` an own value |
