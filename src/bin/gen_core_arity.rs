@@ -50,7 +50,9 @@ for (const [id, ns] of Object.entries(spellings)) {
     let f = d.value;
     if (d.get) { try { f = mod[k]; } catch { continue; } }
     if (typeof f !== 'function') continue;
-    rows.push(ns + '.' + k + '\t' + f.name + '\t' + f.length);
+    // The fourth column: whether the function owns a `prototype` (an ordinary
+    // `function` does; an arrow, a method or a bound function does not).
+    rows.push(ns + '.' + k + '\t' + f.name + '\t' + f.length + '\t' + (Object.hasOwn(f, 'prototype') ? 1 : 0));
   }
 }
 console.log(rows.join('\n'));
@@ -78,7 +80,7 @@ fn main() {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    let mut rows: Vec<(String, String, String)> = String::from_utf8_lossy(&out.stdout)
+    let mut rows: Vec<(String, String, String, bool)> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
@@ -87,6 +89,7 @@ fn main() {
                 it.next().unwrap_or_default().to_string(),
                 it.next().unwrap_or_default().to_string(),
                 it.next().unwrap_or_default().to_string(),
+                it.next() == Some("1"),
             )
         })
         .collect();
@@ -116,8 +119,21 @@ fn main() {
          pub const CORE_ARITY: &[(&str, &str, u32)] = &["
     )
     .unwrap();
-    for (key, name, len) in &rows {
+    for (key, name, len, _) in &rows {
         writeln!(w, "    ({key:?}, {name:?}, {len}),").unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    writeln!(
+        w,
+        "\n/// The keys of [`CORE_ARITY`] whose function owns a `prototype` (an ordinary\n\
+         /// `function`; an arrow, a method or a bound function owns none). Sorted.\n\
+         pub const CORE_PROTOTYPED: &[&str] = &["
+    )
+    .unwrap();
+    for (key, _, _, proto) in &rows {
+        if *proto {
+            writeln!(w, "    {key:?},").unwrap();
+        }
     }
     writeln!(w, "];").unwrap();
 }
