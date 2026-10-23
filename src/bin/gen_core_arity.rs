@@ -66,7 +66,7 @@ for (const [id, ns] of Object.entries(spellings)) {
 // The web and node classes this frontend models as native prototypes, with
 // each prototype's own STRING keys in node's order (`getOwnPropertyNames`).
 console.log('===PROTOS===');
-for (const name of [
+const protoClasses = [
   'ReadableStream', 'ReadableStreamDefaultReader', 'ReadableStreamBYOBReader',
   'ReadableStreamDefaultController', 'ReadableByteStreamController', 'ReadableStreamBYOBRequest',
   'WritableStream', 'WritableStreamDefaultWriter', 'WritableStreamDefaultController',
@@ -74,9 +74,22 @@ for (const name of [
   'CountQueuingStrategy', 'TextEncoderStream', 'TextDecoderStream', 'CompressionStream',
   'DecompressionStream', 'Performance', 'Crypto', 'CryptoKey', 'SubtleCrypto',
   'EventTarget', 'Event', 'CustomEvent', 'AbortController', 'AbortSignal',
-]) {
+];
+for (const name of protoClasses) {
   const C = globalThis[name];
   if (typeof C === 'function' && C.prototype) console.log(name + '\t' + Object.getOwnPropertyNames(C.prototype).join(','));
+}
+// The `name` and `length` of those prototypes' METHODS (data members that are
+// functions), keyed `@proto:<Class>:<method>` as this frontend spells them.
+console.log('===PROTO_ARITY===');
+for (const name of protoClasses) {
+  const C = globalThis[name];
+  if (typeof C !== 'function' || !C.prototype) continue;
+  for (const k of Object.getOwnPropertyNames(C.prototype)) {
+    if (k === 'constructor') continue;
+    const d = Object.getOwnPropertyDescriptor(C.prototype, k);
+    if (d && typeof d.value === 'function') console.log('@proto:' + name + ':' + k + '\t' + d.value.name + '\t' + d.value.length);
+  }
 }
 "#;
 
@@ -106,9 +119,12 @@ fn main() {
     let (rows_text, rest) = text
         .split_once("===KEYS===\n")
         .expect("enumerator emitted no key section");
-    let (keys_text, protos_text) = rest
+    let (keys_text, rest) = rest
         .split_once("===PROTOS===\n")
         .expect("enumerator emitted no prototype section");
+    let (protos_text, proto_arity_text) = rest
+        .split_once("===PROTO_ARITY===\n")
+        .expect("enumerator emitted no prototype-arity section");
     let mut rows: Vec<(String, String, String, bool)> = rows_text
         .lines()
         .filter(|l| !l.is_empty())
@@ -221,6 +237,30 @@ fn main() {
             .collect::<Vec<_>>()
             .join(", ");
         writeln!(w, "    ({c:?}, &[{list}]),").unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    let mut parity_rows: Vec<(String, String, String)> = proto_arity_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut it = l.split('\t');
+            (
+                it.next().unwrap_or_default().to_string(),
+                it.next().unwrap_or_default().to_string(),
+                it.next().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    parity_rows.sort();
+    writeln!(
+        w,
+        "\n/// `(key, name, length)` of each modelled class prototype's methods, keyed\n\
+         /// `@proto:<Class>:<method>` by the class's NAME; sorted by key.\n\
+         pub const CLASS_PROTO_ARITY: &[(&str, &str, u32)] = &["
+    )
+    .unwrap();
+    for (key, name, len) in &parity_rows {
+        writeln!(w, "    ({key:?}, {name:?}, {len}),").unwrap();
     }
     writeln!(w, "];").unwrap();
 }
