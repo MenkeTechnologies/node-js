@@ -3746,7 +3746,9 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         // `Crypto.prototype`) answers what the namespace holds.
         if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(recv).cloned()) {
             if crate::stdlib::singleton_class(&ns) == Some(ctor) {
-                return Ok(namespace_property(&ns, key));
+                // The namespace's own constant, not a property read: a read
+                // would find this very getter on the prototype again.
+                return Ok(crate::stdlib::constant(&ns, key).unwrap_or(Value::Undef));
             }
         }
         if tag != ctor && crate::stdlib::brand_checked_class(ctor) {
@@ -6990,6 +6992,21 @@ pub fn builtin_meta(key: &str) -> Option<(&'static str, u32)> {
                 .ok()
                 .map(|i| (t[i].1, t[i].2))
         })
+        // A modelled web/node class's prototype method
+        // (`@proto:ReadableStream:getReader`), measured by class NAME — the
+        // `SubtleCrypto` class is keyed `webcrypto.SubtleCrypto` here.
+        .or_else(|| {
+            let rest = key.strip_prefix("@proto:")?;
+            let (ctor, member) = rest.rsplit_once(':')?;
+            let key = format!(
+                "@proto:{}:{member}",
+                crate::stdlib::class_display_name(ctor)
+            );
+            let t = crate::core_arity::CLASS_PROTO_ARITY;
+            t.binary_search_by(|(k, _, _)| (*k).cmp(key.as_str()))
+                .ok()
+                .map(|i| (t[i].1, t[i].2))
+        })
 }
 
 /// `name` and `length` of the timer functions, which no ECMAScript table covers:
@@ -7038,6 +7055,18 @@ pub fn builtin_name(key: &str) -> &str {
 /// else. Kept out of `builtin_name`'s `&str` return, which cannot own the
 /// `"get size"` it has to build.
 pub fn proto_getter_name(key: &str) -> Option<String> {
+    // A native class's accessor thunk, `@proto:<Ctor>:@get@<member>` (or
+    // `@set@`), is named the same way: `get locked`, not `@get@locked`.
+    if let Some(rest) = key.strip_prefix("@proto:") {
+        let (_, member) = rest.rsplit_once(':')?;
+        if let Some(m) = member.strip_prefix("@get@") {
+            return Some(format!("get {m}"));
+        }
+        if let Some(m) = member.strip_prefix("@set@") {
+            return Some(format!("set {m}"));
+        }
+        return None;
+    }
     let (verb, rest) = match key.strip_prefix("@protoget:") {
         Some(rest) => ("get", rest),
         None => ("set", key.strip_prefix("@protoset:")?),

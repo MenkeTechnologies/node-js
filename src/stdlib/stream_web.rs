@@ -357,9 +357,9 @@ fn new_readable_controller(stream: &Value, byte: bool) -> Value {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(tag));
         m.insert("@@stream".into(), stream.clone());
-        m.insert("desiredSize".into(), Value::Float(1.0));
+        m.insert("@@desiredSize".into(), Value::Float(1.0));
         if byte {
-            m.insert("byobRequest".into(), h.null());
+            m.insert("@@byobRequest".into(), h.null());
         }
         h.new_object(m)
     });
@@ -393,7 +393,7 @@ fn stream_close(stream: &Value) {
     }
     // Resolve a reader's `closed` promise if one is attached.
     if let Some(reader) = get_prop(stream, "@@reader") {
-        if let Some(cp) = get_prop(&reader, "closed") {
+        if let Some(cp) = get_prop(&reader, "@@closed") {
             settle(&cp, Value::Undef);
         }
     }
@@ -410,7 +410,7 @@ fn stream_error(stream: &Value, err: Value) {
         settle_reject(&waiter, err.clone());
     }
     if let Some(reader) = get_prop(stream, "@@reader") {
-        if let Some(cp) = get_prop(&reader, "closed") {
+        if let Some(cp) = get_prop(&reader, "@@closed") {
             settle_reject(&cp, err.clone());
         }
     }
@@ -546,7 +546,7 @@ fn get_reader(stream: &Value, args: &[Value]) -> Result<Value, String> {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(tag));
         m.insert("@@stream".into(), stream.clone());
-        m.insert("closed".into(), closed);
+        m.insert("@@closed".into(), closed);
         h.new_object(m)
     });
     set_prop(stream, "@@locked", Value::Bool(true));
@@ -723,7 +723,7 @@ fn ws_finish(ws: &Value) -> Result<(), String> {
     }
     set_prop(ws, "@@state", with_host(|h| h.new_str("closed")));
     if let Some(writer) = get_prop(ws, "@@writer") {
-        if let Some(cp) = get_prop(&writer, "closed") {
+        if let Some(cp) = get_prop(&writer, "@@closed") {
             settle(&cp, Value::Undef);
         }
     }
@@ -742,7 +742,7 @@ fn ws_abort(ws: &Value, reason: Value) -> Result<(), String> {
     set_prop(ws, "@@state", with_host(|h| h.new_str("errored")));
     set_prop(ws, "@@stored_error", reason.clone());
     if let Some(writer) = get_prop(ws, "@@writer") {
-        if let Some(cp) = get_prop(&writer, "closed") {
+        if let Some(cp) = get_prop(&writer, "@@closed") {
             settle_reject(&cp, reason);
         }
     }
@@ -802,9 +802,9 @@ fn get_writer(ws: &Value) -> Result<Value, String> {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(WS_DEFAULT_WRITER_TAG));
         m.insert("@@stream".into(), ws.clone());
-        m.insert("ready".into(), ready);
-        m.insert("closed".into(), closed);
-        m.insert("desiredSize".into(), Value::Float(1.0));
+        m.insert("@@ready".into(), ready);
+        m.insert("@@closed".into(), closed);
+        m.insert("@@desiredSize".into(), Value::Float(1.0));
         h.new_object(m)
     });
     set_prop(ws, "@@locked", Value::Bool(true));
@@ -851,7 +851,7 @@ pub fn construct_transform(args: &[Value]) -> Result<Value, String> {
         m.insert("@@native".into(), h.new_str(TS_DEFAULT_CONTROLLER_TAG));
         m.insert("@@readable".into(), readable.clone());
         m.insert("@@writable".into(), writable.clone());
-        m.insert("desiredSize".into(), Value::Float(1.0));
+        m.insert("@@desiredSize".into(), Value::Float(1.0));
         h.new_object(m)
     });
     set_prop(&writable, "@@tcontroller", tctrl.clone());
@@ -995,7 +995,7 @@ pub fn construct_strategy(tag: &str, args: &[Value]) -> Result<Value, String> {
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(tag));
-        m.insert("highWaterMark".into(), Value::Float(hwm));
+        m.insert("@@highWaterMark".into(), Value::Float(hwm));
         h.new_object(m)
     }))
 }

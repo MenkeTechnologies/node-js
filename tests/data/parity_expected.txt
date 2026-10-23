@@ -2593,6 +2593,48 @@ webidl   append,delete,entries,forEach,get,getAll,has,keys,set,size,sort,toStrin
 url      hash,host,hostname,href,origin,password,pathname,port,protocol,search,searchParams,toJSON,toString,username
 encoder  encode,encodeInto,encoding
 callable function get 1 true
+==== protoshape.js ====
+ReadableStream constructor,locked,cancel,getReader,pipeThrough,pipeTo,tee,values
+WritableStream constructor,locked,abort,close,getWriter
+TransformStream constructor,readable,writable
+TextEncoderStream constructor,encoding,readable,writable
+TextDecoderStream constructor,encoding,fatal,ignoreBOM,readable,writable
+CompressionStream constructor,readable,writable
+Crypto constructor,subtle,getRandomValues,randomUUID
+CryptoKey constructor,type,extractable,algorithm,usages
+EventTarget constructor,addEventListener,removeEventListener,dispatchEvent
+Event constructor,initEvent,stopImmediatePropagation,preventDefault,target,currentTarget,srcElement,type,cancelable,defaultPrevented,timeStamp,composedPath,returnValue,bubbles,composed,eventPhase,cancelBubble,stopPropagation,isTrusted
+CustomEvent constructor,detail
+AbortController constructor,signal,abort
+AbortSignal constructor,aborted,reason,throwIfAborted,onabort
+ReadableStreamDefaultReader constructor,read,releaseLock,closed,cancel
+WritableStreamDefaultWriter constructor,closed,desiredSize,ready,abort,close,releaseLock,write
+CountQueuingStrategy constructor,highWaterMark,size
+ReadableStream.getReader=getReader/0
+ReadableStream.pipeTo=pipeTo/1
+ReadableStream.locked=get locked/0
+WritableStream.getWriter=getWriter/0
+WritableStreamDefaultWriter.write=write/0
+WritableStreamDefaultWriter.ready=get ready/0
+Performance.mark=mark/1
+Performance.timerify=timerify/1
+Performance.timeOrigin=get timeOrigin/0
+Performance.setResourceTimingBufferSize=setResourceTimingBufferSize/1
+Crypto.getRandomValues=getRandomValues/1
+Crypto.subtle=get subtle/0
+SubtleCrypto.digest=digest/2
+EventTarget.addEventListener=addEventListener/2
+AbortSignal.aborted=get aborted/0
+Event.composedPath=composedPath/0
+undefined undefined number undefined
+ds 1 []
+[] true
+{ done: false, value: 'a' }
+closed ok
+[] number true true
+w closed
+[] 3 5 4
+tds number []
 ==== protosymbols.js ====
 array         [true,true,"function"]
 map-set       [true,true,true]

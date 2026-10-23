@@ -47,6 +47,26 @@ pub const METHODS: &[&str] = &[
     "@@timerify_record",
 ];
 
+/// The `performance` instance's methods: the module's, plus the two that
+/// live only on `Performance.prototype`.
+pub const PERFORMANCE_METHODS: &[&str] = &[
+    "now",
+    "mark",
+    "measure",
+    "getEntriesByName",
+    "getEntriesByType",
+    "getEntries",
+    "clearMarks",
+    "clearMeasures",
+    "createHistogram",
+    "eventLoopUtilization",
+    "monitorEventLoopDelay",
+    "timerify",
+    "@@timerify_record",
+    "clearResourceTimings",
+    "setResourceTimingBufferSize",
+];
+
 /// Methods dispatched on an `@@native = "Histogram"` object (from
 /// `createHistogram()` / `monitorEventLoopDelay()`; reported to the parent for
 /// `instance_has_method` / `instance_call` wiring).
@@ -172,6 +192,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // are no-ops. Honest empty data, never a fabricated delay distribution.
         "monitorEventLoopDelay" => Ok(new_histogram()),
         "timerify" => timerify(args),
+        // node-js records no resource timings (nothing it fetches makes a
+        // `PerformanceResourceTiming`), so there are none to clear and the
+        // buffer they would fill can never overflow: both are the no-ops
+        // node's own are for a process with no resource entries.
+        "clearResourceTimings" | "setResourceTimingBufferSize" => Ok(Value::Undef),
         "@@timerify_record" => Ok(timerify_record(args)),
         _ => return None,
     })

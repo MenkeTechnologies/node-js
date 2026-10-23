@@ -11049,6 +11049,26 @@ impl JsHost {
             }
             self.hide_prop(&proto, "@@toStringTag");
         }
+        // A class node models with interleaved methods and accessors lists its
+        // members in node's order (measured: `CLASS_PROTO_ORDER`), not methods
+        // first: `ReadableStream.prototype` is `constructor, locked, cancel, …`.
+        let display = crate::stdlib::class_display_name(ctor);
+        let t = crate::core_arity::CLASS_PROTO_ORDER;
+        if let Ok(i) = t.binary_search_by(|(c, _)| (*c).cmp(display)) {
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                let mut ordered = IndexMap::with_capacity(p.len());
+                for name in t[i].1 {
+                    let marker = format!("{ORD_MARKER}{name}");
+                    for k in [name.to_string(), marker] {
+                        if let Some(v) = p.shift_remove(&k) {
+                            ordered.insert(k, v);
+                        }
+                    }
+                }
+                ordered.extend(p.drain(..));
+                *p = ordered;
+            }
+        }
         self.native_protos.insert(ctor.to_string(), proto.clone());
         Some(proto)
     }

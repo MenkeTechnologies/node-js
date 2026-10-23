@@ -227,7 +227,8 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "punycode" => punycode::METHODS,
         "timers" => timers::METHODS,
         "timers/promises" => timers::PROMISES_METHODS,
-        "perf_hooks" | "performance" => perf_hooks::METHODS,
+        "perf_hooks" => perf_hooks::METHODS,
+        "performance" => perf_hooks::PERFORMANCE_METHODS,
         "async_hooks" => async_hooks::METHODS,
         "AsyncResource" => async_hooks::RESOURCE_STATIC_METHODS,
         "util/types" => util_types::METHODS,
@@ -945,7 +946,7 @@ pub fn instance_accessors(tag: &str) -> (&'static [(&'static str, bool)], &'stat
             "",
         ),
         "TextEncoder" => (&[("encoding", false)], "TextEncoder"),
-        "Performance" => (&[], "Performance"),
+        "Performance" => (&[("timeOrigin", false)], "Performance"),
         "Crypto" => (&[("subtle", false)], "Crypto"),
         "webcrypto.SubtleCrypto" => (&[], "SubtleCrypto"),
         "CryptoKey" => (
@@ -960,6 +961,25 @@ pub fn instance_accessors(tag: &str) -> (&'static [(&'static str, bool)], &'stat
         // The web streams' state is read through prototype getters; an
         // instance owns none of it (`Object.keys(new ReadableStream())` is `[]`).
         "ReadableStream" => (&[("locked", false)], "ReadableStream"),
+        "ReadableStreamDefaultReader" => (&[("closed", false)], "ReadableStreamDefaultReader"),
+        "ReadableStreamBYOBReader" => (&[("closed", false)], "ReadableStreamBYOBReader"),
+        "ReadableStreamDefaultController" => {
+            (&[("desiredSize", false)], "ReadableStreamDefaultController")
+        }
+        "ReadableByteStreamController" => (
+            &[("byobRequest", false), ("desiredSize", false)],
+            "ReadableByteStreamController",
+        ),
+        "TransformStreamDefaultController" => (
+            &[("desiredSize", false)],
+            "TransformStreamDefaultController",
+        ),
+        "WritableStreamDefaultWriter" => (
+            &[("closed", false), ("desiredSize", false), ("ready", false)],
+            "WritableStreamDefaultWriter",
+        ),
+        "ByteLengthQueuingStrategy" => (&[("highWaterMark", false)], "ByteLengthQueuingStrategy"),
+        "CountQueuingStrategy" => (&[("highWaterMark", false)], "CountQueuingStrategy"),
         "WritableStream" => (&[("locked", false)], "WritableStream"),
         "TransformStream" => (
             &[("readable", false), ("writable", false)],
@@ -1114,6 +1134,8 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         // `performance` is the `Performance` instance; the methods it shares
         // with the `perf_hooks` module live on `Performance.prototype`.
         "Performance" => &[
+            "clearResourceTimings",
+            "setResourceTimingBufferSize",
             "now",
             "mark",
             "measure",
