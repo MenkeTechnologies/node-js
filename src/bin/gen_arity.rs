@@ -12,10 +12,9 @@
 //! hand-written: the values are the specification's, and a hand-copy of ~480
 //! numbers would rot the first time one of them was mistyped.
 //!
-//! The core-module surface (`fs.readFileSync`, `util.format`, …) is deliberately
-//! NOT included: those arities come from the signatures of Node's own JavaScript
-//! implementations, are not specified anywhere, and change between releases.
-//! Reading `.length` off one of those still answers `undefined` here.
+//! The core-module surface (`fs.readFileSync`, `util.format`, …) is NOT in this
+//! table: those arities come from the signatures of Node's own JavaScript and
+//! are measured separately, into `src/core_arity.rs`, by `gen-core-arity`.
 //!
 //! Dev tool — needs a reference `node`, so nothing in CI runs it; the generated
 //! table is checked in.

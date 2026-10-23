@@ -74,6 +74,10 @@ path = "src/bin/parity_fuzz.rs"
 name = "gen-arity"
 path = "src/bin/gen_arity.rs"
 
+[[bin]]
+name = "gen-core-arity"
+path = "src/bin/gen_core_arity.rs"
+
 [dependencies]
 # JavaScript executes on fusevm. node-js is a pure frontend: it lowers JS to
 # fusevm bytecode (src/compiler.rs) and hosts the JS object heap (src/host.rs,
