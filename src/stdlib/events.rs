@@ -545,15 +545,24 @@ fn init_emitter(emitter: Value) -> Value {
     emitter
 }
 
-/// `events.addAbortListener(signal, listener)` — best-effort: register a
-/// one-time `abort` listener if `signal` is emitter-like. `AbortSignal` is not
-/// modeled natively, so this is a no-op for plain signals. Returns a disposable
-/// placeholder object.
+/// `events.addAbortListener(signal, listener)`: a one-time `abort` listener on
+/// the signal, or — if it is already aborted — `listener` on a microtask. The
+/// returned disposable is a plain object: this runtime has no `Symbol.dispose`.
 fn add_abort_listener(args: &[Value]) -> Value {
     let signal = args.first().cloned().unwrap_or(Value::Undef);
     let listener = args.get(1).cloned().unwrap_or(Value::Undef);
-    let name = with_host(|h| h.new_str("abort"));
-    let _ = call_method(&signal, "once", vec![name, listener]);
+    let aborted = crate::builtins::get_property(&signal, "aborted").unwrap_or(Value::Undef);
+    if with_host(|h| h.truthy(&aborted)) {
+        with_host(|h| h.queue_micro(listener, Vec::new()));
+    } else {
+        let name = with_host(|h| h.new_str("abort"));
+        let once = with_host(|h| {
+            let mut m = IndexMap::new();
+            m.insert("once".into(), Value::Bool(true));
+            h.new_object(m)
+        });
+        let _ = call_method(&signal, "addEventListener", vec![name, listener, once]);
+    }
     with_host(|h| h.new_object(IndexMap::new()))
 }
 

@@ -32,6 +32,7 @@ pub mod dgram;
 pub mod diagnostics_channel;
 pub mod dns;
 pub mod domain;
+pub mod event_target;
 pub mod events;
 pub mod fetch;
 pub mod fs;
@@ -400,6 +401,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// `buffer.Buffer`, `url.URL`), reachable via `namespace_property`.
 pub fn constant(ns: &str, name: &str) -> Option<Value> {
     match ns {
+        "Event" => event_target::constant(name),
         // Both flavors carry `.posix`/`.win32` cross-links, exactly as Node's
         // `posix.win32 = win32.win32 = win32; posix.posix = win32.posix = posix`.
         "path" | "path/win32" if name == "posix" => {
@@ -560,6 +562,7 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "WeakRef" => Some(typedarray::construct_weakref(args)),
         "FinalizationRegistry" => Some(typedarray::construct_finalization_registry(args)),
         n if fetch::is_class(n) => fetch::construct(n, args),
+        n if event_target::is_class(n) => event_target::construct(n, args),
         "TextEncoder" => Some(typedarray::construct_text_encoder()),
         "TextDecoder" => Some(typedarray::construct_text_decoder(args)),
         "DataView" => Some(typedarray::construct_dataview(args)),
@@ -654,6 +657,11 @@ pub fn native_parent(ctor: &str) -> Option<&'static str> {
     match ctor {
         "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" => Some("Stream"),
         "Stream" => Some("EventEmitter"),
+        // `AbortSignal` is an `EventTarget` in node, and `CustomEvent` an `Event`,
+        // so `signal instanceof EventTarget` holds and both inherit the base
+        // class's methods.
+        "AbortSignal" => Some("EventTarget"),
+        "CustomEvent" => Some("Event"),
         // `crypto.createSecretKey` and `generateKeyPair` hand back the LEAF
         // classes, not `KeyObject`: node's chain is
         // `SecretKeyObject → KeyObject` and
@@ -702,6 +710,7 @@ pub fn native_parent(ctor: &str) -> Option<&'static str> {
 pub fn instance_late_methods(tag: &str) -> &'static [&'static str] {
     match tag {
         "URL" => &["toJSON"],
+        "Event" => event_target::EVENT_LATE_METHODS,
         _ => &[],
     }
 }
@@ -738,10 +747,22 @@ pub fn instance_inspect_members(tag: &str) -> (&'static [&'static str], bool) {
         ),
         "AbortController" => (&["signal"], true),
         "AbortSignal" => (&["aborted"], true),
+        // node's custom inspect for an `Event` prints these four; a `CustomEvent`
+        // shows the same four (not `detail`).
+        "Event" | "CustomEvent" => (&["type", "defaultPrevented", "cancelable", "timeStamp"], true),
         "TextDecoder" => (&["encoding", "fatal", "ignoreBOM"], true),
         "TextEncoder" => (&["encoding"], false),
         _ => (&[], true),
     }
+}
+
+/// Whether node gives instances of `tag` a CUSTOM `util.inspect` — one that
+/// prints a curated view and nothing else. Such a class hides a subclass's own
+/// properties and the `[Tag]` suffix: `class S extends AbortController {}` is
+/// `S { signal: … }`, and an `EventTarget` subclass prints ` {}` even
+/// with own fields.
+pub fn instance_inspect_is_custom(tag: &str) -> bool {
+    tag == "EventTarget" || !instance_inspect_members(tag).0.is_empty()
 }
 
 pub fn instance_members_enumerable(tag: &str) -> bool {
@@ -766,6 +787,24 @@ pub fn instance_accessor_written(
     if tag == "URL" {
         return url::set_component(recv, key, value);
     }
+    // `Event.cancelBubble` / `returnValue` are verbs, not stored values.
+    if tag == "Event" {
+        return event_target::accessor_written(recv, key, value);
+    }
+    // `signal.onabort = f`: node's `defineEventHandler` registers the handler's
+    // listener slot on the FIRST assignment; the slot reads `@@onabort` at
+    // dispatch time, and a non-function reads back as `null`.
+    if tag == "AbortSignal" && key == "onabort" {
+        if !with_host(|h| crate::host::is_callable(h, value)) {
+            let null = with_host(|h| h.null());
+            with_host(|h| {
+                if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+                    p.insert("@@onabort".into(), null);
+                }
+            });
+        }
+        event_target::ensure_handler_slot(recv, "abort");
+    }
     Ok(())
 }
 
@@ -786,6 +825,9 @@ pub fn instance_accessors(tag: &str) -> (&'static [(&'static str, bool)], &'stat
             "",
         ),
         "TextEncoder" => (&[("encoding", false)], "TextEncoder"),
+        "EventTarget" => (&[], "EventTarget"),
+        "Event" => (event_target::EVENT_ACCESSORS, "Event"),
+        "CustomEvent" => (&[("detail", false)], "CustomEvent"),
         // `origin` and `searchParams` are the two a caller cannot assign.
         "URL" => (
             &[
@@ -968,6 +1010,8 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         "MIMEType" => util::MIME_TYPE_METHODS,
         "MIMEParams" => util::MIME_PARAMS_METHODS,
         t if fetch::is_class(t) => fetch::methods_for(t),
+        "EventTarget" => event_target::EVENT_TARGET_METHODS,
+        "Event" => event_target::EVENT_METHODS,
         t if stream_web::is_class(t) => stream_web::methods_for(t),
         _ => &[],
     };
@@ -1064,6 +1108,9 @@ pub fn instance_call(
             typedarray::buffer_transfer(recv, &args, true)
         }
         t if fetch::is_class(t) => fetch::instance_call(t, recv, method, &args),
+        "EventTarget" | "Event" | "CustomEvent" => {
+            event_target::instance_call(tag, recv, method, &args)
+        }
         "Hash" => crypto::instance_call(recv, method, &args),
         "Hmac" => crypto::hmac_instance_call(recv, method, &args),
         "Interface" => readline::instance_call(recv, method, args),

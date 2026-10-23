@@ -2600,6 +2600,7 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
 /// `TextEncoder`, the fetch classes) and for the engine-native ones.
 fn requires_new(name: &str) -> String {
     if crate::stdlib::fetch::is_class(name)
+        || crate::stdlib::event_target::is_class(name)
         || matches!(
             name,
             "URL"
@@ -2623,6 +2624,7 @@ fn requires_new(name: &str) -> String {
 fn is_new_only_ctor(name: &str) -> bool {
     crate::stdlib::typedarray::is_ctor(name)
         || crate::stdlib::fetch::is_class(name)
+        || crate::stdlib::event_target::is_class(name)
         || matches!(
             name,
             "ArrayBuffer"
@@ -3659,7 +3661,10 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
     }
     if let Some(key) = method.strip_prefix("@set@") {
         let v = args.first().cloned().unwrap_or(Value::Undef);
-        if ctor == "URL" {
+        // A setter that is a VERB rather than a stored value (`url.href = …`
+        // reparses, `event.cancelBubble = true` stops propagation) skips the
+        // slot write.
+        if ctor == "URL" || ctor == "Event" {
             crate::stdlib::instance_accessor_written(ctor, key, recv, &v)?;
             return Ok(Value::Undef);
         }
@@ -3898,6 +3903,12 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
             }
             c = crate::stdlib::native_parent(t);
         }
+    }
+    // The `Event` / `EventTarget` methods are branded too: `Event.prototype
+    // .preventDefault.call({})` is `TypeError [ERR_INVALID_THIS]`, which the
+    // module's own dispatcher raises for a receiver that is not an instance.
+    if matches!(ctor, "Event" | "EventTarget") {
+        return crate::stdlib::event_target::instance_call(ctor, recv, method, &args);
     }
     // A BRANDED method reached with a receiver that has no such internal slot.
     // Every arm above dispatches a receiver that IS an instance, so arriving
@@ -6656,6 +6667,10 @@ const GLOBAL_FUNCS: &[&str] = &[
     "FormData",
     "AbortController",
     "AbortSignal",
+    // WHATWG DOM events (see `stdlib::event_target`).
+    "Event",
+    "EventTarget",
+    "CustomEvent",
     "queueMicrotask",
     "setTimeout",
     "setInterval",
@@ -7691,6 +7706,19 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         _ if name.starts_with("@@aborttimeout:") => {
             let idx: u32 = name["@@aborttimeout:".len()..].parse().unwrap_or(0);
             crate::stdlib::fetch::fire_timeout_abort(idx)
+        }
+        // An `EventTarget` listener threw: node re-raises it on the next tick so
+        // it reaches `uncaughtException`, not `dispatchEvent`'s caller. The
+        // suffix is the error's heap index.
+        _ if name.starts_with("@@rethrow:") => {
+            let idx: u32 = name["@@rethrow:".len()..].parse().unwrap_or(0);
+            crate::stdlib::event_target::rethrow(idx)
+        }
+        // `addEventListener(…, { signal })`: the signal aborted, so the listener
+        // the record at this heap index describes is removed.
+        _ if name.starts_with("@@evunlisten:") => {
+            let idx: u32 = name["@@evunlisten:".len()..].parse().unwrap_or(0);
+            crate::stdlib::event_target::unlisten(idx)
         }
         // The `callback` handed to a `new Writable({ write(chunk, enc, cb) })`
         // implementation. Nothing here waits on backpressure, so it only has to

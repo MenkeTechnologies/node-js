@@ -95,7 +95,7 @@ fn origin() -> &'static Origin {
 }
 
 /// Real monotonic milliseconds since the process-start reference.
-fn now_ms() -> f64 {
+pub(crate) fn now_ms() -> f64 {
     origin().instant.elapsed().as_secs_f64() * 1000.0
 }
 

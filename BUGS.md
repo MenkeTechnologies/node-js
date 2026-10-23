@@ -2921,9 +2921,25 @@ Each needs substrate this frontend does not have; none is approximated.
 - **`(0, eval)(src)` sees the module's top-level bindings**, because the entry
   source is compiled as global code rather than as the CommonJS wrapper function
   (see the entry-point table above).
-- **`Event`, `EventTarget`, `Intl`, `Atomics` and `SharedArrayBuffer` are
-  absent.** `AbortController`/`AbortSignal` exist; the base classes they extend
-  in node do not.
+- **`Intl`, `Atomics` and `SharedArrayBuffer` are absent.** `Event`, `EventTarget`
+  and `CustomEvent` are implemented (`src/stdlib/event_target.rs`, a port of
+  node's `lib/internal/event_target.js` for a target with no DOM tree):
+  registration-order dispatch, `once`/`capture`/`signal` options, duplicate
+  suppression, `handleEvent` objects, `stopImmediatePropagation`,
+  `preventDefault`/`cancelable`/`returnValue`/`cancelBubble`, `initEvent`,
+  `composedPath`, the `ERR_EVENT_RECURSION`/`ERR_INVALID_ARG_TYPE`/
+  `ERR_MISSING_ARGS`/`ERR_INVALID_THIS` rejections, and a throwing listener
+  re-raised on the next tick as an `uncaughtException`. `AbortSignal` inherits
+  from `EventTarget` (its `abort` listeners and `onabort` receive the `Event`;
+  `onabort` keeps the listener position of its first assignment, as node's
+  `defineEventHandler` does), and `events.addAbortListener` / `util.aborted` go
+  through that same listener list. What differs: `Event.prototype`'s members
+  enumerate with the methods grouped around the accessors rather than in node's
+  interleaved order (`composedPath` and `stopPropagation` come last), the
+  constructors carry no `length`/`NONE…` own keys
+  (`Object.getOwnPropertyNames(Event)`), `Object.getPrototypeOf(CustomEvent)` is
+  not `Event`, and the `AddEventListenerArgumentTypeWarning` for a nullish
+  listener is written synchronously where node defers it to the next tick.
 - **A non-`u` regexp steps by code point, not code unit** (the engine's
   semantics). A capture inside a quantified group is corrected after the match
   (`regexp::CaptureMap`): it is dropped unless it lies inside the span of the

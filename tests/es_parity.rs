@@ -7054,3 +7054,215 @@ fn process_stdin_is_a_readable_stream() {
     let utf8 = r#"process.stdin.setEncoding('utf8'); process.stdin.on('data', d => console.log(typeof d, d))"#;
     assert_eq!(run_with_stdin(utf8, "éz"), "string éz");
 }
+
+// ── Event / EventTarget / CustomEvent ────────────────────────────────────────
+
+/// `EventTarget.prototype.dispatchEvent` runs listeners in registration order,
+/// drops a duplicate `(callback, capture)` registration, stops at
+/// `stopImmediatePropagation`, removes a `once` listener before calling it, and
+/// calls an `EventListener` object's `handleEvent` with the object as `this`.
+/// `eventPhase` is `AT_TARGET` (2) during dispatch and `NONE` (0) after, and
+/// `currentTarget` is reset to `null`. Expected values from node v26.12.0.
+#[test]
+fn event_target_dispatches_in_registration_order() {
+    let src = r##"
+        const et = new EventTarget();
+        const log = [];
+        const h1 = e => log.push(['h1', e.type, e.target === et, e.currentTarget === et, e.eventPhase, e.composedPath().length]);
+        et.addEventListener('x', h1);
+        et.addEventListener('x', h1);
+        et.addEventListener('x', e => { log.push('h2'); e.stopImmediatePropagation(); });
+        et.addEventListener('x', () => log.push('h3-never'));
+        const ev = new Event('x');
+        console.log(et.dispatchEvent(ev), JSON.stringify(log), ev.eventPhase, ev.currentTarget, ev.target === et, ev.composedPath().length);
+        log.length = 0;
+        et.addEventListener('y', () => log.push('once'), { once: true });
+        et.addEventListener('y', { handleEvent(e) { log.push('obj ' + e.type + ' ' + (this.handleEvent !== undefined)); } });
+        et.dispatchEvent(new Event('y')); et.dispatchEvent(new Event('y'));
+        console.log(JSON.stringify(log));
+        log.length = 0;
+        et.removeEventListener('x', h1);
+        et.dispatchEvent(new Event('x'));
+        console.log(JSON.stringify(log), et.dispatchEvent(new Event('nobody')));
+        let n = 0;
+        et.addEventListener('a', () => { n++; et.addEventListener('a', () => (n += 10)); });
+        et.dispatchEvent(new Event('a'));
+        console.log(n, Event.NONE, Event.AT_TARGET, Object.prototype.toString.call(et), Object.keys(et));
+    "##;
+    let expected = [
+        "true [[\"h1\",\"x\",true,true,2,1],\"h2\"] 0 null true 0",
+        "[\"once\",\"obj y true\",\"obj y true\"]",
+        "[\"h2\"] true",
+        "1 0 2 [object EventTarget] []",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// `preventDefault` is honoured only on a cancelable event; `dispatchEvent`
+/// reports `!defaultPrevented`; `returnValue = false` is `preventDefault()` and
+/// `cancelBubble = true` is `stopPropagation()`; `initEvent` rewrites type and
+/// flags; a `CustomEvent` carries `detail` (default `null`).
+#[test]
+fn event_cancelation_and_custom_event() {
+    let src = r##"
+        const et = new EventTarget();
+        const c = new Event('c', { cancelable: true, bubbles: true });
+        et.addEventListener('c', e => e.preventDefault());
+        console.log(et.dispatchEvent(c), c.defaultPrevented, c.returnValue, c.bubbles);
+        const nc = new Event('c');
+        console.log(et.dispatchEvent(nc), nc.defaultPrevented, nc.returnValue);
+        const rv = new Event('s', { cancelable: true });
+        rv.returnValue = false; rv.cancelBubble = true;
+        console.log(rv.defaultPrevented, rv.returnValue, rv.cancelBubble);
+        const ie = new Event('s'); ie.initEvent('t', true, true);
+        console.log(ie.type, ie.bubbles, ie.cancelable, new Event(123).type, new Event('u').target, new Event('u').srcElement, new Event('u').isTrusted);
+        const ce = new CustomEvent('c', { detail: { a: 1 } });
+        console.log(ce.detail, new CustomEvent('c').detail, ce instanceof Event, Object.prototype.toString.call(ce), Object.getOwnPropertyNames(CustomEvent.prototype));
+    "##;
+    let expected = [
+        "false true false true",
+        "true false true",
+        "true false true",
+        "t true true 123 null null false",
+        "{ a: 1 } null true [object CustomEvent] [ 'constructor', 'detail' ]",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// The argument and receiver rejections, by `name`, `code` and `message`, and
+/// the `ERR_EVENT_RECURSION` error for re-dispatching an event mid-dispatch.
+#[test]
+fn event_target_argument_errors_match_node() {
+    let src = r##"
+        const et = new EventTarget();
+        const show = f => { try { f(); console.log('no throw'); } catch (e) { console.log(e.name, e.code, e.message); } };
+        show(() => new Event());
+        show(() => et.dispatchEvent({}));
+        show(() => et.dispatchEvent());
+        show(() => et.addEventListener('q', 5));
+        show(() => et.addEventListener('q'));
+        show(() => et.removeEventListener('q'));
+        show(() => Event.prototype.preventDefault.call({}));
+        show(() => EventTarget.prototype.dispatchEvent.call({}, new Event('x')));
+        show(() => Event());
+        const reent = new Event('r');
+        et.addEventListener('r', () => show(() => et.dispatchEvent(reent)));
+        et.dispatchEvent(reent);
+    "##;
+    let expected = [
+        "TypeError ERR_MISSING_ARGS The \"type\" argument must be specified",
+        "TypeError ERR_INVALID_ARG_TYPE The \"event\" argument must be an instance of Event. Received an instance of Object",
+        "TypeError ERR_MISSING_ARGS The \"event\" argument must be specified",
+        "TypeError ERR_INVALID_ARG_TYPE The \"listener\" argument must be an instance of EventListener. Received type number (5)",
+        "TypeError ERR_MISSING_ARGS The \"type\" and \"listener\" arguments must be specified",
+        "TypeError ERR_MISSING_ARGS The \"type\" and \"listener\" arguments must be specified",
+        "TypeError ERR_INVALID_THIS Value of \"this\" must be of type Event",
+        "TypeError ERR_INVALID_THIS Value of \"this\" must be of type EventTarget",
+        "TypeError undefined Class constructor Event cannot be invoked without 'new'",
+        "Error ERR_EVENT_RECURSION The event \"r\" is already being dispatched",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// A subclass declared BEFORE any base instance exists still links to the real
+/// prototype (`build_class` builds it on demand): `instanceof` holds, inherited
+/// methods dispatch, and inspect prints the curated view under the subclass
+/// name with own fields hidden, as node's custom inspect does. The same fix
+/// makes `class AC extends AbortController` read `signal`.
+#[test]
+fn event_target_subclasses_link_to_the_real_prototype() {
+    let src = r##"
+        class MyT extends EventTarget { constructor() { super(); this.v = 1; } }
+        class MyE extends Event { constructor() { super('mine'); this.extra = 2; } }
+        class AC extends AbortController { constructor() { super(); this.z = 3; } }
+        const m = new MyT();
+        m.addEventListener('k', e => console.log('sub', e.type, e.target === m, e.target.v, e instanceof Event));
+        m.dispatchEvent(new Event('k'));
+        m.addEventListener('mine', e => console.log(e.extra, e instanceof MyE, e instanceof Event, e.type));
+        m.dispatchEvent(new MyE());
+        console.log(m instanceof EventTarget, m, m.constructor.name, Object.keys(m), JSON.stringify(m));
+        const sub = new AC();
+        console.log(sub.signal.aborted, sub.z, sub instanceof AbortController, sub);
+        sub.abort();
+        console.log(sub.signal.aborted);
+    "##;
+    let expected = [
+        "sub k true 1 true",
+        "2 true true mine",
+        "true MyT {} MyT [ 'v' ] {\"v\":1}",
+        "false 3 true AC { signal: AbortSignal { aborted: false } }",
+        "true",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// `AbortSignal` is an `EventTarget`: `abort` listeners and `onabort` receive
+/// the `Event` with the signal as `target`/`this`; `onabort` keeps the listener
+/// position of its FIRST assignment and reads back `null` for a non-function;
+/// `{ once }` and `{ signal }` options work; an already-aborted `{ signal }`
+/// never registers; `events.addAbortListener` and `util.aborted` ride the same
+/// list (`util.aborted` resolves WITH the event, as node's does).
+#[test]
+fn abort_signal_is_an_event_target() {
+    let src = r##"
+        const sig = AbortSignal.abort('why');
+        console.log(sig.aborted, sig.reason, sig instanceof EventTarget, sig instanceof AbortSignal);
+        const ac = new AbortController();
+        ac.signal.onabort = 5;
+        console.log(ac.signal.onabort);
+        ac.signal.onabort = () => console.log('fn ran');
+        ac.signal.addEventListener('abort', function (e) { console.log('listener', e.type, e.target === ac.signal, this === ac.signal, e instanceof Event, ac.signal.aborted, ac.signal.reason.name); }, { once: true });
+        ac.signal.onabort = function (e) { console.log('onabort', e.type, e.target === ac.signal, this === ac.signal); };
+        ac.abort(); ac.abort();
+        const et = new EventTarget(), log = [];
+        const ac2 = new AbortController();
+        et.addEventListener('s', () => log.push('signal-listener'), { signal: ac2.signal });
+        et.addEventListener('s', () => log.push('plain-listener'));
+        ac2.abort();
+        et.dispatchEvent(new Event('s'));
+        et.addEventListener('s2', () => log.push('never'), { signal: AbortSignal.abort() });
+        et.dispatchEvent(new Event('s2'));
+        console.log(JSON.stringify(log));
+        const ac3 = new AbortController();
+        require('events').addAbortListener(ac3.signal, e => console.log('addAbortListener', e.type));
+        require('util').aborted(ac3.signal, {}).then(v => console.log('util.aborted', v instanceof Event, v.type));
+        try { require('util').aborted(ac3.signal); } catch (e) { console.log(e.code, e.message); }
+        ac3.abort();
+    "##;
+    let expected = [
+        "true why true true",
+        "null",
+        "onabort abort true true",
+        "listener abort true true true true AbortError",
+        "[\"plain-listener\"]",
+        "ERR_INVALID_ARG_TYPE The \"resource\" argument must be of type object. Received undefined",
+        "addAbortListener abort",
+        "util.aborted true abort",
+    ]
+    .join("\n");
+    assert_eq!(run(src), expected);
+}
+
+/// A listener that throws does not stop the dispatch and does not reach
+/// `dispatchEvent`'s caller: node re-raises it on the next tick, so it arrives
+/// as an `uncaughtException` after the remaining listeners ran and the
+/// dispatch returned `true`.
+#[test]
+fn event_listener_exception_is_uncaught_on_the_next_tick() {
+    let src = r##"
+        process.on('uncaughtException', e => console.log('uncaught:', e.message));
+        const et = new EventTarget();
+        et.addEventListener('t', () => { throw new Error('in listener'); });
+        et.addEventListener('t', () => console.log('second still runs'));
+        console.log('dispatch returns', et.dispatchEvent(new Event('t')));
+        setTimeout(() => console.log('after'), 0);
+    "##;
+    assert_eq!(
+        run(src),
+        "second still runs\ndispatch returns true\nuncaught: in listener\nafter"
+    );
+}

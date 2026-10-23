@@ -5241,6 +5241,15 @@ impl JsHost {
                         .as_deref()
                         .map(crate::stdlib::instance_inspect_members)
                         .unwrap_or((&[], true));
+                    // A class with a custom inspect prints ONLY what that
+                    // inspect curates: a subclass's own properties and the
+                    // inherited `Symbol.toStringTag` suffix are both left out,
+                    // so `class S extends AbortController { z = 1 }` prints as
+                    // `S { signal: … }`, not `S [AbortController] { z: 1, … }`.
+                    let curated = native
+                        .as_deref()
+                        .map(crate::stdlib::instance_inspect_is_custom)
+                        .unwrap_or(false);
                     let plain_prefix = if ctor == "Object" || !show_class {
                         String::new()
                     } else {
@@ -5253,7 +5262,7 @@ impl JsHost {
                         // native classes included: a `SecretKeyObject` prints as
                         // `SecretKeyObject [KeyObject] {}`.
                         match self.inspect_tag(v) {
-                            Some(t) if t != ctor => format!("{ctor} [{t}] "),
+                            Some(t) if t != ctor && !curated => format!("{ctor} [{t}] "),
                             _ => plain_prefix.clone(),
                         }
                     };
@@ -5288,7 +5297,7 @@ impl JsHost {
                         .iter()
                         .filter_map(|k| props.get(*k).map(|val| (format!("[{k}]"), Ok(val))))
                         .collect();
-                    shown.extend(props.iter().filter_map(
+                    shown.extend(props.iter().filter(|_| !curated).filter_map(
                         |(k, val)| match k.strip_prefix(ORD_MARKER) {
                             // A SYMBOL-keyed accessor is listed with the other
                             // symbol keys below, after every string key.
@@ -8925,8 +8934,13 @@ pub fn build_class(name: &str, parent: Value, ctor: Value, source_def: Option<us
                     // `new S("hi") instanceof String` read false and
                     // `String(new S("hi"))` reported `[object String]` instead
                     // of `hi`.
+                    // `ensure_ctor_proto`, not `native_proto`: a stdlib class's
+                    // prototype is built on first use, and `class AC extends
+                    // AbortController {}` declared before any instance existed
+                    // found none and fell back to `Object.prototype`, so
+                    // `new AC().signal` read `undefined`.
                     error_proto_of(h, &bn)
-                        .or_else(|| h.native_proto(&bn))
+                        .or_else(|| h.ensure_ctor_proto(&bn))
                         .or_else(|| h.fn_prop(p, "prototype"))
                         .unwrap_or_else(|| h.object_proto())
                 }

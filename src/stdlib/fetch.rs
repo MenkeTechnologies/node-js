@@ -77,8 +77,9 @@ pub const FORM_DATA_METHODS: &[&str] = &[
     "@@iterator",
 ];
 pub const ABORT_CONTROLLER_METHODS: &[&str] = &["abort"];
-pub const ABORT_SIGNAL_METHODS: &[&str] =
-    &["throwIfAborted", "addEventListener", "removeEventListener"];
+// `addEventListener`/`removeEventListener`/`dispatchEvent` are inherited from
+// `EventTarget.prototype` (see `native_parent`), not listed here.
+pub const ABORT_SIGNAL_METHODS: &[&str] = &["throwIfAborted"];
 
 pub fn methods_for(tag: &str) -> &'static [&'static str] {
     match tag {
@@ -796,12 +797,16 @@ pub fn form_data_call(recv: &Value, method: &str, args: &[Value]) -> Result<Valu
 // ── AbortController / AbortSignal ────────────────────────────────────────────
 
 pub fn new_abort_signal() -> Value {
+    let listeners = super::event_target::new_listener_map();
     with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("AbortSignal"));
         m.insert("@@aborted".into(), Value::Bool(false));
         m.insert("@@reason".into(), Value::Undef);
         m.insert("@@onabort".into(), h.null());
+        // The `EventTarget` listener map: `abort` listeners and the `onabort`
+        // handler slot live here, dispatched by `event_target::dispatch`.
+        m.insert("@@listeners".into(), listeners);
         h.new_object(m)
     })
 }
@@ -835,7 +840,10 @@ pub fn fire_timeout_abort(idx: u32) -> Result<Value, String> {
     Ok(Value::Undef)
 }
 
-/// Mark a signal aborted and run its `onabort` / `abort` listeners.
+/// Mark a signal aborted and dispatch its `abort` event: `onabort` and every
+/// `addEventListener('abort')` listener receive a real `Event` whose `target`
+/// is the signal, in registration order, through the same `EventTarget`
+/// dispatch a script's own `dispatchEvent` uses.
 fn abort_signal(signal: &Value, reason: Value) -> Result<(), String> {
     if matches!(prop(signal, "@@aborted"), Some(Value::Bool(true))) {
         return Ok(());
@@ -847,16 +855,9 @@ fn abort_signal(signal: &Value, reason: Value) -> Result<(), String> {
     };
     set_prop(signal, "@@aborted", Value::Bool(true));
     set_prop(signal, "@@reason", reason);
-    if let Some(cb) = prop(signal, "@@onabort") {
-        if with_host(|h| crate::host::is_callable(h, &cb)) {
-            crate::host::invoke(&cb, vec![Value::Undef], Some(signal.clone()))?;
-        }
-    }
-    if let Some(list) = prop(signal, "@@abortListeners") {
-        for cb in crate::host::iter_all(&list).unwrap_or_default() {
-            crate::host::invoke(&cb, vec![Value::Undef], Some(signal.clone()))?;
-        }
-    }
+    let ty = new_str("abort");
+    let event = super::event_target::construct("Event", &[ty]).unwrap_or(Ok(Value::Undef))?;
+    super::event_target::dispatch(signal, &[event])?;
     Ok(())
 }
 
@@ -882,28 +883,10 @@ pub fn abort_signal_call(recv: &Value, method: &str, args: &[Value]) -> Result<V
             }
             Ok(Value::Undef)
         }
-        "addEventListener" => {
-            if super::arg_str(args, 0) == "abort" {
-                let cb = args.get(1).cloned().unwrap_or(Value::Undef);
-                let existing = prop(recv, "@@abortListeners");
-                let list = match existing {
-                    Some(l) => l,
-                    None => {
-                        let l = with_host(|h| h.new_array(Vec::new()));
-                        set_prop(recv, "@@abortListeners", l.clone());
-                        with_host(|h| h.hide_prop(recv, "@@abortListeners"));
-                        l
-                    }
-                };
-                with_host(|h| {
-                    if let Some(JsObj::Array(items)) = h.get_mut(&list) {
-                        items.push(cb);
-                    }
-                });
-            }
-            Ok(Value::Undef)
+        // The `EventTarget` surface a signal inherits.
+        "addEventListener" | "removeEventListener" | "dispatchEvent" => {
+            super::event_target::event_target_call(recv, method, args)
         }
-        "removeEventListener" => Ok(Value::Undef),
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
         ))),

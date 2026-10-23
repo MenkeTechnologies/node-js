@@ -257,7 +257,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // abort threw.
         "aborted" => {
             let signal = args.first().cloned().unwrap_or(Value::Undef);
-            return Some(aborted(&signal));
+            let resource = args.get(1).cloned().unwrap_or(Value::Undef);
+            return Some(aborted(&signal, &resource));
         }
         "callbackify" => return Some(callbackify(args)),
         // `util.parseEnv(content)` → an object of the parsed dotenv assignments.
@@ -581,16 +582,24 @@ const CALLBACKIFY_SRC: &str = "(function(original){\n\
 /// `util.aborted(signal, resource)`.
 ///
 /// Resolves when `signal` aborts — immediately if it already has. The
-/// `resource` argument only ties the promise to an async resource for tracking,
-/// which this runtime does not model, so it is accepted and ignored.
-fn aborted(signal: &Value) -> Result<Value, String> {
+/// `resource` argument is REQUIRED to be an object (node validates it before
+/// looking at the signal); it only ties the promise to an async resource for
+/// tracking, which this runtime does not model, so a valid one is then ignored.
+fn aborted(signal: &Value, resource: &Value) -> Result<Value, String> {
+    if !with_host(|h| matches!(h.get(resource), Some(crate::host::JsObj::Object(_)) | Some(crate::host::JsObj::Array(_)))
+        || crate::host::is_callable(h, resource))
+    {
+        return Err(crate::host::invalid_arg_type("resource", "argument", "object", resource));
+    }
     let already = crate::builtins::get_property(signal, "aborted").unwrap_or(Value::Undef);
     if with_host(|h| h.truthy(&already)) {
         return crate::builtins::promise_resolve_pub(Value::Undef);
     }
-    let (promise, resolve) = crate::builtins::pending_promise_with_resolver();
     // The listener is an ordinary `abort` handler, so it goes through the same
-    // path a script's own `signal.addEventListener('abort', …)` would.
+    // path a script's own `signal.addEventListener('abort', …)` would — and,
+    // as in node (`signal.addEventListener('abort', resolve)`), the promise
+    // resolves WITH the abort `Event` the listener receives.
+    let (promise, resolve) = crate::builtins::pending_promise_with_resolver();
     crate::host::call_method(
         signal,
         "addEventListener",
