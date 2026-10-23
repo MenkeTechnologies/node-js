@@ -3209,14 +3209,37 @@ was upgraded to mid-round), pinned in `examples/perfinstance.js`,
 
 | Case | node | node-js |
 |---|---|---|
-| `util.inspect(require('path'))` (any core-module namespace) | the members, `{ resolve: [Function: resolve], … }` | `Object [path] {}` |
-| `Object.keys(require('fs'))` and the other modules | includes `constants` and every other object-valued export | the object-valued exports are readable but not listed |
-| `require('fs').readFileSync` own keys | `length`, `name`, `prototype` | `length`, `name` — a builtin function owns no `prototype` |
-| `require('child_process').exec(cmd, cb)` | a `ChildProcess`, so `promisify(exec)(cmd).child` is one | `undefined` (exec is sync-backed) |
-| `require('events').on(emitter, name)` | an async iterator of events | absent |
-| `assert.strict.length`/`.name`, `crypto.getRandomValues.length`, `util.aborted.length` | `0`/`strict`, `1`, `2` | `undefined`/`assertStrict`, `undefined`, `undefined` — these builtins are spelled under another key than the table's |
-| `fs.fstatSync(0)` (stdin, stdout, stderr) | their stats | `EBADF` — the descriptor table holds only descriptors node-js opened |
 | `new ReadableStream({ type: 'bytes', pull(c) { c.byobRequest.view } })` | a BYOB request per pull | `byobRequest` is `null` |
 | `Object.getOwnPropertyNames(SubtleCrypto.prototype)` | every WebCrypto method (`encrypt`, `sign`, `importKey`, …) | `digest` only — the one implemented |
 | `Object.getOwnPropertyNames(ReadableStream.prototype)` order | `constructor, locked, cancel, …` | the accessor after the methods |
 | `Object.getOwnPropertyNames(Performance.prototype)` | also `toJSON`, `timeOrigin`, `nodeTiming`, `markResourceTiming`, … | the implemented methods only |
+
+## FIXED in round 21 — verified against node v26.12.1
+
+Pinned in `examples/funcprototypes.js`, `stdiofds.js`, `eventson.js`,
+`execchild.js` and `nsinspect.js`; each fix was re-broken alone and its
+record went red.
+
+| Case | node | was |
+|---|---|---|
+| `util.inspect(require('path'))`, any core-module namespace | a plain object of its members, `path.posix` as `[Circular *1]` | `Object [path] {}`. A namespace is now inspected through a snapshot object built before the render (the render runs under the host borrow and cannot read member values) |
+| `Object.keys(require('path'))`, `os`, `fs`, `dns`, … | node's order, value exports (`sep`, `EOL`, `constants`, the `dns` codes) included | dispatch order, value exports missing. The order is measured (`CORE_KEYS`); the value exports are the static `namespace_values` lists, which `is_method` also answers |
+| `fs.readFileSync.prototype` (any core function written as `function`) | `{ constructor: fn }`, writable, non-enumerable, non-configurable | absent — measured per function (`CORE_PROTOTYPED`) |
+| `util.aborted.length`, `crypto.getRandomValues.length`, `assert.strict.name`/`length` | `2`, `1`, `strict`/`0` | `undefined` — two are accessor exports the generator skipped, one is keyed `assertStrict` here |
+| an anonymous builtin (`os.freemem`) | `[Function (anonymous)]` | `[Function: ]` |
+| `fs.writeSync(1, s)`, `fs.fstatSync(0)`, `readSync(0, …)`, `fstat(1, cb)` | the process's stdio descriptors | `EBADF` — only descriptors node-js opened were known |
+| `fs.fsyncSync(1)` on a pipe | `EINVAL` (libuv: `F_FULLFSYNC`, then `F_BARRIERFSYNC`, then `fsync`) | `EBADF` |
+| `stat.isCharacterDevice()`, `isFIFO()`, `isBlockDevice()`, `isSocket()` (Stats and Dirent) | the real file type | always `false` |
+| `events.on(emitter, event[, options])` | an async iterator (ported from `lib/events.js`: `error`, `close`, `signal`, watermarks, EventTarget sources) | absent |
+| `child_process.exec(cmd[, cb])` | the `ChildProcess`; the callback is its first `close` listener | `undefined`, so `promisify(exec)(cmd).child` was missing |
+| `child instanceof EventEmitter`, a `net.Socket`, a `net.Server` | `true` | `false` |
+
+### Still open — found in round 21, not fixed
+
+| Case | node | node-js |
+|---|---|---|
+| `Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype)` | `%AsyncIteratorPrototype%` | `null` |
+| `child.on === EventEmitter.prototype.on` (an emitter-backed native) | `true` | `false` — the instance's methods are dispatch thunks |
+| `util.inspect(os.freemem)`, `util.inspect(setTimeout)` | the function's own symbol-keyed properties (`Symbol(Symbol.toPrimitive)`, the `promisify.custom` getter) | the bare function |
+| module exports node defines as GETTERS (`timers.promises`) | `[Getter]` under inspect | the value |
+| `parity-scripts/stdlib/40_event_target.js` | — | the REFERENCE is non-deterministic here: node itself prints `after` before or after the uncaught-exception line run to run (measured 6/10 and 4/10), so the harness reports it intermittently |
