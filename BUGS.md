@@ -2649,14 +2649,13 @@ and `examples/dates.js`.
 
 Still divergent, and why:
 
-- **An async `fs` callback runs as a microtask.** `fs.readFile(p, cb)` and the
-  `fs.promises` settlements are queued on the microtask queue when the
-  operation completes synchronously here, so `cb` runs before promise
-  reactions queued after the call, and before a `setTimeout(…, 0)`. In node the
-  work completes on the threadpool and the callback runs in the poll phase:
-  always after the current microtasks, and (timing-dependent) usually after an
-  expired 0 ms timer. Moving them needs an I/O-completion phase in the event
-  loop, which the virtual-clock loop does not model.
+- **An `fs.promises` settlement is a microtask.** The CALLBACK forms are fixed
+  (see "FIXED in round 18" below): an `fs`, `zlib`, `crypto` thread-pool or
+  `child_process.exec` callback waits in an I/O-completion queue that the loop
+  services after the microtask checkpoint. The promise forms still settle when
+  the call returns, so `await fs.promises.readFile(p)` resumes in the same
+  microtask round as jobs queued after the call, where node resumes it from the
+  poll phase.
 - **Compound and logical assignment evaluate a computed key TWICE.**
   `o[k()] += 1` calls `k` twice where node calls it once; the parser desugars
   `a op= b` to `a = a op b`, which duplicates the target expression. Simple
@@ -3094,3 +3093,17 @@ have; re-blessing them would record a divergence as a target.
 | `crypto.Crypto`, `CryptoKey`, `SubtleCrypto` globals / members | constructors | absent |
 | `require('fs/promises').open(p)` / `fs.promises.open` | a `FileHandle` (`read`, `write`, `readFile`, `stat`, `close`, …) | `open is not a function` — there is no `FileHandle` class; every other `fs/promises` member delegates to its sync twin |
 | `fs.readSync(fd, big.subarray(2), 0, 2, 0)` | the bytes appear in `big` | they land in the subarray only — the documented no-aliasing Buffer model above, reached through a write-into-view API |
+
+## FIXED in round 18 — microtask rounds and I/O callbacks, verified against node v26.12.1
+
+| Case | node v26.12.1 | node-js (was) |
+|---|---|---|
+| `await null; process.nextTick(t); queueMicrotask(q)` inside an async function | `q` then `t` — `RunMicrotasks` drains the jobs the last job queues before the tick queue is serviced | `t` then `q`: the microtask round counted as finished once the queue looked empty at POP time, so the final job's own jobs lost to its ticks |
+| `fs.stat(f, cb); Promise.resolve().then(p); process.nextTick(t)` | `t p cb` — the callback is a libuv completion in the poll phase | `t cb p`: every async `fs` callback (and `zlib`, `crypto.randomBytes`/`pbkdf2`/`scrypt`/`generateKeyPair`/`checkPrime`/`generatePrime`/`randomFill`, `child_process.exec`/`execFile`) was queued on the MICROTASK queue, FIFO with the promise jobs around it |
+| inside that callback: `Promise.resolve().then(p2); process.nextTick(t2)` | `t2 p2` — a macrotask callback is followed by `processTicksAndRejections`, ticks first | `p2 t2` |
+
+`JsHost::queue_io_callback` is the I/O-completion queue: the loop runs one
+callback per turn after the microtask checkpoint and ahead of the timers, so a
+full checkpoint follows each callback. Two completions keep the order they were
+started in; in node that order is a thread-pool race. Pinned by
+`tests/timers.rs` (three tests, each verified to fail on the previous build).

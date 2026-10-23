@@ -147,7 +147,7 @@ fn run_async(op: &str, args: &[Value]) -> Result<Value, String> {
             Value::Undef,
         ),
     };
-    with_host(|h| h.queue_micro(cb, vec![err, buf]));
+    with_host(|h| h.queue_io_callback(cb, vec![err, buf]));
     Ok(Value::Undef)
 }
 

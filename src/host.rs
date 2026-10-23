@@ -1081,6 +1081,12 @@ pub struct JsHost {
     pub nextticks: std::collections::VecDeque<Task>,
     /// Promise-reaction / `queueMicrotask` microtasks.
     pub microtasks: std::collections::VecDeque<Task>,
+    /// Completed asynchronous I/O whose callback is waiting for the loop's poll
+    /// phase: an `fs` callback, a `child_process.exec` result, a `zlib` or
+    /// `crypto` thread-pool job. In node these arrive from libuv as MACROTASKS,
+    /// so every `nextTick` and promise job queued by the code that started the
+    /// operation runs first. See `queue_io_callback`.
+    io_completions: std::collections::VecDeque<Task>,
     /// `setTimeout`/`setInterval`/`setImmediate` macrotasks.
     pub macrotasks: Vec<Timer>,
     /// Monotonic timer-id source.
@@ -1341,6 +1347,7 @@ impl JsHost {
             promises: Vec::new(),
             microtasks: std::collections::VecDeque::new(),
             draining_micro: false,
+            io_completions: std::collections::VecDeque::new(),
             nextticks: std::collections::VecDeque::new(),
             macrotasks: Vec::new(),
             next_timer: 1,
@@ -4136,8 +4143,7 @@ fn finish_process_events() -> Result<(), String> {
         if !crate::stdlib::process::emit_before_exit(code)? {
             break;
         }
-        let more =
-            with_host(|h| h.has_microtasks() || h.open_handles() > 0 || h.has_refed_macrotasks());
+        let more = with_host(|h| h.loop_alive());
         if !more {
             break;
         }
@@ -11133,6 +11139,15 @@ impl JsHost {
     pub fn queue_micro(&mut self, cb: Value, args: Vec<Value>) {
         self.microtasks.push_back(Task::Js { cb, args });
     }
+    /// Deliver the callback of an asynchronous I/O operation that has already
+    /// completed. node-js performs the operation synchronously, but the callback
+    /// still belongs to the loop's POLL phase, not to the microtask queue: node
+    /// runs it as a libuv completion, after the nextTick and promise jobs the
+    /// starting code queued (`fs.stat(f, cb); Promise.resolve().then(p)` runs `p`
+    /// first) and with a full microtask checkpoint after it.
+    pub fn queue_io_callback(&mut self, cb: Value, args: Vec<Value>) {
+        self.io_completions.push_back(Task::Js { cb, args });
+    }
     pub fn queue_nexttick(&mut self, cb: Value, args: Vec<Value>) {
         self.nextticks.push_back(Task::Js { cb, args });
     }
@@ -11297,8 +11312,14 @@ impl JsHost {
             }
         }
         if let Some(t) = self.microtasks.pop_front() {
-            // Stay in the microtask phase until this queue is exhausted.
-            self.draining_micro = !self.microtasks.is_empty();
+            // Stay in the microtask phase until this queue is exhausted —
+            // INCLUDING jobs the task about to run queues itself, which V8's
+            // `RunMicrotasks` also drains before returning. Clearing the flag
+            // when the queue looked empty at POP time let a tick queued by the
+            // last job's own continuation jump ahead of the jobs that
+            // continuation queued (`await null; process.nextTick(t);
+            // queueMicrotask(q)` ran `t` before `q`).
+            self.draining_micro = true;
             return Some(t);
         }
         self.draining_micro = false;
@@ -11306,6 +11327,17 @@ impl JsHost {
     }
     fn has_microtasks(&self) -> bool {
         !self.nextticks.is_empty() || !self.microtasks.is_empty()
+    }
+    fn next_io_completion(&mut self) -> Option<Task> {
+        self.io_completions.pop_front()
+    }
+    /// Node's loop-alive test: queued jobs, an open handle, a referenced timer,
+    /// or an I/O completion still waiting for its callback.
+    fn loop_alive(&self) -> bool {
+        self.has_microtasks()
+            || !self.io_completions.is_empty()
+            || self.open_handles() > 0
+            || self.has_refed_macrotasks()
     }
     /// Whether any pending timer is *referenced* — the timer half of Node's
     /// handle count. Only these keep the loop alive; unref'd timers still fire
@@ -11373,13 +11405,21 @@ fn drive_event_loop(rx: Option<&Receiver<IoTask>>) -> Result<(), String> {
         //    process exits, dropping any unref'd timers still pending — which is
         //    why `setTimeout(fn, 1000).unref()` never fires, while an unref'd
         //    timer behind a ref'd one does.
-        let alive =
-            with_host(|h| h.has_microtasks() || h.open_handles() > 0 || h.has_refed_macrotasks());
+        let alive = with_host(|h| h.loop_alive());
         if !alive {
             break;
         }
 
-        // 3) Pick the clock regime for this turn.
+        // 3) Poll phase for I/O that has already completed: one callback per
+        //    turn, so the microtask checkpoint above runs between callbacks.
+        //    Ahead of the timers, matching what node reports for an fs callback
+        //    and a `setTimeout(0)`/`setImmediate` scheduled alongside it.
+        if let Some(task) = with_host(|h| h.next_io_completion()) {
+            task.run()?;
+            continue;
+        }
+
+        // 4) Pick the clock regime for this turn.
         let virtual_clock = with_host(|h| h.open_handles() == 0 && !h.has_pending_interval());
         if virtual_clock {
             // ── virtual-clock regime (unchanged for one-shot timers) ─────────

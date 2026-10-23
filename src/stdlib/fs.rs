@@ -298,7 +298,7 @@ fn async_cb(args: &[Value], result: Result<Value, String>) -> Result<Value, Stri
     match result {
         Ok(v) => with_host(|h| {
             let n = h.null();
-            h.queue_micro(cb, vec![n, v]);
+            h.queue_io_callback(cb, vec![n, v]);
         }),
         // An error-first callback is handed an ERROR OBJECT, not the message:
         // `fs.stat(missing, (err) => …)` gives an `err` carrying `code`,
@@ -308,7 +308,7 @@ fn async_cb(args: &[Value], result: Result<Value, String>) -> Result<Value, Stri
         // `undefined`. The promise forms already built the object.
         Err(e) => with_host(|h| {
             let ev = crate::builtins::synth_error(h, &e);
-            h.queue_micro(cb, vec![ev]);
+            h.queue_io_callback(cb, vec![ev]);
         }),
     }
     Ok(Value::Undef)
@@ -323,11 +323,11 @@ fn read_write_async(args: &[Value], result: Result<usize, String>) -> Result<Val
     match result {
         Ok(n) => with_host(|h| {
             let nul = h.null();
-            h.queue_micro(cb, vec![nul, Value::Float(n as f64), buffer]);
+            h.queue_io_callback(cb, vec![nul, Value::Float(n as f64), buffer]);
         }),
         Err(e) => with_host(|h| {
             let ev = crate::builtins::synth_error(h, &e);
-            h.queue_micro(cb, vec![ev]);
+            h.queue_io_callback(cb, vec![ev]);
         }),
     }
     Ok(Value::Undef)
@@ -457,7 +457,7 @@ fn read_file_async(args: &[Value]) -> Result<Value, String> {
             Value::Undef,
         ),
     };
-    with_host(|h| h.queue_micro(cb, vec![err, data]));
+    with_host(|h| h.queue_io_callback(cb, vec![err, data]));
     Ok(Value::Undef)
 }
 
@@ -467,7 +467,7 @@ fn exists_async(args: &[Value]) -> Result<Value, String> {
         return Ok(Value::Undef);
     };
     let ex = Path::new(&path).exists();
-    with_host(|h| h.queue_micro(cb, vec![Value::Bool(ex)]));
+    with_host(|h| h.queue_io_callback(cb, vec![Value::Bool(ex)]));
     Ok(Value::Undef)
 }
 
@@ -1116,11 +1116,11 @@ fn read_async(args: &[Value]) -> Result<Value, String> {
     with_host(|h| match result {
         Ok(n) => {
             let nul = h.null();
-            h.queue_micro(cb, vec![nul, Value::Float(n as f64), buffer]);
+            h.queue_io_callback(cb, vec![nul, Value::Float(n as f64), buffer]);
         }
         Err(e) => {
             let ev = crate::builtins::synth_error(h, &e);
-            h.queue_micro(cb, vec![ev]);
+            h.queue_io_callback(cb, vec![ev]);
         }
     });
     Ok(Value::Undef)
@@ -1848,7 +1848,7 @@ pub fn dir_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
             if let Some(cb) = args.first().filter(|c| is_fn(c)).cloned() {
                 with_host(|h| {
                     let n = h.null();
-                    h.queue_micro(cb, vec![n, v]);
+                    h.queue_io_callback(cb, vec![n, v]);
                 });
                 Ok(Value::Undef)
             } else {
@@ -1860,7 +1860,7 @@ pub fn dir_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, S
             if let Some(cb) = args.first().filter(|c| is_fn(c)).cloned() {
                 with_host(|h| {
                     let n = h.null();
-                    h.queue_micro(cb, vec![n]);
+                    h.queue_io_callback(cb, vec![n]);
                 });
                 Ok(Value::Undef)
             } else {

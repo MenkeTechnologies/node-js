@@ -418,3 +418,72 @@ fn immediate_precedes_timeout_inside_an_io_callback() {
     );
     assert_eq!(run(&src), "immediate\ntimeout");
 }
+
+/// A microtask round drains EVERY job, including the ones the round's own last
+/// job queues, before the nextTick queue is looked at again (V8's
+/// `RunMicrotasks` inside node's `processTicksAndRejections`). The queue used
+/// to count as drained when it looked empty at the moment a job was popped, so
+/// a tick queued by the final job jumped ahead of the jobs that same job
+/// queued. Expected values from node v26.12.1.
+#[test]
+fn jobs_queued_by_the_last_microtask_run_before_its_ticks() {
+    let src = r#"
+        const o = [];
+        (async () => {
+            await null;
+            process.nextTick(() => o.push('tick'));
+            queueMicrotask(() => o.push('micro'));
+            Promise.resolve().then(() => o.push('promise'));
+        })();
+        Promise.resolve().then(() => {}).then(() => {
+            process.nextTick(() => o.push('tick2'));
+            Promise.resolve().then(() => o.push('promise2'));
+        });
+        setTimeout(() => console.log(o.join(' ')), 0);
+    "#;
+    assert_eq!(run(src), "micro promise promise2 tick tick2");
+}
+
+/// An asynchronous I/O callback is a poll-phase MACROTASK in node, not a
+/// microtask: every nextTick and promise job queued by the code that started
+/// the operation runs first, and inside the callback node's
+/// `processTicksAndRejections` runs that callback's ticks before its promise
+/// jobs. These callbacks used to be queued as microtasks, so they ran in FIFO
+/// order with the promise jobs around them. Expected values from node v26.12.1
+/// (the relative order of two completions is a thread-pool race in node, so
+/// only one I/O operation is pinned per program).
+#[test]
+fn io_callbacks_run_after_the_jobs_queued_before_them() {
+    let src = r#"
+        const o = [];
+        require('fs').stat(__filename, () => {
+            o.push('stat');
+            Promise.resolve().then(() => o.push('stat-promise'));
+            process.nextTick(() => o.push('stat-tick'));
+        });
+        Promise.resolve().then(() => o.push('promise'));
+        new Promise(r => process.nextTick(r)).then(() => o.push('resolved-by-tick'));
+        process.nextTick(() => o.push('tick'));
+        setTimeout(() => console.log(o.join(' ')), 20);
+    "#;
+    assert_eq!(
+        run(src),
+        "tick promise resolved-by-tick stat stat-tick stat-promise"
+    );
+}
+
+/// The same holds for the other callback APIs node services from its thread
+/// pool or a child process: `crypto.randomBytes`, `zlib`, `child_process.exec`.
+#[test]
+fn thread_pool_callbacks_run_after_pending_jobs() {
+    let src = r#"
+        const o = [];
+        const check = name => () => o.push(name);
+        require('crypto').randomBytes(4, check('randomBytes'));
+        require('zlib').gzip('x', check('gzip'));
+        require('child_process').exec('true', check('exec'));
+        Promise.resolve().then(check('promise'));
+        setTimeout(() => console.log(o.slice(0, 1).join(), o.length), 200);
+    "#;
+    assert_eq!(run(src), "promise 4");
+}

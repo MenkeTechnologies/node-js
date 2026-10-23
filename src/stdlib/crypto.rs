@@ -209,7 +209,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 let bufv = super::buffer::from_bytes(&buf);
                 with_host(|h| {
                     let nullv = h.null();
-                    h.queue_micro(cb, vec![nullv, bufv]);
+                    h.queue_io_callback(cb, vec![nullv, bufv]);
                 });
                 Ok(Value::Undef)
             } else {
@@ -320,7 +320,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 let bufv = super::buffer::from_bytes(&buf);
                 with_host(|h| {
                     let nullv = h.null();
-                    h.queue_micro(cb, vec![nullv, bufv]);
+                    h.queue_io_callback(cb, vec![nullv, bufv]);
                 });
                 Ok(Value::Undef)
             } else {
@@ -372,11 +372,11 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                                 ),
                                 _ => (Value::Undef, Value::Undef),
                             };
-                            h.queue_micro(cb, vec![nullv, pubk, prvk]);
+                            h.queue_io_callback(cb, vec![nullv, pubk, prvk]);
                         }),
                         Err(e) => {
                             let errv = with_host(|h| h.new_str(e));
-                            with_host(|h| h.queue_micro(cb, vec![errv]));
+                            with_host(|h| h.queue_io_callback(cb, vec![errv]));
                         }
                     }
                     Ok(Value::Undef)
@@ -429,7 +429,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 Some(cb) => {
                     with_host(|h| {
                         let nullv = h.null();
-                        h.queue_micro(cb, vec![nullv, Value::Bool(ok)]);
+                        h.queue_io_callback(cb, vec![nullv, Value::Bool(ok)]);
                     });
                     Ok(Value::Undef)
                 }
@@ -446,13 +446,13 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 (Some(cb), Ok(v)) => {
                     with_host(|h| {
                         let nullv = h.null();
-                        h.queue_micro(cb, vec![nullv, v]);
+                        h.queue_io_callback(cb, vec![nullv, v]);
                     });
                     Ok(Value::Undef)
                 }
                 (Some(cb), Err(e)) => {
                     let errv = with_host(|h| h.new_str(e));
-                    with_host(|h| h.queue_micro(cb, vec![errv]));
+                    with_host(|h| h.queue_io_callback(cb, vec![errv]));
                     Ok(Value::Undef)
                 }
                 (None, r) => r,
@@ -880,7 +880,7 @@ fn deliver_async(cb: Option<Value>, res: Result<Vec<u8>, String>) -> Result<Valu
             let bufv = super::buffer::from_bytes(&out);
             with_host(|h| {
                 let nullv = h.null();
-                h.queue_micro(cb, vec![nullv, bufv]);
+                h.queue_io_callback(cb, vec![nullv, bufv]);
             });
             Ok(Value::Undef)
         }
@@ -1225,7 +1225,7 @@ fn random_fill_async(args: &[Value]) -> Result<Value, String> {
     let filled = random_fill(&args[..n])?;
     with_host(|h| {
         let nullv = h.null();
-        h.queue_micro(cb, vec![nullv, filled]);
+        h.queue_io_callback(cb, vec![nullv, filled]);
     });
     Ok(Value::Undef)
 }

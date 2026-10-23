@@ -419,7 +419,7 @@ fn exec(args: &[Value]) -> Result<Value, String> {
     with_host(|h| {
         let so = h.new_str(out);
         let se = h.new_str(errout);
-        h.queue_micro(cb, vec![err, so, se]);
+        h.queue_io_callback(cb, vec![err, so, se]);
     });
     Ok(Value::Undef)
 }
@@ -719,7 +719,7 @@ fn exec_file(args: &[Value]) -> Result<Value, String> {
                 with_host(|h| {
                     let so = h.new_str(so);
                     let se = h.new_str(se);
-                    h.queue_micro(cb, vec![err, so, se]);
+                    h.queue_io_callback(cb, vec![err, so, se]);
                 });
             }
             let mut m = IndexMap::new();
@@ -744,7 +744,7 @@ fn exec_file(args: &[Value]) -> Result<Value, String> {
             let err = spawn_error(&file, &cmd_args, &e);
             if let Some(cb) = cb {
                 let (empty1, empty2) = with_host(|h| (h.new_str(""), h.new_str("")));
-                with_host(|h| h.queue_micro(cb, vec![err, empty1, empty2]));
+                with_host(|h| h.queue_io_callback(cb, vec![err, empty1, empty2]));
                 let null = with_host(|h| h.null());
                 let mut m = IndexMap::new();
                 m.insert("pid".into(), Value::Undef);
