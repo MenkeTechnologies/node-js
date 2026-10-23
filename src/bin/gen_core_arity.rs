@@ -56,6 +56,13 @@ for (const [id, ns] of Object.entries(spellings)) {
   }
 }
 console.log(rows.join('\n'));
+// Each module's own ENUMERABLE keys in node's order (`Object.keys`), values and
+// classes included — the order and membership `Object.keys(require(id))` shows.
+console.log('===KEYS===');
+for (const [id, ns] of Object.entries(spellings)) {
+  let mod; try { mod = require(id); } catch { continue; }
+  console.log(ns + '\t' + Object.keys(mod).join(','));
+}
 "#;
 
 fn main() {
@@ -80,7 +87,11 @@ fn main() {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    let mut rows: Vec<(String, String, String, bool)> = String::from_utf8_lossy(&out.stdout)
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (rows_text, keys_text) = text
+        .split_once("===KEYS===\n")
+        .expect("enumerator emitted no key section");
+    let mut rows: Vec<(String, String, String, bool)> = rows_text
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
@@ -134,6 +145,37 @@ fn main() {
         if *proto {
             writeln!(w, "    {key:?},").unwrap();
         }
+    }
+    writeln!(w, "];").unwrap();
+    let mut keys: Vec<(String, Vec<String>)> = keys_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (ns, list) = l.split_once('\t').unwrap_or((l, ""));
+            let list = list
+                .split(',')
+                .filter(|k| !k.is_empty())
+                .map(str::to_string)
+                .collect();
+            (ns.to_string(), list)
+        })
+        .collect();
+    keys.sort();
+    writeln!(
+        w,
+        "\n/// Each core module's own enumerable keys in node's order (`Object.keys`),\n\
+         /// keyed by namespace spelling and sorted by it; the keys within a row are\n\
+         /// not sorted.\n\
+         pub const CORE_KEYS: &[(&str, &[&str])] = &["
+    )
+    .unwrap();
+    for (ns, list) in &keys {
+        let list = list
+            .iter()
+            .map(|k| format!("{k:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(w, "    ({ns:?}, &[{list}]),").unwrap();
     }
     writeln!(w, "];").unwrap();
 }
