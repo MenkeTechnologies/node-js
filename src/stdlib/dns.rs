@@ -184,34 +184,83 @@ pub fn constant(name: &str) -> Option<Value> {
 }
 
 /// String error-code constants (`dns.NODATA === 'ENODATA'`, …).
+const CODE_CONSTANTS: &[(&str, &str)] = &[
+    ("NODATA", "ENODATA"),
+    ("FORMERR", "EFORMERR"),
+    ("SERVFAIL", "ESERVFAIL"),
+    ("NOTFOUND", "ENOTFOUND"),
+    ("NOTIMP", "ENOTIMP"),
+    ("REFUSED", "EREFUSED"),
+    ("BADQUERY", "EBADQUERY"),
+    ("BADNAME", "EBADNAME"),
+    ("BADFAMILY", "EBADFAMILY"),
+    ("BADRESP", "EBADRESP"),
+    ("CONNREFUSED", "ECONNREFUSED"),
+    ("TIMEOUT", "ETIMEOUT"),
+    ("EOF", "EOF"),
+    ("FILE", "EFILE"),
+    ("NOMEM", "ENOMEM"),
+    ("DESTRUCTION", "EDESTRUCTION"),
+    ("BADSTR", "EBADSTR"),
+    ("BADFLAGS", "EBADFLAGS"),
+    ("NONAME", "ENONAME"),
+    ("BADHINTS", "EBADHINTS"),
+    ("NOTINITIALIZED", "ENOTINITIALIZED"),
+    ("LOADIPHLPAPI", "ELOADIPHLPAPI"),
+    ("ADDRGETNETWORKPARAMS", "EADDRGETNETWORKPARAMS"),
+    ("CANCELLED", "ECANCELLED"),
+];
+
 fn code_constant(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "NODATA" => "ENODATA",
-        "FORMERR" => "EFORMERR",
-        "SERVFAIL" => "ESERVFAIL",
-        "NOTFOUND" => "ENOTFOUND",
-        "NOTIMP" => "ENOTIMP",
-        "REFUSED" => "EREFUSED",
-        "BADQUERY" => "EBADQUERY",
-        "BADNAME" => "EBADNAME",
-        "BADFAMILY" => "EBADFAMILY",
-        "BADRESP" => "EBADRESP",
-        "CONNREFUSED" => "ECONNREFUSED",
-        "TIMEOUT" => "ETIMEOUT",
-        "EOF" => "EOF",
-        "FILE" => "EFILE",
-        "NOMEM" => "ENOMEM",
-        "DESTRUCTION" => "EDESTRUCTION",
-        "BADSTR" => "EBADSTR",
-        "BADFLAGS" => "EBADFLAGS",
-        "NONAME" => "ENONAME",
-        "BADHINTS" => "EBADHINTS",
-        "NOTINITIALIZED" => "ENOTINITIALIZED",
-        "LOADIPHLPAPI" => "ELOADIPHLPAPI",
-        "ADDRGETNETWORKPARAMS" => "EADDRGETNETWORKPARAMS",
-        "CANCELLED" => "ECANCELLED",
-        _ => return None,
-    })
+    CODE_CONSTANTS
+        .iter()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| *v)
+}
+
+/// Every name [`constant`] answers — the namespace's value exports, listed
+/// for `is_method` and the key listing. Kept in step with [`CODE_CONSTANTS`]
+/// by the `value_keys_cover_every_constant` test.
+pub const VALUE_KEYS: &[&str] = &[
+    "ADDRCONFIG",
+    "ALL",
+    "V4MAPPED",
+    "NODATA",
+    "FORMERR",
+    "SERVFAIL",
+    "NOTFOUND",
+    "NOTIMP",
+    "REFUSED",
+    "BADQUERY",
+    "BADNAME",
+    "BADFAMILY",
+    "BADRESP",
+    "CONNREFUSED",
+    "TIMEOUT",
+    "EOF",
+    "FILE",
+    "NOMEM",
+    "DESTRUCTION",
+    "BADSTR",
+    "BADFLAGS",
+    "NONAME",
+    "BADHINTS",
+    "NOTINITIALIZED",
+    "LOADIPHLPAPI",
+    "ADDRGETNETWORKPARAMS",
+    "CANCELLED",
+    "promises",
+];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn value_keys_cover_every_constant() {
+        for (k, _) in super::CODE_CONSTANTS {
+            assert!(super::VALUE_KEYS.contains(k), "{k} missing from VALUE_KEYS");
+        }
+        assert_eq!(super::VALUE_KEYS.len(), super::CODE_CONSTANTS.len() + 4);
+    }
 }
 
 // ── dns.lookup (getaddrinfo) ─────────────────────────────────────────────────

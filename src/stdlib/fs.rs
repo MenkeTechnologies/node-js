@@ -149,7 +149,20 @@ fn register_fd(file: File) -> i32 {
 }
 
 fn with_file<R>(fd: i32, f: impl FnOnce(&File) -> R) -> Option<R> {
-    FD_TABLE.with(|t| t.borrow().get(&fd).map(f))
+    if FD_TABLE.with(|t| t.borrow().contains_key(&fd)) {
+        return FD_TABLE.with(|t| t.borrow().get(&fd).map(f));
+    }
+    // The process's own stdin/stdout/stderr are descriptors 0–2 in node too:
+    // `fs.writeSync(1, s)` writes to stdout and `fs.fstatSync(0)` stats stdin.
+    // They are never in the table (nothing here opened them), so they are
+    // borrowed for the one call — `ManuallyDrop`, so the borrow never closes
+    // the real descriptor.
+    if (0..=2).contains(&fd) {
+        use std::os::unix::io::FromRawFd;
+        let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+        return Some(f(&file));
+    }
+    None
 }
 
 /// The file descriptor an fs call names when its first argument is a number
@@ -1667,16 +1680,42 @@ fn ftruncate_impl(args: &[Value]) -> Result<Value, String> {
     }
 }
 
+/// libuv's `uv__fs_fsync` / `uv__fs_fdatasync`: on macOS `F_FULLFSYNC`, then
+/// `F_BARRIERFSYNC`, then plain `fsync(2)`, so the error a descriptor that
+/// cannot be synced reports is `fsync`'s (`EINVAL` for a pipe), not the
+/// first fcntl's; elsewhere `fsync(2)` / `fdatasync(2)`.
+fn uv_fsync(fd: libc::c_int, data_only: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let rc = unsafe {
+        let _ = data_only;
+        let mut rc = libc::fcntl(fd, libc::F_FULLFSYNC);
+        if rc != 0 {
+            rc = libc::fcntl(fd, 85 /* F_BARRIERFSYNC */);
+        }
+        if rc != 0 {
+            rc = libc::fsync(fd);
+        }
+        rc
+    };
+    #[cfg(not(target_os = "macos"))]
+    let rc = unsafe {
+        if data_only {
+            libc::fdatasync(fd)
+        } else {
+            libc::fsync(fd)
+        }
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn fsync_impl(args: &[Value], data_only: bool) -> Result<Value, String> {
     let fd = arg_num(args, 0) as i32;
     let op = if data_only { "fdatasync" } else { "fsync" };
-    let r = with_file(fd, |file| {
-        if data_only {
-            file.sync_data()
-        } else {
-            file.sync_all()
-        }
-    });
+    let r = with_file(fd, |file| uv_fsync(file.as_raw_fd(), data_only));
     match r {
         Some(Ok(_)) => Ok(Value::Undef),
         Some(Err(e)) => Err(err_str(op, "", &e)),
@@ -1771,6 +1810,7 @@ fn build_stats(h: &mut crate::host::JsHost, md: &std::fs::Metadata, bigint: bool
     m.insert("@@native".into(), h.new_str(tag));
     m.insert("@@isFile".into(), Value::Bool(md.is_file()));
     m.insert("@@isDir".into(), Value::Bool(md.is_dir()));
+    insert_special_types(&mut m, &ft);
     m.insert("@@isSymlink".into(), Value::Bool(ft.is_symlink()));
     let fields: [(&str, i128); 10] = [
         ("dev", md.dev() as i128),
@@ -2424,9 +2464,8 @@ pub fn dirent_call(recv: &Value, method: &str) -> Result<Value, String> {
     type_test(recv, method, "dirent")
 }
 
-/// Shared `is*` predicates for `Stats` and `Dirent` (both carry `@@isFile`/
-/// `@@isDir`/`@@isSymlink`; the device/FIFO/socket predicates are always false —
-/// node-js does not model those file types).
+/// Shared `is*` predicates for `Stats` and `Dirent`, read from the type flags
+/// both carry (`@@isFile`, `@@isDir`, `@@isSymlink`, `@@isFIFO`, …).
 fn type_test(recv: &Value, method: &str, what: &str) -> Result<Value, String> {
     let read = |key: &str| {
         with_host(|h| match h.get(recv) {
@@ -2438,7 +2477,10 @@ fn type_test(recv: &Value, method: &str, what: &str) -> Result<Value, String> {
         "isFile" => Ok(Value::Bool(read("@@isFile"))),
         "isDirectory" => Ok(Value::Bool(read("@@isDir"))),
         "isSymbolicLink" => Ok(Value::Bool(read("@@isSymlink"))),
-        "isBlockDevice" | "isCharacterDevice" | "isFIFO" | "isSocket" => Ok(Value::Bool(false)),
+        "isBlockDevice" => Ok(Value::Bool(read("@@isBlockDev"))),
+        "isCharacterDevice" => Ok(Value::Bool(read("@@isCharDev"))),
+        "isFIFO" => Ok(Value::Bool(read("@@isFIFO"))),
+        "isSocket" => Ok(Value::Bool(read("@@isSocket"))),
         _ => Err(crate::host::type_error(&format!(
             "{what}.{method} is not a function"
         ))),
@@ -2519,6 +2561,7 @@ fn build_dirent(
     m.insert("@@isFile".into(), Value::Bool(ft.is_file()));
     m.insert("@@isDir".into(), Value::Bool(ft.is_dir()));
     m.insert("@@isSymlink".into(), Value::Bool(ft.is_symlink()));
+    insert_special_types(&mut m, &ft);
     h.new_object(m)
 }
 
@@ -2882,4 +2925,16 @@ fn err_str(op: &str, path: &str, e: &std::io::Error) -> String {
     } else {
         format!("Error: {code}: {reason}, {op} '{path}'")
     }
+}
+
+/// The four file types node tests besides file/directory/symlink — a pipe
+/// (stdin under `|`), a terminal or `/dev/null`, a block device, a socket —
+/// recorded for `Stats`/`Dirent`'s `isFIFO`/`isCharacterDevice`/… They all
+/// answered `false`.
+fn insert_special_types(m: &mut IndexMap<String, Value>, ft: &std::fs::FileType) {
+    use std::os::unix::fs::FileTypeExt;
+    m.insert("@@isFIFO".into(), Value::Bool(ft.is_fifo()));
+    m.insert("@@isCharDev".into(), Value::Bool(ft.is_char_device()));
+    m.insert("@@isBlockDev".into(), Value::Bool(ft.is_block_device()));
+    m.insert("@@isSocket".into(), Value::Bool(ft.is_socket()));
 }

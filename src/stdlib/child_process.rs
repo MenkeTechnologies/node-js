@@ -97,6 +97,7 @@ fn child_object(extra: IndexMap<String, Value>) -> Value {
 
 /// Result of running a child to completion: exit code (`None` if terminated by a
 /// signal), captured stdout, captured stderr.
+#[derive(Clone)]
 struct Run {
     status: Option<i32>,
     /// The signal that terminated the child, when one did.
@@ -389,11 +390,26 @@ fn exec_file_sync(args: &[Value]) -> Result<Value, String> {
 fn exec(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     // Callback is the last function-shaped argument.
-    let Some(cb) = args.last().cloned() else {
-        return Ok(Value::Undef);
+    let cb = args
+        .last()
+        .filter(|v| with_host(|h| crate::host::is_callable(h, v)))
+        .cloned();
+    // node's `exec` is `execFile('/bin/sh', ['-c', command])`: it RETURNS the
+    // ChildProcess (whose events fire), and the callback is that child's first
+    // `close` listener. It returned `undefined`, so `promisify(exec)(cmd).child`
+    // and `exec(cmd, cb).on('exit', …)` had no child to reach.
+    let sh_args = ["-c".to_string(), cmd.clone()];
+    let result = run("/bin/sh", &sh_args, &spawn_opts(args, 1));
+    let child = spawned_child(
+        "/bin/sh",
+        &sh_args,
+        [Disposition::Pipe; 3],
+        clone_run(&result),
+    );
+    let Some(cb) = cb else {
+        return Ok(child);
     };
-    let (err, out, errout) = match run("sh", &["-c".to_string(), cmd.clone()], &spawn_opts(args, 1))
-    {
+    let (err, out, errout) = match result {
         Ok(r) => {
             let stdout = String::from_utf8_lossy(&r.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&r.stderr).into_owned();
@@ -416,12 +432,21 @@ fn exec(args: &[Value]) -> Result<Value, String> {
             String::new(),
         ),
     };
-    with_host(|h| {
-        let so = h.new_str(out);
-        let se = h.new_str(errout);
-        h.queue_io_callback(cb, vec![err, so, se]);
-    });
-    Ok(Value::Undef)
+    let (so, se) = with_host(|h| (h.new_str(out), h.new_str(errout)));
+    on_close_call(&child, cb, vec![err, so, se])?;
+    Ok(child)
+}
+
+/// A second copy of a run's outcome (the child's events and the callback each
+/// take one); an error keeps its kind and OS code.
+fn clone_run(r: &std::io::Result<Run>) -> std::io::Result<Run> {
+    match r {
+        Ok(run) => Ok(run.clone()),
+        Err(e) => Err(match e.raw_os_error() {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None => std::io::Error::new(e.kind(), e.to_string()),
+        }),
+    }
 }
 
 /// `spawn(command, args[, options])` — see the module doc comment: runs the
@@ -431,6 +456,19 @@ fn spawn(args: &[Value]) -> Result<Value, String> {
     let cmd = arg_str(args, 0);
     let cmd_args = arg_array(args, 1);
     let disp = stdio_dispositions(args.get(2));
+    let result = run(&cmd, &cmd_args, &spawn_opts(args, 2));
+    Ok(spawned_child(&cmd, &cmd_args, disp, result))
+}
+
+/// The ChildProcess for a child that has already run: `stdout`/`stderr`
+/// streams per `disp`, and its `spawn`/`data`/`exit`/`close` (or `error`)
+/// events queued for delivery. Shared by `spawn`, `exec` and `execFile`.
+fn spawned_child(
+    cmd: &str,
+    cmd_args: &[String],
+    disp: [Disposition; 3],
+    result: std::io::Result<Run>,
+) -> Value {
     let null = with_host(|h| h.null());
     let pipe = |d: Disposition| match d {
         Disposition::Pipe => child_pipe(),
@@ -438,7 +476,7 @@ fn spawn(args: &[Value]) -> Result<Value, String> {
     };
     let (stdout, stderr) = (pipe(disp[1]), pipe(disp[2]));
     let mut m = IndexMap::new();
-    let (status, signal, out, err, spawn_err) = match run(&cmd, &cmd_args, &spawn_opts(args, 2)) {
+    let (status, signal, out, err, spawn_err) = match result {
         Ok(r) => {
             m.insert("pid".into(), Value::Float(r.pid as f64));
             (r.status, r.signal, r.stdout, r.stderr, None)
@@ -452,7 +490,7 @@ fn spawn(args: &[Value]) -> Result<Value, String> {
                 None,
                 Vec::new(),
                 Vec::new(),
-                Some(spawn_error(&cmd, &cmd_args, &e)),
+                Some(spawn_error(cmd, cmd_args, &e)),
             )
         }
     };
@@ -480,7 +518,31 @@ fn spawn(args: &[Value]) -> Result<Value, String> {
         let cb = h.alloc(JsObj::Builtin("child_process.@@childEvents".into()));
         h.add_timer(-1.0, cb, vec![child.clone()], None);
     });
-    Ok(child)
+    child
+}
+
+/// Give `child` its first `close` listener: the exec-style callback, called
+/// as `cb(err, stdout, stderr)` — so it runs where node's does, after `exit`
+/// and ahead of any `close` listener the caller adds.
+fn on_close_call(child: &Value, cb: Value, cb_args: Vec<Value>) -> Result<(), String> {
+    thread_local! {
+        static BIND: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    let bind = match BIND.with(|b| b.borrow().clone()) {
+        Some(f) => f,
+        None => {
+            let f = crate::eval_in_global_scope(
+                "(function (cb, args) { return function () { Reflect.apply(cb, undefined, args); }; })",
+            )?;
+            BIND.with(|b| *b.borrow_mut() = Some(f.clone()));
+            f
+        }
+    };
+    let args = with_host(|h| h.new_array(cb_args));
+    let listener = crate::host::invoke(&bind, vec![cb, args], None)?;
+    let close = with_host(|h| h.new_str("close"));
+    super::events::instance_call(child, "on", vec![close, listener])?;
+    Ok(())
 }
 
 /// Where a spawned child's stdout or stderr goes (`options.stdio`).

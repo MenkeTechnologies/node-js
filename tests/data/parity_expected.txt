@@ -1083,6 +1083,27 @@ raw      1 true
 chain    true
 removeAll 0
 subclass 1 true
+==== eventson.js ====
+[[1,2],[3],[4]] 0 0
+val [ 'a' ]
+err boom
+{ done: true, value: undefined }
+[[1]] 0
+AbortError ABORT_ERR r
+ERR_INVALID_ARG_TYPE The "options" argument must be of type object. Received type number (5)
+ERR_INVALID_ARG_TYPE The "options.signal" property must be an instance of AbortSignal. Received type number (5)
+ERR_OUT_OF_RANGE The value of "options.highWaterMark" is out of range. It must be >= 1 && <= 9007199254740991. Received 0
+AbortError
+foo false
+function 2 true
+ERR_INVALID_ARG_TYPE The "EventEmitter.AsyncIterator" property must be an instance of Error. Received type number (5)
+==== execchild.js ====
+ChildProcess number function true function
+object number
+nocb number
+true true
+data "hi\n" | exit 2 null | cb 2 "hi\n" "e\n" | close 2
+prom {"stdout":"z\n","stderr":""}
 ==== existsdeprecation.js ====
 nul     false
 object  false
@@ -1375,6 +1396,15 @@ stat-dir      [false,true]
 roundtrip     ["abc!",false]
 ==== fspromiseorder.js ====
 tick micro micro2 | await readFile stat ENOENT
+==== funcprototypes.js ====
+readFileSync length,name,prototype true true true,false,false true true constructor 0
+join length,name false false undefined undefined undefined undefined 0
+format length,name,prototype true true true,false,false true true constructor 0
+readFile length,name false false undefined undefined undefined undefined 0
+once length,name false false undefined undefined undefined undefined 0
+cpus length,name,prototype true true true,false,false true true constructor 0
+1
+2 1 strict 0
 ==== generators.js ====
 range [ 2, 3, 4, 5, 6 ]
 fib [ 0, 1, 1, 2, 3, 5 ]
@@ -2055,6 +2085,80 @@ subtle   object function
 digest   ArrayBuffer 32 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 digest1  20 7037807198c22a7d2b0807371d763779a84fdfcf
 unknown  NotSupportedError Unrecognized algorithm name true
+==== nsinspect.js ====
+<ref *2> {
+  resolve: [Function: resolve],
+  normalize: [Function: normalize],
+  isAbsolute: [Function: isAbsolute],
+  join: [Function: join],
+  relative: [Function: relative],
+  toNamespacedPath: [Function: toNamespacedPath],
+  dirname: [Function: dirname],
+  basename: [Function: basename],
+  extname: [Function: extname],
+  format: [Function: bound _format],
+  parse: [Function: parse],
+  matchesGlob: [Function: matchesGlob],
+  sep: '/',
+  delimiter: ':',
+  win32: <ref *1> {
+    resolve: [Function: resolve],
+    normalize: [Function: normalize],
+    isAbsolute: [Function: isAbsolute],
+    join: [Function: join],
+    relative: [Function: relative],
+    toNamespacedPath: [Function: toNamespacedPath],
+    dirname: [Function: dirname],
+    basename: [Function: basename],
+    extname: [Function: extname],
+    format: [Function: bound _format],
+    parse: [Function: parse],
+    matchesGlob: [Function: matchesGlob],
+    sep: '\\',
+    delimiter: ';',
+    win32: [Circular *1],
+    posix: [Circular *2],
+    _makeLong: [Function: toNamespacedPath]
+  },
+  posix: [Circular *2],
+  _makeLong: [Function: toNamespacedPath]
+}
+{
+  unescapeBuffer: [Function: unescapeBuffer],
+  unescape: [Function: qsUnescape],
+  escape: [Function: qsEscape],
+  stringify: [Function: stringify],
+  encode: [Function: stringify],
+  parse: [Function: parse],
+  decode: [Function: parse]
+}
+{ StringDecoder: [Function: StringDecoder] }
+<ref *1> {
+  resolve: [Function: resolve],
+  normalize: [Function: normalize],
+  isAbsolute: [Function: isAbsolute],
+  join: [Function: join],
+  relative: [Function: relative],
+  toNamespacedPath: [Function: toNamespacedPath],
+  dirname: [Function: dirname],
+  basename: [Function: basename],
+  extname: [Function: extname],
+  format: [Function: bound _format],
+  parse: [Function: parse],
+  matchesGlob: [Function: matchesGlob],
+  sep: '/',
+  delimiter: ':',
+  win32: [Object],
+  posix: [Circular *1],
+  _makeLong: [Function: toNamespacedPath]
+}
+resolve,normalize,isAbsolute,join,relative,toNamespacedPath,dirname,basename,extname,format,parse,matchesGlob,sep,delimiter,win32,posix,_makeLong
+arch,availableParallelism,cpus,endianness,freemem,getPriority,homedir,hostname,loadavg,networkInterfaces,platform,release,setPriority,tmpdir,totalmem,type,userInfo,uptime,version,machine,constants,EOL,devNull
+setTimeout,clearTimeout,setImmediate,clearImmediate,setInterval,clearInterval,promises
+true,true,true
+true true
+lookup,lookupService,getDefaultResultOrder,setDefaultResultOrder,setServers,ADDRCONFIG,ALL,V4MAPPED,NODATA,FORMERR,SERVFAIL,NOTFOUND,NOTIMP,REFUSED,BADQUERY,BADNAME,BADFAMILY,BADRESP,CONNREFUSED,TIMEOUT,EOF,FILE,NOMEM,DESTRUCTION,BADSTR,BADFLAGS,NONAME,BADHINTS,NOTINITIALIZED,LOADIPHLPAPI,ADDRGETNETWORKPARAMS,CANCELLED,getServers,resolve,resolve4,resolve6,resolveAny,resolveCaa,resolveCname,resolveMx,resolveNaptr,resolveNs,resolvePtr,resolveSoa,resolveSrv,resolveTlsa,resolveTxt,reverse,promises
+arch,availableParallelism,cpus,endianness,freemem,getPriority,homedir,hostname,loadavg,networkInterfaces,platform,release,setPriority,tmpdir,totalmem,type,userInfo,uptime,version,machine,constants,EOL,devNull
 ==== numbers.js ====
 0.30000000000000004 0.30 1234.57
 1234.57 ff 11111111
@@ -2894,6 +2998,14 @@ bigint bigint
 function true false true true true
 cb bigint
 pr bigint
+==== stdiofds.js ====
+0 number true
+1 number true
+2 number true
+w1
+fsync EINVAL
+null true false false false false
+cb null number
 ==== streams.js ====
 transform A,B,C
 filter    keep,last

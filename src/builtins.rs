@@ -2912,13 +2912,14 @@ pub fn namespace_constants(ns: &str) -> &'static [(&'static str, f64)] {
 /// require('path').join                                 w=true  e=true  c=true
 /// ```
 ///
-/// So: a constant (and a constructor's `prototype`) is frozen, a function's own
+/// So: a constant (and a constructor's `prototype` — an ordinary core-module
+/// function's is writable) is frozen, a function's own
 /// `name`/`length` is read-only but configurable, and everything else is an
 /// ordinary method — enumerable exactly when the namespace enumerates it, which
 /// is what separates a core module's exports from an ECMAScript namespace's.
 fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
     let frozen = namespace_constants(ns).iter().any(|(k, _)| *k == key)
-        || key == "prototype"
+        || key == "prototype" && !core_function_prototyped(ns)
         || (ns == "Symbol" && host::WELL_KNOWN_SYMBOLS.contains(&key));
     let own_fn_meta = matches!(key, "name" | "length") && host::builtin_is_callable(ns);
     // A key a SCRIPT assigned is an ordinary writable/enumerable/configurable
@@ -2941,7 +2942,10 @@ fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
             Value::Bool(assigned || (!frozen && !own_fn_meta)),
         );
         m.insert("enumerable".into(), Value::Bool(enumerable));
-        m.insert("configurable".into(), Value::Bool(assigned || !frozen));
+        m.insert(
+            "configurable".into(),
+            Value::Bool(assigned || builtin_member_configurable(ns, key)),
+        );
         h.new_object(m)
     })
 }
@@ -3240,6 +3244,13 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
         {
             return with_host(|h| h.alloc(JsObj::Builtin(format!("@proto:{class}:{name}"))));
         }
+    }
+    // A core-module function written as an ordinary `function` owns a
+    // `prototype` (`fs.readFileSync.prototype.constructor === fs.readFileSync`);
+    // which ones do is measured into `CORE_PROTOTYPED`. One object per
+    // function, so the read is stable.
+    if name == "prototype" && core_function_prototyped(ns) {
+        return core_function_prototype(ns);
     }
     // `require('timers').setTimeout` IS the global `setTimeout` (and likewise
     // the other five); it was a distinct function, so `===` said false.
@@ -6967,6 +6978,13 @@ pub fn builtin_meta(key: &str) -> Option<(&'static str, u32)> {
         // reference binary by `gen-core-arity`. `.length` read `undefined` for
         // every one of them.
         .or_else(|| {
+            // `require('assert').strict` is the builtin this frontend keys
+            // `assertStrict` (it is also the `assert/strict` module); the
+            // measured table keys it as the member it is.
+            let key = match key {
+                "assertStrict" => "assert.strict",
+                k => k,
+            };
             let t = crate::core_arity::CORE_ARITY;
             t.binary_search_by(|(k, _, _)| (*k).cmp(key))
                 .ok()
@@ -9466,6 +9484,9 @@ fn object_keys(args: Vec<Value>, mode: u8) -> Result<Value, String> {
                 names.push("length".to_string());
             }
             names.push("name".to_string());
+            if core_function_prototyped(&ns) {
+                names.push("prototype".to_string());
+            }
         }
         // Whatever a script assigned onto the namespace, in assignment order and
         // after the built-in members — an ordinary enumerable own property, so
@@ -17437,4 +17458,33 @@ fn json_gap(space: Value) -> Result<Option<String>, String> {
     Ok(with_host(|h| h.as_str(&space))
         .filter(|s| !s.is_empty())
         .map(|s| crate::utf16::Units::of(&s).slice(0, 10)))
+}
+
+/// Whether the core-module function keyed `ns` owns a `prototype` in node.
+pub(crate) fn core_function_prototyped(ns: &str) -> bool {
+    crate::core_arity::CORE_PROTOTYPED
+        .binary_search(&ns)
+        .is_ok()
+}
+
+/// The `prototype` object of a core-module function: `{ constructor: fn }`
+/// (non-enumerable), made once per function.
+fn core_function_prototype(ns: &str) -> Value {
+    thread_local! {
+        static PROTOS: std::cell::RefCell<std::collections::HashMap<String, Value>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(p) = PROTOS.with(|m| m.borrow().get(ns).cloned()) {
+        return p;
+    }
+    let proto = with_host(|h| {
+        let ctor = h.alloc(JsObj::Builtin(ns.to_string()));
+        let mut m = IndexMap::new();
+        m.insert("constructor".to_string(), ctor);
+        let p = h.new_object(m);
+        h.hide_prop(&p, "constructor");
+        p
+    });
+    PROTOS.with(|m| m.borrow_mut().insert(ns.to_string(), proto.clone()));
+    proto
 }

@@ -5601,7 +5601,12 @@ impl JsHost {
                             }
                         }
                     } else {
-                        format!("[Function: {}]", crate::builtins::builtin_name(n))
+                        // A measured core function can be anonymous (`os.freemem`
+                        // is an arrow assigned by name-less property).
+                        match crate::builtins::builtin_name(n) {
+                            "" => "[Function (anonymous)]".to_string(),
+                            name => format!("[Function: {name}]"),
+                        }
                     }
                 }
                 // A bound method is not anonymous: it is the prototype method it
@@ -6757,6 +6762,8 @@ type AccessorShown = (&'static str, Option<Result<Value, Value>>);
 
 thread_local! {
     static CUSTOM_RENDERS: RefCell<HashMap<u32, CustomRender>> = RefCell::new(HashMap::new());
+    /// The stand-in object for each module namespace in the current render.
+    static NAMESPACE_SNAPSHOTS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     /// `getters`: the value each own getter returned, keyed by object and key.
     static GETTER_RENDERS: RefCell<HashMap<(u32, String), Result<Value, Value>>> = RefCell::new(HashMap::new());
     /// `util.inspect`'s `getters` option: 0 off, 1 every getter, 2 only
@@ -6799,12 +6806,14 @@ fn with_custom_renders(
     // answers are set aside and restored rather than shared.
     let saved = CUSTOM_RENDERS.with(|m| std::mem::take(&mut *m.borrow_mut()));
     let saved_getters = GETTER_RENDERS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    let saved_snaps = NAMESPACE_SNAPSHOTS.with(|m| std::mem::take(&mut *m.borrow_mut()));
     let mut seen = HashSet::new();
     let mut ctx = None;
     let r = collect_custom_renders(v, 0, &mut seen, &mut ctx);
     let out = r.map(|()| with_host(|h| render(h)));
     CUSTOM_RENDERS.with(|m| *m.borrow_mut() = saved);
     GETTER_RENDERS.with(|m| *m.borrow_mut() = saved_getters);
+    NAMESPACE_SNAPSHOTS.with(|m| *m.borrow_mut() = saved_snaps);
     out
 }
 
@@ -6878,6 +6887,25 @@ fn custom_inspect_args() -> Result<(Value, Value), String> {
 
 /// Walk what the render will expand from `v` at nesting `level`, running each
 /// custom inspect method found and recording its answer.
+/// The plain-object stand-in for module namespace `ns` in one render: its
+/// enumerable keys (`namespace_keys`, node's order) and their values.
+fn namespace_snapshot(ns: &str) -> Value {
+    if let Some(s) = NAMESPACE_SNAPSHOTS.with(|m| m.borrow().get(ns).cloned()) {
+        return s;
+    }
+    let snap = with_host(|h| h.new_object(IndexMap::new()));
+    NAMESPACE_SNAPSHOTS.with(|m| m.borrow_mut().insert(ns.to_string(), snap.clone()));
+    for k in crate::stdlib::namespace_keys(ns) {
+        let val = crate::builtins::namespace_property(ns, &k);
+        with_host(|h| {
+            if let Some(JsObj::Object(p)) = h.get_mut(&snap) {
+                p.insert(k, val);
+            }
+        });
+    }
+    snap
+}
+
 fn collect_custom_renders(
     v: &Value,
     level: i64,
@@ -6929,6 +6957,26 @@ fn collect_custom_renders(
             CUSTOM_RENDERS.with(|m| m.borrow_mut().insert(*id, render));
             return Ok(());
         }
+    }
+    // A core-module namespace (`require('path')`) inspects as node prints it:
+    // a plain object of its members. Rendering one needs each member's VALUE,
+    // which cannot be built under the render's host borrow, so a snapshot is
+    // built here and rendered in its place — one per module per render, so
+    // `path.posix` inside `path` is the same object and prints `[Circular]`.
+    if let Some(ns) = with_host(|h| match h.get(v) {
+        Some(JsObj::Builtin(n))
+            if !builtin_is_callable(n) && crate::stdlib::core_keys(n).is_some() =>
+        {
+            Some(n.clone())
+        }
+        _ => None,
+    }) {
+        let snap = namespace_snapshot(&ns);
+        CUSTOM_RENDERS.with(|m| {
+            m.borrow_mut()
+                .insert(*id, CustomRender::Value(snap.clone()))
+        });
+        return collect_custom_renders(&snap, level, seen, ctx);
     }
     // Only a value the render EXPANDS has its children rendered.
     if level > inspect_max_depth() {

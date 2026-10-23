@@ -300,7 +300,8 @@ pub fn namespace_statics_enumerable(ns: &str) -> bool {
 /// read resolves through [`constant`] before any method thunk is considered.
 pub fn namespace_values(ns: &str) -> &'static [&'static str] {
     match ns {
-        "timers" | "dns" | "readline" | "stream" | "Stream" => &["promises"],
+        "timers" | "readline" | "stream" | "Stream" => &["promises"],
+        "dns" => dns::VALUE_KEYS,
         "assert" => &["strict"],
         "EventEmitter" => &[
             "usingDomains",
@@ -309,8 +310,31 @@ pub fn namespace_values(ns: &str) -> &'static [&'static str] {
             "errorMonitor",
             "defaultMaxListeners",
         ],
-        "path" | "path/win32" => &["win32", "posix"],
-        "crypto" => &["webcrypto", "subtle"],
+        "path" | "path/win32" => &["sep", "delimiter", "win32", "posix"],
+        "crypto" => &["constants", "webcrypto", "subtle"],
+        "os" => &["constants", "EOL", "devNull"],
+        "fs" | "fs/promises" | "http2" => &["constants"],
+        "buffer" => &[
+            "kMaxLength",
+            "kStringMaxLength",
+            "constants",
+            "INSPECT_MAX_BYTES",
+        ],
+        "http" => &["METHODS", "STATUS_CODES", "globalAgent"],
+        "https" => &["globalAgent"],
+        "perf_hooks" => &["performance", "constants"],
+        "worker_threads" => &["isMainThread", "threadId", "parentPort", "workerData"],
+        "cluster" => &[
+            "isWorker",
+            "isMaster",
+            "isPrimary",
+            "workers",
+            "settings",
+            "SCHED_NONE",
+            "SCHED_RR",
+            "schedulingPolicy",
+        ],
+        "domain" => &["active"],
         _ => &[],
     }
 }
@@ -338,7 +362,28 @@ pub fn namespace_keys(ns: &str) -> Vec<String> {
             out.push((*m).to_string());
         }
     }
+    // A core module enumerates in NODE's order (measured into `CORE_KEYS`),
+    // listing only what this frontend implements. This runs under the host
+    // borrow (`for-in`), so it consults the static lists above and never
+    // reads a value.
+    if ns != "process" {
+        if let Some(theirs) = core_keys(ns) {
+            return theirs
+                .iter()
+                .filter(|k| out.iter().any(|o| o == *k))
+                .map(|k| (*k).to_string())
+                .collect();
+        }
+    }
     out
+}
+
+/// node's `Object.keys(require(id))` for the core module spelled `ns`.
+pub fn core_keys(ns: &str) -> Option<&'static [&'static str]> {
+    let t = crate::core_arity::CORE_KEYS;
+    t.binary_search_by(|(k, _)| (*k).cmp(ns))
+        .ok()
+        .map(|i| t[i].1)
 }
 
 /// Dispatch a resolved stdlib builtin (`assert`, or `namespace.method`). Returns
@@ -726,6 +771,9 @@ pub fn native_parent(ctor: &str) -> Option<&'static str> {
     match ctor {
         "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" => Some("Stream"),
         "Stream" => Some("EventEmitter"),
+        // Emitter-backed native classes: `child instanceof EventEmitter` holds
+        // in node, and the emitter methods are inherited.
+        "ChildProcess" | "Socket" | "Server" => Some("EventEmitter"),
         // `AbortSignal` is an `EventTarget` in node, and `CustomEvent` an `Event`,
         // so `signal instanceof EventTarget` holds and both inherit the base
         // class's methods.

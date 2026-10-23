@@ -668,10 +668,10 @@ fn resolve_waiters(recv: &Value, name: &str, args: &[Value]) {
 // ── static module functions (`require('events').once`, `.listenerCount`, …) ──
 
 /// Static functions on the `events` module namespace. `EventEmitter` (the
-/// self-ref ctor) and `EventEmitterAsyncResource` are handled by the parent;
-/// `on` (async iterator) is deferred (see module docs / final report).
+/// self-ref ctor) and `EventEmitterAsyncResource` are handled by the parent.
 pub const STATIC_METHODS: &[&str] = &[
     "once",
+    "on",
     "listenerCount",
     "getEventListeners",
     "getMaxListeners",
@@ -686,6 +686,7 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
     let emitter = args.first().cloned().unwrap_or(Value::Undef);
     Some(match method {
         "once" => Ok(once_static(emitter, &arg_str(args, 1))),
+        "on" => events_on(args),
         "listenerCount" => Ok(Value::Float(
             listeners(&emitter, &arg_str(args, 1)).len() as f64
         )),
@@ -753,4 +754,23 @@ fn add_abort_listener(args: &[Value]) -> Value {
         let _ = call_method(&signal, "addEventListener", vec![name, listener, once]);
     }
     with_host(|h| h.new_object(IndexMap::new()))
+}
+
+/// `events.on(emitter, event[, options])` — the port in `events_on.js`,
+/// evaluated once.
+fn events_on(args: &[Value]) -> Result<Value, String> {
+    thread_local! {
+        static ON: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    let on = match ON.with(|o| o.borrow().clone()) {
+        Some(f) => f,
+        None => {
+            let factory = crate::eval_in_global_scope(include_str!("events_on.js"))?;
+            let node_error = with_host(|h| h.alloc(JsObj::Builtin("util.@@nodeError".into())));
+            let made = invoke(&factory, vec![node_error], None)?;
+            ON.with(|o| *o.borrow_mut() = Some(made.clone()));
+            made
+        }
+    };
+    invoke(&on, args.to_vec(), None)
 }
