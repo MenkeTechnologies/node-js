@@ -17,7 +17,7 @@ over a generated cross-product of inputs × `parseQueryString` ×
 `slashesDenoteHost`, dumping every `Url` field),
 `util`(+`/types`), `v8`
 (serialize = JSON, not V8 binary; heap stats are a shim), `async_hooks`
-(AsyncLocalStorage sync-only; hooks are no-ops), `zlib`.
+(AsyncLocalStorage follows async work through async context frames; hooks are no-ops), `zlib`.
 
 `process.emitWarning` delivers on the next tick, as node's does: it writes to
 stderr in Node's format (`(node:PID) [CODE] Name: message`, plus the one-time
@@ -90,7 +90,9 @@ the root context) and records the creating context as its `triggerAsyncId`;
 duration of the call, so `executionAsyncId()` inside reports the resource and a
 resource constructed there inherits it as its parent. Nesting builds a real
 parent chain. `bind` (instance and static) returns the function bound to its
-`thisArg`, and `emitDestroy()` returns `this` without destroying anything.
+`thisArg` and to the async context frame the resource was made in (where
+`runInAsyncScope` also runs), and `emitDestroy()` returns `this` without
+destroying anything.
 
 The graph covers ONLY resources this module creates. node-js does not instrument
 timers, promises or sockets, so `executionAsyncId()` inside a `setTimeout`/
