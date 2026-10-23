@@ -5311,8 +5311,8 @@ impl JsHost {
                         .iter()
                         .filter_map(|k| props.get(*k).map(|val| (format!("[{k}]"), Ok(val))))
                         .collect();
-                    shown.extend(props.iter().filter(|_| !curated).filter_map(
-                        |(k, val)| match k.strip_prefix(ORD_MARKER) {
+                    shown.extend(props.iter().filter(|_| !curated).filter_map(|(k, val)| {
+                        match k.strip_prefix(ORD_MARKER) {
                             // A SYMBOL-keyed accessor is listed with the other
                             // symbol keys below, after every string key.
                             Some(real) if is_symbol_key(real) => None,
@@ -5341,8 +5341,8 @@ impl JsHost {
                                 Some((fmt_key(k), Ok(val)))
                             }
                             None => None,
-                        },
-                    ));
+                        }
+                    }));
                     // The curated accessor values, read from the hidden slots the
                     // getters read, in the order node prints them.
                     for name in inspect_members {

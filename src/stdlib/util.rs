@@ -619,10 +619,15 @@ const CALLBACKIFY_SRC: &str = "(function(original){\n\
 /// looking at the signal); it only ties the promise to an async resource for
 /// tracking, which this runtime does not model, so a valid one is then ignored.
 fn aborted(signal: &Value, resource: &Value) -> Result<Value, String> {
-    if !with_host(|h| matches!(h.get(resource), Some(crate::host::JsObj::Object(_)) | Some(crate::host::JsObj::Array(_)))
-        || crate::host::is_callable(h, resource))
-    {
-        return Err(crate::host::invalid_arg_type("resource", "argument", "object", resource));
+    if !with_host(|h| {
+        matches!(
+            h.get(resource),
+            Some(crate::host::JsObj::Object(_)) | Some(crate::host::JsObj::Array(_))
+        ) || crate::host::is_callable(h, resource)
+    }) {
+        return Err(crate::host::invalid_arg_type(
+            "resource", "argument", "object", resource,
+        ));
     }
     let already = crate::builtins::get_property(signal, "aborted").unwrap_or(Value::Undef);
     if with_host(|h| h.truthy(&already)) {

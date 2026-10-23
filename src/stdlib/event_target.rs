@@ -382,8 +382,7 @@ pub fn add_listener(target: &Value, args: &[Value]) -> Result<Value, String> {
                 h.new_object(m)
             });
             if let Value::Obj(idx) = record {
-                let thunk =
-                    with_host(|h| h.alloc(JsObj::Builtin(format!("@@evunlisten:{idx}"))));
+                let thunk = with_host(|h| h.alloc(JsObj::Builtin(format!("@@evunlisten:{idx}"))));
                 let abort = with_host(|h| h.new_str("abort"));
                 let once = with_host(|h| {
                     let mut m = IndexMap::new();
@@ -566,8 +565,14 @@ fn event_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, Strin
             }
             if !flag(recv, "@@dispatching") {
                 let ty = with_host(|h| h.str_of(&args[0]));
-                let bubbles = args.get(1).map(|v| with_host(|h| h.truthy(v))).unwrap_or(false);
-                let cancelable = args.get(2).map(|v| with_host(|h| h.truthy(v))).unwrap_or(false);
+                let bubbles = args
+                    .get(1)
+                    .map(|v| with_host(|h| h.truthy(v)))
+                    .unwrap_or(false);
+                let cancelable = args
+                    .get(2)
+                    .map(|v| with_host(|h| h.truthy(v)))
+                    .unwrap_or(false);
                 set_slot(recv, "@@type", with_host(|h| h.new_str(ty)));
                 set_slot(recv, "@@bubbles", Value::Bool(bubbles));
                 set_slot(recv, "@@cancelable", Value::Bool(cancelable));

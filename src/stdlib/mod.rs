@@ -799,7 +799,10 @@ pub fn instance_inspect_members(tag: &str) -> (&'static [&'static str], bool) {
         "AbortSignal" => (&["aborted"], true),
         // node's custom inspect for an `Event` prints these four; a `CustomEvent`
         // shows the same four (not `detail`).
-        "Event" | "CustomEvent" => (&["type", "defaultPrevented", "cancelable", "timeStamp"], true),
+        "Event" | "CustomEvent" => (
+            &["type", "defaultPrevented", "cancelable", "timeStamp"],
+            true,
+        ),
         "TextDecoder" => (&["encoding", "fatal", "ignoreBOM"], true),
         "TextEncoder" => (&["encoding"], false),
         _ => (&[], true),
