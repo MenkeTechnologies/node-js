@@ -3085,13 +3085,10 @@ have; re-blessing them would record a divergence as a target.
 
 | Case | node | node-js |
 |---|---|---|
-| `emitter.rawListeners(e)` after `emitter.once(e, f)` | the once-WRAPPER, whose `.listener` is `f` | `f` itself — once-listeners are stored unwrapped, so `listeners` and `rawListeners` coincide |
-| `util.parseArgs({ tokens: true, … })` | a `tokens` array (`option`, `positional`, `option-terminator` records with `index`/`rawName`/`inlineValue`) | no `tokens` key — `parse_args` (`src/stdlib/util.rs`) is a reimplementation, not a port of `lib/internal/util/parse_args`, and records no token stream |
 | `setTimeout[util.promisify.custom]`, `fs.exists[util.promisify.custom]` | the custom promisified function | `undefined` — `util.promisify` itself resolves these builtins' custom forms, but the symbol-keyed READ on a builtin function does not |
 | `performance instanceof Performance` | `true` | `false` — `performance` is not linked to the `Performance` class's prototype |
 | `Object.getOwnPropertyNames(ReadableStream.prototype)` | includes the `locked` accessor, in node's order | `locked` is an own data property of each stream |
 | `crypto.Crypto`, `CryptoKey`, `SubtleCrypto` globals / members | constructors | absent |
-| `require('fs/promises').open(p)` / `fs.promises.open` | a `FileHandle` (`read`, `write`, `readFile`, `stat`, `close`, …) | `open is not a function` — there is no `FileHandle` class; every other `fs/promises` member delegates to its sync twin |
 | `fs.readSync(fd, big.subarray(2), 0, 2, 0)` | the bytes appear in `big` | they land in the subarray only — the documented no-aliasing Buffer model above, reached through a write-into-view API |
 
 ## FIXED in round 18 — microtask rounds and I/O callbacks, verified against node v26.12.1
@@ -3107,3 +3104,69 @@ callback per turn after the microtask checkpoint and ahead of the timers, so a
 full checkpoint follows each callback. Two completions keep the order they were
 started in; in node that order is a thread-pool race. Pinned by
 `tests/timers.rs` (three tests, each verified to fail on the previous build).
+
+## FIXED in round 19 — verified against node v26.12.0
+
+Pinned in `examples/emitteronce.js`, `examples/parseargs.js`,
+`examples/fdargs.js`, `examples/filehandle.js`, `examples/filehandleargs.js`,
+`examples/filehandlestreams.js` and `tests/es_parity.rs`
+(`a_double_dash_ends_the_runtime_flags_and_is_in_neither_list`); each fix
+was re-broken alone and the record went red.
+
+| Case | node | was |
+|---|---|---|
+| `e.once(t, f); e.rawListeners(t)[0]` | node's `_onceWrap` wrapper (`name` `wrapper`, `.listener === f`); `listeners()` unwraps it | `f` itself — once-listeners were stored unwrapped beside a marker list |
+| `e.once(t, f); e.on(t, f); e.removeListener(t, f)` | the LAST match goes (the `on` one) | the first |
+| `e.listenerCount(t, f)` | counts `f`'s registrations, a wrapper counting for what it wraps | the second argument was ignored |
+| the `removeListener` event for a once-listener | `list.listener` for a lone listener, the wrapper itself in a longer list | never emitted for a once-listener firing |
+| `e.removeAllListeners([t])` with a `removeListener` listener | each removal announced, LIFO, `removeListener`'s own list last | the lists were dropped silently |
+| `e.once(t, g); const w = e.rawListeners(t)[0]; w(); w(); e.emit(t)` | `g` runs once and the wrapper has removed itself | `w` was `g`, so it ran three times (the two direct calls removed nothing) |
+| `util.parseArgs({ tokens: true })` | the token stream | no `tokens` key — `parse_args` was a reimplementation; it is now a port of `lib/internal/util/parse_args` (`parse_args.js` + `utils.js`) |
+| `parseArgs` config validation (`args`, `strict`, `options.x.type`/`short`/`multiple`/`default`) | node's `ERR_INVALID_ARG_TYPE` / `ERR_INVALID_ARG_VALUE` | none |
+| `parseArgs({ args: ['--foo', '-x'], options: { foo: { type: 'string' } } })` | `ERR_PARSE_ARGS_INVALID_OPTION_VALUE` "argument is ambiguous" | `foo: '-x'` |
+| `parseArgs` `-abc` in non-strict mode, `--__proto__`, `values`' prototype, the unknown-option hint under `allowPositionals` | node's expansion, ignored, `null`, the `'-- "--x"` hint | errored, stored, `Object.prototype`, no hint |
+| `node -e src -- --foo x` | `--` ends the runtime's options and is in neither `execArgv` nor `argv` | `--` and `--foo` landed in `execArgv` |
+| `fs.writeSync(fd, data, position)`, `writevSync(fd, bufs, position)` | `pwrite`: the descriptor's offset does not move | `seek` + `write`, moving it |
+| any OS error Rust's `ErrorKind` does not single out (`EBADF`, `ELOOP`, `ENAMETOOLONG`, `EXDEV`, …) | its own code, libuv message and the platform errno | `EIO: i/o error`, errno `-5`; `ENOTEMPTY`'s errno was hard-coded to macOS's 66 |
+| a failed `writevSync` / `readvSync` | `syscall` `write` / `read` | `writev` / `readv` |
+| `fs.fchmodSync(fd, '640')`, `chmodSync(p, '600')` | octal strings (`parseFileMode`) | `'644'` read as decimal: permissions 0o1204 |
+| a bad `fd` (`'x'`, `1.5`, `-1`, `2**31`, `null`) to every descriptor call, sync or callback | `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`, thrown synchronously | `EBADF` — or, for `readSync('x', buf)`, a read of stdin (`'x'` → descriptor 0) |
+| `writeSync(fd, {})`, `writeSync(fd, 5)`, an `offset`/`length` past the buffer | `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE` | wrote the 15 bytes of `[object Object]` / `"5"` / clamped |
+| `ftruncateSync(fd, 'x')`, `fchownSync(fd, 'a', 1)`, `futimesSync(fd, 'x', 1)`, `readvSync(fd, 'x')`, `writevSync(fd, [1])`, a bad `mode` | node's validators | accepted (`NaN` → 0, or nothing written) |
+| `fs.openSync(p, 'zz')`, `openSync(p, {})`, `openSync(p, 1.5)` | `ERR_INVALID_ARG_VALUE` / `ERR_OUT_OF_RANGE` | opened read-only |
+| `openSync(p, 'wx', 0o640)`, `openSync(p, fs.constants.O_RDONLY)`, `'as+'` | the mode honoured, numeric flags, `O_SYNC` | `mode` ignored, a number read as `'r'`, `as`/`as+`/`sa`/`sa+` read-only |
+| `fs.utimesSync(p, date, date)`, `futimesSync(fd, date, date)` | the `Date`'s time | the epoch: the `Date` converted through `ToNumber` of the object, which is `NaN` |
+| a path that is a number, `{}`, `undefined`, contains NUL, or is a `Uint16Array` | `ERR_INVALID_ARG_TYPE` / `ERR_INVALID_ARG_VALUE` (`getValidatedPath`, with `src`/`dest`/`oldPath`/`newPath`/`existingPath`/`target` named) | stringified and opened: `ENOENT … '5'` |
+| a `file:` URL, a Buffer or a `Uint8Array` as a path | its path | `[object Object]` |
+| `fileURLToPath('file://host/x')`, `'file:///a%2Fb'` | `ERR_INVALID_FILE_URL_HOST` / `ERR_INVALID_FILE_URL_PATH` | the host dropped, `%2F` decoded to `/` |
+| `fs.existsSync({})`, `existsSync(new URL(...))` | `false` / the URL's file | `false` / `false` |
+| `fs.createReadStream(null, { fd })`, `createWriteStream(null, { fd, autoClose: false })` | the descriptor, no `open`/`ready`; `autoClose: false` leaves it open and emits no `close` | opened the path argument (`'null'`); always closed the descriptor |
+| `require('fs/promises').open(p)` | a `FileHandle` | `open is not a function` |
+
+`FileHandle` (`src/stdlib/fs_filehandle.js`) is a port of the class in node's
+`lib/internal/fs/promises.js` over the synchronous descriptor calls: `fsCall`'s
+closed-handle `EBADF` (with the operation as `syscall`), the reference count
+that makes `close()` wait for an operation in flight, the `read`/`write`
+argument forms and their null-prototype results, `readFile`/`writeFile`/
+`appendFile` from the current position (also through
+`fsPromises.readFile(handle)`), `readv`, `writev`, `stat`, `truncate`,
+`chmod`, `chown`, `utimes`, `sync`, `datasync`, `readLines`,
+`createReadStream`/`createWriteStream` (which close the handle) and
+`Symbol.asyncDispose`. Not modelled: `getAsyncId`, `readableWebStream`, the
+transfer symbols, `options.signal`.
+
+`util.@@nodeError` is the hidden builtin through which these JavaScript ports
+raise node's coded errors (`ERR_INVALID_ARG_TYPE`, `ERR_INVALID_ARG_VALUE`,
+`ERR_OUT_OF_RANGE`, any `ERR_*` as a `TypeError`).
+
+### Still open — found in round 19, not fixed
+
+| Case | node | node-js |
+|---|---|---|
+| `fs.statSync(p, { bigint: true })`, `fstatSync(fd, { bigint: true })`, `fh.stat({ bigint: true })` | `BigIntStats` (`bigint` fields, `atimeNs`…) | plain numbers; no `*Ns` fields |
+| `util.inspect(fs.statSync(p))` | `Stats { … }` plus the four `Symbol(partial*Ns)` keys | `{ … }` |
+| `fs.existsSync({})` | `false`, plus a `DEP0187` DeprecationWarning on stderr | `false`, no warning |
+| `fs.readFile(p, cb)` started before `fsPromises.readFile(p)` | the callback first (both are thread-pool completions, in start order here) | the promise first — `fs/promises` settles synchronously, so its reaction is a microtask that runs before the poll-phase callback |
+| `Object.keys(require('util'))`, `typeof util.types` | no `types.*` keys; `'object'` | lists `types.isMap` … `types.isAsyncFunction`; `'function'` |
+| `require('util').format.length`, `fs.readFileSync.length`, any core-module function's `length` | the function's arity | `undefined` — `gen-arity` deliberately covers the ECMAScript intrinsics only (`src/bin/gen_arity.rs` module doc) |
+| `fs.read*`/`createReadStream` `start`/`end`/`highWaterMark` | honoured | a read stream emits the whole remainder as one chunk |
