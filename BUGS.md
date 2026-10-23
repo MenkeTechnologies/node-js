@@ -3085,7 +3085,6 @@ have; re-blessing them would record a divergence as a target.
 
 | Case | node | node-js |
 |---|---|---|
-| `setTimeout[util.promisify.custom]`, `fs.exists[util.promisify.custom]` | the custom promisified function | `undefined` — `util.promisify` itself resolves these builtins' custom forms, but the symbol-keyed READ on a builtin function does not |
 | `performance instanceof Performance` | `true` | `false` — `performance` is not linked to the `Performance` class's prototype |
 | `Object.getOwnPropertyNames(ReadableStream.prototype)` | includes the `locked` accessor, in node's order | `locked` is an own data property of each stream |
 | `crypto.Crypto`, `CryptoKey`, `SubtleCrypto` globals / members | constructors | absent |
@@ -3163,10 +3162,46 @@ raise node's coded errors (`ERR_INVALID_ARG_TYPE`, `ERR_INVALID_ARG_VALUE`,
 
 | Case | node | node-js |
 |---|---|---|
-| `fs.statSync(p, { bigint: true })`, `fstatSync(fd, { bigint: true })`, `fh.stat({ bigint: true })` | `BigIntStats` (`bigint` fields, `atimeNs`…) | plain numbers; no `*Ns` fields |
-| `util.inspect(fs.statSync(p))` | `Stats { … }` plus the four `Symbol(partial*Ns)` keys | `{ … }` |
-| `fs.existsSync({})` | `false`, plus a `DEP0187` DeprecationWarning on stderr | `false`, no warning |
-| `fs.readFile(p, cb)` started before `fsPromises.readFile(p)` | the callback first (both are thread-pool completions, in start order here) | the promise first — `fs/promises` settles synchronously, so its reaction is a microtask that runs before the poll-phase callback |
-| `Object.keys(require('util'))`, `typeof util.types` | no `types.*` keys; `'object'` | lists `types.isMap` … `types.isAsyncFunction`; `'function'` |
-| `require('util').format.length`, `fs.readFileSync.length`, any core-module function's `length` | the function's arity | `undefined` — `gen-arity` deliberately covers the ECMAScript intrinsics only (`src/bin/gen_arity.rs` module doc) |
-| `fs.read*`/`createReadStream` `start`/`end`/`highWaterMark` | honoured | a read stream emits the whole remainder as one chunk |
+
+## FIXED in round 20 — verified against node v26.12.0
+
+Pinned in `examples/finallythrow.js`, `utilnamespace.js`, `promisifycustom.js`,
+`existsdeprecation.js`, `statsshape.js`, `fspromiseorder.js`,
+`coremodulearity.js` and `readstreamwindow.js`; each fix was re-broken alone
+and its record went red.
+
+| Case | node | was |
+|---|---|---|
+| `try { throw o } finally { try { throw 2 } catch {} }` — any exception leaving a `finally` whose body threw and caught one of its own (sync, generator `throw()`, awaited rejection) | `o` itself | a NEW error synthesized from the message: `e !== o`, `.code` and every other property gone, an awaited rejection's message prefixed `Uncaught Error:` — the finalizer's own handled throw cleared the pending value, and `b_try` rethrew from the message string |
+| `Object.keys(require('util'))`, `Object.keys(process)` | no dotted keys | `types.isMap` … `types.isAsyncFunction`, `hrtime.bigint` — dispatch paths into a member's namespace listed as keys |
+| `typeof util.types`, `String(util.types)` | `'object'`, `[object Object]` | `'function'`, `[object Function]` |
+| `setTimeout[util.promisify.custom]`, `setImmediate[…]`, `fs.exists[…]`, `child_process.exec[…]`/`execFile[…]`, `stream.pipeline[…]`/`finished[…]`, and `c in fn` | the custom form — the same function `util.promisify(fn)` returns (`timers/promises.setTimeout`, `stream/promises.pipeline`, …) | `undefined` / `false` |
+| `require('timers').setTimeout === setTimeout` (and the other five timer functions) | `true` | `false` |
+| `fs.existsSync({})`, `existsSync(5)` | `false` and a one-time `DEP0187` DeprecationWarning (a NUL string warns nothing) | `false`, silent |
+| `fs.statSync(p, { bigint: true })`, `lstatSync`, `fstatSync`, `fs.stat`, `fsPromises.stat` | `BigIntStats`: BigInt fields, whole-millisecond `*Ms`, nanosecond `*Ns` | Numbers, no `*Ns` |
+| `util.inspect(fs.statSync(p))` | `Stats { …, Symbol(partialAtimeNs): … }` (the four sub-ms remainders are own symbol-keyed properties) | `{ … }` |
+| `typeof stat.isFile`, `stat instanceof fs.Stats`, `dirent instanceof fs.Dirent`, `Object.keys(fs)` | `'function'`, `true`, `true`, includes `Stats`/`Dirent` | `'undefined'` (callable but not readable), `fs.Stats` absent |
+| `fsPromises.readFile(p).then(r); Promise.resolve().then(m)` | `m` first — the promise settles when the work completes on the loop | `r` first: the promise was settled inside the call. It now settles from the poll-phase queue (`JsHost::queue_io_native`) |
+| `require('fs').readFileSync.length`, `util.format.length`, any core-module function's `length` (and `name`, e.g. `url.format` is `urlFormat`) | the function's arity | `undefined` |
+| `fs.createReadStream(p, { start, end, highWaterMark })`, `stream.bytesRead` | the inclusive window, one `data` per `highWaterMark` bytes, a StringDecoder across chunk boundaries, `bytesRead` counted; bad `start`/`end` throw synchronously | the whole file as one chunk; `bytesRead` undefined |
+
+The core-module arities come from a NEW generated table, `src/core_arity.rs`,
+written by `cargo run --bin gen-core-arity` (`src/bin/gen_core_arity.rs`)
+from the reference binary. It is separate from `src/arity.rs` on purpose:
+regenerating `src/arity.rs` from node v26.12.0 would add
+`Date.prototype.toTemporalInstant`, which node-js does not implement and which
+would change the two `Date.prototype` transcript lines held at v26.11.1
+(above). `src/arity.rs` is therefore NOT regenerated in this round.
+
+### Still open — found in round 20, not fixed
+
+| Case | node | node-js |
+|---|---|---|
+| `util.inspect(require('path'))` (any core-module namespace) | the members, `{ resolve: [Function: resolve], … }` | `Object [path] {}` |
+| `Object.keys(require('fs'))` and the other modules | includes `constants` and every other object-valued export | the object-valued exports are readable but not listed |
+| `require('fs').readFileSync` own keys | `length`, `name`, `prototype` | `length`, `name` — a builtin function owns no `prototype` |
+| `require('child_process').exec(cmd, cb)` | a `ChildProcess`, so `promisify(exec)(cmd).child` is one | `undefined` (exec is sync-backed) |
+| `require('events').on(emitter, name)` | an async iterator of events | absent |
+| `assert.strict.length`/`.name`, `crypto.getRandomValues.length`, `util.aborted.length` | `0`/`strict`, `1`, `2` | `undefined`/`assertStrict`, `undefined`, `undefined` — these builtins are spelled under another key than the table's |
+| `fs.fstatSync(0)` (stdin, stdout, stderr) | their stats | `EBADF` — the descriptor table holds only descriptors node-js opened |
+| `new ReadableStream({ type: 'bytes', pull(c) { c.byobRequest.view } })` | a BYOB request per pull | `byobRequest` is `null` |

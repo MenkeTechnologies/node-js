@@ -246,9 +246,11 @@ neither is derivable from a list of functions.
 Those values are normative — ECMA-262 gives each intrinsic a `length` — so the
 reference engine is a transcription source here rather than an oracle to agree
 with, and the generated table is checked in (`cargo run --bin gen-arity >
-src/arity.rs`). The core-module surface is deliberately excluded: `fs
+src/arity.rs`). The core-module surface is a different question: `fs
 .readFileSync.length` is a property of node's own JavaScript, not of any
-specification.
+specification, so **`gen-core-arity`** MEASURES it from the reference binary
+into its own table, `src/core_arity.rs` (`cargo run --bin gen-core-arity >
+src/core_arity.rs`), keyed `<namespace>.<member>`.
 
 The two tools deliberately drive DIFFERENT entry points — the corpus runs each
 case as a script FILE, the fuzzer through `-e` — because Node itself answers
