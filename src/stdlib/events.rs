@@ -1,6 +1,7 @@
 //! Node `events` module: `EventEmitter`. The emitter is an object tagged
-//! `@@native = "EventEmitter"` with hidden `@@on`/`@@once` maps (event name →
-//! listener array). `emit` collects listeners, releases the host borrow, then
+//! `@@native = "EventEmitter"` with a hidden `@@on` map (event name → the
+//! ordered RAW listener array: a `once` registration is stored as node's
+//! `_onceWrap` wrapper, whose `.listener` is the function registered). `emit` collects listeners, releases the host borrow, then
 //! invokes each so callbacks can re-enter the host.
 
 use super::arg_str;
@@ -12,11 +13,9 @@ use indexmap::IndexMap;
 pub fn new_emitter() -> Value {
     with_host(|h| {
         let on = h.new_object(IndexMap::new());
-        let once = h.new_object(IndexMap::new());
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("EventEmitter"));
         m.insert("@@on".into(), on);
-        m.insert("@@once".into(), once);
         h.new_object(m)
     })
 }
@@ -58,10 +57,14 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         // so they must resolve BEFORE the `with_host` that allocates the array —
         // nesting them inside it panics with `RefCell already borrowed`. That was
         // latent until `listeners` became reachable on a socket/request/stream.
-        // `rawListeners` returns the once-WRAPPERS in node; once-listeners are
-        // stored unwrapped here, so the two views coincide.
-        "listeners" | "rawListeners" => {
+        // `rawListeners` is the stored list, once-WRAPPERS included;
+        // `listeners` unwraps each one (`unwrapListeners`).
+        "rawListeners" => {
             let items = listeners(recv, &event_key(&args));
+            Ok(with_host(|h| h.new_array(items)))
+        }
+        "listeners" => {
+            let items = unwrapped_listeners(recv, &event_key(&args))?;
             Ok(with_host(|h| h.new_array(items)))
         }
         // The cap is not enforced (nothing here warns on listener count), but it
@@ -111,22 +114,22 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             let once = matches!(method, "once" | "prependOnceListener");
             let prepend = method.starts_with("prepend");
             let name = event_key(&args);
-            let f = args.get(1).cloned().unwrap_or(Value::Undef);
+            let event = args.first().cloned().unwrap_or(Value::Undef);
+            let mut f = args.get(1).cloned().unwrap_or(Value::Undef);
             check_listener(&f)?;
+            // `once` registers `_onceWrap(this, type, listener)` in the
+            // listener's place, so `rawListeners` sees the wrapper.
+            if once {
+                f = once_wrap(recv, &event, &f)?;
+            }
             // `newListener` fires BEFORE the listener is added, so a handler for
             // it sees the emitter without the new listener and can add its own
-            // ahead of it. It was never emitted at all.
+            // ahead of it. It is handed `listener.listener ?? listener`.
             if name != "newListener" && !listeners(recv, "newListener").is_empty() {
-                let nv = with_host(|h| h.new_str(name.clone()));
-                emit(recv, "newListener", &[nv, f.clone()])?;
+                let shown = original_listener(&f)?;
+                emit(recv, "newListener", &[event, shown])?;
             }
-            add(
-                recv,
-                if once { "@@once" } else { "@@on" },
-                &name,
-                f,
-                prepend,
-            );
+            add_to_list(recv, &name, f, prepend);
             warn_max_listeners(recv, &name, args.first().unwrap_or(&Value::Undef));
             Ok(recv.clone())
         }
@@ -136,31 +139,37 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             &args.get(1..).map(|s| s.to_vec()).unwrap_or_default(),
         ),
         "removeListener" | "off" => {
-            let name = event_key(&args);
-            let f = args.get(1).cloned();
-            check_listener(&f.clone().unwrap_or(Value::Undef))?;
-            let had = f
-                .as_ref()
-                .is_some_and(|f| listeners(recv, &name).iter().any(|l| l == f));
-            remove(recv, &name, f.clone());
-            // `removeListener` fires AFTER the removal, and only when one
-            // actually happened. It was never emitted at all.
-            if had && name != "removeListener" && !listeners(recv, "removeListener").is_empty() {
-                let nv = with_host(|h| h.new_str(name.clone()));
-                emit(recv, "removeListener", &[nv, f.unwrap_or(Value::Undef)])?;
-            }
+            let event = args.first().cloned().unwrap_or(Value::Undef);
+            let f = args.get(1).cloned().unwrap_or(Value::Undef);
+            check_listener(&f)?;
+            remove_listener(recv, &event_key(&args), event, &f)?;
             Ok(recv.clone())
         }
         "removeAllListeners" => {
-            let name = if args.is_empty() {
-                None
+            if args.is_empty() {
+                remove_all_listeners(recv, None)?;
             } else {
-                Some(event_key(&args))
-            };
-            remove_all(recv, name.as_deref());
+                let event = args.first().cloned().unwrap_or(Value::Undef);
+                remove_all_listeners(recv, Some((event_key(&args), event)))?;
+            }
             Ok(recv.clone())
         }
-        "listenerCount" => Ok(Value::Float(listeners(recv, &event_key(&args)).len() as f64)),
+        // `listenerCount(type, listener)` counts the registrations of one
+        // function, a once-wrapper counting for the function it wraps.
+        "listenerCount" => {
+            let list = listeners(recv, &event_key(&args));
+            let wanted = args.get(1).cloned().unwrap_or(Value::Undef);
+            if with_host(|h| h.is_nullish(&wanted)) {
+                return Ok(Value::Float(list.len() as f64));
+            }
+            let mut matching = 0;
+            for l in &list {
+                if *l == wanted || crate::builtins::get_property(l, "listener")? == wanted {
+                    matching += 1;
+                }
+            }
+            Ok(Value::Float(matching as f64))
+        }
         // A SYMBOL event name comes back as the symbol itself, not as its
         // `Symbol(desc)` rendering — `emitter.on(sym, f)` then `eventNames()`
         // has to hand back something `emitter.off(name, f)` accepts. Strings
@@ -234,7 +243,7 @@ fn warn_max_listeners(recv: &Value, key: &str, event: &Value) {
     );
 }
 
-/// Read a hidden emitter field (`@@on`/`@@once`). Works for a plain emitter
+/// Read a hidden emitter field (`@@on`, `@@maxListeners`). Works for a plain emitter
 /// object AND for a function/class receiver (express's `app` is a function whose
 /// emitter maps live in the fn-prop side table).
 fn named_map(h: &crate::host::JsHost, recv: &Value, which: &str) -> Option<Value> {
@@ -257,30 +266,16 @@ fn set_named_map(h: &mut crate::host::JsHost, recv: &Value, which: &str, val: Va
     }
 }
 
-/// Register `f` for `name`.
-///
-/// Every listener — `once` included — goes into the single ordered `@@on` list,
-/// and `@@once` holds only a MARKER copy of the once-only ones. It used to be
-/// two parallel queues that `listeners` concatenated `@@on`-then-`@@once`, so a
-/// once-listener always fired last no matter when it was registered:
-/// `e.once('a', first); e.on('a', second)` ran `second` first, and
-/// `prependOnceListener` could not reach the front at all.
-fn add(recv: &Value, which: &str, name: &str, f: Value, prepend: bool) {
-    if which == "@@once" {
-        // The marker records once-ness; order within it is never observed.
-        add_to_list(recv, "@@once", name, f.clone(), false);
-    }
-    add_to_list(recv, "@@on", name, f, prepend);
-}
-
-fn add_to_list(recv: &Value, which: &str, name: &str, f: Value, prepend: bool) {
+/// Register `f` for `name`. Every listener — a once-wrapper included — goes
+/// into the one ordered `@@on` list, so registration order is firing order.
+fn add_to_list(recv: &Value, name: &str, f: Value, prepend: bool) {
     with_host(|h| {
         // Lazily create the listener map (a mixed-in function emitter has none).
-        let map = match named_map(h, recv, which) {
+        let map = match named_map(h, recv, "@@on") {
             Some(m) => m,
             None => {
                 let m = h.new_object(IndexMap::new());
-                set_named_map(h, recv, which, m.clone());
+                set_named_map(h, recv, "@@on", m.clone());
                 m
             }
         };
@@ -300,8 +295,7 @@ fn add_to_list(recv: &Value, which: &str, name: &str, f: Value, prepend: bool) {
             }
         };
         if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
-            // `prependListener` puts the handler FIRST; it was appending like
-            // `on`, so the two were indistinguishable.
+            // `prependListener` puts the handler FIRST.
             if prepend {
                 items.insert(0, f);
             } else {
@@ -311,11 +305,10 @@ fn add_to_list(recv: &Value, which: &str, name: &str, f: Value, prepend: bool) {
     });
 }
 
-/// Drop the FIRST entry equal to `f` from one listener list, leaving any
-/// duplicate registrations of the same function in place.
-fn remove_first(recv: &Value, which: &str, name: &str, f: &Value) {
+/// Drop the entry at `index` from `name`'s listener list.
+fn remove_at(recv: &Value, name: &str, index: usize) {
     with_host(|h| {
-        let Some(map) = named_map(h, recv, which) else {
+        let Some(map) = named_map(h, recv, "@@on") else {
             return;
         };
         let arr = match h.get(&map) {
@@ -324,8 +317,8 @@ fn remove_first(recv: &Value, which: &str, name: &str, f: &Value) {
         };
         let mut emptied = false;
         if let Some(JsObj::Array(items)) = arr.and_then(|a| h.get_mut(&a)) {
-            if let Some(i) = items.iter().position(|x| x == f) {
-                items.remove(i);
+            if index < items.len() {
+                items.remove(index);
             }
             emptied = items.is_empty();
         }
@@ -339,10 +332,9 @@ fn remove_first(recv: &Value, which: &str, name: &str, f: &Value) {
     });
 }
 
+/// The RAW listener list for `name` (`rawListeners`): once-wrappers as stored.
 fn listeners(recv: &Value, name: &str) -> Vec<Value> {
     with_host(|h| {
-        // `@@on` alone: it holds every listener in registration order, and
-        // `@@once` is only a marker copy of some of them.
         let mut out = Vec::new();
         if let Some(map) = named_map(h, recv, "@@on") {
             if let Some(JsObj::Object(p)) = h.get(&map) {
@@ -355,6 +347,151 @@ fn listeners(recv: &Value, name: &str) -> Vec<Value> {
         }
         out
     })
+}
+
+/// `unwrapListeners`: each entry's `.listener`, or the entry itself.
+fn unwrapped_listeners(recv: &Value, name: &str) -> Result<Vec<Value>, String> {
+    listeners(recv, name)
+        .iter()
+        .map(original_listener)
+        .collect()
+}
+
+/// `listener.listener || listener` — the function a once-wrapper stands for.
+fn original_listener(f: &Value) -> Result<Value, String> {
+    let inner = crate::builtins::get_property(f, "listener")?;
+    Ok(if with_host(|h| h.truthy(&inner)) {
+        inner
+    } else {
+        f.clone()
+    })
+}
+
+/// `_onceWrap(target, type, listener)` from `lib/events.js`, verbatim: a
+/// closure that removes itself before its first call and ignores any later
+/// one, carrying the wrapped function as `.listener`.
+const ONCE_WRAP_SRC: &str = "(function _onceWrap(target, type, listener) {\n\
+  let fired = false;\n\
+  function wrapper(...args) {\n\
+    if (fired) return;\n\
+    fired = true;\n\
+    target.removeListener(type, wrapper);\n\
+    return Reflect.apply(listener, target, args);\n\
+  }\n\
+  wrapper.listener = listener;\n\
+  return wrapper;\n\
+})";
+
+fn once_wrap(target: &Value, event: &Value, f: &Value) -> Result<Value, String> {
+    thread_local! {
+        static FACTORY: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    let factory = match FACTORY.with(|c| c.borrow().clone()) {
+        Some(f) => f,
+        None => {
+            let made = crate::eval_in_global_scope(ONCE_WRAP_SRC)?;
+            FACTORY.with(|c| *c.borrow_mut() = Some(made.clone()));
+            made
+        }
+    };
+    invoke(
+        &factory,
+        vec![target.clone(), event.clone(), f.clone()],
+        None,
+    )
+}
+
+/// `removeListener(type, listener)`, ported from `lib/events.js`. A lone
+/// listener is matched by itself or its `.listener`, and the `removeListener`
+/// event is handed `list.listener || listener`; in a longer list the LAST
+/// match goes, and the event is handed `listener` exactly as passed — which
+/// is the wrapper when a once-wrapper removes itself.
+fn remove_listener(recv: &Value, name: &str, event: Value, f: &Value) -> Result<(), String> {
+    let list = listeners(recv, name);
+    let removed = if list.len() == 1 {
+        let inner = if list[0] == *f {
+            None
+        } else {
+            Some(crate::builtins::get_property(&list[0], "listener")?)
+        };
+        match inner {
+            None => Some(original_listener(&list[0])?),
+            Some(inner) if inner == *f => Some(original_listener(&list[0])?),
+            Some(_) => None,
+        }
+        .inspect(|_| remove_at(recv, name, 0))
+    } else {
+        let mut position = None;
+        for (i, l) in list.iter().enumerate().rev() {
+            if *l == *f || crate::builtins::get_property(l, "listener")? == *f {
+                position = Some(i);
+                break;
+            }
+        }
+        position.map(|i| {
+            remove_at(recv, name, i);
+            f.clone()
+        })
+    };
+    // `removeListener` fires AFTER the removal, and only when one happened.
+    if let Some(shown) = removed {
+        if !listeners(recv, "removeListener").is_empty() {
+            emit(recv, "removeListener", &[event, shown])?;
+        }
+    }
+    Ok(())
+}
+
+/// `removeAllListeners([type])`, ported from `lib/events.js`. With nobody
+/// listening for `removeListener` the lists are simply dropped; otherwise
+/// every listener goes through `removeListener` (LIFO within an event), every
+/// event but `removeListener` first, so each removal is announced.
+fn remove_all_listeners(recv: &Value, event: Option<(String, Value)>) -> Result<(), String> {
+    if listeners(recv, "removeListener").is_empty() {
+        with_host(|h| {
+            if let Some(map) = named_map(h, recv, "@@on") {
+                if let Some(JsObj::Object(p)) = h.get_mut(&map) {
+                    match &event {
+                        Some((name, _)) => {
+                            p.shift_remove(name);
+                        }
+                        None => p.clear(),
+                    }
+                }
+            }
+        });
+        return Ok(());
+    }
+    let Some((name, event)) = event else {
+        let keys: Vec<(String, Value)> = with_host(|h| {
+            let names: Vec<String> = match named_map(h, recv, "@@on").and_then(|m| h.get(&m)) {
+                Some(JsObj::Object(p)) => p.keys().cloned().collect(),
+                _ => Vec::new(),
+            };
+            // `ReflectOwnKeys` order: string keys, then symbols.
+            let (syms, strs): (Vec<String>, Vec<String>) = names
+                .into_iter()
+                .partition(|k| crate::host::is_symbol_key(k));
+            strs.into_iter()
+                .chain(syms)
+                .filter(|k| k != "removeListener")
+                .map(|k| {
+                    let v = h.symbol_of_key(&k).unwrap_or_else(|| h.new_str(k.clone()));
+                    (k, v)
+                })
+                .collect()
+        });
+        for key in keys {
+            remove_all_listeners(recv, Some(key))?;
+        }
+        let rl = with_host(|h| h.new_str("removeListener"));
+        remove_all_listeners(recv, Some(("removeListener".into(), rl)))?;
+        return remove_all_listeners(recv, None);
+    };
+    for f in listeners(recv, &name).iter().rev() {
+        remove_listener(recv, &name, event.clone(), f)?;
+    }
+    Ok(())
 }
 
 /// `checkListener`: every registration and removal refuses a non-function.
@@ -406,14 +543,6 @@ fn emit(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
             crate::builtins::error_string(h, &err)
         });
         return Err(msg);
-    }
-    // Once-listeners fire a single time. They live in BOTH lists now, so
-    // clearing the marker also has to drop one matching entry apiece from the
-    // ordered list — one, not all, so a function registered with `on` AND
-    // `once` keeps its `on` registration, as in node.
-    let expired = remove_all_of(recv, "@@once", Some(name));
-    for f in &expired {
-        remove_first(recv, "@@on", name, f);
     }
     let had = !to_call.is_empty();
     for f in to_call {
@@ -565,7 +694,10 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
         // borrowed" — a Rust panic, not a throw, so no JS `try` caught it.
         // Collect first, then borrow to build the array.
         "getEventListeners" => {
-            let found = listeners(&emitter, &arg_str(args, 1));
+            let found = match unwrapped_listeners(&emitter, &arg_str(args, 1)) {
+                Ok(found) => found,
+                Err(e) => return Some(Err(e)),
+            };
             Ok(with_host(|h| h.new_array(found)))
         }
         // No per-emitter cap is tracked; report Node's default and accept sets.
@@ -592,12 +724,10 @@ fn init_emitter(emitter: Value) -> Value {
         let has = matches!(h.get(&emitter), Some(JsObj::Object(p)) if p.contains_key("@@on"));
         if !has {
             let on = h.new_object(IndexMap::new());
-            let once = h.new_object(IndexMap::new());
             let native = h.new_str("EventEmitter");
             if let Some(JsObj::Object(p)) = h.get_mut(&emitter) {
                 p.entry("@@native".to_string()).or_insert(native);
                 p.insert("@@on".to_string(), on);
-                p.insert("@@once".to_string(), once);
             }
         }
     });
@@ -623,71 +753,4 @@ fn add_abort_listener(args: &[Value]) -> Value {
         let _ = call_method(&signal, "addEventListener", vec![name, listener, once]);
     }
     with_host(|h| h.new_object(IndexMap::new()))
-}
-
-fn remove(recv: &Value, name: &str, f: Option<Value>) {
-    let Some(f) = f else { return };
-    with_host(|h| {
-        for which in ["@@on", "@@once"] {
-            if let Some(map) = named_map(h, recv, which) {
-                let arr = match h.get(&map) {
-                    Some(JsObj::Object(p)) => p.get(name).cloned(),
-                    _ => None,
-                };
-                if let Some(a) = arr {
-                    let now_empty = if let Some(JsObj::Array(items)) = h.get_mut(&a) {
-                        if let Some(pos) = items.iter().position(|x| x == &f) {
-                            items.remove(pos);
-                        }
-                        items.is_empty()
-                    } else {
-                        false
-                    };
-                    // Node drops an event key once its last listener is removed,
-                    // so `eventNames()` no longer lists it.
-                    if now_empty {
-                        if let Some(JsObj::Object(p)) = h.get_mut(&map) {
-                            p.shift_remove(name);
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn remove_all(recv: &Value, name: Option<&str>) {
-    remove_all_of(recv, "@@on", name);
-    remove_all_of(recv, "@@once", name);
-}
-
-/// Drop a whole listener list (or every list), returning what was in it so the
-/// caller can mirror the removal into the other map.
-fn remove_all_of(recv: &Value, which: &str, name: Option<&str>) -> Vec<Value> {
-    with_host(|h| {
-        let mut dropped = Vec::new();
-        if let Some(map) = named_map(h, recv, which) {
-            let arrays: Vec<Value> = match h.get(&map) {
-                Some(JsObj::Object(p)) => match name {
-                    Some(n) => p.get(n).cloned().into_iter().collect(),
-                    None => p.values().cloned().collect(),
-                },
-                _ => Vec::new(),
-            };
-            for a in arrays {
-                if let Some(JsObj::Array(items)) = h.get(&a) {
-                    dropped.extend(items.iter().cloned());
-                }
-            }
-            if let Some(JsObj::Object(p)) = h.get_mut(&map) {
-                match name {
-                    Some(n) => {
-                        p.shift_remove(n);
-                    }
-                    None => p.clear(),
-                }
-            }
-        }
-        dropped
-    })
 }

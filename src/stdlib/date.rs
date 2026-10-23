@@ -100,7 +100,7 @@ fn from_ms(ms: f64) -> Value {
 }
 
 /// The stored time value of a Date instance (NaN if not a Date).
-fn ms_of(recv: &Value) -> f64 {
+pub(crate) fn ms_of(recv: &Value) -> f64 {
     with_host(|h| match h.get(recv) {
         Some(JsObj::Object(p)) => p.get("@@ms").map(|v| h.to_number(v)).unwrap_or(f64::NAN),
         _ => f64::NAN,

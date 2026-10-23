@@ -98,6 +98,8 @@ pub struct Argv {
     pub script: Option<String>,
     /// Everything after the entry point, passed through to the program.
     pub user: Vec<String>,
+    /// Whether the program came from `-e`/`--eval`/`-p`/`--print`.
+    pub eval: bool,
 }
 
 /// Compute [`Argv`] from the raw command line.
@@ -110,6 +112,7 @@ pub fn split_argv<I: IntoIterator<Item = String>>(raw: I) -> Argv {
         exec: Vec::new(),
         script: None,
         user: Vec::new(),
+        eval: false,
     };
     let mut it = raw.into_iter().skip(1);
     let mut eval_seen = false;
@@ -120,6 +123,16 @@ pub fn split_argv<I: IntoIterator<Item = String>>(raw: I) -> Argv {
                 out.exec.push(src);
             }
             eval_seen = true;
+            out.eval = true;
+        } else if a == "--" {
+            // `--` ends the runtime's options and is in neither list: what
+            // follows is the entry script (unless `-e` supplied the program)
+            // and then the program's own arguments, dashes and all.
+            if !eval_seen {
+                out.script = it.next();
+            }
+            out.user.extend(it);
+            break;
         } else if a.starts_with('-') && a != "-" {
             // `-` is Node's "read stdin" entry point, not a flag.
             out.exec.push(a);

@@ -6001,20 +6001,11 @@ fn syscall_error_fields(message: &str) -> Vec<(&'static str, SysField)> {
 }
 
 /// The negative `errno` Node reports for a libuv error code on this platform.
-/// Only the codes `err_str` can produce are mapped; anything else reports the
-/// generic `EIO` number rather than inventing a value.
+/// It is the platform's own number (`ENOTEMPTY` is 66 on macOS, 39 on Linux),
+/// from the table `util.getSystemErrorMap` reports; a code outside it reports
+/// the `EIO` number rather than inventing a value.
 fn errno_for(code: &str) -> f64 {
-    let n: i32 = match code {
-        "ENOENT" => 2,
-        "EACCES" => 13,
-        "EEXIST" => 17,
-        "ENOTDIR" => 20,
-        "EISDIR" => 21,
-        "EINVAL" => 22,
-        "EPIPE" => 32,
-        "ENOTEMPTY" => 66,
-        _ => 5, // EIO
-    };
+    let n = crate::stdlib::util::errno_by_name(code).map_or(libc::EIO, |(n, _)| n);
     -f64::from(n)
 }
 

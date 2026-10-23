@@ -840,7 +840,17 @@ pub fn install_argv() {
         });
     }
     argv.extend(split.user);
+    let _ = EVAL_ENTRY.set(split.eval);
     let _ = ARGV.set((split.exec, argv));
+}
+
+/// Whether this run's program is a `-e`/`-p` source rather than a script:
+/// node's `getOptionValue('--eval')`, which decides where `process.argv`'s
+/// program arguments start.
+static EVAL_ENTRY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn eval_entry() -> bool {
+    EVAL_ENTRY.get().copied().unwrap_or(false)
 }
 
 /// `process.argv`: `[execPath, entryScript, ...userArgs]`.

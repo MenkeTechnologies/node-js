@@ -968,6 +968,20 @@ hoisted  parsed
 nested   parsed
 kinds    parsed parsed
 unrelated SyntaxError: Private field '#a' must be declared in an enclosing class
+==== emitteronce.js ====
+raw      false true wrapper 0
+unwrap   true
+lastwins 1 true
+manual   1 0
+count    3 2 1
+removed  wrapper,b a,b
+statics  a,b
+lone     k true f
+many     k false wrapper
+rmall x  x:wrapper x:a
+rmall    y:a x:a 0
+order    first,second,first
+newlis   p true
 ==== errors.js ====
 MyError boom 42 true true
 try,catch
@@ -1029,6 +1043,69 @@ raw      1 true
 chain    true
 removeAll 0
 subclass 1 true
+==== fdargs.js ====
+pwrite   ZWUdXYQV
+fd str   TypeError ERR_INVALID_ARG_TYPE undefined true The "fd" argument must be of type number. Received type string ('x')
+fd frac  RangeError ERR_OUT_OF_RANGE undefined true The value of "fd" is out of range. It must be an integer. Received 1.5
+fd neg   RangeError ERR_OUT_OF_RANGE undefined true The value of "fd" is out of range. It must be >= 0 && <= 2147483647. Received -1
+fd big   RangeError ERR_OUT_OF_RANGE undefined true The value of "fd" is out of range. It must be >= 0 && <= 2147483647. Received 2147483648
+fd null  TypeError ERR_INVALID_ARG_TYPE undefined true The "fd" argument must be of type number. Received null
+fd cb    TypeError ERR_INVALID_ARG_TYPE undefined true The "fd" argument must be of type number. Received type string ('x')
+rs fd    TypeError ERR_INVALID_ARG_TYPE undefined true The "fd" argument must be of type number. Received type string ('x')
+rs len0  ok 0
+rs both  TypeError ERR_INVALID_ARG_TYPE undefined true The "buffer" argument must be an instance of Buffer, TypedArray, or DataView. Received type number (5)
+read cb  RangeError ERR_OUT_OF_RANGE undefined true The value of "fd" is out of range. It must be >= 0 && <= 2147483647. Received -1
+wr num   TypeError ERR_INVALID_ARG_TYPE undefined true The "buffer" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (5)
+wr obj   TypeError ERR_INVALID_ARG_TYPE undefined true The "buffer" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received an instance of Object
+wr off   RangeError ERR_OUT_OF_RANGE undefined true The value of "offset" is out of range. It must be <= 2. Received 3
+wr len   RangeError ERR_OUT_OF_RANGE undefined true The value of "length" is out of range. It must be <= 2. Received 3
+wr neg   RangeError ERR_OUT_OF_RANGE undefined true The value of "offset" is out of range. It must be >= 0 && <= 9007199254740991. Received -1
+writev   TypeError ERR_INVALID_ARG_TYPE undefined true The "buffers" argument must be an ArrayBufferView[]. Received an instance of Array
+readv    TypeError ERR_INVALID_ARG_TYPE undefined true The "buffers" argument must be an ArrayBufferView[]. Received type string ('x')
+fchmod   640
+chmod    600
+mode zz  TypeError ERR_INVALID_ARG_VALUE undefined true The argument 'mode' must be a 32-bit unsigned integer or an octal string. Received 'zz'
+mode 8   TypeError ERR_INVALID_ARG_VALUE undefined true The argument 'mode' must be a 32-bit unsigned integer or an octal string. Received '8'
+mode neg RangeError ERR_OUT_OF_RANGE undefined true The value of "mode" is out of range. It must be >= 0 && <= 4294967295. Received -1
+mode frc RangeError ERR_OUT_OF_RANGE undefined true The value of "mode" is out of range. It must be an integer. Received 1.5
+mode und TypeError ERR_INVALID_ARG_TYPE undefined true The "mode" argument must be of type number. Received undefined
+len str  TypeError ERR_INVALID_ARG_TYPE undefined true The "len" argument must be of type number. Received type string ('x')
+len frac RangeError ERR_OUT_OF_RANGE undefined true The value of "len" is out of range. It must be an integer. Received 1.5
+uid str  TypeError ERR_INVALID_ARG_TYPE undefined true The "uid" argument must be of type number. Received type string ('a')
+uid low  RangeError ERR_OUT_OF_RANGE undefined true The value of "uid" is out of range. It must be >= -1 && <= 4294967295. Received -2
+time str TypeError ERR_INVALID_ARG_TYPE undefined true The "atime" argument must be an instance of Date or an Time in seconds. Received type string ('x')
+time nan TypeError ERR_INVALID_ARG_TYPE undefined true The "atime" argument must be an instance of Date or an Time in seconds. Received type number (NaN)
+futimes  1000000000000 2000000000000
+utimes   3000000000000 4000000000000
+flag zz  TypeError ERR_INVALID_ARG_VALUE undefined true The argument 'flags' is invalid. Received 'zz'
+flag obj TypeError ERR_INVALID_ARG_VALUE undefined true The argument 'flags' is invalid. Received {}
+flag frc RangeError ERR_OUT_OF_RANGE undefined true The value of "flags" is out of range. It must be an integer. Received 1.5
+mode     true
+wx again Error EEXIST open true EEXIST: file already exists, open '<dir>/made'
+as+      s
+eloop    Error ELOOP open true ELOOP: too many symbolic links encountered, open '<dir>/l1'
+toolong  Error ENAMETOOLONG stat true ENAMETOOLONG: name too long, stat '<dir>/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+notdir   Error ENOTDIR mkdir true ENOTDIR: not a directory, mkdir '<dir>/a/sub'
+ebadf w  Error EBADF write true EBADF: bad file descriptor, write
+ebadf wv Error EBADF write true EBADF: bad file descriptor, write
+ebadf rv Error EBADF read true EBADF: bad file descriptor, read
+path num TypeError ERR_INVALID_ARG_TYPE undefined true The "path" argument must be of type string or an instance of Buffer or URL. Received type number (5)
+path obj TypeError ERR_INVALID_ARG_TYPE undefined true The "path" argument must be of type string or an instance of Buffer or URL. Received an instance of Object
+path und TypeError ERR_INVALID_ARG_TYPE undefined true The "path" argument must be of type string or an instance of Buffer or URL. Received undefined
+path nul TypeError ERR_INVALID_ARG_VALUE undefined true The argument 'path' must be a string, Uint8Array, or URL without null bytes. Received 'a\x00b'
+path u16 TypeError ERR_INVALID_ARG_TYPE undefined true The "path" argument must be of type string or an instance of Buffer or URL. Received an instance of Uint16Array
+src      TypeError ERR_INVALID_ARG_TYPE undefined true The "src" argument must be of type string or an instance of Buffer or URL. Received type number (1)
+dest     TypeError ERR_INVALID_ARG_TYPE undefined true The "newPath" argument must be of type string or an instance of Buffer or URL. Received type boolean (true)
+url      ok 8
+url http TypeError ERR_INVALID_URL_SCHEME undefined true The URL must be of scheme file
+url chk  file://host/x ERR_INVALID_FILE_URL_HOST
+url chk  file:///a%2Fb ERR_INVALID_FILE_URL_PATH
+url chk  file:///a%2fb ERR_INVALID_FILE_URL_PATH
+url chk  file://localhost/ object
+buffer   ok 8
+u8       ok 8
+exists   true false
+stream   data,end,close false
 ==== fdread.js ====
 u16        4 Uint16Array(3) [ 16640, 17218, 68 ]
 dataView   4 43444546
@@ -1056,6 +1133,74 @@ readOpts   null 2 GH
 ==== fib.js ====
 fib: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
 1 2 3
+==== filehandle.js ====
+number FileHandle true function true
+5 true hello null [ 'bytesRead', 'buffer' ]
+3 wor
+4 ello
+18 16384 "hello world\nline2\n"
+0
+""
+18 true
+2 XY
+2 XYlab wo
+2 XYlab worRS
+
+XYlab
+"XYlab\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000new"
+"XYlab\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000new+more"
+5 [ 'XY', 'lab' ]
+2 "12lab\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000new+more"
+644
+false -1 1
+ERR Error EBADF read file closed
+ERR Error EBADF fstat file closed
+ERR Error EBADF writeFile file closed
+ERR Error EBADF writeFile file closed
+ERR Error EBADF ftruncate file closed
+ERR Error ENOENT open ENOENT: no such file or directory, open '<dir>/nope'
+ERR RangeError ERR_OUT_OF_RANGE undefined The value of "length" is out of range. It must be <= -3. Received 1
+ERR RangeError ERR_OUT_OF_RANGE undefined The value of "length" is out of range. It must be <= 2. Received 3
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "options" argument must be of type object. Received type number (5)
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "buffer" argument must be an instance of Buffer, TypedArray, or DataView. Received type number (5)
+ERR Error EBADF write EBADF: bad file descriptor, write
+true
+2
+-1
+<Buffer ff 00 41>
+3
+-1
+==== filehandleargs.js ====
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "options" argument must be of type object. Received type number (5)
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "options" argument must be of type object. Received type string ('str')
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "options" argument must be of type object. Received type boolean (true)
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "options" argument must be of type object. Received an instance of Array
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "options" argument must be of type object. Received function 
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "buffer" argument must be an instance of Buffer, TypedArray, or DataView. Received type string ('x')
+ERR RangeError ERR_OUT_OF_RANGE undefined The value of "offset" is out of range. It must be >= 0 && <= 9007199254740991. Received -1
+ERR RangeError ERR_OUT_OF_RANGE undefined The value of "position" is out of range. It must be >= -1 && <= 9007199254740991. Received -2
+ERR RangeError ERR_OUT_OF_RANGE undefined The value of "offset" is out of range. It must be an integer. Received 1.5
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "buffer" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (5)
+ERR RangeError ERR_OUT_OF_RANGE undefined The value of "offset" is out of range. It must be <= 2. Received 3
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "len" argument must be of type number. Received type string ('x')
+ERR TypeError ERR_INVALID_ARG_VALUE undefined The argument 'mode' must be a 32-bit unsigned integer or an octal string. Received 'zz'
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "options" argument must be of type object. Received type string ('x')
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "buffers" argument must be an ArrayBufferView[]. Received type string ('x')
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "buffers" argument must be an ArrayBufferView[]. Received an instance of Array
+"abc\ndef\nghi"
+""
+"abc\ndef\nghi+w+a"
+[ 'abc', 'def', 'ghi+w+a' ]
+true
+ERR TypeError ERR_INVALID_ARG_VALUE undefined The argument 'flags' is invalid. Received 'zz'
+ERR TypeError ERR_INVALID_ARG_TYPE undefined The "path" argument must be of type string or an instance of Buffer or URL. Received type number (5)
+ERR Error EISDIR open EISDIR: illegal operation on a directory, open '<dir>'
+600
+ERR Error EEXIST open EEXIST: file already exists, open '<dir>/new.txt'
+function true function
+==== filehandlestreams.js ====
+abcd finish,close -1 1
+abcd!? finish
 ==== filesystem.js ====
 none     Buffer<68656c6c6f>
 utf8     "hello" "hello"
@@ -1993,6 +2138,38 @@ define    9 5 0
 redefine  z {"value":"z","writable":false,"enumerable":false,"configurable":true}
 descs     ["length","name","prototype"] ["0","1"]
 copies    {} {} [["0",5],["1",6]] {"0":5,"1":6}
+==== parseargs.js ====
+tokens   {"values":{"foo":"x","bar":"1"},"positionals":["pos","-z"],"tokens":[{"kind":"option","name":"foo","rawName":"-f","index":0,"value":"x","inlineValue":false},{"kind":"option","name":"bar","rawName":"--bar","index":2,"value":"1","inlineValue":true},{"kind":"positional","index":3,"value":"pos"},{"kind":"option-terminator","index":4},{"kind":"positional","index":5,"value":"-z"}]}
+group    {"values":{"a":true,"b":true,"c":"VAL"},"positionals":[],"tokens":[{"kind":"option","name":"a","rawName":"-a","index":0},{"kind":"option","name":"b","rawName":"-b","index":0},{"kind":"option","name":"a","rawName":"-a","index":1},{"kind":"option","name":"c","rawName":"-c","index":1,"value":"VAL","inlineValue":true},{"kind":"option","name":"b","rawName":"-b","index":2},{"kind":"option","name":"a","rawName":"-a","index":2}]}
+lone     {"values":{"=x":true,"bar":""},"positionals":["-"],"tokens":[{"kind":"positional","index":0,"value":"-"},{"kind":"option","name":"=x","rawName":"--=x","index":1},{"kind":"option","name":"bar","rawName":"--bar","index":2,"value":"","inlineValue":true}]}
+negate   {"values":{"a":[false,true]},"positionals":[],"tokens":[{"kind":"option","name":"a","rawName":"--no-a","index":0},{"kind":"option","name":"a","rawName":"--a","index":1}]}
+defaults {"values":{"m":["a","b"],"d":true},"positionals":[]}
+proto    {"values":{"toString":true},"positionals":[]}
+noargs   {"values":{},"positionals":[]}
+nullpro  null values,positionals
+ambig    TypeError ERR_PARSE_ARGS_INVALID_OPTION_VALUE "Option '--foo' argument is ambiguous.\nDid you forget to specify the option argument for '--foo'?\nTo specify an option argument starting with a dash use '--foo=-XYZ'."
+ambigsh  TypeError ERR_PARSE_ARGS_INVALID_OPTION_VALUE "Option '-f' argument is ambiguous.\nDid you forget to specify the option argument for '-f'?\nTo specify an option argument starting with a dash use '--foo=-XYZ' or '-f-XYZ'."
+missing  TypeError ERR_PARSE_ARGS_INVALID_OPTION_VALUE "Option '-c, --c <value>' argument missing"
+noarg    TypeError ERR_PARSE_ARGS_INVALID_OPTION_VALUE "Option '-a, --a' does not take an argument"
+negarg   TypeError ERR_PARSE_ARGS_INVALID_OPTION_VALUE "Option '-a, --a' does not take an argument"
+negstr   TypeError ERR_PARSE_ARGS_UNKNOWN_OPTION "Unknown option '--no-bar'"
+unknown  TypeError ERR_PARSE_ARGS_UNKNOWN_OPTION "Unknown option '--x'. To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- \"--x\""
+posit    TypeError ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL "Unexpected argument 'p'. This command does not take positional arguments"
+posnum   TypeError ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL "Unexpected argument '5'. This command does not take positional arguments"
+v.args   TypeError ERR_INVALID_ARG_TYPE "The \"args\" argument must be an instance of Array. Received type string ('x')"
+v.strict TypeError ERR_INVALID_ARG_TYPE "The \"strict\" argument must be of type boolean. Received type number (1)"
+v.tokens TypeError ERR_INVALID_ARG_TYPE "The \"tokens\" argument must be of type boolean. Received type string ('y')"
+v.allowp TypeError ERR_INVALID_ARG_TYPE "The \"allowPositionals\" argument must be of type boolean. Received an instance of Object"
+v.opts   TypeError ERR_INVALID_ARG_TYPE "The \"options\" argument must be of type object. Received an instance of Array"
+v.opt    TypeError ERR_INVALID_ARG_TYPE "The \"options.a\" property must be of type object. Received null"
+v.type   TypeError ERR_INVALID_ARG_TYPE "The \"options.a.type\" property must be ('string|boolean'). Received undefined"
+v.short  TypeError ERR_INVALID_ARG_TYPE "The \"options.a.short\" property must be of type string. Received type number (5)"
+v.shortl TypeError ERR_INVALID_ARG_VALUE "The property 'options.a.short' must be a single character. Received 'ab'"
+v.multi  TypeError ERR_INVALID_ARG_TYPE "The \"options.a.multiple\" property must be of type boolean. Received type string ('y')"
+v.def    TypeError ERR_INVALID_ARG_TYPE "The \"options.a.default\" property must be of type boolean. Received type string ('y')"
+v.defarr TypeError ERR_INVALID_ARG_TYPE "The \"options.a.default\" property must be an instance of Array. Received type boolean (true)"
+v.defel  TypeError ERR_INVALID_ARG_TYPE "The \"options.a.default[1]\" property must be of type string. Received type number (1)"
+v.inherit {"values":{},"positionals":[]}
 ==== primitivereceivers.js ====
 reflect-set   [false,false,false,false,false]
 reflect-null  false

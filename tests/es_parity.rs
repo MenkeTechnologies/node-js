@@ -2141,6 +2141,21 @@ fn runtime_flags_land_in_exec_argv_not_argv() {
     assert_eq!(run_at("-", src, &["q"]), "[] [\"-\",\"q\"]");
 }
 
+#[test]
+fn a_double_dash_ends_the_runtime_flags_and_is_in_neither_list() {
+    // `node -e src -- --foo x`: `--` ends node's own options, so `--foo` is a
+    // program argument (not a runtime flag in `execArgv`) and the `--` itself
+    // is dropped from both lists. `util.parseArgs()`'s default `args` is that
+    // same `process.argv` tail, so it sees the option. `node v26.12.0`.
+    let src = "console.log(JSON.stringify(process.execArgv.slice(2)), \
+               JSON.stringify(process.argv.slice(1)), \
+               JSON.stringify(require('util').parseArgs({ strict: false }).values))";
+    assert_eq!(
+        run_at("-e", src, &["--", "--foo", "x"]),
+        "[] [\"--foo\",\"x\"] {\"foo\":true}"
+    );
+}
+
 /// Minimal JSON string encoding for the one expected value above.
 fn serde_json_string(s: &str) -> String {
     let mut out = String::from("\"");

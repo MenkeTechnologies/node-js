@@ -536,7 +536,7 @@ fn url_href(v: &Value) -> String {
 }
 
 /// `fileURLToPath` core: `file://[host]/path` → decoded `/path`.
-fn file_url_to_path(args: &[Value]) -> Result<String, String> {
+pub(crate) fn file_url_to_path(args: &[Value]) -> Result<String, String> {
     let v = args.first().cloned().unwrap_or(Value::Undef);
     let href = url_href(&v);
     let rest = href.strip_prefix("file://").ok_or_else(|| {
@@ -547,11 +547,29 @@ fn file_url_to_path(args: &[Value]) -> Result<String, String> {
         )
     })?;
     // The authority runs up to the first '/'; the remainder is the path.
-    let path = match rest.find('/') {
-        Some(0) => rest,
-        Some(i) => &rest[i..],
-        None => "/",
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
     };
+    // `getPathFromURLPosix`: a POSIX file URL names no host (the URL parser
+    // reduces `localhost` to the empty host), and its path may not encode `/`.
+    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        return Err(crate::host::plain_coded_error(
+            "TypeError",
+            "ERR_INVALID_FILE_URL_HOST",
+            &format!(
+                "File URL host must be \"localhost\" or empty on {}",
+                super::os::platform()
+            ),
+        ));
+    }
+    if path.to_ascii_lowercase().contains("%2f") {
+        return Err(crate::host::plain_coded_error(
+            "TypeError",
+            "ERR_INVALID_FILE_URL_PATH",
+            "File URL path must not include encoded / characters",
+        ));
+    }
     Ok(percent_decode(path))
 }
 

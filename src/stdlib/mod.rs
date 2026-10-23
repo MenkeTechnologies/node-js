@@ -1411,6 +1411,16 @@ pub(crate) fn from_base64(s: &str) -> Vec<u8> {
 /// `Number.MAX_SAFE_INTEGER`): a Number, an integer, and within range — each
 /// failure with node's own code and wording.
 pub(crate) fn validate_integer(v: &Value, name: &str, min: f64) -> Result<f64, String> {
+    validate_integer_in(v, name, min, 9_007_199_254_740_991.0)
+}
+
+/// `validateInteger(value, name, min, max)` with an explicit `max`.
+pub(crate) fn validate_integer_in(
+    v: &Value,
+    name: &str,
+    min: f64,
+    max: f64,
+) -> Result<f64, String> {
     if with_host(|h| h.type_of(v)) != "number" {
         return Err(crate::host::invalid_arg_type(name, "argument", "number", v));
     }
@@ -1418,8 +1428,12 @@ pub(crate) fn validate_integer(v: &Value, name: &str, min: f64) -> Result<f64, S
     if n.fract() != 0.0 || !n.is_finite() {
         return Err(out_of_range(name, "an integer", n));
     }
-    if n < min || n > 9_007_199_254_740_991.0 {
-        let must = format!(">= {} && <= 9007199254740991", crate::host::fmt_number(min));
+    if n < min || n > max {
+        let must = format!(
+            ">= {} && <= {}",
+            crate::host::fmt_number(min),
+            crate::host::fmt_number(max)
+        );
         return Err(out_of_range(name, &must, n));
     }
     Ok(n)

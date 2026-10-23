@@ -250,6 +250,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "getSystemErrorMap" => Ok(system_error_map()),
         "styleText" => return Some(style_text(args)),
         "parseArgs" => return Some(parse_args(args)),
+        "@@nodeError" => return Some(node_error(args)),
         "debuglog" => return Some(debuglog(args)),
         "promisify" => return Some(promisify(args)),
         // `util.aborted(signal, resource)` — a promise that settles when the
@@ -1256,7 +1257,7 @@ fn errno_of(err: f64) -> i32 {
     }
 }
 
-fn errno_name(e: i32) -> Option<&'static str> {
+pub(crate) fn errno_name(e: i32) -> Option<&'static str> {
     ERRNO_TABLE
         .iter()
         .find(|(_, code, _)| *code == e)
@@ -1268,6 +1269,16 @@ fn errno_message(e: i32) -> Option<&'static str> {
         .iter()
         .find(|(_, code, _)| *code == e)
         .map(|(_, _, m)| *m)
+}
+
+/// The platform errno number and libuv message for an error CODE (`EBADF` →
+/// `(9, "bad file descriptor")`), from the same table `util.getSystemErrorMap`
+/// reports.
+pub(crate) fn errno_by_name(name: &str) -> Option<(i32, &'static str)> {
+    ERRNO_TABLE
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, code, m)| (*code, *m))
 }
 
 /// `util.getSystemErrorMap()` → a `Map` of negative errno → `[name, message]`.
@@ -1291,282 +1302,425 @@ fn system_error_map() -> Value {
 
 // ── parseArgs ────────────────────────────────────────────────────────────────
 
-/// A parsed option value (or list, when `multiple` is set).
-enum Slot {
-    Bool(bool),
-    Str(String),
-    ListBool(Vec<bool>),
-    ListStr(Vec<String>),
+/// A port of node's `lib/internal/util/parse_args/parse_args.js` and
+/// `utils.js` (v26.12.0), with the primordials spelled as ordinary method
+/// calls. It runs as JavaScript because it IS JavaScript in node: the token
+/// stream (`tokens: true`), the order every validation and usage check runs
+/// in, and the `__proto__`/null-prototype handling all fall out of the same
+/// code. The errors node's `internal/errors` would construct are raised by
+/// `fail` (`util.@@nodeError`, below), so they carry node's codes and
+/// wording.
+const PARSE_ARGS_SRC: &str = r#"(function (fail, evalMode) {
+'use strict';
+const ObjectHasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const uncurry = (f) => (self, ...args) => Reflect.apply(f, self, args);
+const StringPrototypeCharAt = uncurry(String.prototype.charAt);
+const StringPrototypeIncludes = uncurry(String.prototype.includes);
+const StringPrototypeIndexOf = uncurry(String.prototype.indexOf);
+const StringPrototypeSlice = uncurry(String.prototype.slice);
+const StringPrototypeStartsWith = uncurry(String.prototype.startsWith);
+function ERR_INVALID_ARG_TYPE(name, expected, value) { fail('type', name, expected, value); }
+function ERR_INVALID_ARG_VALUE(name, value, reason) { fail('value', name, value, reason); }
+function ERR_PARSE_ARGS_INVALID_OPTION_VALUE(message) { fail('code', 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE', message); }
+function ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL(value) {
+  fail('code', 'ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL', `Unexpected argument '${value}'. This command does not take positional arguments`);
+}
+function ERR_PARSE_ARGS_UNKNOWN_OPTION(option, allowPositionals) {
+  const suggestDashDash = allowPositionals ? '. To specify a positional ' +
+    "argument starting with a '-', place it at the end of the command after " +
+    `'--', as in '-- ${JSON.stringify(option)}` : '';
+  fail('code', 'ERR_PARSE_ARGS_UNKNOWN_OPTION', `Unknown option '${option}'${suggestDashDash}`);
 }
 
-/// The declared config for one option.
-struct OptCfg {
-    long: String,
-    is_string: bool,
-    multiple: bool,
-    short: Option<String>,
-    default: Option<Value>,
+// internal/validators
+function validateObject(value, name) {
+  if (value === null || Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, 'Object', value);
+  if (typeof value !== 'object') throw new ERR_INVALID_ARG_TYPE(name, 'Object', value);
+}
+function validateArray(value, name, minLength = 0) {
+  if (!Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, 'Array', value);
+  if (value.length < minLength) throw new ERR_INVALID_ARG_VALUE(name, value, `must be longer than ${minLength}`);
+}
+function validateString(value, name) {
+  if (typeof value !== 'string') throw new ERR_INVALID_ARG_TYPE(name, 'string', value);
+}
+function validateBoolean(value, name) {
+  if (typeof value !== 'boolean') throw new ERR_INVALID_ARG_TYPE(name, 'boolean', value);
+}
+function validateStringArray(value, name) {
+  validateArray(value, name);
+  for (let i = 0; i < value.length; ++i) validateString(value[i], `${name}[${i}]`);
+}
+function validateBooleanArray(value, name) {
+  validateArray(value, name);
+  for (let i = 0; i < value.length; ++i) validateBoolean(value[i], `${name}[${i}]`);
+}
+function validateUnion(value, name, union) {
+  if (!union.includes(value)) throw new ERR_INVALID_ARG_TYPE(name, `('${union.join('|')}')`, value);
 }
 
-/// `util.parseArgs(config)` → `{ values, positionals }`. Implements the documented
-/// short/long/`--`/`=`/grouped-short algorithm. `config.tokens` is not emitted.
-fn parse_args(config_args: &[Value]) -> Result<Value, String> {
-    let config = config_args.first().cloned().unwrap_or(Value::Undef);
-    let tokens = read_arg_tokens(&config);
-    let strict = read_bool_prop(&config, "strict", true);
-    let allow_positionals = read_bool_prop(&config, "allowPositionals", false);
-    let allow_negative = read_bool_prop(&config, "allowNegative", false);
-    let opts = read_options(&config);
+// internal/util/parse_args/utils
+function objectGetOwn(obj, prop) {
+  if (ObjectHasOwn(obj, prop))
+    return obj[prop];
+}
+function optionsGetOwn(options, longOption, prop) {
+  if (ObjectHasOwn(options, longOption))
+    return objectGetOwn(options[longOption], prop);
+}
+function isOptionValue(value) {
+  if (value == null) return false;
+  return true; // greedy!
+}
+function isOptionLikeValue(value) {
+  if (value == null) return false;
+  return value.length > 1 && StringPrototypeCharAt(value, 0) === '-';
+}
+function isLoneShortOption(arg) {
+  return arg.length === 2 && StringPrototypeCharAt(arg, 0) === '-' && StringPrototypeCharAt(arg, 1) !== '-';
+}
+function isLoneLongOption(arg) {
+  return arg.length > 2 && StringPrototypeStartsWith(arg, '--') && !StringPrototypeIncludes(arg, '=', 3);
+}
+function isLongOptionAndValue(arg) {
+  return arg.length > 2 && StringPrototypeStartsWith(arg, '--') && StringPrototypeIncludes(arg, '=', 3);
+}
+function isShortOptionGroup(arg, options) {
+  if (arg.length <= 2) return false;
+  if (StringPrototypeCharAt(arg, 0) !== '-') return false;
+  if (StringPrototypeCharAt(arg, 1) === '-') return false;
+  const firstShort = StringPrototypeCharAt(arg, 1);
+  const longOption = findLongOptionForShort(firstShort, options);
+  return optionsGetOwn(options, longOption, 'type') !== 'string';
+}
+function isShortOptionAndValue(arg, options) {
+  validateObject(options, 'options');
+  if (arg.length <= 2) return false;
+  if (StringPrototypeCharAt(arg, 0) !== '-') return false;
+  if (StringPrototypeCharAt(arg, 1) === '-') return false;
+  const shortOption = StringPrototypeCharAt(arg, 1);
+  const longOption = findLongOptionForShort(shortOption, options);
+  return optionsGetOwn(options, longOption, 'type') === 'string';
+}
+function findLongOptionForShort(shortOption, options) {
+  validateObject(options, 'options');
+  const longOptionEntry = Object.entries(options).find(
+    ({ 1: optionConfig }) => objectGetOwn(optionConfig, 'short') === shortOption,
+  );
+  return longOptionEntry?.[0] ?? shortOption;
+}
+function useDefaultValueOption(longOption, optionConfig, values) {
+  return objectGetOwn(optionConfig, 'default') !== undefined &&
+    values[longOption] === undefined;
+}
 
-    let lookup_long = |name: &str| opts.iter().find(|o| o.long == name);
-    let lookup_short = |c: &str| opts.iter().find(|o| o.short.as_deref() == Some(c));
-    let is_bool_long = |name: &str| opts.iter().any(|o| o.long == name && !o.is_string);
-
-    let mut values: IndexMap<String, Slot> = IndexMap::new();
-    let mut positionals: Vec<String> = Vec::new();
-
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let tok = tokens[i].clone();
-        if tok == "--" {
-            for t in &tokens[i + 1..] {
-                positionals.push(t.clone());
-            }
+// internal/util/parse_args/parse_args
+function getMainArgs() {
+  if (evalMode) return process.argv.slice(1);
+  return process.argv.slice(2);
+}
+function checkOptionLikeValue(token) {
+  if (!token.inlineValue && isOptionLikeValue(token.value)) {
+    const example = StringPrototypeStartsWith(token.rawName, '--') ?
+      `'${token.rawName}=-XYZ'` :
+      `'--${token.name}=-XYZ' or '${token.rawName}-XYZ'`;
+    const errorMessage = `Option '${token.rawName}' argument is ambiguous.
+Did you forget to specify the option argument for '${token.rawName}'?
+To specify an option argument starting with a dash use ${example}.`;
+    throw new ERR_PARSE_ARGS_INVALID_OPTION_VALUE(errorMessage);
+  }
+}
+function checkOptionUsage(config, token) {
+  let tokenName = token.name;
+  if (!ObjectHasOwn(config.options, tokenName)) {
+    if (config.allowNegative && StringPrototypeStartsWith(tokenName, 'no-')) {
+      tokenName = StringPrototypeSlice(tokenName, 3);
+      if (!ObjectHasOwn(config.options, tokenName) || optionsGetOwn(config.options, tokenName, 'type') !== 'boolean') {
+        throw new ERR_PARSE_ARGS_UNKNOWN_OPTION(token.rawName, config.allowPositionals);
+      }
+    } else {
+      throw new ERR_PARSE_ARGS_UNKNOWN_OPTION(token.rawName, config.allowPositionals);
+    }
+  }
+  const short = optionsGetOwn(config.options, tokenName, 'short');
+  const shortAndLong = `${short ? `-${short}, ` : ''}--${tokenName}`;
+  const type = optionsGetOwn(config.options, tokenName, 'type');
+  if (type === 'string' && typeof token.value !== 'string') {
+    throw new ERR_PARSE_ARGS_INVALID_OPTION_VALUE(`Option '${shortAndLong} <value>' argument missing`);
+  }
+  if (type === 'boolean' && token.value != null) {
+    throw new ERR_PARSE_ARGS_INVALID_OPTION_VALUE(`Option '${shortAndLong}' does not take an argument`);
+  }
+}
+function storeOption(token, options, values, allowNegative) {
+  let longOption = token.name;
+  let optionValue = token.value;
+  if (longOption === '__proto__') {
+    return;
+  }
+  if (allowNegative && StringPrototypeStartsWith(longOption, 'no-') && optionValue === undefined) {
+    longOption = StringPrototypeSlice(longOption, 3);
+    token.name = longOption;
+    optionValue = false;
+  }
+  const newValue = optionValue ?? true;
+  if (optionsGetOwn(options, longOption, 'multiple')) {
+    if (values[longOption]) {
+      values[longOption].push(newValue);
+    } else {
+      values[longOption] = [newValue];
+    }
+  } else {
+    values[longOption] = newValue;
+  }
+}
+function storeDefaultOption(longOption, optionValue, values) {
+  if (longOption === '__proto__') {
+    return;
+  }
+  values[longOption] = optionValue;
+}
+function argsToTokens(args, options) {
+  const tokens = [];
+  let index = -1;
+  let groupCount = 0;
+  const remainingArgs = args.slice();
+  while (remainingArgs.length > 0) {
+    const arg = remainingArgs.shift();
+    const nextArg = remainingArgs[0];
+    if (groupCount > 0)
+      groupCount--;
+    else
+      index++;
+    if (arg === '--') {
+      tokens.push({ kind: 'option-terminator', index });
+      tokens.push(...remainingArgs.map((arg) => {
+        return { kind: 'positional', index: ++index, value: arg };
+      }));
+      break;
+    }
+    if (isLoneShortOption(arg)) {
+      const shortOption = StringPrototypeCharAt(arg, 1);
+      const longOption = findLongOptionForShort(shortOption, options);
+      let value;
+      let inlineValue;
+      if (optionsGetOwn(options, longOption, 'type') === 'string' &&
+          isOptionValue(nextArg)) {
+        value = remainingArgs.shift();
+        inlineValue = false;
+      }
+      tokens.push({ kind: 'option', name: longOption, rawName: arg, index, value, inlineValue });
+      if (value != null) ++index;
+      continue;
+    }
+    if (isShortOptionGroup(arg, options)) {
+      const expanded = [];
+      for (let index = 1; index < arg.length; index++) {
+        const shortOption = StringPrototypeCharAt(arg, index);
+        const longOption = findLongOptionForShort(shortOption, options);
+        if (optionsGetOwn(options, longOption, 'type') !== 'string' ||
+          index === arg.length - 1) {
+          expanded.push(`-${shortOption}`);
+        } else {
+          expanded.push(`-${StringPrototypeSlice(arg, index)}`);
+          break;
+        }
+      }
+      remainingArgs.unshift(...expanded);
+      groupCount = expanded.length;
+      continue;
+    }
+    if (isShortOptionAndValue(arg, options)) {
+      const shortOption = StringPrototypeCharAt(arg, 1);
+      const longOption = findLongOptionForShort(shortOption, options);
+      const value = StringPrototypeSlice(arg, 2);
+      tokens.push({ kind: 'option', name: longOption, rawName: `-${shortOption}`, index, value, inlineValue: true });
+      continue;
+    }
+    if (isLoneLongOption(arg)) {
+      const longOption = StringPrototypeSlice(arg, 2);
+      let value;
+      let inlineValue;
+      if (optionsGetOwn(options, longOption, 'type') === 'string' &&
+          isOptionValue(nextArg)) {
+        value = remainingArgs.shift();
+        inlineValue = false;
+      }
+      tokens.push({ kind: 'option', name: longOption, rawName: arg, index, value, inlineValue });
+      if (value != null) ++index;
+      continue;
+    }
+    if (isLongOptionAndValue(arg)) {
+      const equalIndex = StringPrototypeIndexOf(arg, '=');
+      const longOption = StringPrototypeSlice(arg, 2, equalIndex);
+      const value = StringPrototypeSlice(arg, equalIndex + 1);
+      tokens.push({ kind: 'option', name: longOption, rawName: `--${longOption}`, index, value, inlineValue: true });
+      continue;
+    }
+    tokens.push({ kind: 'positional', index, value: arg });
+  }
+  return tokens;
+}
+const parseArgs = (config = {}) => {
+  const args = objectGetOwn(config, 'args') ?? getMainArgs();
+  const strict = objectGetOwn(config, 'strict') ?? true;
+  const allowPositionals = objectGetOwn(config, 'allowPositionals') ?? !strict;
+  const returnTokens = objectGetOwn(config, 'tokens') ?? false;
+  const allowNegative = objectGetOwn(config, 'allowNegative') ?? false;
+  const options = objectGetOwn(config, 'options') ?? { __proto__: null };
+  const parseConfig = { args, strict, options, allowPositionals, allowNegative };
+  validateArray(args, 'args');
+  validateBoolean(strict, 'strict');
+  validateBoolean(allowPositionals, 'allowPositionals');
+  validateBoolean(returnTokens, 'tokens');
+  validateBoolean(allowNegative, 'allowNegative');
+  validateObject(options, 'options');
+  Object.entries(options).forEach(
+    ({ 0: longOption, 1: optionConfig }) => {
+      validateObject(optionConfig, `options.${longOption}`);
+      const optionType = objectGetOwn(optionConfig, 'type');
+      validateUnion(optionType, `options.${longOption}.type`, ['string', 'boolean']);
+      if (ObjectHasOwn(optionConfig, 'short')) {
+        const shortOption = optionConfig.short;
+        validateString(shortOption, `options.${longOption}.short`);
+        if (shortOption.length !== 1) {
+          throw new ERR_INVALID_ARG_VALUE(
+            `options.${longOption}.short`,
+            shortOption,
+            'must be a single character',
+          );
+        }
+      }
+      const multipleOption = objectGetOwn(optionConfig, 'multiple');
+      if (ObjectHasOwn(optionConfig, 'multiple')) {
+        validateBoolean(multipleOption, `options.${longOption}.multiple`);
+      }
+      const defaultValue = objectGetOwn(optionConfig, 'default');
+      if (defaultValue !== undefined) {
+        let validator;
+        switch (optionType) {
+          case 'string':
+            validator = multipleOption ? validateStringArray : validateString;
+            break;
+          case 'boolean':
+            validator = multipleOption ? validateBooleanArray : validateBoolean;
             break;
         }
-        if let Some(rest) = tok.strip_prefix("--") {
-            let (raw_name, inline) = match rest.split_once('=') {
-                Some((n, v)) => (n.to_string(), Some(v.to_string())),
-                None => (rest.to_string(), None),
-            };
-            // `--no-foo` negation for boolean options.
-            let (name, negate) = match raw_name.strip_prefix("no-") {
-                Some(base) if allow_negative && is_bool_long(base) => (base.to_string(), true),
-                _ => (raw_name, false),
-            };
-            match lookup_long(&name) {
-                None if strict => {
-                    return Err(format!(
-                        "TypeError [ERR_PARSE_ARGS_UNKNOWN_OPTION]: Unknown option '--{name}'"
-                    ))
-                }
-                None => {
-                    // Lenient: record as a boolean flag.
-                    store(&mut values, &name, Slot::Bool(true), false);
-                }
-                Some(cfg) if cfg.is_string => {
-                    let val = match inline {
-                        Some(v) => v,
-                        None => {
-                            i += 1;
-                            tokens.get(i).cloned().ok_or_else(|| {
-                                format!(
-                                    "TypeError [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
-                                     Option '--{name} <value>' argument missing"
-                                )
-                            })?
-                        }
-                    };
-                    store(&mut values, &cfg.long, Slot::Str(val), cfg.multiple);
-                }
-                Some(cfg) => {
-                    if inline.is_some() && strict {
-                        return Err(format!(
-                            "TypeError [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
-                             Option '--{}' does not take an argument",
-                            cfg.long
-                        ));
-                    }
-                    store(&mut values, &cfg.long, Slot::Bool(!negate), cfg.multiple);
-                }
-            }
-        } else if tok.len() > 1 && tok.starts_with('-') {
-            let chars: Vec<char> = tok[1..].chars().collect();
-            let mut ci = 0usize;
-            while ci < chars.len() {
-                let short = chars[ci].to_string();
-                match lookup_short(&short) {
-                    None if strict => {
-                        return Err(format!(
-                            "TypeError [ERR_PARSE_ARGS_UNKNOWN_OPTION]: Unknown option '-{short}'"
-                        ))
-                    }
-                    None => {
-                        store(&mut values, &short, Slot::Bool(true), false);
-                        ci += 1;
-                    }
-                    Some(cfg) if cfg.is_string => {
-                        let remainder: String = chars[ci + 1..].iter().collect();
-                        let val = if !remainder.is_empty() {
-                            remainder
-                        } else {
-                            i += 1;
-                            tokens.get(i).cloned().ok_or_else(|| {
-                                format!(
-                                    "TypeError [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: \
-                                     Option '-{short}, --{} <value>' argument missing",
-                                    cfg.long
-                                )
-                            })?
-                        };
-                        store(&mut values, &cfg.long, Slot::Str(val), cfg.multiple);
-                        break;
-                    }
-                    Some(cfg) => {
-                        store(&mut values, &cfg.long, Slot::Bool(true), cfg.multiple);
-                        ci += 1;
-                    }
-                }
-            }
-        } else {
-            if !allow_positionals && strict {
-                return Err(format!(
-                    "TypeError [ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL]: \
-                     Unexpected argument '{tok}'. This command does not take positional arguments"
-                ));
-            }
-            positionals.push(tok);
-        }
-        i += 1;
+        validator(defaultValue, `options.${longOption}.default`);
+      }
+    },
+  );
+  const tokens = argsToTokens(args, options);
+  const result = {
+    values: { __proto__: null },
+    positionals: [],
+  };
+  if (returnTokens) {
+    result.tokens = tokens;
+  }
+  tokens.forEach((token) => {
+    if (token.kind === 'option') {
+      if (strict) {
+        checkOptionUsage(parseConfig, token);
+        checkOptionLikeValue(token);
+      }
+      storeOption(token, options, result.values, parseConfig.allowNegative);
+    } else if (token.kind === 'positional') {
+      if (!allowPositionals) {
+        throw new ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL(token.value);
+      }
+      result.positionals.push(token.value);
     }
-
-    // Apply declared defaults for options that were never provided.
-    for cfg in &opts {
-        if !values.contains_key(&cfg.long) {
-            if let Some(def) = &cfg.default {
-                store_default(&mut values, cfg, def.clone());
-            }
-        }
+  });
+  Object.entries(options).forEach(({ 0: longOption, 1: optionConfig }) => {
+    const mustSetDefault = useDefaultValueOption(longOption, optionConfig, result.values);
+    if (mustSetDefault) {
+      storeDefaultOption(longOption, objectGetOwn(optionConfig, 'default'), result.values);
     }
+  });
+  return result;
+};
+return parseArgs;
+})"#;
 
-    Ok(build_parse_result(values, positionals))
+/// `util.parseArgs(config)`: the cached port above, called with `config`.
+fn parse_args(args: &[Value]) -> Result<Value, String> {
+    thread_local! {
+        static PARSER: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    let parser = match PARSER.with(|p| p.borrow().clone()) {
+        Some(p) => p,
+        None => {
+            let factory = run_completion(PARSE_ARGS_SRC)?;
+            let fail = with_host(|h| h.alloc(JsObj::Builtin("util.@@nodeError".into())));
+            let eval_mode = Value::Bool(super::process::eval_entry());
+            let made = crate::host::invoke(&factory, vec![fail, eval_mode], None)?;
+            PARSER.with(|p| *p.borrow_mut() = Some(made.clone()));
+            made
+        }
+    };
+    let config = args.first().cloned().unwrap_or(Value::Undef);
+    crate::host::invoke(&parser, vec![config], None)
 }
 
-/// Insert/append a parsed value under `name`, honoring `multiple`.
-fn store(values: &mut IndexMap<String, Slot>, name: &str, slot: Slot, multiple: bool) {
-    if !multiple {
-        values.insert(name.to_string(), slot);
-        return;
-    }
-    match values.get_mut(name) {
-        Some(Slot::ListBool(v)) => {
-            if let Slot::Bool(b) = slot {
-                v.push(b);
-            }
-        }
-        Some(Slot::ListStr(v)) => {
-            if let Slot::Str(s) = slot {
-                v.push(s);
-            }
-        }
-        _ => {
-            let init = match slot {
-                Slot::Bool(b) => Slot::ListBool(vec![b]),
-                Slot::Str(s) => Slot::ListStr(vec![s]),
-                other => other,
+/// `util.@@nodeError(kind, …)`: the errors node's `internal/errors` builds,
+/// for the JavaScript ports (`parseArgs`, `FileHandle`) to throw. `kind` is
+/// `type` (`ERR_INVALID_ARG_TYPE`, given the validator's expected-type
+/// spelling), `value` (`ERR_INVALID_ARG_VALUE`) or `code` (any code, as a
+/// `TypeError`, with its finished message) or `range` (`ERR_OUT_OF_RANGE`). Always
+/// throws.
+fn node_error(args: &[Value]) -> Result<Value, String> {
+    let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Undef);
+    let kind = super::arg_str(args, 0);
+    let name = super::arg_str(args, 1);
+    // `ERR_INVALID_ARG_TYPE` / `ERR_INVALID_ARG_VALUE` call a dotted name a
+    // property and anything else an argument.
+    let noun = if name.contains('.') {
+        "property"
+    } else {
+        "argument"
+    };
+    Err(match kind.as_str() {
+        "type" => {
+            let spec = super::arg_str(args, 2);
+            let expected = match spec.as_str() {
+                "Array" => "an instance of Array".to_string(),
+                "Object" => "of type object".to_string(),
+                // A finished phrase (`('a|b')`, `an instance of Buffer, …`).
+                s if s.starts_with('(') || s.contains(' ') => s.to_string(),
+                s => format!("of type {s}"),
             };
-            values.insert(name.to_string(), init);
+            crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_TYPE",
+                &format!(
+                    "The \"{name}\" {noun} must be {expected}. Received {}",
+                    super::received_desc(&arg(3))
+                ),
+            )
         }
-    }
-}
-
-/// Seed a default value (already a JS `Value`) for an unset option.
-fn store_default(values: &mut IndexMap<String, Slot>, cfg: &OptCfg, def: Value) {
-    // A `multiple` default is expected to be an array; a scalar default is stored
-    // directly. We coerce through the option's declared type.
-    let slot = with_host(|h| match h.get(&def) {
-        Some(JsObj::Array(items)) => {
-            if cfg.is_string {
-                Slot::ListStr(items.iter().map(|v| h.str_of(v)).collect())
-            } else {
-                Slot::ListBool(items.iter().map(|v| h.truthy(v)).collect())
+        "value" => {
+            let mut shown = crate::host::inspect_js(&arg(2))?;
+            if shown.chars().count() > 128 {
+                shown = format!("{}...", shown.chars().take(128).collect::<String>());
             }
-        }
-        _ if cfg.is_string => Slot::Str(h.str_of(&def)),
-        _ => Slot::Bool(h.truthy(&def)),
-    });
-    values.insert(cfg.long.clone(), slot);
-}
-
-/// Materialize `{ values, positionals }` in a single host borrow.
-fn build_parse_result(values: IndexMap<String, Slot>, positionals: Vec<String>) -> Value {
-    with_host(|h| {
-        let mut vobj = IndexMap::new();
-        for (k, slot) in values {
-            let v = match slot {
-                Slot::Bool(b) => Value::Bool(b),
-                Slot::Str(s) => h.new_str(s),
-                Slot::ListBool(items) => {
-                    let arr = items.into_iter().map(Value::Bool).collect();
-                    h.new_array(arr)
-                }
-                Slot::ListStr(items) => {
-                    let arr = items.into_iter().map(|s| h.new_str(s)).collect();
-                    h.new_array(arr)
-                }
+            let reason = match arg(3) {
+                Value::Undef => "is invalid".to_string(),
+                v => with_host(|h| h.str_of(&v)),
             };
-            vobj.insert(k, v);
+            crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_VALUE",
+                &format!("The {noun} '{name}' {reason}. Received {shown}"),
+            )
         }
-        let values_v = h.new_object(vobj);
-        let pos: Vec<Value> = positionals.into_iter().map(|s| h.new_str(s)).collect();
-        let positionals_v = h.new_array(pos);
-        let mut out = IndexMap::new();
-        out.insert("values".to_string(), values_v);
-        out.insert("positionals".to_string(), positionals_v);
-        h.new_object(out)
+        // `ERR_OUT_OF_RANGE(name, must, value)` for a numeric value.
+        "range" => {
+            let n = with_host(|h| h.to_number(&arg(3)));
+            super::out_of_range(&name, &super::arg_str(args, 2), n)
+        }
+        _ => crate::host::coded_error("TypeError", &name, &super::arg_str(args, 2)),
     })
-}
-
-/// `config.args` as strings, or `process.argv.slice(2)` (the runtime's own tail).
-fn read_arg_tokens(config: &Value) -> Vec<String> {
-    let arr = crate::builtins::get_property(config, "args").unwrap_or(Value::Undef);
-    let from_config = with_host(|h| match h.get(&arr) {
-        Some(JsObj::Array(items)) => Some(items.iter().map(|v| h.str_of(v)).collect::<Vec<_>>()),
-        _ => None,
-    });
-    from_config.unwrap_or_else(|| std::env::args().skip(2).collect())
-}
-
-/// Read a boolean config property, defaulting when absent/undefined.
-fn read_bool_prop(config: &Value, name: &str, default: bool) -> bool {
-    match crate::builtins::get_property(config, name) {
-        Ok(Value::Undef) | Err(_) => default,
-        Ok(v) => with_host(|h| h.truthy(&v)),
-    }
-}
-
-/// Read `config.options` into an ordered list of `OptCfg`.
-fn read_options(config: &Value) -> Vec<OptCfg> {
-    let options = crate::builtins::get_property(config, "options").unwrap_or(Value::Undef);
-    let keys: Vec<String> = with_host(|h| match h.get(&options) {
-        Some(JsObj::Object(m)) => m.keys().filter(|k| !k.starts_with("@@")).cloned().collect(),
-        _ => Vec::new(),
-    });
-    keys.into_iter()
-        .map(|long| {
-            let spec = crate::builtins::get_property(&options, &long).unwrap_or(Value::Undef);
-            let type_str = crate::builtins::get_property(&spec, "type")
-                .ok()
-                .map(|v| with_host(|h| h.str_of(&v)))
-                .unwrap_or_default();
-            let short = match crate::builtins::get_property(&spec, "short") {
-                Ok(Value::Undef) | Err(_) => None,
-                Ok(v) => Some(with_host(|h| h.str_of(&v))),
-            };
-            let multiple = read_bool_prop(&spec, "multiple", false);
-            let default = match crate::builtins::get_property(&spec, "default") {
-                Ok(Value::Undef) | Err(_) => None,
-                Ok(v) => Some(v),
-            };
-            OptCfg {
-                long,
-                is_string: type_str == "string",
-                multiple,
-                short,
-                default,
-            }
-        })
-        .collect()
 }
 
 // ── parseEnv ─────────────────────────────────────────────────────────────────

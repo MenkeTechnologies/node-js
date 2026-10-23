@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -190,6 +190,23 @@ fn close_fd(fd: i32) -> bool {
 // ── dispatch ─────────────────────────────────────────────────────────────────
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let op = method.strip_suffix("Sync").unwrap_or(method);
+    // `existsSync` reports an unusable path as absent rather than throwing.
+    if op == "exists" && validated_paths("exists", args).is_err() {
+        return Some(match method {
+            "existsSync" => Ok(Value::Bool(false)),
+            _ => exists_async(&[Value::Undef, args.get(1).cloned().unwrap_or(Value::Undef)]),
+        });
+    }
+    let normalized = match validated_paths(op, args) {
+        Ok(Some(a)) => a,
+        Ok(None) => args.to_vec(),
+        Err(e) => return Some(Err(e)),
+    };
+    let args = normalized.as_slice();
+    if let Err(e) = validate_call(op, args) {
+        return Some(Err(e));
+    }
     Some(match method {
         // ── path, sync ──
         "readFileSync" => read_file_sync(args),
@@ -599,7 +616,7 @@ fn access_impl(args: &[Value]) -> Result<Value, String> {
 
 fn chmod_impl(args: &[Value]) -> Result<Value, String> {
     let path = arg_str(args, 0);
-    let mode = arg_num(args, 1) as u32;
+    let mode = parse_file_mode(args.get(1).unwrap_or(&Value::Undef), "mode", None)?;
     match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
         Ok(_) => Ok(Value::Undef),
         Err(e) => Err(err_str("chmod", &path, &e)),
@@ -816,58 +833,416 @@ fn random_suffix() -> String {
         .collect()
 }
 
-// ── file descriptors ─────────────────────────────────────────────────────────
+// ── argument validation for the descriptor and mode calls ────────────────────
+//
+// node checks these in JavaScript (`lib/fs.js`, `internal/fs/utils.js`,
+// `internal/validators.js`) and then in the binding (`fd`), always BEFORE any
+// I/O, and a callback form throws them synchronously rather than handing them
+// to the callback. They used to be read with an infallible `ToNumber`: a
+// string mode `'644'` set permissions 0o1204, `writeSync(fd, {})` wrote the 15
+// bytes of `[object Object]`, and an unknown flag string opened read-only.
 
-fn open_impl(args: &[Value]) -> Result<Value, String> {
-    let path = arg_str(args, 0);
-    let flags = match args.get(1) {
-        Some(v) if !matches!(v, Value::Undef) && !is_fn(v) => arg_str(args, 1),
-        _ => "r".to_string(),
+/// The checks one call makes before its I/O, in node's order. `op` is the API
+/// name without `Sync`; a FUNCTION in an optional position is the callback of
+/// the async form, not the argument.
+fn validate_call(op: &str, args: &[Value]) -> Result<(), String> {
+    let arg = |i: usize| match args.get(i) {
+        Some(v) if !is_fn(v) => v.clone(),
+        _ => Value::Undef,
     };
-    match open_options(&flags).open(&path) {
-        Ok(f) => Ok(Value::Float(register_fd(f) as f64)),
-        Err(e) => Err(err_str("open", &path, &e)),
+    match op {
+        "open" => {
+            string_to_flags(&arg(1))?;
+            parse_file_mode(&arg(2), "mode", Some(0o666))?;
+        }
+        "chmod" => {
+            parse_file_mode(&arg(1), "mode", None)?;
+        }
+        "utimes" | "lutimes" => {
+            to_unix_timestamp(&arg(1), "atime")?;
+            to_unix_timestamp(&arg(2), "mtime")?;
+        }
+        "close" | "fstat" | "fsync" | "fdatasync" => {
+            validate_fd(&arg(0))?;
+        }
+        "fchmod" => {
+            parse_file_mode(&arg(1), "mode", None)?;
+            validate_fd(&arg(0))?;
+        }
+        "fchown" => {
+            validate_id(&arg(1), "uid")?;
+            validate_id(&arg(2), "gid")?;
+            validate_fd(&arg(0))?;
+        }
+        "futimes" => {
+            to_unix_timestamp(&arg(1), "atime")?;
+            to_unix_timestamp(&arg(2), "mtime")?;
+            validate_fd(&arg(0))?;
+        }
+        "ftruncate" => {
+            let len = arg(1);
+            if !matches!(len, Value::Undef) {
+                super::validate_integer_in(&len, "len", -MAX_SAFE, MAX_SAFE)?;
+            }
+            validate_fd(&arg(0))?;
+        }
+        "readv" | "writev" => {
+            validate_buffer_array(&arg(1))?;
+            validate_fd(&arg(0))?;
+        }
+        "write" => {
+            validate_write(args)?;
+            validate_fd(&arg(0))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
+
+/// The path parameters of each call: argument position, the name node's
+/// `getValidatedPath(value, name)` reports, and whether a descriptor NUMBER is
+/// accepted in its place (`readFileSync(0)`).
+fn path_params(op: &str) -> &'static [(usize, &'static str, bool)] {
+    match op {
+        "readFile" | "writeFile" | "appendFile" | "truncate" => &[(0, "path", true)],
+        "access" | "exists" | "chmod" | "chown" | "lchown" | "utimes" | "lutimes" | "mkdir"
+        | "open" | "opendir" | "readdir" | "readlink" | "realpath" | "rm" | "rmdir" | "stat"
+        | "lstat" | "statfs" | "unlink" | "watchFile" | "unwatchFile" => &[(0, "path", false)],
+        "copyFile" | "cp" => &[(0, "src", false), (1, "dest", false)],
+        "link" => &[(0, "existingPath", false), (1, "newPath", false)],
+        "symlink" => &[(0, "target", false), (1, "path", false)],
+        "rename" => &[(0, "oldPath", false), (1, "newPath", false)],
+        _ => &[],
     }
 }
 
-fn open_options(flags: &str) -> std::fs::OpenOptions {
-    let mut o = std::fs::OpenOptions::new();
-    match flags {
-        "r" | "rs" | "sr" => {
-            o.read(true);
+/// `getValidatedPath` for each path parameter of `op`: a string, a
+/// `Uint8Array` (its bytes), or a `file:` URL (its path), with no NUL. The
+/// arguments come back with each path replaced by its string, or `None` when
+/// `op` takes no path. A URL or Buffer used to be stringified as
+/// `[object Object]` and a number or `undefined` opened as the file `5` /
+/// `undefined`.
+fn validated_paths(op: &str, args: &[Value]) -> Result<Option<Vec<Value>>, String> {
+    let params = path_params(op);
+    if params.is_empty() {
+        return Ok(None);
+    }
+    let mut out = args.to_vec();
+    for &(i, name, fd_ok) in params {
+        let v = args.get(i).cloned().unwrap_or(Value::Undef);
+        if fd_ok && matches!(v, Value::Float(_) | Value::Int(_)) {
+            continue;
         }
-        "r+" | "rs+" | "sr+" => {
-            o.read(true).write(true);
-        }
-        "w" => {
-            o.write(true).create(true).truncate(true);
-        }
-        "wx" | "xw" => {
-            o.write(true).create_new(true);
-        }
-        "w+" => {
-            o.read(true).write(true).create(true).truncate(true);
-        }
-        "wx+" | "xw+" => {
-            o.read(true).write(true).create_new(true);
-        }
-        "a" => {
-            o.append(true).create(true);
-        }
-        "ax" | "xa" => {
-            o.append(true).create_new(true);
-        }
-        "a+" => {
-            o.read(true).append(true).create(true);
-        }
-        "ax+" | "xa+" => {
-            o.read(true).append(true).create_new(true);
-        }
-        _ => {
-            o.read(true);
+        let path = validated_path(&v, name)?;
+        if i < out.len() {
+            out[i] = with_host(|h| h.new_str(path));
         }
     }
-    o
+    Ok(Some(out))
+}
+
+fn validated_path(v: &Value, name: &str) -> Result<String, String> {
+    let tag = native_tag(v);
+    let (path, shown) = if tag.as_deref() == Some("URL") {
+        let s = super::url::file_url_to_path(std::slice::from_ref(v))?;
+        let shown = with_host(|h| h.new_str(s.clone()));
+        (s, shown)
+    } else if let Some(s) = with_host(|h| h.as_str(v)) {
+        (s, v.clone())
+    } else if is_uint8_array(v) {
+        let bytes = super::buffer::view_bytes(v).unwrap_or_default();
+        (String::from_utf8_lossy(&bytes).into_owned(), v.clone())
+    } else {
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"{name}\" argument must be of type string or an instance of Buffer or URL. Received {}",
+                super::received_desc(v)
+            ),
+        ));
+    };
+    if path.contains('\0') {
+        let kind = if name.contains('.') {
+            "property"
+        } else {
+            "argument"
+        };
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_VALUE",
+            &format!(
+                "The {kind} '{name}' must be a string, Uint8Array, or URL without null bytes. Received {}",
+                with_host(|h| h.inspect(&shown))
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+/// `isUint8Array`: a Buffer or a `Uint8Array` (not another element type).
+fn is_uint8_array(v: &Value) -> bool {
+    match native_tag(v).as_deref() {
+        Some("Buffer") => true,
+        Some("TypedArray") => super::typedarray::kind_of(v) == "Uint8Array",
+        _ => false,
+    }
+}
+
+/// The binding's descriptor check, `validateInt32(fd, 'fd', 0)`.
+fn validate_fd(v: &Value) -> Result<i32, String> {
+    validate_int32(v, "fd", 0.0)
+}
+
+/// `validateInt32(value, name, min)`: a Number, an integer, in `[min, 2³¹)`.
+fn validate_int32(v: &Value, name: &str, min: f64) -> Result<i32, String> {
+    if with_host(|h| h.type_of(v)) != "number" {
+        return Err(crate::host::invalid_arg_type(name, "argument", "number", v));
+    }
+    let n = with_host(|h| h.to_number(v));
+    if n.fract() != 0.0 || !n.is_finite() {
+        return Err(super::out_of_range(name, "an integer", n));
+    }
+    if n < min || n > 2_147_483_647.0 {
+        let must = format!(">= {} && <= 2147483647", crate::host::fmt_number(min));
+        return Err(super::out_of_range(name, &must, n));
+    }
+    Ok(n as i32)
+}
+
+/// A `uid`/`gid`: `validateInteger(id, name, -1, kMaxUserId)`.
+fn validate_id(v: &Value, name: &str) -> Result<i64, String> {
+    super::validate_integer_in(v, name, -1.0, 4_294_967_295.0).map(|n| n as i64)
+}
+
+/// `parseFileMode(value, name, def)`: an octal string or a 32-bit unsigned
+/// integer, `def` standing in for `undefined`/`null`.
+fn parse_file_mode(v: &Value, name: &str, def: Option<u32>) -> Result<u32, String> {
+    let nullish = matches!(v, Value::Undef) || with_host(|h| h.is_null(v));
+    let v = match (nullish, def) {
+        (true, Some(d)) => Value::Float(d as f64),
+        (true, None) => Value::Undef,
+        (false, _) => v.clone(),
+    };
+    let mut v = v;
+    if let Some(s) = with_host(|h| h.as_str(&v)) {
+        if s.is_empty() || !s.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_VALUE",
+                &format!(
+                    "The argument '{name}' must be a 32-bit unsigned integer or an octal string. Received {}",
+                    with_host(|h| h.inspect(&v))
+                ),
+            ));
+        }
+        // `NumberParseInt(value, 8)`, then the range check below.
+        let n = s.bytes().fold(0.0, |n, b| n * 8.0 + f64::from(b - b'0'));
+        v = Value::Float(n);
+    }
+    if with_host(|h| h.type_of(&v)) != "number" {
+        return Err(crate::host::invalid_arg_type(
+            name, "argument", "number", &v,
+        ));
+    }
+    let n = with_host(|h| h.to_number(&v));
+    if n.fract() != 0.0 || !n.is_finite() {
+        return Err(super::out_of_range(name, "an integer", n));
+    }
+    if !(0.0..=4_294_967_295.0).contains(&n) {
+        return Err(super::out_of_range(name, ">= 0 && <= 4294967295", n));
+    }
+    Ok(n as u32)
+}
+
+/// `stringToFlags(flags)`: a number is the `open(2)` flags themselves, a
+/// nullish value is `O_RDONLY`, and the strings are node's fixed table.
+fn string_to_flags(v: &Value) -> Result<libc::c_int, String> {
+    use libc::{O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_SYNC, O_TRUNC, O_WRONLY};
+    if with_host(|h| h.type_of(v)) == "number" {
+        return validate_int32(v, "flags", -2_147_483_648.0);
+    }
+    if matches!(v, Value::Undef) || with_host(|h| h.is_null(v)) {
+        return Ok(O_RDONLY);
+    }
+    let s = with_host(|h| h.as_str(v));
+    Ok(match s.as_deref() {
+        Some("r") => O_RDONLY,
+        Some("rs" | "sr") => O_RDONLY | O_SYNC,
+        Some("r+") => O_RDWR,
+        Some("rs+" | "sr+") => O_RDWR | O_SYNC,
+        Some("w") => O_TRUNC | O_CREAT | O_WRONLY,
+        Some("wx" | "xw") => O_TRUNC | O_CREAT | O_WRONLY | O_EXCL,
+        Some("w+") => O_TRUNC | O_CREAT | O_RDWR,
+        Some("wx+" | "xw+") => O_TRUNC | O_CREAT | O_RDWR | O_EXCL,
+        Some("a") => O_APPEND | O_CREAT | O_WRONLY,
+        Some("ax" | "xa") => O_APPEND | O_CREAT | O_WRONLY | O_EXCL,
+        Some("as" | "sa") => O_APPEND | O_CREAT | O_WRONLY | O_SYNC,
+        Some("a+") => O_APPEND | O_CREAT | O_RDWR,
+        Some("ax+" | "xa+") => O_APPEND | O_CREAT | O_RDWR | O_EXCL,
+        Some("as+" | "sa+") => O_APPEND | O_CREAT | O_RDWR | O_SYNC,
+        _ => {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_VALUE",
+                &format!(
+                    "The argument 'flags' is invalid. Received {}",
+                    with_host(|h| h.inspect(v))
+                ),
+            ))
+        }
+    })
+}
+
+/// `toUnixTimestamp(time, name)`: seconds from a numeric string, a finite
+/// number (a negative one meaning NOW), or a `Date`.
+fn to_unix_timestamp(v: &Value, name: &str) -> Result<f64, String> {
+    // `+time == time` holds for exactly the strings that convert to a number.
+    if with_host(|h| h.as_str(v).is_some()) {
+        let n = with_host(|h| h.to_number(v));
+        if !n.is_nan() {
+            return Ok(n);
+        }
+    }
+    if matches!(v, Value::Float(_) | Value::Int(_)) {
+        let n = with_host(|h| h.to_number(v));
+        if n.is_finite() {
+            if n < 0.0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(0.0);
+                return Ok(now / 1000.0);
+            }
+            return Ok(n);
+        }
+    }
+    if native_tag(v).as_deref() == Some("Date") {
+        return Ok(super::date::ms_of(v) / 1000.0);
+    }
+    Err(crate::host::coded_error(
+        "TypeError",
+        "ERR_INVALID_ARG_TYPE",
+        &format!(
+            "The \"{name}\" argument must be an instance of Date or an Time in seconds. Received {}",
+            super::received_desc(v)
+        ),
+    ))
+}
+
+/// `validateBufferArray(buffers)`: an Array whose every element is a byte view.
+fn validate_buffer_array(v: &Value) -> Result<(), String> {
+    let items = with_host(|h| match h.get(v) {
+        Some(JsObj::Array(items)) => Some(items.clone()),
+        _ => None,
+    });
+    let all_views = items.as_ref().is_some_and(|items| {
+        items.iter().all(|b| {
+            matches!(
+                native_tag(b).as_deref(),
+                Some("Buffer" | "TypedArray" | "DataView")
+            )
+        })
+    });
+    if all_views {
+        return Ok(());
+    }
+    Err(crate::host::coded_error(
+        "TypeError",
+        "ERR_INVALID_ARG_TYPE",
+        &format!(
+            "The \"buffers\" argument must be an ArrayBufferView[]. Received {}",
+            super::received_desc(v)
+        ),
+    ))
+}
+
+/// `writeSync`'s own checks (`lib/fs.js`): for a byte view, `offset` an
+/// integer `>= 0` and `validateOffsetLengthWrite`; otherwise the data must be
+/// a string (`validateStringAfterArrayBufferView`).
+fn validate_write(args: &[Value]) -> Result<(), String> {
+    let src = args.get(1).cloned().unwrap_or(Value::Undef);
+    let Some(len) = super::buffer::view_bytes(&src).map(|b| b.len() as f64) else {
+        if with_host(|h| h.as_str(&src).is_some()) {
+            return Ok(());
+        }
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            &format!(
+                "The \"buffer\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received {}",
+                super::received_desc(&src)
+            ),
+        ));
+    };
+    let third = args.get(2).cloned().unwrap_or(Value::Undef);
+    let (offset, length) = if with_host(|h| h.type_of(&third)) == "object" {
+        let opts = third;
+        let nullish = with_host(|h| h.is_null(&opts));
+        let get = |k: &str| match nullish {
+            true => Ok(Value::Undef),
+            false => crate::builtins::get_property(&opts, k),
+        };
+        (get("offset")?, get("length")?)
+    } else {
+        (third, args.get(3).cloned().unwrap_or(Value::Undef))
+    };
+    let offset = if matches!(offset, Value::Undef) || with_host(|h| h.is_null(&offset)) {
+        0.0
+    } else {
+        super::validate_integer(&offset, "offset", 0.0)?
+    };
+    let length = match length {
+        Value::Float(n) => n,
+        Value::Int(n) => n as f64,
+        _ => len - offset,
+    };
+    // `validateOffsetLengthWrite`.
+    if offset > len {
+        return Err(super::out_of_range(
+            "offset",
+            &format!("<= {}", crate::host::fmt_number(len)),
+            offset,
+        ));
+    }
+    if length > len - offset {
+        let must = format!("<= {}", crate::host::fmt_number(len - offset));
+        return Err(super::out_of_range("length", &must, length));
+    }
+    if length < 0.0 {
+        return Err(super::out_of_range("length", ">= 0", length));
+    }
+    Ok(())
+}
+
+// ── file descriptors ─────────────────────────────────────────────────────────
+
+/// `fs.openSync(path, flags, mode)`: one `open(2)` with node's flag table and
+/// `mode` (so `wx` really is exclusive, `as` really is synchronous, and a
+/// numeric flag set or a created file's mode is honoured).
+fn open_impl(args: &[Value]) -> Result<Value, String> {
+    let arg = |i: usize| match args.get(i) {
+        Some(v) if !is_fn(v) => v.clone(),
+        _ => Value::Undef,
+    };
+    let flags = string_to_flags(&arg(1))?;
+    let mode = parse_file_mode(&arg(2), "mode", Some(0o666))?;
+    let path = arg_str(args, 0);
+    let file = open_file(&path, flags, mode)?;
+    Ok(Value::Float(register_fd(file) as f64))
+}
+
+/// One `open(2)` of `path`, its failure worded as node words an `open`.
+fn open_file(path: &str, flags: libc::c_int, mode: u32) -> Result<File, String> {
+    use std::os::unix::io::FromRawFd;
+    let c = cpath(path, "open")?;
+    let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC, mode as libc::c_uint) };
+    if fd < 0 {
+        return Err(err_str("open", path, &std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn close_impl(args: &[Value]) -> Result<Value, String> {
@@ -894,7 +1269,7 @@ fn read_impl(args: &[Value]) -> Result<usize, String> {
             position: args.get(4).cloned().unwrap_or(Value::Undef),
         }
     };
-    read_validated(arg_num(args, 0) as i32, &buffer, &req)?
+    read_validated(args.first().unwrap_or(&Value::Undef), &buffer, &req)?
 }
 
 /// The three operands of a read, before validation.
@@ -945,7 +1320,7 @@ fn read_options(buffer: &Value, opts: &Value) -> Result<ReadArgs, String> {
 /// `DataView` receives them exactly as a Buffer does — and a `position` reads
 /// with `pread`, leaving the descriptor's own offset where it was.
 fn read_validated(
-    fd: i32,
+    fd: &Value,
     buffer: &Value,
     req: &ReadArgs,
 ) -> Result<Result<usize, String>, String> {
@@ -982,6 +1357,9 @@ fn read_validated(
         ));
     }
     let position = read_position(&req.position, length)?;
+    // The binding checks the descriptor last, once the JavaScript-side checks
+    // above have passed.
+    let fd = validate_fd(fd)?;
     let (offset, length) = (offset as usize, length as usize);
     let dest = &mut bytes[offset..offset + length];
     let got = if fd == 0 && position.is_none() {
@@ -1112,7 +1490,7 @@ fn read_async(args: &[Value]) -> Result<Value, String> {
             "cb", "argument", "function", &cb,
         ));
     }
-    let result = read_validated(arg_num(args, 0) as i32, &buffer, &req)?;
+    let result = read_validated(args.first().unwrap_or(&Value::Undef), &buffer, &req)?;
     with_host(|h| match result {
         Ok(n) => {
             let nul = h.null();
@@ -1148,13 +1526,9 @@ fn write_impl(args: &[Value]) -> Result<usize, String> {
             position_arg(args, 2),
         )
     };
-    let r = with_file(fd, |file| {
-        let mut fr: &File = file;
-        if let Some(pos) = position {
-            fr.seek(SeekFrom::Start(pos)).ok();
-        }
-        fr.write(&data)
-    });
+    // A numeric `position` is `pwrite`: the descriptor's offset stays where it
+    // was, so a later position-less write continues from there.
+    let r = with_file(fd, |file| write_maybe_at(file, &data, position));
     match r {
         Some(Ok(n)) => Ok(n),
         Some(Err(e)) => Err(err_str("write", "", &e)),
@@ -1183,8 +1557,9 @@ fn readv_impl(args: &[Value]) -> Result<usize, String> {
         });
         let n = match got {
             Some(Ok(n)) => n,
-            Some(Err(e)) => return Err(err_str("readv", "", &e)),
-            None => return Err("Error: EBADF: bad file descriptor, readv".to_string()),
+            // libuv reports a failed vectored read as the `read` it issues.
+            Some(Err(e)) => return Err(err_str("read", "", &e)),
+            None => return Err("Error: EBADF: bad file descriptor, read".to_string()),
         };
         if n == 0 {
             break;
@@ -1207,17 +1582,25 @@ fn writev_impl(args: &[Value]) -> Result<usize, String> {
     for b in &buffers {
         data.extend(buf_bytes(b));
     }
-    let r = with_file(fd, |file| {
-        let mut fr: &File = file;
-        if let Some(pos) = position {
-            fr.seek(SeekFrom::Start(pos)).ok();
-        }
-        fr.write(&data)
-    });
+    // `pwritev` for a numeric position, as in `writeSync`. libuv reports a
+    // failed vectored write as the `write` it issues.
+    let r = with_file(fd, |file| write_maybe_at(file, &data, position));
     match r {
         Some(Ok(n)) => Ok(n),
-        Some(Err(e)) => Err(err_str("writev", "", &e)),
-        None => Err("Error: EBADF: bad file descriptor, writev".to_string()),
+        Some(Err(e)) => Err(err_str("write", "", &e)),
+        None => Err("Error: EBADF: bad file descriptor, write".to_string()),
+    }
+}
+
+/// One `write(2)` at the descriptor's offset, or one `pwrite(2)` at `position`.
+fn write_maybe_at(file: &File, data: &[u8], position: Option<u64>) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    match position {
+        Some(pos) => file.write_at(data, pos),
+        None => {
+            let mut fr: &File = file;
+            fr.write(data)
+        }
     }
 }
 
@@ -1233,7 +1616,7 @@ fn fstat_impl(args: &[Value]) -> Result<Value, String> {
 
 fn fchmod_impl(args: &[Value]) -> Result<Value, String> {
     let fd = arg_num(args, 0) as i32;
-    let mode = arg_num(args, 1) as libc::mode_t;
+    let mode = parse_file_mode(args.get(1).unwrap_or(&Value::Undef), "mode", None)? as libc::mode_t;
     let rc = with_file(fd, |file| unsafe { libc::fchmod(file.as_raw_fd(), mode) });
     fd_result(rc, "fchmod")
 }
@@ -1537,15 +1920,97 @@ fn create_read_stream(args: &[Value]) -> Result<Value, String> {
     });
     let stream = super::net::new_emitter_object("FSReadStream", stream);
     with_host(|h| h.incr_handle());
+    // `{ fd }`: the stream reads an already-open descriptor from its current
+    // offset and opens nothing (so no `open`/`ready`). `autoClose` (default
+    // true) closes it after `end`; with it off the stream never emits `close`.
+    let fd = option_value(args, "fd").filter(|v| matches!(v, Value::Float(_) | Value::Int(_)));
+    let auto_close = option_value(args, "autoClose").map_or(true, |v| with_host(|h| h.truthy(&v)));
     let recv = stream.clone();
     let p = path;
     with_host(|h| {
         h.queue_micro_native(Box::new(move || {
-            read_stream_pump(&recv, &p);
+            match fd {
+                Some(fd) => read_fd_stream_pump(&recv, arg_num(&[fd], 0) as i32, auto_close),
+                None => read_stream_pump(&recv, &p),
+            }
             Ok(())
         }))
     });
     Ok(stream)
+}
+
+/// The value of `key` in the options object among `args`, if present.
+fn option_value(args: &[Value], key: &str) -> Option<Value> {
+    with_host(|h| {
+        args.iter().find_map(|v| match h.get(v) {
+            Some(JsObj::Object(p)) => p.get(key).cloned(),
+            _ => None,
+        })
+    })
+}
+
+/// `read_stream_pump` for a stream over a caller's descriptor.
+fn read_fd_stream_pump(recv: &Value, fd: i32, auto_close: bool) {
+    with_host(|h| h.decr_handle());
+    let read = with_file(fd, |file| {
+        let mut bytes = Vec::new();
+        let mut fr: &File = file;
+        fr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let bytes = match read {
+        Some(Ok(b)) => b,
+        failed => {
+            let msg = match failed {
+                Some(Err(e)) => err_str("read", "", &e),
+                _ => "Error: EBADF: bad file descriptor, read".to_string(),
+            };
+            let ev = with_host(|h| crate::builtins::synth_error(h, &msg));
+            let _ = super::events::instance_call(
+                recv,
+                "emit",
+                vec![with_host(|h| h.new_str("error")), ev],
+            );
+            return;
+        }
+    };
+    emit_stream_bytes(recv, &bytes);
+    let target = recv.clone();
+    with_host(|h| {
+        h.queue_micro_native(Box::new(move || {
+            let end = with_host(|h| h.new_str("end"));
+            super::events::instance_call(&target, "emit", vec![end])?;
+            if !auto_close {
+                return Ok(());
+            }
+            close_fd(fd);
+            with_host(|h| {
+                h.queue_micro_native(Box::new(move || {
+                    let close = with_host(|h| h.new_str("close"));
+                    super::events::instance_call(&target, "emit", vec![close]).map(|_| ())
+                }))
+            });
+            Ok(())
+        }))
+    });
+}
+
+/// Hand a read stream's bytes to its pipe destination, or emit them as one
+/// `data` chunk in the stream's encoding.
+fn emit_stream_bytes(recv: &Value, bytes: &[u8]) {
+    let enc = get_prop(recv, "@@encoding").map(|v| with_host(|h| h.str_of(&v)));
+    let chunk = match enc.as_deref() {
+        Some(e) if e != "buffer" => {
+            with_host(|h| h.new_str(String::from_utf8_lossy(bytes).into_owned()))
+        }
+        _ => super::buffer::from_bytes(bytes),
+    };
+    if let Some(dest) = get_prop(recv, "@@pipeDest") {
+        let _ = crate::host::call_method(&dest, "write", vec![chunk]);
+        let _ = crate::host::call_method(&dest, "end", vec![]);
+    } else {
+        let name = with_host(|h| h.new_str("data"));
+        let _ = super::events::instance_call(recv, "emit", vec![name, chunk]);
+    }
 }
 
 /// Read the whole file and drive the stream's events on the microtask tick after
@@ -1579,20 +2044,7 @@ fn read_stream_pump(recv: &Value, path: &str) {
             return;
         }
     };
-    let enc = get_prop(recv, "@@encoding").map(|v| with_host(|h| h.str_of(&v)));
-    let chunk = match enc.as_deref() {
-        Some(e) if e != "buffer" => {
-            with_host(|h| h.new_str(String::from_utf8_lossy(&bytes).into_owned()))
-        }
-        _ => super::buffer::from_bytes(&bytes),
-    };
-    if let Some(dest) = get_prop(recv, "@@pipeDest") {
-        let _ = crate::host::call_method(&dest, "write", vec![chunk]);
-        let _ = crate::host::call_method(&dest, "end", vec![]);
-    } else {
-        let name = with_host(|h| h.new_str("data"));
-        let _ = super::events::instance_call(recv, "emit", vec![name, chunk]);
-    }
+    emit_stream_bytes(recv, &bytes);
     // `end` and then `close` each follow on a later tick, as node schedules
     // them, so what a `data` listener queued runs before the stream ends.
     let target = recv.clone();
@@ -1664,19 +2116,31 @@ fn create_write_stream(args: &[Value]) -> Result<Value, String> {
         Some(f) => f,
         None => "w".to_string(),
     };
-    let file = open_options(&flags)
-        .open(&path)
-        .map_err(|e| err_str("open", &path, &e))?;
-    let fd = register_fd(file);
+    // `{ fd }` writes to an already-open descriptor and opens nothing (no
+    // `open`/`ready`); `autoClose: false` leaves it open after `finish`, and
+    // the stream then never emits `close`.
+    let given = option_value(args, "fd").filter(|v| matches!(v, Value::Float(_) | Value::Int(_)));
+    let auto_close = option_value(args, "autoClose").map_or(true, |v| with_host(|h| h.truthy(&v)));
+    let fd = match &given {
+        Some(v) => arg_num(std::slice::from_ref(v), 0) as i32,
+        None => {
+            let flags = string_to_flags(&with_host(|h| h.new_str(flags)))?;
+            register_fd(open_file(&path, flags, 0o666)?)
+        }
+    };
     let stream = with_host(|h| {
         let mut extra = IndexMap::new();
         extra.insert("path".into(), h.new_str(path));
         extra.insert("@@wfd".into(), Value::Float(fd as f64));
+        extra.insert("@@autoClose".into(), Value::Bool(auto_close));
         extra.insert("bytesWritten".into(), Value::Float(0.0));
         extra
     });
     let stream = super::net::new_emitter_object("FSWriteStream", stream);
     with_host(|h| h.incr_handle());
+    if given.is_some() {
+        return Ok(stream);
+    }
     let recv = stream.clone();
     with_host(|h| {
         h.queue_micro_native(Box::new(move || {
@@ -1731,7 +2195,11 @@ pub fn write_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result
             {
                 write_stream_bytes(recv, Some(chunk));
             }
-            if let Some(fd) = get_prop(recv, "@@wfd").map(|v| with_host(|h| h.to_number(&v)) as i32)
+            let auto_close =
+                get_prop(recv, "@@autoClose").map_or(true, |v| with_host(|h| h.truthy(&v)));
+            if let Some(fd) = get_prop(recv, "@@wfd")
+                .filter(|_| auto_close)
+                .map(|v| with_host(|h| h.to_number(&v)) as i32)
             {
                 close_fd(fd);
             }
@@ -1754,7 +2222,10 @@ pub fn write_stream_call(recv: &Value, method: &str, args: Vec<Value>) -> Result
                         invoke(&cb, vec![null], None)?;
                     }
                     ev("finish")?;
-                    ev("close")
+                    if auto_close {
+                        ev("close")?;
+                    }
+                    Ok(())
                 }))
             });
             Ok(recv.clone())
@@ -2138,13 +2609,10 @@ fn position_arg(args: &[Value], i: usize) -> Option<u64> {
     }
 }
 
-/// A timestamp argument in **seconds**. A `Date` argument stores milliseconds, so
-/// divide; a bare number is already seconds (Node's `fs.utimes` convention).
+/// A timestamp argument in **seconds** (`toUnixTimestamp`). `validate_call`
+/// has already refused one that does not convert.
 fn time_secs(args: &[Value], i: usize) -> f64 {
-    match args.get(i) {
-        Some(v) if native_tag(v).as_deref() == Some("Date") => arg_num(args, i) / 1000.0,
-        _ => arg_num(args, i),
-    }
+    to_unix_timestamp(args.get(i).unwrap_or(&Value::Undef), "time").unwrap_or(f64::NAN)
 }
 
 fn to_timeval(secs: f64) -> libc::timeval {
@@ -2235,6 +2703,13 @@ fn err_str2(op: &str, from: &str, to: &str, e: &std::io::Error) -> String {
 /// Node exposes it as `err.code`, and every error it renders leads with it.
 pub(crate) fn libuv_code(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
+    // An OS error names itself: its errno is looked up in the same table
+    // `util.getSystemErrorMap` reports, so `EBADF`, `ELOOP`, `ENAMETOOLONG`,
+    // `EXDEV`, … keep their own codes. Mapping by `ErrorKind` alone folded
+    // every kind Rust does not single out into `EIO`.
+    if let Some(name) = e.raw_os_error().and_then(crate::stdlib::util::errno_name) {
+        return name;
+    }
     match e.kind() {
         NotFound => "ENOENT",
         PermissionDenied => "EACCES",
@@ -2255,17 +2730,7 @@ pub(crate) fn libuv_message(e: &std::io::Error) -> String {
 
 /// libuv's own lowercase reason string for a code.
 fn libuv_reason(code: &str) -> &'static str {
-    match code {
-        "ENOENT" => "no such file or directory",
-        "EACCES" => "permission denied",
-        "EEXIST" => "file already exists",
-        "ENOTDIR" => "not a directory",
-        "EISDIR" => "illegal operation on a directory",
-        "ENOTEMPTY" => "directory not empty",
-        "EINVAL" => "invalid argument",
-        "EPIPE" => "broken pipe",
-        _ => "i/o error",
-    }
+    crate::stdlib::util::errno_by_name(code).map_or("i/o error", |(_, m)| m)
 }
 
 fn err_str(op: &str, path: &str, e: &std::io::Error) -> String {

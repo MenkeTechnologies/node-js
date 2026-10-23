@@ -8,6 +8,10 @@
 //! handling, `Stats`/`Dirent`/`Dir` shapes, and error strings identical to the
 //! rest of `fs`.
 //!
+//! `open` returns a `FileHandle`: a port of node's class over the same
+//! synchronous descriptor calls (`fs_filehandle.js`), which `readFile`,
+//! `writeFile` and `appendFile` also route through when handed one.
+//!
 //! The work is performed synchronously (node-js has no thread-pooled `fs` at this
 //! layer); the Promise is already settled when returned, so `await`/`.then`
 //! observe the result on the next microtask tick — the observable contract
@@ -43,13 +47,68 @@ pub const METHODS: &[&str] = &[
     "utimes",
     "lutimes",
     "mkdtemp",
+    "open",
     "opendir",
     "glob",
 ];
 
+/// The `FileHandle` port (`fs_filehandle.js`), evaluated once: an object with
+/// `open`, `FileHandle`, and the handle forms of `readFile` / `writeFile`.
+fn file_handle_module() -> Result<Value, String> {
+    thread_local! {
+        static MODULE: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    if let Some(m) = MODULE.with(|m| m.borrow().clone()) {
+        return Ok(m);
+    }
+    let factory = crate::eval_in_global_scope(include_str!("fs_filehandle.js"))?;
+    let node_error = with_host(|h| h.alloc(crate::host::JsObj::Builtin("util.@@nodeError".into())));
+    let made = crate::host::invoke(&factory, vec![node_error], None)?;
+    MODULE.with(|m| *m.borrow_mut() = Some(made.clone()));
+    Ok(made)
+}
+
+/// Call one of the port's functions by name.
+fn call_port(name: &str, args: Vec<Value>) -> Result<Value, String> {
+    let f = crate::builtins::get_property(&file_handle_module()?, name)?;
+    crate::host::invoke(&f, args, None)
+}
+
+/// `path instanceof FileHandle` — the test node's `readFile`/`writeFile` make
+/// before treating their first argument as a path. Only an ordinary object can
+/// be one; a string never reaches the port.
+fn is_file_handle(v: &Value) -> Result<bool, String> {
+    let plain = with_host(|h| matches!(h.get(v), Some(crate::host::JsObj::Object(_))));
+    if !plain {
+        return Ok(false);
+    }
+    let class = crate::builtins::get_property(&file_handle_module()?, "FileHandle")?;
+    let found = crate::host::call_method(&class, "isFileHandle", vec![v.clone()])?;
+    Ok(with_host(|h| h.truthy(&found)))
+}
+
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
-    // Every method delegates to the synchronous `fs` sibling of the same name,
-    // then wraps the outcome in a settled Promise.
+    if method == "open" {
+        return Some(call_port("open", args.to_vec()));
+    }
+    // A `FileHandle` in the path position reads or writes through the handle,
+    // from its current position (`readFileHandle` / `writeFileHandle`).
+    if matches!(method, "readFile" | "writeFile" | "appendFile") {
+        match is_file_handle(args.first().unwrap_or(&Value::Undef)) {
+            Ok(true) => {
+                let port = if method == "readFile" {
+                    "readFile"
+                } else {
+                    "writeFile"
+                };
+                return Some(call_port(port, args.to_vec()));
+            }
+            Ok(false) => {}
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    // Every other method delegates to the synchronous `fs` sibling of the same
+    // name, then wraps the outcome in a settled Promise.
     let sync_name = match method {
         "readFile" => "readFileSync",
         "writeFile" => "writeFileSync",
