@@ -3252,3 +3252,33 @@ Also in round 21, pinned in `examples/protoshape.js`:
 | a native accessor's getter `name` (`ReadableStream.prototype` `locked`, `AbortSignal.prototype` `aborted`) | `get locked` | `@get@locked` |
 | `ReadableStream.prototype.getReader.length` and every modelled class method's `length` | the arity (measured: `CLASS_PROTO_ARITY`) | `undefined` |
 | `performance.clearResourceTimings()`, `setResourceTimingBufferSize(n)`, `Performance.prototype.timeOrigin` | methods (no-ops for a process that records no resource timings, which node-js never does) and an accessor | absent; `timeOrigin` an own value |
+
+Also in round 21, pinned in `examples/alspropagation.js`, `stringdecoderstate.js`,
+`ossurface.js` and `rlinterface.js`:
+
+| Case | node | was |
+|---|---|---|
+| an `AsyncLocalStorage` store inside `setTimeout`/`setInterval`/`setImmediate`/`nextTick`/promise jobs/`await`/I/O and `fs/promises` callbacks started in `run` (or after `enterWith`) | the store (node's `AsyncContextFrame`) | `undefined` — only synchronous code saw it. Every queued task, timer and promise reaction now carries the frame it was scheduled in (a reaction: the frame `.then`/`await` registered in, not the resolver's) |
+| `AsyncLocalStorage.snapshot()`, `AsyncLocalStorage.bind(fn)`; `AsyncResource#runInAsyncScope`/`bind`, `AsyncResource.bind` | run in the frame captured at creation | absent / ran in the caller's |
+| `new StringDecoder('nope')` | `ERR_UNKNOWN_ENCODING` | accepted, `encoding` `'nope'` |
+| `decoder.text(buf, offset)`, `decoder.lastNeed`/`lastTotal`/`lastChar` | the method and the held-back state as prototype getters | absent |
+| `os.userInfo()` | the password-database entry (`uid, gid, username, homedir, shell`); Buffers under `{ encoding: 'buffer' }` | uid/gid `-1`, fields from `$USER`/`$HOME`/`$SHELL`, `encoding` ignored |
+| `os.getPriority(1.5)`, `os.setPriority(0, 20)`, `os.setPriority(999999, 0)` | `ERR_OUT_OF_RANGE`; `SystemError [ERR_SYSTEM_ERROR]` with `info`/`errno`/`syscall` | coerced and answered silently |
+| `` `${os.arch}` ``, `os.freemem + 0` (the `os` value functions) | the value — they carry a `[Symbol.toPrimitive]` | the function's source text |
+| `fs.constants === fs.constants`, `=== require('fs/promises').constants`; `os`/`crypto`/`zlib`/`http2`/`buffer`/`perf_hooks` `constants`; `require('constants')` | one object | a new object per read |
+| `Object.isFrozen(os.constants.signals)` | `true` | `false` |
+| `rl.question(q)` / `rl.prompt()` with no `output` | write nothing | wrote to the process's stdout |
+| a non-terminal `rl.write('x\n')` | input: a `line` event, the pending question answered | written to the output |
+| `rl.terminal`, `rl.line`, `rl.input`, `rl.output`, `rl.closed` after `close()` | instance fields | `undefined` |
+
+Still open, found here:
+
+| Case | node | node-js |
+|---|---|---|
+| `require('node:test')` | the test runner (`test`, `describe`, `it`, `mock`, reporters) | `Cannot find module` |
+| `new ReadableStream({ type: 'bytes' })`'s `byobRequest`; `fh.readableWebStream()` as a byte stream | a BYOB request per pull | `null`; a default stream. node-js's `ReadableStream` is its own simplified implementation (a `pull` that returns a promise is not awaited), so byte streams need the spec's machinery — a port of node's `lib/internal/webstreams` — rather than a patch |
+| `SubtleCrypto.prototype` | every WebCrypto method | `digest` only — WebCrypto itself is not implemented |
+| `Performance.prototype.toJSON`, `nodeTiming`, `markResourceTiming`, `onresourcetimingbufferfull` | members | absent (`nodeTiming`'s bootstrap milestones are not recorded) |
+| `u = new URL('http://a/'); u.protocol = 'file'` | `file://a/` | unchanged — the vendored `url` crate refuses that scheme change |
+| `CountQueuingStrategy.prototype.size` | a getter returning the size function | a method |
+| `parity-scripts/stdlib/37_spawn_events.js` | — | the REFERENCE is non-deterministic (node printed a different interleaving 1 run in 12) |
