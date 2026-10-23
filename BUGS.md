@@ -19,9 +19,12 @@ over a generated cross-product of inputs × `parseQueryString` ×
 (serialize = JSON, not V8 binary; heap stats are a shim), `async_hooks`
 (AsyncLocalStorage sync-only; hooks are no-ops), `zlib`.
 
-`process.emitWarning` writes to stderr in Node's format
-(`(node:PID) [CODE] Name: message`, plus the one-time
-`(Use \`node --trace-… ...\`)` hint). `url.parse` emits `DEP0169` through it.
+`process.emitWarning` delivers on the next tick, as node's does: it writes to
+stderr in Node's format (`(node:PID) [CODE] Name: message`, plus the one-time
+`(Use \`node --trace-… ...\`)` hint) and then emits `process`'s `warning` event
+with the warning `Error` (an `Error` argument is passed through as itself).
+`url.parse` emits `DEP0169` through it, and an `EventEmitter` past its
+`setMaxListeners` cap emits `MaxListenersExceededWarning` once per event.
 
 `--no-warnings` and `--no-deprecation` behave as in Node (the warning is
 suppressed entirely). `--trace-warnings` / `--trace-deprecation` are ACCEPTED
@@ -3051,6 +3054,29 @@ Each row is pinned in `examples/viewbytes.js` or `examples/fdread.js`.
 | `decoder.write([65])`, `.write(5)`, `.write()` | `ERR_INVALID_ARG_TYPE` | decoded |
 | `decoder.end('xy')` after a held-back byte | `'xy'` then the flushed `U+FFFD` — a string chunk passes through untouched | the string's bytes were decoded after the held byte |
 
+Also in round 17, pinned in `examples/querystring.js` and `examples/webglobals.js`:
+
+| Case | node | was |
+|---|---|---|
+| `querystring.parse` with `null`/`0`/`false` separators, `maxKeys` counting pairs (empty ones too), a fractional or non-number `maxKeys`, multi-character separators, `options.decodeURIComponent`, a non-string input | `lib/querystring.js`'s scanner, now ported | `null` used as the literal separator `"null"`, `maxKeys` counted distinct keys, the custom decoder ignored, `parse(5)` gave `{5: ""}` |
+| `querystring.stringify` of `NaN`/`Infinity`, `1e21`, `options.encodeURIComponent`, `null` separators; `escape({toString})` | empty, `1e%2B21`, the custom encoder, `&`/`=`, the `toString` result | `NaN`, `1e+21`, ignored, `"anull1"`, `[object Object]` |
+| `qs.encode === qs.stringify`, `qs.decode === qs.parse` | `true` (`.name` `stringify`/`parse`) | distinct functions |
+| `ReadableStream`, `WritableStream`, `TransformStream`, the reader/controller/strategy classes, `TextEncoderStream`, `TextDecoderStream`, `(De)CompressionStream`, `MessageChannel`, `BroadcastChannel`, the `Performance*` classes as globals | the module's constructors | `ReferenceError` |
+| `for await (const c of readableStream)`, `stream.values({preventCancel})`, `break` out of it | iterates, then cancels the source (unless `preventCancel`) and releases the lock | `not async iterable` |
+| `await reader.read()` | `{ done, value }` (that key order) | `{ value, done }` |
+| a second `getReader()` / `getWriter()` | `ERR_INVALID_STATE` `Invalid state: ReadableStream is locked` | a bare `TypeError: ReadableStream is locked` |
+| `TextEncoderStream` / `CompressionStream` chunks | `Uint8Array` | `Buffer` |
+| `require('timers').promises`, `require('crypto').subtle` | the module / `webcrypto.subtle` | `undefined` |
+| `require('dns').promises === require('dns/promises')`; `Object.keys(require('dns'))` | `true`; `promises` and no `promise*` internals | a fresh object per read; 17 internal `promiseLookup`… names advertised |
+| `Object.keys` of `timers`, `dns`, `stream`, `readline`, `assert`, `path`, `crypto`, `EventEmitter` | includes `promises` / `strict` / `posix`,`win32` / `webcrypto`,`subtle` / the statics | omitted |
+| `EventEmitter.captureRejections`, `usingDomains`, `captureRejectionSymbol`, `errorMonitor` (and `errorMonitor` listeners seeing an `error` first) | `false`, `false`, `Symbol.for('nodejs.rejection')`, a private symbol | absent |
+| more than `getMaxListeners()` listeners on one event | one `MaxListenersExceededWarning` | silent — the cap was stored and never consulted |
+| `process.emitWarning(msg)` then `console.log` | the log first; the warning on the next tick, with a `warning` event | printed inline; no event |
+| `process.emitWarning(new Error('boom'))`, `emitWarning(5)` | `Error: boom`; `ERR_INVALID_ARG_TYPE` | `Warning: Error: boom`; printed `5` |
+| `util.promisify(setTimeout)`, `(setImmediate)`, `(fs.exists)`, `(fs.read)`, `(dns.lookup)`, `(child_process.exec)` | the custom forms / multi-value results (`{stdout, stderr}`) | callback-last wrapping: `promisify(setTimeout)(5)` threw `"callback" argument must be of type function` |
+| `util.promisify(f)` where `f[util.promisify.custom]` is set; `.name`/`.length`; `promisify(promisify(f))` | the custom function; `f`'s; the same function | ignored; `""`/`0`; a new wrapper |
+| `util.styleText(['bold','red'], t)`, nested `styleText`, `#RRGGBB`, a bad `text`/`options`/`stream`, piped `stdout` | first format outermost, inner resets re-open, 24-bit color, node's errors, and NO escape codes when the stream would not colorize (`FORCE_COLOR` honoured) | reversed nesting, an inner reset ended the outer style, hex rejected, no validation, raw escapes written into pipes |
+
 The two `examples/protolistings.js` / `examples/protomembers.js` lines that
 count `Date.prototype` keep their v26.11.1 transcript: node v26.12.0 adds
 `toTemporalInstant` (see the `Temporal` entry above), which node-js does not
@@ -3060,5 +3086,11 @@ have; re-blessing them would record a divergence as a target.
 
 | Case | node | node-js |
 |---|---|---|
+| `emitter.rawListeners(e)` after `emitter.once(e, f)` | the once-WRAPPER, whose `.listener` is `f` | `f` itself — once-listeners are stored unwrapped, so `listeners` and `rawListeners` coincide |
+| `util.parseArgs({ tokens: true, … })` | a `tokens` array (`option`, `positional`, `option-terminator` records with `index`/`rawName`/`inlineValue`) | no `tokens` key — `parse_args` (`src/stdlib/util.rs`) is a reimplementation, not a port of `lib/internal/util/parse_args`, and records no token stream |
+| `setTimeout[util.promisify.custom]`, `fs.exists[util.promisify.custom]` | the custom promisified function | `undefined` — `util.promisify` itself resolves these builtins' custom forms, but the symbol-keyed READ on a builtin function does not |
+| `performance instanceof Performance` | `true` | `false` — `performance` is not linked to the `Performance` class's prototype |
+| `Object.getOwnPropertyNames(ReadableStream.prototype)` | includes the `locked` accessor, in node's order | `locked` is an own data property of each stream |
+| `crypto.Crypto`, `CryptoKey`, `SubtleCrypto` globals / members | constructors | absent |
 | `require('fs/promises').open(p)` / `fs.promises.open` | a `FileHandle` (`read`, `write`, `readFile`, `stat`, `close`, …) | `open is not a function` — there is no `FileHandle` class; every other `fs/promises` member delegates to its sync twin |
 | `fs.readSync(fd, big.subarray(2), 0, 2, 0)` | the bytes appear in `big` | they land in the subarray only — the documented no-aliasing Buffer model above, reached through a write-into-view API |

@@ -182,7 +182,10 @@ pub fn is_method(qualified: &str) -> bool {
     // Any method on an unimplemented namespace routes to `call`, which throws an
     // honest "not implemented" error (so `mod.foo()` fails clearly rather than
     // silently returning undefined).
-    is_unimplemented(ns) || namespace_methods(ns).contains(&m) || namespace_ctors(ns).contains(&m)
+    is_unimplemented(ns)
+        || namespace_methods(ns).contains(&m)
+        || namespace_ctors(ns).contains(&m)
+        || namespace_values(ns).contains(&m)
 }
 
 /// The callable members of builtin namespace `ns`. THE single table backing both
@@ -290,12 +293,38 @@ pub fn namespace_statics_enumerable(ns: &str) -> bool {
     ns != "Iterator"
 }
 
+/// Non-callable members a namespace exports as enumerable VALUES — the nested
+/// modules and cross-links (`timers.promises`, `assert.strict`, `path.posix`,
+/// `crypto.subtle`). Listed apart from [`namespace_ctors`] because they are
+/// values rather than constructors; like `fs.promises` among the ctors, each
+/// read resolves through [`constant`] before any method thunk is considered.
+pub fn namespace_values(ns: &str) -> &'static [&'static str] {
+    match ns {
+        "timers" | "dns" | "readline" | "stream" | "Stream" => &["promises"],
+        "assert" => &["strict"],
+        "EventEmitter" => &[
+            "usingDomains",
+            "captureRejectionSymbol",
+            "captureRejections",
+            "errorMonitor",
+            "defaultMaxListeners",
+        ],
+        "path" | "path/win32" => &["win32", "posix"],
+        "crypto" => &["webcrypto", "subtle"],
+        _ => &[],
+    }
+}
+
 pub fn namespace_keys(ns: &str) -> Vec<String> {
     // The `require.cache` view enumerates the resolved filenames it holds.
     if ns == crate::builtins::REQUIRE_CACHE {
         return crate::module::cache_keys();
     }
-    let mut out: Vec<String> = namespace_ctors(ns).iter().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = namespace_ctors(ns)
+        .iter()
+        .chain(namespace_values(ns))
+        .map(|s| s.to_string())
+        .collect();
     for m in namespace_methods(ns) {
         if !out.iter().any(|k| k == m) {
             out.push((*m).to_string());
@@ -422,6 +451,14 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         // `crypto.webcrypto` is the WHATWG surface; `globalThis.crypto` is the
         // same object. Only its two random helpers and `subtle.digest` are
         // implemented — see `crypto::WEBCRYPTO_METHODS`.
+        // `crypto.subtle` is `crypto.webcrypto.subtle`; it was absent.
+        "crypto" if name == "subtle" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("SubtleCrypto".into()))
+        })),
+        // `timers.promises` is the `timers/promises` module; it was absent.
+        "timers" if name == "promises" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("timers/promises".into()))
+        })),
         "crypto" if name == "webcrypto" => {
             Some(with_host(|h| h.alloc(JsObj::Builtin("webcrypto".into()))))
         }
@@ -432,6 +469,19 @@ pub fn constant(ns: &str, name: &str) -> Option<Value> {
         // here rather than among the static methods (which would make it read
         // as a function). It was absent: node reports 10.
         "EventEmitter" | "events" if name == "defaultMaxListeners" => Some(Value::Float(10.0)),
+        // The capture-rejections switch (off by default), the symbol a class
+        // implements to receive captured rejections, the legacy domain flag,
+        // and the private symbol whose listeners monitor `error` events. All
+        // four were absent.
+        "EventEmitter" | "events" if matches!(name, "captureRejections" | "usingDomains") => {
+            Some(Value::Bool(false))
+        }
+        "EventEmitter" | "events" if name == "captureRejectionSymbol" => {
+            Some(with_host(|h| h.symbol_for("nodejs.rejection")))
+        }
+        "EventEmitter" | "events" if name == "errorMonitor" => {
+            Some(with_host(|h| h.internal_symbol("events.errorMonitor")))
+        }
         // `Buffer.poolSize` is a DATA property, not a method, so it belongs here
         // rather than in `STATIC_METHODS` (which would make it read as a
         // function). It was absent entirely: `Buffer.poolSize` was `undefined`
@@ -1012,6 +1062,7 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         t if fetch::is_class(t) => fetch::methods_for(t),
         "EventTarget" => event_target::EVENT_TARGET_METHODS,
         "Event" => event_target::EVENT_METHODS,
+        stream_web::ASYNC_ITERATOR_TAG => stream_web::ASYNC_ITERATOR_METHODS,
         t if stream_web::is_class(t) => stream_web::methods_for(t),
         _ => &[],
     };
@@ -1169,6 +1220,9 @@ pub fn instance_call(
         "Console" => console::instance_call(recv, method, args),
         "ChildProcess" => child_process::instance_call(recv, method, args),
         "ChildPipe" => child_process::pipe_call(recv, method, args),
+        stream_web::ASYNC_ITERATOR_TAG => {
+            stream_web::instance_call(stream_web::ASYNC_ITERATOR_TAG, recv, method, args)
+        }
         t if stream_web::is_class(t) => stream_web::instance_call(t, recv, method, args),
         "AsyncLocalStorage" | "AsyncHook" | "AsyncResource" => {
             async_hooks::instance_call(tag, recv, method, args)

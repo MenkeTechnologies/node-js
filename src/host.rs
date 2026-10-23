@@ -2215,6 +2215,20 @@ impl JsHost {
         self.symbol_registry.insert(key.to_string(), s.clone());
         s
     }
+    /// A process-wide symbol node keeps privately (`events.errorMonitor`): one
+    /// identity for every read, described by `desc`, but NOT in the
+    /// `Symbol.for` registry, so `Symbol.keyFor` answers `undefined` for it.
+    /// It shares the registry map under a `@@Symbol.` key, which
+    /// `symbol_registry_key` already excludes.
+    pub fn internal_symbol(&mut self, desc: &str) -> Value {
+        let key = format!("@@Symbol.@internal:{desc}");
+        if let Some(v) = self.symbol_registry.get(&key) {
+            return v.clone();
+        }
+        let s = self.new_symbol(Some(desc.to_string()));
+        self.symbol_registry.insert(key, s.clone());
+        s
+    }
     /// `Symbol.keyFor(sym)`: the registry key `Symbol.for` interned `sym` under,
     /// or `undefined` for a symbol that is not in the registry at all.
     ///

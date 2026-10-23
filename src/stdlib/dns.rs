@@ -52,24 +52,6 @@ pub const METHODS: &[&str] = &[
     "setServers",
     "getDefaultResultOrder",
     "setDefaultResultOrder",
-    // `dns.promises.*` members, reachable through the `promises` nested object.
-    "promiseLookup",
-    "promiseLookupService",
-    "promiseResolve",
-    "promiseResolve4",
-    "promiseResolve6",
-    "promiseResolveMx",
-    "promiseResolveTxt",
-    "promiseResolveCname",
-    "promiseResolveNs",
-    "promiseResolvePtr",
-    "promiseResolveSrv",
-    "promiseResolveSoa",
-    "promiseResolveNaptr",
-    "promiseResolveCaa",
-    "promiseResolveTlsa",
-    "promiseResolveAny",
-    "promiseReverse",
 ];
 
 /// Method surface of a `dns.Resolver` instance (wired by the parent via
@@ -189,7 +171,11 @@ fn module_servers() -> Option<Vec<String>> {
 /// `dns.promises` nested object plus the numeric flags and string error codes.
 pub fn constant(name: &str) -> Option<Value> {
     match name {
-        "promises" => Some(promises_object()),
+        // `dns.promises` IS the `dns/promises` module. It was a fresh object of
+        // thunks per read, so `dns.promises !== require("dns/promises")`.
+        "promises" => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("dns/promises".into()))
+        })),
         "ADDRCONFIG" => Some(Value::Float(1024.0)),
         "V4MAPPED" => Some(Value::Float(2048.0)),
         "ALL" => Some(Value::Float(256.0)),
@@ -225,44 +211,6 @@ fn code_constant(name: &str) -> Option<&'static str> {
         "ADDRGETNETWORKPARAMS" => "EADDRGETNETWORKPARAMS",
         "CANCELLED" => "ECANCELLED",
         _ => return None,
-    })
-}
-
-/// `dns.promises` member name → the `dns.*` builtin it routes to.
-const PROMISE_MEMBERS: &[(&str, &str)] = &[
-    ("lookup", "promiseLookup"),
-    ("lookupService", "promiseLookupService"),
-    ("resolve", "promiseResolve"),
-    ("resolve4", "promiseResolve4"),
-    ("resolve6", "promiseResolve6"),
-    ("resolveMx", "promiseResolveMx"),
-    ("resolveTxt", "promiseResolveTxt"),
-    ("resolveCname", "promiseResolveCname"),
-    ("resolveNs", "promiseResolveNs"),
-    ("resolvePtr", "promiseResolvePtr"),
-    ("resolveSrv", "promiseResolveSrv"),
-    ("resolveSoa", "promiseResolveSoa"),
-    ("resolveNaptr", "promiseResolveNaptr"),
-    ("resolveCaa", "promiseResolveCaa"),
-    ("resolveTlsa", "promiseResolveTlsa"),
-    ("resolveAny", "promiseResolveAny"),
-    ("reverse", "promiseReverse"),
-    ("getServers", "getServers"),
-    ("setServers", "setServers"),
-    ("getDefaultResultOrder", "getDefaultResultOrder"),
-    ("setDefaultResultOrder", "setDefaultResultOrder"),
-];
-
-/// Build the `dns.promises` namespace object: each member is a `Builtin`
-/// reference routed back through `call`.
-fn promises_object() -> Value {
-    with_host(|h| {
-        let mut m = IndexMap::new();
-        for (key, target) in PROMISE_MEMBERS {
-            let b = h.alloc(JsObj::Builtin(format!("dns.{target}")));
-            m.insert((*key).into(), b);
-        }
-        h.new_object(m)
     })
 }
 

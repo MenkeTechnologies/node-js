@@ -18,9 +18,10 @@
 //!   — the one place the synchronous model diverges from spec timing (documented,
 //!   not faked: no chunk is invented).
 //!
-//! `Symbol.asyncIterator` on a `ReadableStream` is DEFERRED: the host does not
-//! support async-iterator discovery on native objects. `getReader().read()` is
-//! the fully-working consumption path.
+//! A `ReadableStream` is async-iterable: `values([{preventCancel}])` and
+//! `[Symbol.asyncIterator]()` lock it with a reader and hand back a
+//! `ReadableStreamAsyncIterator` whose `next()` is `reader.read()` and whose
+//! `return()` cancels the stream (unless `preventCancel`) and releases the lock.
 
 use crate::host::{invoke, with_host, JsObj};
 use fusevm::Value;
@@ -74,8 +75,19 @@ pub const COMPRESSION_STREAM_TAG: &str = "CompressionStream";
 pub const DECOMPRESSION_STREAM_TAG: &str = "DecompressionStream";
 
 // Instance-method lists (for `instance_has_method` wiring in mod.rs).
-pub const READABLE_STREAM_METHODS: &[&str] =
-    &["getReader", "cancel", "tee", "pipeTo", "pipeThrough"];
+pub const READABLE_STREAM_METHODS: &[&str] = &[
+    "getReader",
+    "cancel",
+    "tee",
+    "pipeTo",
+    "pipeThrough",
+    "values",
+    "@@asyncIterator",
+];
+/// The iterator `ReadableStream.prototype.values()` returns. Not an exported
+/// class, so it is routed by tag rather than through [`is_class`].
+pub const ASYNC_ITERATOR_TAG: &str = "ReadableStreamAsyncIterator";
+pub const ASYNC_ITERATOR_METHODS: &[&str] = &["next", "return", "@@asyncIterator"];
 pub const RS_DEFAULT_READER_METHODS: &[&str] = &["read", "releaseLock", "cancel"];
 pub const RS_BYOB_READER_METHODS: &[&str] = &["read", "releaseLock", "cancel"];
 pub const RS_DEFAULT_CONTROLLER_METHODS: &[&str] = &["enqueue", "close", "error"];
@@ -105,6 +117,7 @@ pub fn constant(name: &str) -> Option<Value> {
 pub fn methods_for(tag: &str) -> &'static [&'static str] {
     match tag {
         READABLE_STREAM_TAG => READABLE_STREAM_METHODS,
+        ASYNC_ITERATOR_TAG => ASYNC_ITERATOR_METHODS,
         RS_DEFAULT_READER_TAG => RS_DEFAULT_READER_METHODS,
         RS_BYOB_READER_TAG => RS_BYOB_READER_METHODS,
         RS_DEFAULT_CONTROLLER_TAG => RS_DEFAULT_CONTROLLER_METHODS,
@@ -167,12 +180,13 @@ fn opt_cb(obj: &Value, key: &str) -> Option<Value> {
     get_prop(obj, key).filter(is_callable_val)
 }
 
-/// Build a `{ value, done }` iterator result.
+/// Build a read result. node creates it as `{ done, value }` — that key order
+/// is what `JSON.stringify(await reader.read())` shows.
 fn iter_result(value: Value, done: bool) -> Value {
     with_host(|h| {
         let mut m = IndexMap::new();
-        m.insert("value".into(), value);
         m.insert("done".into(), Value::Bool(done));
+        m.insert("value".into(), value);
         h.new_object(m)
     })
 }
@@ -207,9 +221,13 @@ fn rejected(err: Value) -> Value {
     p
 }
 
-/// Raw bytes of a chunk: a Buffer's `@@bytes`, a TypedArray's view, else its
+/// Raw bytes of a chunk: the bytes a byte view (or `ArrayBuffer`) views — a
+/// `Uint16Array` two per element — else another object's `@@bytes`, else its
 /// UTF-8 string form.
 fn chunk_bytes(v: &Value) -> Vec<u8> {
+    if let Some(bytes) = super::buffer::view_bytes(v) {
+        return bytes;
+    }
     let via_field = with_host(|h| match h.get(v) {
         Some(JsObj::Object(p)) => {
             let field = if p.contains_key("@@bytes") {
@@ -452,7 +470,11 @@ fn stream_read(stream: &Value) -> Value {
 
 /// `stream.cancel(reason)` / `reader.cancel(reason)`: close and run `cancel`.
 fn stream_cancel(stream: &Value, reason: Value) -> Value {
-    if state_of(stream) == "readable" {
+    // A stream closed with chunks still queued is, in the spec, still
+    // READABLE (close-requested), so cancelling it discards them and runs the
+    // source's `cancel` — `break` out of `for await` does exactly this.
+    let state = state_of(stream);
+    if state == "readable" || (state == "closed" && arr_len(stream, "@@queue") > 0) {
         // Discard buffered chunks, then close.
         let _ = arr_drain(stream, "@@queue");
         if let Some(cancel) = opt_cb(stream, "@@cancel") {
@@ -495,7 +517,11 @@ pub fn construct_readable(args: &[Value]) -> Result<Value, String> {
 /// `stream.getReader([{ mode }])`.
 fn get_reader(stream: &Value, args: &[Value]) -> Result<Value, String> {
     if is_locked(stream) {
-        return Err(crate::host::type_error("ReadableStream is locked"));
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_STATE",
+            "Invalid state: ReadableStream is locked",
+        ));
     }
     let byob = args.first().and_then(|o| get_str(o, "mode")).as_deref() == Some("byob");
     let tag = if byob {
@@ -528,6 +554,62 @@ fn get_reader(stream: &Value, args: &[Value]) -> Result<Value, String> {
     Ok(reader)
 }
 
+/// `stream.values([{ preventCancel }])` / `stream[Symbol.asyncIterator]()`:
+/// lock the stream with a default reader and wrap it in an iterator.
+fn values_iterator(stream: &Value, opts: Option<&Value>) -> Result<Value, String> {
+    let prevent_cancel = opts
+        .map(|o| get_prop(o, "preventCancel").unwrap_or(Value::Undef))
+        .is_some_and(|v| with_host(|h| h.truthy(&v)));
+    let reader = get_reader(stream, &[])?;
+    Ok(with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert("@@native".into(), h.new_str(ASYNC_ITERATOR_TAG));
+        m.insert("@@reader".into(), reader);
+        m.insert("@@preventCancel".into(), Value::Bool(prevent_cancel));
+        h.new_object(m)
+    }))
+}
+
+/// The iterator's `next` / `return`. `next` reads through the reader and lets
+/// go of the lock once the stream is done; `return(value)` cancels the stream
+/// (unless `preventCancel`), releases the lock, and reports `{done: true,
+/// value}` — `break` inside `for await` calls it.
+fn async_iterator_call(it: &Value, method: &str, arg: Option<&Value>) -> Result<Value, String> {
+    let stream = get_prop(it, "@@reader").and_then(|r| get_prop(&r, "@@stream"));
+    let finish = |it: &Value| {
+        if let Some(r) = get_prop(it, "@@reader") {
+            reader_release(&r);
+        }
+        remove_prop(it, "@@reader");
+    };
+    match method {
+        "@@asyncIterator" => Ok(it.clone()),
+        "next" => {
+            let Some(stream) = stream else {
+                return Ok(resolved(iter_result(Value::Undef, true)));
+            };
+            let p = stream_read(&stream);
+            if state_of(&stream) != "readable" && arr_len(&stream, "@@queue") == 0 {
+                finish(it);
+            }
+            Ok(p)
+        }
+        "return" => {
+            let value = arg.cloned().unwrap_or(Value::Undef);
+            if let Some(stream) = stream {
+                let prevent =
+                    get_prop(it, "@@preventCancel").is_some_and(|v| with_host(|h| h.truthy(&v)));
+                if !prevent {
+                    stream_cancel(&stream, value.clone());
+                }
+                finish(it);
+            }
+            Ok(resolved(iter_result(value, true)))
+        }
+        _ => unknown(ASYNC_ITERATOR_TAG, method),
+    }
+}
+
 fn reader_release(reader: &Value) {
     if let Some(stream) = get_prop(reader, "@@stream") {
         set_prop(&stream, "locked", Value::Bool(false));
@@ -547,7 +629,7 @@ fn ws_accept_chunk(ws: &Value, chunk: Value) -> Result<(), String> {
             "textencode" => {
                 if let Some(r) = &readable {
                     let bytes = with_host(|h| h.str_of(&chunk)).into_bytes();
-                    let buf = super::buffer::from_bytes(&bytes);
+                    let buf = uint8(&bytes)?;
                     stream_enqueue(r, buf);
                 }
             }
@@ -626,7 +708,7 @@ fn ws_finish(ws: &Value) -> Result<(), String> {
                 let data = ws_accum_bytes(ws);
                 let out = run_codec(&kind, &data)?;
                 if let Some(r) = &readable {
-                    stream_enqueue(r, super::buffer::from_bytes(&out));
+                    stream_enqueue(r, uint8(&out)?);
                     stream_close(r);
                 }
             }
@@ -700,7 +782,11 @@ pub fn construct_writable(args: &[Value]) -> Result<Value, String> {
 /// `writable.getWriter()`.
 fn get_writer(ws: &Value) -> Result<Value, String> {
     if is_locked(ws) {
-        return Err(crate::host::type_error("WritableStream is locked"));
+        return Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_STATE",
+            "Invalid state: WritableStream is locked",
+        ));
     }
     let ready = resolved(Value::Undef);
     let closed = new_pending();
@@ -1129,8 +1215,10 @@ pub fn instance_call(
                 &args.first().cloned().unwrap_or(Value::Undef),
             )),
             "pipeThrough" => pipe_through(recv, &args),
+            "values" | "@@asyncIterator" => values_iterator(recv, args.first()),
             _ => unknown(tag, method),
         },
+        ASYNC_ITERATOR_TAG => async_iterator_call(recv, method, args.first()),
         RS_DEFAULT_READER_TAG => match method {
             "read" => match get_prop(recv, "@@stream") {
                 Some(stream) => Ok(stream_read(&stream)),
@@ -1279,4 +1367,11 @@ fn unknown(tag: &str, method: &str) -> Result<Value, String> {
     Err(crate::host::type_error(&format!(
         "{tag}.{method} is not a function"
     )))
+}
+
+/// A `Uint8Array` over `bytes` — the chunk type `TextEncoderStream` and the
+/// compression streams produce (it was a Buffer).
+fn uint8(bytes: &[u8]) -> Result<Value, String> {
+    let arr = with_host(|h| h.new_array(bytes.iter().map(|b| Value::Float(*b as f64)).collect()));
+    super::typedarray::construct("Uint8Array", &[arr])
 }

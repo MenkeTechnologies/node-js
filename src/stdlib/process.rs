@@ -78,17 +78,84 @@ thread_local! {
 /// Node prints it after the FIRST warning only, per process.
 static TRACE_HINT_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Port of `internal/process/warning.js` `onWarning`: render a warning to
-/// stderr as `(node:PID) [CODE] Name: message`, followed by an optional detail
-/// line and the one-time trace hint. Suppressed by `--no-warnings`, and
-/// deprecations additionally by `--no-deprecation`.
+/// Port of `internal/process/warning.js` `emitWarning`: the warning is
+/// delivered on the NEXT TICK, not inline — first node's default `onWarning`
+/// printer, then every `process.on('warning')` listener with the warning
+/// `Error` (`name`, `message`, and `code`/`detail` when given). It used to
+/// print synchronously, ahead of output the script wrote after the call, and
+/// the `warning` event never fired. `--no-warnings` (and `--no-deprecation`
+/// for deprecations) silences only the printer, as in node.
 pub fn emit_warning(name: &str, code: Option<&str>, message: &str, detail: Option<&str>) {
+    queue_warning(name, code, message, detail, None);
+}
+
+/// [`emit_warning`], handing the listeners `obj` when the caller passed its own
+/// `Error` (`process.emitWarning(err)`) rather than a fresh one.
+fn queue_warning(
+    name: &str,
+    code: Option<&str>,
+    message: &str,
+    detail: Option<&str>,
+    obj: Option<Value>,
+) {
     let argv: Vec<String> = std::env::args().collect();
     let flag = |f: &str| argv.iter().any(|a| a == f);
     let is_deprecation = name == "DeprecationWarning";
-    if flag("--no-warnings") || (is_deprecation && flag("--no-deprecation")) {
-        return;
-    }
+    let printed = !(flag("--no-warnings") || (is_deprecation && flag("--no-deprecation")));
+    let text = printed.then(|| warning_text(name, code, message, detail, &flag));
+    let (name, code, message, detail) = (
+        name.to_string(),
+        code.map(str::to_string),
+        message.to_string(),
+        detail.map(str::to_string),
+    );
+    with_host(|h| {
+        h.nextticks
+            .push_back(crate::host::Task::Native(Box::new(move || {
+                if let Some(text) = text {
+                    eprintln!("{text}");
+                }
+                let listeners = with_host(|h| h.take_process_listeners("warning"));
+                if listeners.is_empty() {
+                    return Ok(());
+                }
+                if let Some(w) = obj {
+                    for f in listeners {
+                        crate::host::invoke(&f, vec![w.clone()], None)?;
+                    }
+                    return Ok(());
+                }
+                let msg = with_host(|h| h.new_str(message));
+                let w = crate::builtins::call_builtin_function("Error", vec![msg])?;
+                let field = |k: &str, v: &str| {
+                    let v = with_host(|h| h.new_str(v.to_string()));
+                    crate::builtins::set_property_pub(&w, k, v)
+                };
+                field("name", &name)?;
+                if let Some(c) = &code {
+                    field("code", c)?;
+                }
+                if let Some(d) = &detail {
+                    field("detail", d)?;
+                }
+                for f in listeners {
+                    crate::host::invoke(&f, vec![w.clone()], None)?;
+                }
+                Ok(())
+            })));
+    });
+}
+
+/// The stderr rendering of a warning: `(node:PID) [CODE] Name: message`, an
+/// optional detail line, and the one-time trace hint.
+fn warning_text(
+    name: &str,
+    code: Option<&str>,
+    message: &str,
+    detail: Option<&str>,
+    flag: &dyn Fn(&str) -> bool,
+) -> String {
+    let is_deprecation = name == "DeprecationWarning";
     let trace = flag("--trace-warnings") || (is_deprecation && flag("--trace-deprecation"));
 
     let mut msg = std::format!("(node:{}) ", std::process::id());
@@ -109,7 +176,7 @@ pub fn emit_warning(name: &str, code: Option<&str>, message: &str, detail: Optio
             "\n(Use `node {trace_flag} ...` to show where the warning was created)"
         ));
     }
-    eprintln!("{msg}");
+    msg
 }
 
 /// A `DeprecationWarning` fires at most once per `code` per process, matching
@@ -160,7 +227,41 @@ pub fn signal_number(name: &str) -> Option<libc::c_int> {
 }
 
 /// `process.emitWarning(warning[, options])` / `(warning[, type[, code]])`.
-fn emit_warning_args(args: &[Value]) {
+fn emit_warning_args(args: &[Value]) -> Result<(), String> {
+    let warning = args.first().cloned().unwrap_or(Value::Undef);
+    // An `Error` is the warning itself: its own `name`/`message` render it and
+    // listeners receive that same object. It was stringified into the message
+    // of a fresh `Warning`, printing `Warning: Error: boom`.
+    if with_host(|h| h.as_str(&warning)).is_none() {
+        let error_ctor = with_host(|h| h.alloc(JsObj::Builtin("Error".into())));
+        let is_error = with_host(|h| matches!(h.type_of(&warning), "object" | "function"))
+            && crate::host::instance_of(&warning, &error_ctor)?;
+        if !is_error {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_TYPE",
+                &format!(
+                    "The \"warning\" argument must be of type string or an instance of Error. Received {}",
+                    super::received_desc(&warning)
+                ),
+            ));
+        }
+        let text = |k: &str| -> Result<Option<String>, String> {
+            let v = crate::builtins::get_property(&warning, k)?;
+            Ok((!with_host(|h| h.is_nullish(&v))).then(|| with_host(|h| h.str_of(&v))))
+        };
+        let name = text("name")?.unwrap_or_else(|| "Error".into());
+        let message = text("message")?.unwrap_or_default();
+        let (code, detail) = (text("code")?, text("detail")?);
+        queue_warning(
+            &name,
+            code.as_deref(),
+            &message,
+            detail.as_deref(),
+            Some(warning),
+        );
+        return Ok(());
+    }
     let message = super::arg_str(args, 0);
     let mut name = "Warning".to_string();
     let mut code: Option<String> = None;
@@ -188,6 +289,7 @@ fn emit_warning_args(args: &[Value]) {
         None => {}
     }
     emit_warning(&name, code.as_deref(), &message, detail.as_deref());
+    Ok(())
 }
 
 /// Data properties, served through `namespace_property` → `stdlib::constant`.
@@ -500,10 +602,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             }
             r
         }
-        "emitWarning" => {
-            emit_warning_args(args);
-            Ok(Value::Undef)
-        }
+        "emitWarning" => emit_warning_args(args).map(|_| Value::Undef),
         // `process.exit([code])` really exits, and does so IMMEDIATELY — nothing
         // after the call runs. It used to return `undefined` and let execution
         // continue, which is a silent lie with teeth: the idiom

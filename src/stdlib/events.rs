@@ -127,6 +127,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
                 f,
                 prepend,
             );
+            warn_max_listeners(recv, &name, args.first().unwrap_or(&Value::Undef));
             Ok(recv.clone())
         }
         "emit" => emit(
@@ -184,6 +185,53 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             "emitter.{method} is not a function"
         ))),
     }
+}
+
+/// `_addListener`'s leak check: once an event has more listeners than the
+/// emitter's cap (`setMaxListeners`, default 10; `0` disables it), emit ONE
+/// `MaxListenersExceededWarning` for that event. The cap used to be stored and
+/// never consulted.
+fn warn_max_listeners(recv: &Value, key: &str, event: &Value) {
+    let max = with_host(|h| match named_map(h, recv, "@@maxListeners") {
+        Some(v @ (Value::Float(_) | Value::Int(_))) => h.to_number(&v),
+        _ => 10.0,
+    });
+    let count = listeners(recv, key).len();
+    if max <= 0.0 || count as f64 <= max {
+        return;
+    }
+    let marker = format!("@@warned:{key}");
+    if with_host(|h| named_map(h, recv, &marker).is_some()) {
+        return;
+    }
+    with_host(|h| match h.get_mut(recv) {
+        Some(JsObj::Object(p)) => {
+            p.insert(marker, Value::Bool(true));
+        }
+        _ => h.set_fn_prop(recv, &marker, Value::Bool(true)),
+    });
+    let (event, target) = with_host(|h| {
+        let event = h.str_of(event);
+        let target = if crate::host::is_callable(h, recv) {
+            format!("[Function: {}]", h.callable_name(recv))
+        } else {
+            match h.ctor_name(recv) {
+                n if n.is_empty() => "[EventEmitter]".to_string(),
+                n => format!("[{n}]"),
+            }
+        };
+        (event, target)
+    });
+    super::process::emit_warning(
+        "MaxListenersExceededWarning",
+        None,
+        &format!(
+            "Possible EventEmitter memory leak detected. {count} {event} listeners added to {target}. \
+             MaxListeners is {}. Use emitter.setMaxListeners() to increase limit",
+            crate::host::fmt_number(max)
+        ),
+        None,
+    );
 }
 
 /// Read a hidden emitter field (`@@on`/`@@once`). Works for a plain emitter
@@ -320,6 +368,17 @@ fn check_listener(f: &Value) -> Result<(), String> {
 }
 
 fn emit(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // `EventEmitter.errorMonitor` listeners see every `error` FIRST, without
+    // counting as a handler: an error with only a monitor still throws.
+    if name == "error" {
+        let monitor = with_host(|h| {
+            let sym = h.internal_symbol("events.errorMonitor");
+            h.property_key(&sym)
+        });
+        if !listeners(recv, &monitor).is_empty() {
+            emit(recv, &monitor, args)?;
+        }
+    }
     let to_call = listeners(recv, name);
     // An `error` event with no listener THROWS rather than being dropped. This
     // is how node surfaces a failed socket, stream or request, and swallowing

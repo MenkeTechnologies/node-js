@@ -2283,6 +2283,35 @@ copies-spread  [{"g":7,"plain":1},1]
 copies-rest    [{"g":7,"plain":1},1]
 then          "THENABLE"
 asyncIterator [3]
+==== querystring.js ====
+defaultMax [1000,1]
+nullSep    {"a":"1","b":"2"}
+falsySep   {"a":"1","b":"2"}
+pairBudget {"a":"1"}
+dupBudget  {"a":["1","2"]}
+maxStr     {"a":"1","b":"2"}
+maxFrac    1500
+notString  {}
+multiSep   {"a":"1","b":"2","c":""}
+multiEq    {"a==>1":"","b":"2=>3"}
+parse "&&=&a&=b&a=" {"":["","b"],"a":["",""]}
+parse "a=b=c" {"a":"b=c"}
+parse "a%2=1" {"a%2":"1"}
+parse "a+%20b=c+%2B" {"a  b":"c +"}
+parse "a=%zz&b=%E0%A4&c=%41%" {"a":"%zz","b":"�","c":"A%"}
+parse "__proto__=1&constructor=2" {"__proto__":"1","constructor":"2"}
+customDec  {"[a]":"[%41]","[b]":"[x%20y]"}
+decThrows  {"a":"A"}
+decNumber  {"7":[7,7]}
+afterThrow TypeError Cannot convert a Symbol value to a string
+stringify  "1=one&b=2&a=1&a=&a=3&d=%C3%A9%20&e=1e%2B21&f=0&g=&g=&h=&i=1"
+strSep     ["a:1;b:2","a=1&b=2"]
+customEnc  "<A>=<X Y>&<B>=<>"
+getter     "x=g"
+nonObject  ["","","","0=a&1=b"]
+escape     ["12","null","a%20b"]
+unescape   ["a+b","%zzA","a b"]
+aliases    [true,true,"stringify","parse"]
 ==== rawjson.js ====
 shape     object [object Object] ["rawJSON"] 12345678901234567890
 frozen    null true {"value":"12345678901234567890","writable":false,"enumerable":true,"configurable":false}
@@ -2992,6 +3021,34 @@ fillSize   RangeError ERR_OUT_OF_RANGE The value of "size + offset" is out of ra
 fillStr    TypeError ERR_INVALID_ARG_TYPE The "buf" argument must be an instance of ArrayBuffer or ArrayBufferView. Received type string ('x')
 fillCb     TypeError ERR_INVALID_ARG_TYPE The "callback" argument must be of type function. Received undefined
 fillAsync  null Uint16Array 2
+==== webglobals.js ====
+globals    [true,true,true,true,true,true]
+perfGlob   [true,true,true,true]
+msgGlob    [true,true]
+notEnum    false
+sameMods   [true,true,true]
+enumMods   ["promises","promises","promises","promises","strict","posix+win32","subtle+webcrypto"]
+dnsKeys    false
+eeStatics  [false,false,true,"symbol",null,"Symbol(events.errorMonitor)"]
+monitorOnly Error undefined x
+monitored  ["monitor:x","monitor:y","handler:y"]
+promisify  ["foo",3,true,true]
+custom     "custom"
+customBad  TypeError ERR_INVALID_ARG_TYPE The "util.promisify.custom" property must be of type function. Received type number (5)
+style      ["\u001b[1m\u001b[31mx\u001b[39m\u001b[22m","\u001b[31m\u001b[34min\u001b[31mout\u001b[39m","\u001b[1m\u001b[2ma\u001b[22m\u001b[2m\u001b[1mb\u001b[22m\u001b[22m"]
+styleHex   ["\u001b[38;2;255;128;0mx\u001b[39m","\u001b[38;2;0;255;0mx\u001b[39m"]
+styleBad   TypeError ERR_INVALID_ARG_VALUE The argument 'format' must be a valid hex color (#RGB or #RRGGBB). Received '#ggg'
+styleText  TypeError ERR_INVALID_ARG_TYPE The "text" argument must be of type string. Received type number (5)
+styleStrm  TypeError ERR_INVALID_ARG_TYPE The "stream" argument must be an instance of ReadableStream, WritableStream, or Stream. Received type number (5)
+sync      done
+warning    Warning first C1
+warning    Error boom undefined
+warning    MaxListenersExceededWarning Possible EventEmitter memory leak detected.  undefined
+forAwait   a,b,cancel:undefined false
+prevent    {"done":false,"value":2}
+locked     TypeError ERR_INVALID_STATE Invalid state: ReadableStream is locked
+transform  X,Y
+encoded    Uint8Array 104,195,169
 ==== wordcount.js ====
 the: 3
 fox: 2

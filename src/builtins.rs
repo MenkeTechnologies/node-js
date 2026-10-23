@@ -3437,6 +3437,14 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
         }
         return Value::Undef;
     }
+    // `querystring.encode`/`decode` are not copies of `stringify`/`parse` but
+    // the same functions (`qs.encode === qs.stringify`, and its `.name` is
+    // `stringify`), so they resolve to the one builtin.
+    let name = match (ns, name) {
+        ("querystring", "encode") => "stringify",
+        ("querystring", "decode") => "parse",
+        _ => name,
+    };
     let qualified = format!("{ns}.{name}");
     if is_known_builtin(&qualified) {
         return with_host(|h| h.alloc(JsObj::Builtin(qualified)));
@@ -6671,6 +6679,37 @@ const GLOBAL_FUNCS: &[&str] = &[
     "Event",
     "EventTarget",
     "CustomEvent",
+    // The WHATWG stream, messaging and performance classes node also exposes
+    // as globals. Each was reachable only through its module
+    // (`require("stream/web").ReadableStream`), so the bare name — the form
+    // web-targeted code uses — was a ReferenceError. The global and the
+    // module member are the same constructor.
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamBYOBReader",
+    "ReadableStreamDefaultController",
+    "ReadableByteStreamController",
+    "ReadableStreamBYOBRequest",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "WritableStreamDefaultController",
+    "TransformStream",
+    "TransformStreamDefaultController",
+    "ByteLengthQueuingStrategy",
+    "CountQueuingStrategy",
+    "TextEncoderStream",
+    "TextDecoderStream",
+    "CompressionStream",
+    "DecompressionStream",
+    "MessageChannel",
+    "BroadcastChannel",
+    "Performance",
+    "PerformanceEntry",
+    "PerformanceMark",
+    "PerformanceMeasure",
+    "PerformanceObserver",
+    "PerformanceObserverEntryList",
+    "PerformanceResourceTiming",
     "queueMicrotask",
     "setTimeout",
     "setInterval",

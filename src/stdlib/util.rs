@@ -554,15 +554,48 @@ fn run_completion(src: &str) -> Result<Value, String> {
     crate::eval_in_global_scope(src)
 }
 
-const PROMISIFY_SRC: &str = "(function(original){\n\
-  return function(){\n\
+/// A port of `lib/internal/util.js` `promisify`. `custom` is the builtin's own
+/// promisified form (node's `kCustomPromisifiedSymbol` on `setTimeout`,
+/// `fs.exists`, …) and `argNames` its `kCustomPromisifyArgsSymbol` — the names a
+/// multi-value callback resolves into (`{bytesRead, buffer}`); both are supplied
+/// from Rust because those symbols are internal. A user function's own
+/// `[util.promisify.custom]` is honoured, the result carries the original's
+/// prototype and own properties (`name`, `length`), and it is its own custom
+/// form, so promisifying it again is the identity.
+/// A non-function custom form is returned boxed (`[c]`) for the caller to
+/// reject with node's `ERR_INVALID_ARG_TYPE`.
+const PROMISIFY_SRC: &str = "(function(original, custom, argNames, sym){\n\
+  var c = custom || original[sym];\n\
+  if (c) {\n\
+    if (typeof c !== 'function') return [c];\n\
+    try { Object.defineProperty(c, sym, { value: c, enumerable: false, writable: false, configurable: true }); } catch (_) {}\n\
+    return c;\n\
+  }\n\
+  function fn(...args) {\n\
     var self = this;\n\
-    var args = Array.prototype.slice.call(arguments);\n\
     return new Promise(function(resolve, reject){\n\
-      args.push(function(err, value){ if (err) reject(err); else resolve(value); });\n\
-      original.apply(self, args);\n\
+      args.push(function(err, ...values){\n\
+        if (err) return reject(err);\n\
+        if (argNames !== undefined && values.length > 1) {\n\
+          var obj = {};\n\
+          for (var i = 0; i < argNames.length; i++) obj[argNames[i]] = values[i];\n\
+          resolve(obj);\n\
+        } else {\n\
+          resolve(values[0]);\n\
+        }\n\
+      });\n\
+      Reflect.apply(original, self, args);\n\
     });\n\
-  };\n\
+  }\n\
+  Object.setPrototypeOf(fn, Object.getPrototypeOf(original));\n\
+  Object.defineProperty(fn, sym, { value: fn, enumerable: false, writable: false, configurable: true });\n\
+  return Object.defineProperties(fn, Object.getOwnPropertyDescriptors(original));\n\
+})";
+
+/// `fs.exists`'s custom promisified form: it resolves with the boolean its
+/// one-argument callback receives, never rejects.
+const EXISTS_PROMISIFIED_SRC: &str = "(function exists(path){\n\
+  return new Promise(function(resolve){ require('fs').exists(path, resolve); });\n\
 })";
 
 const CALLBACKIFY_SRC: &str = "(function(original){\n\
@@ -617,8 +650,57 @@ fn promisify(args: &[Value]) -> Result<Value, String> {
             super::received_desc(&orig)
         ));
     }
+    // The builtins node gives a custom promisified form or callback-argument
+    // names. `promisify(setTimeout)` used to wrap it as callback-last, so the
+    // `sleep = promisify(setTimeout)` idiom passed the delay as the callback.
+    let builtin = with_host(|h| match h.get(&orig) {
+        Some(JsObj::Builtin(name)) => Some(name.clone()),
+        _ => None,
+    });
+    let custom = match builtin.as_deref() {
+        Some("setTimeout") => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("timers/promises.setTimeout".into()))
+        })),
+        Some("setImmediate") => Some(with_host(|h| {
+            h.alloc(JsObj::Builtin("timers/promises.setImmediate".into()))
+        })),
+        Some("fs.exists") => Some(run_completion(EXISTS_PROMISIFIED_SRC)?),
+        _ => None,
+    };
+    let arg_names: Option<&[&str]> = match builtin.as_deref() {
+        Some("fs.read") | Some("fs.readv") => Some(&["bytesRead", "buffer"]),
+        Some("fs.write") => Some(&["bytesWritten", "buffer"]),
+        Some("fs.writev") => Some(&["bytesWritten", "buffers"]),
+        Some("dns.lookup") => Some(&["address", "family"]),
+        Some("dns.lookupService") => Some(&["hostname", "service"]),
+        Some("child_process.exec") | Some("child_process.execFile") => Some(&["stdout", "stderr"]),
+        _ => None,
+    };
+    let (custom, names, sym) = with_host(|h| {
+        let names = match arg_names {
+            Some(list) => {
+                let items = list.iter().map(|n| h.new_str(*n)).collect();
+                h.new_array(items)
+            }
+            None => Value::Undef,
+        };
+        let sym = h.symbol_for("nodejs.util.promisify.custom");
+        (custom.unwrap_or(Value::Undef), names, sym)
+    });
     let factory = run_completion(PROMISIFY_SRC)?;
-    crate::host::invoke(&factory, vec![orig], None)
+    let out = crate::host::invoke(&factory, vec![orig, custom, names, sym], None)?;
+    // A non-function `[util.promisify.custom]` comes back boxed in a
+    // one-element array, so the rejection can name it as node does.
+    if with_host(|h| crate::host::is_callable(h, &out)) {
+        return Ok(out);
+    }
+    let bad = crate::builtins::get_property(&out, "0")?;
+    Err(crate::host::invalid_arg_type(
+        "util.promisify.custom",
+        "property",
+        "function",
+        &bad,
+    ))
 }
 
 /// `util.callbackify(fn)` → a function taking a trailing `(err, value)` callback,
@@ -856,36 +938,198 @@ fn style_codes(name: &str) -> Option<(u16, u16)> {
         .map(|(_, o, c)| (*o, *c))
 }
 
-/// `util.styleText(format, text)` — wrap `text` in the SGR codes for `format`
-/// (a color/modifier name or an array of them). `"none"` is a no-op passthrough.
+/// `util.styleText(format, text[, { validateStream = true, stream = process.stdout }])`,
+/// a port of `lib/util.js`. Each format's opening code goes on the left in order
+/// and its closing code on the right in reverse, so the first is outermost; a
+/// format's closing code inside the text is replaced by its opening code (for
+/// the codes `bold`/`dim` share, the close is kept and the open re-applied), so
+/// a nested `styleText` does not end the outer style early. `#RGB`/`#RRGGBB` is
+/// a 24-bit color. With `validateStream` the stream must be a stream, and when
+/// it would not colorize — not a TTY, or `FORCE_COLOR` disabling it — the text
+/// comes back unstyled: piped output used to carry raw escape codes.
 fn style_text(args: &[Value]) -> Result<Value, String> {
     let fmt = args.first().cloned().unwrap_or(Value::Undef);
-    let names = style_names(&fmt);
-    let mut result = super::arg_str(args, 1);
-    for name in &names {
+    let text_v = args.get(1).cloned().unwrap_or(Value::Undef);
+    let Some(text) = with_host(|h| h.as_str(&text_v)) else {
+        return Err(crate::host::invalid_arg_type(
+            "text", "argument", "string", &text_v,
+        ));
+    };
+    let options = args.get(2).cloned().unwrap_or(Value::Undef);
+    let has_options = !matches!(options, Value::Undef);
+    if has_options && !is_plain_object_arg(&options) {
+        return Err(crate::host::invalid_arg_type(
+            "options", "argument", "object", &options,
+        ));
+    }
+    let opt = |k: &str| -> Result<Value, String> {
+        if has_options {
+            crate::builtins::get_property(&options, k)
+        } else {
+            Ok(Value::Undef)
+        }
+    };
+    let validate_stream = match opt("validateStream")? {
+        Value::Undef => true,
+        Value::Bool(b) => b,
+        v => {
+            return Err(crate::host::invalid_arg_type(
+                "options.validateStream",
+                "property",
+                "boolean",
+                &v,
+            ))
+        }
+    };
+    let mut skip_colorize = false;
+    if validate_stream {
+        let stream = match opt("stream")? {
+            Value::Undef => crate::builtins::namespace_property("process", "stdout"),
+            s => s,
+        };
+        if !is_stream_like(&stream)? {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_TYPE",
+                &format!(
+                    "The \"stream\" argument must be an instance of ReadableStream, WritableStream, or Stream. Received {}",
+                    super::received_desc(&stream)
+                ),
+            ));
+        }
+        skip_colorize = !should_colorize(&stream)?;
+    }
+    let (mut open_codes, mut close_codes, mut processed) =
+        (String::new(), String::new(), text.clone());
+    for name in style_names(&fmt) {
         if name == "none" {
             continue;
         }
-        let (open, close) = style_codes(name).ok_or_else(|| {
-            // Node spells out every accepted name. Generated from the same table
-            // the lookup reads, so a style can never be accepted-but-unlisted.
-            let listed: Vec<String> = STYLES
-                .iter()
-                .chain(STYLE_ALIASES.iter())
-                .map(|(n, _, _)| format!("'{n}'"))
-                .collect();
-            crate::host::coded_error(
-                "TypeError",
-                "ERR_INVALID_ARG_VALUE",
-                &format!(
-                    "The argument 'format' must be one of: {}. Received '{name}'",
-                    listed.join(", ")
-                ),
+        let (open, close, keep_close) = if let Some(hex) = name.strip_prefix('#') {
+            let Some((r, g, b)) = hex_rgb(hex) else {
+                return Err(crate::host::coded_error(
+                    "TypeError",
+                    "ERR_INVALID_ARG_VALUE",
+                    &format!(
+                        "The argument 'format' must be a valid hex color (#RGB or #RRGGBB). Received '{name}'"
+                    ),
+                ));
+            };
+            if skip_colorize {
+                continue;
+            }
+            (
+                format!("\u{1b}[38;2;{r};{g};{b}m"),
+                "\u{1b}[39m".to_string(),
+                false,
             )
-        })?;
-        result = format!("\u{1b}[{open}m{result}\u{1b}[{close}m");
+        } else {
+            let (open, close) = style_codes(&name).ok_or_else(|| {
+                // Node spells out every accepted name. Generated from the same
+                // table the lookup reads, so a style can never be
+                // accepted-but-unlisted.
+                let listed: Vec<String> = STYLES
+                    .iter()
+                    .chain(STYLE_ALIASES.iter())
+                    .map(|(n, _, _)| format!("'{n}'"))
+                    .collect();
+                crate::host::coded_error(
+                    "TypeError",
+                    "ERR_INVALID_ARG_VALUE",
+                    &format!(
+                        "The argument 'format' must be one of: {}. Received '{name}'",
+                        listed.join(", ")
+                    ),
+                )
+            })?;
+            (
+                format!("\u{1b}[{open}m"),
+                format!("\u{1b}[{close}m"),
+                close == 22,
+            )
+        };
+        open_codes.push_str(&open);
+        close_codes.insert_str(0, &close);
+        let replacement = if keep_close {
+            format!("{close}{open}")
+        } else {
+            open
+        };
+        processed = processed.replace(&close, &replacement);
     }
-    Ok(with_host(|h| h.new_str(result)))
+    let out = if skip_colorize {
+        text
+    } else {
+        format!("{open_codes}{processed}{close_codes}")
+    };
+    Ok(with_host(|h| h.new_str(out)))
+}
+
+/// `#RGB` / `#RRGGBB` (the part after `#`) as its three channels.
+fn hex_rgb(hex: &str) -> Option<(u8, u8, u8)> {
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |s: &str| u8::from_str_radix(s, 16).ok();
+    match hex.len() {
+        3 => {
+            let d = |i: usize| channel(&hex[i..i + 1].repeat(2));
+            Some((d(0)?, d(1)?, d(2)?))
+        }
+        6 => Some((
+            channel(&hex[0..2])?,
+            channel(&hex[2..4])?,
+            channel(&hex[4..6])?,
+        )),
+        _ => None,
+    }
+}
+
+/// `validateObject(options, 'options')`: an object, not `null`, not an array.
+fn is_plain_object_arg(v: &Value) -> bool {
+    with_host(|h| {
+        h.type_of(v) == "object" && !h.is_null(v) && !matches!(h.get(v), Some(JsObj::Array(_)))
+    })
+}
+
+/// node's `isReadableStream || isWritableStream || isNodeStream`.
+fn is_stream_like(v: &Value) -> Result<bool, String> {
+    if matches!(
+        super::native_tag(v).as_deref(),
+        Some(super::stream_web::READABLE_STREAM_TAG | super::stream_web::WRITABLE_STREAM_TAG)
+    ) {
+        return Ok(true);
+    }
+    if !with_host(|h| matches!(h.type_of(v), "object" | "function") && !h.is_null(v)) {
+        return Ok(false);
+    }
+    let get = |k: &str| crate::builtins::get_property(v, k);
+    let truthy = |x: &Value| with_host(|h| h.truthy(x));
+    let callable = |x: &Value| with_host(|h| crate::host::is_callable(h, x));
+    if truthy(&get("_readableState")?) || truthy(&get("_writableState")?) {
+        return Ok(true);
+    }
+    let on = callable(&get("on")?);
+    Ok(on && (callable(&get("write")?) || callable(&get("pipe")?)))
+}
+
+/// `utilColors.shouldColorize(stream)`: with `FORCE_COLOR` set, whether its
+/// color depth exceeds 2 (`''`, `1`, `true`, `2`, `3` do); otherwise whether the
+/// stream is a TTY whose `getColorDepth()` (when it has one) exceeds 2.
+fn should_colorize(stream: &Value) -> Result<bool, String> {
+    if let Ok(fc) = std::env::var("FORCE_COLOR") {
+        return Ok(matches!(fc.as_str(), "" | "1" | "true" | "2" | "3"));
+    }
+    let is_tty = crate::builtins::get_property(stream, "isTTY")?;
+    if !with_host(|h| h.truthy(&is_tty)) {
+        return Ok(false);
+    }
+    let depth = crate::builtins::get_property(stream, "getColorDepth")?;
+    if !with_host(|h| crate::host::is_callable(h, &depth)) {
+        return Ok(true);
+    }
+    let d = crate::host::invoke(&depth, Vec::new(), Some(stream.clone()))?;
+    Ok(with_host(|h| h.to_number(&d)) > 2.0)
 }
 
 // ── getSystemError{Name,Message,Map} ─────────────────────────────────────────
