@@ -15,33 +15,52 @@ use indexmap::IndexMap;
 /// The methods a `StringDecoder` instance carries. Also the method set its real
 /// prototype object is built from, so a read (`sd.write`), a call (`sd.write(b)`)
 /// and a prototype lookup (`StringDecoder.prototype.write`) cannot disagree.
-pub const INSTANCE_METHODS: &[&str] = &["write", "end"];
+pub const INSTANCE_METHODS: &[&str] = &["write", "end", "text"];
+
+/// The prototype getters over the held-back bytes (`lastChar`, `lastNeed`,
+/// `lastTotal`).
+pub const ACCESSORS: &[(&str, bool)] = &[
+    ("lastChar", false),
+    ("lastNeed", false),
+    ("lastTotal", false),
+];
 
 /// Node's `normalizeEncoding`: the `encoding` property reports the CANONICAL
 /// name, not the spelling that was passed — `new StringDecoder('ucs2').encoding`
 /// is `'utf16le'` and `new StringDecoder('UTF-8').encoding` is `'utf8'`. Code
 /// that branches on `decoder.encoding` (iconv-lite does) sees the canonical set.
-fn normalize_encoding(enc: &str) -> String {
-    match enc.to_ascii_lowercase().as_str() {
-        "utf8" | "utf-8" => "utf8",
+///
+/// An encoding outside node's set is `ERR_UNKNOWN_ENCODING` (it used to be
+/// accepted and stored verbatim), and an empty one is `utf8`.
+fn normalize_encoding(enc: &str) -> Result<String, String> {
+    Ok(match enc.to_ascii_lowercase().as_str() {
+        "" | "utf8" | "utf-8" => "utf8",
         "ucs2" | "ucs-2" | "utf16le" | "utf-16le" => "utf16le",
         "latin1" | "binary" => "latin1",
-        other => return other.to_string(),
+        e @ ("base64" | "base64url" | "hex" | "ascii") => e,
+        _ => {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_UNKNOWN_ENCODING",
+                &format!("Unknown encoding: {enc}"),
+            ))
+        }
     }
-    .to_string()
+    .to_string())
 }
 
 /// `new StringDecoder([encoding])`.
 pub fn construct(args: &[Value]) -> Result<Value, String> {
-    let enc = if args.is_empty() {
-        "utf8".to_string()
-    } else {
-        super::arg_str(args, 0)
+    let enc = match args.first() {
+        None | Some(Value::Undef) => "utf8".to_string(),
+        Some(v) if with_host(|h| h.is_null(v)) => "utf8".to_string(),
+        Some(_) => super::arg_str(args, 0),
     };
+    let enc = normalize_encoding(&enc)?;
     Ok(with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("StringDecoder"));
-        m.insert("encoding".into(), h.new_str(normalize_encoding(&enc)));
+        m.insert("encoding".into(), h.new_str(enc));
         // Held-back bytes from a UTF-8 sequence split across chunks.
         let empty = h.new_array(Vec::new());
         m.insert("@@pending".into(), empty);
@@ -128,6 +147,38 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let s = write_chunk(recv, &enc, &args.first().cloned().unwrap_or(Value::Undef))?;
             Ok(with_host(|h| h.new_str(s)))
         }
+        // `text(buf, offset)`: `write` of the bytes from `offset` on.
+        "text" => {
+            let buf = args.first().cloned().unwrap_or(Value::Undef);
+            let offset = with_host(|h| h.to_number(args.get(1).unwrap_or(&Value::Float(0.0))));
+            let bytes = match chunk_of(&buf)? {
+                Chunk::Bytes(b) => b,
+                Chunk::Text(s) => return Ok(with_host(|h| h.new_str(s))),
+            };
+            let from = if offset.is_finite() && offset > 0.0 {
+                offset as usize
+            } else {
+                0
+            };
+            let rest = super::buffer::from_bytes(bytes.get(from..).unwrap_or(&[]));
+            let s = write_chunk(recv, &enc, &rest)?;
+            Ok(with_host(|h| h.new_str(s)))
+        }
+        // The held-back state: `lastNeed` bytes still wanted to finish the
+        // character whose `lastTotal` bytes `lastChar` is gathering.
+        "@get@lastNeed" | "@get@lastTotal" | "@get@lastChar" => {
+            let held = pending_of(recv);
+            let (need, total) = held_shape(&enc, &held);
+            Ok(match method {
+                "@get@lastNeed" => Value::Float(need as f64),
+                "@get@lastTotal" => Value::Float(total as f64),
+                _ => {
+                    let mut four = held.clone();
+                    four.resize(4, 0);
+                    super::buffer::from_bytes(&four)
+                }
+            })
+        }
         // `end([buf])` is `write(buf)` (when given) and then a flush of
         // whatever is still held back.
         "end" => {
@@ -144,6 +195,28 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             "{method} is not a function"
         ))),
     }
+}
+
+/// `(lastNeed, lastTotal)` for the bytes `held`: a UTF-8 sequence's length
+/// from its lead byte, a UTF-16LE code unit (2) or surrogate pair (4), a
+/// base64 group (3); nothing is held by the single-byte encodings.
+fn held_shape(enc: &str, held: &[u8]) -> (usize, usize) {
+    let n = held.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let total: usize = match enc {
+        "utf8" => match held[0] {
+            b if b >= 0xF0 => 4,
+            b if b >= 0xE0 => 3,
+            _ => 2,
+        },
+        "utf16le" if n >= 2 => 4,
+        "utf16le" => 2,
+        "base64" | "base64url" => 3,
+        _ => return (0, 0),
+    };
+    (total.saturating_sub(n), total)
 }
 
 /// What `end()` emits for bytes still held when the stream closes. Each encoding

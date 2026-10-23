@@ -23,14 +23,13 @@
 //!     lifetimes. This is intentional; do not treat it as a gap to "fill" by
 //!     faking hook invocations.
 //!
-//! What IS real is `AsyncLocalStorage` for the SYNCHRONOUS case: `run(store, cb)`
-//! makes `getStore()` return `store` for the duration of `cb` (and restores the
-//! previous store afterwards), and `enterWith(store)` sets the current store for
-//! subsequent synchronous `getStore()` calls. Because there is no async-context
-//! propagation, a store set with `enterWith` (or visible inside `run`) does NOT
-//! automatically follow into `setTimeout`/Promise callbacks — cross-async
-//! propagation is not modeled. Within straight-line synchronous code the store is
-//! correct.
+//! `AsyncLocalStorage` is real across async boundaries: stores live in the
+//! host's ASYNC CONTEXT FRAME (node's `AsyncContextFrame`), which every queued
+//! task, timer and promise reaction captures when it is scheduled (a reaction:
+//! when `.then`/`await` registers it) and restores while it runs. `run(store,
+//! cb)` runs `cb` in a frame with the store set, `exit` in one without it,
+//! `enterWith` replaces the current frame, and `AsyncLocalStorage.snapshot()` /
+//! `bind()` and `AsyncResource` hold the frame they were made in.
 //!
 //! Instances are `@@native`-tagged objects (`AsyncLocalStorage` / `AsyncHook`)
 //! dispatched through `instance_call`; the parent wires `construct`,
@@ -40,14 +39,8 @@ use crate::host::{invoke, with_host};
 use fusevm::Value;
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 thread_local! {
-    /// Per-`AsyncLocalStorage`-instance store stack, keyed by the instance's heap
-    /// index. Push on `run`/`enterWith`, pop on `run` exit. The top is what
-    /// `getStore()` returns. A stack (not a single slot) so nested `run` calls
-    /// restore the enclosing store correctly.
-    static STORES: RefCell<HashMap<u32, Vec<Value>>> = RefCell::new(HashMap::new());
 
     /// Monotonic async-id source. Node reserves 1 for the root execution
     /// context, so fresh resources start at 2.
@@ -118,7 +111,9 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
     match method {
         "bind" => {
             let f = args.first().cloned().unwrap_or(Value::Undef);
-            Some(Ok(bind_to(f, args.get(2).cloned())))
+            let bound = bind_to(f, args.get(2).cloned());
+            let frame = with_host(|h| h.async_frame.clone());
+            Some(frame_runner(frame, Some(bound)))
         }
         _ => None,
     }
@@ -138,8 +133,9 @@ fn bind_to(f: Value, this: Option<Value>) -> Value {
     }
 }
 
-pub fn call(method: &str, _args: &[Value]) -> Option<Result<Value, String>> {
+pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match method {
+        "@@runInFrame" => run_in_frame(args),
         "executionAsyncId" => Ok(Value::Float(execution_async_id())),
         "triggerAsyncId" => Ok(Value::Float(trigger_async_id())),
         // The hook object; its callbacks never fire (see module docs).
@@ -159,6 +155,7 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // `options.triggerAsyncId` overrides the inherited parent, as in Node.
         "AsyncResource" => {
             let r = new_native("AsyncResource");
+            let frame_id = hold_frame(with_host(|h| h.async_frame.clone()));
             let trigger = args
                 .get(1)
                 .and_then(|o| {
@@ -175,6 +172,9 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 if let Some(crate::host::JsObj::Object(p)) = h.get_mut(&r) {
                     p.insert("@@asyncId".into(), Value::Float(fresh_async_id()));
                     p.insert("@@triggerAsyncId".into(), Value::Float(trigger));
+                    // The async context frame the resource was created in;
+                    // `runInAsyncScope` and `bind` run in it.
+                    p.insert("@@frame".into(), Value::Float(frame_id));
                 }
             });
             Some(Ok(r))
@@ -251,11 +251,15 @@ fn resource_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, 
             let rest = args.get(2..).map(|s| s.to_vec()).unwrap_or_default();
             let id = hidden_num(recv, "@@asyncId", 1.0);
             let trigger = hidden_num(recv, "@@triggerAsyncId", 0.0);
-            in_async_scope(id, trigger, || invoke(&f, rest, this))
+            let frame = resource_frame(recv);
+            in_async_scope(id, trigger, || {
+                crate::host::in_frame(frame, || invoke(&f, rest, this))
+            })
         }
         "bind" => {
             let f = args.first().cloned().unwrap_or(Value::Undef);
-            Ok(bind_to(f, args.get(1).cloned()))
+            let bound = bind_to(f, args.get(1).cloned());
+            frame_runner(resource_frame(recv), Some(bound))
         }
         "emitDestroy" => Ok(recv.clone()),
         "asyncId" => Ok(Value::Float(hidden_num(recv, "@@asyncId", 1.0))),
@@ -277,11 +281,12 @@ fn key(recv: &Value) -> u32 {
 fn als_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     let id = key(recv);
     match method {
-        // The current store (top of this instance's stack), or undefined.
-        "getStore" => Ok(STORES.with(|s| {
-            s.borrow()
-                .get(&id)
-                .and_then(|v| v.last().cloned())
+        // The store this instance has in the current async context frame.
+        "getStore" => Ok(with_host(|h| {
+            h.async_frame
+                .iter()
+                .find(|(k, _)| *k == id)
+                .map(|(_, v)| v.clone())
                 .unwrap_or(Value::Undef)
         })),
         // run(store, callback, ...args): set the store, call the callback with the
@@ -290,27 +295,23 @@ fn als_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, Strin
             let store = args.first().cloned().unwrap_or(Value::Undef);
             let cb = args.get(1).cloned().unwrap_or(Value::Undef);
             let rest = args.get(2..).map(|s| s.to_vec()).unwrap_or_default();
-            with_store(id, store, cb, rest)
+            let frame = crate::host::frame_with(id, Some(store));
+            crate::host::in_frame(frame, || invoke(&cb, rest, None))
         }
-        // exit(callback, ...args): run the callback with the store unset (undefined
-        // pushed) for its duration.
+        // exit(callback, ...args): the callback runs with no store.
         "exit" => {
             let cb = args.first().cloned().unwrap_or(Value::Undef);
             let rest = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
-            with_store(id, Value::Undef, cb, rest)
+            let frame = crate::host::frame_with(id, None);
+            crate::host::in_frame(frame, || invoke(&cb, rest, None))
         }
-        // enterWith(store): set the current store for subsequent synchronous
-        // getStore() calls (not popped automatically; not propagated across async).
-        "enterWith" => {
-            let store = args.first().cloned().unwrap_or(Value::Undef);
-            STORES.with(|s| s.borrow_mut().entry(id).or_default().push(store));
-            Ok(Value::Undef)
-        }
-        // disable(): drop all stores for this instance.
-        "disable" => {
-            STORES.with(|s| {
-                s.borrow_mut().remove(&id);
-            });
+        // enterWith(store): the store for the rest of the current execution and
+        // everything it schedules.
+        "enterWith" | "disable" => {
+            let store =
+                (method == "enterWith").then(|| args.first().cloned().unwrap_or(Value::Undef));
+            let frame = crate::host::frame_with(id, store);
+            with_host(|h| h.async_frame = frame);
             Ok(Value::Undef)
         }
         _ => Err(crate::host::type_error(&format!(
@@ -319,15 +320,86 @@ fn als_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, Strin
     }
 }
 
-/// Push `store`, invoke `cb` with `rest` (releasing every host borrow first, so
-/// the callback may re-enter the host), then always pop — even on error.
-fn with_store(id: u32, store: Value, cb: Value, rest: Vec<Value>) -> Result<Value, String> {
-    STORES.with(|s| s.borrow_mut().entry(id).or_default().push(store));
-    let r = invoke(&cb, rest, None);
-    STORES.with(|s| {
-        if let Some(v) = s.borrow_mut().get_mut(&id) {
-            v.pop();
+/// The frame an `AsyncResource` was created in.
+fn resource_frame(recv: &Value) -> crate::host::AsyncFrame {
+    let id = hidden_num(recv, "@@frame", -1.0);
+    if id < 0.0 {
+        return with_host(|h| h.async_frame.clone());
+    }
+    HELD_FRAMES
+        .with(|f| f.borrow().get(id as usize).cloned())
+        .unwrap_or_default()
+}
+
+/// Static members on the `AsyncLocalStorage` constructor.
+pub const ALS_STATIC_METHODS: &[&str] = &["bind", "snapshot"];
+
+/// `AsyncLocalStorage.snapshot()` — a function that runs its argument in the
+/// frame current now — and `AsyncLocalStorage.bind(fn)` — `fn`, run in the
+/// frame current now.
+pub fn als_static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let frame = with_host(|h| h.async_frame.clone());
+    Some(match method {
+        "snapshot" => frame_runner(frame, None),
+        "bind" => frame_runner(frame, Some(args.first().cloned().unwrap_or(Value::Undef))),
+        _ => return None,
+    })
+}
+
+thread_local! {
+    /// Frames handed out to `snapshot`/`bind`/`AsyncResource`, by handle.
+    static HELD_FRAMES: RefCell<Vec<crate::host::AsyncFrame>> = const { RefCell::new(Vec::new()) };
+}
+
+fn hold_frame(frame: crate::host::AsyncFrame) -> f64 {
+    HELD_FRAMES.with(|f| {
+        let mut f = f.borrow_mut();
+        f.push(frame);
+        (f.len() - 1) as f64
+    })
+}
+
+/// A JS function over a held frame: with `target`, `target` bound to it (its
+/// `this` and arguments passed through); without, node's snapshot runner
+/// `(fn, ...args) => fn(...args)` in that frame.
+fn frame_runner(frame: crate::host::AsyncFrame, target: Option<Value>) -> Result<Value, String> {
+    thread_local! {
+        static FACTORY: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    let factory = match FACTORY.with(|f| f.borrow().clone()) {
+        Some(f) => f,
+        None => {
+            let f = crate::eval_in_global_scope(
+                "(function (runner, id, target) {\n\
+                   if (target === undefined) return function runInAsyncScope(fn, ...args) { return runner(id, fn, undefined, ...args); };\n\
+                   return function (...args) { return runner(id, target, this, ...args); };\n\
+                 })",
+            )?;
+            FACTORY.with(|c| *c.borrow_mut() = Some(f.clone()));
+            f
         }
+    };
+    let id = Value::Float(hold_frame(frame));
+    let runner = with_host(|h| {
+        h.alloc(crate::host::JsObj::Builtin(
+            "async_hooks.@@runInFrame".into(),
+        ))
     });
-    r
+    invoke(
+        &factory,
+        vec![runner, id, target.unwrap_or(Value::Undef)],
+        None,
+    )
+}
+
+/// `async_hooks.@@runInFrame(id, fn, this, ...args)`: `fn` called in held frame `id`.
+pub fn run_in_frame(args: &[Value]) -> Result<Value, String> {
+    let id = with_host(|h| h.to_number(args.first().unwrap_or(&Value::Undef))) as usize;
+    let frame = HELD_FRAMES
+        .with(|f| f.borrow().get(id).cloned())
+        .unwrap_or_default();
+    let f = args.get(1).cloned().unwrap_or(Value::Undef);
+    let this = args.get(2).cloned().filter(|t| !matches!(t, Value::Undef));
+    let rest = args.get(3..).map(|s| s.to_vec()).unwrap_or_default();
+    crate::host::in_frame(frame, || invoke(&f, rest, this))
 }

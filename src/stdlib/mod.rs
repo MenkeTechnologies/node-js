@@ -91,7 +91,9 @@ pub fn is_unimplemented(ns: &str) -> bool {
 /// are dispatchable methods by construction.
 pub fn data_module(spec: &str) -> Option<Value> {
     match spec.strip_prefix("node:").unwrap_or(spec) {
-        "constants" => Some(constants::object(&constants::flat())),
+        "constants" => {
+            cached_module_value("@constants", || Some(constants::object(&constants::flat())))
+        }
         _ => None,
     }
 }
@@ -231,6 +233,7 @@ pub fn namespace_methods(ns: &str) -> &'static [&'static str] {
         "performance" => perf_hooks::PERFORMANCE_METHODS,
         "async_hooks" => async_hooks::METHODS,
         "AsyncResource" => async_hooks::RESOURCE_STATIC_METHODS,
+        "AsyncLocalStorage" => async_hooks::ALS_STATIC_METHODS,
         "util/types" => util_types::METHODS,
         "diagnostics_channel" => diagnostics_channel::METHODS,
         "v8" => v8::METHODS,
@@ -440,6 +443,7 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "perf_hooks" | "performance" => perf_hooks::call(m, args)?,
         "async_hooks" => async_hooks::call(m, args)?,
         "AsyncResource" => async_hooks::static_call(m, args)?,
+        "AsyncLocalStorage" => async_hooks::als_static_call(m, args)?,
         "util/types" => util_types::call(m, args)?,
         "diagnostics_channel" => diagnostics_channel::call(m, args)?,
         "v8" => v8::call(m, args)?,
@@ -483,6 +487,31 @@ pub fn call(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// A non-function constant on a stdlib namespace (`path.sep`, `os.EOL`,
 /// `buffer.Buffer`, `url.URL`), reachable via `namespace_property`.
 pub fn constant(ns: &str, name: &str) -> Option<Value> {
+    // A module's `constants` object is ONE object for the life of the process
+    // (`fs.constants === fs.constants`, and `fs/promises` shares `fs`'s); each
+    // read built a fresh one.
+    if name == "constants" {
+        let key = if ns == "fs/promises" { "fs" } else { ns };
+        return cached_module_value(key, || constant_uncached(ns, name));
+    }
+    constant_uncached(ns, name)
+}
+
+/// One value per `key`, built by `make` on first use.
+fn cached_module_value(key: &str, make: impl FnOnce() -> Option<Value>) -> Option<Value> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, Value>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(v) = CACHE.with(|c| c.borrow().get(key).cloned()) {
+        return Some(v);
+    }
+    let v = make()?;
+    CACHE.with(|c| c.borrow_mut().insert(key.to_string(), v.clone()));
+    Some(v)
+}
+
+fn constant_uncached(ns: &str, name: &str) -> Option<Value> {
     match ns {
         "Event" => event_target::constant(name),
         // Both flavors carry `.posix`/`.win32` cross-links, exactly as Node's
@@ -946,6 +975,7 @@ pub fn instance_accessors(tag: &str) -> (&'static [(&'static str, bool)], &'stat
             "",
         ),
         "TextEncoder" => (&[("encoding", false)], "TextEncoder"),
+        "StringDecoder" => (string_decoder::ACCESSORS, ""),
         "Performance" => (&[("timeOrigin", false)], "Performance"),
         "Crypto" => (&[("subtle", false)], "Crypto"),
         "webcrypto.SubtleCrypto" => (&[], "SubtleCrypto"),

@@ -28,6 +28,33 @@ spellings true true false false
 nonconf  false true 1
 readd    plain {"x":"plain"}
 shadow   base false
+==== alspropagation.js ====
+"sync" {"id":1}
+"emit" "other"
+"outside" 
+"nested" 3
+"exit" 
+"enterWith" "E"
+"after enterWith run" 
+"snapshot" "S"
+"bind" "B"
+"resource" "R" "R" 
+"disabled" 
+--
+"await" {"id":1}
+"await-resolved-elsewhere" "A"
+"await2" {"id":1}
+"enterWith later" "E"
+"fs cb" {"id":1}
+"fsp" {"id":1}
+"immediate" {"id":1}
+"interval" {"id":1}
+"micro" {"id":1}
+"then" {"id":1}
+"then-registered-inside" {"id":1}
+"then-resolved-elsewhere" "A2"
+"tick" {"id":1}
+"timeout" {"id":1}
 ==== argumentsobject.js ====
 callee        [true,"self1"]
 callee-expr   [true,"named"]
@@ -2281,6 +2308,22 @@ net-mac       true
 net-cidr      true
 net-internal  [true,true]
 neighbours    ["string",true,true,"string",true]
+==== ossurface.js ====
+uid,gid,username,homedir,shell true true true true string string
+get [null] 0
+get [0] 0
+get [1.5] RangeError:ERR_OUT_OF_RANGE:The value of "pid" is out of range. It must be an integer. Received 1.5
+get [2147483648] RangeError:ERR_OUT_OF_RANGE:The value of "pid" is out of range. It must be >= -2147483648 && <= 2147483647. Received 2147483648
+get ["x"] TypeError:ERR_INVALID_ARG_TYPE:The "pid" argument must be of type number. Received type string ('x')
+set [0,20] RangeError:ERR_OUT_OF_RANGE:The value of "priority" is out of range. It must be >= -20 && <= 19. Received 20
+set [0,"x"] TypeError:ERR_INVALID_ARG_TYPE:The "priority" argument must be of type number. Received type string ('x')
+set [-21] RangeError:ERR_OUT_OF_RANGE:The value of "priority" is out of range. It must be >= -20 && <= 19. Received -21
+set [0,1.5] RangeError:ERR_OUT_OF_RANGE:The value of "priority" is out of range. It must be an integer. Received 1.5
+set [999999,0] SystemError:ERR_SYSTEM_ERROR:A system error occurred: uv_os_setpriority returned ESRCH (no such process)
+SystemError code,info,errno,syscall {"errno":-3,"code":"ESRCH","message":"no such process","syscall":"uv_os_setpriority"} true uv_os_setpriority SystemError [ERR_SYSTEM_ERROR] true
+true true true true true false
+true true true true
+true false false
 ==== ownproperties.js ====
                    read  in    own   keys  desc  gopn
 fn.length          number true true false true true
@@ -2890,6 +2933,8 @@ units    [[1,2]] 1
 absent   undefined
 paths    [[1,2]] [[0,1]] [[1,2]]
 sticky   [[1,2]]
+==== rlinterface.js ====
+out:Q?  | ans:typed | out:$  | line:more | line2:a true false object true
 ==== setoperations.js ====
 union    [ 3, 1, 2 ]
 inter-l  [ 2, 3 ]
@@ -3134,6 +3179,52 @@ matchAll      [1,3]
 search-meta   0
 search-absent 0
 search-miss   -1
+==== stringdecoderstate.js ====
+["","","€",""]
+["","","😀A",""]
+["","�"]
+["�A",""]
+["","A","😀",""]
+["","","YWJj","ZA=="]
+["","-_8"]
+["ab","cd",""]
+["éÿ",""]
+["iA",""]
+"utf8"
+"utf16le"
+"latin1"
+TypeError:ERR_UNKNOWN_ENCODING:Unknown encoding: nope
+[2,3,4]
+"éllo"
+"�"
+["encoding"]
+utf8 null 0|0|4|
+utf8 [226] 2|3|4|226
+utf8 [240,159] 2|4|4|240,159
+utf8 [226,130,172] 0|0|4|
+utf16le [65] 1|2|4|65
+utf16le [61,216] 2|4|4|61,216
+base64 [97] 2|3|4|97
+base64 [97,98] 1|3|4|97,98
+hex [171] 0|0|4|
+latin1 [1] 0|0|4|
+"A" 1 "�"
+[
+  'constructor',
+  'write',
+  'end',
+  'text',
+  'lastChar',
+  'lastNeed',
+  'lastTotal'
+] function
+undefined utf8
+null utf8
+"" utf8
+"UCS-2" utf16le
+"Base64" base64
+"nope" ERR_UNKNOWN_ENCODING Unknown encoding: nope
+5 ERR_UNKNOWN_ENCODING Unknown encoding: 5
 ==== strings.js ====
 HELLO, WORLD hello, world 12
 World World Hello d

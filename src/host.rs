@@ -674,6 +674,8 @@ pub enum PromiseReaction {
         on_ful: Value,
         on_rej: Value,
         result: Value,
+        /// The async context frame `.then` was called in; the handler runs in it.
+        frame: AsyncFrame,
     },
     Native(Box<dyn FnOnce(PromiseState, Value) -> Result<(), String>>),
 }
@@ -954,6 +956,8 @@ pub struct JsHost {
     pub error: Option<String>,
     /// The in-flight thrown value, if any (JS `throw`).
     pub exc: Option<Value>,
+    /// The current async context frame (see [`Task`]).
+    pub async_frame: AsyncFrame,
     pub signal: Option<Signal>,
     /// A forced `.return(v)` / `.throw(e)` that arrived at a `yield*`, waiting
     /// for the delegate step that applies it to the delegate (see
@@ -1144,18 +1148,51 @@ pub struct ProcListener {
 
 /// A queued unit of work: either a JS callback invocation (`queueMicrotask`,
 /// `nextTick`, timer body) or a native step (Promise reaction / async resume).
+///
+/// Each carries the ASYNC CONTEXT FRAME current when it was queued and runs in
+/// it — node's `AsyncContextFrame`, which is what an `AsyncLocalStorage`
+/// store follows across `setTimeout`, `nextTick`, promise jobs and I/O
+/// callbacks.
 pub enum Task {
-    Js { cb: Value, args: Vec<Value> },
-    Native(Box<dyn FnOnce() -> Result<(), String>>),
+    Js {
+        cb: Value,
+        args: Vec<Value>,
+        frame: AsyncFrame,
+    },
+    Native(Box<dyn FnOnce() -> Result<(), String>>, AsyncFrame),
 }
 
 impl Task {
     fn run(self) -> Result<(), String> {
         match self {
-            Task::Js { cb, args } => invoke(&cb, args, None).map(|_| ()),
-            Task::Native(f) => f(),
+            Task::Js { cb, args, frame } => in_frame(frame, || invoke(&cb, args, None).map(|_| ())),
+            Task::Native(f, frame) => in_frame(frame, f),
         }
     }
+}
+
+/// An async context frame: each `AsyncLocalStorage` (by heap index) with its
+/// store. Immutable once built — a `run`/`enterWith` makes a new one — so a
+/// queued task can hold the frame it was created in.
+pub type AsyncFrame = std::rc::Rc<Vec<(u32, Value)>>;
+
+/// Run `f` with `frame` as the current async context frame, restoring the
+/// previous one afterwards (a store a callback `enterWith`s stays inside it).
+pub fn in_frame<R>(frame: AsyncFrame, f: impl FnOnce() -> R) -> R {
+    let prev = with_host(|h| std::mem::replace(&mut h.async_frame, frame));
+    let r = f();
+    with_host(|h| h.async_frame = prev);
+    r
+}
+
+/// The current frame with `key`'s store set to `store` (or removed, for `None`).
+pub fn frame_with(key: u32, store: Option<Value>) -> AsyncFrame {
+    let cur = with_host(|h| h.async_frame.clone());
+    let mut v: Vec<(u32, Value)> = cur.iter().filter(|(k, _)| *k != key).cloned().collect();
+    if let Some(s) = store {
+        v.push((key, s));
+    }
+    std::rc::Rc::new(v)
 }
 
 /// A scheduled macrotask (`setTimeout`/`setInterval`/`setImmediate`). Ordering
@@ -1180,6 +1217,8 @@ pub struct Timer {
     /// path (an open handle or a pending interval). On the pure virtual clock
     /// this is ignored.
     pub deadline: Instant,
+    /// The async context frame the timer was created in; its callback runs in it.
+    pub frame: AsyncFrame,
 }
 
 /// One suspended generator. `coro` is `None` only while actively running (taken
@@ -1315,6 +1354,7 @@ impl JsHost {
             global_env,
             error: None,
             exc: None,
+            async_frame: std::rc::Rc::new(Vec::new()),
             signal: None,
             pending_rejections: Vec::new(),
             process_listeners: IndexMap::new(),
@@ -10480,6 +10520,18 @@ pub fn protocol_lookup(v: &Value, key: &str) -> Result<Option<Value>, String> {
         let got = crate::builtins::get_property(v, key)?;
         return Ok((!matches!(got, Value::Undef)).then_some(got));
     }
+    // A builtin `os` function's own `[Symbol.toPrimitive]` lives in no property
+    // map; the namespace read synthesizes it.
+    if key == "@@toPrimitive" {
+        if let Some(JsObj::Builtin(n)) = with_host(|h| h.get(v).cloned()) {
+            if n.starts_with("os.") {
+                let got = crate::builtins::namespace_property(&n, key);
+                if !matches!(got, Value::Undef) {
+                    return Ok(Some(got));
+                }
+            }
+        }
+    }
     Ok(with_host(|h| lookup_chain(h, v, key)))
 }
 
@@ -11220,7 +11272,8 @@ impl JsHost {
         c.value = value;
     }
     pub fn queue_micro(&mut self, cb: Value, args: Vec<Value>) {
-        self.microtasks.push_back(Task::Js { cb, args });
+        let frame = self.async_frame.clone();
+        self.microtasks.push_back(Task::Js { cb, args, frame });
     }
     /// Deliver the callback of an asynchronous I/O operation that has already
     /// completed. node-js performs the operation synchronously, but the callback
@@ -11229,20 +11282,24 @@ impl JsHost {
     /// starting code queued (`fs.stat(f, cb); Promise.resolve().then(p)` runs `p`
     /// first) and with a full microtask checkpoint after it.
     pub fn queue_io_callback(&mut self, cb: Value, args: Vec<Value>) {
-        self.io_completions.push_back(Task::Js { cb, args });
+        let frame = self.async_frame.clone();
+        self.io_completions.push_back(Task::Js { cb, args, frame });
     }
     /// A native step delivered as an I/O completion, in the same poll-phase
     /// queue as [`JsHost::queue_io_callback`] (a `fs/promises` settlement).
     pub fn queue_io_native(&mut self, f: Box<dyn FnOnce() -> Result<(), String>>) {
-        self.io_completions.push_back(Task::Native(f));
+        let frame = self.async_frame.clone();
+        self.io_completions.push_back(Task::Native(f, frame));
     }
     pub fn queue_nexttick(&mut self, cb: Value, args: Vec<Value>) {
-        self.nextticks.push_back(Task::Js { cb, args });
+        let frame = self.async_frame.clone();
+        self.nextticks.push_back(Task::Js { cb, args, frame });
     }
     /// Schedule a native (Rust) microtask — used by Promise reactions and async
     /// resumption.
     pub fn queue_micro_native(&mut self, f: Box<dyn FnOnce() -> Result<(), String>>) {
-        self.microtasks.push_back(Task::Native(f));
+        let frame = self.async_frame.clone();
+        self.microtasks.push_back(Task::Native(f, frame));
     }
     /// Schedule a macrotask. `interval` is the repeat period for `setInterval`
     /// (`None` for the one-shot `setTimeout`/`setImmediate`). Returns the timer
@@ -11270,6 +11327,7 @@ impl JsHost {
             interval,
             refed: true,
             deadline,
+            frame: self.async_frame.clone(),
         });
         id
     }
@@ -11294,6 +11352,7 @@ impl JsHost {
             interval: Some(period),
             refed: t.refed,
             deadline,
+            frame: t.frame.clone(),
         });
     }
     /// `timeout.ref()` / `timeout.unref()` — set the handle bit on a pending
@@ -11556,7 +11615,7 @@ fn fire_timer(t: Timer) -> Result<(), String> {
     if let Some(period) = t.interval {
         with_host(|h| h.rearm_timer(&t, period));
     }
-    invoke(&t.callback, t.args, None)?;
+    in_frame(t.frame, || invoke(&t.callback, t.args, None))?;
     Ok(())
 }
 
@@ -11829,6 +11888,11 @@ pub fn promise_of(v: &Value) -> Value {
 /// Register a native reaction on promise `id` (schedules immediately if already
 /// settled).
 pub fn subscribe_native(id: u32, f: Box<dyn FnOnce(PromiseState, Value) -> Result<(), String>>) {
+    // The continuation (`await` resumption above all) runs in the async context
+    // frame it was registered in, not the settling code's.
+    let frame = with_host(|h| h.async_frame.clone());
+    let f: Box<dyn FnOnce(PromiseState, Value) -> Result<(), String>> =
+        Box::new(move |s, v| in_frame(frame, || f(s, v)));
     // A native continuation (`await`, promise adoption, `for await`) observes a
     // rejection exactly as a `.catch` does, so it is not "unhandled".
     with_host(|h| h.promise_mark_handled(id));
@@ -12017,10 +12081,13 @@ fn schedule_reactions(id: u32) {
                 on_ful,
                 on_rej,
                 result,
+                frame,
             } => {
                 with_host(|h| {
                     h.queue_micro_native(Box::new(move || {
-                        run_js_reaction(state, value, on_ful, on_rej, result)
+                        in_frame(frame, || {
+                            run_js_reaction(state, value, on_ful, on_rej, result)
+                        })
                     }))
                 });
             }
@@ -12087,6 +12154,7 @@ pub fn promise_then(p: &Value, on_ful: Value, on_rej: Value) -> Value {
         on_ful,
         on_rej,
         result: result.clone(),
+        frame: with_host(|h| h.async_frame.clone()),
     };
     let state = with_host(|h| h.promise_state(id));
     if state == PromiseState::Pending {
@@ -12097,11 +12165,14 @@ pub fn promise_then(p: &Value, on_ful: Value, on_rej: Value) -> Value {
             on_ful,
             on_rej,
             result,
+            frame,
         } = reaction
         {
             with_host(|h| {
                 h.queue_micro_native(Box::new(move || {
-                    run_js_reaction(state, value, on_ful, on_rej, result)
+                    in_frame(frame, || {
+                        run_js_reaction(state, value, on_ful, on_rej, result)
+                    })
                 }))
             });
         }

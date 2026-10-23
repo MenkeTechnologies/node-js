@@ -45,6 +45,8 @@ pub fn constant(name: &str) -> Option<Value> {
             // Each sub-table allocates, so it is built BEFORE the borrow below
             // rather than inside it.
             let sig = super::constants::object(&super::constants::signals());
+            // node freezes the signal table (only that one).
+            with_host(|h| h.seal_object(&sig, true));
             let prio = super::constants::object(&super::constants::priority());
             let errno = super::constants::object(&super::constants::errno());
             let dlopen = super::constants::object(&super::constants::dlopen());
@@ -81,6 +83,10 @@ pub fn arch() -> &'static str {
 }
 
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    // An `os.<fn>[Symbol.toPrimitive]`: the function's own result.
+    if let Some(m) = method.strip_prefix("@@toPrimitive:") {
+        return call(m, &[]);
+    }
     let s = |v: &str| Ok(with_host(|h| h.new_str(v)));
     Some(match method {
         "platform" => s(platform()),
@@ -124,7 +130,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             Ok(with_host(|h| h.new_array(items)))
         }
         "networkInterfaces" => Ok(network_interfaces()),
-        "userInfo" => Ok(user_info()),
+        "userInfo" => user_info(args),
         // Logical CPU count (Node uses libuv's available parallelism).
         "availableParallelism" => {
             let n = std::thread::available_parallelism()
@@ -133,33 +139,53 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             Ok(Value::Float(n as f64))
         }
         // `os.getPriority([pid])` — the nice value of `pid` (0 = current process).
-        "getPriority" => {
-            let pid = if args.is_empty() {
-                0
-            } else {
-                super::arg_num(args, 0) as i32
+        "getPriority" => (|| -> Result<Value, String> {
+            let pid = match args.first() {
+                None | Some(Value::Undef) => 0,
+                Some(v) => {
+                    super::validate_integer_in(v, "pid", -2_147_483_648.0, 2_147_483_647.0)? as i32
+                }
             };
+            // `getpriority` returns -1 for a nice value of -1 AND for an error,
+            // so errno is cleared first and read after (libuv's `uv_os_getpriority`).
             // SAFETY: pure query; PRIO_PROCESS with a pid.
-            let prio = unsafe { libc::getpriority(libc::PRIO_PROCESS as _, pid as _) };
+            let prio = unsafe {
+                *errno_location() = 0;
+                libc::getpriority(libc::PRIO_PROCESS as _, pid as _)
+            };
+            if prio == -1 && std::io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0 {
+                return Err(system_error(
+                    "uv_os_getpriority",
+                    std::io::Error::last_os_error(),
+                ));
+            }
             Ok(Value::Float(prio as f64))
-        }
+        })(),
         // `os.setPriority([pid, ]priority)` — best-effort (needs privilege to lower
         // the nice value); returns undefined.
-        "setPriority" => {
-            let (pid, prio) = if args.len() >= 2 {
-                (
-                    super::arg_num(args, 0) as i32,
-                    super::arg_num(args, 1) as i32,
-                )
+        "setPriority" => (|| -> Result<Value, String> {
+            // `setPriority(priority)` or `setPriority(pid, priority)`.
+            let (pid_v, prio_v) = if args.len() >= 2 {
+                (Some(args[0].clone()), args[1].clone())
             } else {
-                (0, super::arg_num(args, 0) as i32)
+                (None, args.first().cloned().unwrap_or(Value::Undef))
             };
+            let pid = match pid_v {
+                Some(v) => {
+                    super::validate_integer_in(&v, "pid", -2_147_483_648.0, 2_147_483_647.0)? as i32
+                }
+                None => 0,
+            };
+            let prio = super::validate_integer_in(&prio_v, "priority", -20.0, 19.0)? as i32;
             // SAFETY: PRIO_PROCESS with a pid and nice value; failure returns -1.
-            unsafe {
-                libc::setpriority(libc::PRIO_PROCESS as _, pid as _, prio as _);
+            if unsafe { libc::setpriority(libc::PRIO_PROCESS as _, pid as _, prio as _) } != 0 {
+                return Err(system_error(
+                    "uv_os_setpriority",
+                    std::io::Error::last_os_error(),
+                ));
             }
             Ok(Value::Undef)
-        }
+        })(),
         _ => return None,
     })
 }
@@ -173,23 +199,104 @@ fn hostname() -> String {
         .unwrap_or_default()
 }
 
-fn user_info() -> Value {
-    with_host(|h| {
+/// `os.userInfo([{ encoding }])`: libuv's `uv_os_get_passwd` — the password
+/// database entry for the effective uid, in node's key order `uid, gid,
+/// username, homedir, shell`, the strings as Buffers under `encoding: 'buffer'`.
+/// It read ``/``/`` and reported uid and gid as -1.
+fn user_info(args: &[Value]) -> Result<Value, String> {
+    let as_buffer = match args.first() {
+        Some(o) if with_host(|h| h.type_of(o)) == "object" && !with_host(|h| h.is_null(o)) => {
+            let e = crate::builtins::get_property(o, "encoding")?;
+            with_host(|h| h.as_str(&e)).as_deref() == Some("buffer")
+        }
+        _ => false,
+    };
+    // SAFETY: `getpwuid_r` fills `pw` with pointers into `buf`, which outlives
+    // every read below.
+    let uid = unsafe { libc::geteuid() };
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() {
+        let e = if rc != 0 {
+            std::io::Error::from_raw_os_error(rc)
+        } else {
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        };
+        return Err(system_error("uv_os_get_passwd", e));
+    }
+    let text = |p: *const libc::c_char| -> Vec<u8> {
+        if p.is_null() {
+            return Vec::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec()
+    };
+    let (name, dir, shell) = (text(pw.pw_name), text(pw.pw_dir), text(pw.pw_shell));
+    let field = |bytes: Vec<u8>| -> Value {
+        if as_buffer {
+            super::buffer::from_bytes(&bytes)
+        } else {
+            with_host(|h| h.new_str(String::from_utf8_lossy(&bytes).into_owned()))
+        }
+    };
+    let (name, dir, shell) = (field(name), field(dir), field(shell));
+    Ok(with_host(|h| {
         let mut m = IndexMap::new();
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_default();
-        let home = dirs::home_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let shell = std::env::var("SHELL").unwrap_or_default();
-        m.insert("username".into(), h.new_str(user));
-        m.insert("homedir".into(), h.new_str(home));
-        m.insert("shell".into(), h.new_str(shell));
-        m.insert("uid".into(), Value::Float(-1.0));
-        m.insert("gid".into(), Value::Float(-1.0));
+        m.insert("uid".into(), Value::Float(f64::from(pw.pw_uid)));
+        m.insert("gid".into(), Value::Float(f64::from(pw.pw_gid)));
+        m.insert("username".into(), name);
+        m.insert("homedir".into(), dir);
+        m.insert("shell".into(), shell);
         h.new_object(m)
-    })
+    }))
+}
+
+/// The calling thread's `errno`.
+#[cfg(target_os = "macos")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__error()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+
+/// node's `ERR_SYSTEM_ERROR` (`SystemError`) for a failed libuv call: `code`,
+/// then `info` (`{ errno, code, message, syscall }`), `errno` and `syscall`,
+/// named `SystemError` and printed `SystemError [ERR_SYSTEM_ERROR]: …`. It is
+/// raised as the pending exception; the returned string is its message.
+fn system_error(syscall: &str, e: std::io::Error) -> String {
+    let code = super::fs::libuv_code(&e);
+    let (errno, reason) = super::util::errno_by_name(code).unwrap_or((libc::EIO, "i/o error"));
+    let msg = format!("A system error occurred: {syscall} returned {code} ({reason})");
+    let full = crate::host::coded_error("Error", "ERR_SYSTEM_ERROR", &msg);
+    with_host(|h| {
+        let err = crate::builtins::synth_error(h, &full);
+        let info = {
+            let mut m = IndexMap::new();
+            m.insert("errno".into(), Value::Float(-f64::from(errno)));
+            m.insert("code".into(), h.new_str(code));
+            m.insert("message".into(), h.new_str(reason));
+            m.insert("syscall".into(), h.new_str(syscall));
+            h.new_object(m)
+        };
+        let (name, stack, sys) = (
+            h.new_str("SystemError"),
+            h.new_str(format!("SystemError [ERR_SYSTEM_ERROR]: {msg}")),
+            h.new_str(syscall),
+        );
+        if let Some(crate::host::JsObj::Object(p)) = h.get_mut(&err) {
+            p.insert("info".into(), info);
+            p.insert("errno".into(), Value::Float(-f64::from(errno)));
+            p.insert("syscall".into(), sys);
+            p.insert("name".into(), name);
+            p.insert("stack".into(), stack);
+        }
+        h.hide_prop(&err, "name");
+        h.exc = Some(err);
+    });
+    full
 }
 
 /// Bytes of physical memory behind a `sysconf` page count. Both platforms this
@@ -598,3 +705,22 @@ fn ip_addr(ifa: &libc::ifaddrs) -> Option<IfAddr> {
     }
     None
 }
+
+/// The `os` functions node gives a `[Symbol.toPrimitive]` (`() => fn()`), so
+/// `` `${os.arch}` `` and `os.freemem + 0` read the value.
+pub const TO_PRIMITIVE: &[&str] = &[
+    "arch",
+    "availableParallelism",
+    "endianness",
+    "freemem",
+    "homedir",
+    "hostname",
+    "platform",
+    "release",
+    "tmpdir",
+    "totalmem",
+    "type",
+    "uptime",
+    "version",
+    "machine",
+];

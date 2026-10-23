@@ -3245,6 +3245,15 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
             return with_host(|h| h.alloc(JsObj::Builtin(format!("@proto:{class}:{name}"))));
         }
     }
+    // `os.arch[Symbol.toPrimitive]` (and the other `os` value functions): an
+    // anonymous function returning the call's result.
+    if name == "@@toPrimitive" {
+        if let Some(m) = ns.strip_prefix("os.") {
+            if crate::stdlib::os::TO_PRIMITIVE.contains(&m) {
+                return with_host(|h| h.alloc(JsObj::Builtin(format!("os.@@toPrimitive:{m}"))));
+            }
+        }
+    }
     // A core-module function written as an ordinary `function` owns a
     // `prototype` (`fs.readFileSync.prototype.constructor === fs.readFileSync`);
     // which ones do is measured into `CORE_PROTOTYPED`. One object per
@@ -7039,6 +7048,10 @@ const TIMER_ARITY: &[(&str, &str, u32)] = &[
 /// is `set` and `fs.readFileSync` is `readFileSync`. Reporting the whole key was
 /// how `[Function: @proto:TypedArray:set]` reached `console.log`.
 pub fn builtin_name(key: &str) -> &str {
+    // The anonymous `[Symbol.toPrimitive]` of an `os` function.
+    if key.contains(".@@toPrimitive:") {
+        return "";
+    }
     if let Some((name, _)) = builtin_meta(key) {
         return name;
     }

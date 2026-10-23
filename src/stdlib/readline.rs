@@ -172,13 +172,32 @@ fn create_interface(args: &[Value], promises: bool) -> Value {
             args.get(1).cloned().unwrap_or(Value::Undef),
         ),
     };
+    // `terminal`: the option, else whether the output is a TTY.
+    let terminal = match args.first().and_then(|o| opt_prop(o, "terminal")) {
+        Some(t) if !matches!(t, Value::Undef) => with_host(|h| h.truthy(&t)),
+        _ => {
+            matches!(output, Value::Obj(_))
+                && crate::builtins::get_property(&output, "isTTY")
+                    .map(|v| with_host(|h| h.truthy(&v)))
+                    .unwrap_or(false)
+        }
+    };
     let iface = with_host(|h| {
         let listeners = h.new_object(IndexMap::new());
         let prompt = h.new_str("> ");
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("Interface"));
         m.insert("@@input".into(), input.clone());
-        m.insert("@@output".into(), output);
+        m.insert("@@output".into(), output.clone());
+        m.insert(
+            "@@terminal".into(),
+            h.new_str(if terminal { "1" } else { "0" }),
+        );
+        // node's own instance fields a caller reads.
+        m.insert("line".into(), h.new_str(""));
+        m.insert("output".into(), output);
+        m.insert("input".into(), input.clone());
+        m.insert("terminal".into(), Value::Bool(terminal));
         m.insert("@@prompt".into(), prompt);
         m.insert("@@listeners".into(), listeners);
         m.insert("@@rlid".into(), Value::Float(id as f64));
@@ -201,7 +220,7 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
         // invoke the callback with it. Returns undefined (Node's callback form).
         "question" => {
             let query = with_host(|h| args.first().map(|v| h.str_of(v)).unwrap_or_default());
-            write_stdout(&query);
+            write_output(recv, &query);
             // Once input is flowing as line events, the answer is the next
             // line the stream delivers rather than a read of its own.
             if with_state(recv, |s| s.flowing) {
@@ -247,9 +266,16 @@ pub fn instance_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Val
             }
             Ok(Value::Undef)
         }
+        // `rl.write(data)` on a non-terminal interface is input, as if the
+        // input stream had delivered it (node's `[kNormalWrite]`); a terminal
+        // one echoes it to the output.
         "write" => {
             let data = with_host(|h| args.first().map(|v| h.str_of(v)).unwrap_or_default());
-            write_output(recv, &data);
+            if read_hidden(recv, "@@terminal") == "1" {
+                write_output(recv, &data);
+            } else {
+                on_data(recv, data.as_bytes())?;
+            }
             Ok(Value::Undef)
         }
         "prompt" => {
@@ -459,15 +485,16 @@ fn write_stdout(s: &str) {
 /// capture or redirect that text. Both went straight to `io::stdout()` here, so
 /// an interface given its own output printed to the process's stdout anyway and
 /// the supplied stream never saw a byte.
+///
+/// With no `output` node writes nothing at all (`_writeToOutput` tests
+/// `this.output !== null && this.output !== undefined`); this fell back to the
+/// process's stdout.
 fn write_output(recv: &Value, s: &str) {
     let out = opt_prop(recv, "@@output").unwrap_or(Value::Undef);
-    if matches!(out, Value::Obj(_)) {
+    if matches!(out, Value::Obj(_)) && !with_host(|h| h.is_null(&out)) {
         let payload = with_host(|h| h.new_str(s.to_string()));
-        if crate::host::call_method(&out, "write", vec![payload]).is_ok() {
-            return;
-        }
+        let _ = crate::host::call_method(&out, "write", vec![payload]);
     }
-    write_stdout(s);
 }
 
 /// An own property of `v` if `v` is a plain object, else `None`.
@@ -690,6 +717,12 @@ fn close(recv: &Value) -> Result<(), String> {
     let Some(waiters) = waiters else {
         return Ok(());
     };
+    // node sets `closed` on the instance when it closes.
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(recv) {
+            p.insert("closed".into(), Value::Bool(true));
+        }
+    });
     // A closed Interface stops its input, so standard input no longer holds
     // the process open.
     let input = opt_prop(recv, "@@input").unwrap_or(Value::Undef);

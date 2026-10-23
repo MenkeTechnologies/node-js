@@ -110,8 +110,9 @@ fn queue_warning(
         detail.map(str::to_string),
     );
     with_host(|h| {
-        h.nextticks
-            .push_back(crate::host::Task::Native(Box::new(move || {
+        let frame = h.async_frame.clone();
+        h.nextticks.push_back(crate::host::Task::Native(
+            Box::new(move || {
                 if let Some(text) = text {
                     eprintln!("{text}");
                 }
@@ -142,7 +143,9 @@ fn queue_warning(
                     crate::host::invoke(&f, vec![w.clone()], None)?;
                 }
                 Ok(())
-            })));
+            }),
+            frame,
+        ));
     });
 }
 
