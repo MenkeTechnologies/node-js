@@ -744,6 +744,29 @@ timers/promises  setTimeout/2
 stream           pipeline/0 eos/3
 own keys         true,true
 bound            1
+==== cryptoglobals.js ====
+Crypto function true
+CryptoKey function true
+SubtleCrypto function true
+true true true
+[object Crypto] [object SubtleCrypto]
+Crypto TypeError ERR_ILLEGAL_CONSTRUCTOR Illegal constructor
+CryptoKey TypeError ERR_ILLEGAL_CONSTRUCTOR Illegal constructor
+SubtleCrypto TypeError ERR_ILLEGAL_CONSTRUCTOR Illegal constructor
+constructor,getRandomValues,randomUUID,subtle
+algorithm,constructor,extractable,type,usages
+true undefined true
+[] [] false false
+true true true
+true true
+TypeError undefined Class constructor Crypto cannot be invoked without 'new'
+function true
+TypeError ERR_INVALID_THIS Value of "this" must be of type Crypto
+TypeError ERR_INVALID_THIS Value of "this" must be of type CryptoKey
+Class constructor SubtleCrypto cannot be invoked without 'new'
+Illegal constructor
+Class constructor SubtleCrypto cannot be invoked without 'new'
+true
 ==== cryptostate.js ====
 update-num   THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (5)"]
 update-null  THROW TypeError ["ERR_INVALID_ARG_TYPE","The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received null"]
@@ -1224,6 +1247,18 @@ function true function
 ==== filehandlestreams.js ====
 abcd finish,close -1 1
 abcd!? finish
+==== filehandleweb.js ====
+AbortError ABORT_ERR The operation was aborted why [ 'code', 'name' ] true AbortError false
+AbortError ABORT_ERR The operation was aborted why [ 'code', 'name' ] true AbortError false
+AbortError ABORT_ERR The operation was aborted why
+AbortError ABORT_ERR The operation was aborted why
+ERR_INVALID_ARG_TYPE The "options.signal" property must be an instance of AbortSignal. Received type number (5)
+number true
+true Uint8Array true
+Error ERR_INVALID_STATE Invalid state: The FileHandle is locked
+Error ERR_INVALID_STATE Invalid state: The FileHandle is closed
+autoClose -1
+ERR_INVALID_ARG_TYPE The "options.autoClose" property must be of type boolean. Received type number (1)
 ==== filesystem.js ====
 none     Buffer<68656c6c6f>
 utf8     "hello" "hello"
@@ -2204,6 +2239,14 @@ v.def    TypeError ERR_INVALID_ARG_TYPE "The \"options.a.default\" property must
 v.defarr TypeError ERR_INVALID_ARG_TYPE "The \"options.a.default\" property must be an instance of Array. Received type boolean (true)"
 v.defel  TypeError ERR_INVALID_ARG_TYPE "The \"options.a.default[1]\" property must be of type string. Received type number (1)"
 v.inherit {"values":{},"positionals":[]}
+==== perfinstance.js ====
+number 1 true
+true true 0 false true
+true true true
+[object Performance] [object process]
+TypeError ERR_ILLEGAL_CONSTRUCTOR Illegal constructor
+true true number
+7
 ==== primitivereceivers.js ====
 reflect-set   [false,false,false,false,false]
 reflect-null  false
@@ -3343,6 +3386,26 @@ prevent    {"done":false,"value":2}
 locked     TypeError ERR_INVALID_STATE Invalid state: ReadableStream is locked
 transform  X,Y
 encoded    Uint8Array 104,195,169
+==== webstreamaccessors.js ====
+ReadableStream cancel,constructor,getReader,locked,pipeThrough,pipeTo,tee,values
+WritableStream abort,close,constructor,getWriter,locked
+TransformStream constructor,readable,writable
+TextEncoderStream constructor,encoding,readable,writable
+TextDecoderStream constructor,encoding,fatal,ignoreBOM,readable,writable
+CompressionStream constructor,readable,writable
+DecompressionStream constructor,readable,writable
+function undefined true true
+[] false false true
+true
+false
+TypeError ERR_INVALID_THIS Value of "this" must be of type ReadableStream
+[] false
+true
+[] true true
+[] utf-8 true
+[] utf-8 false false
+[ 120, 121 ]
+hello
 ==== wordcount.js ====
 the: 3
 fox: 2

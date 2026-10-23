@@ -943,7 +943,14 @@ pub(crate) fn global_object_binding(name: &str) -> Option<Value> {
 fn is_lazy_global(name: &str) -> bool {
     matches!(
         name,
-        "undefined" | "NaN" | "Infinity" | "globalThis" | "global" | "crypto" | "performance"
+        "undefined"
+            | "NaN"
+            | "Infinity"
+            | "globalThis"
+            | "global"
+            | "crypto"
+            | "performance"
+            | "SubtleCrypto"
     ) || is_namespace(name)
         || is_known_builtin(name)
 }
@@ -992,6 +999,13 @@ fn global_binding_from(name: &str, object_only: bool) -> Option<Value> {
         "crypto" => return Some(with_host(|h| h.alloc(JsObj::Builtin("webcrypto".into())))),
         // The global `performance` IS `require('perf_hooks').performance`.
         "performance" => return Some(with_host(|h| h.alloc(JsObj::Builtin("performance".into())))),
+        // The `SubtleCrypto` CLASS; the bare name `SubtleCrypto` is this
+        // frontend's key for the `crypto.subtle` instance.
+        "SubtleCrypto" => {
+            return Some(with_host(|h| {
+                h.alloc(JsObj::Builtin(crate::stdlib::SUBTLE_CRYPTO_CLASS.into()))
+            }))
+        }
         _ => {}
     }
     if is_namespace(name) || is_known_builtin(name) {
@@ -2483,6 +2497,12 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             // A builtin namespace/prototype receiver (`Map.prototype`) reports
             // ownership via `has_property` (its methods resolve as thunks).
             if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Builtin) {
+                // …except a singleton (`performance`, `crypto`), whose members
+                // are all inherited from its class prototype.
+                if matches!(with_host(|h| h.get(recv).cloned()), Some(JsObj::Builtin(n)) if crate::stdlib::singleton_class(&n).is_some())
+                {
+                    return Ok(Value::Bool(false));
+                }
                 return Ok(Value::Bool(has_property(recv, &k)?));
             }
             // `HasOwnProperty` (7.3.12) is `[[GetOwnProperty]]`, so on a Proxy it
@@ -3207,6 +3227,20 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     if let Some(v) = with_host(|h| h.builtin_static(ns, name)) {
         return v;
     }
+    // A singleton (`performance`, `crypto`, `crypto.subtle`) reads its methods
+    // and `constructor` off its class prototype, so `performance.now ===
+    // Performance.prototype.now` and `crypto.constructor === Crypto`.
+    if let Some(class) = crate::stdlib::singleton_class(ns) {
+        if name == "constructor" {
+            return with_host(|h| h.alloc(JsObj::Builtin(class.into())));
+        }
+        if crate::stdlib::instance_method_lists(class)
+            .0
+            .contains(&name)
+        {
+            return with_host(|h| h.alloc(JsObj::Builtin(format!("@proto:{class}:{name}"))));
+        }
+    }
     // `require('timers').setTimeout` IS the global `setTimeout` (and likewise
     // the other five); it was a distinct function, so `===` said false.
     if ns == "timers"
@@ -3695,6 +3729,22 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         // No stored slot: the value is COMPUTED, so ask the class. `KeyObject`'s
         // `symmetricKeySize` is the secret's byte length, which nothing stores.
         let tag = crate::stdlib::native_tag(recv).unwrap_or_default();
+        // A web-stream getter brand-checks its receiver
+        // (`if (!isReadableStream(this)) throw new ERR_INVALID_THIS(…)`).
+        // A singleton's accessor (`crypto.subtle` read through
+        // `Crypto.prototype`) answers what the namespace holds.
+        if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(recv).cloned()) {
+            if crate::stdlib::singleton_class(&ns) == Some(ctor) {
+                return Ok(namespace_property(&ns, key));
+            }
+        }
+        if tag != ctor && crate::stdlib::brand_checked_class(ctor) {
+            return Err(host::coded_error(
+                "TypeError",
+                "ERR_INVALID_THIS",
+                &format!("Value of \"this\" must be of type {ctor}"),
+            ));
+        }
         return crate::stdlib::instance_call(&tag, recv, method, args);
     }
     if let Some(key) = method.strip_prefix("@set@") {
@@ -4439,6 +4489,14 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
             Some(JsObj::Builtin(n)) if matches!(n.as_str(), "Math" | "JSON" | "Reflect") => {
                 n.clone()
             }
+            // `performance`, `crypto` and `crypto.subtle` brand as their class,
+            // and `process` carries a `process` tag; all are singletons this
+            // frontend keeps as namespaces, and all branded `[object Object]`.
+            Some(JsObj::Builtin(n)) if crate::stdlib::singleton_class(n).is_some() => {
+                crate::stdlib::class_display_name(crate::stdlib::singleton_class(n).unwrap_or(""))
+                    .to_string()
+            }
+            Some(JsObj::Builtin(n)) if n == "process" => "process".into(),
             // A `<Ctor>.prototype` object brands as the constructor it belongs
             // to — `Object.prototype.toString.call(Set.prototype)` is
             // `[object Set]` — and a `require()`d module namespace is a plain
@@ -6741,6 +6799,8 @@ const GLOBAL_FUNCS: &[&str] = &[
     "PerformanceObserver",
     "PerformanceObserverEntryList",
     "PerformanceResourceTiming",
+    "Crypto",
+    "CryptoKey",
     "queueMicrotask",
     "setTimeout",
     "setInterval",
@@ -7597,6 +7657,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             "Promise constructor cannot be invoked without 'new'",
         )),
         "Map" | "WeakMap" | "Set" | "WeakSet" => Err(requires_new(name)),
+        // The classes behind the singletons are ES classes in node: a plain
+        // call is refused before the illegal-constructor check.
+        n if crate::stdlib::illegal_constructor(n) => Err(host::type_error(&format!(
+            "Class constructor {} cannot be invoked without 'new'",
+            crate::stdlib::class_display_name(n)
+        ))),
         // `Proxy` has no `[[Call]]` slot: it is constructor-only (28.2.1).
         "Proxy" => Err(host::type_error("Constructor Proxy requires 'new'")),
         "Proxy.revocable" => crate::proxy::revocable(&args),
@@ -16670,6 +16736,15 @@ pub fn prototype_of(v: &Value) -> Value {
     // link — the instance-side half is `Buffer.prototype`'s `[[Prototype]]`.
     if matches!(with_host(|h| h.get(v).cloned()), Some(JsObj::Builtin(ref n)) if n == "Buffer") {
         return with_host(|h| h.alloc(JsObj::Builtin("Uint8Array".into())));
+    }
+    // A singleton is an instance of its class: `performance`'s prototype is
+    // `Performance.prototype`, `crypto`'s is `Crypto.prototype`.
+    if let Some(JsObj::Builtin(n)) = with_host(|h| h.get(v).cloned()) {
+        if let Some(class) = crate::stdlib::singleton_class(&n) {
+            if let Some(p) = with_host(|h| h.ensure_ctor_proto(class)) {
+                return p;
+            }
+        }
     }
     // The NativeError constructors inherit from `Error` (20.5.6.2: their
     // `[[Prototype]]` is %Error%), so `Object.getPrototypeOf(RangeError) ===

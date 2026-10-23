@@ -166,7 +166,7 @@ fn state_of(stream: &Value) -> String {
 }
 
 fn is_locked(stream: &Value) -> bool {
-    get_prop(stream, "locked")
+    get_prop(stream, "@@locked")
         .map(|v| with_host(|h| h.truthy(&v)))
         .unwrap_or(false)
 }
@@ -341,7 +341,7 @@ fn new_readable_shell() -> Value {
         m.insert("@@state".into(), h.new_str("readable"));
         m.insert("@@queue".into(), queue);
         m.insert("@@waiters".into(), waiters);
-        m.insert("locked".into(), Value::Bool(false));
+        m.insert("@@locked".into(), Value::Bool(false));
         h.new_object(m)
     })
 }
@@ -549,7 +549,7 @@ fn get_reader(stream: &Value, args: &[Value]) -> Result<Value, String> {
         m.insert("closed".into(), closed);
         h.new_object(m)
     });
-    set_prop(stream, "locked", Value::Bool(true));
+    set_prop(stream, "@@locked", Value::Bool(true));
     set_prop(stream, "@@reader", reader.clone());
     Ok(reader)
 }
@@ -612,7 +612,7 @@ fn async_iterator_call(it: &Value, method: &str, arg: Option<&Value>) -> Result<
 
 fn reader_release(reader: &Value) {
     if let Some(stream) = get_prop(reader, "@@stream") {
-        set_prop(&stream, "locked", Value::Bool(false));
+        set_prop(&stream, "@@locked", Value::Bool(false));
         remove_prop(&stream, "@@reader");
     }
     remove_prop(reader, "@@stream");
@@ -756,7 +756,7 @@ pub fn construct_writable(args: &[Value]) -> Result<Value, String> {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(WRITABLE_STREAM_TAG));
         m.insert("@@state".into(), h.new_str("writable"));
-        m.insert("locked".into(), Value::Bool(false));
+        m.insert("@@locked".into(), Value::Bool(false));
         h.new_object(m)
     });
     for key in ["write", "close", "abort"] {
@@ -807,14 +807,14 @@ fn get_writer(ws: &Value) -> Result<Value, String> {
         m.insert("desiredSize".into(), Value::Float(1.0));
         h.new_object(m)
     });
-    set_prop(ws, "locked", Value::Bool(true));
+    set_prop(ws, "@@locked", Value::Bool(true));
     set_prop(ws, "@@writer", writer.clone());
     Ok(writer)
 }
 
 fn writer_release(writer: &Value) {
     if let Some(ws) = get_prop(writer, "@@stream") {
-        set_prop(&ws, "locked", Value::Bool(false));
+        set_prop(&ws, "@@locked", Value::Bool(false));
         remove_prop(&ws, "@@writer");
     }
     remove_prop(writer, "@@stream");
@@ -831,7 +831,7 @@ fn build_transform_pair(kind: &str) -> (Value, Value) {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(WRITABLE_STREAM_TAG));
         m.insert("@@state".into(), h.new_str("writable"));
-        m.insert("locked".into(), Value::Bool(false));
+        m.insert("@@locked".into(), Value::Bool(false));
         m.insert("@@xform_kind".into(), h.new_str(kind));
         m.insert("@@accum".into(), accum);
         h.new_object(m)
@@ -865,8 +865,8 @@ pub fn construct_transform(args: &[Value]) -> Result<Value, String> {
     let ts = with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(TRANSFORM_STREAM_TAG));
-        m.insert("readable".into(), readable);
-        m.insert("writable".into(), writable);
+        m.insert("@@readable".into(), readable);
+        m.insert("@@writable".into(), writable);
         h.new_object(m)
     });
 
@@ -883,10 +883,10 @@ fn build_codec_stream(tag: &str, kind: &str, extra: Vec<(&str, Value)>) -> Value
     with_host(|h| {
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str(tag));
-        m.insert("readable".into(), readable);
-        m.insert("writable".into(), writable);
+        m.insert("@@readable".into(), readable);
+        m.insert("@@writable".into(), writable);
         for (k, v) in extra {
-            m.insert(k.to_string(), v);
+            m.insert(format!("@@{k}"), v);
         }
         h.new_object(m)
     })
@@ -1093,7 +1093,7 @@ fn tee_pull(branch: &Value) {
 
 /// `stream.tee()` → `[branch1, branch2]`, lazily sharing the source.
 fn tee(stream: &Value) -> Value {
-    set_prop(stream, "locked", Value::Bool(true));
+    set_prop(stream, "@@locked", Value::Bool(true));
     let shared = with_host(|h| {
         let buf = h.new_array(Vec::new());
         let mut m = IndexMap::new();
@@ -1120,8 +1120,8 @@ fn tee(stream: &Value) -> Value {
 /// `stream.pipeTo(destWritable)` — synchronously drain the source into the sink,
 /// then close it. Returns a resolved (or rejected on error) promise.
 fn pipe_to(stream: &Value, dest: &Value) -> Value {
-    set_prop(stream, "locked", Value::Bool(true));
-    set_prop(dest, "locked", Value::Bool(true));
+    set_prop(stream, "@@locked", Value::Bool(true));
+    set_prop(dest, "@@locked", Value::Bool(true));
     loop {
         match pull_one(stream) {
             Pulled::Chunk(c) => {
@@ -1146,12 +1146,18 @@ fn pipe_to(stream: &Value, dest: &Value) -> Value {
 /// `readable`. The pipe runs synchronously so `readable` is already fed on return.
 fn pipe_through(stream: &Value, args: &[Value]) -> Result<Value, String> {
     let transform = args.first().cloned().unwrap_or(Value::Undef);
-    let writable = get_prop(&transform, "writable").ok_or_else(|| {
-        crate::host::type_error("pipeThrough argument must have a writable and readable")
-    })?;
-    let readable = get_prop(&transform, "readable").ok_or_else(|| {
-        crate::host::type_error("pipeThrough argument must have a writable and readable")
-    })?;
+    let writable = crate::builtins::get_property(&transform, "writable")
+        .ok()
+        .filter(|v| !matches!(v, Value::Undef))
+        .ok_or_else(|| {
+            crate::host::type_error("pipeThrough argument must have a writable and readable")
+        })?;
+    let readable = crate::builtins::get_property(&transform, "readable")
+        .ok()
+        .filter(|v| !matches!(v, Value::Undef))
+        .ok_or_else(|| {
+            crate::host::type_error("pipeThrough argument must have a writable and readable")
+        })?;
     let _ = pipe_to(stream, &writable);
     Ok(readable)
 }
@@ -1374,4 +1380,18 @@ fn unknown(tag: &str, method: &str) -> Result<Value, String> {
 fn uint8(bytes: &[u8]) -> Result<Value, String> {
     let arr = with_host(|h| h.new_array(bytes.iter().map(|b| Value::Float(*b as f64)).collect()));
     super::typedarray::construct("Uint8Array", &[arr])
+}
+
+/// The web-stream classes whose prototype getters brand-check `this`.
+pub fn is_web_stream_class(ctor: &str) -> bool {
+    matches!(
+        ctor,
+        READABLE_STREAM_TAG
+            | WRITABLE_STREAM_TAG
+            | TRANSFORM_STREAM_TAG
+            | "TextEncoderStream"
+            | "TextDecoderStream"
+            | "CompressionStream"
+            | "DecompressionStream"
+    )
 }

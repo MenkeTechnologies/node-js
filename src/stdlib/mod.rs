@@ -316,6 +316,11 @@ pub fn namespace_values(ns: &str) -> &'static [&'static str] {
 }
 
 pub fn namespace_keys(ns: &str) -> Vec<String> {
+    // A singleton's members are inherited from its class prototype; it owns
+    // none (`Object.keys(performance)` is `[]`).
+    if singleton_class(ns).is_some() {
+        return Vec::new();
+    }
     // The `require.cache` view enumerates the resolved filenames it holds.
     if ns == crate::builtins::REQUIRE_CACHE {
         return crate::module::cache_keys();
@@ -643,6 +648,12 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "MessageChannel" => Some(worker_threads::construct_message_channel(args)),
         "BroadcastChannel" => Some(worker_threads::construct_broadcast_channel(args)),
         "PerformanceObserver" => Some(perf_hooks::construct(name, args)),
+        // `performance`, `crypto`, `crypto.subtle` are the only instances.
+        n if illegal_constructor(n) => Some(Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_ILLEGAL_CONSTRUCTOR",
+            "Illegal constructor",
+        ))),
         "REPLServer" | "Recoverable" => Some(repl::construct(name, args)),
         "Interface" => Some(readline::construct(args)),
         "Console" => Some(console::construct(args)),
@@ -886,6 +897,52 @@ pub fn instance_accessors(tag: &str) -> (&'static [(&'static str, bool)], &'stat
             "",
         ),
         "TextEncoder" => (&[("encoding", false)], "TextEncoder"),
+        "Performance" => (&[], "Performance"),
+        "Crypto" => (&[("subtle", false)], "Crypto"),
+        "webcrypto.SubtleCrypto" => (&[], "SubtleCrypto"),
+        "CryptoKey" => (
+            &[
+                ("type", false),
+                ("extractable", false),
+                ("algorithm", false),
+                ("usages", false),
+            ],
+            "CryptoKey",
+        ),
+        // The web streams' state is read through prototype getters; an
+        // instance owns none of it (`Object.keys(new ReadableStream())` is `[]`).
+        "ReadableStream" => (&[("locked", false)], "ReadableStream"),
+        "WritableStream" => (&[("locked", false)], "WritableStream"),
+        "TransformStream" => (
+            &[("readable", false), ("writable", false)],
+            "TransformStream",
+        ),
+        "TextEncoderStream" => (
+            &[
+                ("encoding", false),
+                ("readable", false),
+                ("writable", false),
+            ],
+            "TextEncoderStream",
+        ),
+        "TextDecoderStream" => (
+            &[
+                ("encoding", false),
+                ("fatal", false),
+                ("ignoreBOM", false),
+                ("readable", false),
+                ("writable", false),
+            ],
+            "TextDecoderStream",
+        ),
+        "CompressionStream" => (
+            &[("readable", false), ("writable", false)],
+            "CompressionStream",
+        ),
+        "DecompressionStream" => (
+            &[("readable", false), ("writable", false)],
+            "DecompressionStream",
+        ),
         "EventTarget" => (&[], "EventTarget"),
         "Event" => (event_target::EVENT_ACCESSORS, "Event"),
         "CustomEvent" => (&[("detail", false)], "CustomEvent"),
@@ -1004,6 +1061,22 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         // `copy` is Hash-only — an Hmac cannot be forked.
         "Hash" => &["update", "digest", "copy"],
         "Hmac" => &["update", "digest"],
+        "Crypto" => crypto::WEBCRYPTO_METHODS,
+        "webcrypto.SubtleCrypto" => crypto::SUBTLE_METHODS,
+        // `performance` is the `Performance` instance; the methods it shares
+        // with the `perf_hooks` module live on `Performance.prototype`.
+        "Performance" => &[
+            "now",
+            "mark",
+            "measure",
+            "getEntriesByName",
+            "getEntriesByType",
+            "getEntries",
+            "clearMarks",
+            "clearMeasures",
+            "eventLoopUtilization",
+            "timerify",
+        ],
         "StringDecoder" => string_decoder::INSTANCE_METHODS,
         "Interface" => readline::INTERFACE_METHODS,
         "ReadlineIterator" => readline::ITERATOR_METHODS,
@@ -1457,5 +1530,43 @@ pub(crate) fn out_of_range(name: &str, must: &str, n: f64) -> String {
             "The value of \"{name}\" is out of range. It must be {must}. Received {}",
             buffer::out_of_range_received(n)
         ),
+    )
+}
+
+/// A builtin SINGLETON kept as a namespace (`performance`, `crypto`,
+/// `crypto.subtle`) and the class it is the one instance of, under the key
+/// that class's `Builtin` is spelled with. Every view of the instance — its
+/// prototype, `instanceof`, brand, `constructor`, own keys, `hasOwnProperty`,
+/// and its methods (read off the class prototype) — consults this one table.
+pub fn singleton_class(ns: &str) -> Option<&'static str> {
+    match ns {
+        "performance" => Some("Performance"),
+        "webcrypto" => Some("Crypto"),
+        "SubtleCrypto" => Some(SUBTLE_CRYPTO_CLASS),
+        _ => None,
+    }
+}
+
+/// The key of the `SubtleCrypto` CLASS. `SubtleCrypto` itself names the
+/// `crypto.subtle` namespace, and the last dotted segment is the name the
+/// class reports.
+pub const SUBTLE_CRYPTO_CLASS: &str = "webcrypto.SubtleCrypto";
+
+/// The display name of a class key (`webcrypto.SubtleCrypto` → `SubtleCrypto`).
+pub fn class_display_name(key: &str) -> &str {
+    key.rsplit('.').next().unwrap_or(key)
+}
+
+/// The web classes whose prototype getters brand-check `this` and throw
+/// `ERR_INVALID_THIS` for any other receiver.
+pub fn brand_checked_class(ctor: &str) -> bool {
+    stream_web::is_web_stream_class(ctor) || matches!(ctor, "Crypto" | "CryptoKey")
+}
+
+/// `new Performance()`, `new Crypto()`, … — classes node lets no script build.
+pub fn illegal_constructor(name: &str) -> bool {
+    matches!(
+        name,
+        "Performance" | "Crypto" | "CryptoKey" | SUBTLE_CRYPTO_CLASS
     )
 }

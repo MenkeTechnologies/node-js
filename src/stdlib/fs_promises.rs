@@ -106,6 +106,23 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             Err(e) => return Some(Err(e)),
         }
     }
+    // `options.signal`: validated, and an already-aborted one rejects with
+    // node's `AbortError` before any work. It was ignored.
+    if matches!(method, "readFile" | "writeFile" | "appendFile") {
+        let opts = args.get(if method == "readFile" { 1 } else { 2 });
+        if let Some(o) = opts.filter(|o| with_host(|h| h.type_of(o)) == "object") {
+            let refusal = match call_port("signalRefusal", vec![o.clone()]) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            if !matches!(refusal, Value::Undef) {
+                let p = with_host(|h| h.new_promise());
+                let id = with_host(|h| h.promise_id(&p).unwrap_or(0));
+                crate::host::reject_promise_val(id, refusal);
+                return Some(Ok(p));
+            }
+        }
+    }
     // Every other method delegates to the synchronous `fs` sibling of the same
     // name, then wraps the outcome in a settled Promise.
     let sync_name = match method {

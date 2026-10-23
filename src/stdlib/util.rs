@@ -1772,6 +1772,8 @@ fn node_error(args: &[Value]) -> Result<Value, String> {
             let n = with_host(|h| h.to_number(&arg(3)));
             super::out_of_range(&name, &super::arg_str(args, 2), n)
         }
+        // A code node raises as a plain `Error` (`ERR_INVALID_STATE`).
+        "error" => crate::host::coded_error("Error", &name, &super::arg_str(args, 2)),
         _ => crate::host::coded_error("TypeError", &name, &super::arg_str(args, 2)),
     })
 }

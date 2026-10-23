@@ -7739,6 +7739,12 @@ pub fn call_named(name: &str, args: Vec<Value>) -> Result<Value, String> {
             return r;
         }
     }
+    // A lazily bound global that is not itself a builtin key (`SubtleCrypto`
+    // reads as the class kept under another key): call what the READ gives,
+    // so `SubtleCrypto()` and `const S = SubtleCrypto; S()` agree.
+    if let Some(v) = crate::builtins::global_binding(name) {
+        return invoke(&v, args, None);
+    }
     Err(ref_error(name))
 }
 
@@ -9312,6 +9318,14 @@ pub fn ordinary_has_instance(
             // A native-tagged instance (`WeakRef`, `FinalizationRegistry`,
             // `TextEncoder`, …) is an instance of the builtin whose name matches
             // its hidden `@@native` tag.
+            // A singleton kept as a namespace is the one instance of its class
+            // (`performance` is also an `EventTarget`).
+            c if matches!(&kind, Some(JsObj::Builtin(n))
+                if crate::stdlib::singleton_class(n) == Some(c)
+                    || (n == "performance" && c == "EventTarget")) =>
+            {
+                return Ok(true);
+            }
             other => {
                 if crate::stdlib::native_tag(obj).as_deref() == Some(other) {
                     return Ok(true);

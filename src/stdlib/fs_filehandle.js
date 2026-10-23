@@ -13,8 +13,8 @@
 // current position until end of file, `writeFile`/`appendFile` writing from
 // the current position, and `'close'` emitted once.
 //
-// Not modelled: `getAsyncId`, `readableWebStream`, the transfer symbols, and
-// `options.signal`.
+// `readableWebStream` delivers its reads as a default (not a byte) stream;
+// see the method. Not modelled: the transfer symbols.
 (function (nodeError) {
 'use strict';
 const fs = require('fs');
@@ -33,6 +33,9 @@ const kCloseReject = Symbol('kCloseReject');
 const kRef = Symbol('kRef');
 const kUnref = Symbol('kUnref');
 const kCloseSync = Symbol('kCloseSync');
+const kLocked = Symbol('kLocked');
+const kAsyncId = Symbol('kAsyncId');
+let nextAsyncId = 1;
 
 const isArrayBufferView = ArrayBuffer.isView;
 
@@ -79,6 +82,13 @@ class FileHandle extends EventEmitter {
     this[kFd] = fd === undefined ? -1 : fd;
     this[kRefs] = 1;
     this[kClosePromise] = null;
+  }
+
+  // The handle's async resource id: one number per handle, for the life of
+  // the handle (node-js models no other async resources to number against).
+  getAsyncId() {
+    if (this[kAsyncId] === undefined) this[kAsyncId] = nextAsyncId++;
+    return this[kAsyncId];
   }
 
   get fd() {
@@ -189,6 +199,68 @@ class FileHandle extends EventEmitter {
 
   async [Symbol.asyncDispose]() {
     await this.close();
+  }
+
+  // node builds a `type: 'bytes'` stream that reads into each BYOB request
+  // with an `autoAllocateChunkSize` of 16384. Byte streams are not
+  // implemented here, so this is the same reads delivered as a default
+  // stream: each pull reads up to 16384 bytes and enqueues them as a
+  // Uint8Array, which is what a default reader of node's stream receives.
+  readableWebStream(options = {}) {
+    if (this[kFd] === -1)
+      nodeError('error', 'ERR_INVALID_STATE', 'Invalid state: The FileHandle is closed');
+    if (this[kClosePromise])
+      nodeError('error', 'ERR_INVALID_STATE', 'Invalid state: The FileHandle is closing');
+    if (this[kLocked])
+      nodeError('error', 'ERR_INVALID_STATE', 'Invalid state: The FileHandle is locked');
+    this[kLocked] = true;
+
+    validateObject(options, 'options');
+    const {
+      type = 'bytes',
+      autoClose = false,
+    } = options;
+
+    if (typeof autoClose !== 'boolean') nodeError('type', 'options.autoClose', 'boolean', autoClose);
+
+    if (type !== 'bytes') {
+      process.emitWarning(
+        'A non-"bytes" options.type has no effect. A byte-oriented steam is ' +
+        'always created.',
+        'ExperimentalWarning',
+      );
+    }
+
+    const readFn = this.read.bind(this);
+    const ondone = async () => {
+      this[kUnref]();
+      if (autoClose) await this.close();
+    };
+
+    const readable = new ReadableStream({
+      async pull(controller) {
+        const view = new Uint8Array(16384);
+        const { bytesRead } = await readFn(view, 0, view.byteLength);
+
+        if (bytesRead === 0) {
+          controller.close();
+          await ondone();
+        } else {
+          controller.enqueue(view.subarray(0, bytesRead));
+        }
+      },
+
+      async cancel() {
+        await ondone();
+      },
+    });
+
+    this[kRef]();
+    this.once('close', () => {
+      readable.cancel().catch(() => {});
+    });
+
+    return readable;
   }
 
   // node hands the stream the FileHandle itself, and the stream's autoClose
@@ -352,6 +424,9 @@ async function writev(handle, buffers, position) {
 
 async function fstat(handle, options = { __proto__: null, bigint: false }) {
   validateObject(options, 'options');
+  const { signal } = options;
+  if (signal !== undefined) validateAbortSignal(signal, 'options.signal');
+  checkAborted(signal);
   return fs.fstatSync(handle.fd, options);
 }
 
@@ -388,11 +463,36 @@ function getOptions(options, defaultOptions = {}) {
     defaultOptions.encoding = options;
     options = defaultOptions;
   }
+  if (options.signal !== undefined) {
+    validateAbortSignal(options.signal, 'options.signal');
+  }
   return options;
+}
+
+// internal/errors `AbortError`.
+class AbortError extends Error {
+  constructor(message = 'The operation was aborted', options = undefined) {
+    super(message, options);
+    this.code = 'ABORT_ERR';
+    this.name = 'AbortError';
+  }
+}
+
+function validateAbortSignal(signal, name) {
+  if (signal !== undefined &&
+      (signal === null || typeof signal !== 'object' || !('aborted' in signal))) {
+    nodeError('type', name, 'an instance of AbortSignal', signal);
+  }
+}
+
+function checkAborted(signal) {
+  if (signal?.aborted)
+    throw new AbortError(undefined, { cause: signal.reason });
 }
 
 async function writeFile(handle, data, options) {
   options = getOptions(options, { encoding: 'utf8', mode: 0o666, flag: 'w' });
+  checkAborted(options.signal);
   if (!isArrayBufferView(data)) {
     data = Buffer.from(data, options.encoding || 'utf8');
   }
@@ -415,6 +515,7 @@ async function writeFile(handle, data, options) {
 
 async function readFile(filehandle, options) {
   options = getOptions(options, { flag: 'r' });
+  checkAborted(options.signal);
   const encoding = options?.encoding;
   const decoder = encoding && new StringDecoder(encoding);
 
@@ -485,5 +586,19 @@ async function readFile(filehandle, options) {
   }
 }
 
-return { open, FileHandle, readFile, writeFile };
+// `fsPromises.readFile(path, { signal })` and friends: the options check the
+// path forms make before their (synchronous) work, as a function that
+// returns the rejection value, or `undefined` to proceed.
+function signalRefusal(options) {
+  try {
+    if (options !== null && typeof options === 'object') {
+      validateAbortSignal(options.signal, 'options.signal');
+      checkAborted(options.signal);
+    }
+  } catch (e) {
+    return e;
+  }
+}
+
+return { open, FileHandle, readFile, writeFile, signalRefusal };
 })
