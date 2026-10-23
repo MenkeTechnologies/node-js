@@ -3085,9 +3085,6 @@ have; re-blessing them would record a divergence as a target.
 
 | Case | node | node-js |
 |---|---|---|
-| `performance instanceof Performance` | `true` | `false` — `performance` is not linked to the `Performance` class's prototype |
-| `Object.getOwnPropertyNames(ReadableStream.prototype)` | includes the `locked` accessor, in node's order | `locked` is an own data property of each stream |
-| `crypto.Crypto`, `CryptoKey`, `SubtleCrypto` globals / members | constructors | absent |
 | `fs.readSync(fd, big.subarray(2), 0, 2, 0)` | the bytes appear in `big` | they land in the subarray only — the documented no-aliasing Buffer model above, reached through a write-into-view API |
 
 ## FIXED in round 18 — microtask rounds and I/O callbacks, verified against node v26.12.1
@@ -3193,6 +3190,21 @@ regenerating `src/arity.rs` from node v26.12.0 would add
 would change the two `Date.prototype` transcript lines held at v26.11.1
 (above). `src/arity.rs` is therefore NOT regenerated in this round.
 
+Also in round 20 (verified against node v26.12.1, which the reference binary
+was upgraded to mid-round), pinned in `examples/perfinstance.js`,
+`webstreamaccessors.js`, `cryptoglobals.js` and `filehandleweb.js`:
+
+| Case | node | was |
+|---|---|---|
+| `performance instanceof Performance` (and `EventTarget`), `Object.getPrototypeOf(performance)`, `performance.constructor`, `Object.prototype.toString.call(performance)`, `Object.keys(performance)`, `performance.hasOwnProperty('now')`, `performance.now === Performance.prototype.now` | `true`, `Performance.prototype`, `Performance`, `[object Performance]`, `[]`, `false`, `true` | `false`, `undefined`, …, `[object Object]`, every method as an own key |
+| `new Performance()`, `Performance()` | `ERR_ILLEGAL_CONSTRUCTOR`; `Class constructor Performance cannot be invoked without 'new'` | "not a constructor"; "not a function" |
+| `Object.prototype.toString.call(process)` | `[object process]` | `[object Object]` |
+| `Crypto`, `CryptoKey`, `SubtleCrypto` | the WebCrypto classes: `crypto instanceof Crypto`, `crypto.subtle instanceof SubtleCrypto`, brands, inherited members, the brand-checked `subtle` getter, illegal construction | absent (`ReferenceError`) |
+| a bareword call of a lazily-bound global that is not itself a builtin key (`SubtleCrypto()`) | the same as calling what the read gives | `ReferenceError` |
+| `ReadableStream.prototype.locked`, `WritableStream.prototype.locked`, `TransformStream`'s and the codec streams' `readable`/`writable`/`encoding`/`fatal`/`ignoreBOM` | prototype getters; `Object.keys(stream)` is `[]`; a foreign receiver is `ERR_INVALID_THIS` | own data properties of every instance |
+| `fsPromises.readFile(p, { signal })`, `writeFile`, `appendFile`, `fh.readFile`/`writeFile`/`stat({ signal })` | `options.signal` validated; an aborted one rejects with `AbortError` (`ABORT_ERR`, the reason as `cause`) | ignored |
+| `fh.getAsyncId()`, `fh.readableWebStream([{ autoClose }])` | a number; a stream of the file's bytes, refusing a closed, closing or already-locked handle | absent. The stream is delivered as a DEFAULT stream of `Uint8Array` reads of up to 16384 bytes, which is what a default reader of node's byte stream receives; byte streams themselves are open (below) |
+
 ### Still open — found in round 20, not fixed
 
 | Case | node | node-js |
@@ -3205,3 +3217,6 @@ would change the two `Date.prototype` transcript lines held at v26.11.1
 | `assert.strict.length`/`.name`, `crypto.getRandomValues.length`, `util.aborted.length` | `0`/`strict`, `1`, `2` | `undefined`/`assertStrict`, `undefined`, `undefined` — these builtins are spelled under another key than the table's |
 | `fs.fstatSync(0)` (stdin, stdout, stderr) | their stats | `EBADF` — the descriptor table holds only descriptors node-js opened |
 | `new ReadableStream({ type: 'bytes', pull(c) { c.byobRequest.view } })` | a BYOB request per pull | `byobRequest` is `null` |
+| `Object.getOwnPropertyNames(SubtleCrypto.prototype)` | every WebCrypto method (`encrypt`, `sign`, `importKey`, …) | `digest` only — the one implemented |
+| `Object.getOwnPropertyNames(ReadableStream.prototype)` order | `constructor, locked, cancel, …` | the accessor after the methods |
+| `Object.getOwnPropertyNames(Performance.prototype)` | also `toJSON`, `timeOrigin`, `nodeTiming`, `markResourceTiming`, … | the implemented methods only |
