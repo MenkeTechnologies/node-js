@@ -63,6 +63,21 @@ for (const [id, ns] of Object.entries(spellings)) {
   let mod; try { mod = require(id); } catch { continue; }
   console.log(ns + '\t' + Object.keys(mod).join(','));
 }
+// The web and node classes this frontend models as native prototypes, with
+// each prototype's own STRING keys in node's order (`getOwnPropertyNames`).
+console.log('===PROTOS===');
+for (const name of [
+  'ReadableStream', 'ReadableStreamDefaultReader', 'ReadableStreamBYOBReader',
+  'ReadableStreamDefaultController', 'ReadableByteStreamController', 'ReadableStreamBYOBRequest',
+  'WritableStream', 'WritableStreamDefaultWriter', 'WritableStreamDefaultController',
+  'TransformStream', 'TransformStreamDefaultController', 'ByteLengthQueuingStrategy',
+  'CountQueuingStrategy', 'TextEncoderStream', 'TextDecoderStream', 'CompressionStream',
+  'DecompressionStream', 'Performance', 'Crypto', 'CryptoKey', 'SubtleCrypto',
+  'EventTarget', 'Event', 'CustomEvent', 'AbortController', 'AbortSignal',
+]) {
+  const C = globalThis[name];
+  if (typeof C === 'function' && C.prototype) console.log(name + '\t' + Object.getOwnPropertyNames(C.prototype).join(','));
+}
 "#;
 
 fn main() {
@@ -88,9 +103,12 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let (rows_text, keys_text) = text
+    let (rows_text, rest) = text
         .split_once("===KEYS===\n")
         .expect("enumerator emitted no key section");
+    let (keys_text, protos_text) = rest
+        .split_once("===PROTOS===\n")
+        .expect("enumerator emitted no prototype section");
     let mut rows: Vec<(String, String, String, bool)> = rows_text
         .lines()
         .filter(|l| !l.is_empty())
@@ -176,6 +194,33 @@ fn main() {
             .collect::<Vec<_>>()
             .join(", ");
         writeln!(w, "    ({ns:?}, &[{list}]),").unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    let mut protos: Vec<(String, String)> = protos_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (c, list) = l.split_once('\t').unwrap_or((l, ""));
+            (c.to_string(), list.to_string())
+        })
+        .collect();
+    protos.sort();
+    writeln!(
+        w,
+        "\n/// The own string keys of each modelled web/node class prototype, in node's\n\
+         /// order (`Object.getOwnPropertyNames(C.prototype)`), by class name; sorted\n\
+         /// by class, the names within a row are not.\n\
+         pub const CLASS_PROTO_ORDER: &[(&str, &[&str])] = &["
+    )
+    .unwrap();
+    for (c, list) in &protos {
+        let list = list
+            .split(',')
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("{k:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(w, "    ({c:?}, &[{list}]),").unwrap();
     }
     writeln!(w, "];").unwrap();
 }
