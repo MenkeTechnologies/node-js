@@ -44,8 +44,13 @@ for (const [id, ns] of Object.entries(spellings)) {
   let mod; try { mod = require(id); } catch { continue; }
   for (const k of Object.getOwnPropertyNames(mod)) {
     let d; try { d = Object.getOwnPropertyDescriptor(mod, k); } catch { continue; }
-    if (!d || typeof d.value !== 'function' || /^[A-Z]/.test(k)) continue;
-    rows.push(ns + '.' + k + '\t' + d.value.name + '\t' + d.value.length);
+    if (!d || /^[A-Z]/.test(k)) continue;
+    // A lazily loaded export (`crypto.getRandomValues`, `util.aborted`) is an
+    // ACCESSOR whose getter yields the function, so it is read through.
+    let f = d.value;
+    if (d.get) { try { f = mod[k]; } catch { continue; } }
+    if (typeof f !== 'function') continue;
+    rows.push(ns + '.' + k + '\t' + f.name + '\t' + f.length);
   }
 }
 console.log(rows.join('\n'));
