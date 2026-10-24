@@ -2466,6 +2466,30 @@ pub const CLASS_PROTO_ORDER: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "EventEmitter",
+        &[
+            "constructor",
+            "_events",
+            "_eventsCount",
+            "_maxListeners",
+            "setMaxListeners",
+            "getMaxListeners",
+            "emit",
+            "addListener",
+            "on",
+            "prependListener",
+            "once",
+            "prependOnceListener",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "listeners",
+            "rawListeners",
+            "listenerCount",
+            "eventNames",
+        ],
+    ),
+    (
         "EventTarget",
         &[
             "constructor",
@@ -2625,6 +2649,29 @@ pub const CLASS_PROTO_ARITY: &[(&str, &str, u32)] = &[
         0,
     ),
     ("@proto:Event:stopPropagation", "stopPropagation", 0),
+    ("@proto:EventEmitter:addListener", "addListener", 2),
+    ("@proto:EventEmitter:emit", "emit", 1),
+    ("@proto:EventEmitter:eventNames", "eventNames", 0),
+    ("@proto:EventEmitter:getMaxListeners", "getMaxListeners", 0),
+    ("@proto:EventEmitter:listenerCount", "listenerCount", 2),
+    ("@proto:EventEmitter:listeners", "listeners", 1),
+    ("@proto:EventEmitter:off", "removeListener", 2),
+    ("@proto:EventEmitter:on", "addListener", 2),
+    ("@proto:EventEmitter:once", "once", 2),
+    ("@proto:EventEmitter:prependListener", "prependListener", 2),
+    (
+        "@proto:EventEmitter:prependOnceListener",
+        "prependOnceListener",
+        2,
+    ),
+    ("@proto:EventEmitter:rawListeners", "rawListeners", 1),
+    (
+        "@proto:EventEmitter:removeAllListeners",
+        "removeAllListeners",
+        1,
+    ),
+    ("@proto:EventEmitter:removeListener", "removeListener", 2),
+    ("@proto:EventEmitter:setMaxListeners", "setMaxListeners", 1),
     ("@proto:EventTarget:addEventListener", "addEventListener", 2),
     ("@proto:EventTarget:dispatchEvent", "dispatchEvent", 1),
     (
@@ -3001,35 +3048,6 @@ pub const CORE_ACCESSOR_EXPORTS: &[(&str, &str, bool, bool, bool, &str, &str)] =
         "get transferableAbortSignal",
         "",
     ),
-];
-
-/// `(key, name, length)` of `EventEmitter.prototype`'s methods, keyed
-/// `@proto:EventEmitter:<method>`; an alias reports the method it is
-/// (`on` is `addListener`). Sorted by key.
-pub const EMITTER_PROTO_ARITY: &[(&str, &str, u32)] = &[
-    ("@proto:EventEmitter:addListener", "addListener", 2),
-    ("@proto:EventEmitter:emit", "emit", 0),
-    ("@proto:EventEmitter:eventNames", "eventNames", 0),
-    ("@proto:EventEmitter:getMaxListeners", "getMaxListeners", 0),
-    ("@proto:EventEmitter:listenerCount", "listenerCount", 2),
-    ("@proto:EventEmitter:listeners", "listeners", 1),
-    ("@proto:EventEmitter:off", "removeListener", 2),
-    ("@proto:EventEmitter:on", "addListener", 2),
-    ("@proto:EventEmitter:once", "once", 2),
-    ("@proto:EventEmitter:prependListener", "prependListener", 2),
-    (
-        "@proto:EventEmitter:prependOnceListener",
-        "prependOnceListener",
-        2,
-    ),
-    ("@proto:EventEmitter:rawListeners", "rawListeners", 1),
-    (
-        "@proto:EventEmitter:removeAllListeners",
-        "removeAllListeners",
-        1,
-    ),
-    ("@proto:EventEmitter:removeListener", "removeListener", 2),
-    ("@proto:EventEmitter:setMaxListeners", "setMaxListeners", 1),
 ];
 
 /// For each emitter-backed native class (by tag), the `EventEmitter` methods

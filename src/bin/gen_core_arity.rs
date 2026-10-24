@@ -25,6 +25,15 @@ use std::process::Command;
 /// frontend gives each module: `require('events')` is the `EventEmitter`
 /// constructor and `require('stream')` the `Stream` one.
 const ENUMERATE: &str = r#"
+// `EventEmitter.prototype` as it is BEFORE any other module loads: `domain`
+// replaces `EventEmitter.prototype.emit` with its own (length 0) when it is
+// required, which the walk below does. A copy of the descriptors keeps node's.
+const eeProtoAtStart = (() => {
+  const P = require('events').prototype;
+  const copy = {};
+  for (const k of Object.getOwnPropertyNames(P)) Object.defineProperty(copy, k, Object.getOwnPropertyDescriptor(P, k));
+  return copy;
+})();
 const spellings = {
   assert: 'assert', buffer: 'buffer', child_process: 'child_process', console: 'console',
   crypto: 'crypto', dns: 'dns', 'dns/promises': 'dns/promises', events: 'EventEmitter',
@@ -87,17 +96,24 @@ const protoClasses = [
   'TransformStream', 'TransformStreamDefaultController', 'ByteLengthQueuingStrategy',
   'CountQueuingStrategy', 'TextEncoderStream', 'TextDecoderStream', 'CompressionStream',
   'DecompressionStream', 'Performance', 'Crypto', 'CryptoKey', 'SubtleCrypto',
-  'EventTarget', 'Event', 'CustomEvent', 'AbortController', 'AbortSignal',
+  'EventTarget', 'Event', 'CustomEvent', 'AbortController', 'AbortSignal', 'EventEmitter',
 ];
+// `EventEmitter` is the one that is not a global: it is `require('events')`.
+const protoClass = (name) => {
+  if (name !== 'EventEmitter') return globalThis[name];
+  const C = function EventEmitter() {};
+  C.prototype = eeProtoAtStart;
+  return C;
+};
 for (const name of protoClasses) {
-  const C = globalThis[name];
+  const C = protoClass(name);
   if (typeof C === 'function' && C.prototype) console.log(name + '\t' + Object.getOwnPropertyNames(C.prototype).join(','));
 }
 // The `name` and `length` of those prototypes' METHODS (data members that are
 // functions), keyed `@proto:<Class>:<method>` as this frontend spells them.
 console.log('===PROTO_ARITY===');
 for (const name of protoClasses) {
-  const C = globalThis[name];
+  const C = protoClass(name);
   if (typeof C !== 'function' || !C.prototype) continue;
   for (const k of Object.getOwnPropertyNames(C.prototype)) {
     if (k === 'constructor') continue;
@@ -107,18 +123,16 @@ for (const name of protoClasses) {
 }
 console.log('===SYMBOLS===');
 console.log(symbolRows.join('\n'));
-// EventEmitter.prototype's methods (`name`/`length`, an alias reporting the
-// method it IS: `on` is `addListener`), then, for each emitter-backed class
-// this frontend models (keyed by its native tag), the EventEmitter methods its
-// prototype chain OVERRIDES rather than inherits: a Readable's `on` is
-// `Readable.prototype.on`, a ChildProcess's is `EventEmitter.prototype.on`.
-console.log('===EMITTER===');
+// For each emitter-backed class this frontend models (keyed by its native
+// tag), the EventEmitter methods its prototype chain OVERRIDES rather than
+// inherits: a Readable's `on` is `Readable.prototype.on`, a ChildProcess's is
+// `EventEmitter.prototype.on`.
+console.log('===EMITTER_OVERRIDES===');
 {
   const EE = require('events');
+  // The LIVE prototype: a class that inherits `emit` inherits domain's too.
   const P = EE.prototype;
   const methods = Object.getOwnPropertyNames(P).filter((k) => k !== 'constructor' && typeof P[k] === 'function');
-  for (const k of methods) console.log('@proto:EventEmitter:' + k + '\t' + P[k].name + '\t' + P[k].length);
-  console.log('===EMITTER_OVERRIDES===');
   const s = require('stream'), net = require('net'), http = require('http'), https = require('https');
   const fs = require('fs'), tls = require('tls'), dgram = require('dgram'), http2 = require('http2');
   const wt = require('worker_threads'), cluster = require('cluster'), domain = require('domain');
@@ -191,9 +205,6 @@ fn main() {
         .split_once("===SYMBOLS===\n")
         .expect("enumerator emitted no symbol-property section");
     let (symbols_text, rest) = rest
-        .split_once("===EMITTER===\n")
-        .expect("enumerator emitted no emitter section");
-    let (emitter_text, rest) = rest
         .split_once("===EMITTER_OVERRIDES===\n")
         .expect("enumerator emitted no emitter-override section");
     let (overrides_text, accessors_text) = rest
@@ -396,31 +407,6 @@ fn main() {
             col(6)
         )
         .unwrap();
-    }
-    writeln!(w, "];").unwrap();
-    let mut emitter_rows: Vec<(String, String, String)> = emitter_text
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            let mut it = l.split('\t');
-            (
-                it.next().unwrap_or_default().to_string(),
-                it.next().unwrap_or_default().to_string(),
-                it.next().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
-    emitter_rows.sort();
-    writeln!(
-        w,
-        "\n/// `(key, name, length)` of `EventEmitter.prototype`'s methods, keyed\n\
-         /// `@proto:EventEmitter:<method>`; an alias reports the method it is\n\
-         /// (`on` is `addListener`). Sorted by key.\n\
-         pub const EMITTER_PROTO_ARITY: &[(&str, &str, u32)] = &["
-    )
-    .unwrap();
-    for (key, name, len) in &emitter_rows {
-        writeln!(w, "    ({key:?}, {name:?}, {len}),").unwrap();
     }
     writeln!(w, "];").unwrap();
     let mut override_rows: Vec<(String, String)> = overrides_text
