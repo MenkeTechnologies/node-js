@@ -76,6 +76,39 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
     }
 }
 
+/// A node's source position over the ops `start..end` it compiled to.
+struct PosMark {
+    start: usize,
+    end: usize,
+    pos: Pos,
+    scope: PosScope,
+}
+
+/// Which of a node's ops its position is given to.
+#[derive(Clone, Copy)]
+enum PosScope {
+    /// A statement: every op no nested node placed — V8's statement position,
+    /// which is where an error in an unplaced sub-expression is reported.
+    Statement,
+    /// A call, `new`, or property access: only the op that performs it (its
+    /// last builtin call), the one that raises or calls out. Its operands keep
+    /// their own places, as V8's expression positions do: an unbound `o` in
+    /// `o.p` is not reported at `p`.
+    Operation,
+}
+
+/// Move a chunk's source positions (script-relative [`Pos`] values in its
+/// `lines`) into the script's range of the host's source address space, which
+/// starts at `base`; with no range (`None`) the positions are dropped.
+pub fn rebase_positions(chunk: &mut Chunk, base: Option<u32>) {
+    for p in chunk.lines.iter_mut().filter(|p| **p != 0) {
+        *p = base.map_or(0, |b| b + *p - 1);
+    }
+    for sub in &mut chunk.sub_chunks {
+        rebase_positions(sub, base);
+    }
+}
+
 /// The binding scope a declaration keyword introduces.
 fn bind_mode(kind: DeclKind) -> BindMode {
     match kind {
@@ -183,6 +216,9 @@ pub struct Compiler {
     /// host when the chunk is built so a failed call can name the callee the way
     /// the source wrote it. Saved and restored around every nested chunk.
     call_sites: Vec<(usize, String)>,
+    /// Source positions for the chunk being emitted, innermost node first;
+    /// `finish_chunk` writes them into the chunk's `lines`.
+    pos_marks: Vec<PosMark>,
     /// Parked-iterator depth per `yield` op of the chunk being emitted, so an
     /// injected `.return()`/`.throw()` can close the `for…of` / `yield*`
     /// iterators the halt would otherwise abandon.
@@ -465,15 +501,15 @@ impl Compiler {
     /// `undefined`, not 1, and a `break` out of a loop body discards what
     /// earlier iterations accumulated. A block, a labelled statement, `;` and
     /// every declaration propagate empty instead and are not reset here.
-    fn reset_completion_for_finalizer_exit(&mut self, b: &mut ChunkBuilder, line: u32) {
+    fn reset_completion_for_finalizer_exit(&mut self, b: &mut ChunkBuilder) {
         let Some((own, outer)) = self.finalizer_completion.clone() else {
             return;
         };
         self.name_const(b, &outer);
         self.name_const(b, &own);
-        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), line);
-        b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), line);
-        b.emit(Op::Pop, line);
+        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+        b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
+        b.emit(Op::Pop, 0);
     }
 
     /// The register the running statement list accumulates its value in.
@@ -485,15 +521,15 @@ impl Compiler {
         }
     }
 
-    fn reset_completion(&mut self, b: &mut ChunkBuilder, line: u32) {
+    fn reset_completion(&mut self, b: &mut ChunkBuilder) {
         if !self.completion {
             return;
         }
         let slot = self.cslot();
         self.name_const(b, &slot);
-        b.emit(Op::LoadUndef, line);
-        b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), line);
-        b.emit(Op::Pop, line);
+        b.emit(Op::LoadUndef, 0);
+        b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
+        b.emit(Op::Pop, 0);
     }
 }
 
@@ -645,6 +681,7 @@ fn callee_text(e: &Expr) -> Option<String> {
             object,
             property,
             optional,
+            ..
         } => {
             let dot = if *optional { "?." } else { "." };
             format!("{}{dot}{property}", callee_text(object)?)
@@ -653,6 +690,7 @@ fn callee_text(e: &Expr) -> Option<String> {
             object,
             index,
             optional,
+            ..
         } => {
             let obj = callee_text(object)?;
             // A string-literal key prints as a dot access whatever it spells —
@@ -866,22 +904,28 @@ impl Compiler {
     }
 
     fn compile_stmt(&mut self, b: &mut ChunkBuilder, s: &Stmt) -> Result<(), String> {
+        let start = b.current_pos();
+        let r = self.compile_stmt_kind(b, s);
+        self.mark_pos(b, start, s.pos, PosScope::Statement);
+        r
+    }
+
+    fn compile_stmt_kind(&mut self, b: &mut ChunkBuilder, s: &Stmt) -> Result<(), String> {
         if self.debug && s.line != 0 {
-            b.emit(Op::LoadInt(s.line as i64), s.line);
-            b.emit(Op::CallBuiltin(ops::DBG_LINE, 1), s.line);
-            b.emit(Op::Pop, s.line);
+            b.emit(Op::LoadInt(s.line as i64), 0);
+            b.emit(Op::CallBuiltin(ops::DBG_LINE, 1), 0);
+            b.emit(Op::Pop, 0);
         }
-        let line = s.line;
         match &s.kind {
             StmtKind::Expr(e) => {
                 self.compile_expr(b, e)?;
                 if self.completion {
                     let slot = self.cslot();
                     self.name_const(b, &slot);
-                    b.emit(Op::Swap, line);
-                    b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), line);
+                    b.emit(Op::Swap, 0);
+                    b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
                 }
-                b.emit(Op::Pop, line);
+                b.emit(Op::Pop, 0);
             }
             StmtKind::Empty => {}
             StmtKind::FuncDecl { .. } => {} // hoisted at block entry
@@ -897,7 +941,7 @@ impl Compiler {
                 if let Some(name) = &node.name {
                     self.declare(b, &Expr::Ident(name.clone()));
                 } else {
-                    b.emit(Op::Pop, line);
+                    b.emit(Op::Pop, 0);
                 }
             }
             StmtKind::Decl { kind, decls } => {
@@ -919,7 +963,7 @@ impl Compiler {
                             }
                         }
                         None => {
-                            b.emit(Op::LoadUndef, line);
+                            b.emit(Op::LoadUndef, 0);
                         }
                     }
                     // 13.3.1.1: a `var`/`let`/`const` may not BIND `eval` or
@@ -956,18 +1000,18 @@ impl Compiler {
                 }
             }
             StmtKind::If { test, cons, alt } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 self.compile_if(b, test, cons, alt)?
             }
             StmtKind::While { test, body } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 self.compile_while(b, test, body)?
             }
             StmtKind::With { object, body } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 self.compile_expr(b, object)?;
-                b.emit(Op::CallBuiltin(ops::WITH_PUSH, 1), line);
-                b.emit(Op::Pop, line);
+                b.emit(Op::CallBuiltin(ops::WITH_PUSH, 1), 0);
+                b.emit(Op::Pop, 0);
                 self.scope_depth += 1;
                 self.with_depth += 1;
                 let r = self.compile_stmt(b, body);
@@ -976,7 +1020,7 @@ impl Compiler {
                 self.emit_pop_scope(b);
             }
             StmtKind::DoWhile { body, test } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 self.compile_do_while(b, body, test)?
             }
             StmtKind::For {
@@ -985,7 +1029,7 @@ impl Compiler {
                 update,
                 body,
             } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 self.compile_for(b, init, test, update, body)?
             }
             StmtKind::ForOf {
@@ -995,7 +1039,7 @@ impl Compiler {
                 body,
                 is_await,
             } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 let mode = decl_kind.map(bind_mode).unwrap_or(BindMode::Assign);
                 if *is_await {
                     self.compile_for_await(b, mode, target, iter, body)?
@@ -1009,19 +1053,19 @@ impl Compiler {
                 object,
                 body,
             } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 let mode = decl_kind.map(bind_mode).unwrap_or(BindMode::Assign);
                 self.compile_for_in(b, mode, target, object, body)?
             }
             StmtKind::Switch { disc, cases } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 self.compile_switch(b, disc, cases)?
             }
             StmtKind::Return(e) => {
                 match e {
                     Some(e) => self.compile_expr(b, e)?,
                     None => {
-                        b.emit(Op::LoadUndef, line);
+                        b.emit(Op::LoadUndef, 0);
                     }
                 }
                 // A `return` out of a `for…of` is an abrupt completion, and
@@ -1030,7 +1074,7 @@ impl Compiler {
                 // `continue` already closed theirs; a `return` walked away and
                 // left the iterator suspended forever.
                 self.emit_close_iters_under_value(b);
-                b.emit(Op::CallBuiltin(ops::SIG_RETURN, 1), line);
+                b.emit(Op::CallBuiltin(ops::SIG_RETURN, 1), 0);
             }
             StmtKind::Labeled { label, body } => self.compile_labeled(b, label, body)?,
             StmtKind::Break(label) => {
@@ -1050,11 +1094,11 @@ impl Compiler {
                 if idx >= self.chunk_loop_base {
                     self.emit_unwind_scopes(b, self.loops[idx].break_depth);
                     self.emit_close_iters(b, self.loops[idx].iter_depth);
-                    let j = b.emit(Op::Jump(0), line);
+                    let j = b.emit(Op::Jump(0), 0);
                     self.loops[idx].breaks.push(j);
                 } else {
-                    self.reset_completion_for_finalizer_exit(b, line);
-                    self.emit_signal_jump(b, ops::SIG_BREAK, label.as_deref(), line);
+                    self.reset_completion_for_finalizer_exit(b);
+                    self.emit_signal_jump(b, ops::SIG_BREAK, label.as_deref());
                 }
             }
             StmtKind::Continue(label) => {
@@ -1087,23 +1131,23 @@ impl Compiler {
                 if idx >= self.chunk_loop_base {
                     self.emit_unwind_scopes(b, self.loops[idx].continue_depth);
                     self.emit_close_iters(b, self.loops[idx].iter_depth);
-                    let j = b.emit(Op::Jump(0), line);
+                    let j = b.emit(Op::Jump(0), 0);
                     self.loops[idx].continues.push(j);
                 } else {
-                    self.reset_completion_for_finalizer_exit(b, line);
-                    self.emit_signal_jump(b, ops::SIG_CONTINUE, label.as_deref(), line);
+                    self.reset_completion_for_finalizer_exit(b);
+                    self.emit_signal_jump(b, ops::SIG_CONTINUE, label.as_deref());
                 }
             }
             StmtKind::Throw(e) => {
                 self.compile_expr(b, e)?;
-                b.emit(Op::CallBuiltin(ops::THROW, 1), line);
+                b.emit(Op::CallBuiltin(ops::THROW, 1), 0);
             }
             StmtKind::Try {
                 block,
                 handler,
                 finalizer,
             } => {
-                self.reset_completion(b, line);
+                self.reset_completion(b);
                 self.compile_try(b, block, handler, finalizer)?
             }
         }
@@ -1243,6 +1287,7 @@ impl Compiler {
         let e = Expr::New {
             callee: Box::new(Expr::Ident(ctor.into())),
             args: vec![Expr::Str(message.into())],
+            pos: 0,
         };
         // `New` of a known builtin with a literal argument cannot fail to
         // compile, so the error path is unreachable rather than swallowed.
@@ -1472,6 +1517,7 @@ impl Compiler {
             let e = Expr::New {
                 callee: Box::new(Expr::Ident("TypeError".into())),
                 args: vec![Expr::Str(msg)],
+                pos: 0,
             };
             if self.compile_expr(b, &e).is_ok() {
                 b.emit(Op::CallBuiltin(ops::THROW, 1), 0);
@@ -2291,6 +2337,7 @@ impl Compiler {
         let iters = std::mem::take(&mut self.iter_depth);
         let sites = std::mem::take(&mut self.call_sites);
         let yields = std::mem::take(&mut self.yield_sites);
+        let marks = std::mem::take(&mut self.pos_marks);
         let events = std::mem::take(&mut self.iter_events);
         let r = (|| {
             prelude(self, &mut cb)?;
@@ -2309,6 +2356,7 @@ impl Compiler {
         let chunk = self.finish_chunk(cb);
         self.call_sites = sites;
         self.yield_sites = yields;
+        self.pos_marks = marks;
         self.iter_events = events;
         Ok(chunk)
     }
@@ -2390,6 +2438,7 @@ impl Compiler {
         // The body is a chunk of its own, so its call sites are keyed to ITS
         // `op_hash`; the enclosing chunk's pending ones must not be swept in.
         let saved_sites = std::mem::take(&mut self.call_sites);
+        let saved_marks = std::mem::take(&mut self.pos_marks);
         let saved_yields = std::mem::take(&mut self.yield_sites);
         let saved_events = std::mem::take(&mut self.iter_events);
         let r = (|| {
@@ -2430,6 +2479,7 @@ impl Compiler {
             script: None,
         };
         self.call_sites = saved_sites;
+        self.pos_marks = saved_marks;
         self.yield_sites = saved_yields;
         self.iter_events = saved_events;
         self.functions.push((name.to_string(), def));
@@ -3249,27 +3299,48 @@ impl Compiler {
             Expr::Update { op, prefix, target } => self.compile_update(b, *op, *prefix, target)?,
             // A chain's ROOT opens the frame its `?.` links park their jumps
             // in; nested links see it already open and add to it.
-            Expr::Call { .. } | Expr::Member { .. } | Expr::Index { .. }
+            Expr::Call { pos, .. } | Expr::Member { pos, .. } | Expr::Index { pos, .. }
                 if self.opt_chain.is_empty() && Self::spine_has_optional(e) =>
             {
-                self.compile_chain_root(b, e)?
+                let start = b.current_pos();
+                self.compile_chain_root(b, e)?;
+                self.mark_pos(b, start, *pos, PosScope::Operation);
             }
             Expr::Call {
                 func,
                 args,
                 optional,
-            } => self.compile_call(b, func, args, *optional)?,
-            Expr::New { callee, args } => self.compile_new(b, callee, args)?,
+                pos,
+            } => {
+                let start = b.current_pos();
+                self.compile_call(b, func, args, *optional)?;
+                self.mark_pos(b, start, *pos, PosScope::Operation);
+            }
+            Expr::New { callee, args, pos } => {
+                let start = b.current_pos();
+                self.compile_new(b, callee, args)?;
+                self.mark_pos(b, start, *pos, PosScope::Operation);
+            }
             Expr::Member {
                 object,
                 property,
                 optional,
-            } => self.compile_member(b, object, property, *optional)?,
+                pos,
+            } => {
+                let start = b.current_pos();
+                self.compile_member(b, object, property, *optional)?;
+                self.mark_pos(b, start, *pos, PosScope::Operation);
+            }
             Expr::Index {
                 object,
                 index,
                 optional,
-            } => self.compile_index(b, object, index, *optional)?,
+                pos,
+            } => {
+                let start = b.current_pos();
+                self.compile_index(b, object, index, *optional)?;
+                self.mark_pos(b, start, *pos, PosScope::Operation);
+            }
             Expr::Function {
                 params,
                 body,
@@ -3377,6 +3448,7 @@ impl Compiler {
                 object,
                 property,
                 optional: false,
+                ..
             } if !matches!(**object, Expr::Super) => {
                 self.compile_expr(b, object)?; // [o]
                 b.emit(Op::Dup, 0); // [o, o]
@@ -3940,6 +4012,7 @@ impl Compiler {
                 object,
                 property,
                 optional,
+                ..
             } => {
                 self.compile_expr(b, object)?;
                 if *optional {
@@ -3953,6 +4026,7 @@ impl Compiler {
                 object,
                 index,
                 optional,
+                ..
             } => {
                 self.compile_expr(b, object)?;
                 if *optional {
@@ -4261,7 +4335,26 @@ impl Compiler {
         let sites = std::mem::take(&mut self.call_sites);
         let mut yields = std::mem::take(&mut self.yield_sites);
         let events = std::mem::take(&mut self.iter_events);
-        let chunk = b.build();
+        let marks = std::mem::take(&mut self.pos_marks);
+        let mut chunk = b.build();
+        for m in marks {
+            let range = m.start..m.end;
+            match m.scope {
+                PosScope::Statement => {
+                    for line in chunk.lines[range].iter_mut().filter(|l| **l == 0) {
+                        *line = m.pos;
+                    }
+                }
+                PosScope::Operation => {
+                    let op = range
+                        .rev()
+                        .find(|&i| matches!(chunk.ops[i], Op::CallBuiltin(..)) && chunk.lines[i] == 0);
+                    if let Some(i) = op {
+                        chunk.lines[i] = m.pos;
+                    }
+                }
+            }
+        }
         // Every builtin call inside a `for…of` / `for…in` body can raise, and a
         // raise abandons the iterators parked beneath it. The depth recorded
         // per yield op is what closes them there; the same table answers for
@@ -4290,6 +4383,20 @@ impl Compiler {
     /// next op to be emitted onward.
     fn note_iter_depth(&mut self, b: &ChunkBuilder) {
         self.iter_events.push((b.current_pos(), self.iter_depth));
+    }
+
+    /// Place the ops emitted since `start` at source position `pos` — see
+    /// [`PosScope`] for which of them.
+    fn mark_pos(&mut self, b: &ChunkBuilder, start: usize, pos: Pos, scope: PosScope) {
+        let end = b.current_pos();
+        if pos != 0 && end > start {
+            self.pos_marks.push(PosMark {
+                start,
+                end,
+                pos,
+                scope,
+            });
+        }
     }
 
     /// Record the callee's source text for the call op just emitted at `at`, so
@@ -4326,10 +4433,10 @@ impl Compiler {
     }
 
     /// Raise a `break`/`continue` whose target loop is outside this chunk.
-    fn emit_signal_jump(&mut self, b: &mut ChunkBuilder, op: u16, label: Option<&str>, line: u32) {
+    fn emit_signal_jump(&mut self, b: &mut ChunkBuilder, op: u16, label: Option<&str>) {
         self.name_const(b, label.unwrap_or(""));
-        b.emit(Op::CallBuiltin(op, 1), line);
-        b.emit(Op::Pop, line);
+        b.emit(Op::CallBuiltin(op, 1), 0);
+        b.emit(Op::Pop, 0);
         self.chunk_signals = true;
     }
 
@@ -4487,6 +4594,7 @@ impl Compiler {
             object,
             property,
             optional: obj_optional,
+            ..
         } = func
         {
             self.compile_expr(b, object)?; // [recv]
@@ -4548,6 +4656,7 @@ impl Compiler {
             object,
             index,
             optional: obj_optional,
+            ..
         } = func
         {
             self.compile_expr(b, object)?; // [recv]
@@ -4703,6 +4812,7 @@ impl Compiler {
                 object,
                 property,
                 optional,
+                ..
             } => {
                 self.compile_expr(b, object)?;
                 // `obj?.method(...)`: if `obj` is nullish, short-circuit the whole
@@ -4754,6 +4864,7 @@ impl Compiler {
                 object,
                 index,
                 optional,
+                ..
             } => {
                 // recv[expr](args) — evaluate as a method via computed name.
                 self.compile_expr(b, object)?; // [recv]
@@ -5035,6 +5146,7 @@ fn destructure_source_text(e: &Expr) -> Option<String> {
             object,
             property,
             optional: false,
+            ..
         } => format!("{}.{property}", destructure_source_text(object)?),
         _ => return None,
     })

@@ -120,8 +120,24 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
         .filter_map(|n| n.strip_prefix(PROG_IMAGE_TAG))
         .filter_map(|j| serde_json::from_str(j).ok())
         .collect();
+    // An image carries no script text, so its source positions (script
+    // offsets) resolve to nothing and are dropped, as `load_merged_from` drops
+    // a sourceless program's.
+    crate::compiler::rebase_positions(&mut vm.chunk, None);
     host::with_host(|h| {
-        for img in images {
+        for mut img in images {
+            for f in &mut img.functions {
+                crate::compiler::rebase_positions(&mut f.chunk, None);
+            }
+            for t in &mut img.tries {
+                crate::compiler::rebase_positions(&mut t.block, None);
+                if let Some((_, c)) = &mut t.handler {
+                    crate::compiler::rebase_positions(c, None);
+                }
+                if let Some(c) = &mut t.finalizer {
+                    crate::compiler::rebase_positions(c, None);
+                }
+            }
             h.load_program(img.functions, img.tries);
         }
     });

@@ -11,6 +11,11 @@ use fusevm::Value;
 use indexmap::IndexMap;
 
 /// Callable members. `nextTick` is deliberately absent (handled in `builtins`).
+/// The node release this runtime reports itself as: `process.version`,
+/// `process.versions.node`, and the `Node.js <version>` line that ends a
+/// fatal-exception report.
+pub const NODE_VERSION: &str = "v26.5.0";
+
 pub const METHODS: &[&str] = &[
     "cwd",
     "chdir",
@@ -418,7 +423,7 @@ pub fn constant(name: &str) -> Option<Value> {
         "title" => with_host(|h| h.new_str("node")),
         // A best-effort Node-compatible version string. Kept low so a dep's
         // `if (semver.lt(process.version, ...))` gate takes the conservative path.
-        "version" => with_host(|h| h.new_str("v26.5.0")),
+        "version" => with_host(|h| h.new_str(NODE_VERSION)),
         "versions" => memo("versions", versions),
         // A capability map tooling probes before reaching for an optional API.
         // It reports what THIS runtime supports, not what node's own build
@@ -893,7 +898,7 @@ fn exec_path() -> String {
 fn versions() -> Value {
     with_host(|h| {
         let mut m = IndexMap::new();
-        m.insert("node".into(), h.new_str("26.5.0"));
+        m.insert("node".into(), h.new_str(&NODE_VERSION[1..]));
         m.insert("v8".into(), h.new_str("0.0.0"));
         h.new_object(m)
     })

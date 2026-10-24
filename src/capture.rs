@@ -128,7 +128,7 @@ pub fn expr_captures(e: &Expr) -> bool {
         }
         Expr::Assign { target, value, .. } => expr_captures(target) || expr_captures(value),
         Expr::Update { target, .. } => expr_captures(target),
-        Expr::Call { func, args, .. } | Expr::New { callee: func, args } => {
+        Expr::Call { func, args, .. } | Expr::New { callee: func, args, .. } => {
             expr_captures(func) || args.iter().any(expr_captures)
         }
         Expr::Member { object, .. } => expr_captures(object),
@@ -169,7 +169,7 @@ pub fn block_needs_scope(body: &[Stmt]) -> bool {
 fn mentions_eval(e: &Expr) -> bool {
     match e {
         Expr::Ident(n) => n == "eval",
-        Expr::Call { func, args, .. } | Expr::New { callee: func, args } => {
+        Expr::Call { func, args, .. } | Expr::New { callee: func, args, .. } => {
             mentions_eval(func) || args.iter().any(mentions_eval)
         }
         Expr::Assign { target, value, .. } => mentions_eval(target) || mentions_eval(value),

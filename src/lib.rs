@@ -135,26 +135,53 @@ pub fn with_source(
 /// Rebase a freshly compiled program's func/try ids above those already loaded
 /// on the host, install its functions/tries, and return the (rebased) main
 /// chunk to run.
-pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
+pub fn load_merged(prog: compiler::Program) -> fusevm::Chunk {
+    load_merged_from(prog, None)
+}
+
+/// [`load_merged`] for a program whose text node names `origin` — the name a
+/// source arrow and a stack frame print for its positions (`<anonymous>` when
+/// `None`).
+pub fn load_merged_from(
+    mut prog: compiler::Program,
+    origin: Option<host::ScriptOrigin>,
+) -> fusevm::Chunk {
     let (func_off, try_off) = host::with_host(|h| h.program_offsets());
     compiler::rebase_program(&mut prog, func_off, try_off);
     let compiler::Program {
-        main,
+        mut main,
         functions,
-        tries,
+        mut tries,
         strict,
         source,
     } = prog;
-    let funcs: Vec<host::FuncDef> = functions.into_iter().map(|(_, f)| f).collect();
+    let mut funcs: Vec<host::FuncDef> = functions.into_iter().map(|(_, f)| f).collect();
     host::with_host(|h| {
-        // Each span-carrying function learns which script its span indexes.
-        let mut funcs = funcs;
-        if let Some(text) = source {
-            let script = h.scripts.len() as u32;
-            h.scripts.push(text);
-            for f in funcs.iter_mut().filter(|f| f.span.1 != 0) {
-                f.script = Some(script);
+        // Each span-carrying function learns which script its span indexes,
+        // and every op's source position moves into the script's range of the
+        // host's source address space. Without the text a position cannot be
+        // resolved, so it is dropped.
+        let base = match source {
+            Some(text) => {
+                let script = h.scripts.len() as u32;
+                h.scripts.push(text);
+                for f in funcs.iter_mut().filter(|f| f.span.1 != 0) {
+                    f.script = Some(script);
+                }
+                let origin = origin.unwrap_or_else(|| host::ScriptOrigin::named("<anonymous>"));
+                Some(h.register_source(script, origin))
             }
+            None => None,
+        };
+        let mut chunks: Vec<&mut fusevm::Chunk> = vec![&mut main];
+        chunks.extend(funcs.iter_mut().map(|f| &mut f.chunk));
+        for t in &mut tries {
+            chunks.push(&mut t.block);
+            chunks.extend(t.handler.as_mut().map(|(_, c)| c));
+            chunks.extend(t.finalizer.as_mut());
+        }
+        for c in chunks {
+            compiler::rebase_positions(c, base);
         }
         h.load_program(funcs, tries);
         // A strict top level marks the frame it is about to run on, so a
@@ -170,7 +197,15 @@ pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
 
 /// Run an already-compiled program on the current host.
 pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
-    host::run_main(load_merged(prog))
+    run_compiled_from(prog, None)
+}
+
+/// [`run_compiled`] for the entry script, named `origin` (see [`load_merged_from`]).
+pub fn run_compiled_from(
+    prog: compiler::Program,
+    origin: Option<host::ScriptOrigin>,
+) -> Result<Value, String> {
+    host::run_main(load_merged_from(prog, origin))
 }
 
 /// `process.exitCode` as the program left it, or `None` if it was never set.
@@ -223,8 +258,24 @@ pub fn exit_code_after_failure() -> i32 {
 /// here; `vm.runInThisContext('typeof loc')` likewise. `run_chunk_in_global_scope`
 /// fixes it once, for all of them.
 pub fn eval_in_global_scope(src: &str) -> Result<Value, String> {
+    eval_in_global_scope_from(src, None)
+}
+
+/// [`eval_in_global_scope`] for the runtime's own JavaScript — the factories
+/// behind `util.promisify`, `events.on`, web streams and the rest. Its frames
+/// stay out of every stack trace (see [`host::ScriptOrigin::internal`]).
+pub fn eval_internal(src: &str) -> Result<Value, String> {
+    eval_in_global_scope_from(src, Some(host::ScriptOrigin::internal("node:internal")))
+}
+
+/// [`eval_in_global_scope`] for source node names `origin` (a CommonJS
+/// module's file; see [`load_merged_from`]).
+pub fn eval_in_global_scope_from(
+    src: &str,
+    origin: Option<host::ScriptOrigin>,
+) -> Result<Value, String> {
     let prog = compile_completion(src)?;
-    let chunk = load_merged(prog);
+    let chunk = load_merged_from(prog, origin);
     host::run_chunk_in_global_scope(chunk)
 }
 
@@ -277,18 +328,21 @@ pub fn eval_str_from(src: &str, origin: &str) -> Result<Value, String> {
     match compile_or_load(src) {
         Ok(prog) => {
             module::install_entry_globals(origin);
-            run_compiled(prog)
+            run_compiled_from(prog, Some(host::ScriptOrigin::named(origin)))
         }
         // Syntax detection, as for a file of undeclared format: source that
         // only parses as a module runs as one, named `[eval1]` in the
         // current directory (node's name for `-e` and stdin alike).
-        Err(e) if esm::detect_module(src, &e) => {
+        Err(e) => {
+            let at = parser::take_error_pos();
+            if !esm::detect_module(src, &e) {
+                return Err(syntax_error(src, origin, e, at));
+            }
             let cwd = std::env::current_dir().unwrap_or_default();
             let entry = cwd.join("[eval1]").to_string_lossy().into_owned();
             let main = esm::main_program(&entry, Some(src.to_string()), false);
             run_compiled(compiler::compile(&main, false)?)
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -307,7 +361,10 @@ pub fn eval_str_print(src: &str, origin: &str) -> Result<(), String> {
         module::set_entry_dir(cwd);
     }
     module::install_entry_globals(origin);
-    let value = run_compiled(compile_completion(src)?)?;
+    let value = run_compiled_from(
+        compile_completion(src)?,
+        Some(host::ScriptOrigin::named(origin)),
+    )?;
     // One argument means no directive processing at all (node returns a lone
     // argument as-is), so this call has nothing that can throw.
     let line = stdlib::util::format(std::slice::from_ref(&value))?;
@@ -389,10 +446,15 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         None => match compile_or_load(&src) {
             Ok(prog) => {
                 module::install_entry_globals(&entry);
-                return run_compiled(prog);
+                return run_compiled_from(prog, Some(host::ScriptOrigin::named(&entry)));
             }
-            Err(e) if esm::detect_module(&src, &e) => true,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let at = parser::take_error_pos();
+                if !esm::detect_module(&src, &e) {
+                    return Err(syntax_error(&src, &entry, e, at));
+                }
+                true
+            }
         },
     };
     if is_module {
@@ -400,7 +462,19 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         return run_compiled(compiler::compile(&main, false)?);
     }
     module::install_entry_globals(&entry);
-    run_compiled(compile_or_load(&src)?)
+    let prog = compile_or_load(&src).map_err(|e| {
+        let at = parser::take_error_pos();
+        syntax_error(&src, &entry, e, at)
+    })?;
+    run_compiled_from(prog, Some(host::ScriptOrigin::named(&entry)))
+}
+
+/// A SyntaxError (or other compile error) `e` from the entry script `src`,
+/// recorded so the report shows node's arrow at `at` (see
+/// `host::note_syntax_error`).
+fn syntax_error(src: &str, origin: &str, e: String, at: ast::Pos) -> String {
+    host::note_syntax_error(src, host::ScriptOrigin::named(origin), &e, at);
+    e
 }
 
 /// Read and run a `.js` file under the DAP debugger.

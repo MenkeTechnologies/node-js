@@ -113,12 +113,16 @@ node --dump-tokens script.js         # print the lexer token stream (also --dump
 `--no-warnings`, `--no-deprecation`, `--trace-warnings` and `--trace-deprecation`
 are accepted with Node's meaning for `process.emitWarning` output.
 
-Errors go to stderr in terse `node: <reason>` form; nothing else is printed. A
-program that ran to completion exits with `process.exitCode` if it set one, and
-the `beforeExit`/`exit` events fire as they do in Node. An uncaught exception
-(a top-level throw, a throwing timer or microtask, or an unhandled rejection) is
+A failure to start (an unreadable file) goes to stderr in terse
+`node: <reason>` form; nothing else is printed. A program that ran to
+completion exits with `process.exitCode` if it set one, and the
+`beforeExit`/`exit` events fire as they do in Node. An uncaught exception (a
+top-level throw, a throwing timer or microtask, or an unhandled rejection) is
 offered to `process.on('uncaughtException')` and `uncaughtExceptionMonitor`
-first; a listener that throws exits 7.
+first; a listener that throws exits 7. Otherwise it ends the process with
+Node's report: the `file:line` source arrow with a caret under the raise, the
+error's stack (`at f (file:line:col)` frames) and own properties, and the
+`Node.js <version>` line; exit 1.
 Runnable `examples/*.js` ship with the crate.
 
 ## [0x03] SUPPORTED TODAY

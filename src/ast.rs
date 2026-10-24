@@ -11,6 +11,14 @@
 /// `Function.prototype.toString` returns this slice (20.2.3.5).
 pub type Span = (u32, u32);
 
+/// A source position: one past the UTF-8 byte offset of a token in the text the
+/// node was parsed from, so `0` means "none" (a synthetic node, or text the
+/// parser could not map back — see `Parser::spans`). The compiler stores it in
+/// the `lines` entry of the op the node lowers to, and the loader rebases it into
+/// the host's source address space, which is what an error's source arrow and a
+/// stack frame's `file:line:column` are read from.
+pub type Pos = u32;
+
 /// A binary operator (`a <op> b`). `&&`/`||`/`??` are `LogicalOp` because they
 /// short-circuit and yield an operand value, not a coerced boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,23 +215,31 @@ pub enum Expr {
         func: Box<Expr>,
         args: Vec<Expr>,
         optional: bool,
+        /// Where V8 places the call for an error or a stack frame — see [`Pos`].
+        pos: Pos,
     },
     /// `new Ctor(args)`.
     New {
         callee: Box<Expr>,
         args: Vec<Expr>,
+        /// The `new` keyword — see [`Pos`].
+        pos: Pos,
     },
     /// `value.name` — `optional` marks `?.name`.
     Member {
         object: Box<Expr>,
         property: String,
         optional: bool,
+        /// The property name — see [`Pos`].
+        pos: Pos,
     },
     /// `value[expr]` — `optional` marks `?.[expr]`.
     Index {
         object: Box<Expr>,
         index: Box<Expr>,
         optional: bool,
+        /// The `[` — see [`Pos`].
+        pos: Pos,
     },
 
     /// A function expression / arrow function.
@@ -483,22 +499,26 @@ pub enum ExportDecl {
     },
 }
 
-/// A statement plus its 1-based source line.
+/// A statement plus its 1-based source line and the [`Pos`] of its first token.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stmt {
     pub kind: StmtKind,
     pub line: u32,
+    pub pos: Pos,
 }
 
 impl Stmt {
     pub fn new(kind: StmtKind, line: u32) -> Stmt {
-        Stmt { kind, line }
+        Stmt { kind, line, pos: 0 }
+    }
+    pub fn at(kind: StmtKind, line: u32, pos: Pos) -> Stmt {
+        Stmt { kind, line, pos }
     }
 }
 
 impl From<StmtKind> for Stmt {
     /// Wrap a `StmtKind` as a synthetic statement (line 0).
     fn from(kind: StmtKind) -> Stmt {
-        Stmt { kind, line: 0 }
+        Stmt { kind, line: 0, pos: 0 }
     }
 }

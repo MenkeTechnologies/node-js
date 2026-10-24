@@ -428,13 +428,19 @@ fn load_file(path: &Path, parent: &str) -> Result<Value, String> {
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
 
     // Compile the Node module wrapper to obtain the wrapper FUNCTION value.
-    // A compile error is annotated with the offending file (Node does likewise).
+    // A compile error names the offending file: through the source arrow when
+    // the parser placed it, else in the message.
     // A source of undeclared format that fails only because it is written as
     // an ES module is one (node's syntax detection), and loads as one.
-    let wrapper = match compile_wrapper(&source) {
+    let wrapper = match compile_wrapper(&source, path) {
         Ok(w) => w,
         Err(e) if crate::esm::detect_module(&source, &e) => {
             return crate::esm::require_module(path, parent);
+        }
+        // With its position recorded, the report's source arrow names the file,
+        // as node's does; otherwise the message has to.
+        Err(e) if with_host(|h| h.throw_site.as_ref().is_some_and(|s| s.msg == e)) => {
+            return Err(e)
         }
         Err(e) => return Err(format!("{e}\n    while loading {}", path.display())),
     };
@@ -456,10 +462,11 @@ fn load_file(path: &Path, parent: &str) -> Result<Value, String> {
     // the partial `exports`.
     CACHE.with(|c| c.borrow_mut().insert(path.to_path_buf(), module.clone()));
 
+    // node calls the wrapper with `this` = `module.exports`.
     host::invoke(
         &wrapper,
-        vec![exports, require_fn, module.clone(), dirname, filename],
-        None,
+        vec![exports.clone(), require_fn, module.clone(), dirname, filename],
+        Some(exports),
     )?;
     mark_loaded(&module);
 
@@ -549,7 +556,7 @@ fn module_exports(module: &Value) -> Value {
 
 /// Compile `<source>` wrapped in the Node module wrapper and return the wrapper
 /// FUNCTION value.
-fn compile_wrapper(source: &str) -> Result<Value, String> {
+fn compile_wrapper(source: &str, path: &Path) -> Result<Value, String> {
     // A module may open with a hashbang line, which is only a comment at the
     // start of the TEXT; inside the wrapper it would not be, so it becomes a
     // `//` comment of the same length.
@@ -558,9 +565,19 @@ fn compile_wrapper(source: &str) -> Result<Value, String> {
         None => source.to_string(),
     };
     // A trailing newline before `})` guards a source ending in a `//` comment.
-    eval_binding(&format!(
-        "(function (exports, require, module, __dirname, __filename) {{\n{source}\n}})"
-    ))
+    // Its stack frames and source arrow name the file, counting lines from
+    // the module's own first line rather than the wrapper's.
+    let origin = host::ScriptOrigin {
+        name: path.to_string_lossy().into_owned(),
+        line_shift: 1,
+        internal: false,
+    };
+    let text = format!("(function (exports, require, module, __dirname, __filename) {{\n{source}\n}})");
+    crate::eval_in_global_scope_from(&text, Some(origin.clone())).map_err(|e| {
+        let at = crate::parser::take_error_pos();
+        host::note_syntax_error(&text, origin, &e, at);
+        e
+    })
 }
 
 /// Compile+run a single JS expression on the LIVE host — no reset, no
@@ -578,7 +595,7 @@ fn compile_wrapper(source: &str) -> Result<Value, String> {
 /// `module.exports = typeof secret` is `"undefined"` there and was `"number"`
 /// here.
 fn eval_binding(src: &str) -> Result<Value, String> {
-    crate::eval_in_global_scope(src)
+    crate::eval_internal(src)
 }
 
 /// Build a per-module `require` closure bound to `dir` (see module docs).

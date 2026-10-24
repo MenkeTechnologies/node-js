@@ -79,7 +79,11 @@ use std::path::PathBuf;
 /// v14: the call-site side table prints more callee shapes (operators, array
 ///     literals, templates, `(intermediate value)`); a v13 entry carries the
 ///     old texts.
-const SCHEMA: u64 = 14;
+/// v15: a chunk's `lines` hold source positions (`ast::Pos`), not line numbers
+///     — the per-op record a stack frame and a fatal error's source arrow are
+///     read from. A v14 blob has none, so every stack would lose its
+///     `file:line:col`.
+const SCHEMA: u64 = 15;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

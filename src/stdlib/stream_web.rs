@@ -64,7 +64,7 @@ fn port() -> Result<Value, String> {
     if let Some(p) = PORT.with(|p| p.borrow().clone()) {
         return Ok(p);
     }
-    let factory = crate::eval_in_global_scope(include_str!("webstreams.js"))?;
+    let factory = crate::eval_internal(include_str!("webstreams.js"))?;
     let (node_error, promise_state) = with_host(|h| {
         (
             h.alloc(JsObj::Builtin("util.@@nodeError".into())),

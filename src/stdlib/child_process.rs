@@ -531,7 +531,7 @@ fn on_close_call(child: &Value, cb: Value, cb_args: Vec<Value>) -> Result<(), St
     let bind = match BIND.with(|b| b.borrow().clone()) {
         Some(f) => f,
         None => {
-            let f = crate::eval_in_global_scope(
+            let f = crate::eval_internal(
                 "(function (cb, args) { return function () { Reflect.apply(cb, undefined, args); }; })",
             )?;
             BIND.with(|b| *b.borrow_mut() = Some(f.clone()));

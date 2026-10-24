@@ -4,8 +4,9 @@
 //! file on a TTY) starts the interactive loop; `--build` AOT-compiles to a
 //! standalone native executable; `--dump-bytecode` prints the lowered fusevm
 //! chunk; `-e <src>` runs a one-liner; a positional `.js` file is executed;
-//! otherwise stdin is read and run as a script. Errors go to stderr in terse
-//! `node: <reason>` form; nothing else is printed.
+//! otherwise stdin is read and run as a script. A failure to start goes to
+//! stderr in terse `node: <reason>` form; an uncaught exception prints node's
+//! fatal-exception report (`host::fatal_report`). Nothing else is printed.
 
 use std::process::ExitCode;
 
@@ -228,8 +229,9 @@ fn fail(msg: &str) -> ExitCode {
 /// failing to start one. Node still runs the `exit` listeners on this path, and
 /// a code one of them assigns is the one the process leaves with.
 fn fail_program(msg: &str) -> ExitCode {
-    let code = nodejs::exit_code_after_failure();
-    eprintln!("node: {}", nodejs::host::plain_error_text(msg));
+    // node runs the `exit` listeners first and prints the report after them.
+    let code = nodejs::host::preserving_fatal_state(nodejs::exit_code_after_failure);
+    eprint!("{}", nodejs::host::fatal_report(msg));
     ExitCode::from((code & 0xff) as u8)
 }
 

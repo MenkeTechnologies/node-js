@@ -525,7 +525,7 @@ fn walk_expr_children(e: &Expr, ex: &mut dyn FnMut(&Expr)) {
             ex(func);
             args.iter().for_each(&mut *ex);
         }
-        Expr::New { callee, args } => {
+        Expr::New { callee, args, .. } => {
             ex(callee);
             args.iter().for_each(&mut *ex);
         }
@@ -560,11 +560,13 @@ fn const_assignment_throw() -> Expr {
     let throw = Stmt::from(StmtKind::Throw(Expr::New {
         callee: Box::new(Expr::Ident("TypeError".into())),
         args: vec![Expr::Str("Assignment to constant variable.".into())],
+        pos: 0,
     }));
     Expr::Call {
         func: Box::new(arrow(FnBody::Block(vec![throw]))),
         args: Vec::new(),
         optional: false,
+        pos: 0,
     }
 }
 
@@ -601,6 +603,7 @@ fn const_assignment_target() -> Expr {
         }])),
         property: "v".into(),
         optional: false,
+        pos: 0,
     }
 }
 
@@ -642,9 +645,11 @@ impl Rewriter<'_> {
                 object: Box::new(Expr::Ident(IMP.into())),
                 index: Box::new(Expr::Number(k as f64)),
                 optional: false,
+                pos: 0,
             }),
             args: Vec::new(),
             optional: false,
+            pos: 0,
         }
     }
     fn with_scope<T>(&mut self, names: Vec<String>, f: impl FnOnce(&mut Self) -> T) -> T {
@@ -943,6 +948,7 @@ impl Rewriter<'_> {
                     func: Box::new(Expr::Ident(IMPORT_FN.into())),
                     args: full,
                     optional: false,
+                    pos: 0,
                 };
             }
             Expr::Assign { target, op, value } => {
@@ -1072,7 +1078,7 @@ impl Rewriter<'_> {
                 self.expr(func);
                 args.iter_mut().for_each(|x| self.expr(x));
             }
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, .. } => {
                 self.expr(callee);
                 args.iter_mut().for_each(|x| self.expr(x));
             }
@@ -1159,6 +1165,7 @@ pub fn lower(stmts: Vec<Stmt>, info: &ModuleInfo, referrer: &str, generator: boo
         func: Box::new(Expr::Ident(REG.into())),
         args: vec![Expr::Array(getters)],
         optional: false,
+        pos: 0,
     }))];
     if generator {
         prologue.push(Stmt::from(StmtKind::Expr(Expr::Yield {
@@ -1778,6 +1785,8 @@ use fusevm::Value;
 struct Parsed {
     lowered: Option<Expr>,
     source: String,
+    /// The module's `file://` URL, which its stack frames and source arrow name.
+    url: String,
 }
 
 thread_local! {
@@ -1892,7 +1901,11 @@ fn parse_file(path: &str) -> Result<Value, String> {
             std::fs::read_to_string(path).map_err(|e| format!("Error: cannot read {path}: {e}"))?
         }
     };
-    let stmts = crate::parser::parse_module(&source)?;
+    let stmts = crate::parser::parse_module(&source).map_err(|e| {
+        let at = crate::parser::take_error_pos();
+        host::note_syntax_error(&source, host::ScriptOrigin::named(file_url(path)), &e, at);
+        e
+    })?;
     let info = analyze(&stmts)?;
     let lowered = lower(stmts, &info, path, false);
     // The early errors of the module's own statement list (duplicate lexical
@@ -1911,6 +1924,7 @@ fn parse_file(path: &str) -> Result<Value, String> {
         p.borrow_mut().push(Parsed {
             lowered: Some(lowered),
             source,
+            url: file_url(path),
         })
     });
     Ok(record)
@@ -1919,10 +1933,14 @@ fn parse_file(path: &str) -> Result<Value, String> {
 /// Compile parsed module `id` to its function; `generator` selects the form a
 /// module in an import cycle is built in (see the module docs).
 fn compile(id: usize, generator: bool) -> Result<Value, String> {
-    let (lowered, source) = PARSED.with(|p| {
+    let (lowered, source, url) = PARSED.with(|p| {
         let mut p = p.borrow_mut();
         let entry = &mut p[id];
-        (entry.lowered.take(), std::mem::take(&mut entry.source))
+        (
+            entry.lowered.take(),
+            std::mem::take(&mut entry.source),
+            entry.url.clone(),
+        )
     });
     let mut lowered = lowered.ok_or_else(|| host::type_error("module instantiated twice"))?;
     if generator {
@@ -1947,7 +1965,10 @@ fn compile(id: usize, generator: bool) -> Result<Value, String> {
         crate::compiler::compile_completion_strict(&stmts, false, true, false),
         &source,
     )?;
-    host::run_chunk_in_global_scope(crate::load_merged(prog))
+    host::run_chunk_in_global_scope(crate::load_merged_from(
+        prog,
+        Some(host::ScriptOrigin::named(url)),
+    ))
 }
 
 /// Mark `ns` (a Proxy) as a module namespace object, which `util.inspect`
@@ -2029,7 +2050,10 @@ fn loader() -> Result<Value, String> {
     if let Some(l) = LOADER.with(|l| l.borrow().clone()) {
         return Ok(l);
     }
-    let factory = crate::eval_in_global_scope(include_str!("esm_loader.js"))?;
+    let factory = crate::eval_in_global_scope_from(
+        include_str!("esm_loader.js"),
+        Some(host::ScriptOrigin::internal("node:internal/modules/esm/loader")),
+    )?;
     let mut natives = indexmap::IndexMap::new();
     for n in [
         "resolve",
@@ -2076,6 +2100,9 @@ pub fn main_program(entry: &str, source: Option<String>, is_main: bool) -> Vec<S
         VIRTUAL.with(|v| v.borrow_mut().insert(entry.to_string(), text));
     }
     ENTRY_URL.with(|u| *u.borrow_mut() = file_url(entry));
+    // The entry module's body runs in a function of its own; the program
+    // frame that starts the loader is no part of a stack node prints.
+    with_host(|h| h.module_frame_done = true);
     let call = Expr::Call {
         func: Box::new(Expr::Ident(MAIN_FN.into())),
         args: vec![
@@ -2084,6 +2111,7 @@ pub fn main_program(entry: &str, source: Option<String>, is_main: bool) -> Vec<S
             if is_main { Expr::True } else { Expr::False },
         ],
         optional: false,
+        pos: 0,
     };
     vec![Stmt::from(StmtKind::Expr(call))]
 }

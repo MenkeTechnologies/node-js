@@ -396,6 +396,105 @@ pub struct ParamSlot {
     pub has_default: bool,
 }
 
+thread_local! {
+    /// The source position of the op in the innermost frame that is calling
+    /// out right now — see [`set_op_pos`].
+    static OP_POS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Record that the innermost frame is executing the op at source position
+/// `pos` (`0`: unknown, ignored) — called by every op that can run user code
+/// (the calls, `new`, and the property reads and writes that may reach a
+/// getter or setter). It is a thread-local cell rather than a host write
+/// because a property read is the hottest op there is; the position moves into
+/// the frame's [`Frame::pos`] only when that frame stops being the innermost,
+/// and is cleared then, so it always describes the innermost frame.
+pub fn set_op_pos(pos: u32) {
+    if pos != 0 {
+        OP_POS.with(|p| p.set(pos));
+    }
+}
+
+/// The innermost frame is gone (popped, or swapped out with its generator):
+/// what was pending for it describes no frame that remains.
+fn clear_op_pos() {
+    OP_POS.with(|p| p.set(0));
+}
+
+/// Where a script's text came from, as node names it in a source arrow and a
+/// stack frame: the absolute path of a CommonJS file, the `file://` URL of an
+/// ES module, `[eval]` / `[stdin]` for source given on the command line.
+#[derive(Clone, Debug)]
+pub struct ScriptOrigin {
+    pub name: String,
+    /// Lines the loader put in front of the user's text (the CommonJS
+    /// wrapper's opening line), subtracted from every reported line.
+    pub line_shift: u32,
+    /// The runtime's own JavaScript (the ES module loader and the other JS
+    /// factories): node shows its internals as `node:internal/…` frames that do
+    /// not exist here, so this code's frames are left out of a stack and a
+    /// source arrow never points into it.
+    pub internal: bool,
+}
+
+impl ScriptOrigin {
+    pub fn named(name: impl Into<String>) -> ScriptOrigin {
+        ScriptOrigin {
+            name: name.into(),
+            line_shift: 0,
+            internal: false,
+        }
+    }
+
+    pub fn internal(name: impl Into<String>) -> ScriptOrigin {
+        ScriptOrigin {
+            internal: true,
+            ..ScriptOrigin::named(name)
+        }
+    }
+}
+
+/// One script's range of the source address space: positions
+/// `base ..= base + len` belong to `scripts[script]`.
+pub struct ScriptRange {
+    pub base: u32,
+    pub len: u32,
+    pub script: u32,
+    pub origin: ScriptOrigin,
+    /// Byte offset of every line start, computed on the first lookup.
+    line_starts: std::cell::OnceCell<Vec<u32>>,
+}
+
+/// A source position resolved to node's terms.
+pub struct SourceLocation<'a> {
+    pub name: &'a str,
+    /// 1-based, as node prints them; the column counts UTF-16 units, as V8's.
+    pub line: u32,
+    pub col: u32,
+    /// The text of that line, without its terminator.
+    pub source_line: &'a str,
+    /// See [`ScriptOrigin::internal`].
+    pub internal: bool,
+}
+
+/// The raise an in-flight exception came from: its error string, the source
+/// position of the op that raised it, the frame depth it was raised at, and —
+/// for an error the runtime raised rather than a JS `throw` — the stack frames
+/// live at that moment, which are gone by the time a `catch` (or the fatal
+/// report) builds the error object.
+///
+/// A raise propagates outward through every enclosing chunk, each of which
+/// re-reports the same string. A report of the same string at the same or a
+/// shallower depth is that propagation and keeps the original site; a
+/// `catch` clears it, so the next raise of an equal string is recorded anew.
+#[derive(Clone, Debug)]
+pub struct ThrowSite {
+    pub msg: String,
+    pub pos: u32,
+    pub depth: usize,
+    pub frames: Option<String>,
+}
+
 /// A compiled `try`/`catch`/`finally` block. Bodies are bare chunks run in the
 /// current scope.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -867,6 +966,15 @@ pub struct Frame {
     /// Source line the frame is currently executing (updated by the DAP line hook
     /// under `--dap`; stays 0 on ordinary runs).
     pub line: u32,
+    /// The source position (in the host's source address space, see
+    /// [`JsHost::source_location`]) of the op this frame is executing, as of
+    /// its last call out or raise: what its `at …(file:line:col)` stack line
+    /// reports. Written by the call ops, `new` and the raise paths; `0` until
+    /// the frame does one of those.
+    pub pos: u32,
+    /// Whether this is an arrow function's activation. Its `this_obj` is the
+    /// lexical `this`, not a receiver, so its stack line has no `Type.` prefix.
+    pub arrow: bool,
     /// The function name that owns this frame, for the DAP `stackTrace`; `None`
     /// for the module frame and anonymous activations.
     pub owner: Option<String>,
@@ -918,6 +1026,14 @@ pub struct JsHost {
     /// Every script text a loaded program was parsed from; a `FuncDef`'s
     /// `script` indexes it and its `span` slices it.
     pub scripts: Vec<std::sync::Arc<str>>,
+    /// While a generator or async body runs, the frames of every context that
+    /// resumed one, outermost first: a body runs with only its own frame
+    /// installed, and these are the callers a stack trace continues into.
+    outer_frames: Vec<Vec<Frame>>,
+    /// The scripts that own a range of the source address space, by ascending
+    /// base — what a source position resolves against. See
+    /// [`JsHost::register_source`].
+    pub source_map: Vec<ScriptRange>,
     /// try/catch/finally block templates, indexed by try id.
     pub tries: Vec<TryDef>,
     /// Module-level (global) names.
@@ -956,6 +1072,16 @@ pub struct JsHost {
     pub error: Option<String>,
     /// The in-flight thrown value, if any (JS `throw`).
     pub exc: Option<Value>,
+    /// Where the in-flight exception was raised — see [`ThrowSite`].
+    pub throw_site: Option<ThrowSite>,
+    /// Whether the exception that is about to end the process is an unhandled
+    /// promise rejection, whose source arrow node takes from where the error
+    /// was CREATED rather than from where it was thrown.
+    pub fatal_from_promise: bool,
+    /// Whether the module frame (frame 0) no longer runs the program's top
+    /// level: once that has returned, or when the entry is an ES module (whose
+    /// body runs in a function of its own). A stack then leaves the frame out.
+    pub module_frame_done: bool,
     /// The current async context frame (see [`Task`]).
     pub async_frame: AsyncFrame,
     pub signal: Option<Signal>,
@@ -1342,6 +1468,8 @@ impl JsHost {
             heap: Vec::new(),
             funcs: Vec::new(),
             scripts: Vec::new(),
+            source_map: Vec::new(),
+            outer_frames: Vec::new(),
             tries: Vec::new(),
             globals: VarMap::default(),
             global_consts: rustc_hash::FxHashSet::default(),
@@ -1355,6 +1483,8 @@ impl JsHost {
                 home_object: None,
                 strict: false,
                 line: 0,
+                pos: 0,
+                arrow: false,
                 owner: None,
                 is_module: true,
                 this_state: ThisState::Plain,
@@ -1362,6 +1492,9 @@ impl JsHost {
             global_env,
             error: None,
             exc: None,
+            throw_site: None,
+            fatal_from_promise: false,
+            module_frame_done: false,
             async_frame: std::rc::Rc::new(Vec::new()),
             signal: None,
             pending_rejections: Vec::new(),
@@ -2762,14 +2895,6 @@ impl JsHost {
             f.line = line;
         }
     }
-    /// The `.stack` tail for an error created right now: one `    at <name>`
-    /// line per live frame, innermost first, ending at the module frame.
-    ///
-    /// These are the REAL user frames — node-js has no `file:line:column` (the
-    /// per-frame line is only tracked under `--dap`) and no Node-internal
-    /// module-loader frames, so `.stack` names the call chain but can never be
-    /// byte-identical to V8's. The names are what makes a thrown error
-    /// diagnosable; the missing positions are documented in BUGS.md.
     /// V8's `Error.stackTraceLimit` — how many frames a captured stack keeps.
     ///
     /// The default is 10, it is settable, and setting it to 0 is the documented
@@ -2791,25 +2916,324 @@ impl JsHost {
         }
     }
 
+    /// The `.stack` tail for an error created right now: one `    at …` line
+    /// per live frame, innermost first, in V8's `CallSite` format —
+    /// `at f (file:line:col)`, `at new C (…)`, `at Object.m (…)`, and the bare
+    /// `at file:line:col` of an anonymous function or a script's top level.
+    ///
+    /// Each frame's location is the op it was executing when it last called
+    /// out (see [`Frame::pos`]), so the innermost frame of a `new Error()` names
+    /// the `new` and every outer frame names its call. These are the user's
+    /// frames only: node's own loader frames (`Module._compile`, …) and the
+    /// frames of native functions (`Array.map (<anonymous>)`) do not exist in
+    /// this runtime.
     pub fn stack_frames(&self) -> String {
+        self.stack_frames_from(self.frames.len())
+    }
+
+    /// [`JsHost::stack_frames`] over the frames below `top` — the error
+    /// constructors skip the frames of the subclass constructors that are
+    /// building the error, as V8's `SKIP_UNTIL_SEEN` mode does.
+    pub fn stack_frames_from(&self, top: usize) -> String {
         let limit = self.stack_trace_limit();
         if limit == 0 {
             return String::new();
         }
         let mut out = String::new();
-        for (i, f) in self.frames.iter().enumerate().rev().take(limit) {
-            let name = match (&f.owner, i) {
-                (Some(n), _) => n.clone(),
-                (None, 0) => "Object.<anonymous>".to_string(),
-                (None, _) => "<anonymous>".to_string(),
-            };
+        // The running context's frames, then — when a generator or async body
+        // is running — the frames of each context that resumed it, innermost
+        // first. Each item: the frame, whether it is the bottom of its
+        // context, and its position.
+        let current = self.frames[..top]
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, f)| (f, i == 0, self.frame_pos_of(i)));
+        let resumers = self
+            .outer_frames
+            .iter()
+            .rev()
+            .flat_map(|fs| fs.iter().enumerate().rev().map(|(i, f)| (f, i == 0, f.pos)));
+        let shown = current
+            .chain(resumers)
+            .map(|(f, bottom, pos)| (f, bottom, pos, self.source_location(pos)))
+            // The program's own frame once its top level has finished (a
+            // timer or a promise reaction runs on it, where node has only its
+            // own loop frames) or before it has run anything (a SyntaxError),
+            // and the runtime's internal JS.
+            .filter(|(f, bottom, pos, loc)| {
+                !(*bottom && f.is_module && (self.module_frame_done || *pos == 0))
+                    && !loc.as_ref().is_some_and(|l| l.internal)
+            })
+            .map(|(f, _, _, loc)| (f, loc));
+        for (f, loc) in shown.take(limit) {
+            let name = self.frame_function_name(f, loc.as_ref().map(|l| l.name));
             out.push_str("\n    at ");
-            out.push_str(&name);
+            match (name, loc) {
+                (Some(n), Some(l)) => {
+                    out.push_str(&format!("{n} ({}:{}:{})", l.name, l.line, l.col))
+                }
+                (Some(n), None) => out.push_str(&n),
+                (None, Some(l)) => out.push_str(&format!("{}:{}:{}", l.name, l.line, l.col)),
+                (None, None) => out.push_str("<anonymous>"),
+            }
         }
-        if out.is_empty() && limit > 0 {
+        // With no frame at all there is still V8's one anonymous line. Frames
+        // that exist but were left out stand for node's own, which a stack
+        // there shows instead.
+        if out.is_empty() && top == 0 {
             out.push_str("\n    at <anonymous>");
         }
         out
+    }
+
+    /// How V8's `CallSite` names the function of frame `f`
+    /// (`CallSiteInfo::GetFunctionName` / `GetTypeName`): `new F` for a
+    /// construct call; `Type.f` for a method call on a receiver of type `Type`
+    /// (the CommonJS module function is anonymous and called on
+    /// `module.exports`, hence `Object.<anonymous>`); a plain `f` when the
+    /// receiver is the global object or `undefined`, or the function is an
+    /// arrow; nothing for an anonymous function or the top level of an
+    /// `[eval]` script or an ES module.
+    fn frame_function_name(&self, f: &Frame, script: Option<&str>) -> Option<String> {
+        let own = f.owner.as_deref().filter(|n| !n.is_empty());
+        if f.new_target.is_some() {
+            return Some(format!("new {}", own.unwrap_or("<anonymous>")));
+        }
+        if f.is_module {
+            // A top level. A CommonJS entry file's runs inside node's module
+            // wrapper, called on `module.exports`; it is named by its path.
+            return match script {
+                Some(s) if s.starts_with('/') => Some("Object.<anonymous>".to_string()),
+                Some(_) => None,
+                None => Some("Object.<anonymous>".to_string()),
+            };
+        }
+        // `GetTypeName`: a function receiver (a static method's class) is
+        // named by its own name, anything else by its constructor's.
+        let method_type = match &f.this_obj {
+            Some(t @ Value::Obj(_)) if !f.arrow && !self.is_global_object(t) => {
+                let own_name = match self.get(t) {
+                    Some(JsObj::Func(_)) | Some(JsObj::Class(_)) => self.callable_name(t),
+                    _ => String::new(),
+                };
+                Some(match own_name {
+                    n if !n.is_empty() => n,
+                    _ => match self.ctor_name(t) {
+                        n if n.is_empty() => "Object".to_string(),
+                        n => n,
+                    },
+                })
+            }
+            _ => None,
+        };
+        match (method_type, own) {
+            // `AppendMethodCall` drops the type when the name already starts
+            // with it; an accessor (`get g`) prints without one as well.
+            (Some(t), Some(n)) if n.starts_with(&t) || n.starts_with("get ") || n.starts_with("set ") => {
+                Some(n.to_string())
+            }
+            (Some(t), Some(n)) => Some(format!("{t}.{n}")),
+            (Some(t), None) => Some(format!("{t}.<anonymous>")),
+            (None, Some(n)) => Some(n.to_string()),
+            (None, None) => None,
+        }
+    }
+
+    /// Give `script` the next range of the source address space and return its
+    /// base: a [`crate::ast::Pos`] `p` in that script becomes `base + p - 1`, so
+    /// one `u32` names a place in any loaded script. Ranges are never reused.
+    pub fn register_source(&mut self, script: u32, origin: ScriptOrigin) -> u32 {
+        let base = self.source_map.last().map_or(1, |r| r.base + r.len + 1);
+        let len = self.scripts[script as usize].len() as u32;
+        self.source_map.push(ScriptRange {
+            base,
+            len,
+            script,
+            origin,
+            line_starts: std::cell::OnceCell::new(),
+        });
+        base
+    }
+
+    /// The position of the first reference to identifier `name` at or after
+    /// `pos`, else `pos` itself.
+    ///
+    /// An identifier carries no position of its own, so an op that reads or
+    /// writes a name is placed at its statement; V8 places a `ReferenceError`
+    /// at the identifier. The first whole-word occurrence from the statement on
+    /// that is not a property name (`o.name`) is the reference evaluated first.
+    pub fn name_position(&self, pos: u32, name: &str) -> u32 {
+        let Some(r) = pos
+            .checked_sub(1)
+            .and_then(|_| self.source_map.partition_point(|r| r.base <= pos).checked_sub(1))
+            .map(|i| &self.source_map[i])
+        else {
+            return pos;
+        };
+        let Some(text) = self.scripts.get(r.script as usize) else {
+            return pos;
+        };
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+        let start = (pos - r.base) as usize;
+        let Some(tail) = text.get(start..) else {
+            return pos;
+        };
+        for (at, _) in tail.match_indices(name) {
+            let before = text[..start + at].chars().next_back();
+            let after = tail[at + name.len()..].chars().next();
+            if before.is_some_and(|c| is_ident(c) || c == '.') || after.is_some_and(is_ident) {
+                continue;
+            }
+            return r.base + (start + at) as u32;
+        }
+        pos
+    }
+
+    /// Resolve a source-address-space position (`0`: none) to its script's
+    /// name, line, column and line text.
+    pub fn source_location(&self, pos: u32) -> Option<SourceLocation<'_>> {
+        if pos == 0 {
+            return None;
+        }
+        let r = &self.source_map[self.source_map.partition_point(|r| r.base <= pos).checked_sub(1)?];
+        let text: &str = self.scripts.get(r.script as usize)?;
+        let mut off = ((pos - r.base) as usize).min(text.len());
+        while !text.is_char_boundary(off) {
+            off -= 1;
+        }
+        let starts = r.line_starts.get_or_init(|| {
+            std::iter::once(0)
+                .chain(text.match_indices('\n').map(|(i, _)| i as u32 + 1))
+                .collect()
+        });
+        let line_ix = starts.partition_point(|&s| s as usize <= off) - 1;
+        let start = starts[line_ix] as usize;
+        let end = starts
+            .get(line_ix + 1)
+            .map_or(text.len(), |&s| s as usize - 1);
+        let source_line = text[start..end].strip_suffix('\r').unwrap_or(&text[start..end]);
+        // A stack captures up to ten of these per error; most lines are ASCII,
+        // whose UTF-16 length is the byte length.
+        let prefix = &text[start..off];
+        let col = if prefix.is_ascii() {
+            prefix.len()
+        } else {
+            prefix.encode_utf16().count()
+        };
+        Some(SourceLocation {
+            name: &r.origin.name,
+            line: (line_ix as u32 + 1).saturating_sub(r.origin.line_shift).max(1),
+            col: col as u32 + 1,
+            source_line,
+            internal: r.origin.internal,
+        })
+    }
+
+    /// Before the innermost frame changes (a callee's frame is pushed, a
+    /// generator's context swapped in or out): move the op position pending
+    /// for it (see [`set_op_pos`]) into its [`Frame::pos`].
+    fn settle_op_pos(&mut self) {
+        let pos = OP_POS.with(|p| p.replace(0));
+        if pos != 0 {
+            if let Some(f) = self.frames.last_mut() {
+                f.pos = pos;
+            }
+        }
+    }
+
+    /// Where frame `i` is: its [`Frame::pos`], or for the innermost frame the
+    /// op position still pending for it.
+    fn frame_pos_of(&self, i: usize) -> u32 {
+        if i + 1 == self.frames.len() {
+            let pending = OP_POS.with(|p| p.get());
+            if pending != 0 {
+                return pending;
+            }
+        }
+        self.frames.get(i).map_or(0, |f| f.pos)
+    }
+
+    /// How many frames are live, counting those of the contexts that resumed
+    /// the running generator or async body.
+    pub fn stack_depth(&self) -> usize {
+        self.frames.len() + self.outer_frames.iter().map(Vec::len).sum::<usize>()
+    }
+
+    /// Where the innermost frame below `top` is: where an error whose stack
+    /// starts there was created.
+    pub fn frame_pos_below(&self, top: usize) -> u32 {
+        top.checked_sub(1).map_or(0, |i| self.frame_pos_of(i))
+    }
+
+    /// The frames an error constructed now captures end below this index.
+    ///
+    /// An error built through `super()` from a subclass constructor does not
+    /// show the constructors that are building it: V8 captures in
+    /// `SKIP_UNTIL_SEEN` mode, skipping every frame up to and including the one
+    /// running `new.target`, so `new MyErr()` reports the frame that said `new`.
+    /// Those are the innermost frames that are derived constructors still
+    /// waiting on `super()`, all for the same `new.target`.
+    pub fn error_capture_top(&self) -> usize {
+        let mut top = self.frames.len();
+        let Some(Value::Obj(target)) = self
+            .frames
+            .last()
+            .filter(|f| f.this_state == ThisState::Pending)
+            .and_then(|f| f.new_target.clone())
+        else {
+            return top;
+        };
+        while top > 0 {
+            let f = &self.frames[top - 1];
+            match &f.new_target {
+                Some(Value::Obj(t)) if *t == target && f.this_state == ThisState::Pending => top -= 1,
+                _ => break,
+            }
+        }
+        top
+    }
+
+    /// Record that the op at source position `pos` raised `msg` — unless this
+    /// is the same raise propagating outward (see [`ThrowSite`]). A raise the
+    /// runtime makes (`native`: not a JS `throw`) also keeps the live frames,
+    /// for the error object a `catch` or the fatal report builds later.
+    pub fn note_raise(&mut self, msg: &str, pos: u32, native: bool) {
+        let depth = self.stack_depth();
+        if native {
+            if let Some(s) = &self.throw_site {
+                if s.msg == msg && depth <= s.depth {
+                    return;
+                }
+            }
+        }
+        if pos != 0 {
+            OP_POS.with(|p| p.set(0));
+            if let Some(f) = self.frames.last_mut() {
+                f.pos = pos;
+            }
+        }
+        let frames = native.then(|| self.stack_frames());
+        self.throw_site = Some(ThrowSite {
+            msg: msg.to_string(),
+            pos,
+            depth,
+            frames,
+        });
+    }
+
+    /// The stack frames an error built from runtime error string `msg` carries:
+    /// those live when it was raised, if that raise was recorded, else the
+    /// current ones.
+    pub fn raise_frames(&self, msg: &str) -> String {
+        match &self.throw_site {
+            Some(ThrowSite {
+                msg: m,
+                frames: Some(f),
+                ..
+            }) if m == msg => f.clone(),
+            _ => self.stack_frames(),
+        }
     }
 
     /// The call stack as (frame name, line) pairs, innermost first — for the DAP
@@ -4091,6 +4515,7 @@ pub fn run_chunk_in_global_scope(chunk: Chunk) -> Result<Value, String> {
 fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
     let global_env = with_host(|h| h.global_env.clone());
     with_host(|h| {
+        h.settle_op_pos();
         h.frames.push(Frame {
             env: global_env.clone(),
             base_env: global_env,
@@ -4101,6 +4526,8 @@ fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
             home_object: None,
             strict: false,
             line: 0,
+            pos: 0,
+            arrow: false,
             owner: None,
             is_module: true,
             this_state: ThisState::Plain,
@@ -4109,6 +4536,7 @@ fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
     let r = run_chunk_on(chunk);
     with_host(|h| {
         h.frames.pop();
+        clear_op_pos();
     });
     r
 }
@@ -4119,7 +4547,10 @@ fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
 pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     with_host(|h| h.module_scope = true);
     let mut r = run_chunk_on(chunk);
-    with_host(|h| h.signal = None);
+    with_host(|h| {
+        h.signal = None;
+        h.module_frame_done = true;
+    });
     if let Err(e) = &r {
         if recover_uncaught(e, "uncaughtException")? {
             r = Ok(Value::Undef);
@@ -4144,6 +4575,162 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
 fn uncaught_value(msg: &str) -> Value {
     with_host(|h| h.exc.take())
         .unwrap_or_else(|| with_host(|h| crate::builtins::synth_error(h, msg)))
+}
+
+/// What node writes to stderr for the exception `msg` that is ending the
+/// process — `ReportFatalException` (`src/node_errors.cc`), fed by
+/// `fatalExceptionStackEnhancers` (`lib/internal/errors.js`):
+///
+/// - an object (an `Error` or anything else) prints the source arrow — the
+///   `file:line` header, the source line and a `^` under the raise, then a
+///   blank line — followed by `util.inspect(err, { customInspect: false,
+///   depth: 5 })`, which for an error is its `stack` plus any own properties;
+/// - a primitive prints a blank line, the arrow, the value, and the
+///   `--trace-uncaught` hint (`AppendExceptionLine` writes the arrow itself
+///   for a non-error);
+/// - both end with a blank line and `Node.js <version>`.
+///
+/// The arrow points where the exception was thrown, except for an unhandled
+/// rejection, whose error has no throw site and is shown where it was created.
+/// node colours the inspected error when stderr is a terminal; this runtime's
+/// `util.inspect` has no colours, so it never does.
+pub fn fatal_report(msg: &str) -> String {
+    let value = uncaught_value(msg);
+    let (is_object, is_error, pos) = with_host(|h| {
+        let is_object = matches!(h.type_of(&value), "object" | "function")
+            && !h.is_null(&value);
+        let is_error = crate::builtins::has_error_data(h, &value);
+        let pos = if h.fatal_from_promise {
+            match lookup_chain(h, &value, "@@pos") {
+                Some(Value::Int(p)) => p as u32,
+                _ => 0,
+            }
+        } else {
+            h.throw_site
+                .as_ref()
+                .filter(|s| s.msg == msg)
+                .map_or(0, |s| s.pos)
+        };
+        (is_object, is_error, pos)
+    });
+    let arrow = with_host(|h| source_arrow(h, pos));
+    // `AppendExceptionLine` keeps the arrow on the error for the report to
+    // print only for a native error, or for anything thrown by `[eval]` /
+    // `[stdin]` source (which node runs through `vm`); otherwise it writes
+    // the arrow to stderr itself, behind a blank line, and the report follows
+    // with no separating line.
+    let arrow_on_error = is_error
+        || with_host(|h| {
+            h.source_location(pos)
+                .is_some_and(|l| l.name.starts_with('['))
+        });
+    let mut out = String::new();
+    if is_object {
+        let shown = with_host(|h| {
+            let mut opts: IndexMap<String, Value> = IndexMap::new();
+            opts.insert("customInspect".into(), Value::Bool(false));
+            opts.insert("depth".into(), Value::Int(5));
+            h.new_object(opts)
+        });
+        let mut trace = match crate::stdlib::util::call("inspect", &[value.clone(), shown]) {
+            Some(Ok(s)) => with_host(|h| h.str_of(&s)),
+            _ => with_host(|h| h.str_of(&value)),
+        };
+        // `inspect` brackets an error whose stack has no frames
+        // (`[SyntaxError: …]`). node's always has some — its own loader's,
+        // which this runtime leaves out — so the header prints bare there.
+        if is_error && trace.starts_with('[') {
+            let stack = crate::builtins::get_property(&value, "stack")
+                .ok()
+                .map(|s| with_host(|h| h.str_of(&s)));
+            if let Some(stack) = stack.filter(|s| !s.contains("\n    at ")) {
+                if trace.strip_prefix('[').and_then(|t| t.strip_suffix(']')) == Some(stack.as_str()) {
+                    trace = stack;
+                }
+            }
+        }
+        match arrow {
+            Some(a) if arrow_on_error => {
+                out.push_str(&a);
+                out.push('\n');
+            }
+            Some(a) => {
+                out.push('\n');
+                out.push_str(&a);
+            }
+            None => {}
+        }
+        out.push_str(&trace);
+        out.push('\n');
+    } else {
+        if let Some(a) = arrow {
+            out.push('\n');
+            out.push_str(&a);
+        }
+        out.push_str(&with_host(|h| h.str_of(&value)));
+        out.push('\n');
+        let argv0 = std::env::args().next().unwrap_or_default();
+        let exe = std::path::Path::new(&argv0)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("node")
+            .to_string();
+        out.push_str(&format!(
+            "(Use `{exe} --trace-uncaught ...` to show where the exception was thrown)\n"
+        ));
+    }
+    out.push_str(&format!("\nNode.js {}\n", crate::stdlib::process::NODE_VERSION));
+    out
+}
+
+/// Record that `src`, which node names `origin`, failed to parse with `msg`
+/// at script-relative position `pos` (from `parser::take_error_pos`): the
+/// text joins the source address space so the SyntaxError's report can show
+/// node's arrow under the offending token.
+pub fn note_syntax_error(src: &str, origin: ScriptOrigin, msg: &str, pos: u32) {
+    if pos == 0 {
+        return;
+    }
+    with_host(|h| {
+        let script = h.scripts.len() as u32;
+        h.scripts.push(src.into());
+        let base = h.register_source(script, origin);
+        let frames = Some(h.stack_frames());
+        h.throw_site = Some(ThrowSite {
+            msg: msg.to_string(),
+            pos: base + pos - 1,
+            depth: h.stack_depth(),
+            frames,
+        });
+    });
+}
+
+/// Run `f` — the `exit` listeners of a dying process — without letting it
+/// disturb the exception [`fatal_report`] then describes: node emits `exit`
+/// inside `process._fatalException` and prints the report after it returns,
+/// and a listener that throws and catches would otherwise replace the record.
+pub fn preserving_fatal_state<R>(f: impl FnOnce() -> R) -> R {
+    let saved = with_host(|h| (h.exc.clone(), h.throw_site.clone(), h.fatal_from_promise));
+    let r = f();
+    with_host(|h| (h.exc, h.throw_site, h.fatal_from_promise) = saved);
+    r
+}
+
+/// node's source arrow for position `pos` (`GetErrorSource`,
+/// `src/node_errors.cc`): `file:line`, the source line, and a caret line that
+/// copies the line's tabs and puts one `^` under the column — V8 reports a
+/// raise as the one-character range `[pos, pos + 1)`.
+fn source_arrow(h: &JsHost, pos: u32) -> Option<String> {
+    let l = h.source_location(pos).filter(|l| !l.internal)?;
+    let mut caret: String = l
+        .source_line
+        .chars()
+        .take(l.col as usize - 1)
+        .map(|c| if c == '\t' { '\t' } else { ' ' })
+        .collect();
+    caret.push('^');
+    Some(format!("{}:{}\n{}\n{caret}\n", l.name, l.line, l.source_line))
 }
 
 /// Offer an uncaught exception to `process.on('uncaughtException')`; `Ok(true)`
@@ -6946,7 +7533,7 @@ fn uncaught_text(msg: &str) -> String {
 /// The `(options, inspect)` arguments node passes a custom method, built once
 /// per render: its user options with a colourless `stylize`, and `util.inspect`.
 fn custom_inspect_args() -> Result<(Value, Value), String> {
-    let stylize = crate::eval_in_global_scope("(function stylizeNoColor(str) { return str; })")?;
+    let stylize = crate::eval_internal("(function stylizeNoColor(str) { return str; })")?;
     let depth = inspect_max_depth();
     let opts = with_host(|h| {
         let num = |n: i64| {
@@ -8540,6 +9127,12 @@ fn run_user_func_full(
             d.name.clone(),
         )
     });
+    // The name a stack frame shows: the definition's own, else the one the
+    // function value was given (`{ m() {} }`, `const f = () => {}`).
+    let def_name = match (&callee, def_name.is_empty()) {
+        (Some(c), true) => with_host(|h| h.callable_name(c)),
+        _ => def_name,
+    };
     let env = new_env(fv.env.clone());
     // Bind the simple/rest arg slots; destructuring + defaults run in the body
     // prologue (compiled ahead of the user statements).
@@ -8593,6 +9186,8 @@ fn run_user_func_full(
             fv.home_static,
             fv.home_object.clone(),
             with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict)),
+            Some(def_name.clone()),
+            fv.is_arrow,
         );
         if is_async {
             if let Some(JsObj::Generator { id }) = with_host(|h| h.get(&gen).cloned()) {
@@ -8627,6 +9222,8 @@ fn run_user_func_full(
             fv.home_static,
             fv.home_object.clone(),
             with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict)),
+            Some(def_name.clone()),
+            fv.is_arrow,
         );
         return Ok(run_async(gen));
     }
@@ -8638,6 +9235,7 @@ fn run_user_func_full(
     // the host, and doing it inside the frame-push closure double-borrows.
     let fn_strict = with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict));
     with_host(|h| {
+        h.settle_op_pos();
         h.frames.push(Frame {
             base_env: env.clone(),
             env,
@@ -8648,6 +9246,8 @@ fn run_user_func_full(
             home_object: fv.home_object.clone(),
             strict: fn_strict,
             line: 0,
+            pos: 0,
+            arrow: fv.is_arrow,
             owner: Some(def_name),
             is_module: false,
             this_state: if derived_ctor {
@@ -8662,6 +9262,7 @@ fn run_user_func_full(
     });
     let (sig, this_state) = with_host(|h| {
         let frame = h.frames.pop();
+        clear_op_pos();
         (h.signal.take(), frame.map(|f| f.this_state))
     });
     let ret = match r {
@@ -9626,6 +10227,7 @@ impl JsHost {
     /// Swap the volatile execution context in one shot, returning the previous
     /// one — installs a generator's context on resume, pulls it back on suspend.
     fn install_gen_ctx(&mut self, mut c: GenContext) -> GenContext {
+        self.settle_op_pos();
         std::mem::swap(&mut self.frames, &mut c.frames);
         std::mem::swap(&mut self.error, &mut c.error);
         std::mem::swap(&mut self.exc, &mut c.exc);
@@ -9671,6 +10273,8 @@ fn make_generator(
     home_static: bool,
     home_object: Option<Value>,
     strict: bool,
+    owner: Option<String>,
+    arrow: bool,
 ) -> Value {
     let home = home_class
         .as_ref()
@@ -9685,7 +10289,9 @@ fn make_generator(
         home_object,
         strict,
         line: 0,
-        owner: None,
+        pos: 0,
+        arrow,
+        owner,
         is_module: false,
         this_state: ThisState::Plain,
     };
@@ -9836,7 +10442,11 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<GenStep, String> {
     };
     with_host(|h| h.generators[id as usize].started = true);
     let gen_ctx = with_host(|h| std::mem::take(&mut h.generators[id as usize].ctx));
-    let caller_ctx = with_host(|h| h.install_gen_ctx(gen_ctx));
+    let mut caller_ctx = with_host(|h| {
+        let mut caller = h.install_gen_ctx(gen_ctx);
+        h.outer_frames.push(std::mem::take(&mut caller.frames));
+        caller
+    });
     let prev = CUR_GEN.with(|c| c.replace(Some(id)));
     // The body runs on the coroutine's OWN stack, so the guard's floor has to
     // move with it and move back on suspend — generators nest, and a resume from
@@ -9853,7 +10463,10 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<GenStep, String> {
         with_host(|h| h.generators[id as usize].stack_floor = measured);
     }
     CUR_GEN.with(|c| c.set(prev));
-    let mut gen_ctx = with_host(|h| h.install_gen_ctx(caller_ctx));
+    let mut gen_ctx = with_host(|h| {
+        caller_ctx.frames = h.outer_frames.pop().unwrap_or_default();
+        h.install_gen_ctx(caller_ctx)
+    });
     // A `throw` inside the body left the thrown VALUE in the generator's context,
     // which the swap above just stashed away. Hand it to the caller so the
     // rejection/catch keeps the original error object instead of a string rebuild.
@@ -12287,7 +12900,10 @@ fn check_unhandled_rejections() -> Result<(), String> {
                     }
                 }
                 let msg = with_host(|h| crate::builtins::error_string(h, &val));
-                with_host(|h| h.exc = Some(val));
+                with_host(|h| {
+                    h.exc = Some(val);
+                    h.fatal_from_promise = true;
+                });
                 return Err(msg);
             }
             let promise = with_host(|h| h.alloc(JsObj::Promise { id }));

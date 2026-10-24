@@ -211,6 +211,7 @@ fn require_callback(cb: &Value) -> Result<(), String> {
 }
 
 fn b_tag_tmpl(vm: &mut VM, argc: u8) -> Value {
+    note_site(vm);
     // The chunk holding this site, read before the operands are popped and
     // before any host borrow: together with the compiler's per-site ordinal it
     // names the Parse Node whose template object 13.2.8.4 caches.
@@ -398,12 +399,14 @@ fn b_def_field(vm: &mut VM, _: u8) -> Value {
 /// run time. Shares everything below with the fixed-arity form; only where the
 /// arguments come from differs.
 fn b_super_call_spread(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let arr = vm.pop();
     let args = host::iter_all(&arr).unwrap_or_default();
     super_call_with(vm, args)
 }
 
 fn b_super_call(vm: &mut VM, argc: u8) -> Value {
+    note_site(vm);
     let args = pop_n(vm, argc as usize);
     super_call_with(vm, args)
 }
@@ -872,9 +875,43 @@ fn sname(v: &Value) -> std::sync::Arc<String> {
 /// completion `IteratorClose` runs, its own failure suppressed so `e` wins).
 fn abort(vm: &mut VM, e: String) -> Value {
     close_parked_iters(vm);
-    with_host(|h| h.error = Some(e));
+    let pos = op_pos(vm);
+    with_host(|h| {
+        h.note_raise(&e, pos, true);
+        h.error = Some(e);
+    });
     vm.ip = vm.chunk.ops.len();
     Value::Undef
+}
+
+/// [`abort`] for an error about identifier `name` (unbound, or in its dead
+/// zone), placed at the identifier rather than its statement — see
+/// `JsHost::name_position`.
+fn abort_at_name(vm: &mut VM, e: String, name: &str) -> Value {
+    let pos = op_pos(vm);
+    with_host(|h| {
+        let at = h.name_position(pos, name);
+        h.note_raise(&e, at, true);
+    });
+    abort(vm, e)
+}
+
+/// The source position of the op now executing (`0`: none) — see
+/// [`crate::ast::Pos`] and `lib::load_merged_from`.
+fn op_pos(vm: &VM) -> u32 {
+    vm.ip
+        .checked_sub(1)
+        .and_then(|ip| vm.chunk.lines.get(ip))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Record the op now executing as the current frame's place, before an op
+/// that may run user code: what that frame's `at …(file:line:col)` stack line
+/// shows while the call runs, and where a `new Error()` it makes was created
+/// (see `host::set_op_pos`).
+fn note_site(vm: &VM) {
+    host::set_op_pos(op_pos(vm));
 }
 
 /// [`abort`] for an error the ITERATOR PROTOCOL itself raised (`next` threw, or
@@ -1036,13 +1073,13 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     // own inner binding for its name does exactly that while its static
     // initializers run.
     if with_host(|h| h.is_tdz_global(&name) && h.read_name(&name).is_none()) {
-        return abort(vm, host::tdz_error(&name));
+        return abort_at_name(vm, host::tdz_error(&name), &name);
     }
     match global_binding(&name) {
         // The binding EXISTS but has not reached its declaration yet.
-        Some(v) if with_host(|h| h.is_tdz(&v)) => abort(vm, host::tdz_error(&name)),
+        Some(v) if with_host(|h| h.is_tdz(&v)) => abort_at_name(vm, host::tdz_error(&name), &name),
         Some(v) => v,
-        None => abort(vm, host::ref_error(&name)),
+        None => abort_at_name(vm, host::ref_error(&name), &name),
     }
 }
 
@@ -1102,7 +1139,7 @@ fn b_setlocal_strict(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = sname(&vm.pop());
     if !binding_exists(&name) {
-        return abort(vm, host::ref_error(&name));
+        return abort_at_name(vm, host::ref_error(&name), &name);
     }
     if READONLY_GLOBALS.contains(&name.as_str()) && !with_host(|h| h.has_name(&name)) {
         return abort(vm, readonly_global_error(&name));
@@ -1285,6 +1322,7 @@ fn b_with_fn(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_call_this(vm: &mut VM, argc: u8) -> Value {
+    note_site(vm);
     let mut args = pop_n(vm, argc as usize);
     let callable = args.remove(0);
     let this = args.remove(0);
@@ -1297,6 +1335,7 @@ fn b_call_this(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_apply_this(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let args_arr = vm.pop();
     let this = vm.pop();
     let callable = vm.pop();
@@ -1357,6 +1396,7 @@ fn b_load_null(_vm: &mut VM, _: u8) -> Value {
 // ── attribute / item handlers ─────────────────────────────────────────────────
 
 fn b_getattr(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let name = sval(&vm.pop());
     let recv = vm.pop();
     match get_property(&recv, &name) {
@@ -4908,6 +4948,7 @@ fn object_brand(h: &host::JsHost, v: &Value) -> String {
 }
 
 fn b_setattr(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let val = vm.pop();
     let name = sval(&vm.pop());
     let recv = vm.pop();
@@ -5481,6 +5522,7 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
 }
 
 fn b_getitem(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let idx = vm.pop();
     let recv = vm.pop();
     let key = match host::to_property_key(&idx) {
@@ -5494,6 +5536,7 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_setitem(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let val = vm.pop();
     let idx = vm.pop();
     let recv = vm.pop();
@@ -6165,21 +6208,43 @@ fn b_sig_unwind(vm: &mut VM, _: u8) -> Value {
 
 fn b_throw(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
+    let pos = op_pos(vm);
     let msg = with_host(|h| {
         h.exc = Some(v.clone());
         // Prefer an error object's message for the top-level report.
-        error_display(h, &v)
+        let msg = error_display(h, &v);
+        if h.source_location(pos).is_some_and(|l| l.internal) {
+            // The runtime's own JS re-throwing for the program — the ES module
+            // loader handing back an evaluation error. node reports that
+            // error as it does a rejection, where it was created.
+            if let Some(Value::Int(created)) = host::lookup_chain(h, &v, "@@pos") {
+                h.throw_site = Some(host::ThrowSite {
+                    msg: msg.clone(),
+                    pos: created as u32,
+                    depth: h.stack_depth(),
+                    frames: None,
+                });
+            }
+        } else {
+            // A `throw` is always a fresh raise, a re-`throw` of a caught value
+            // included: node's arrow points at the statement that threw last.
+            h.note_raise(&msg, pos, false);
+        }
+        msg
     });
     abort(vm, msg)
 }
 
+/// `Uncaught Name: message` for a thrown error object, `Uncaught <value>`
+/// otherwise. `name` is usually inherited (`TypeError.prototype.name`), so it
+/// is read along the prototype chain — data properties only, since this runs
+/// inside a host borrow.
 fn error_display(h: &host::JsHost, v: &Value) -> String {
     if let Some(JsObj::Object(props)) = h.get(v) {
-        let name = props
-            .get("name")
-            .map(|x| h.str_of(x))
-            .unwrap_or_else(|| "Error".into());
         if let Some(m) = props.get("message") {
+            let name = host::lookup_chain(h, v, "name")
+                .map(|x| h.str_of(&x))
+                .unwrap_or_else(|| "Error".into());
             return format!("Uncaught {name}: {}", h.str_of(m));
         }
     }
@@ -6220,6 +6285,7 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
             with_host(|h| {
                 h.error = None;
                 h.exc = None;
+                h.throw_site = None;
             });
             // The catch parameter is block-scoped to the handler.
             with_host(|h| h.push_scope());
@@ -6337,7 +6403,7 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
         (Some(c), true) => format!("{name} [{c}]"),
         _ => name.clone(),
     };
-    let frames = h.stack_frames();
+    let frames = h.raise_frames(e);
     let stack = if message.is_empty() {
         format!("{label}{frames}")
     } else {
@@ -6382,6 +6448,13 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
         };
         props.insert(k.into(), sv);
     }
+    // An error the runtime raised was created where it was raised — the place
+    // an unhandled rejection of it, or a re-throw by the runtime's own JS,
+    // reports (see `host::fatal_report`).
+    let raised_at = h.throw_site.as_ref().filter(|s| s.msg == e).map(|s| s.pos);
+    if let Some(pos) = raised_at {
+        props.insert("@@pos".into(), Value::Int(pos as i64));
+    }
     let obj = h.new_object(props);
     if let Some(p) = host::error_proto_of(h, &name) {
         h.set_proto(&obj, p);
@@ -6390,6 +6463,9 @@ pub(crate) fn synth_error(h: &mut host::JsHost, e: &str) -> Value {
     // (`Object.keys(e)` on an `ERR_INVALID_ARG_TYPE` reads `["code"]`).
     h.hide_prop(&obj, "message");
     h.hide_prop(&obj, "stack");
+    if raised_at.is_some() {
+        h.hide_prop(&obj, "@@pos");
+    }
     obj
 }
 
@@ -6800,6 +6876,7 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
 // ── calls ──────────────────────────────────────────────────────────────────────
 
 fn b_call(vm: &mut VM, argc: u8) -> Value {
+    note_site(vm);
     let mut args = pop_n(vm, argc as usize);
     let name = sval(&args.remove(0));
     let r = host::call_named(&name, args);
@@ -6847,6 +6924,7 @@ fn index_element_call(recv: &Value, name: &str, args: &[Value]) -> Option<Result
 }
 
 fn b_call_method(vm: &mut VM, argc: u8) -> Value {
+    note_site(vm);
     let mut args = pop_n(vm, argc as usize);
     let recv = args.remove(0);
     let name = call_key_of(&args.remove(0));
@@ -6862,6 +6940,7 @@ fn b_call_method(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_call_value(vm: &mut VM, argc: u8) -> Value {
+    note_site(vm);
     let mut args = pop_n(vm, argc as usize);
     let callable = args.remove(0);
     let r = host::invoke(&callable, args, None);
@@ -6883,6 +6962,7 @@ fn b_call_value(vm: &mut VM, argc: u8) -> Value {
 /// passed the array as one argument and `new Date(...[2020, 0, 1])` built an
 /// Invalid Date.
 fn b_new_spread(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let args_arr = vm.pop();
     let ctor = vm.pop();
     let args = host::iter_all(&args_arr).unwrap_or_default();
@@ -6894,6 +6974,7 @@ fn b_new_spread(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_new(vm: &mut VM, argc: u8) -> Value {
+    note_site(vm);
     let mut args = pop_n(vm, argc as usize);
     let ctor = args.remove(0);
     let r = host::construct(&ctor, args);
@@ -6907,6 +6988,7 @@ fn b_new(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_apply(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let args_arr = vm.pop();
     let callable = vm.pop();
     let args = host::iter_all(&args_arr).unwrap_or_default();
@@ -6915,6 +6997,7 @@ fn b_apply(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_apply_method(vm: &mut VM, _: u8) -> Value {
+    note_site(vm);
     let args_arr = vm.pop();
     let name = call_key_of(&vm.pop());
     let recv = vm.pop();
@@ -9080,7 +9163,8 @@ fn make_error_inner(name: &str, args: &[Value]) -> Value {
         // reports `MyErr: boom` and not the `Error: boom` this built eagerly,
         // inside `super()`, before the subclass had renamed anything. `@@stackRaw`
         // carries the frames so the read can redo it; see `materialize_stack`.
-        let frames = h.stack_frames();
+        let top = h.error_capture_top();
+        let frames = h.stack_frames_from(top);
         let stack = match &msg {
             Some(m) if !m.is_empty() => format!("{name}: {m}{frames}"),
             _ => format!("{name}{frames}"),
@@ -9089,6 +9173,9 @@ fn make_error_inner(name: &str, args: &[Value]) -> Value {
         props.insert("stack".into(), sv);
         let raw = h.new_str(frames);
         props.insert("@@stackRaw".into(), raw);
+        // Where the error was created, which is where node's source arrow
+        // points when it ends the process as an unhandled rejection.
+        props.insert("@@pos".into(), Value::Int(h.frame_pos_below(top) as i64));
         // `new Error(msg, { cause })` (ES2022): installed only when the options
         // bag actually has a `cause` key, so `new Error(m, {})` leaves none.
         let opts = args.get(1);
@@ -9111,7 +9198,7 @@ fn make_error_inner(name: &str, args: &[Value]) -> Value {
         // Every own slot an error constructor installs is non-enumerable in V8,
         // which is why `Object.keys(err)` is `[]` and `JSON.stringify(err)` is
         // `{}` — properties a *script* later assigns stay enumerable.
-        for k in ["message", "stack", "errors", "cause", "@@stackRaw"] {
+        for k in ["message", "stack", "errors", "cause", "@@stackRaw", "@@pos"] {
             h.hide_prop(&e, k);
         }
         e
@@ -10204,7 +10291,7 @@ fn array_from_async(args: Vec<Value>) -> Result<Value, String> {
     let f = match f {
         Some(f) => f,
         None => {
-            let f = crate::eval_in_global_scope(SRC)?;
+            let f = crate::eval_internal(SRC)?;
             IMPL.with(|c| *c.borrow_mut() = Some(f.clone()));
             f
         }
@@ -17540,6 +17627,7 @@ fn promise_try(args: Vec<Value>) -> Result<Value, String> {
             with_host(|h| {
                 h.error = None;
                 h.exc = None;
+                h.throw_site = None;
             });
             host::invoke(&reject, vec![err], None)?;
         }
@@ -17574,6 +17662,7 @@ fn rejected_promise(e: String) -> Value {
     with_host(|h| {
         h.error = None;
         h.exc = None;
+        h.throw_site = None;
     });
     let _ = host::invoke(&reject, vec![err], None);
     p

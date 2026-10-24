@@ -239,9 +239,11 @@ fn marker_lines(path: &str) -> HashSet<u32> {
     let mut scan = |chunk: &fusevm::Chunk| {
         for (i, op) in chunk.ops.iter().enumerate() {
             if let Op::CallBuiltin(id, _) = op {
+                // The marker's operand — the `LoadInt(line)` before it — is
+                // the line; `chunk.lines` holds source positions, not lines.
                 if *id == crate::host::ops::DBG_LINE {
-                    if let Some(l) = chunk.lines.get(i) {
-                        set.insert(*l);
+                    if let Some(Op::LoadInt(l)) = i.checked_sub(1).map(|p| &chunk.ops[p]) {
+                        set.insert(*l as u32);
                     }
                 }
             }
@@ -326,7 +328,11 @@ fn launch(program: &str) {
 /// seam ever be switched, and is a no-op for every other extension id.
 pub fn on_ext(vm: &mut VM, id: u16) {
     if id == crate::host::ops::DBG_LINE {
-        let line = *vm.chunk.lines.get(vm.ip.saturating_sub(1)).unwrap_or(&0);
+        // The marker's operand is the `LoadInt(line)` just before it.
+        let line = match vm.ip.checked_sub(2).and_then(|p| vm.chunk.ops.get(p)) {
+            Some(Op::LoadInt(l)) => *l as u32,
+            _ => 0,
+        };
         on_debug_line(line);
     }
 }

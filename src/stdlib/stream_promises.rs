@@ -40,7 +40,7 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
 /// (`crate::eval_in_global_scope`), which runs the factory in the program's
 /// module scope rather than in the calling function's frame.
 fn run_completion(src: &str) -> Result<Value, String> {
-    crate::eval_in_global_scope(src)
+    crate::eval_internal(src)
 }
 
 // `finished(stream[, options])` → a Promise. The incoming args (stream, and an

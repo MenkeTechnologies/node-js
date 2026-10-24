@@ -48,7 +48,7 @@ const CONSUMER_SRC: &str = "(function (stream, kind) {\n\
 /// (`crate::eval_in_global_scope`), which runs the factory in the program's
 /// module scope rather than in the calling function's frame.
 fn run_completion(src: &str) -> Result<Value, String> {
-    crate::eval_in_global_scope(src)
+    crate::eval_internal(src)
 }
 
 /// Module free-function dispatch (`consumers.text`, `consumers.json`, …).

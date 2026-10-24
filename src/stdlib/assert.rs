@@ -883,7 +883,7 @@ fn comparison(obj: &Value, keys: &Value, actual: &Value) -> Result<Value, String
     let factory = match FACTORY.with(|f| f.borrow().clone()) {
         Some(f) => f,
         None => {
-            let f = crate::eval_in_global_scope(
+            let f = crate::eval_internal(
                 "(() => { class Comparison { constructor(obj, keys, actual) { for (const key of keys) { if (key in obj) { if (actual !== undefined && typeof actual[key] === 'string' && Object.prototype.toString.call(obj[key]) === '[object RegExp]' && obj[key].exec(actual[key]) !== null) { this[key] = actual[key]; } else { this[key] = obj[key]; } } } } } return (obj, keys, actual) => new Comparison(obj, keys, actual); })()",
             )?;
             FACTORY.with(|c| *c.borrow_mut() = Some(f.clone()));

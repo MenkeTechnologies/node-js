@@ -369,7 +369,7 @@ fn frame_runner(frame: crate::host::AsyncFrame, target: Option<Value>) -> Result
     let factory = match FACTORY.with(|f| f.borrow().clone()) {
         Some(f) => f,
         None => {
-            let f = crate::eval_in_global_scope(
+            let f = crate::eval_internal(
                 "(function (runner, id, target) {\n\
                    if (target === undefined) return function runInAsyncScope(fn, ...args) { return runner(id, fn, undefined, ...args); };\n\
                    return function (...args) { return runner(id, target, this, ...args); };\n\

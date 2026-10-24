@@ -533,7 +533,7 @@ v26.7.0; every row marked **agrees** is now pinned by a test.
 | top-level `arguments` | the wrapper's 5 | *undefined* | *undefined* | **undefined at all three** |
 | top-level `var x` on `globalThis` | *undefined* (a wrapper local) | *undefined* | `globalThis.x` | agrees |
 | `arguments.callee` in a SLOPPY function | the function | same | same | agrees |
-| stack frame file | `file:L:C` | `[eval]:L:C` | `[stdin]:L:C` | **no `file:line:col`** |
+| stack frame file | `file:L:C` | `[eval]:L:C` | `[stdin]:L:C` | agrees (see "Uncaught exceptions and stack frames" below) |
 
 A row that used to sit in this table said node-js was **strict at all three**
 entry points. That was never true and is removed: with no `'use strict'` the
@@ -616,11 +616,9 @@ local in Node. Measured on node v26.7.0 with
 top-level bindings here and does not in Node. Closing it means running the entry
 file through the CommonJS wrapper, as Node does.
 
-`err.stack` names the REAL call chain — one `    at <function>` line per live
-frame — but carries no `file:line:column` (per-frame line tracking is only
-enabled under `--dap`) and none of Node's internal module-loader frames. So
-`.stack` is diagnosable but can never be byte-identical to V8's, and no parity
-script asserts its text. `console.log(err)` renders the stack followed by any
+`err.stack` names the REAL call chain in V8's format, `file:line:column`
+included (see "Uncaught exceptions and stack frames" below), but none of
+Node's internal module-loader frames. `console.log(err)` renders the stack followed by any
 own property a script added (`Error: x\n    at f { code: 'C' }`), the shape V8
 uses — it no longer prints an object literal exposing the internal
 `message`/`stack` slots.
@@ -3008,10 +3006,8 @@ Measured at node-js 0.1.14 against node v26.11.1.
 
 | Case | node | node-js |
 |---|---|---|
-| an uncaught throw from a file: `throw new Error("boom")` | `file:1`, the source line, a `^` caret, a blank line, `Error: boom` with its stack, a blank line, `Node.js v26.11.1`; exit 1 | `node: Uncaught Error: boom`; exit 1 |
-| an uncaught `throw new TypeError("x")`, `throw new RangeError("r")` (file or `-e`) | `TypeError: x` / `RangeError: r` in the format above | `node: Uncaught Error: x` / `node: Uncaught Error: r` — the subclass name is lost as well (a caught one reports `e.name` `TypeError` correctly) |
-| `throw 5` | the source header, `5`, then the one-line `--trace-uncaught` hint and `Node.js v26.11.1` | `node: Uncaught 5` |
-| `node --lsp`, `didOpen` of `let a = 1;\nlet b = 2;\nlet c = ;\n` | — (the diagnostic belongs on line 3) | `publishDiagnostics` puts `SyntaxError: Unexpected token ';'` on LSP line 0 (editor line 1) — every syntax error lands there. `compute_diagnostics` (`src/lsp.rs`) reads the line from a `(line N)` suffix that the parser's V8-worded messages no longer carry, and `parse_error_line` defaults to 1 |
+| an uncaught throw from a file, `throw new TypeError("x")`, `throw 5` | node's fatal-exception report | FIXED in round 23 — see "Uncaught exceptions and stack frames" |
+| `node --lsp`, `didOpen` of `let a = 1;\nlet b = 2;\nlet c = ;\n` | — (the diagnostic belongs on line 3) | FIXED in round 23: the parser records the token it stopped at (`parser::take_error_pos`), and the diagnostic sits on it (LSP line 2, character 8) |
 
 ## FIXED in round 17 — byte views, verified against node v26.12.0
 
@@ -3366,9 +3362,65 @@ Still open:
 | a read of an imported binding | a direct binding access | one extra closure call (`%imp[k]()`): 300k calls of an imported function took 2893 ms against 1947 ms for a local one (debug build) |
 | `import * as p from 'process'` (and other core modules) `Object.keys(p)` | every key `Object.keys(process)` lists in node (84) | the keys this runtime enumerates (47). A named import of a member it does not list but that reads back defined (`import { argv } from 'process'`) still links |
 | core-module named exports | a snapshot, refreshed by `module.syncBuiltinESMExports()` | read from the module object on each access |
-| an uncaught link or evaluation error of the entry module | `file:///…:line`, the source line and a caret, then the error | the error only, in this runtime's uncaught-error format |
 | unsettled top-level `await` | the warning names `file:///…:line` and shows the source line | the warning names the module URL only (exit status 13 matches) |
 | `require()` of an ES module that is still evaluating (a cycle through `require`) | `ERR_REQUIRE_CYCLE_MODULE` | the namespace, partially evaluated |
 | `--import`, `--loader`, `module.register` hooks; `data:` URLs; `--input-type`; WebAssembly and source-phase imports | supported | absent |
 | `--dump-ast`, `--dump-bytecode`, `--disasm`, `--tiers`, `--build`, `--dap` on a module file | — | parse the file as a script |
 | the bytecode cache | — | module files are compiled on every run; only scripts are cached |
+
+## Uncaught exceptions and stack frames — round 23, verified against node v26.12.1
+
+Pinned in `tests/fatal_report.rs`, each expectation node's stderr with its
+`node:internal/…` frames removed.
+
+An exception that ends the process prints what node's `ReportFatalException`
+(`src/node_errors.cc`) prints: the source arrow (`file:line`, the source line,
+a `^` under the raise), a blank line, `util.inspect(err, { customInspect: false,
+depth: 5 })` — the stack plus any own properties — a blank line and
+`Node.js <version>`. A thrown primitive gets the leading blank line and the
+`(Use \`node --trace-uncaught ...\`)` hint; a non-error object thrown from a
+file gets the arrow behind a blank line. The `exit` listeners run first, as in
+node. `err.stack` frames read `at f (file:line:col)`, `at new C (…)`,
+`at Type.m (…)`, `at get g (…)`, and the bare `at file:line:col` of an
+anonymous function or an `[eval]` / ES-module top level.
+
+How it is built: the parser gives calls, `new`, member and index accesses and
+statements a source position (`ast::Pos`); the compiler stores it in the
+`lines` entry of the op that performs it (statements fill the rest), and
+`load_merged_from` rebases it into the host's source address space, where
+`JsHost::source_location` resolves it against the script's text and its
+origin (absolute path, `file://` URL, `[eval]`, `[stdin]`). The call ops and
+property accesses record their position (`host::set_op_pos`), so each frame
+knows where it is.
+
+| Case | node | was |
+|---|---|---|
+| `function f() { throw new TypeError("boom") } f()` | the arrow at `throw`, `TypeError: boom`, `at f (file:2:9)`, `at Object.<anonymous> (file:5:1)`, `Node.js v…`; exit 1 | `node: Uncaught Error: boom` — the class name lost too |
+| `throw 5`, `throw "s"` | blank line, arrow, `5`, the `--trace-uncaught` hint | `node: Uncaught 5` |
+| `null.x`, `o.f()` on a non-function | the arrow under the property | `node: TypeError: …`, no arrow |
+| an error with own properties | the stack, then `{ code: 'E1' }` | the message only |
+| an unhandled rejection, an ES module's evaluation error | the arrow where the error was created (`new`) | the message only |
+| a required module's throw | the module's own `file:line`; its frames `Object.<anonymous>` | the message only |
+| a SyntaxError in the entry file, a required file or an ES module | the arrow under the offending token | the message, plus a `while loading <file>` line for a required file |
+| `new Error().stack` | `    at f (file:line:col)` per frame | `    at f` — no location; anonymous functions printed as an empty name |
+| `this` at a required module's top level | `module.exports` | `globalThis` |
+| `node --lsp` diagnostics for a syntax error | on the offending token | on the first line of the file |
+
+### Still open — found in round 23, not fixed
+
+| Case | node | node-js |
+|---|---|---|
+| a timer callback's frame | `at Timeout._onTimeout (…)`, `at Timeout.tick [as _onTimeout] (…)` | `at file:line:col` / `at tick (…)` — a timer callback is not called on a `Timeout` object here |
+| an anonymous function stored as a method, a method called under another name | `at F.s (…)`, `at Object.named [as m] (…)` | `at F.<anonymous> (…)`, `at Object.named (…)` — a frame does not know the property its function was found under |
+| an async function after an `await` | its caller as `at async caller (…)` | the caller frame is absent (V8's async stack traces are not modelled) |
+| native frames | `at Array.map (<anonymous>)`, `at JSON.parse (<anonymous>)` | absent: native functions push no frame |
+| node's own frames | `at Module._compile (node:internal/…)` … | absent: the runtime has no such JS |
+| a `ReferenceError` inside `return x` / `if (x)` | the arrow at `return` / `if` (V8's statement position) | the arrow at `x`: an identifier has no position, so it is found by name from its statement |
+| `a = 2` to a `const`, `` `${sym}` `` | the arrow at `=` / the template | the arrow at the statement start |
+| an error a getter, `valueOf` or iterator `next` raised from inside an operator other than a call or property access | the operator's position | the position of the frame's previous call or property access |
+| a SyntaxError inside a template field (`` `a${1 +}` ``) | `Unexpected token '}'` at the `}` | `Unexpected end of input` past it — the field is parsed on its own |
+| `JSON.parse("{")` uncaught | an arrow into `<anonymous_script>` | the arrow at the call |
+| `node -e` with a SyntaxError | an `Expression expected` line from node's TypeScript fallback | no such line |
+| stderr is a terminal | the inspected error in colour | no colour: `util.inspect` has none |
+| `Object.setPrototypeOf(err, null)` thrown | `[Error: null prototype]: x` and its stack | `[Object: null prototype] {}` — `util.inspect` does not recognise the error |
+| `process.version` / the report trailer | `v26.12.1` | `v26.5.0`, the version this runtime reports |

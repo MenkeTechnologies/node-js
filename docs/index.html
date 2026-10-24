@@ -117,7 +117,7 @@ console.log(`hello, ${name}! ${6 * 7}`);  // =&gt; hello, world! 42</pre>
 <pre>node script.js                     # run a file
 node -e 'console.log(1 + 1)'       # evaluate a one-liner
 echo 'console.log(6 * 7)' | node   # read a script from stdin</pre>
-        <p>Errors go to stderr in terse <code>node: &lt;reason&gt;</code> form; nothing else is printed. Runnable <code>examples/*.js</code> ship with the crate.</p>
+        <p>A failure to start goes to stderr in terse <code>node: &lt;reason&gt;</code> form; nothing else is printed. An uncaught exception prints Node's report: the <code>file:line</code> source arrow, the error's stack with <code>file:line:col</code> frames, and the <code>Node.js &lt;version&gt;</code> line. Runnable <code>examples/*.js</code> ship with the crate.</p>
       </section>
 
       <section class="tutorial-section">

@@ -60,7 +60,7 @@ fn file_handle_module() -> Result<Value, String> {
     if let Some(m) = MODULE.with(|m| m.borrow().clone()) {
         return Ok(m);
     }
-    let factory = crate::eval_in_global_scope(include_str!("fs_filehandle.js"))?;
+    let factory = crate::eval_internal(include_str!("fs_filehandle.js"))?;
     let (node_error, cancel) = with_host(|h| {
         (
             h.alloc(crate::host::JsObj::Builtin("util.@@nodeError".into())),

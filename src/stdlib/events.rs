@@ -411,7 +411,7 @@ fn once_wrap(target: &Value, event: &Value, f: &Value) -> Result<Value, String> 
     let factory = match FACTORY.with(|c| c.borrow().clone()) {
         Some(f) => f,
         None => {
-            let made = crate::eval_in_global_scope(ONCE_WRAP_SRC)?;
+            let made = crate::eval_internal(ONCE_WRAP_SRC)?;
             FACTORY.with(|c| *c.borrow_mut() = Some(made.clone()));
             made
         }
@@ -787,7 +787,7 @@ fn events_on(args: &[Value]) -> Result<Value, String> {
     let on = match ON.with(|o| o.borrow().clone()) {
         Some(f) => f,
         None => {
-            let factory = crate::eval_in_global_scope(include_str!("events_on.js"))?;
+            let factory = crate::eval_internal(include_str!("events_on.js"))?;
             let node_error = with_host(|h| h.alloc(JsObj::Builtin("util.@@nodeError".into())));
             let made = invoke(&factory, vec![node_error], None)?;
             ON.with(|o| *o.borrow_mut() = Some(made.clone()));

@@ -163,6 +163,7 @@ fn parse_source(
     in_eval: bool,
     caller_strict: bool,
 ) -> Result<Vec<Stmt>, String> {
+    ERROR_POS.with(|p| p.set(0));
     let desugared = crate::rust_ffi::desugar(src);
     // A `rust { … }` block is rewritten before lexing, so offsets would point
     // into text the caller never sees; record spans only when nothing moved.
@@ -187,9 +188,21 @@ fn parse_source(
     p.strict = caller_strict || p.leading_use_strict(0);
     let mut out = Vec::new();
     while !p.at_eof() {
-        out.push(p.parse_stmt()?);
+        out.push(p.note_error_pos(Parser::parse_stmt)?);
     }
     Ok(out)
+}
+
+thread_local! {
+    /// Where the last parse that failed stopped — see [`take_error_pos`].
+    static ERROR_POS: std::cell::Cell<Pos> = const { std::cell::Cell::new(0) };
+}
+
+/// The [`Pos`] of the token the last failed [`parse`] / [`parse_module`]
+/// stopped at (`0`: none, or none since the last call), which is where V8 puts
+/// a SyntaxError's caret.
+pub fn take_error_pos() -> Pos {
+    ERROR_POS.with(|p| p.replace(0))
 }
 
 /// Parse `src` with the Module goal (ECMA-262 16.2.1): the code is strict,
@@ -197,6 +210,7 @@ fn parse_source(
 /// top level may hold `import`/`export` declarations. A hashbang line is a
 /// comment only at the very start of the text.
 pub fn parse_module(src: &str) -> Result<Vec<Stmt>, String> {
+    ERROR_POS.with(|p| p.set(0));
     let toks = lex(src)?;
     let mut p = Parser {
         toks,
@@ -227,7 +241,7 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, String> {
         {
             p.parse_import()?
         } else {
-            out.push(p.parse_stmt()?);
+            out.push(p.note_error_pos(Parser::parse_stmt)?);
             continue;
         };
         out.push(Stmt::new(item, line));
@@ -267,6 +281,41 @@ impl Parser {
             scope.used.extend(inner.used);
         }
         Ok(e)
+    }
+
+    /// The [`Pos`] of the current token: one past its byte offset, or `0`
+    /// when this parser's offsets do not index the caller's text.
+    fn pos_here(&self) -> Pos {
+        if self.spans {
+            self.toks[self.pos].start + 1
+        } else {
+            0
+        }
+    }
+
+    /// Run one parse step; when it fails, record the token it stopped at for
+    /// [`take_error_pos`].
+    fn note_error_pos<T>(
+        &mut self,
+        step: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let r = step(self);
+        if r.is_err() {
+            let pos = self.pos_here();
+            ERROR_POS.with(|p| p.set(pos));
+        }
+        r
+    }
+
+    /// The [`Pos`] V8 gives a call whose `(` is the current token: the token
+    /// before it when that is a name (`f(`, `o.m(` — "for call of an identifier
+    /// we want to report position of the identifier", `ParseLeftHandSideContinuation`),
+    /// else the parenthesis itself (`o[k](`, `f()(`, `f?.(`).
+    fn call_pos(&self) -> Pos {
+        match self.pos.checked_sub(1).map(|i| &self.toks[i]) {
+            Some(t) if self.spans && matches!(t.tok, Tok::Ident(_)) => t.start + 1,
+            _ => self.pos_here(),
+        }
     }
 
     /// Byte offset where token `i` begins.
@@ -537,6 +586,7 @@ impl Parser {
 
     fn parse_stmt_inner(&mut self) -> Result<Stmt, String> {
         let line = self.line();
+        let pos = self.pos_here();
         let kind = match self.tok().clone() {
             Tok::Punct(p) if p == "{" => {
                 self.advance();
@@ -668,7 +718,7 @@ impl Parser {
                 StmtKind::Expr(e)
             }
         };
-        Ok(Stmt::new(kind, line))
+        Ok(Stmt::at(kind, line, pos))
     }
 
     /// Whether the token `n` ahead is the punctuator `p`.
@@ -2007,6 +2057,7 @@ impl Parser {
     }
 
     fn parse_call_member(&mut self) -> Result<Expr, String> {
+        let new_pos = self.pos_here();
         let mut e = if self.eat_kw("new") {
             // `new.target` meta-property.
             if self.is_punct(".") {
@@ -2036,6 +2087,7 @@ impl Parser {
                 Expr::New {
                     callee: Box::new(callee),
                     args,
+                    pos: new_pos,
                 }
             }
         } else {
@@ -2043,12 +2095,14 @@ impl Parser {
         };
         loop {
             if self.eat_punct(".") {
+                let pos = self.pos_here();
                 let property = self.ident_name()?;
                 self.check_private_in_scope(&property)?;
                 e = Expr::Member {
                     object: Box::new(e),
                     property,
                     optional: false,
+                    pos,
                 };
             } else if self.eat_punct("?.") {
                 if matches!(self.tok(), Tok::Template { .. }) {
@@ -2057,13 +2111,16 @@ impl Parser {
                     );
                 }
                 if self.is_punct("(") {
+                    let pos = self.call_pos();
                     let args = self.parse_args()?;
                     e = Expr::Call {
                         func: Box::new(e),
                         args,
                         optional: true,
+                        pos,
                     };
                 } else if self.is_punct("[") {
+                    let pos = self.pos_here();
                     self.advance();
                     let index = self.allow_in(|p| p.parse_expr())?;
                     self.expect_punct("]")?;
@@ -2071,16 +2128,20 @@ impl Parser {
                         object: Box::new(e),
                         index: Box::new(index),
                         optional: true,
+                        pos,
                     };
                 } else {
+                    let pos = self.pos_here();
                     let property = self.ident_name()?;
                     e = Expr::Member {
                         object: Box::new(e),
                         property,
                         optional: true,
+                        pos,
                     };
                 }
             } else if self.is_punct("[") {
+                let pos = self.pos_here();
                 self.advance();
                 let index = self.allow_in(|p| p.parse_expr())?;
                 self.expect_punct("]")?;
@@ -2088,13 +2149,16 @@ impl Parser {
                     object: Box::new(e),
                     index: Box::new(index),
                     optional: false,
+                    pos,
                 };
             } else if self.is_punct("(") {
+                let pos = self.call_pos();
                 let args = self.parse_args()?;
                 e = Expr::Call {
                     func: Box::new(e),
                     args,
                     optional: false,
+                    pos,
                 };
             } else if matches!(self.tok(), Tok::Template { .. }) {
                 // A template literal immediately after a callee is a *tagged*
@@ -2145,14 +2209,17 @@ impl Parser {
         let mut e = self.parse_primary()?;
         loop {
             if self.eat_punct(".") {
+                let pos = self.pos_here();
                 let property = self.ident_name()?;
                 self.check_private_in_scope(&property)?;
                 e = Expr::Member {
                     object: Box::new(e),
                     property,
                     optional: false,
+                    pos,
                 };
             } else if self.is_punct("[") {
+                let pos = self.pos_here();
                 self.advance();
                 let index = self.allow_in(|p| p.parse_expr())?;
                 self.expect_punct("]")?;
@@ -2160,6 +2227,7 @@ impl Parser {
                     object: Box::new(e),
                     index: Box::new(index),
                     optional: false,
+                    pos,
                 };
             } else {
                 break;
@@ -2314,6 +2382,7 @@ impl Parser {
                             object: Box::new(Expr::Ident("import".into())),
                             property: "meta".into(),
                             optional: false,
+                            pos: 0,
                         })
                     }
                     "import" if !self.peek_punct_at(1, "(") => Err(self.unexpected()),

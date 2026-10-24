@@ -1079,13 +1079,13 @@ fn compute_diagnostics(text: &str) -> Vec<Diagnostic> {
     match crate::parser::parse(text) {
         Ok(_) => Vec::new(),
         Err(e) => {
-            let line = parse_error_line(&e).saturating_sub(1);
+            let start = error_position(text, crate::parser::take_error_pos());
             vec![Diagnostic {
                 range: Range {
-                    start: Position { line, character: 0 },
+                    start,
                     end: Position {
-                        line,
-                        character: 200,
+                        line: start.line,
+                        character: start.character + 1,
                     },
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -1096,13 +1096,20 @@ fn compute_diagnostics(text: &str) -> Vec<Diagnostic> {
     }
 }
 
-/// Extract the (1-based) line number from a node-js parser error, which embeds
-/// it as `… (line N)`. Defaults to line 1 when no such marker is present.
-fn parse_error_line(e: &str) -> u32 {
-    e.rsplit_once("(line ")
-        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(1)
+/// The LSP position (0-based line, UTF-16 column) of the token a failed parse
+/// stopped at — `at` from `parser::take_error_pos`, `0` when the parser
+/// recorded none, which places the diagnostic at the start of the text.
+fn error_position(text: &str, at: crate::ast::Pos) -> Position {
+    let mut off = (at.saturating_sub(1) as usize).min(text.len());
+    while !text.is_char_boundary(off) {
+        off -= 1;
+    }
+    let before = &text[..off];
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    Position {
+        line: before.matches('\n').count() as u32,
+        character: before[line_start..].encode_utf16().count() as u32,
+    }
 }
 
 /// Exit if reparented to pid 1 (the editor died) so we never leak.
@@ -1127,4 +1134,20 @@ fn spawn_orphan_guard() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A syntax error is reported on the line and column of the token the
+    /// parser stopped at — it used to land on line 0 whatever the line.
+    #[test]
+    fn a_diagnostic_sits_on_the_offending_token() {
+        let d = compute_diagnostics("let a = 1;\nlet b = 2;\nlet é = ;\n");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].message, "SyntaxError: Unexpected token ';'");
+        assert_eq!(d[0].range.start, Position { line: 2, character: 8 });
+        assert_eq!(d[0].range.end, Position { line: 2, character: 9 });
+    }
 }
