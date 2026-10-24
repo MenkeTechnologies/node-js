@@ -42,6 +42,32 @@ pub const COMPONENTS: &[&str] = &[
     "href",
 ];
 
+/// `url.protocol = 'file'` on a special non-file URL, which the WHATWG
+/// protocol setter allows unless the URL has credentials or a port (the scheme
+/// state with a state override, steps 2.1.1-2.1.3). The `url` crate refuses
+/// every such change (it rejects a `file` scheme on any URL with an authority),
+/// so this applies it: the scheme is replaced, the rest kept, and the result
+/// re-parsed. The re-parse is what refuses credentials and a port (a file URL
+/// can carry neither), and it re-runs file-host parsing, which turns a
+/// `localhost` host into the empty one where the setter keeps it (BUGS.md).
+fn special_to_file(u: &url::Url, value: &str) -> Option<url::Url> {
+    // The scheme state's buffer: ASCII alphanumerics, `+`, `-` and `.`, ended
+    // by `:` or the end of input (anything else refuses the assignment).
+    let end = value
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .unwrap_or(value.len());
+    let (scheme, rest) = value.split_at(end);
+    if !(rest.is_empty() || rest.starts_with(':')) {
+        return None;
+    }
+    let special = ["http", "https", "ws", "wss", "ftp"];
+    if !scheme.eq_ignore_ascii_case("file") || !special.contains(&u.scheme()) {
+        return None;
+    }
+    let href = u.as_str();
+    url::Url::parse(&format!("file{}", &href[u.scheme().len()..])).ok()
+}
+
 /// Whether `name` is a `URL` component whose assignment must refresh the
 /// derived fields.
 pub fn is_component(name: &str) -> bool {
@@ -92,7 +118,11 @@ pub fn set_component(url_obj: &Value, key: &str, v: &Value) -> Result<(), String
             })?;
         }
         "protocol" => {
-            let _ = quirks::set_protocol(&mut u, &value);
+            if quirks::set_protocol(&mut u, &value).is_err() {
+                if let Some(file) = special_to_file(&u, &value) {
+                    u = file;
+                }
+            }
         }
         "username" => {
             let _ = quirks::set_username(&mut u, &value);

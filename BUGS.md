@@ -3273,14 +3273,15 @@ Still open, found here:
 | `require('node:test')` | the test runner (`test`, `describe`, `it`, `mock`, reporters) | `Cannot find module` |
 | `SubtleCrypto.prototype` | every WebCrypto method | `digest` only — WebCrypto itself is not implemented |
 | `Performance.prototype.toJSON`, `nodeTiming`, `markResourceTiming`, `onresourcetimingbufferfull` | members | absent (`nodeTiming`'s bootstrap milestones are not recorded) |
-| `u = new URL('http://a/'); u.protocol = 'file'` | `file://a/` | unchanged — the vendored `url` crate refuses that scheme change |
+| `u = new URL('http://localhost/x'); u.protocol = 'file'` | `file://localhost/x` | `file:///x`: the `url` crate refuses every change to `file`, so node-js applies it by re-parsing, and file-host parsing empties a `localhost` host that the setter keeps |
 | `parity-scripts/stdlib/37_spawn_events.js` | — | the REFERENCE is non-deterministic (node printed a different interleaving 1 run in 12) |
 
 ## FIXED in round 22 — verified against node v26.12.1
 
 Pinned in `examples/asynciteratorproto.js`, `timerdeadlines.js`,
 `webstreampull.js`, `bytestreams.js`, `webstreampipe.js`,
-`coresymbolprops.js`, `accessorexports.js` and `emitterproto.js`; each fix was
+`coresymbolprops.js`, `accessorexports.js`, `emitterproto.js` and
+`urlprotocolfile.js`; each fix was
 re-broken alone and its record went red.
 
 | Case | node | was |
@@ -3303,6 +3304,7 @@ re-broken alone and its record went red.
 | `o.propertyIsEnumerable(sym)` for any symbol-keyed property | its `enumerable` | `false` — the symbol's display string was looked up |
 | core-module exports node defines as accessors (`timers.promises`, `crypto.webcrypto`, `events.defaultMaxListeners`, …; measured: `CORE_ACCESSOR_EXPORTS`) | an accessor descriptor (getter/setter names measured); `[Getter]` / `[Getter/Setter]` under inspect | a data property holding the value |
 | `http.globalAgent === http.globalAgent` (and `https`) | `true` | `false` — a new Agent per read |
+| `u = new URL('http://a/'); u.protocol = 'file'` (any special URL without credentials or a port) | `file://a/` | unchanged — the `url` crate refuses every change to `file`; node-js now applies it itself |
 | `EventEmitter.prototype.on` (any of its methods), `EventEmitter.prototype.on === EventEmitter.prototype.addListener` | the method; `true` | `undefined` while `getOwnPropertyNames` listed the name |
 | `Object.getOwnPropertyNames(EventEmitter.prototype)`, `Object.keys` | node's order with `_events`, `_eventsCount`, `_maxListeners` (measured: `CLASS_PROTO_ORDER`) | the method list alone |
 | `Object.getPrototypeOf(new EventEmitter()) === EventEmitter.prototype` when the prototype is read first | `true` | `false` — a namespace handle until the first emitter built the real object |

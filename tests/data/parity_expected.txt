@@ -3612,6 +3612,56 @@ detached z=1&y=2 2
 statics  function function
 canParse true false true
 parse    https://a.com/x null https://a.com/p
+==== urlprotocolfile.js ====
+http://a/ "file" -> file://a/ file: a null
+http://a/ "FILE:junk" -> file://a/ file: a null
+http://a/ "file x" -> http://a/ http: a http://a
+http://a/ "file+x" -> http://a/ http: a http://a
+http://a/ "1file" -> http://a/ http: a http://a
+http://a/ "fi le" -> http://a/ http: a http://a
+https://A.b/%7e "file" -> file://a.b/%7e file: a.b null
+https://A.b/%7e "FILE:junk" -> file://a.b/%7e file: a.b null
+https://A.b/%7e "file x" -> https://a.b/%7e https: a.b https://a.b
+https://A.b/%7e "file+x" -> https://a.b/%7e https: a.b https://a.b
+https://A.b/%7e "1file" -> https://a.b/%7e https: a.b https://a.b
+https://A.b/%7e "fi le" -> https://a.b/%7e https: a.b https://a.b
+ws://x/y "file" -> file://x/y file: x null
+ws://x/y "FILE:junk" -> file://x/y file: x null
+ws://x/y "file x" -> ws://x/y ws: x ws://x
+ws://x/y "file+x" -> ws://x/y ws: x ws://x
+ws://x/y "1file" -> ws://x/y ws: x ws://x
+ws://x/y "fi le" -> ws://x/y ws: x ws://x
+ftp://h/p?x#f "file" -> file://h/p?x#f file: h null
+ftp://h/p?x#f "FILE:junk" -> file://h/p?x#f file: h null
+ftp://h/p?x#f "file x" -> ftp://h/p?x#f ftp: h ftp://h
+ftp://h/p?x#f "file+x" -> ftp://h/p?x#f ftp: h ftp://h
+ftp://h/p?x#f "1file" -> ftp://h/p?x#f ftp: h ftp://h
+ftp://h/p?x#f "fi le" -> ftp://h/p?x#f ftp: h ftp://h
+http://u:p@a/ "file" -> http://u:p@a/ http: a http://a
+http://u:p@a/ "FILE:junk" -> http://u:p@a/ http: a http://a
+http://u:p@a/ "file x" -> http://u:p@a/ http: a http://a
+http://u:p@a/ "file+x" -> http://u:p@a/ http: a http://a
+http://u:p@a/ "1file" -> http://u:p@a/ http: a http://a
+http://u:p@a/ "fi le" -> http://u:p@a/ http: a http://a
+http://a:81/ "file" -> http://a:81/ http: a:81 http://a:81
+http://a:81/ "FILE:junk" -> http://a:81/ http: a:81 http://a:81
+http://a:81/ "file x" -> http://a:81/ http: a:81 http://a:81
+http://a:81/ "file+x" -> http://a:81/ http: a:81 http://a:81
+http://a:81/ "1file" -> http://a:81/ http: a:81 http://a:81
+http://a:81/ "fi le" -> http://a:81/ http: a:81 http://a:81
+file://h/p "file" -> file://h/p file: h null
+file://h/p "FILE:junk" -> file://h/p file: h null
+file://h/p "file x" -> file://h/p file: h null
+file://h/p "file+x" -> file://h/p file: h null
+file://h/p "1file" -> file://h/p file: h null
+file://h/p "fi le" -> file://h/p file: h null
+foo://h/p "file" -> foo://h/p foo: h null
+foo://h/p "FILE:junk" -> foo://h/p foo: h null
+foo://h/p "file x" -> foo://h/p foo: h null
+foo://h/p "file+x" -> file+x://h/p file+x: h null
+foo://h/p "1file" -> foo://h/p foo: h null
+foo://h/p "fi le" -> foo://h/p foo: h null
+/b ?c=1 1 file://a/b?c=1 "file://a/b?c=1"
 ==== urls.js ====
 encode   /a%20b ?c=d%20e #f%20g
 href     https://a.b/a%20b?c=d%20e#f%20g
