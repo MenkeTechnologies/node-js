@@ -1901,10 +1901,9 @@ fn parse_file(path: &str) -> Result<Value, String> {
             std::fs::read_to_string(path).map_err(|e| format!("Error: cannot read {path}: {e}"))?
         }
     };
-    let stmts = crate::parser::parse_module(&source).map_err(|e| {
+    let stmts = crate::parser::parse_module(&source).inspect_err(|e| {
         let at = crate::parser::take_error_pos();
-        host::note_syntax_error(&source, host::ScriptOrigin::named(file_url(path)), &e, at);
-        e
+        host::note_syntax_error(&source, host::ScriptOrigin::named(file_url(path)), e, at);
     })?;
     let info = analyze(&stmts)?;
     let lowered = lower(stmts, &info, path, false);
@@ -2052,7 +2051,9 @@ fn loader() -> Result<Value, String> {
     }
     let factory = crate::eval_in_global_scope_from(
         include_str!("esm_loader.js"),
-        Some(host::ScriptOrigin::internal("node:internal/modules/esm/loader")),
+        Some(host::ScriptOrigin::internal(
+            "node:internal/modules/esm/loader",
+        )),
     )?;
     let mut natives = indexmap::IndexMap::new();
     for n in [

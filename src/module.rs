@@ -465,7 +465,13 @@ fn load_file(path: &Path, parent: &str) -> Result<Value, String> {
     // node calls the wrapper with `this` = `module.exports`.
     host::invoke(
         &wrapper,
-        vec![exports.clone(), require_fn, module.clone(), dirname, filename],
+        vec![
+            exports.clone(),
+            require_fn,
+            module.clone(),
+            dirname,
+            filename,
+        ],
         Some(exports),
     )?;
     mark_loaded(&module);
@@ -572,11 +578,11 @@ fn compile_wrapper(source: &str, path: &Path) -> Result<Value, String> {
         line_shift: 1,
         internal: false,
     };
-    let text = format!("(function (exports, require, module, __dirname, __filename) {{\n{source}\n}})");
-    crate::eval_in_global_scope_from(&text, Some(origin.clone())).map_err(|e| {
+    let text =
+        format!("(function (exports, require, module, __dirname, __filename) {{\n{source}\n}})");
+    crate::eval_in_global_scope_from(&text, Some(origin.clone())).inspect_err(|e| {
         let at = crate::parser::take_error_pos();
-        host::note_syntax_error(&text, origin, &e, at);
-        e
+        host::note_syntax_error(&text, origin, e, at);
     })
 }
 

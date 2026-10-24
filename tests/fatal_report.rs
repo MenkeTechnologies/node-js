@@ -47,12 +47,19 @@ fn run_node(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            panic!("node {args:?} did not exit within {}s", CHILD_BUDGET.as_secs());
+            panic!(
+                "node {args:?} did not exit within {}s",
+                CHILD_BUDGET.as_secs()
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     };
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
-    (status.code().unwrap_or(-1), read(&out_path), read(&err_path))
+    (
+        status.code().unwrap_or(-1),
+        read(&out_path),
+        read(&err_path),
+    )
 }
 
 /// `expected` with `{dir}` replaced by the fixture directory and the
@@ -100,7 +107,10 @@ fn a_runtime_type_error_points_at_the_property() {
 #[test]
 fn an_errors_own_properties_follow_its_stack() {
     assert_fatal(
-        &[("props.js", "const e = new Error(\"bad\");\ne.code = \"E_BAD\";\nthrow e;\n")],
+        &[(
+            "props.js",
+            "const e = new Error(\"bad\");\ne.code = \"E_BAD\";\nthrow e;\n",
+        )],
         &["props.js"],
         "{dir}/props.js:3\nthrow e;\n^\n\n\
          Error: bad\n    at Object.<anonymous> ({dir}/props.js:1:11) {\n  code: 'E_BAD'\n}\n\n\
@@ -249,7 +259,10 @@ fn stack_frames_are_named_as_v8_names_them() {
 fn a_required_modules_this_is_its_exports() {
     let (_keep, dir) = fixture(&[
         ("entry.js", "require(\"./dep.js\");\n"),
-        ("dep.js", "console.log(this === module.exports, this === globalThis);\n"),
+        (
+            "dep.js",
+            "console.log(this === module.exports, this === globalThis);\n",
+        ),
     ]);
     let (code, stdout, stderr) = run_node(&dir, &["entry.js"]);
     assert_eq!(code, 0, "stderr: {stderr}");

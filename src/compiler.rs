@@ -4346,9 +4346,9 @@ impl Compiler {
                     }
                 }
                 PosScope::Operation => {
-                    let op = range
-                        .rev()
-                        .find(|&i| matches!(chunk.ops[i], Op::CallBuiltin(..)) && chunk.lines[i] == 0);
+                    let op = range.rev().find(|&i| {
+                        matches!(chunk.ops[i], Op::CallBuiltin(..)) && chunk.lines[i] == 0
+                    });
                     if let Some(i) = op {
                         chunk.lines[i] = m.pos;
                     }

@@ -253,9 +253,10 @@ fn expr_slot_safe(e: &Expr) -> bool {
         }
         Expr::Assign { target, value, .. } => expr_slot_safe(target) && expr_slot_safe(value),
         Expr::Update { target, .. } => expr_slot_safe(target),
-        Expr::Call { func, args, .. } | Expr::New { callee: func, args, .. } => {
-            expr_slot_safe(func) && all(args)
-        }
+        Expr::Call { func, args, .. }
+        | Expr::New {
+            callee: func, args, ..
+        } => expr_slot_safe(func) && all(args),
         Expr::Member { object, .. } => expr_slot_safe(object),
         Expr::Index { object, index, .. } => expr_slot_safe(object) && expr_slot_safe(index),
         // Its own chunk, its own frame; `collect_escaping_expr` takes the names.
@@ -547,7 +548,10 @@ impl Planner {
                 self.walk_expr(cons);
                 self.walk_expr(alt);
             }
-            Expr::Call { func, args, .. } | Expr::New { callee: func, args, .. } => {
+            Expr::Call { func, args, .. }
+            | Expr::New {
+                callee: func, args, ..
+            } => {
                 self.walk_expr(func);
                 self.walk_all(args);
             }
@@ -744,7 +748,10 @@ fn collect_escaping_expr(e: &Expr, out: &mut FxHashSet<String>) {
             collect_escaping_expr(value, out);
         }
         Expr::Update { target, .. } => collect_escaping_expr(target, out),
-        Expr::Call { func, args, .. } | Expr::New { callee: func, args, .. } => {
+        Expr::Call { func, args, .. }
+        | Expr::New {
+            callee: func, args, ..
+        } => {
             collect_escaping_expr(func, out);
             args.iter().for_each(|x| collect_escaping_expr(x, out));
         }
@@ -949,7 +956,10 @@ fn collect_all_idents_expr(e: &Expr, out: &mut FxHashSet<String>) {
             collect_all_idents_expr(value, out);
         }
         Expr::Update { target, .. } => collect_all_idents_expr(target, out),
-        Expr::Call { func, args, .. } | Expr::New { callee: func, args, .. } => {
+        Expr::Call { func, args, .. }
+        | Expr::New {
+            callee: func, args, ..
+        } => {
             collect_all_idents_expr(func, out);
             all(args, out);
         }

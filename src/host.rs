@@ -3030,7 +3030,9 @@ impl JsHost {
         match (method_type, own) {
             // `AppendMethodCall` drops the type when the name already starts
             // with it; an accessor (`get g`) prints without one as well.
-            (Some(t), Some(n)) if n.starts_with(&t) || n.starts_with("get ") || n.starts_with("set ") => {
+            (Some(t), Some(n))
+                if n.starts_with(&t) || n.starts_with("get ") || n.starts_with("set ") =>
+            {
                 Some(n.to_string())
             }
             (Some(t), Some(n)) => Some(format!("{t}.{n}")),
@@ -3066,7 +3068,11 @@ impl JsHost {
     pub fn name_position(&self, pos: u32, name: &str) -> u32 {
         let Some(r) = pos
             .checked_sub(1)
-            .and_then(|_| self.source_map.partition_point(|r| r.base <= pos).checked_sub(1))
+            .and_then(|_| {
+                self.source_map
+                    .partition_point(|r| r.base <= pos)
+                    .checked_sub(1)
+            })
             .map(|i| &self.source_map[i])
         else {
             return pos;
@@ -3096,7 +3102,10 @@ impl JsHost {
         if pos == 0 {
             return None;
         }
-        let r = &self.source_map[self.source_map.partition_point(|r| r.base <= pos).checked_sub(1)?];
+        let r = &self.source_map[self
+            .source_map
+            .partition_point(|r| r.base <= pos)
+            .checked_sub(1)?];
         let text: &str = self.scripts.get(r.script as usize)?;
         let mut off = ((pos - r.base) as usize).min(text.len());
         while !text.is_char_boundary(off) {
@@ -3112,7 +3121,9 @@ impl JsHost {
         let end = starts
             .get(line_ix + 1)
             .map_or(text.len(), |&s| s as usize - 1);
-        let source_line = text[start..end].strip_suffix('\r').unwrap_or(&text[start..end]);
+        let source_line = text[start..end]
+            .strip_suffix('\r')
+            .unwrap_or(&text[start..end]);
         // A stack captures up to ten of these per error; most lines are ASCII,
         // whose UTF-16 length is the byte length.
         let prefix = &text[start..off];
@@ -3123,7 +3134,9 @@ impl JsHost {
         };
         Some(SourceLocation {
             name: &r.origin.name,
-            line: (line_ix as u32 + 1).saturating_sub(r.origin.line_shift).max(1),
+            line: (line_ix as u32 + 1)
+                .saturating_sub(r.origin.line_shift)
+                .max(1),
             col: col as u32 + 1,
             source_line,
             internal: r.origin.internal,
@@ -3187,7 +3200,9 @@ impl JsHost {
         while top > 0 {
             let f = &self.frames[top - 1];
             match &f.new_target {
-                Some(Value::Obj(t)) if *t == target && f.this_state == ThisState::Pending => top -= 1,
+                Some(Value::Obj(t)) if *t == target && f.this_state == ThisState::Pending => {
+                    top -= 1
+                }
                 _ => break,
             }
         }
@@ -4597,8 +4612,7 @@ fn uncaught_value(msg: &str) -> Value {
 pub fn fatal_report(msg: &str) -> String {
     let value = uncaught_value(msg);
     let (is_object, is_error, pos) = with_host(|h| {
-        let is_object = matches!(h.type_of(&value), "object" | "function")
-            && !h.is_null(&value);
+        let is_object = matches!(h.type_of(&value), "object" | "function") && !h.is_null(&value);
         let is_error = crate::builtins::has_error_data(h, &value);
         let pos = if h.fatal_from_promise {
             match lookup_chain(h, &value, "@@pos") {
@@ -4644,7 +4658,8 @@ pub fn fatal_report(msg: &str) -> String {
                 .ok()
                 .map(|s| with_host(|h| h.str_of(&s)));
             if let Some(stack) = stack.filter(|s| !s.contains("\n    at ")) {
-                if trace.strip_prefix('[').and_then(|t| t.strip_suffix(']')) == Some(stack.as_str()) {
+                if trace.strip_prefix('[').and_then(|t| t.strip_suffix(']')) == Some(stack.as_str())
+                {
                     trace = stack;
                 }
             }
@@ -4680,7 +4695,10 @@ pub fn fatal_report(msg: &str) -> String {
             "(Use `{exe} --trace-uncaught ...` to show where the exception was thrown)\n"
         ));
     }
-    out.push_str(&format!("\nNode.js {}\n", crate::stdlib::process::NODE_VERSION));
+    out.push_str(&format!(
+        "\nNode.js {}\n",
+        crate::stdlib::process::NODE_VERSION
+    ));
     out
 }
 
@@ -4730,7 +4748,10 @@ fn source_arrow(h: &JsHost, pos: u32) -> Option<String> {
         .map(|c| if c == '\t' { '\t' } else { ' ' })
         .collect();
     caret.push('^');
-    Some(format!("{}:{}\n{}\n{caret}\n", l.name, l.line, l.source_line))
+    Some(format!(
+        "{}:{}\n{}\n{caret}\n",
+        l.name, l.line, l.source_line
+    ))
 }
 
 /// Offer an uncaught exception to `process.on('uncaughtException')`; `Ok(true)`
@@ -9164,17 +9185,8 @@ fn run_user_func_full(
     // generator over the already-bound frame.
     if is_generator {
         let chunk = with_host(|h| h.funcs[fv.def_id].chunk.clone());
-        let gen = make_generator(
-            chunk,
-            env,
-            this_val,
-            fv.home_class.clone(),
-            fv.home_static,
-            fv.home_object.clone(),
-            with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict)),
-            Some(def_name.clone()),
-            fv.is_arrow,
-        );
+        let strict = with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict));
+        let gen = make_generator(chunk, env, this_val, fv, strict, Some(def_name.clone()));
         if is_async {
             if let Some(JsObj::Generator { id }) = with_host(|h| h.get(&gen).cloned()) {
                 with_host(|h| h.generators[id as usize].async_gen = true);
@@ -9200,17 +9212,8 @@ fn run_user_func_full(
     // synchronously up to the first `await`, then continues via microtasks.
     if is_async {
         let chunk = with_host(|h| h.funcs[fv.def_id].chunk.clone());
-        let gen = make_generator(
-            chunk,
-            env,
-            this_val,
-            fv.home_class.clone(),
-            fv.home_static,
-            fv.home_object.clone(),
-            with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict)),
-            Some(def_name.clone()),
-            fv.is_arrow,
-        );
+        let strict = with_host(|h| h.funcs.get(fv.def_id).is_some_and(|d| d.strict));
+        let gen = make_generator(chunk, env, this_val, fv, strict, Some(def_name.clone()));
         return Ok(run_async(gen));
     }
     let home = fv
@@ -10250,19 +10253,18 @@ impl JsHost {
 }
 
 /// Build a suspended generator whose body is `chunk`, run in a frame with the
-/// already-bound `env`. Nothing executes until the first `gen_resume`.
+/// already-bound `env`. Nothing executes until the first `gen_resume`. The
+/// frame's home class/object and arrow-ness come from the function value `fv`.
 fn make_generator(
     chunk: Chunk,
     env: Env,
     this_val: Option<Value>,
-    home_class: Option<String>,
-    home_static: bool,
-    home_object: Option<Value>,
+    fv: &FuncVal,
     strict: bool,
     owner: Option<String>,
-    arrow: bool,
 ) -> Value {
-    let home = home_class
+    let home = fv
+        .home_class
         .as_ref()
         .and_then(|n| with_host(|h| h.class_registry.get(n).cloned()));
     let frame = Frame {
@@ -10271,12 +10273,12 @@ fn make_generator(
         this_obj: this_val,
         new_target: None,
         home_class: home,
-        home_static,
-        home_object,
+        home_static: fv.home_static,
+        home_object: fv.home_object.clone(),
         strict,
         line: 0,
         pos: 0,
-        arrow,
+        arrow: fv.is_arrow,
         owner,
         is_module: false,
         this_state: ThisState::Plain,

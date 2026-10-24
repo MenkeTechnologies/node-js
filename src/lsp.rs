@@ -1147,7 +1147,19 @@ mod tests {
         let d = compute_diagnostics("let a = 1;\nlet b = 2;\nlet é = ;\n");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].message, "SyntaxError: Unexpected token ';'");
-        assert_eq!(d[0].range.start, Position { line: 2, character: 8 });
-        assert_eq!(d[0].range.end, Position { line: 2, character: 9 });
+        assert_eq!(
+            d[0].range.start,
+            Position {
+                line: 2,
+                character: 8
+            }
+        );
+        assert_eq!(
+            d[0].range.end,
+            Position {
+                line: 2,
+                character: 9
+            }
+        );
     }
 }

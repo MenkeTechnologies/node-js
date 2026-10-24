@@ -519,6 +519,10 @@ impl Stmt {
 impl From<StmtKind> for Stmt {
     /// Wrap a `StmtKind` as a synthetic statement (line 0).
     fn from(kind: StmtKind) -> Stmt {
-        Stmt { kind, line: 0, pos: 0 }
+        Stmt {
+            kind,
+            line: 0,
+            pos: 0,
+        }
     }
 }
