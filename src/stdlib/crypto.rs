@@ -2556,7 +2556,7 @@ fn get_random_values(v: Option<&Value>) -> Result<Value, String> {
         let len = val_bytes(&ta).len();
         let mut rnd = vec![0u8; len];
         getrandom::getrandom(&mut rnd).map_err(|e| format!("Error: {e}"))?;
-        set_obj_bytes_named(&ta, "@@bytes", &rnd);
+        super::buffer::write_view(&ta, &rnd);
         return Ok(ta);
     }
     if tag.as_deref() != Some("TypedArray") {
@@ -2601,21 +2601,6 @@ fn ta_coerce(kind: &str, raw: u64) -> f64 {
         "Uint32Array" => (raw as u32) as f64,
         _ => (raw as u8) as f64, // Uint8Array / Uint8ClampedArray
     }
-}
-
-/// Store raw bytes into a named byte-array property (for Buffer `@@bytes`).
-fn set_obj_bytes_named(recv: &Value, key: &str, bytes: &[u8]) {
-    with_host(|h| {
-        let arr = match h.get(recv) {
-            Some(JsObj::Object(p)) => p.get(key).cloned(),
-            _ => None,
-        };
-        if let Some(a) = arr {
-            if let Some(JsObj::Array(items)) = h.get_mut(&a) {
-                *items = bytes.iter().map(|b| Value::Float(*b as f64)).collect();
-            }
-        }
-    });
 }
 
 // ── KeyObject instance methods ──────────────────────────────────────────

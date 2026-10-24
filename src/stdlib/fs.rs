@@ -2707,10 +2707,7 @@ fn value_bytes(v: &Value) -> Vec<u8> {
 
 fn buf_bytes(v: &Value) -> Vec<u8> {
     with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|b| h.get(b)) {
-            Some(JsObj::Array(items)) => items.iter().map(|x| h.to_number(x) as u8).collect(),
-            _ => Vec::new(),
-        },
+        Some(JsObj::Object(p)) => crate::stdlib::buffer::window_bytes_h(h, p),
         _ => Vec::new(),
     })
 }

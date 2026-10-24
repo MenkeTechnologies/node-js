@@ -5100,12 +5100,7 @@ impl JsHost {
                     // template interpolation, and `data += chunk` (the pattern
                     // Express/body-parser use to read a request body).
                     if props.get("@@native").map(|t| self.str_of(t)).as_deref() == Some("Buffer") {
-                        let bytes: Vec<u8> = match props.get("@@bytes").and_then(|b| self.get(b)) {
-                            Some(JsObj::Array(items)) => {
-                                items.iter().map(|x| self.to_number(x) as u8).collect()
-                            }
-                            _ => Vec::new(),
-                        };
+                        let bytes = crate::stdlib::buffer::window_bytes_h(self, props);
                         String::from_utf8_lossy(&bytes).into_owned()
                     } else if let Some(s) = self.error_to_string(v) {
                         s
@@ -5719,12 +5714,7 @@ impl JsHost {
                     if indent as i64 > inspect_indent_limit() {
                         return self.builtin_depth_stub(v, "ArrayBuffer");
                     }
-                    let bytes: Vec<u8> = match props.get("@@bytes").and_then(|b| self.get(b)) {
-                        Some(JsObj::Array(items)) => {
-                            items.iter().map(|x| self.to_number(x) as u8).collect()
-                        }
-                        _ => Vec::new(),
-                    };
+                    let bytes = crate::stdlib::buffer::window_bytes_h(self, props);
                     let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
                     let mut parts = vec![
                         format!("[Uint8Contents]: <{}>", hex.join(" ")),
@@ -5818,12 +5808,7 @@ impl JsHost {
                     if props.get("@@native").map(|t| self.str_of(t)).as_deref()
                         == Some("Buffer") =>
                 {
-                    let bytes: Vec<u8> = match props.get("@@bytes").and_then(|b| self.get(b)) {
-                        Some(JsObj::Array(items)) => {
-                            items.iter().map(|x| self.to_number(x) as u8).collect()
-                        }
-                        _ => Vec::new(),
-                    };
+                    let bytes = crate::stdlib::buffer::window_bytes_h(self, props);
                     // `<Buffer …>` is Buffer's `[util.inspect.custom]` hook, not
                     // the shape of the object. Under `customInspect: false` node
                     // does not call that hook and falls back to the generic
@@ -8242,14 +8227,15 @@ impl JsHost {
                 if crate::stdlib::typedarray::view_detached_h(self, v) {
                     return Vec::new();
                 }
-                // A Buffer counts its byte store; every other view reports the
-                // element count of its window onto the ArrayBuffer.
-                let n = match props.get("@@bytes").and_then(|b| self.get(b)) {
-                    Some(JsObj::Array(items)) => items.len(),
-                    _ => props
+                // A Buffer counts its window onto its store; every other view
+                // reports the element count of its window onto the ArrayBuffer.
+                let n = if props.contains_key("@@bytes") {
+                    crate::stdlib::buffer::window_h(self, props).1
+                } else {
+                    props
                         .get("length")
                         .map(|l| self.to_number(l))
-                        .unwrap_or(0.0) as usize,
+                        .unwrap_or(0.0) as usize
                 };
                 (0..n).map(|i| i.to_string()).collect()
             }

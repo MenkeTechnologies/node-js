@@ -249,10 +249,10 @@ pub fn elem_values(v: &Value) -> Vec<Value> {
         return Vec::new();
     }
     with_host(|h| match h.get(v) {
-        Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|a| h.get(a)) {
-            Some(JsObj::Array(items)) => items.clone(),
-            _ => Vec::new(),
-        },
+        Some(JsObj::Object(p)) => super::buffer::window_bytes_h(h, p)
+            .into_iter()
+            .map(|b| Value::Float(b as f64))
+            .collect(),
         _ => Vec::new(),
     })
 }
@@ -1042,10 +1042,7 @@ pub fn index_len(v: &Value) -> Option<usize> {
     match super::native_tag(v)?.as_str() {
         "TypedArray" => Some(view_len(v)),
         "Buffer" => with_host(|h| match h.get(v) {
-            Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|a| h.get(a)) {
-                Some(JsObj::Array(items)) => Some(items.len()),
-                _ => None,
-            },
+            Some(JsObj::Object(p)) => Some(super::buffer::window_h(h, p).1),
             _ => None,
         }),
         _ => None,
@@ -1082,8 +1079,19 @@ pub fn kind_of(recv: &Value) -> String {
 
 /// Allocate an `ArrayBuffer` of `n` zeroed bytes.
 pub fn new_array_buffer(n: usize) -> Value {
+    let arr = with_host(|h| h.new_array(vec![Value::Float(0.0); n]));
+    array_buffer_over(arr)
+}
+
+/// An `ArrayBuffer` whose bytes ARE the heap array `arr` — shared, not copied.
+/// A `Buffer` built from its own bytes keeps its store this way, so its
+/// `.buffer` and every view made over that are one memory.
+pub fn array_buffer_over(arr: Value) -> Value {
     with_host(|h| {
-        let arr = h.new_array(vec![Value::Float(0.0); n]);
+        let n = match h.get(&arr) {
+            Some(JsObj::Array(items)) => items.len(),
+            _ => 0,
+        };
         let mut m = IndexMap::new();
         m.insert("@@native".into(), h.new_str("ArrayBuffer"));
         m.insert("@@bytes".into(), arr);
@@ -1149,10 +1157,14 @@ pub fn detach_buffer(ab: &Value) {
 }
 
 fn detach(ab: &Value) {
+    let store = store_of(ab);
     with_host(|h| {
-        let empty = h.new_array(Vec::new());
+        // Emptied IN PLACE: a `Buffer` holds the store array itself, so a
+        // replacement array would leave it reading the old bytes.
+        if let Some(JsObj::Array(items)) = store.as_ref().and_then(|s| h.get_mut(s)) {
+            items.clear();
+        }
         if let Some(JsObj::Object(p)) = h.get_mut(ab) {
-            p.insert("@@bytes".into(), empty);
             p.insert("byteLength".into(), Value::Float(0.0));
             p.insert("detached".into(), Value::Bool(true));
         }
@@ -1375,11 +1387,11 @@ fn encode(kind: &str, v: &Value) -> Vec<u8> {
 /// the outstanding borrow.
 pub fn elems_with_host(h: &crate::host::JsHost, v: &Value) -> Vec<Value> {
     if let Some(JsObj::Object(p)) = h.get(v) {
-        if let Some(arr) = p.get("@@bytes") {
-            return match h.get(arr) {
-                Some(JsObj::Array(items)) => items.clone(),
-                _ => Vec::new(),
-            };
+        if p.contains_key("@@bytes") {
+            return super::buffer::window_bytes_h(h, p)
+                .into_iter()
+                .map(|b| Value::Float(b as f64))
+                .collect();
         }
     }
     let Some((kind, raws)) = raw_elems(h, v) else {
@@ -1440,11 +1452,11 @@ fn raw_elems(h: &crate::host::JsHost, v: &Value) -> Option<(String, Vec<Vec<u8>>
 /// one below cannot allocate and so answers `undefined` for those two kinds.
 pub fn elems_mut_host(h: &mut crate::host::JsHost, v: &Value) -> Vec<Value> {
     if let Some(JsObj::Object(p)) = h.get(v) {
-        if let Some(arr) = p.get("@@bytes").cloned() {
-            return match h.get(&arr) {
-                Some(JsObj::Array(items)) => items.clone(),
-                _ => Vec::new(),
-            };
+        if p.contains_key("@@bytes") {
+            return super::buffer::window_bytes_h(h, p)
+                .into_iter()
+                .map(|b| Value::Float(b as f64))
+                .collect();
         }
     }
     let Some((kind, raws)) = raw_elems(h, v) else {
@@ -1576,15 +1588,19 @@ fn write_elems(recv: &Value, kind: &str, vals: &[Value]) -> Result<(), String> {
         .map(|v| coerce_val(kind, v))
         .collect::<Result<_, _>>()?;
     with_host(|h| {
-        if let Some(JsObj::Object(p)) = h.get(recv) {
-            if let Some(arr) = p.get(field).cloned() {
-                if let Some(JsObj::Array(items)) = h.get_mut(&arr) {
-                    for (i, v) in coerced.into_iter().enumerate() {
-                        if i < items.len() {
-                            items[i] = v;
-                        }
-                    }
-                }
+        let (arr, off, len) = match h.get(recv) {
+            Some(JsObj::Object(p)) => {
+                let (off, len) = super::buffer::window_h(h, p);
+                (p.get(field).cloned(), off, len)
+            }
+            _ => (None, 0, 0),
+        };
+        // Through the Buffer's WINDOW: its store is shared with its
+        // `ArrayBuffer`, so writing from the store's origin clobbers bytes
+        // that belong to other views.
+        if let Some(JsObj::Array(items)) = arr.as_ref().and_then(|a| h.get_mut(a)) {
+            for (i, v) in coerced.into_iter().enumerate().take(len) {
+                items[off + i] = v;
             }
         }
     });

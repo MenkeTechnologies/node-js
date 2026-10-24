@@ -1,6 +1,8 @@
 //! Node `Buffer` (global + `require('buffer').Buffer`). A Buffer is a plain
 //! object tagged `@@native = "Buffer"` whose bytes live in a hidden `@@bytes`
-//! array; `length` is an enumerable data property so `buf.length` reads directly.
+//! array SHARED with its `ArrayBuffer` (`@@buffer`, read as `buf.buffer`); the
+//! Buffer is a window (`byteOffset`/`length`) onto it, so every reader goes
+//! through `window_bytes_h`.
 
 use super::{arg_str, from_base64, from_hex, to_base64, to_hex};
 use crate::host::{with_host, JsObj};
@@ -469,33 +471,14 @@ pub fn share_array_buffer(ab: &Value, off: usize, len: usize) -> Value {
 }
 
 /// Build a Buffer value from raw bytes.
+///
+/// Every Buffer is a VIEW: the bytes live in an `ArrayBuffer` (its `.buffer`)
+/// and the Buffer shares that store. It used to own a private array with no
+/// buffer behind it, so `buf.buffer` threw on every Buffer node-js made.
 pub fn from_bytes(bytes: &[u8]) -> Value {
-    with_host(|h| {
-        let arr = h.new_array(bytes.iter().map(|b| Value::Float(*b as f64)).collect());
-        let mut m = IndexMap::new();
-        m.insert("@@native".into(), h.new_str("Buffer"));
-        m.insert("@@bytes".into(), arr);
-        m.insert("length".into(), Value::Float(bytes.len() as f64));
-        // The `Uint8Array` view properties a Buffer inherits in Node. `byteLength`
-        // equals `length` because the element size is 1.
-        m.insert("byteLength".into(), Value::Float(bytes.len() as f64));
-        m.insert("byteOffset".into(), Value::Float(0.0));
-        m.insert("BYTES_PER_ELEMENT".into(), Value::Float(1.0));
-        let obj = h.new_object(m);
-        // A Buffer is a real `Uint8Array` subclass instance in Node, so link it
-        // to the actual `Buffer.prototype` object rather than leaving it a bare
-        // tagged object with no `[[Prototype]]`.
-        h.ensure_native_protos();
-        if let Some(p) = h.native_proto("Buffer") {
-            h.set_proto(&obj, p);
-        }
-        // The view metadata is real but non-enumerable; V8 keeps `length` and
-        // friends off `Object.keys(buf)` (whose own keys are the byte indices).
-        for k in ["length", "byteLength", "byteOffset", "BYTES_PER_ELEMENT"] {
-            h.hide_prop(&obj, k);
-        }
-        obj
-    })
+    let arr = with_host(|h| h.new_array(bytes.iter().map(|b| Value::Float(*b as f64)).collect()));
+    let ab = crate::stdlib::typedarray::array_buffer_over(arr);
+    share_array_buffer(&ab, 0, bytes.len())
 }
 
 /// A Buffer's window onto its byte store as `(byteOffset, length)`.
@@ -506,32 +489,43 @@ pub fn from_bytes(bytes: &[u8]) -> Value {
 /// is what makes `Buffer.from(ab, 2, 2)` alias rather than copy.
 fn window(recv: &Value) -> (usize, usize) {
     with_host(|h| match h.get(recv) {
-        Some(JsObj::Object(p)) => {
-            let off = p.get("byteOffset").map(|o| h.to_number(o)).unwrap_or(0.0) as usize;
-            let store = match p.get("@@bytes").and_then(|v| h.get(v)) {
-                Some(JsObj::Array(items)) => items.len(),
-                _ => 0,
-            };
-            let len = p
-                .get("length")
-                .map(|l| h.to_number(l) as usize)
-                .unwrap_or(store);
-            (off.min(store), len.min(store.saturating_sub(off)))
-        }
+        Some(JsObj::Object(p)) => window_h(h, p),
         _ => (0, 0),
     })
 }
 
+/// [`window`] over a Buffer's own properties, with the host borrow held.
+pub fn window_h(h: &crate::host::JsHost, p: &IndexMap<String, Value>) -> (usize, usize) {
+    let off = p.get("byteOffset").map(|o| h.to_number(o)).unwrap_or(0.0) as usize;
+    let store = match p.get("@@bytes").and_then(|v| h.get(v)) {
+        Some(JsObj::Array(items)) => items.len(),
+        _ => 0,
+    };
+    let len = p
+        .get("length")
+        .map(|l| h.to_number(l) as usize)
+        .unwrap_or(store);
+    (off.min(store), len.min(store.saturating_sub(off)))
+}
+
+/// The bytes a Buffer's window covers, with the host borrow held. Every reader
+/// of a Buffer's bytes goes through here: the store is SHARED with its
+/// `ArrayBuffer` and with every other view over it, so reading the whole store
+/// returns bytes that are not the Buffer's.
+pub fn window_bytes_h(h: &crate::host::JsHost, p: &IndexMap<String, Value>) -> Vec<u8> {
+    let (off, len) = window_h(h, p);
+    match p.get("@@bytes").and_then(|v| h.get(v)) {
+        Some(JsObj::Array(items)) => items[off..off + len]
+            .iter()
+            .map(|v| h.to_number(v) as u8)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn bytes_of(recv: &Value) -> Vec<u8> {
-    let (off, len) = window(recv);
     with_host(|h| match h.get(recv) {
-        Some(JsObj::Object(p)) => match p.get("@@bytes").and_then(|v| h.get(v)) {
-            Some(JsObj::Array(items)) => items[off..off + len]
-                .iter()
-                .map(|v| h.to_number(v) as u8)
-                .collect(),
-            _ => Vec::new(),
-        },
+        Some(JsObj::Object(p)) => window_bytes_h(h, p),
         _ => Vec::new(),
     })
 }
@@ -1071,9 +1065,19 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
             let other = uint8_arg(args.first(), "otherBuffer")?;
             Ok(Value::Bool(bytes == other))
         }
+        // Both are a window onto the SAME memory in node (`slice` is the
+        // deprecated alias): a write through the result shows in the parent.
         "slice" | "subarray" => {
             let (s, e) = slice_bounds(args, bytes.len());
-            Ok(from_bytes(&bytes[s..e]))
+            let (off, _) = window(recv);
+            let ab = with_host(|h| match h.get(recv) {
+                Some(JsObj::Object(p)) => p.get("@@buffer").cloned(),
+                _ => None,
+            });
+            Ok(match ab {
+                Some(ab) => share_array_buffer(&ab, off + s, e - s),
+                None => from_bytes(&bytes[s..e]),
+            })
         }
         "readUInt8" => {
             let i = read_offset(args, 1, bytes.len())?;
@@ -1231,6 +1235,20 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
         // `%TypedArray%.prototype`, so it dispatches here rather than reporting
         // itself missing.
         "values" | "keys" | "entries" | "@@iterator" => {
+            // They are `%TypedArray%.prototype`'s, so over a DETACHED buffer
+            // they throw where Buffer's own methods read zero bytes.
+            if crate::stdlib::typedarray::view_detached(recv) {
+                let name = if method == "@@iterator" {
+                    "values"
+                } else {
+                    method
+                };
+                return Err(crate::stdlib::typedarray::detached_error(
+                    "%TypedArray%.prototype",
+                    name,
+                    false,
+                ));
+            }
             let items: Vec<Value> = with_host(|h| match method {
                 "keys" => (0..bytes.len()).map(|i| Value::Float(i as f64)).collect(),
                 "values" | "@@iterator" => bytes.iter().map(|b| Value::Float(*b as f64)).collect(),

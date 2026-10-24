@@ -685,20 +685,15 @@ Two divergences remain:
    implements a subset of those methods and marks them non-enumerable, so
    `for (k in buf)` yields the indices only. Emitting our shorter list instead
    would advertise methods Node has that node-js does not.
-2. **There is no shared backing store, so `.buffer` does not work and views do not
-   alias.** `buf.buffer` throws `TypeError: Method get TypedArray.prototype.buffer
-   called on incompatible receiver [object Uint8Array]` (node-js 0.1.14; it used to
-   read `undefined`) where Node hands back the `ArrayBuffer`,
-   and `buf.slice(1,3)`/`subarray(1,3)` copy where Node returns a window over
-   the same memory (so writing through the result does not show up in the
-   parent, and two views over one `ArrayBuffer` are independent). An
-   `ArrayBuffer` here carries only a byte length, and a typed array's elements
-   live in a per-object hidden array; making views alias means re-basing both
-   onto one shared byte store and moving every `@@bytes`/`@@elems` call site
-   (15 files, by `grep -rln`) onto it. That is a real refactor, not a patch — doing it
-   partially would leave some views aliasing and others not, which is worse
-   than the honest gap. `express.json()` does not depend on it (verified: a
-   live POST round-trips byte-identically).
+2. **Buffers are not allocated from a pool.** Every Buffer is a view onto an
+   `ArrayBuffer` (`buf.buffer`) and shares its bytes, and `subarray`/`slice`
+   are windows onto the same memory. But node carves small `Buffer.from(string
+   | array)`/`allocUnsafe` results out of a shared pool, so there
+   `buf.buffer.byteLength` is the pool's size, `buf.byteOffset` is wherever the
+   pool cursor stood, and `buf.buffer.transfer()` throws `ArrayBuffer is not
+   detachable and could not be cloned.` Here each Buffer owns an exactly-sized
+   buffer at offset 0, which is detachable. Code that honours
+   `byteOffset`/`length` behaves identically either way.
 
 A builtin namespace (`require('buffer')`, `Buffer`, `fs`, …) enumerates the
 members node-js ACTUALLY implements under `for…in` / `Object.keys` — not Node's
@@ -3320,7 +3315,6 @@ validators, and V8's promise state (`util.@@promiseState`, for
 |---|---|---|
 | `CompressionStream`/`DecompressionStream` output chunking | a chunk per zlib flush (gzip of a short input: a 10-byte header, then the rest) | one chunk when the writable closes: node builds these over its Duplex adapters (`internal/webstreams/adapters`), which are not ported, so the codec runs over the whole input |
 | transferring a stream (`structuredClone(rs, { transfer: [rs] })`, `postMessage`) | the stream moves | not modelled: the transfer symbols exist, nothing calls them |
-| `Buffer.from('ab').buffer`, `zlib.gzipSync(x).buffer`, any `Buffer`'s `.buffer` | the backing `ArrayBuffer` | `TypeError: Method get TypedArray.prototype.buffer called on incompatible receiver` — a Buffer is a tagged object with its own byte store, not a view over an `ArrayBuffer`, so the inherited getter's brand check refuses it |
 | `Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())) === Iterator.prototype`, `Object.getPrototypeOf(%GeneratorPrototype%)` against it | `true` | `false`: the built-in iterators are not linked to `Iterator.prototype` |
 | `util.inspect(Object.getPrototypeOf(function* () {}))` | `Function [GeneratorFunction] {}` | `Object [GeneratorFunction] {}` |
 | `TextEncoderStream` given a surrogate pair split across two chunks | one 4-byte sequence | two U+FFFD — a lone surrogate has no Rust `String` representation (the known boundary above) |
@@ -3424,3 +3418,15 @@ knows where it is.
 | stderr is a terminal | the inspected error in colour | no colour: `util.inspect` has none |
 | `Object.setPrototypeOf(err, null)` thrown | `[Error: null prototype]: x` and its stack | `[Object: null prototype] {}` — `util.inspect` does not recognise the error |
 | `process.version` / the report trailer | `v26.12.1` | `v26.5.0`, the version this runtime reports |
+
+## FIXED in round 23 — Buffer backing store, verified against node v26.12.1
+
+Pinned in `examples/bufferbacking.js`; each fix was re-broken alone and its
+record went red.
+
+| Case | node | was |
+|---|---|---|
+| `Buffer.from('ab').buffer`, `Buffer.alloc(4).buffer`, `zlib.gzipSync(x).buffer` — any Buffer's `.buffer` | the backing `ArrayBuffer`, sharing the Buffer's bytes both ways | `TypeError: Method get TypedArray.prototype.buffer called on incompatible receiver`: a Buffer owned a private byte array with no `ArrayBuffer` behind it |
+| `w = Buffer.from(ab, 3, 4)`: `[...w]` was right, but `w.map`, `Object.keys(w)`, `w.hasOwnProperty(4)`, `getOwnPropertyDescriptor(w, 0)`, `` `${w}` ``, `inspect`, `w.reverse()`/`fill()`, `crypto.getRandomValues(w)`, and the byte readers of `fs`/`net`/`http`/`http2`/`https`/`tls`/`dgram` | the 4-byte window | the WHOLE store: each read `@@bytes` from offset 0 to its end, and the in-place writers wrote from the store's origin (`getRandomValues` replaced the store with the window's length) |
+| `buf.subarray(1, 3)` / `buf.slice(1, 3)` | a window onto the same memory (a write shows in the parent) | a copy |
+| a Buffer whose `ArrayBuffer` was transferred: `length`, `buf[0]`, `[...buf]` | `0`, `undefined`, `Cannot perform %TypedArray%.prototype.values on a detached …` | the old length and bytes: `detach` swapped in a new empty store, which the Buffer did not hold |

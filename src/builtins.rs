@@ -1740,7 +1740,7 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
                 && crate::stdlib::typedarray::view_detached(recv)
             {
                 match crate::stdlib::native_tag(recv).as_deref() {
-                    Some("TypedArray") => return Ok(Value::Float(0.0)),
+                    Some("TypedArray" | "Buffer") => return Ok(Value::Float(0.0)),
                     // A DataView THROWS where a typed array answers zero — its
                     // extent accessors are brand-checked and node reports the
                     // getter by name.
@@ -16458,13 +16458,11 @@ fn object_get_own_descriptor(args: Vec<Value>) -> Result<Value, String> {
         Some(JsObj::Object(p))
             if p.get("@@native").map(|t| h.str_of(t)).as_deref() == Some("Buffer") =>
         {
-            match (
-                p.get("@@bytes").and_then(|b| h.get(b)),
-                key.parse::<usize>(),
-            ) {
-                (Some(JsObj::Array(items)), Ok(i)) => items.get(i).cloned(),
-                _ => None,
-            }
+            let bytes = crate::stdlib::buffer::window_bytes_h(h, p);
+            key.parse::<usize>()
+                .ok()
+                .and_then(|i| bytes.get(i))
+                .map(|b| Value::Float(*b as f64))
         }
         Some(JsObj::Object(p)) => p.get(&key).cloned(),
         // An array's index keys read the elements; `length` is the exotic own

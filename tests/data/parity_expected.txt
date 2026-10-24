@@ -441,6 +441,36 @@ grown    6 6 RangeError
 brand    [object ArrayBuffer] [object DataView] [object Uint8Array] true
 inspect  ArrayBuffer { [Uint8Contents]: <00 00 00>, [byteLength]: 3 } Uint8Array(2) [ 1, 2 ] Int32Array(1) [ 5 ] BigInt64Array(1) [ 7n ]
 iterate  1|2|3 0,1 4|5 {"0":1,"1":2}
+==== bufferbacking.js ====
+true 4 0
+azya [ 97, 122, 121, 97 ]
+hello
+101
+1
+true
+<Buffer 03 04 05 06> [ 3, 4, 5, 6 ] <Buffer 06 08 0a 0c> [ 3, 4, 5, 6 ] { type: 'Buffer', data: [ 3, 4, 5, 6 ] }
+[ '0', '1', '2', '3' ] true false false
+50595078 true 4
+ {"type":"Buffer","data":[8,9]}
+240cde039f48feb689143386c55aebc5
+3 6
+4 0 0
+[
+  0, 1, 2, 6, 5,
+  4, 3, 7, 8, 9
+]
+[
+  0, 1, 2, 9, 9,
+  9, 9, 7, 8, 9
+]
+[
+    0, 1, 2, 9, 238,
+  255, 9, 7, 8,   9
+] true 3
+azzaQa true 1 2
+<Buffer 09 ee> 6
+0 0 undefined [] true
+TypeError Cannot perform %TypedArray%.prototype.values on a detached or out-of-bounds ArrayBuffer
 ==== buffers.js ====
 Int8      80=-128 ff=-1 7f=127
 UInt8     00=0 ff=255
