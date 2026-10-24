@@ -5670,10 +5670,11 @@ impl JsHost {
                     } else {
                         // A measured core function can be anonymous (`os.freemem`
                         // is an arrow assigned by name-less property).
-                        match crate::builtins::builtin_name(n) {
+                        let base = match crate::builtins::builtin_name(n) {
                             "" => "[Function (anonymous)]".to_string(),
                             name => format!("[Function: {name}]"),
-                        }
+                        };
+                        self.with_core_symbol_props(n, base, indent, st)
                     }
                 }
                 // A bound method is not anonymous: it is the prototype method it
@@ -5692,6 +5693,45 @@ impl JsHost {
             },
             _ => "undefined".into(),
         }
+    }
+
+    /// Append a core function's ENUMERABLE measured symbol-keyed properties
+    /// (`CORE_SYMBOL_PROPS`) to its `[Function: f]` base, as `util.inspect`
+    /// shows them: `setTimeout`'s `util.promisify.custom` getter as
+    /// `[Getter]`, `os.freemem`'s `Symbol.toPrimitive` as the anonymous
+    /// function it is. Rendered from the table alone: this runs under the host
+    /// borrow, which neither a symbol nor a value can be allocated through.
+    fn with_core_symbol_props(
+        &self,
+        ns: &str,
+        base: String,
+        indent: usize,
+        st: &mut InspectCycles,
+    ) -> String {
+        let inner: Vec<String> = crate::builtins::core_symbol_props(ns)
+            .iter()
+            .filter(|row| row.3)
+            .filter_map(|&(_, spelling, accessor, ..)| {
+                let key = match spelling.strip_prefix("for:") {
+                    Some(k) => format!("Symbol({k})"),
+                    None => format!("Symbol(Symbol.{})", spelling.trim_start_matches("@@")),
+                };
+                let value = if accessor {
+                    "[Getter]".to_string()
+                } else {
+                    let fn_key = crate::builtins::os_to_primitive_key(ns, spelling)?;
+                    match crate::builtins::builtin_name(&fn_key) {
+                        "" => "[Function (anonymous)]".to_string(),
+                        name => format!("[Function: {name}]"),
+                    }
+                };
+                Some(format!("{key}: {value}"))
+            })
+            .collect();
+        if inner.is_empty() {
+            return base;
+        }
+        self.render_object(&inner, &format!("{base} "), indent, st)
     }
 
     /// Append a callable's own enumerable properties to its `[Function: f]` /

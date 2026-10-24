@@ -2588,6 +2588,18 @@ pub fn object_builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Resu
             Ok(Value::Bool(false))
         }
         "propertyIsEnumerable" => {
+            // A SYMBOL key is answered by `[[GetOwnProperty]]` (20.1.3.4). The
+            // key below is the symbol's display string, which names no property,
+            // so every symbol-keyed property — an object literal's, a function's,
+            // a core function's measured ones — read as not enumerable.
+            if with_host(|h| matches!(h.get(&arg0(&args)), Some(JsObj::Symbol { .. }))) {
+                let desc = object_get_own_descriptor(vec![recv.clone(), arg0(&args)])?;
+                if with_host(|h| h.is_nullish(&desc)) {
+                    return Ok(Value::Bool(false));
+                }
+                let enumerable = get_property(&desc, "enumerable")?;
+                return Ok(Value::Bool(with_host(|h| h.truthy(&enumerable))));
+            }
             let k = with_host(|h| h.str_of(&arg0(&args)));
             // Own *and* enumerable — a non-enumerable own slot reads false. On a
             // Proxy that question is `[[GetOwnProperty]]`, i.e. the descriptor
@@ -2960,6 +2972,9 @@ pub fn namespace_constants(ns: &str) -> &'static [(&'static str, f64)] {
 /// ordinary method — enumerable exactly when the namespace enumerates it, which
 /// is what separates a core module's exports from an ECMAScript namespace's.
 fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
+    if let Some(row) = core_symbol_prop(ns, key) {
+        return core_symbol_descriptor(ns, row, value);
+    }
     let frozen = namespace_constants(ns).iter().any(|(k, _)| *k == key)
         || key == "prototype" && !core_function_prototyped(ns)
         || (ns == "Symbol" && host::WELL_KNOWN_SYMBOLS.contains(&key));
@@ -2990,6 +3005,93 @@ fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
         );
         h.new_object(m)
     })
+}
+
+/// The builtin key of `os.<m>[Symbol.toPrimitive]` (`os.@@toPrimitive:<m>`),
+/// for `name` the `@@toPrimitive` key of one of the `os` value functions.
+pub fn os_to_primitive_key(ns: &str, name: &str) -> Option<String> {
+    let m = ns.strip_prefix("os.")?;
+    (name == "@@toPrimitive" && crate::stdlib::os::TO_PRIMITIVE.contains(&m))
+        .then(|| format!("os.@@toPrimitive:{m}"))
+}
+
+/// One measured own symbol-keyed property of a core function:
+/// `(key, symbol, accessor, enumerable, writable, configurable)`.
+pub type CoreSymbolProp = (&'static str, &'static str, bool, bool, bool, bool);
+
+/// The measured own symbol-keyed properties (`CORE_SYMBOL_PROPS`) of the core
+/// function keyed `ns`. A global timer function is its `timers` twin in node
+/// (`setTimeout === require('timers').setTimeout`), so it answers for it.
+pub fn core_symbol_props(ns: &str) -> &'static [CoreSymbolProp] {
+    let t = crate::core_arity::CORE_SYMBOL_PROPS;
+    let rows = |k: &str| -> &'static [CoreSymbolProp] {
+        &t[t.partition_point(|r| r.0 < k)..t.partition_point(|r| r.0 <= k)]
+    };
+    match rows(ns) {
+        [] if !ns.contains('.') => rows(&format!("timers.{ns}")),
+        found => found,
+    }
+}
+
+/// The symbol a `CORE_SYMBOL_PROPS` spelling names: `@@<name>` a well-known
+/// symbol, `for:<key>` the `Symbol.for` registry's.
+pub fn core_symbol_value(h: &mut host::JsHost, spelling: &str) -> Value {
+    match spelling.strip_prefix("for:") {
+        Some(k) => h.symbol_for(k),
+        None => h.well_known_symbol(spelling.trim_start_matches("@@")),
+    }
+}
+
+/// The `CORE_SYMBOL_PROPS` row of `<ns>[key]`, `key` being the internal
+/// property-key spelling of a symbol.
+fn core_symbol_prop(ns: &str, key: &str) -> Option<CoreSymbolProp> {
+    let rows = core_symbol_props(ns);
+    if rows.is_empty() || !host::is_symbol_key(key) {
+        return None;
+    }
+    rows.iter().copied().find(|r| {
+        with_host(|h| {
+            let sym = core_symbol_value(h, r.1);
+            h.property_key(&sym) == key
+        })
+    })
+}
+
+/// The descriptor of a measured symbol-keyed property: an accessor's getter
+/// is a function named `get` returning the property's value, as node's are.
+fn core_symbol_descriptor(ns: &str, row: CoreSymbolProp, value: Value) -> Value {
+    let (_, spelling, accessor, enumerable, writable, configurable) = row;
+    with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        if accessor {
+            let getter = h.alloc(JsObj::Builtin(format!(
+                "{CORE_SYMBOL_GETTER}{ns}:{spelling}"
+            )));
+            m.insert("get".into(), getter);
+            m.insert("set".into(), Value::Undef);
+        } else {
+            m.insert("value".into(), value);
+            m.insert("writable".into(), Value::Bool(writable));
+        }
+        m.insert("enumerable".into(), Value::Bool(enumerable));
+        m.insert("configurable".into(), Value::Bool(configurable));
+        h.new_object(m)
+    })
+}
+
+/// The key prefix of a measured symbol accessor's getter,
+/// `@coresymget:<ns>:<spelling>`.
+const CORE_SYMBOL_GETTER: &str = "@coresymget:";
+
+/// Run the getter [`core_symbol_descriptor`] hands out: the read it stands for.
+fn call_core_symbol_getter(rest: &str) -> Result<Value, String> {
+    let (ns, spelling) = rest.split_once(':').unwrap_or((rest, ""));
+    let spelling_key = spelling.to_string();
+    let key = with_host(|h| {
+        let sym = core_symbol_value(h, &spelling_key);
+        h.property_key(&sym)
+    });
+    Ok(namespace_property(ns, &key))
 }
 
 /// Whether `<ns>.<key>` may be deleted — the `configurable` half of
@@ -3289,12 +3391,8 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
     }
     // `os.arch[Symbol.toPrimitive]` (and the other `os` value functions): an
     // anonymous function returning the call's result.
-    if name == "@@toPrimitive" {
-        if let Some(m) = ns.strip_prefix("os.") {
-            if crate::stdlib::os::TO_PRIMITIVE.contains(&m) {
-                return with_host(|h| h.alloc(JsObj::Builtin(format!("os.@@toPrimitive:{m}"))));
-            }
-        }
+    if let Some(key) = os_to_primitive_key(ns, name) {
+        return with_host(|h| h.alloc(JsObj::Builtin(key)));
     }
     // A core-module function written as an ordinary `function` owns a
     // `prototype` (`fs.readFileSync.prototype.constructor === fs.readFileSync`);
@@ -7081,6 +7179,15 @@ const NS_METHODS: &[&str] = &[
 /// does not cover — every non-function namespace (`Math`, `require('fs')`),
 /// and the core-module functions, whose arity is not specified anywhere.
 pub fn builtin_meta(key: &str) -> Option<(&'static str, u32)> {
+    // A measured symbol accessor's getter (`core_symbol_descriptor`) is
+    // node's `get`, of length 0.
+    if key.starts_with(CORE_SYMBOL_GETTER) {
+        return Some(("get", 0));
+    }
+    // `os.<m>[Symbol.toPrimitive]` is an anonymous arrow of no parameters.
+    if key.contains(".@@toPrimitive:") {
+        return Some(("", 0));
+    }
     crate::arity::BUILTIN_ARITY
         .binary_search_by(|(k, _, _)| (*k).cmp(key))
         .ok()
@@ -7186,10 +7293,6 @@ const GENERATOR_PROTO_ARITY: &[(&str, &str, u32)] = &[
 /// is `set` and `fs.readFileSync` is `readFileSync`. Reporting the whole key was
 /// how `[Function: @proto:TypedArray:set]` reached `console.log`.
 pub fn builtin_name(key: &str) -> &str {
-    // The anonymous `[Symbol.toPrimitive]` of an `os` function.
-    if key.contains(".@@toPrimitive:") {
-        return "";
-    }
     if let Some((name, _)) = builtin_meta(key) {
         return name;
     }
@@ -7392,6 +7495,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
         let file = with_host(|h| h.str_of(args.get(2).unwrap_or(&Value::Undef)));
         return crate::module::require(&spec, std::path::Path::new(&from), &file);
+    }
+    if let Some(rest) = name.strip_prefix(CORE_SYMBOL_GETTER) {
+        return call_core_symbol_getter(rest);
     }
     // A bareword call of a web-stream class (`ReadableStream()`) calls the
     // `webstreams.js` port's class, which refuses a call without `new`.
@@ -15351,6 +15457,23 @@ fn proxy_or_own_symbol_keys(v: &Value) -> Result<Vec<Value>, String> {
                     .filter_map(|m| m.strip_prefix('+').unwrap_or(m).strip_prefix("@@"))
                     .map(|name| h.well_known_symbol(name))
                     .collect()
+            }));
+        }
+    }
+    // A core function's measured symbol-keyed properties
+    // (`os.freemem[Symbol.toPrimitive]`, `setTimeout[util.promisify.custom]`),
+    // which it owns no map entry for, then any a script added.
+    if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(v).cloned()) {
+        let rows = core_symbol_props(&ns);
+        if !rows.is_empty() {
+            return Ok(with_host(|h| {
+                let mut keys: Vec<Value> = rows.iter().map(|r| core_symbol_value(h, r.1)).collect();
+                for k in h.own_symbol_keys(v) {
+                    if !keys.iter().any(|s| h.strict_eq(s, &k)) {
+                        keys.push(k);
+                    }
+                }
+                keys
             }));
         }
     }

@@ -817,6 +817,39 @@ timers/promises  setTimeout/2
 stream           pipeline/0 eos/3
 own keys         true,true
 bound            1
+==== coresymbolprops.js ====
+os.freemem [Function (anonymous)] {
+  Symbol(Symbol.toPrimitive): [Function (anonymous)]
+}
+  Symbol(Symbol.toPrimitive) value  0 true true true true function
+setTimeout [Function: setTimeout] {
+  Symbol(nodejs.util.promisify.custom): [Getter]
+}
+  Symbol(nodejs.util.promisify.custom) get get 0 true false - true true
+setImmediate [Function: setImmediate] {
+  Symbol(nodejs.util.promisify.custom): [Getter]
+}
+  Symbol(nodejs.util.promisify.custom) get get 0 true false - true true
+timers.setTimeout [Function: setTimeout] {
+  Symbol(nodejs.util.promisify.custom): [Getter]
+}
+  Symbol(nodejs.util.promisify.custom) get get 0 true false - true true
+stream.pipeline [Function: pipeline] { Symbol(nodejs.util.promisify.custom): [Getter] }
+  Symbol(nodejs.util.promisify.custom) get get 0 true false - true true
+fs.exists [Function: exists]
+  Symbol(nodejs.util.promisify.custom) value exists 1 false false false false function
+child_process.exec [Function: exec]
+  Symbol(nodejs.util.promisify.custom) value exec 0 false false false false function
+{
+  t: [Function: setTimeout] {
+    Symbol(nodejs.util.promisify.custom): [Getter]
+  },
+  m: [Function (anonymous)] {
+    Symbol(Symbol.toPrimitive): [Function (anonymous)]
+  }
+}
+true false true false
+true true true false
 ==== cryptoglobals.js ====
 Crypto function true
 CryptoKey function true
