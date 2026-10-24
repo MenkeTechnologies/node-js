@@ -117,7 +117,19 @@ pub fn constant(name: &str) -> Option<Value> {
         "OutgoingMessage" => Some(with_host(|h| {
             h.alloc(JsObj::Builtin("OutgoingMessage".into()))
         })),
-        "globalAgent" => Some(construct_agent(&[])),
+        // One Agent for the process: `http.globalAgent === http.globalAgent`.
+        // Each read built a new one.
+        "globalAgent" => {
+            thread_local! {
+                static AGENT: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+            }
+            if let Some(a) = AGENT.with(|a| a.borrow().clone()) {
+                return Some(a);
+            }
+            let a = construct_agent(&[]);
+            AGENT.with(|slot| *slot.borrow_mut() = Some(a.clone()));
+            Some(a)
+        }
         _ => None,
     }
 }

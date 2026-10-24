@@ -2975,6 +2975,9 @@ fn builtin_member_descriptor(ns: &str, key: &str, value: Value) -> Value {
     if let Some(row) = core_symbol_prop(ns, key) {
         return core_symbol_descriptor(ns, row, value);
     }
+    if let Some(row) = core_accessor_export(ns, key) {
+        return core_accessor_descriptor(row);
+    }
     let frozen = namespace_constants(ns).iter().any(|(k, _)| *k == key)
         || key == "prototype" && !core_function_prototyped(ns)
         || (ns == "Symbol" && host::WELL_KNOWN_SYMBOLS.contains(&key));
@@ -3092,6 +3095,87 @@ fn call_core_symbol_getter(rest: &str) -> Result<Value, String> {
         h.property_key(&sym)
     });
     Ok(namespace_property(ns, &key))
+}
+
+/// One measured accessor export of a core module:
+/// `(namespace, key, has_setter, enumerable, configurable, getter_name,
+/// setter_name)`.
+pub type CoreAccessorExport = (
+    &'static str,
+    &'static str,
+    bool,
+    bool,
+    bool,
+    &'static str,
+    &'static str,
+);
+
+/// The `CORE_ACCESSOR_EXPORTS` row of `<ns>.<key>`: an export node defines as
+/// a getter (`timers.promises`, `fs.ReadStream`, `crypto.webcrypto`).
+pub fn core_accessor_export(ns: &str, key: &str) -> Option<CoreAccessorExport> {
+    let t = crate::core_arity::CORE_ACCESSOR_EXPORTS;
+    t.binary_search_by(|r| (r.0, r.1).cmp(&(ns, key)))
+        .ok()
+        .map(|i| t[i])
+}
+
+/// The key prefixes of an accessor export's getter and setter,
+/// `@coreexportget:<ns>:<key>` / `@coreexportset:<ns>:<key>`.
+pub const CORE_EXPORT_GETTER: &str = "@coreexportget:";
+pub const CORE_EXPORT_SETTER: &str = "@coreexportset:";
+
+/// The getter and (if node defines one) setter function values of an
+/// accessor export.
+pub fn core_accessor_functions(row: CoreAccessorExport) -> (Value, Option<Value>) {
+    let (ns, key, has_setter, ..) = row;
+    with_host(|h| {
+        let get = h.alloc(JsObj::Builtin(format!("{CORE_EXPORT_GETTER}{ns}:{key}")));
+        let set =
+            has_setter.then(|| h.alloc(JsObj::Builtin(format!("{CORE_EXPORT_SETTER}{ns}:{key}"))));
+        (get, set)
+    })
+}
+
+/// The descriptor of an accessor export: `{ get, set, enumerable,
+/// configurable }`, as node reports it.
+fn core_accessor_descriptor(row: CoreAccessorExport) -> Value {
+    let (get, set) = core_accessor_functions(row);
+    with_host(|h| {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert("get".into(), get);
+        m.insert("set".into(), set.unwrap_or(Value::Undef));
+        m.insert("enumerable".into(), Value::Bool(row.3));
+        m.insert("configurable".into(), Value::Bool(row.4));
+        h.new_object(m)
+    })
+}
+
+/// `name`/`length` of an accessor export's getter or setter thunk: the
+/// measured name; a getter takes no argument and a setter one.
+fn core_accessor_function_meta(key: &str) -> Option<(&'static str, u32)> {
+    let (rest, setter) = match key.strip_prefix(CORE_EXPORT_GETTER) {
+        Some(rest) => (rest, false),
+        None => (key.strip_prefix(CORE_EXPORT_SETTER)?, true),
+    };
+    let (ns, member) = rest.split_once(':')?;
+    let row = core_accessor_export(ns, member)?;
+    Some(if setter { (row.6, 1) } else { (row.5, 0) })
+}
+
+/// Run an accessor export's getter or setter thunk: the read or write it
+/// stands for.
+fn call_core_accessor_function(key: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let (rest, setter) = match key.strip_prefix(CORE_EXPORT_GETTER) {
+        Some(rest) => (rest, false),
+        None => (key.strip_prefix(CORE_EXPORT_SETTER)?, true),
+    };
+    let (ns, member) = rest.split_once(':')?;
+    if !setter {
+        return Some(Ok(namespace_property(ns, member)));
+    }
+    let target = with_host(|h| h.alloc(JsObj::Builtin(ns.to_string())));
+    let value = args.first().cloned().unwrap_or(Value::Undef);
+    Some(set_property_pub(&target, member, value).map(|()| Value::Undef))
 }
 
 /// Whether `<ns>.<key>` may be deleted — the `configurable` half of
@@ -7184,6 +7268,9 @@ pub fn builtin_meta(key: &str) -> Option<(&'static str, u32)> {
     if key.starts_with(CORE_SYMBOL_GETTER) {
         return Some(("get", 0));
     }
+    if let Some(meta) = core_accessor_function_meta(key) {
+        return Some(meta);
+    }
     // `os.<m>[Symbol.toPrimitive]` is an anonymous arrow of no parameters.
     if key.contains(".@@toPrimitive:") {
         return Some(("", 0));
@@ -7498,6 +7585,9 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
     }
     if let Some(rest) = name.strip_prefix(CORE_SYMBOL_GETTER) {
         return call_core_symbol_getter(rest);
+    }
+    if let Some(r) = call_core_accessor_function(name, &args) {
+        return r;
     }
     // A bareword call of a web-stream class (`ReadableStream()`) calls the
     // `webstreams.js` port's class, which refuses a call without `new`.

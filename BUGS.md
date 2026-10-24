@@ -3237,8 +3237,6 @@ record went red.
 | Case | node | node-js |
 |---|---|---|
 | `child.on === EventEmitter.prototype.on` (an emitter-backed native) | `true` | `false` — the instance's methods are dispatch thunks |
-| `util.inspect(os.freemem)`, `util.inspect(setTimeout)` | the function's own symbol-keyed properties (`Symbol(Symbol.toPrimitive)`, the `promisify.custom` getter) | the bare function |
-| module exports node defines as GETTERS (`timers.promises`) | `[Getter]` under inspect | the value |
 | `parity-scripts/stdlib/40_event_target.js` | — | the REFERENCE is non-deterministic here: node itself prints `after` before or after the uncaught-exception line run to run (measured 6/10 and 4/10), so the harness reports it intermittently |
 
 Also in round 21, pinned in `examples/protoshape.js`:
@@ -3282,7 +3280,8 @@ Still open, found here:
 ## FIXED in round 22 — verified against node v26.12.1
 
 Pinned in `examples/asynciteratorproto.js`, `timerdeadlines.js`,
-`webstreampull.js`, `bytestreams.js` and `webstreampipe.js`; each fix was
+`webstreampull.js`, `bytestreams.js`, `webstreampipe.js`,
+`coresymbolprops.js` and `accessorexports.js`; each fix was
 re-broken alone and its record went red.
 
 | Case | node | was |
@@ -3300,6 +3299,11 @@ re-broken alone and its record went red.
 | `CountQueuingStrategy.prototype.size` | a getter returning the size function | a method |
 | `require('stream/web').ReadableStreamTee(stream, cloneForBranch2)` | the module's 18th member | absent |
 | `ReadableStream()`, `require('stream/web').WritableStream()` | `Class constructor … cannot be invoked without 'new'` | `is not a function` |
+| `util.inspect(os.freemem)`, `util.inspect(setTimeout)` (any core function with symbol-keyed members; measured: `CORE_SYMBOL_PROPS`) | `[Function (anonymous)] { Symbol(Symbol.toPrimitive): … }`, `Symbol(nodejs.util.promisify.custom): [Getter]` | the bare function |
+| `Object.getOwnPropertySymbols(setTimeout)`, its descriptor | `[ Symbol(nodejs.util.promisify.custom) ]`; an enumerable, non-configurable getter named `get` | `[]`; a writable data property |
+| `o.propertyIsEnumerable(sym)` for any symbol-keyed property | its `enumerable` | `false` — the symbol's display string was looked up |
+| core-module exports node defines as accessors (`timers.promises`, `crypto.webcrypto`, `events.defaultMaxListeners`, …; measured: `CORE_ACCESSOR_EXPORTS`) | an accessor descriptor (getter/setter names measured); `[Getter]` / `[Getter/Setter]` under inspect | a data property holding the value |
+| `http.globalAgent === http.globalAgent` (and `https`) | `true` | `false` — a new Agent per read |
 
 The streams are `src/stdlib/webstreams.js`: node's `lib/internal/webstreams/`
 `util.js`, `queuingstrategies.js`, `writablestream.js`, `readablestream.js`,

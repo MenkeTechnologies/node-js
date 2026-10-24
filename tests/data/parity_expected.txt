@@ -1,3 +1,32 @@
+==== accessorexports.js ====
+timers promises function get 0 undefined undefined undefined true true false true
+dns promises function get 0 undefined undefined undefined true true false true
+stream promises function get 0 undefined undefined undefined true true false true
+fs promises function get 0 undefined undefined undefined true true false true
+crypto webcrypto function get 0 undefined undefined undefined true false false true
+crypto subtle function get 0 undefined undefined undefined true false false true
+crypto getRandomValues function get 0 undefined undefined undefined true false false true
+util aborted function get aborted 0 undefined undefined undefined true true false true
+events captureRejections function get 0 function set 1 true false false true
+events defaultMaxListeners function get 0 function set 1 true false false true
+http globalAgent function get 0 function set 1 true true false true
+buffer INSPECT_MAX_BYTES function get 0 function set 1 true true false true
+async_hooks AsyncLocalStorage function get AsyncLocalStorage 0 undefined undefined undefined true true false true
+{
+  setTimeout: [Function: setTimeout] {
+    Symbol(nodejs.util.promisify.custom): [Getter]
+  },
+  clearTimeout: [Function: clearTimeout],
+  setImmediate: [Function: setImmediate] {
+    Symbol(nodejs.util.promisify.custom): [Getter]
+  },
+  clearImmediate: [Function: clearImmediate],
+  setInterval: [Function: setInterval],
+  clearInterval: [Function: clearInterval],
+  promises: [Getter]
+}
+10 7
+true true
 ==== accessors.js ====
 literal  10 10
 computed 20 20

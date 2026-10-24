@@ -66,13 +66,24 @@ pub const CLIENT_REQUEST_METHODS: &[&str] = &[
 pub fn constant(name: &str) -> Option<Value> {
     match name {
         "Agent" => Some(with_host(|h| h.alloc(JsObj::Builtin("https.Agent".into())))),
-        "globalAgent" => Some(with_host(|h| {
-            let mut m = IndexMap::new();
-            m.insert("@@native".into(), h.new_str("Agent"));
-            m.insert("maxSockets".into(), Value::Float(f64::INFINITY));
-            m.insert("protocol".into(), h.new_str("https:"));
-            h.new_object(m)
-        })),
+        // One Agent for the process: `https.globalAgent === https.globalAgent`.
+        "globalAgent" => {
+            thread_local! {
+                static AGENT: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+            }
+            if let Some(a) = AGENT.with(|a| a.borrow().clone()) {
+                return Some(a);
+            }
+            let a = with_host(|h| {
+                let mut m = IndexMap::new();
+                m.insert("@@native".into(), h.new_str("Agent"));
+                m.insert("maxSockets".into(), Value::Float(f64::INFINITY));
+                m.insert("protocol".into(), h.new_str("https:"));
+                h.new_object(m)
+            });
+            AGENT.with(|slot| *slot.borrow_mut() = Some(a.clone()));
+            Some(a)
+        }
         _ => None,
     }
 }

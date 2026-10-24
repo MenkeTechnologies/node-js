@@ -7003,6 +7003,13 @@ fn namespace_snapshot(ns: &str) -> Value {
     let snap = with_host(|h| h.new_object(IndexMap::new()));
     NAMESPACE_SNAPSHOTS.with(|m| m.borrow_mut().insert(ns.to_string(), snap.clone()));
     for k in crate::stdlib::namespace_keys(ns) {
+        // An export node defines as an accessor renders as `[Getter]` (or
+        // `[Getter/Setter]`), so the stand-in carries the accessor itself.
+        if let Some(row) = crate::builtins::core_accessor_export(ns, &k) {
+            let (get, set) = crate::builtins::core_accessor_functions(row);
+            with_host(|h| h.set_accessor(&snap, &k, Some(get), set));
+            continue;
+        }
         let val = crate::builtins::namespace_property(ns, &k);
         with_host(|h| {
             if let Some(JsObj::Object(p)) = h.get_mut(&snap) {
