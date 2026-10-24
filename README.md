@@ -261,8 +261,10 @@ src/core_arity.rs && cargo fmt`), keyed `<namespace>.<member>`. The same run
 measures which of those functions own a `prototype` and which symbol-keyed
 properties each owns (`setTimeout[util.promisify.custom]`), each module's
 `Object.keys` order and its accessor exports (`timers.promises`), and —
-for the web and node classes modelled as native prototypes (`AbortSignal`, `Performance`, `Crypto`, …) — each prototype's
-member order and its methods' `name`/`length`.
+for the web and node classes modelled as native prototypes (`AbortSignal`,
+`Performance`, `Crypto`, `EventEmitter`, …) — each prototype's member order
+and its methods' `name`/`length`, plus which `EventEmitter` methods each
+emitter-backed class overrides rather than inherits.
 
 The two tools deliberately drive DIFFERENT entry points — the corpus runs each
 case as a script FILE, the fuzzer through `-e` — because Node itself answers
