@@ -3002,3 +3002,172 @@ pub const CORE_ACCESSOR_EXPORTS: &[(&str, &str, bool, bool, bool, &str, &str)] =
         "",
     ),
 ];
+
+/// `(key, name, length)` of `EventEmitter.prototype`'s methods, keyed
+/// `@proto:EventEmitter:<method>`; an alias reports the method it is
+/// (`on` is `addListener`). Sorted by key.
+pub const EMITTER_PROTO_ARITY: &[(&str, &str, u32)] = &[
+    ("@proto:EventEmitter:addListener", "addListener", 2),
+    ("@proto:EventEmitter:emit", "emit", 0),
+    ("@proto:EventEmitter:eventNames", "eventNames", 0),
+    ("@proto:EventEmitter:getMaxListeners", "getMaxListeners", 0),
+    ("@proto:EventEmitter:listenerCount", "listenerCount", 2),
+    ("@proto:EventEmitter:listeners", "listeners", 1),
+    ("@proto:EventEmitter:off", "removeListener", 2),
+    ("@proto:EventEmitter:on", "addListener", 2),
+    ("@proto:EventEmitter:once", "once", 2),
+    ("@proto:EventEmitter:prependListener", "prependListener", 2),
+    (
+        "@proto:EventEmitter:prependOnceListener",
+        "prependOnceListener",
+        2,
+    ),
+    ("@proto:EventEmitter:rawListeners", "rawListeners", 1),
+    (
+        "@proto:EventEmitter:removeAllListeners",
+        "removeAllListeners",
+        1,
+    ),
+    ("@proto:EventEmitter:removeListener", "removeListener", 2),
+    ("@proto:EventEmitter:setMaxListeners", "setMaxListeners", 1),
+];
+
+/// For each emitter-backed native class (by tag), the `EventEmitter` methods
+/// its prototype chain OVERRIDES instead of inheriting from
+/// `EventEmitter.prototype`. Sorted by tag; the names within a row are not.
+pub const EMITTER_OVERRIDES: &[(&str, &[&str])] = &[
+    (
+        "ChildPipe",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    ("ChildProcess", &[]),
+    ("ClientRequest", &["eventNames"]),
+    ("ClusterWorker", &[]),
+    ("Domain", &[]),
+    (
+        "Duplex",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    ("EventEmitter", &[]),
+    (
+        "FSReadStream",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    ("FSWriteStream", &["eventNames"]),
+    ("HTTPSClientRequest", &["eventNames"]),
+    ("HTTPSServerResponse", &["eventNames"]),
+    (
+        "IncomingMessage",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    (
+        "MessagePort",
+        &[
+            "setMaxListeners",
+            "getMaxListeners",
+            "emit",
+            "addListener",
+            "on",
+            "prependListener",
+            "once",
+            "prependOnceListener",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "listeners",
+            "rawListeners",
+            "listenerCount",
+            "eventNames",
+        ],
+    ),
+    (
+        "PassThrough",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    (
+        "Readable",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    ("Server", &[]),
+    ("ServerResponse", &["eventNames"]),
+    (
+        "Socket",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    ("Stream", &["eventNames"]),
+    ("TLSServer", &[]),
+    (
+        "TLSSocket",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    (
+        "Transform",
+        &[
+            "addListener",
+            "on",
+            "removeListener",
+            "off",
+            "removeAllListeners",
+            "eventNames",
+        ],
+    ),
+    ("UdpSocket", &[]),
+    ("Worker", &[]),
+    ("Writable", &["eventNames"]),
+];

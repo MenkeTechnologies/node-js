@@ -107,6 +107,39 @@ for (const name of protoClasses) {
 }
 console.log('===SYMBOLS===');
 console.log(symbolRows.join('\n'));
+// EventEmitter.prototype's methods (`name`/`length`, an alias reporting the
+// method it IS: `on` is `addListener`), then, for each emitter-backed class
+// this frontend models (keyed by its native tag), the EventEmitter methods its
+// prototype chain OVERRIDES rather than inherits: a Readable's `on` is
+// `Readable.prototype.on`, a ChildProcess's is `EventEmitter.prototype.on`.
+console.log('===EMITTER===');
+{
+  const EE = require('events');
+  const P = EE.prototype;
+  const methods = Object.getOwnPropertyNames(P).filter((k) => k !== 'constructor' && typeof P[k] === 'function');
+  for (const k of methods) console.log('@proto:EventEmitter:' + k + '\t' + P[k].name + '\t' + P[k].length);
+  console.log('===EMITTER_OVERRIDES===');
+  const s = require('stream'), net = require('net'), http = require('http'), https = require('https');
+  const fs = require('fs'), tls = require('tls'), dgram = require('dgram'), http2 = require('http2');
+  const wt = require('worker_threads'), cluster = require('cluster'), domain = require('domain');
+  const classes = {
+    EventEmitter: EE, Stream: s.Stream, Readable: s.Readable, Writable: s.Writable,
+    Duplex: s.Duplex, Transform: s.Transform, PassThrough: s.PassThrough,
+    Socket: net.Socket, Server: net.Server, ChildPipe: net.Socket,
+    IncomingMessage: http.IncomingMessage, ServerResponse: http.ServerResponse,
+    ClientRequest: http.ClientRequest, HTTPSServerResponse: http.ServerResponse,
+    HTTPSClientRequest: http.ClientRequest, FSReadStream: fs.ReadStream,
+    FSWriteStream: fs.WriteStream, TLSSocket: tls.TLSSocket, TLSServer: tls.Server,
+    UdpSocket: dgram.Socket, MessagePort: wt.MessagePort, Worker: wt.Worker,
+    ClusterWorker: cluster.Worker, Domain: domain.Domain,
+    ChildProcess: require('child_process').ChildProcess,
+    Http2Server: http2.Http2Server, Http2Session: http2.Http2Session, Http2Stream: http2.Http2Stream,
+  };
+  for (const [tag, K] of Object.entries(classes)) {
+    if (typeof K !== 'function' || !K.prototype) continue;
+    console.log(tag + '\t' + methods.filter((m) => K.prototype[m] !== P[m]).join(','));
+  }
+}
 // Each module's ACCESSOR exports (`timers.promises`, `fs.ReadStream`,
 // `crypto.webcrypto`): whether a setter exists, the attributes, and the
 // getter's and setter's `name`.
@@ -157,7 +190,13 @@ fn main() {
     let (proto_arity_text, rest) = rest
         .split_once("===SYMBOLS===\n")
         .expect("enumerator emitted no symbol-property section");
-    let (symbols_text, accessors_text) = rest
+    let (symbols_text, rest) = rest
+        .split_once("===EMITTER===\n")
+        .expect("enumerator emitted no emitter section");
+    let (emitter_text, rest) = rest
+        .split_once("===EMITTER_OVERRIDES===\n")
+        .expect("enumerator emitted no emitter-override section");
+    let (overrides_text, accessors_text) = rest
         .split_once("===ACCESSORS===\n")
         .expect("enumerator emitted no accessor-export section");
     let mut rows: Vec<(String, String, String, bool)> = rows_text
@@ -357,6 +396,58 @@ fn main() {
             col(6)
         )
         .unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    let mut emitter_rows: Vec<(String, String, String)> = emitter_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut it = l.split('\t');
+            (
+                it.next().unwrap_or_default().to_string(),
+                it.next().unwrap_or_default().to_string(),
+                it.next().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    emitter_rows.sort();
+    writeln!(
+        w,
+        "\n/// `(key, name, length)` of `EventEmitter.prototype`'s methods, keyed\n\
+         /// `@proto:EventEmitter:<method>`; an alias reports the method it is\n\
+         /// (`on` is `addListener`). Sorted by key.\n\
+         pub const EMITTER_PROTO_ARITY: &[(&str, &str, u32)] = &["
+    )
+    .unwrap();
+    for (key, name, len) in &emitter_rows {
+        writeln!(w, "    ({key:?}, {name:?}, {len}),").unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    let mut override_rows: Vec<(String, String)> = overrides_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (tag, list) = l.split_once('\t').unwrap_or((l, ""));
+            (tag.to_string(), list.to_string())
+        })
+        .collect();
+    override_rows.sort();
+    writeln!(
+        w,
+        "\n/// For each emitter-backed native class (by tag), the `EventEmitter` methods\n\
+         /// its prototype chain OVERRIDES instead of inheriting from\n\
+         /// `EventEmitter.prototype`. Sorted by tag; the names within a row are not.\n\
+         pub const EMITTER_OVERRIDES: &[(&str, &[&str])] = &["
+    )
+    .unwrap();
+    for (tag, list) in &override_rows {
+        let list = list
+            .split(',')
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("{k:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(w, "    ({tag:?}, &[{list}]),").unwrap();
     }
     writeln!(w, "];").unwrap();
 }
