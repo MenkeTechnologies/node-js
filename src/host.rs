@@ -894,6 +894,18 @@ pub type Accessor = (Option<Value>, Option<Value>);
 
 /// Prefix of the hidden property-map entry that reserves an accessor's slot in
 /// own-key insertion order (see `set_accessor`).
+/// The built-in iterator prototypes `ensure_iterator_protos` installs: the
+/// `native_protos` key (also the `@proto:<key>:next` thunk's class) and the
+/// `@@toStringTag` each carries, which is also the brand an iterator of that
+/// kind reports.
+pub const ITERATOR_PROTOS: &[(&str, &str)] = &[
+    ("ArrayIterator", "Array Iterator"),
+    ("MapIterator", "Map Iterator"),
+    ("SetIterator", "Set Iterator"),
+    ("StringIterator", "String Iterator"),
+    ("RegExpStringIterator", "RegExp String Iterator"),
+];
+
 pub const ORD_MARKER: &str = "@@ord:";
 
 /// The three ECMAScript own-property attributes. `PropAttrs::default()` is the
@@ -11320,6 +11332,15 @@ pub fn lookup_chain(h: &JsHost, recv: &Value, key: &str) -> Option<Value> {
                     return Some(v);
                 }
             }
+            // An intrinsic prototype kept as a namespace handle
+            // (`Iterator.prototype`, `Array.prototype`): what a script
+            // assigned onto it lives in the namespace's side table, so
+            // `Object.create(Array.prototype)` inherits a patched member.
+            Some(JsObj::Builtin(ns)) => {
+                if let Some(v) = h.builtin_static(ns, key) {
+                    return Some(v);
+                }
+            }
             _ => {}
         }
         cur = h.proto_of(&p);
@@ -11625,6 +11646,75 @@ impl JsHost {
             self.native_protos.insert(ctor.to_string(), proto);
         }
         self.ensure_generator_protos();
+        self.ensure_iterator_protos();
+    }
+
+    /// `%ArrayIteratorPrototype%`, `%MapIteratorPrototype%`,
+    /// `%SetIteratorPrototype%`, `%StringIteratorPrototype%` and
+    /// `%RegExpStringIteratorPrototype%` (ECMA-262 23.1.5.2, 24.1.5.2,
+    /// 24.2.6.2, 22.1.5.1, 22.2.9.2): each owns `next` and a non-writable
+    /// `@@toStringTag`, and inherits from `Iterator.prototype`. A built-in
+    /// iterator reported `Iterator.prototype` itself as its prototype, so the
+    /// standard probe `Object.getPrototypeOf(Object.getPrototypeOf([].values()))
+    /// === Iterator.prototype` was false. Keyed in `native_protos` by
+    /// [`ITERATOR_PROTOS`]'s first column; `alloc_iter` and `collection_iterator`
+    /// link each new iterator to one by brand.
+    fn ensure_iterator_protos(&mut self) {
+        self.well_known_symbol("toStringTag");
+        let fixed = PropAttrs {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        };
+        for (key, tag) in ITERATOR_PROTOS {
+            let proto = self.new_object(IndexMap::new());
+            let iter_proto = self.alloc(JsObj::Builtin("Iterator.prototype".into()));
+            self.set_proto(&proto, iter_proto);
+            let next = self.alloc(JsObj::Builtin(format!("@proto:{key}:next")));
+            let tag = self.new_str(*tag);
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert("next".into(), next);
+                p.insert("@@toStringTag".into(), tag);
+            }
+            self.hide_prop(&proto, "next");
+            self.set_prop_attrs(&proto, "@@toStringTag", fixed);
+            self.native_protos.insert((*key).into(), proto);
+        }
+    }
+
+    /// Allocate a built-in iterator (`JsObj::Iter`) linked to its kind's
+    /// intrinsic prototype, so a read, `in`, `instanceof` and a patched
+    /// `next` all see the chain `Object.getPrototypeOf` reports.
+    pub fn alloc_iter(&mut self, it: JsObj) -> Value {
+        let v = self.alloc(it);
+        if let Some(key) = self.iterator_proto_key(&v) {
+            if !self.native_protos.contains_key(key) {
+                self.ensure_native_protos();
+            }
+            if let Some(p) = self.native_proto(key) {
+                self.set_proto(&v, p);
+            }
+        }
+        v
+    }
+
+    /// The [`ITERATOR_PROTOS`] key of the intrinsic prototype a built-in
+    /// iterator inherits from, read with the borrow held. `None` for anything
+    /// that is not one of those five iterator kinds.
+    pub fn iterator_proto_key(&self, v: &Value) -> Option<&'static str> {
+        let brand = match self.get(v)? {
+            JsObj::Iter { array: Some(_), .. } => "Array Iterator",
+            JsObj::Iter { brand: Some(b), .. } => b,
+            JsObj::Object(_) => match crate::builtins::collection_iterator_view(self, v)?.0 {
+                "Map Iterator" | "Map Entries" => "Map Iterator",
+                _ => "Set Iterator",
+            },
+            _ => return None,
+        };
+        ITERATOR_PROTOS
+            .iter()
+            .find(|(_, tag)| *tag == brand)
+            .map(|(key, _)| *key)
     }
 
     /// `%AsyncIteratorPrototype%`, `%GeneratorPrototype%` and

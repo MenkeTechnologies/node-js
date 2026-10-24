@@ -1643,7 +1643,12 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
     // inherits `'Uint8Array'` from the typed-array prototype it now really has.
     // Anything the receiver's own chain provides wins (a class may define its
     // own getter), so this is only the fallback.
-    if name == "@@toStringTag" && with_host(|h| host::lookup_chain(h, recv, name)).is_none() {
+    if name == "@@toStringTag" {
+        // A data tag on the chain is the answer itself: an exotic receiver's
+        // own read path (a built-in iterator's) does not walk to it.
+        if let Some(v) = with_host(|h| host::lookup_chain(h, recv, name)) {
+            return Ok(v);
+        }
         if let Some(tag) = with_host(|h| well_known_tag(h, recv)) {
             return Ok(with_host(|h| h.new_str(tag)));
         }
@@ -4019,6 +4024,15 @@ fn generator_proto_method(
     args: &[Value],
 ) -> Option<Result<Value, String>> {
     match (ctor, method) {
+        // 27.1.4.13 `%Iterator.prototype%[@@iterator]`: return `this`. Routing
+        // an ordinary receiver back through `call_method` found this thunk
+        // on its chain again and overflowed the stack.
+        ("Iterator", "@@iterator") => Some(Ok(recv.clone())),
+        // The helpers are generic over any receiver with a `next`; the same
+        // re-dispatch would find them on the chain again.
+        ("Iterator", m) if crate::stdlib::iterator::is_helper(m) => {
+            Some(crate::stdlib::iterator::call(recv, m, args))
+        }
         ("AsyncIterator", "@@asyncIterator") => Some(Ok(recv.clone())),
         // 27.1.3.1: call `this.return()` if there is one, and settle with
         // `undefined` once its result does.
@@ -4046,6 +4060,39 @@ fn generator_proto_method(
         }
         _ => None,
     }
+}
+
+/// `next` of the built-in iterator prototypes (`ensure_iterator_protos`),
+/// called through the prototype: an iterator of that kind steps; anything
+/// else is V8's incompatible-receiver TypeError, which names the prototype by
+/// its tag (and `%RegExpStringIterator%` by its intrinsic name).
+fn iterator_proto_next(
+    recv: &Value,
+    ctor: &str,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let (_, tag) = host::ITERATOR_PROTOS.iter().find(|(k, _)| *k == ctor)?;
+    if method != "next" {
+        return None;
+    }
+    if with_host(|h| h.iterator_proto_key(recv)) == Some(ctor) {
+        // Stepped directly: dispatching `next` by name would find this very
+        // thunk on the chain again.
+        return Some(match ctor {
+            "MapIterator" | "SetIterator" => collection_iterator_next(recv),
+            _ => iter_method(recv, "next", args.to_vec()),
+        });
+    }
+    let label = if ctor == "RegExpStringIterator" {
+        "%RegExpStringIterator%"
+    } else {
+        tag
+    };
+    Some(Err(host::type_error(&format!(
+        "Method {label}.prototype.next called on incompatible receiver {}",
+        no_side_effects_string(recv)
+    ))))
 }
 
 /// `%AsyncIteratorPrototype%[@@asyncDispose]()`.
@@ -4085,6 +4132,9 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         _ => method,
     };
     if let Some(r) = generator_proto_method(recv, ctor, method, &args) {
+        return r;
+    }
+    if let Some(r) = iterator_proto_next(recv, ctor, method, &args) {
         return r;
     }
     // A prototype ACCESSOR installed by `ensure_ctor_proto`: it reads or writes
@@ -7459,7 +7509,8 @@ const TIMER_ARITY: &[(&str, &str, u32)] = &[
 ];
 
 /// `name` and `length` of the `%GeneratorPrototype%`, `%AsyncGeneratorPrototype%`
-/// and `%AsyncIteratorPrototype%` methods (`ensure_generator_protos`), which the
+/// and `%AsyncIteratorPrototype%` methods (`ensure_generator_protos`) and of the
+/// five built-in iterator prototypes' `next` (`ensure_iterator_protos`), which the
 /// generated table does not reach: it walks the global constructors, and these
 /// prototypes hang off no global. Measured against node v26.12.1.
 const GENERATOR_PROTO_ARITY: &[(&str, &str, u32)] = &[
@@ -7479,6 +7530,11 @@ const GENERATOR_PROTO_ARITY: &[(&str, &str, u32)] = &[
         "[Symbol.asyncDispose]",
         0,
     ),
+    ("@proto:ArrayIterator:next", "next", 0),
+    ("@proto:MapIterator:next", "next", 0),
+    ("@proto:SetIterator:next", "next", 0),
+    ("@proto:StringIterator:next", "next", 0),
+    ("@proto:RegExpStringIterator:next", "next", 0),
 ];
 
 /// The `name` a builtin function reports. The table answers for an intrinsic;
@@ -11943,7 +11999,19 @@ fn collection_iterator(coll: &Value, kind: &str) -> Value {
         m.insert("@@kind".into(), h.new_str(kind.to_string()));
         m.insert("@@started".into(), Value::Bool(false));
         m.insert("@@lastIdx".into(), Value::Float(0.0));
-        h.new_object(m)
+        let it = h.new_object(m);
+        // `%MapIteratorPrototype%` / `%SetIteratorPrototype%`, not the generic
+        // native-instance prototype the `@@native` tag would otherwise pick.
+        h.ensure_native_protos();
+        let key = if matches!(h.get(coll), Some(JsObj::Map { .. })) {
+            "MapIterator"
+        } else {
+            "SetIterator"
+        };
+        if let Some(p) = h.native_proto(key) {
+            h.set_proto(&it, p);
+        }
+        it
     })
 }
 
@@ -13812,7 +13880,7 @@ fn string_method(s: &str, name: &str, args: Vec<Value>) -> Result<Value, String>
         "@@iterator" => {
             let items: Vec<Value> = s.chars().map(|c| new_s(c.to_string())).collect();
             Ok(with_host(|h| {
-                h.alloc(JsObj::Iter {
+                h.alloc_iter(JsObj::Iter {
                     items,
                     idx: 0,
                     array: None,
@@ -15402,7 +15470,7 @@ fn iter_result(value: Value, done: bool) -> Value {
 /// and `Symbol.iterator` return, and what a `for-of` over an array steps.
 pub(crate) fn array_iterator(arr: &Value, kind: host::ArrayIterKind) -> Value {
     with_host(|h| {
-        h.alloc(JsObj::Iter {
+        h.alloc_iter(JsObj::Iter {
             items: Vec::new(),
             idx: 0,
             array: Some((arr.clone(), kind)),

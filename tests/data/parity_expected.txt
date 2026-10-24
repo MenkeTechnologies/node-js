@@ -1899,6 +1899,44 @@ call-object   TypeError: {(intermediate value)} is not a function
 call-empty    TypeError: {} is not a function
 new-object    TypeError: {(intermediate value)} is not a constructor
 forawait      TypeError: o is not async iterable
+==== iteratorprotos.js ====
+array      true true Array Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Array Iterator] {}
+arrayKeys  true true Array Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Array Iterator] {}
+typed      true true Array Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Array Iterator] {}
+buffer     true true Array Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Array Iterator] {}
+args       true true Array Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Array Iterator] {}
+map        true true Map Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Map Iterator] {}
+mapKeys    true true Map Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Map Iterator] {}
+set        true true Set Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Set Iterator] {}
+setEntries true true Set Iterator next,Symbol(Symbol.toStringTag) next 0 Object [Set Iterator] {}
+string     true true String Iterator next,Symbol(Symbol.toStringTag) next 0 Object [String Iterator] {}
+regexp     true true RegExp String Iterator next,Symbol(Symbol.toStringTag) next 0 Object [RegExp String Iterator] {}
+true
+true
+{
+  value: 'Array Iterator',
+  writable: false,
+  enumerable: false,
+  configurable: true
+}
+true true
+{ value: 5, done: false } { value: 1, done: false }
+TypeError Method Array Iterator.prototype.next called on incompatible receiver [object Map Iterator]
+TypeError Method Array Iterator.prototype.next called on incompatible receiver #<Object>
+TypeError Method Map Iterator.prototype.next called on incompatible receiver [object Array Iterator]
+TypeError Method Set Iterator.prototype.next called on incompatible receiver #<Object>
+TypeError Method String Iterator.prototype.next called on incompatible receiver #<Object>
+TypeError Method %RegExpStringIterator%.prototype.next called on incompatible receiver #<Object>
+7 true
+8
+{ value: 'patched', done: false }
+{ value: 1, done: false }
+true [ 0, 10, 20 ] []
+true
+2 2 2 2 2 true
+1 true 1
+undefined false
+1 2 3 yz
 ==== iterclose.js ====
 from-throws   ["m",["next","return"]]
 from-maps     [10,21]

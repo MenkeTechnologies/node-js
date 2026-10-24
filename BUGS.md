@@ -3315,7 +3315,6 @@ validators, and V8's promise state (`util.@@promiseState`, for
 |---|---|---|
 | `CompressionStream`/`DecompressionStream` output chunking | a chunk per zlib flush (gzip of a short input: a 10-byte header, then the rest) | one chunk when the writable closes: node builds these over its Duplex adapters (`internal/webstreams/adapters`), which are not ported, so the codec runs over the whole input |
 | transferring a stream (`structuredClone(rs, { transfer: [rs] })`, `postMessage`) | the stream moves | not modelled: the transfer symbols exist, nothing calls them |
-| `Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())) === Iterator.prototype`, `Object.getPrototypeOf(%GeneratorPrototype%)` against it | `true` | `false`: the built-in iterators are not linked to `Iterator.prototype` |
 | `util.inspect(Object.getPrototypeOf(function* () {}))` | `Function [GeneratorFunction] {}` | `Object [GeneratorFunction] {}` |
 | `TextEncoderStream` given a surrogate pair split across two chunks | one 4-byte sequence | two U+FFFD — a lone surrogate has no Rust `String` representation (the known boundary above) |
 | `require('child_process').ChildProcess` | the class | `undefined` |
@@ -3430,3 +3429,26 @@ record went red.
 | `w = Buffer.from(ab, 3, 4)`: `[...w]` was right, but `w.map`, `Object.keys(w)`, `w.hasOwnProperty(4)`, `getOwnPropertyDescriptor(w, 0)`, `` `${w}` ``, `inspect`, `w.reverse()`/`fill()`, `crypto.getRandomValues(w)`, and the byte readers of `fs`/`net`/`http`/`http2`/`https`/`tls`/`dgram` | the 4-byte window | the WHOLE store: each read `@@bytes` from offset 0 to its end, and the in-place writers wrote from the store's origin (`getRandomValues` replaced the store with the window's length) |
 | `buf.subarray(1, 3)` / `buf.slice(1, 3)` | a window onto the same memory (a write shows in the parent) | a copy |
 | a Buffer whose `ArrayBuffer` was transferred: `length`, `buf[0]`, `[...buf]` | `0`, `undefined`, `Cannot perform %TypedArray%.prototype.values on a detached …` | the old length and bytes: `detach` swapped in a new empty store, which the Buffer did not hold |
+
+## FIXED in round 23 — built-in iterator prototypes, verified against node v26.12.1
+
+Pinned in `examples/iteratorprotos.js`; each fix was re-broken alone and its
+record went red (a hook in `prototype_of` that the sabotage showed was never
+reached — every iterator is linked when allocated — was deleted).
+
+| Case | node | was |
+|---|---|---|
+| `Object.getPrototypeOf(Object.getPrototypeOf([].values())) === Iterator.prototype` (and a Map, Set, String, RegExp-string, typed-array, Buffer or `arguments` iterator) | `true`: each inherits `%ArrayIteratorPrototype%` / `%MapIteratorPrototype%` / `%SetIteratorPrototype%` / `%StringIteratorPrototype%` / `%RegExpStringIteratorPrototype%`, which owns `next` (length 0) and a non-writable `Symbol.toStringTag` | `false`: an array iterator reported `Iterator.prototype` itself; a Map/Set iterator a generic native prototype with `constructor` and no tag |
+| `[].values() instanceof Iterator`, `''[Symbol.iterator]() instanceof Iterator` | `true` | `false` |
+| `AIP.next.call(new Map().keys())`, `…call({})` (and per kind) | `Method Array Iterator.prototype.next called on incompatible receiver …` (`%RegExpStringIterator%` for that kind) | absent |
+| a member added to `%ArrayIteratorPrototype%`, or a replaced `next` | seen by every iterator of that kind | not seen |
+| `Object.create(Iterator.prototype)[Symbol.iterator]()`, `%GeneratorPrototype%[Symbol.iterator]()`, an Iterator helper (`.map`, `.toArray`) on an ordinary object inheriting `Iterator.prototype` | `this`; the helper | a stack overflow that aborted the process |
+| `Object.create(Array.prototype).zz` after `Array.prototype.zz = 1` (any member a script put on an intrinsic prototype kept as a namespace, read through an explicit chain) | `1` | `undefined`: the chain walk skipped namespace handles |
+
+### Still open — found here, not fixed
+
+| Case | node | node-js |
+|---|---|---|
+| `class C extends Iterator {}` | the abstract `Iterator` constructor (callable via `super`) | `Iterator is not a constructor` |
+| `for (k in Object.create(Iterator.prototype))` after `Iterator.prototype.q = 1` | `q` | nothing: `enum_keys` does not list a namespace prototype's patched members |
+| the `URLSearchParams`, `Headers` and `FormData` iterators' prototype | its own `next` + tag (plus `inspect.custom` for URLSearchParams), inheriting `Iterator.prototype` | `Iterator.prototype`'s member list itself |

@@ -1930,7 +1930,7 @@ pub fn instance_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value
                     .collect(),
             });
             Ok(with_host(|h| {
-                h.alloc(JsObj::Iter {
+                h.alloc_iter(JsObj::Iter {
                     items,
                     idx: 0,
                     array: None,

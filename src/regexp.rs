@@ -1585,7 +1585,7 @@ pub fn str_match_all(s: &str, re_val: &Value) -> Result<Value, String> {
     }
     // Return a live iterator so `for-of`/spread/`Array.from` all work.
     Ok(with_host(|h| {
-        h.alloc(JsObj::Iter {
+        h.alloc_iter(JsObj::Iter {
             items,
             idx: 0,
             array: None,
