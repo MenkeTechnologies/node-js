@@ -40,6 +40,7 @@ const spellings = {
   repl: 'repl',
 };
 const rows = [];
+const symbolRows = [];
 for (const [id, ns] of Object.entries(spellings)) {
   let mod; try { mod = require(id); } catch { continue; }
   for (const k of Object.getOwnPropertyNames(mod)) {
@@ -53,6 +54,19 @@ for (const [id, ns] of Object.entries(spellings)) {
     // The fourth column: whether the function owns a `prototype` (an ordinary
     // `function` does; an arrow, a method or a bound function does not).
     rows.push(ns + '.' + k + '\t' + f.name + '\t' + f.length + '\t' + (Object.hasOwn(f, 'prototype') ? 1 : 0));
+    // The function's own SYMBOL-keyed properties (`os.freemem[Symbol.toPrimitive]`,
+    // `setTimeout[util.promisify.custom]`): the key as this frontend spells a
+    // symbol (`@@<name>` for a well-known one, `for:<key>` for a registered
+    // one), whether it is an accessor, and its attributes.
+    for (const s of Object.getOwnPropertySymbols(f)) {
+      const sd = Object.getOwnPropertyDescriptor(f, s);
+      const desc = s.description;
+      const spelled = Symbol.keyFor(s) !== undefined ? 'for:' + Symbol.keyFor(s) :
+        desc.startsWith('Symbol.') ? '@@' + desc.slice(7) : null;
+      if (spelled === null) continue;
+      symbolRows.push([ns + '.' + k, spelled, sd.get ? 1 : 0, sd.enumerable ? 1 : 0,
+        sd.writable ? 1 : 0, sd.configurable ? 1 : 0].join('\t'));
+    }
   }
 }
 console.log(rows.join('\n'));
@@ -91,6 +105,8 @@ for (const name of protoClasses) {
     if (d && typeof d.value === 'function') console.log('@proto:' + name + ':' + k + '\t' + d.value.name + '\t' + d.value.length);
   }
 }
+console.log('===SYMBOLS===');
+console.log(symbolRows.join('\n'));
 "#;
 
 fn main() {
@@ -122,9 +138,12 @@ fn main() {
     let (keys_text, rest) = rest
         .split_once("===PROTOS===\n")
         .expect("enumerator emitted no prototype section");
-    let (protos_text, proto_arity_text) = rest
+    let (protos_text, rest) = rest
         .split_once("===PROTO_ARITY===\n")
         .expect("enumerator emitted no prototype-arity section");
+    let (proto_arity_text, symbols_text) = rest
+        .split_once("===SYMBOLS===\n")
+        .expect("enumerator emitted no symbol-property section");
     let mut rows: Vec<(String, String, String, bool)> = rows_text
         .lines()
         .filter(|l| !l.is_empty())
@@ -261,6 +280,37 @@ fn main() {
     .unwrap();
     for (key, name, len) in &parity_rows {
         writeln!(w, "    ({key:?}, {name:?}, {len}),").unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    let mut symbol_rows: Vec<Vec<String>> = symbols_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('\t').map(str::to_string).collect())
+        .collect();
+    symbol_rows.sort();
+    writeln!(
+        w,
+        "\n/// The own symbol-keyed properties of the core-module functions:\n\
+         /// `(key, symbol, accessor, enumerable, writable, configurable)`. The symbol\n\
+         /// is `@@<name>` for a well-known one, `for:<key>` for one in the\n\
+         /// `Symbol.for` registry; `accessor` marks a getter (`writable` is then\n\
+         /// meaningless). Sorted by key.\n\
+         pub const CORE_SYMBOL_PROPS: &[(&str, &str, bool, bool, bool, bool)] = &["
+    )
+    .unwrap();
+    for r in &symbol_rows {
+        let flag = |i: usize| r.get(i).map(String::as_str) == Some("1");
+        writeln!(
+            w,
+            "    ({:?}, {:?}, {}, {}, {}, {}),",
+            r[0],
+            r[1],
+            flag(2),
+            flag(3),
+            flag(4),
+            flag(5)
+        )
+        .unwrap();
     }
     writeln!(w, "];").unwrap();
 }
