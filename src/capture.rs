@@ -79,6 +79,9 @@ pub fn stmt_captures(s: &Stmt) -> bool {
                     .is_some_and(|body| body.iter().any(stmt_captures))
         }
         StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Empty => false,
+        // Module declarations never reach a compiled body: `esm::lower` replaces
+        // them before compilation. Classified as capturing, the safe answer.
+        StmtKind::Import(_) | StmtKind::Export(_) => true,
     }
 }
 

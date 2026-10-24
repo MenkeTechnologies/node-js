@@ -1001,6 +1001,16 @@ fn global_binding_from(name: &str, object_only: bool) -> Option<Value> {
         "performance" => return Some(with_host(|h| h.alloc(JsObj::Builtin("performance".into())))),
         // The `SubtleCrypto` CLASS; the bare name `SubtleCrypto` is this
         // frontend's key for the `crypto.subtle` instance.
+        // The ES module entry points lowered code calls: `import(…)` and the
+        // entry module's `runMain`. A `%` keeps them out of reach of source.
+        crate::esm::IMPORT_FN => {
+            return Some(with_host(|h| {
+                h.alloc(JsObj::Builtin("@@esm.import".into()))
+            }))
+        }
+        crate::esm::MAIN_FN => {
+            return Some(with_host(|h| h.alloc(JsObj::Builtin("@@esm.main".into()))))
+        }
         "SubtleCrypto" => {
             return Some(with_host(|h| {
                 h.alloc(JsObj::Builtin(crate::stdlib::SUBTLE_CRYPTO_CLASS.into()))
@@ -5148,6 +5158,9 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             return Ok(());
         }
         if with_host(|h| h.current_strict()) {
+            if let Some(e) = crate::esm::namespace_refusal(recv, crate::esm::Refused::Set, name) {
+                return Err(e);
+            }
             return Err(host::type_error(&format!(
                 "'set' on proxy: trap returned falsish for property '{name}'"
             )));
@@ -5660,6 +5673,9 @@ fn refused_delete_error(recv: &Value, key: &str) -> String {
     // A PROXY names the trap that refused. Only the `delete` OPERATOR reports
     // it; `Reflect.deleteProperty` answers `false`, which is why this lives
     // here rather than in the shared `[[Delete]]`.
+    if let Some(e) = crate::esm::namespace_refusal(recv, crate::esm::Refused::Delete, key) {
+        return e;
+    }
     if with_host(|h| h.kind_of(recv)) == Some(ObjKind::Proxy) {
         return host::type_error(&format!(
             "'deleteProperty' on proxy: trap returned falsish for property '{key}'"
@@ -8237,6 +8253,8 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         "JSON.rawJSON" => json_raw(args),
         "JSON.isRawJSON" => json_is_raw(args),
         "structuredClone" => structured_clone(args),
+        // The ES module loader's natives (`esm.rs`), handed to `esm_loader.js`.
+        _ if name.starts_with("@@esm.") => crate::esm::native(&name["@@esm.".len()..], &args),
         // The deferred drain a `Readable.from` schedules; the suffix is the
         // stream's heap index.
         _ if name.starts_with("@@transformCb:") => {
@@ -15604,6 +15622,10 @@ fn object_define_property(args: Vec<Value>) -> Result<Value, String> {
         // `Object.defineProperty` THROWS on a refusing trap — in sloppy code
         // too. `Reflect.defineProperty` is the form that reports `false`.
         if !crate::proxy::define_property(&obj, &key, &desc)? {
+            if let Some(e) = crate::esm::namespace_refusal(&obj, crate::esm::Refused::Define, &key)
+            {
+                return Err(e);
+            }
             return Err(host::type_error(&format!(
                 "'defineProperty' on proxy: trap returned falsish for property '{key}'"
             )));

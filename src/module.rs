@@ -68,6 +68,7 @@ thread_local! {
 /// Clear all per-host loader state. Called from `host::reset_host` so a fresh
 /// eval (which rebuilds the heap) never reuses a stale heap handle.
 pub fn reset() {
+    crate::esm::reset();
     CACHE.with(|c| c.borrow_mut().clear());
     PATH_CACHE.with(|c| c.borrow_mut().clear());
     PARENTS.with(|c| c.borrow_mut().clear());
@@ -416,14 +417,27 @@ fn load_file(path: &Path, parent: &str) -> Result<Value, String> {
         return Ok(val);
     }
 
+    // `require(esm)`: a file whose format is ES module — by its `.mjs`
+    // extension or its package's `"type": "module"` — loads through the ES
+    // module loader and yields its namespace.
+    if is_declared_esm(path) {
+        return crate::esm::require_module(path, parent);
+    }
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
 
     // Compile the Node module wrapper to obtain the wrapper FUNCTION value.
     // A compile error is annotated with the offending file (Node does likewise).
-    let wrapper = compile_wrapper(&source)
-        .map_err(|e| format!("{e}\n    while loading {}", path.display()))?;
+    // A source of undeclared format that fails only because it is written as
+    // an ES module is one (node's syntax detection), and loads as one.
+    let wrapper = match compile_wrapper(&source) {
+        Ok(w) => w,
+        Err(e) if crate::esm::detect_module(&source, &e) => {
+            return crate::esm::require_module(path, parent);
+        }
+        Err(e) => return Err(format!("{e}\n    while loading {}", path.display())),
+    };
 
     // The `module` object, plus the aliases the wrapper receives. A required
     // module's `id` IS its absolute filename (only the entry module's is `.`).
@@ -638,4 +652,22 @@ pub fn callsite_stack(depth: usize) -> Result<Value, String> {
         f
     };
     host::invoke(&factory, vec![Value::Float(depth as f64)], None)
+}
+
+/// Whether `path` is an ES module by declaration alone — its `.mjs` extension,
+/// or a `.js` file in a package scope whose `"type"` is `"module"` — so no
+/// source has to be parsed to know. (A `.js` file of undeclared type is found
+/// to be one only when its CommonJS parse fails; see `load_file`.)
+fn is_declared_esm(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mjs") => true,
+        Some("js") => crate::esm::file_format_declared(path) == Some(crate::esm::Format::Module),
+        _ => false,
+    }
+}
+
+/// Load the resolved CommonJS file `path` (the ES module loader's path into
+/// this one): its `module.exports`, shared with every `require` of the file.
+pub fn require_file(path: &Path, parent: &str) -> Result<Value, String> {
+    load_file(path, parent)
 }

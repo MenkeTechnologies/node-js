@@ -416,7 +416,71 @@ pub enum StmtKind {
         finalizer: Option<Vec<Stmt>>,
     },
 
+    /// An `import` declaration (module code only, top level).
+    Import(ImportDecl),
+    /// An `export` declaration (module code only, top level).
+    Export(ExportDecl),
+
     Empty,
+}
+
+/// One binding an `import` declaration introduces (16.2.2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportSpec {
+    /// `import local from …` — the imported name is `default`.
+    Default(String),
+    /// `import * as local from …`.
+    Namespace(String),
+    /// `import { imported as local } from …` (`imported` may be a string literal
+    /// name such as `"a b"`).
+    Named { imported: String, local: String },
+}
+
+/// `import … from "specifier" with { … }` — the bindings may be empty
+/// (`import "m"` evaluates the module for its effects only).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDecl {
+    pub specifier: String,
+    pub specs: Vec<ImportSpec>,
+    /// The `with { type: "json" }` import attributes, in source order.
+    pub attributes: Vec<(String, String)>,
+    /// The source range of the `{ … }` named-imports clause, `(0, 0)` when
+    /// there is none — node quotes it back in the error for a named import a
+    /// CommonJS module does not provide.
+    pub clause: Span,
+}
+
+/// `local as exported` inside `export { … }`. Without a `from` clause `local`
+/// names a binding of this module; with one it is a name the requested module
+/// exports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportSpec {
+    pub local: String,
+    pub exported: String,
+}
+
+/// The forms of an `export` declaration (16.2.3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportDecl {
+    /// `export var|let|const …`, `export function …`, `export class …`.
+    Decl(Box<Stmt>),
+    /// `export default function …` / `export default class …`: a `FuncDecl` or
+    /// `ClassDecl` whose name is `default` when the source gave none.
+    DefaultDecl(Box<Stmt>),
+    /// `export default <AssignmentExpression>;`.
+    DefaultExpr(Expr),
+    /// `export { a, b as c }`, or `export { a } from "m"` when `from` is set.
+    Named {
+        specs: Vec<ExportSpec>,
+        from: Option<String>,
+        attributes: Vec<(String, String)>,
+    },
+    /// `export * from "m"`, or `export * as alias from "m"`.
+    Star {
+        alias: Option<String>,
+        from: String,
+        attributes: Vec<(String, String)>,
+    },
 }
 
 /// A statement plus its 1-based source line.

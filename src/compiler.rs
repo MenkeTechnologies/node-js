@@ -885,6 +885,12 @@ impl Compiler {
             }
             StmtKind::Empty => {}
             StmtKind::FuncDecl { .. } => {} // hoisted at block entry
+            // `esm::lower` replaces module declarations before compilation; one
+            // reaching here is an `import`/`export` outside module code.
+            StmtKind::Import(_) => {
+                return Err("SyntaxError: Cannot use import statement outside a module".to_string())
+            }
+            StmtKind::Export(_) => return Err("SyntaxError: Unexpected token 'export'".to_string()),
             StmtKind::ClassDecl(node) => {
                 self.compile_class(b, node)?;
                 // Bind the class to its name in the current scope.
@@ -4620,6 +4626,31 @@ impl Compiler {
         if optional {
             return self.compile_optional_call(b, func, args);
         }
+        // `import(specifier[, options])` in a script (13.3.10): the ES module
+        // loader, resolving against the running file — the `__filename` the
+        // CommonJS wrapper (or the entry script) binds. Module code never
+        // reaches here: `esm::lower` passes its own filename instead.
+        if matches!(func, Expr::Ident(n) if n == "import") {
+            if args.is_empty()
+                || args.len() > 2
+                || args.iter().any(|a| matches!(a, Expr::Spread(_)))
+            {
+                return Err("SyntaxError: Unexpected token ')'".to_string());
+            }
+            let filename = Expr::Ident("__filename".into());
+            let referrer = Expr::Conditional {
+                test: Box::new(Expr::Binary(
+                    BinOp::EqEqEq,
+                    Box::new(Expr::Unary(UnOp::TypeOf, Box::new(filename.clone()))),
+                    Box::new(Expr::Str("string".into())),
+                )),
+                cons: Box::new(filename),
+                alt: Box::new(Expr::Undefined),
+            };
+            let mut full = vec![args[0].clone(), referrer];
+            full.extend(args.get(1).cloned());
+            return self.compile_call(b, &Expr::Ident(crate::esm::IMPORT_FN.into()), &full, false);
+        }
         let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
         match func {
             // `super(...args)` — invoke the parent constructor on the current
@@ -4888,7 +4919,7 @@ fn default_stmt(name: &str, default: &Expr) -> Stmt {
 /// and stops at a nested `function` declaration, whose body is its own scope.
 /// Function *expressions* and arrows are inside `Expr`, which is not walked at
 /// all: a `var` can only be introduced by a statement.
-fn collect_var_names(s: &Stmt, out: &mut Vec<String>) {
+pub(crate) fn collect_var_names(s: &Stmt, out: &mut Vec<String>) {
     match &s.kind {
         StmtKind::Decl {
             kind: DeclKind::Var,
@@ -4957,7 +4988,7 @@ fn collect_var_names(s: &Stmt, out: &mut Vec<String>) {
 }
 
 /// The binding names a declaration target introduces, destructuring included.
-fn pattern_names(target: &Expr, out: &mut Vec<String>) {
+pub(crate) fn pattern_names(target: &Expr, out: &mut Vec<String>) {
     match target {
         Expr::Ident(n) => {
             if !out.iter().any(|x| x == n) {

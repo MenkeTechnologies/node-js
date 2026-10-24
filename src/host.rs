@@ -3537,6 +3537,11 @@ pub fn type_error(msg: &str) -> String {
     format!("TypeError: {msg}")
 }
 pub fn ref_error(name: &str) -> String {
+    // A CommonJS wrapper name referenced from an ES module (`esm::lower`
+    // renames it so that it resolves to nothing) is reported by its own name.
+    let name = name
+        .strip_prefix(crate::esm::CJS_FREE_PREFIX)
+        .unwrap_or(name);
     format!("ReferenceError: {name} is not defined")
 }
 
@@ -4211,6 +4216,7 @@ fn finish_process_events() -> Result<(), String> {
         }
         run_event_loop()?;
     }
+    crate::esm::settle_unfinished_entry()?;
     let code = with_host(|h| h.exit_code).unwrap_or(0);
     crate::stdlib::process::emit_exit_event(code)
 }
@@ -5337,7 +5343,9 @@ impl JsHost {
                     } else {
                         format!("{ctor} ")
                     };
-                    let prefix = if self.inspects_null_proto(v) {
+                    let prefix = if props.contains_key(ESM_NAMESPACE_SNAPSHOT) {
+                        "[Module: null prototype] ".to_string()
+                    } else if self.inspects_null_proto(v) {
                         "[Object: null prototype] ".to_string()
                     } else {
                         // An inherited `Symbol.toStringTag` shows as `Ctor [Tag] `,
@@ -6992,6 +7000,54 @@ fn custom_inspect_args() -> Result<(Value, Value), String> {
     Ok((opts, inspect))
 }
 
+/// The stand-in `util.inspect` renders for the module namespace object `ns`:
+/// a null-prototype object of its exports in `[[Exports]]` order, tagged so the
+/// render prefixes it `[Module: null prototype]`. A binding that is not yet
+/// initialized renders as `<uninitialized>`.
+fn esm_namespace_snapshot(ns: &Value) -> Result<Value, String> {
+    // The export names are the proxy target's string keys. They are read off
+    // the target rather than through `Object.keys`, whose [[GetOwnProperty]]
+    // reads each value and so throws for a binding still in its dead zone.
+    let keys: Vec<String> = with_host(|h| {
+        let target = match h.get(ns) {
+            Some(JsObj::Proxy { target, .. }) => target.clone(),
+            _ => return Vec::new(),
+        };
+        match h.get(&target) {
+            Some(JsObj::Object(p)) => p.keys().filter(|k| !k.starts_with("@@")).cloned().collect(),
+            _ => Vec::new(),
+        }
+    });
+    let mut props = IndexMap::new();
+    for k in keys {
+        let val = match crate::builtins::get_property(ns, &k) {
+            Ok(v) => v,
+            Err(_) => {
+                with_host(|h| h.exc = None);
+                let marker = with_host(|h| h.new_object(IndexMap::new()));
+                if let Value::Obj(i) = marker {
+                    CUSTOM_RENDERS.with(|m| {
+                        m.borrow_mut()
+                            .insert(i, CustomRender::Text("<uninitialized>".into()))
+                    });
+                }
+                marker
+            }
+        };
+        props.insert(k, val);
+    }
+    props.insert(ESM_NAMESPACE_SNAPSHOT.to_string(), Value::Bool(true));
+    Ok(with_host(|h| {
+        let snap = h.new_object(props);
+        let null = h.null();
+        h.set_proto(&snap, null);
+        snap
+    }))
+}
+
+/// Hidden slot marking an [`esm_namespace_snapshot`].
+const ESM_NAMESPACE_SNAPSHOT: &str = "@@esmNamespaceSnapshot";
+
 /// Walk what the render will expand from `v` at nesting `level`, running each
 /// custom inspect method found and recording its answer.
 /// The plain-object stand-in for module namespace `ns` in one render: its
@@ -7029,6 +7085,18 @@ fn collect_custom_renders(
     let Value::Obj(id) = v else { return Ok(()) };
     if !seen.insert(*id) {
         return Ok(());
+    }
+    // An ES module namespace object is not a proxy to `util.inspect`: node
+    // prints `[Module: null prototype] { … }` with each export's CURRENT value,
+    // and `<uninitialized>` for a binding still in its dead zone. The values
+    // need the getters run, so a snapshot is rendered in its place.
+    if crate::esm::is_namespace(v) {
+        let snap = esm_namespace_snapshot(v)?;
+        CUSTOM_RENDERS.with(|m| {
+            m.borrow_mut()
+                .insert(*id, CustomRender::Value(snap.clone()))
+        });
+        return collect_custom_renders(&snap, level, seen, ctx);
     }
     let skip = with_host(|h| is_primitive(h, v) || matches!(h.get(v), Some(JsObj::Proxy { .. })));
     if skip {

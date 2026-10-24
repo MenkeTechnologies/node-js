@@ -221,6 +221,8 @@ fn stmt_slot_safe(s: &Stmt) -> bool {
         }
         StmtKind::Labeled { body, .. } => stmt_slot_safe(body),
         StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Empty => true,
+        // Lowered away by `esm::lower` before any chunk is compiled.
+        StmtKind::Import(_) | StmtKind::Export(_) => false,
         // A nested function or class body is its own chunk with its own frame:
         // nothing in it can unsettle this one. What it NAMES is refused per
         // name by `collect_escaping_stmt`.
@@ -481,6 +483,7 @@ impl Planner {
             // Refused by `chunk_is_eligible` before the walk starts.
             StmtKind::Try { .. } | StmtKind::FuncDecl { .. } | StmtKind::ClassDecl(_) => {}
             StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Empty => {}
+            StmtKind::Import(_) | StmtKind::Export(_) => {}
         }
     }
 
@@ -690,6 +693,7 @@ fn collect_escaping_stmt(s: &Stmt, out: &mut FxHashSet<String>) {
         }
         StmtKind::Labeled { body, .. } => collect_escaping_stmt(body, out),
         StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Empty => {}
+        StmtKind::Import(_) | StmtKind::Export(_) => {}
     }
 }
 
@@ -858,6 +862,7 @@ fn collect_all_idents_stmt(s: &Stmt, out: &mut FxHashSet<String>) {
             }
         }
         StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Empty => {}
+        StmtKind::Import(_) | StmtKind::Export(_) => {}
     }
 }
 

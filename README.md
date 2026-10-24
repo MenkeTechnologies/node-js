@@ -195,6 +195,26 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
   `primordials` and internals: promise-driven `start`/`pull`/`cancel`,
   backpressure, byte streams with BYOB readers, `tee`, and
   `pipeTo`/`pipeThrough` with their options are node's code.
+- **ES modules** (ECMA-262 §16.2): static `import`/`export` in every form
+  (default, named, string-named, namespace, `export *`, `export * as ns`,
+  re-exports), **live bindings**, import cycles (a hoisted function of a module
+  that has not started yet is callable; a `const` read too early is the TDZ
+  `ReferenceError`), module namespace objects, top-level `await` with the
+  spec's asynchronous evaluation order, `import()`, `import.meta` (`url`,
+  `filename`, `dirname`, `main`, `resolve`), and the module early errors in
+  V8's wording. A file is a module by `.mjs`, by its package's
+  `"type": "module"`, or — a `.js` file, `-e` or stdin of undeclared format —
+  by node's syntax detection. Resolution is node's ESM resolver: no extension
+  probing, package `"exports"` and `"imports"` with conditions and `*`
+  patterns, self-reference, JSON modules behind `with { type: "json" }`.
+  CommonJS interop goes both ways: importing CommonJS gives `module.exports`
+  as `default` plus the named exports cjs-module-lexer would detect, and
+  `require()` of a synchronous ES module graph returns its namespace. The
+  module-record algorithms (Link, ResolveExport, Evaluate and the async
+  evaluation steps) are ported from the spec in `src/esm_loader.js`; a module
+  body is lowered (`src/esm.rs`) to one ordinary function whose scope is the
+  module environment, so no VM change was needed. `tests/esm.rs` pins the
+  behaviour against node v26.12.1.
 - The persistent bytecode cache runs on EVERY invocation (schema-versioned, so
   an older cached script never replays incompatible bytecode), and AOT
   native-executable emission is on the CLI as `--build`. The shard is read
@@ -218,12 +238,9 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
 
 ## [0x04] NOT YET (LATER WAVES)
 
-ES modules: the static `import`/`export` forms do not parse, so every module
-boundary has to go through CommonJS `require`. The file EXTENSION is not
-consulted — a `.mjs` file holding only CommonJS-compatible code runs — so what
-fails is module syntax, not the suffix. Dynamic `import()` does parse (it lexes
-as an ordinary call) and fails at run time with
-`ReferenceError: import is not defined`. `Intl` is absent by design rather than by
+ES modules lack loader hooks (`--import`, `--loader`, `module.register`),
+`data:` URLs, `--input-type`, and WebAssembly / source-phase imports; the
+remaining divergences are listed in `BUGS.md`. `Intl` is absent by design rather than by
 omission — the reasoning is in `BUGS.md`, which also lists the remaining
 behavioural divergences from the reference `node`.
 

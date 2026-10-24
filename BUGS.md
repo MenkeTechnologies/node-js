@@ -3331,3 +3331,44 @@ validators, and V8's promise state (`util.@@promiseState`, for
 | `require('child_process').ChildProcess` | the class | `undefined` |
 | `Object.getOwnPropertyNames(ChildProcess.prototype)` | `constructor, spawn, kill, ref, unref` | `send` and `disconnect` too (node adds them to an IPC child only), no `spawn` |
 | `Reflect.ownKeys(setTimeout)`, `Reflect.ownKeys(require('timers').setTimeout)` | includes `prototype` | omits it: both are the builtin keyed `setTimeout`, and `CORE_PROTOTYPED` keys the function `timers.setTimeout` |
+
+## ES modules (ECMA-262 §16.2) — implemented, verified against node v26.12.1
+
+Static `import`/`export`, live bindings, cycles, namespace objects, top-level
+`await`, `import()`, `import.meta`, format detection, node's ESM resolver and
+CommonJS interop in both directions. `tests/esm.rs` pins each against the
+reference (`ESM_REFERENCE_NODE=$(which node) cargo test --test esm` runs the
+same files through node to re-capture the expectations).
+
+How it is built, so the divergences below can be read against it:
+
+- `parser::parse_module` parses with the Module goal (strict, top-level
+  `await`, `import.meta`, the declarations). `esm::analyze` derives the
+  record's static fields (16.2.1.6.1) and the module early errors.
+- `esm::lower` turns the body into ONE ordinary function,
+  `(function [*] (%imp, %meta, %reg) { %reg([getters]); [yield;] body })`.
+  Its scope is the module environment: hoisted functions exist on entry,
+  `let`/`const`/`class` sit in their dead zone. Each export is registered as
+  a getter closure over that scope (a live binding); each reference to an
+  import becomes `%imp[k]()`. A module in an import cycle is built as a
+  generator so its prologue can run before any module of the cycle evaluates.
+- `esm_loader.js` ports Link/InnerModuleLinking, ResolveExport,
+  GetExportedNames, the namespace exotic object (a `Proxy` over a sealed
+  null-prototype target), Evaluate/InnerModuleEvaluation and the async
+  evaluation steps. CommonJS, JSON and core modules are synthetic records.
+
+Still open:
+
+| Case | node | node-js |
+|---|---|---|
+| direct `eval('x')` in module code, `x` an import | the import's value | `x is not defined` — an import binding is a rewritten reference, not a name in the scope `eval` searches. For the same reason `eval('require')` finds this runtime's lazily-bound `require` instead of throwing |
+| deep recursion inside a module that uses top-level `await` | node's stack | the body is an async function, which this runtime runs on a 16 MiB coroutine stack: a debug build overflows near 200 frames there — the same as inside any `async function` in a CommonJS script (measured: `deep(200)` fails in both, `deep(2000)` passes in a module WITHOUT top-level `await`) |
+| a read of an imported binding | a direct binding access | one extra closure call (`%imp[k]()`): 300k calls of an imported function took 2893 ms against 1947 ms for a local one (debug build) |
+| `import * as p from 'process'` (and other core modules) `Object.keys(p)` | every key `Object.keys(process)` lists in node (84) | the keys this runtime enumerates (47). A named import of a member it does not list but that reads back defined (`import { argv } from 'process'`) still links |
+| core-module named exports | a snapshot, refreshed by `module.syncBuiltinESMExports()` | read from the module object on each access |
+| an uncaught link or evaluation error of the entry module | `file:///…:line`, the source line and a caret, then the error | the error only, in this runtime's uncaught-error format |
+| unsettled top-level `await` | the warning names `file:///…:line` and shows the source line | the warning names the module URL only (exit status 13 matches) |
+| `require()` of an ES module that is still evaluating (a cycle through `require`) | `ERR_REQUIRE_CYCLE_MODULE` | the namespace, partially evaluated |
+| `--import`, `--loader`, `module.register` hooks; `data:` URLs; `--input-type`; WebAssembly and source-phase imports | supported | absent |
+| `--dump-ast`, `--dump-bytecode`, `--disasm`, `--tiers`, `--build`, `--dap` on a module file | — | parse the file as a script |
+| the bytecode cache | — | module files are compiled on every run; only scripts are cached |

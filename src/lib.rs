@@ -20,6 +20,7 @@ pub mod compiler;
 pub mod core_arity;
 pub mod dap;
 pub mod datefmt;
+pub mod esm;
 pub mod host;
 pub mod ieee754;
 pub mod lexer;
@@ -273,8 +274,22 @@ pub fn eval_str_from(src: &str, origin: &str) -> Result<Value, String> {
     if let Ok(cwd) = std::env::current_dir() {
         module::set_entry_dir(cwd);
     }
-    module::install_entry_globals(origin);
-    run_compiled(compile_or_load(src)?)
+    match compile_or_load(src) {
+        Ok(prog) => {
+            module::install_entry_globals(origin);
+            run_compiled(prog)
+        }
+        // Syntax detection, as for a file of undeclared format: source that
+        // only parses as a module runs as one, named `[eval1]` in the
+        // current directory (node's name for `-e` and stdin alike).
+        Err(e) if esm::detect_module(src, &e) => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let entry = cwd.join("[eval1]").to_string_lossy().into_owned();
+            let main = esm::main_program(&entry, Some(src.to_string()), false);
+            run_compiled(compiler::compile(&main, false)?)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// `node -p <src>`: evaluate as `-e` does, then write the program's COMPLETION
@@ -363,6 +378,27 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     let entry = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| stdlib::path::resolve_one(path));
+    // An ES module entry point: by its `.mjs` extension or its package's
+    // `"type": "module"`, or — for a file of undeclared format — because it
+    // only parses as a module (node's syntax detection). It sees none of the
+    // CommonJS wrapper names.
+    let entry_path = std::path::Path::new(&entry);
+    let format = esm::file_format_declared(entry_path);
+    let is_module = match format {
+        Some(f) => f == esm::Format::Module,
+        None => match compile_or_load(&src) {
+            Ok(prog) => {
+                module::install_entry_globals(&entry);
+                return run_compiled(prog);
+            }
+            Err(e) if esm::detect_module(&src, &e) => true,
+            Err(e) => return Err(e),
+        },
+    };
+    if is_module {
+        let main = esm::main_program(&entry, None, true);
+        return run_compiled(compiler::compile(&main, false)?);
+    }
     module::install_entry_globals(&entry);
     run_compiled(compile_or_load(&src)?)
 }

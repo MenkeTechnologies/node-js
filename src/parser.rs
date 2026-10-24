@@ -139,6 +139,9 @@ struct Parser {
     /// Set while parsing a binding pattern, where `{ a = 1 }` is simply a
     /// default and never a cover grammar.
     in_binding: bool,
+    /// Whether the source is parsed with the Module goal (16.2): strict,
+    /// top-level `await`, `import`/`export` declarations and `import.meta`.
+    module: bool,
 }
 
 /// Parse a complete JS program into a statement list. Inline `rust { ... }` FFI
@@ -179,11 +182,55 @@ fn parse_source(
         cover_init: Vec::new(),
         in_binding: false,
         spans,
+        module: false,
     };
     p.strict = caller_strict || p.leading_use_strict(0);
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.parse_stmt()?);
+    }
+    Ok(out)
+}
+
+/// Parse `src` with the Module goal (ECMA-262 16.2.1): the code is strict,
+/// `await` is an operator at the top level, `return` there is an error, and the
+/// top level may hold `import`/`export` declarations. A hashbang line is a
+/// comment only at the very start of the text.
+pub fn parse_module(src: &str) -> Result<Vec<Stmt>, String> {
+    let toks = lex(src)?;
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        in_generator: false,
+        in_async: true,
+        no_in: false,
+        class_scopes: Vec::new(),
+        labels: Vec::new(),
+        strict: true,
+        super_ok: false,
+        in_function: false,
+        cover_init: Vec::new(),
+        in_binding: false,
+        spans: true,
+        module: true,
+    };
+    let mut out = Vec::new();
+    while !p.at_eof() {
+        let line = p.line();
+        let item = if p.is_kw("export") {
+            p.parse_export()?
+        } else if p.is_kw("import")
+            && !matches!(
+                p.toks.get(p.pos + 1).map(|t| &t.tok),
+                Some(Tok::Punct(s)) if s == "(" || s == "."
+            )
+        {
+            p.parse_import()?
+        } else {
+            out.push(p.parse_stmt()?);
+            continue;
+        };
+        out.push(Stmt::new(item, line));
     }
     Ok(out)
 }
@@ -211,6 +258,7 @@ impl Parser {
         p.strict = self.strict;
         p.super_ok = self.super_ok;
         p.in_function = self.in_function;
+        p.module = self.module;
         if !self.class_scopes.is_empty() {
             p.class_scopes.push(PrivateScope::default());
         }
@@ -623,6 +671,10 @@ impl Parser {
         Ok(Stmt::new(kind, line))
     }
 
+    /// Whether the token `n` ahead is the punctuator `p`.
+    fn peek_punct_at(&self, n: usize, p: &str) -> bool {
+        matches!(self.toks.get(self.pos + n).map(|t| &t.tok), Some(Tok::Punct(s)) if s == p)
+    }
     /// Whether the token `n` ahead is the identifier `kw`.
     fn peek_kw(&self, n: usize, kw: &str) -> bool {
         matches!(self.toks.get(self.pos + n).map(|t| &t.tok), Some(Tok::Ident(s)) if s == kw)
@@ -633,6 +685,254 @@ impl Parser {
             .get(self.pos + n)
             .map(|t| t.newline_before)
             .unwrap_or(false)
+    }
+
+    // ── module declarations (16.2.2, 16.2.3) ─────────────────────────────
+    /// A ModuleExportName: an IdentifierName, or a string literal (`"a b"`).
+    fn module_export_name(&mut self) -> Result<String, String> {
+        match self.tok().clone() {
+            Tok::Str(s) => {
+                self.advance();
+                Ok(s)
+            }
+            Tok::Ident(_) => self.ident_name(),
+            _ => Err(self.unexpected()),
+        }
+    }
+
+    /// A binding identifier an import introduces: never a reserved word.
+    fn import_binding(&mut self) -> Result<String, String> {
+        if matches!(self.tok(), Tok::Ident(s) if is_keyword(s) || s == "import" || s == "export") {
+            return Err(self.unexpected());
+        }
+        let name = self.ident_name()?;
+        self.check_binding_name(&name)?;
+        if name == "eval" || name == "arguments" {
+            return Err("SyntaxError: Unexpected eval or arguments in strict mode".to_string());
+        }
+        Ok(name)
+    }
+
+    /// The module specifier string after `from` (or after a bare `import`).
+    fn module_specifier(&mut self) -> Result<String, String> {
+        match self.tok().clone() {
+            Tok::Str(s) => {
+                self.advance();
+                Ok(s)
+            }
+            _ => Err(self.unexpected()),
+        }
+    }
+
+    /// An optional `with { key: "value", … }` import-attributes clause (the
+    /// older `assert` spelling is accepted the same way).
+    fn import_attributes(&mut self) -> Result<Vec<(String, String)>, String> {
+        let mut out = Vec::new();
+        if !(self.is_kw("with") || self.is_kw("assert") && !self.newline_before()) {
+            return Ok(out);
+        }
+        self.advance();
+        self.expect_punct("{")?;
+        while !self.is_punct("}") {
+            let key = self.module_export_name()?;
+            self.expect_punct(":")?;
+            let value = self.module_specifier()?;
+            if out.iter().any(|(k, _)| *k == key) {
+                return Err(format!(
+                    "SyntaxError: Import attribute has duplicate key '{key}'"
+                ));
+            }
+            out.push((key, value));
+            if !self.eat_punct(",") {
+                break;
+            }
+        }
+        self.expect_punct("}")?;
+        Ok(out)
+    }
+
+    /// `import …;` at the top level of a module (the `import` keyword is current).
+    fn parse_import(&mut self) -> Result<StmtKind, String> {
+        self.advance(); // import
+        let mut specs = Vec::new();
+        let mut clause: Span = (0, 0);
+        // `import "m";` — no bindings, the module is evaluated for effect.
+        if !matches!(self.tok(), Tok::Str(_)) {
+            if !self.is_punct("{") && !self.is_punct("*") {
+                specs.push(ImportSpec::Default(self.import_binding()?));
+                if !self.eat_punct(",") {
+                    return self.finish_import(specs, clause);
+                }
+            }
+            if self.eat_punct("*") {
+                if !self.eat_kw("as") {
+                    return Err(self.unexpected());
+                }
+                specs.push(ImportSpec::Namespace(self.import_binding()?));
+            } else if self.is_punct("{") {
+                let start = self.start_at(self.pos);
+                self.advance();
+                while !self.is_punct("}") {
+                    let string_name = matches!(self.tok(), Tok::Str(_));
+                    let imported = self.module_export_name()?;
+                    let local = if self.eat_kw("as") {
+                        self.import_binding()?
+                    } else if string_name || is_keyword(&imported) {
+                        // `import { "a b" }` / `import { default }` have no
+                        // binding name of their own.
+                        return Err("SyntaxError: Unexpected reserved word".to_string());
+                    } else {
+                        self.check_binding_name(&imported)?;
+                        imported.clone()
+                    };
+                    specs.push(ImportSpec::Named { imported, local });
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+                self.expect_punct("}")?;
+                clause = self.span_from(start);
+            } else {
+                return Err(self.unexpected());
+            }
+        }
+        self.finish_import(specs, clause)
+    }
+
+    /// `from "m" [with {…}];` closing an import declaration with `specs`.
+    fn finish_import(&mut self, specs: Vec<ImportSpec>, clause: Span) -> Result<StmtKind, String> {
+        if !specs.is_empty() && !self.eat_kw("from") {
+            return Err(self.unexpected());
+        }
+        let specifier = self.module_specifier()?;
+        let attributes = self.import_attributes()?;
+        self.semicolon()?;
+        Ok(StmtKind::Import(ImportDecl {
+            specifier,
+            specs,
+            attributes,
+            clause,
+        }))
+    }
+
+    /// `export …` at the top level of a module (the `export` keyword is current).
+    fn parse_export(&mut self) -> Result<StmtKind, String> {
+        self.advance(); // export
+        let line = self.line();
+        if self.eat_punct("*") {
+            let alias = if self.eat_kw("as") {
+                Some(self.module_export_name()?)
+            } else {
+                None
+            };
+            if !self.eat_kw("from") {
+                return Err(self.unexpected());
+            }
+            let from = self.module_specifier()?;
+            let attributes = self.import_attributes()?;
+            self.semicolon()?;
+            return Ok(StmtKind::Export(ExportDecl::Star {
+                alias,
+                from,
+                attributes,
+            }));
+        }
+        if self.eat_punct("{") {
+            let mut specs = Vec::new();
+            let mut string_locals = false;
+            while !self.is_punct("}") {
+                string_locals |= matches!(self.tok(), Tok::Str(_));
+                let local = self.module_export_name()?;
+                let exported = if self.eat_kw("as") {
+                    self.module_export_name()?
+                } else {
+                    local.clone()
+                };
+                specs.push(ExportSpec { local, exported });
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct("}")?;
+            let from = if self.eat_kw("from") {
+                Some(self.module_specifier()?)
+            } else {
+                None
+            };
+            // Without `from`, each local must be a binding of this module, which
+            // a string literal or a reserved word can never be.
+            if from.is_none() {
+                if string_locals {
+                    return Err("SyntaxError: Unexpected string".to_string());
+                }
+                if let Some(s) = specs.iter().find(|s| is_keyword(&s.local)) {
+                    return Err(format!("SyntaxError: Unexpected token '{}'", s.local));
+                }
+            }
+            let attributes = if from.is_some() {
+                self.import_attributes()?
+            } else {
+                Vec::new()
+            };
+            self.semicolon()?;
+            return Ok(StmtKind::Export(ExportDecl::Named {
+                specs,
+                from,
+                attributes,
+            }));
+        }
+        if self.eat_kw("default") {
+            let is_fn = self.is_kw("function")
+                || self.is_kw("async") && self.peek_kw(1, "function") && !self.peek_newline(1);
+            if is_fn {
+                let is_async = self.eat_kw("async");
+                let Expr::Function {
+                    params,
+                    body: FnBody::Block(body),
+                    name,
+                    is_generator,
+                    is_async,
+                    span,
+                    ..
+                } = self.parse_function_expr(is_async)?
+                else {
+                    return Err(self.unexpected());
+                };
+                let decl = StmtKind::FuncDecl {
+                    name: name.unwrap_or_else(|| "default".to_string()),
+                    params,
+                    body,
+                    is_generator,
+                    is_async,
+                    span,
+                };
+                return Ok(StmtKind::Export(ExportDecl::DefaultDecl(Box::new(
+                    Stmt::new(decl, line),
+                ))));
+            }
+            if self.is_kw("class") {
+                let mut node = self.parse_class(true)?;
+                node.name.get_or_insert_with(|| "default".to_string());
+                return Ok(StmtKind::Export(ExportDecl::DefaultDecl(Box::new(
+                    Stmt::new(StmtKind::ClassDecl(node), line),
+                ))));
+            }
+            let e = self.allow_in(|p| p.parse_assign())?;
+            self.semicolon()?;
+            return Ok(StmtKind::Export(ExportDecl::DefaultExpr(e)));
+        }
+        // `export` + a declaration: var/let/const, function, async function, class.
+        let is_decl = self.is_kw("var")
+            || self.is_kw("let")
+            || self.is_kw("const")
+            || self.is_kw("function")
+            || self.is_kw("class")
+            || self.is_kw("async") && self.peek_kw(1, "function") && !self.peek_newline(1);
+        if !is_decl {
+            return Err(self.unexpected());
+        }
+        let decl = self.parse_stmt()?;
+        Ok(StmtKind::Export(ExportDecl::Decl(Box::new(decl))))
     }
 
     /// Parse a `function` declaration (the `function`/`async function` keyword is
@@ -1144,7 +1444,8 @@ impl Parser {
             "static",
             "yield",
         ];
-        if name == "enum" {
+        // `await` is reserved throughout module code (13.1.1).
+        if name == "enum" || self.module && name == "await" {
             return Err("SyntaxError: Unexpected reserved word".to_string());
         }
         if self.strict && STRICT_RESERVED.contains(&name) {
@@ -1994,6 +2295,28 @@ impl Parser {
                     // parsed by `parse_assign`; reaching it here means it sat
                     // where only a higher-precedence operand may (`a + yield`).
                     "yield" if self.in_generator => Err(self.unexpected()),
+                    // `import(…)` (ImportCall) is left as a call of the name
+                    // `import`, which the module lowering and the compiler
+                    // recognise; `import.meta` is a meta property that only the
+                    // Module goal has (16.2.1.1).
+                    "import" if self.peek_punct_at(1, ".") => {
+                        self.advance(); // import
+                        self.advance(); // .
+                        if !self.is_kw("meta") {
+                            return Err(self.unexpected());
+                        }
+                        if !self.module {
+                            return Err("SyntaxError: Cannot use 'import.meta' outside a module"
+                                .to_string());
+                        }
+                        self.advance(); // meta
+                        Ok(Expr::Member {
+                            object: Box::new(Expr::Ident("import".into())),
+                            property: "meta".into(),
+                            optional: false,
+                        })
+                    }
+                    "import" if !self.peek_punct_at(1, "(") => Err(self.unexpected()),
                     "await" if self.in_async => {
                         self.advance();
                         let e = self.parse_unary()?;
@@ -2368,5 +2691,6 @@ fn field_parser(src: &str, base: Option<u32>) -> Result<Parser, String> {
         cover_init: Vec::new(),
         in_binding: false,
         spans: base.is_some(),
+        module: false,
     })
 }
