@@ -3236,7 +3236,6 @@ record went red.
 
 | Case | node | node-js |
 |---|---|---|
-| `child.on === EventEmitter.prototype.on` (an emitter-backed native) | `true` | `false` — the instance's methods are dispatch thunks |
 | `parity-scripts/stdlib/40_event_target.js` | — | the REFERENCE is non-deterministic here: node itself prints `after` before or after the uncaught-exception line run to run (measured 6/10 and 4/10), so the harness reports it intermittently |
 
 Also in round 21, pinned in `examples/protoshape.js`:
@@ -3281,7 +3280,7 @@ Still open, found here:
 
 Pinned in `examples/asynciteratorproto.js`, `timerdeadlines.js`,
 `webstreampull.js`, `bytestreams.js`, `webstreampipe.js`,
-`coresymbolprops.js` and `accessorexports.js`; each fix was
+`coresymbolprops.js`, `accessorexports.js` and `emitterproto.js`; each fix was
 re-broken alone and its record went red.
 
 | Case | node | was |
@@ -3304,6 +3303,10 @@ re-broken alone and its record went red.
 | `o.propertyIsEnumerable(sym)` for any symbol-keyed property | its `enumerable` | `false` — the symbol's display string was looked up |
 | core-module exports node defines as accessors (`timers.promises`, `crypto.webcrypto`, `events.defaultMaxListeners`, …; measured: `CORE_ACCESSOR_EXPORTS`) | an accessor descriptor (getter/setter names measured); `[Getter]` / `[Getter/Setter]` under inspect | a data property holding the value |
 | `http.globalAgent === http.globalAgent` (and `https`) | `true` | `false` — a new Agent per read |
+| `EventEmitter.prototype.on` (any of its methods), `EventEmitter.prototype.on === EventEmitter.prototype.addListener` | the method; `true` | `undefined` while `getOwnPropertyNames` listed the name |
+| `Object.getOwnPropertyNames(EventEmitter.prototype)`, `Object.keys` | node's order with `_events`, `_eventsCount`, `_maxListeners` (measured: `CLASS_PROTO_ORDER`) | the method list alone |
+| `Object.getPrototypeOf(new EventEmitter()) === EventEmitter.prototype` when the prototype is read first | `true` | `false` — a namespace handle until the first emitter built the real object |
+| `child.on === EventEmitter.prototype.on`, a `net.Server`'s, and every other inherited emitter method (measured: `EMITTER_OVERRIDES`) | `true` — while a `net.Socket`'s `on`/`addListener`/`removeListener` stay its own, as node's Readable overrides them | `false`: each class prototype carried its own copies |
 
 The streams are `src/stdlib/webstreams.js`: node's `lib/internal/webstreams/`
 `util.js`, `queuingstrategies.js`, `writablestream.js`, `readablestream.js`,
@@ -3324,3 +3327,6 @@ validators, and V8's promise state (`util.@@promiseState`, for
 | `Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())) === Iterator.prototype`, `Object.getPrototypeOf(%GeneratorPrototype%)` against it | `true` | `false`: the built-in iterators are not linked to `Iterator.prototype` |
 | `util.inspect(Object.getPrototypeOf(function* () {}))` | `Function [GeneratorFunction] {}` | `Object [GeneratorFunction] {}` |
 | `TextEncoderStream` given a surrogate pair split across two chunks | one 4-byte sequence | two U+FFFD — a lone surrogate has no Rust `String` representation (the known boundary above) |
+| `require('child_process').ChildProcess` | the class | `undefined` |
+| `Object.getOwnPropertyNames(ChildProcess.prototype)` | `constructor, spawn, kill, ref, unref` | `send` and `disconnect` too (node adds them to an IPC child only), no `spawn` |
+| `Reflect.ownKeys(setTimeout)`, `Reflect.ownKeys(require('timers').setTimeout)` | includes `prototype` | omits it: both are the builtin keyed `setTimeout`, and `CORE_PROTOTYPED` keys the function `timers.setTimeout` |

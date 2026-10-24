@@ -11223,12 +11223,31 @@ impl JsHost {
             p.insert("constructor".into(), ctor_val);
         }
         self.hide_prop(&proto, "constructor");
+        // node's `EventEmitter.prototype` carries the three instance-field
+        // defaults as ordinary data properties.
+        if ctor == "EventEmitter" {
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert("_events".into(), Value::Undef);
+                p.insert("_eventsCount".into(), Value::Float(0.0));
+                p.insert("_maxListeners".into(), Value::Undef);
+            }
+        }
         // A prototype member is ENUMERABLE in node for every class but the few
         // written as ES classes, so `for (const k in url)` walks `href` and the
         // rest. Hiding all of them made that loop find nothing.
         let visible = crate::stdlib::instance_members_enumerable(ctor);
         let symbols = crate::builtins::proto_symbol_methods(ctor);
         for m in own.iter().chain(emitter.iter()).chain(symbols.iter()) {
+            // An emitter method the class INHERITS lives on
+            // `EventEmitter.prototype` alone (measured: `EMITTER_OVERRIDES`), so
+            // it is the one function every emitter shares: `child.on ===
+            // EventEmitter.prototype.on`.
+            if ctor != "EventEmitter"
+                && emitter.contains(m)
+                && crate::stdlib::events::inherits_proto_method(ctor, m)
+            {
+                continue;
+            }
             let thunk = self.alloc(JsObj::Builtin(format!("@proto:{ctor}:{m}")));
             if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
                 p.insert((*m).to_string(), thunk);

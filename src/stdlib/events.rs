@@ -41,6 +41,28 @@ pub const METHODS: &[&str] = &[
     "getMaxListeners",
 ];
 
+/// Whether `name` is one of `EventEmitter.prototype`'s methods (measured:
+/// `CLASS_PROTO_ARITY`, which also makes an alias the method it is, so
+/// `EventEmitter.prototype.on === EventEmitter.prototype.addListener`).
+pub fn is_proto_method(name: &str) -> bool {
+    let key = format!("@proto:EventEmitter:{name}");
+    crate::core_arity::CLASS_PROTO_ARITY
+        .binary_search_by(|(k, _, _)| (*k).cmp(key.as_str()))
+        .is_ok()
+}
+
+/// Whether an emitter-backed native instance tagged `tag` inherits `name` from
+/// `EventEmitter.prototype` — so reading it gives that very function — rather
+/// than from a class that overrides it (a Readable's `on`, measured:
+/// `EMITTER_OVERRIDES`).
+pub fn inherits_proto_method(tag: &str, name: &str) -> bool {
+    let t = crate::core_arity::EMITTER_OVERRIDES;
+    match t.binary_search_by(|(k, _)| (*k).cmp(tag)) {
+        Ok(i) => !t[i].1.contains(&name) && is_proto_method(name),
+        Err(_) => false,
+    }
+}
+
 /// The internal key an event name registers under.
 ///
 /// `ToPropertyKey`, not `String(name)`: a SYMBOL event name is a distinct key

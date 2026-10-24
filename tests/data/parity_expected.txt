@@ -1157,6 +1157,22 @@ rmall x  x:wrapper x:a
 rmall    y:a x:a 0
 order    first,second,first
 newlis   p true
+==== emitterproto.js ====
+constructor,_events,_eventsCount,_maxListeners,setMaxListeners,getMaxListeners,emit,addListener,on,prependListener,once,prependOnceListener,removeListener,off,removeAllListeners,listeners,rawListeners,listenerCount,eventNames
+_events,_eventsCount,_maxListeners,setMaxListeners,getMaxListeners,emit,addListener,on,prependListener,once,prependOnceListener,removeListener,off,removeAllListeners,listeners,rawListeners,listenerCount,eventNames
+function true true [Function: addListener] [Function: removeListener]
+emit/1 on/2 once/2 listenerCount/2 eventNames/0 setMaxListeners/1
+{"value":0,"writable":true,"enumerable":true,"configurable":true} undefined undefined
+true true true
+true
+child true,true,true,true,true,true true
+  2 1 1
+server true,true,true,true,true,true true
+  2 1 1
+socket false,false,true,true,false,true true
+  2 1 1
+true
+[]
 ==== errors.js ====
 MyError boom 42 true true
 try,catch

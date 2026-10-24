@@ -3658,6 +3658,14 @@ pub fn namespace_property(ns: &str, name: &str) -> Value {
         }) {
             return p;
         }
+        // `EventEmitter.prototype` is the real object every emitter's chain
+        // reaches, built on the first read rather than on the first emitter,
+        // so the two reads cannot disagree.
+        if ns == "EventEmitter" {
+            if let Some(p) = with_host(|h| h.ensure_ctor_proto(ns)) {
+                return p;
+            }
+        }
         let _ = ns;
         return with_host(|h| h.alloc(JsObj::Builtin(format!("{ns}.prototype"))));
     }
