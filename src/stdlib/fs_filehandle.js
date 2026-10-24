@@ -4,7 +4,7 @@
 // matching sync call here, so validation, error codes and messages are the
 // sync API's, which node shares. Evaluated once by `src/stdlib/fs_promises.rs`;
 // the file is a function of `nodeError` (`util.@@nodeError`, node's coded
-// errors) returning the object at its end.
+// errors) and `readableStreamCancel` returning the object at its end.
 //
 // Kept from node: `fsCall`'s closed-handle `EBADF` (with the operation as
 // `syscall`), the reference count that makes `close()` wait for an operation
@@ -13,9 +13,10 @@
 // current position until end of file, `writeFile`/`appendFile` writing from
 // the current position, and `'close'` emitted once.
 //
-// `readableWebStream` delivers its reads as a default (not a byte) stream;
-// see the method. Not modelled: the transfer symbols.
-(function (nodeError) {
+// `readableWebStream` is node's byte stream; `readableStreamCancel` is
+// `util.@@readableStreamCancel`, the web-streams port's lock-free cancel.
+// Not modelled: the transfer symbols.
+(function (nodeError, readableStreamCancel) {
 'use strict';
 const fs = require('fs');
 const EventEmitter = require('events');
@@ -201,11 +202,8 @@ class FileHandle extends EventEmitter {
     await this.close();
   }
 
-  // node builds a `type: 'bytes'` stream that reads into each BYOB request
-  // with an `autoAllocateChunkSize` of 16384. Byte streams are not
-  // implemented here, so this is the same reads delivered as a default
-  // stream: each pull reads up to 16384 bytes and enqueues them as a
-  // Uint8Array, which is what a default reader of node's stream receives.
+  // node's: a byte stream reading into each BYOB request (16384 bytes when
+  // the reader is a default one), cancelled when the handle closes.
   readableWebStream(options = {}) {
     if (this[kFd] === -1)
       nodeError('error', 'ERR_INVALID_STATE', 'Invalid state: The FileHandle is closed');
@@ -238,16 +236,19 @@ class FileHandle extends EventEmitter {
     };
 
     const readable = new ReadableStream({
+      type: 'bytes',
+      autoAllocateChunkSize: 16384,
+
       async pull(controller) {
-        const view = new Uint8Array(16384);
+        const view = controller.byobRequest.view;
         const { bytesRead } = await readFn(view, 0, view.byteLength);
 
         if (bytesRead === 0) {
           controller.close();
           await ondone();
-        } else {
-          controller.enqueue(view.subarray(0, bytesRead));
         }
+
+        controller.byobRequest.respond(bytesRead);
       },
 
       async cancel() {
@@ -257,7 +258,7 @@ class FileHandle extends EventEmitter {
 
     this[kRef]();
     this.once('close', () => {
-      readable.cancel().catch(() => {});
+      readableStreamCancel(readable);
     });
 
     return readable;

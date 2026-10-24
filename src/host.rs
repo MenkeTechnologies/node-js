@@ -7995,6 +7995,12 @@ pub fn call_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, 
         Some(JsObj::Builtin(ns)) => Some(ns.clone()),
         _ => None,
     }) {
+        // `stream/web`'s members are the `webstreams.js` port's functions, not
+        // dispatch entries: call what the read gives.
+        if ns == "stream/web" && crate::stdlib::stream_web::is_class(name) {
+            let member = crate::stdlib::stream_web::constant(name).unwrap_or(Value::Undef);
+            return invoke(&member, args, Some(recv.clone()));
+        }
         let qualified = format!("{ns}.{name}");
         if crate::builtins::is_known_builtin(&qualified) {
             return crate::builtins::call_builtin_function(&qualified, args);
@@ -11215,7 +11221,7 @@ impl JsHost {
         }
         // A class node models with interleaved methods and accessors lists its
         // members in node's order (measured: `CLASS_PROTO_ORDER`), not methods
-        // first: `ReadableStream.prototype` is `constructor, locked, cancel, …`.
+        // first: `AbortSignal.prototype` is `constructor, aborted, reason, throwIfAborted, …`.
         let display = crate::stdlib::class_display_name(ctor);
         let t = crate::core_arity::CLASS_PROTO_ORDER;
         if let Ok(i) = t.binary_search_by(|(c, _)| (*c).cmp(display)) {

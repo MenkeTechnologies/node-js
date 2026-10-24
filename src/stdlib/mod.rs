@@ -740,8 +740,6 @@ pub fn construct(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
             net::construct(name, args)
         }
         "Agent" | "http.Server" => http::construct(name, args),
-        // stream/web WHATWG classes (its `construct` returns Option<Result>).
-        n if stream_web::is_class(n) => stream_web::construct(n, args),
         _ => None,
     }
 }
@@ -988,59 +986,6 @@ pub fn instance_accessors(tag: &str) -> (&'static [(&'static str, bool)], &'stat
             ],
             "CryptoKey",
         ),
-        // The web streams' state is read through prototype getters; an
-        // instance owns none of it (`Object.keys(new ReadableStream())` is `[]`).
-        "ReadableStream" => (&[("locked", false)], "ReadableStream"),
-        "ReadableStreamDefaultReader" => (&[("closed", false)], "ReadableStreamDefaultReader"),
-        "ReadableStreamBYOBReader" => (&[("closed", false)], "ReadableStreamBYOBReader"),
-        "ReadableStreamDefaultController" => {
-            (&[("desiredSize", false)], "ReadableStreamDefaultController")
-        }
-        "ReadableByteStreamController" => (
-            &[("byobRequest", false), ("desiredSize", false)],
-            "ReadableByteStreamController",
-        ),
-        "TransformStreamDefaultController" => (
-            &[("desiredSize", false)],
-            "TransformStreamDefaultController",
-        ),
-        "WritableStreamDefaultWriter" => (
-            &[("closed", false), ("desiredSize", false), ("ready", false)],
-            "WritableStreamDefaultWriter",
-        ),
-        "ByteLengthQueuingStrategy" => (&[("highWaterMark", false)], "ByteLengthQueuingStrategy"),
-        "CountQueuingStrategy" => (&[("highWaterMark", false)], "CountQueuingStrategy"),
-        "WritableStream" => (&[("locked", false)], "WritableStream"),
-        "TransformStream" => (
-            &[("readable", false), ("writable", false)],
-            "TransformStream",
-        ),
-        "TextEncoderStream" => (
-            &[
-                ("encoding", false),
-                ("readable", false),
-                ("writable", false),
-            ],
-            "TextEncoderStream",
-        ),
-        "TextDecoderStream" => (
-            &[
-                ("encoding", false),
-                ("fatal", false),
-                ("ignoreBOM", false),
-                ("readable", false),
-                ("writable", false),
-            ],
-            "TextDecoderStream",
-        ),
-        "CompressionStream" => (
-            &[("readable", false), ("writable", false)],
-            "CompressionStream",
-        ),
-        "DecompressionStream" => (
-            &[("readable", false), ("writable", false)],
-            "DecompressionStream",
-        ),
         "EventTarget" => (&[], "EventTarget"),
         "Event" => (event_target::EVENT_ACCESSORS, "Event"),
         "CustomEvent" => (&[("detail", false)], "CustomEvent"),
@@ -1246,8 +1191,6 @@ pub fn instance_method_lists(tag: &str) -> (&'static [&'static str], &'static [&
         t if fetch::is_class(t) => fetch::methods_for(t),
         "EventTarget" => event_target::EVENT_TARGET_METHODS,
         "Event" => event_target::EVENT_METHODS,
-        stream_web::ASYNC_ITERATOR_TAG => stream_web::ASYNC_ITERATOR_METHODS,
-        t if stream_web::is_class(t) => stream_web::methods_for(t),
         _ => &[],
     };
     let is_emitter = matches!(
@@ -1404,10 +1347,6 @@ pub fn instance_call(
         "Console" => console::instance_call(recv, method, args),
         "ChildProcess" => child_process::instance_call(recv, method, args),
         "ChildPipe" => child_process::pipe_call(recv, method, args),
-        stream_web::ASYNC_ITERATOR_TAG => {
-            stream_web::instance_call(stream_web::ASYNC_ITERATOR_TAG, recv, method, args)
-        }
-        t if stream_web::is_class(t) => stream_web::instance_call(t, recv, method, args),
         "AsyncLocalStorage" | "AsyncHook" | "AsyncResource" => {
             async_hooks::instance_call(tag, recv, method, args)
         }
@@ -1660,7 +1599,7 @@ pub fn class_display_name(key: &str) -> &str {
 /// The web classes whose prototype getters brand-check `this` and throw
 /// `ERR_INVALID_THIS` for any other receiver.
 pub fn brand_checked_class(ctor: &str) -> bool {
-    stream_web::is_web_stream_class(ctor) || matches!(ctor, "Crypto" | "CryptoKey")
+    matches!(ctor, "Crypto" | "CryptoKey")
 }
 
 /// `new Performance()`, `new Crypto()`, … — classes node lets no script build.

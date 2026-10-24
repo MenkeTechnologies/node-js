@@ -61,8 +61,15 @@ fn file_handle_module() -> Result<Value, String> {
         return Ok(m);
     }
     let factory = crate::eval_in_global_scope(include_str!("fs_filehandle.js"))?;
-    let node_error = with_host(|h| h.alloc(crate::host::JsObj::Builtin("util.@@nodeError".into())));
-    let made = crate::host::invoke(&factory, vec![node_error], None)?;
+    let (node_error, cancel) = with_host(|h| {
+        (
+            h.alloc(crate::host::JsObj::Builtin("util.@@nodeError".into())),
+            h.alloc(crate::host::JsObj::Builtin(
+                "util.@@readableStreamCancel".into(),
+            )),
+        )
+    });
+    let made = crate::host::invoke(&factory, vec![node_error, cancel], None)?;
     MODULE.with(|m| *m.borrow_mut() = Some(made.clone()));
     Ok(made)
 }

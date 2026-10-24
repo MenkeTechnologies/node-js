@@ -188,6 +188,13 @@ A working core, grown outward from the sibling frontends. Implemented end-to-end
   maps each trap to the syntax that reaches it, and states the two divergences.
 - CommonJS `require` and the Node standard library — see `BUGS.md` for the
   module-by-module coverage list and the honest not-implemented set.
+- The WHATWG Streams API (`ReadableStream`, `WritableStream`,
+  `TransformStream`, readers, writers, controllers, queuing strategies, the
+  text and compression streams) is node's own `lib/internal/webstreams/`,
+  embedded as `src/stdlib/webstreams.js` behind a prelude supplying its
+  `primordials` and internals: promise-driven `start`/`pull`/`cancel`,
+  backpressure, byte streams with BYOB readers, `tee`, and
+  `pipeTo`/`pipeThrough` with their options are node's code.
 - The persistent bytecode cache runs on EVERY invocation (schema-versioned, so
   an older cached script never replays incompatible bytecode), and AOT
   native-executable emission is on the CLI as `--build`. The shard is read
@@ -253,7 +260,7 @@ into its own table, `src/core_arity.rs` (`cargo run --bin gen-core-arity >
 src/core_arity.rs && cargo fmt`), keyed `<namespace>.<member>`. The same run
 measures which of those functions own a `prototype`, each module's
 `Object.keys` order, and — for the web and node classes modelled as native
-prototypes (`ReadableStream`, `Performance`, `Crypto`, …) — each prototype's
+prototypes (`AbortSignal`, `Performance`, `Crypto`, …) — each prototype's
 member order and its methods' `name`/`length`.
 
 The two tools deliberately drive DIFFERENT entry points — the corpus runs each

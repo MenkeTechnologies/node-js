@@ -251,6 +251,20 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "styleText" => return Some(style_text(args)),
         "parseArgs" => return Some(parse_args(args)),
         "@@nodeError" => return Some(node_error(args)),
+        // `getPromiseDetails(p)[0]` for the web-streams port's
+        // `isPromisePending`: 0 pending, 1 fulfilled, 2 rejected.
+        // The web-streams port's `readableStreamCancel(stream, reason)`, for
+        // `FileHandle.readableWebStream`.
+        "@@readableStreamCancel" => return Some(super::stream_web::readable_stream_cancel(args)),
+        "@@promiseState" => {
+            let p = args.first().cloned().unwrap_or(Value::Undef);
+            let state = with_host(|h| h.promise_id(&p).map(|id| h.promise_state(id)));
+            Ok(Value::Int(match state {
+                Some(crate::host::PromiseState::Fulfilled) => 1,
+                Some(crate::host::PromiseState::Rejected) => 2,
+                _ => 0,
+            }))
+        }
         "debuglog" => return Some(debuglog(args)),
         "promisify" => return Some(promisify(args)),
         // `util.aborted(signal, resource)` — a promise that settles when the
@@ -1153,10 +1167,7 @@ fn is_plain_object_arg(v: &Value) -> bool {
 
 /// node's `isReadableStream || isWritableStream || isNodeStream`.
 fn is_stream_like(v: &Value) -> Result<bool, String> {
-    if matches!(
-        super::native_tag(v).as_deref(),
-        Some(super::stream_web::READABLE_STREAM_TAG | super::stream_web::WRITABLE_STREAM_TAG)
-    ) {
+    if super::stream_web::is_readable_stream(v)? || super::stream_web::is_writable_stream(v)? {
         return Ok(true);
     }
     if !with_host(|h| matches!(h.type_of(v), "object" | "function") && !h.is_null(v)) {
@@ -1721,10 +1732,20 @@ fn parse_args(args: &[Value]) -> Result<Value, String> {
 /// `type` (`ERR_INVALID_ARG_TYPE`, given the validator's expected-type
 /// spelling), `value` (`ERR_INVALID_ARG_VALUE`) or `code` (any code, as a
 /// `TypeError`, with its finished message) or `range` (`ERR_OUT_OF_RANGE`). Always
-/// throws.
+/// throws. A `:<Class>` suffix on `value`, `code` or `error` names the error
+/// class, as node's `ERR_INVALID_ARG_VALUE.RangeError` does
+/// (`value:RangeError`, `code:RangeError`).
 fn node_error(args: &[Value]) -> Result<Value, String> {
     let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Undef);
-    let kind = super::arg_str(args, 0);
+    let kind_arg = super::arg_str(args, 0);
+    let (kind, class) = kind_arg.split_once(':').unwrap_or((kind_arg.as_str(), ""));
+    let class_or = |default: &str| {
+        if class.is_empty() {
+            default.to_string()
+        } else {
+            class.to_string()
+        }
+    };
     let name = super::arg_str(args, 1);
     // `ERR_INVALID_ARG_TYPE` / `ERR_INVALID_ARG_VALUE` call a dotted name a
     // property and anything else an argument.
@@ -1733,7 +1754,7 @@ fn node_error(args: &[Value]) -> Result<Value, String> {
     } else {
         "argument"
     };
-    Err(match kind.as_str() {
+    Err(match kind {
         "type" => {
             let spec = super::arg_str(args, 2);
             let expected = match spec.as_str() {
@@ -1762,7 +1783,7 @@ fn node_error(args: &[Value]) -> Result<Value, String> {
                 v => with_host(|h| h.str_of(&v)),
             };
             crate::host::coded_error(
-                "TypeError",
+                &class_or("TypeError"),
                 "ERR_INVALID_ARG_VALUE",
                 &format!("The {noun} '{name}' {reason}. Received {shown}"),
             )
@@ -1773,8 +1794,8 @@ fn node_error(args: &[Value]) -> Result<Value, String> {
             super::out_of_range(&name, &super::arg_str(args, 2), n)
         }
         // A code node raises as a plain `Error` (`ERR_INVALID_STATE`).
-        "error" => crate::host::coded_error("Error", &name, &super::arg_str(args, 2)),
-        _ => crate::host::coded_error("TypeError", &name, &super::arg_str(args, 2)),
+        "error" => crate::host::coded_error(&class_or("Error"), &name, &super::arg_str(args, 2)),
+        _ => crate::host::coded_error(&class_or("TypeError"), &name, &super::arg_str(args, 2)),
     })
 }
 

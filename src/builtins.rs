@@ -1006,6 +1006,10 @@ fn global_binding_from(name: &str, object_only: bool) -> Option<Value> {
                 h.alloc(JsObj::Builtin(crate::stdlib::SUBTLE_CRYPTO_CLASS.into()))
             }))
         }
+        // The web-stream classes are the `webstreams.js` port's constructors.
+        n if crate::stdlib::stream_web::is_global_class(n) => {
+            return crate::stdlib::stream_web::constant(n);
+        }
         _ => {}
     }
     if is_namespace(name) || is_known_builtin(name) {
@@ -3856,8 +3860,6 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         // No stored slot: the value is COMPUTED, so ask the class. `KeyObject`'s
         // `symmetricKeySize` is the secret's byte length, which nothing stores.
         let tag = crate::stdlib::native_tag(recv).unwrap_or_default();
-        // A web-stream getter brand-checks its receiver
-        // (`if (!isReadableStream(this)) throw new ERR_INVALID_THIS(…)`).
         // A singleton's accessor (`crypto.subtle` read through
         // `Crypto.prototype`) answers what the namespace holds.
         if let Some(JsObj::Builtin(ns)) = with_host(|h| h.get(recv).cloned()) {
@@ -7390,6 +7392,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         let from = with_host(|h| h.str_of(args.get(1).unwrap_or(&Value::Undef)));
         let file = with_host(|h| h.str_of(args.get(2).unwrap_or(&Value::Undef)));
         return crate::module::require(&spec, std::path::Path::new(&from), &file);
+    }
+    // A bareword call of a web-stream class (`ReadableStream()`) calls the
+    // `webstreams.js` port's class, which refuses a call without `new`.
+    if crate::stdlib::stream_web::is_global_class(name) {
+        let class = crate::stdlib::stream_web::constant(name).unwrap_or(Value::Undef);
+        return host::invoke(&class, args, None);
     }
     // `Function.prototype` is itself a function (20.2.3): it accepts any
     // arguments and returns undefined.

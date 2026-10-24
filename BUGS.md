@@ -2272,10 +2272,8 @@ against `node v26.5.0`:
   but classes (`stream_web::METHODS` is empty) — so neither table backed it.
   `Object.keys(require('stream/web')).length` was 0 against node v26.7.0's 18,
   even though `require('stream/web').ReadableStream` resolved fine.
-  `namespace_ctors` now returns `stream_web::CLASSES`, giving the 17 classes
-  node-js implements (node's 18th, `ReadableStreamTee`, is not implemented, and
-  `namespace_keys` deliberately advertises the working set rather than node's
-  full export list).
+  `namespace_ctors` now returns `stream_web::CLASSES`, node's 18 members in
+  its order (`ReadableStreamTee` included since the round-22 port).
 
 - **NamedEvaluation runs at every site the grammar calls for it.** 10.2.9
   SetFunctionName used to fire only for a `const`/`let`/`var` declarator and a
@@ -3211,7 +3209,6 @@ was upgraded to mid-round), pinned in `examples/perfinstance.js`,
 
 | Case | node | node-js |
 |---|---|---|
-| `new ReadableStream({ type: 'bytes', pull(c) { c.byobRequest.view } })` | a BYOB request per pull | `byobRequest` is `null` |
 | `Object.getOwnPropertyNames(SubtleCrypto.prototype)` | every WebCrypto method (`encrypt`, `sign`, `importKey`, …) | `digest` only — the one implemented |
 | `Object.getOwnPropertyNames(Performance.prototype)` | also `toJSON`, `timeOrigin`, `nodeTiming`, `markResourceTiming`, … | the implemented methods only |
 
@@ -3239,7 +3236,6 @@ record went red.
 
 | Case | node | node-js |
 |---|---|---|
-| `Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype)` | `%AsyncIteratorPrototype%` | `null` |
 | `child.on === EventEmitter.prototype.on` (an emitter-backed native) | `true` | `false` — the instance's methods are dispatch thunks |
 | `util.inspect(os.freemem)`, `util.inspect(setTimeout)` | the function's own symbol-keyed properties (`Symbol(Symbol.toPrimitive)`, the `promisify.custom` getter) | the bare function |
 | module exports node defines as GETTERS (`timers.promises`) | `[Getter]` under inspect | the value |
@@ -3278,9 +3274,49 @@ Still open, found here:
 | Case | node | node-js |
 |---|---|---|
 | `require('node:test')` | the test runner (`test`, `describe`, `it`, `mock`, reporters) | `Cannot find module` |
-| `new ReadableStream({ type: 'bytes' })`'s `byobRequest`; `fh.readableWebStream()` as a byte stream | a BYOB request per pull | `null`; a default stream. node-js's `ReadableStream` is its own simplified implementation (a `pull` that returns a promise is not awaited), so byte streams need the spec's machinery — a port of node's `lib/internal/webstreams` — rather than a patch |
 | `SubtleCrypto.prototype` | every WebCrypto method | `digest` only — WebCrypto itself is not implemented |
 | `Performance.prototype.toJSON`, `nodeTiming`, `markResourceTiming`, `onresourcetimingbufferfull` | members | absent (`nodeTiming`'s bootstrap milestones are not recorded) |
 | `u = new URL('http://a/'); u.protocol = 'file'` | `file://a/` | unchanged — the vendored `url` crate refuses that scheme change |
-| `CountQueuingStrategy.prototype.size` | a getter returning the size function | a method |
 | `parity-scripts/stdlib/37_spawn_events.js` | — | the REFERENCE is non-deterministic (node printed a different interleaving 1 run in 12) |
+
+## FIXED in round 22 — verified against node v26.12.1
+
+Pinned in `examples/asynciteratorproto.js`, `timerdeadlines.js`,
+`webstreampull.js`, `bytestreams.js` and `webstreampipe.js`; each fix was
+re-broken alone and its record went red.
+
+| Case | node | was |
+|---|---|---|
+| `Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype)` | `%AsyncIteratorPrototype%`, with `[Symbol.asyncIterator]` and `[Symbol.asyncDispose]` | `null`: `GeneratorFunction.prototype.prototype` did not exist |
+| `Object.getPrototypeOf(f())`, `f() instanceof f`, a method added to `f.prototype` (a `function*`) | `f.prototype`, `true`, reachable | unlinked; `false`; `not a function` |
+| `f.prototype` of a generator function | no `constructor`, inheriting `%GeneratorPrototype%` | a `constructor`, inheriting `Object.prototype` |
+| `%GeneratorPrototype%.next.call({})`, the async form | `Method [Generator].prototype.next called on incompatible receiver #<Object>`; a rejection | absent |
+| `util.inspect(asyncGen())` | `Object [AsyncGenerator] {}` | `Object [Generator] {}` |
+| a 5 ms timer scheduled at 10 ms against a 60 ms timer scheduled at 0 | deadline order | every short timer first: the virtual clock ordered by delay alone, so an `AbortController` timeout racing a polling `pull` never fired |
+| `ReadableStream` with an async `pull` | `pull` awaited; called again only while `desiredSize > 0` | called synchronously, never awaited |
+| `new ReadableStream({ type: 'bytes' })`'s `byobRequest`, `getReader({ mode: 'byob' })`, `read(view, { min })`, `respond`, `autoAllocateChunkSize` | node's byte streams | `byobRequest` `null`; no BYOB machinery |
+| `fh.readableWebStream()` | a byte stream (BYOB-readable, 16384-byte auto-allocated reads), cancelled when the handle closes | a default stream |
+| `pipeTo(dest, { preventClose, signal })`, a writer's `desiredSize`/`ready` under a `highWaterMark`, a source error aborting the destination | node's | drained synchronously, the options ignored |
+| `CountQueuingStrategy.prototype.size` | a getter returning the size function | a method |
+| `require('stream/web').ReadableStreamTee(stream, cloneForBranch2)` | the module's 18th member | absent |
+| `ReadableStream()`, `require('stream/web').WritableStream()` | `Class constructor … cannot be invoked without 'new'` | `is not a function` |
+
+The streams are `src/stdlib/webstreams.js`: node's `lib/internal/webstreams/`
+`util.js`, `queuingstrategies.js`, `writablestream.js`, `readablestream.js`,
+`transformstream.js` and `encoding.js` unchanged, wrapped as modules behind a
+prelude that supplies the `primordials`, the error codes (built through
+`util.@@nodeError`, which now takes a `:<Class>` suffix for
+`ERR_INVALID_ARG_VALUE.RangeError` and the other class variants), the
+validators, and V8's promise state (`util.@@promiseState`, for
+`isPromisePending`). The native reimplementation in `stream_web.rs` is gone.
+
+### Still open — found in round 22, not fixed
+
+| Case | node | node-js |
+|---|---|---|
+| `CompressionStream`/`DecompressionStream` output chunking | a chunk per zlib flush (gzip of a short input: a 10-byte header, then the rest) | one chunk when the writable closes: node builds these over its Duplex adapters (`internal/webstreams/adapters`), which are not ported, so the codec runs over the whole input |
+| transferring a stream (`structuredClone(rs, { transfer: [rs] })`, `postMessage`) | the stream moves | not modelled: the transfer symbols exist, nothing calls them |
+| `Buffer.from('ab').buffer`, `zlib.gzipSync(x).buffer`, any `Buffer`'s `.buffer` | the backing `ArrayBuffer` | `TypeError: Method get TypedArray.prototype.buffer called on incompatible receiver` — a Buffer is a tagged object with its own byte store, not a view over an `ArrayBuffer`, so the inherited getter's brand check refuses it |
+| `Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())) === Iterator.prototype`, `Object.getPrototypeOf(%GeneratorPrototype%)` against it | `true` | `false`: the built-in iterators are not linked to `Iterator.prototype` |
+| `util.inspect(Object.getPrototypeOf(function* () {}))` | `Function [GeneratorFunction] {}` | `Object [GeneratorFunction] {}` |
+| `TextEncoderStream` given a surrogate pair split across two chunks | one 4-byte sequence | two U+FFFD — a lone surrogate has no Rust `String` representation (the known boundary above) |

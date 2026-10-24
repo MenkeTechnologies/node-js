@@ -585,6 +585,24 @@ brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
 brandcheck Uint8Array.prototype.fill    ok
 brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
 brandcheck Uint8Array.prototype.fill    TypeError: this is not a typed array.
+==== bytestreams.js ====
+ReadableStreamBYOBReader
+req true Uint8Array 10
+false Uint8Array [ 7, 8 ] 10
+req true Uint8Array 8
+false Uint16Array 1
+req true Uint8Array 3
+false [ 7, 8 ]
+true 0
+{"done":false,"value":{"0":1,"1":2,"2":3}} {"done":true}
+ERR_INVALID_ARG_VALUE The argument 'stream' must be a byte stream. Received ReadableStream { locked: false, state: 'readable', supportsBYOB: false }
+ERR_INVALID_ARG_VALUE The property 'options.mode' is invalid. Received 'x'
+RangeError ERR_OUT_OF_RANGE The value of "options.min" is out of range. It must be <= view.length. Received 3
+[ 9 ] [ 9 ]
+ReadableStreamBYOBReader
+Uint8Array 5 // By
+Uint8Array true 16384
+true
 ==== byteviews.js ====
 fill       Uint8Array(5) [ 255, 9, 9, 65, 128 ] true
 through    Uint8Array(4) [ 7, 7, 0, 0 ] true
@@ -3681,6 +3699,48 @@ true
 [] utf-8 false false
 [ 120, 121 ]
 hello
+==== webstreampipe.js ====
+ds 2
+ds 1
+ds 0
+ready 1
+[ 'a', 'b', 'closed' ]
+WritableStream { locked: true, state: 'closed' }
+[ 1, 2 ] false
+aborted AbortError true
+rej bad
+[ 'bad' ]
+[ 10, 20, -1 ]
+ERR_INVALID_ARG_TYPE The "transform.readable" property must be an instance of ReadableStream. Received undefined
+ERR_INVALID_ARG_TYPE The "transform.writable" property must be an instance of WritableStream. Received an instance of Object
+true
+{ done: false, value: 1 } { done: true, value: 'r' }
+[ 1, 2, 3 ]
+from-async q
+ERR_ARG_NOT_ITERABLE 5 must be iterable
+18 function
+false {"k":1}
+ERR_INVALID_ARG_TYPE The "stream" argument must be an instance of ReadableStream. Received type number (1)
+TypeError undefined Class constructor ReadableStream cannot be invoked without 'new'
+TypeError undefined Class constructor WritableStream cannot be invoked without 'new'
+TypeError ERR_ILLEGAL_CONSTRUCTOR Illegal constructor
+ready rejected why closed rejected why
+"x"
+"x"
+ERR_INVALID_ARG_TYPE The "stream" argument must be an instance of ReadableStream, WritableStream, or Stream. Received an instance of Object
+==== webstreampull.js ====
+[["start",2],["pull",2],["read",false,2],["pull",2],["read",false,4],["pull",2],["read",false,6],["pull",2],["read",false,8],["read",true,null]]
+[object ReadableStream] ReadableStream { locked: true, state: 'closed', supportsBYOB: false }
+function true size 1 true 3
+5 size ByteLengthQueuingStrategy { highWaterMark: 16 }
+ERR_INVALID_ARG_TYPE The "init" argument must be of type object. Received undefined
+ERR_MISSING_OPTION init.highWaterMark is required
+ERR_INVALID_ARG_VALUE The property 'source.type' is invalid. Received 'nope'
+RangeError ERR_INVALID_ARG_VALUE The property 'strategy.highWaterMark' is invalid. Received -1
+ERR_INVALID_THIS Value of "this" must be of type ReadableStream
+ERR_INVALID_ARG_TYPE The "stream" argument must be an instance of ReadableStream. Received an instance of Object
+ERR_ILLEGAL_CONSTRUCTOR Illegal constructor
+TypeError ERR_INVALID_STATE Invalid state: ReadableStream is locked
 ==== wordcount.js ====
 the: 3
 fox: 2
