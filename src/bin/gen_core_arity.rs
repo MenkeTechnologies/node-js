@@ -107,6 +107,19 @@ for (const name of protoClasses) {
 }
 console.log('===SYMBOLS===');
 console.log(symbolRows.join('\n'));
+// Each module's ACCESSOR exports (`timers.promises`, `fs.ReadStream`,
+// `crypto.webcrypto`): whether a setter exists, the attributes, and the
+// getter's and setter's `name`.
+console.log('===ACCESSORS===');
+for (const [id, ns] of Object.entries(spellings)) {
+  let mod; try { mod = require(id); } catch { continue; }
+  for (const k of Object.getOwnPropertyNames(mod)) {
+    let d; try { d = Object.getOwnPropertyDescriptor(mod, k); } catch { continue; }
+    if (!d || !(d.get || d.set)) continue;
+    console.log([ns, k, d.set ? 1 : 0, d.enumerable ? 1 : 0, d.configurable ? 1 : 0,
+      d.get ? d.get.name : '', d.set ? d.set.name : ''].join('\t'));
+  }
+}
 "#;
 
 fn main() {
@@ -141,9 +154,12 @@ fn main() {
     let (protos_text, rest) = rest
         .split_once("===PROTO_ARITY===\n")
         .expect("enumerator emitted no prototype-arity section");
-    let (proto_arity_text, symbols_text) = rest
+    let (proto_arity_text, rest) = rest
         .split_once("===SYMBOLS===\n")
         .expect("enumerator emitted no symbol-property section");
+    let (symbols_text, accessors_text) = rest
+        .split_once("===ACCESSORS===\n")
+        .expect("enumerator emitted no accessor-export section");
     let mut rows: Vec<(String, String, String, bool)> = rows_text
         .lines()
         .filter(|l| !l.is_empty())
@@ -309,6 +325,36 @@ fn main() {
             flag(3),
             flag(4),
             flag(5)
+        )
+        .unwrap();
+    }
+    writeln!(w, "];").unwrap();
+    let mut accessor_rows: Vec<Vec<String>> = accessors_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('\t').map(str::to_string).collect())
+        .collect();
+    accessor_rows.sort();
+    writeln!(
+        w,
+        "\n/// Each core module's ACCESSOR exports:\n\
+         /// `(namespace, key, has_setter, enumerable, configurable, getter_name,\n\
+         /// setter_name)`, keyed by namespace spelling. Sorted by namespace, then key.\n\
+         pub const CORE_ACCESSOR_EXPORTS: &[(&str, &str, bool, bool, bool, &str, &str)] = &["
+    )
+    .unwrap();
+    for r in &accessor_rows {
+        let col = |i: usize| r.get(i).map(String::as_str).unwrap_or("");
+        writeln!(
+            w,
+            "    ({:?}, {:?}, {}, {}, {}, {:?}, {:?}),",
+            col(0),
+            col(1),
+            col(2) == "1",
+            col(3) == "1",
+            col(4) == "1",
+            col(5),
+            col(6)
         )
         .unwrap();
     }
