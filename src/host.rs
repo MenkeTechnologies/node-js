@@ -1556,6 +1556,19 @@ impl JsHost {
     /// (10.2.5) runs for an ordinary function definition and for every
     /// generator; an arrow, a `MethodDefinition`, an async function and a bound
     /// function are not constructors and own none.
+    /// `Some("Generator")` / `Some("AsyncGenerator")` for a `function*` /
+    /// `async function*`, naming the intrinsic its objects inherit from.
+    pub fn generator_kind(&self, v: &Value) -> Option<&'static str> {
+        match self.get(v) {
+            Some(JsObj::Func(f)) => match self.funcs.get(f.def_id) {
+                Some(d) if d.is_generator && d.is_async => Some("AsyncGenerator"),
+                Some(d) if d.is_generator => Some("Generator"),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn owns_prototype(&self, v: &Value) -> bool {
         match self.get(v) {
             Some(JsObj::Class(_)) => true,
@@ -5563,6 +5576,11 @@ impl JsHost {
                     // formatter, so a 30-member Set is thirty lines.
                     self.render_object(&inner, &prefix, indent, st)
                 }
+                // The brand is `Symbol.toStringTag`, which an async generator
+                // inherits as `AsyncGenerator`.
+                Some(JsObj::Generator { .. }) if self.is_async_gen_val(v) => {
+                    "Object [AsyncGenerator] {}".into()
+                }
                 Some(JsObj::Generator { .. }) => "Object [Generator] {}".into(),
                 Some(JsObj::Iter { array: Some(_), .. }) => "Object [Array Iterator] {}".into(),
                 // node lists what a URLSearchParams iterator has left; every other
@@ -8451,6 +8469,20 @@ fn run_user_func_full(
                 with_host(|h| h.generators[id as usize].async_gen = true);
             }
         }
+        let proto = match &callee {
+            Some(f) => crate::builtins::generator_instance_proto(f),
+            None => with_host(|h| {
+                h.ensure_native_protos();
+                h.native_proto(if is_async {
+                    "AsyncGenerator"
+                } else {
+                    "Generator"
+                })
+            }),
+        };
+        if let Some(p) = proto {
+            with_host(|h| h.set_proto(&gen, p));
+        }
         return Ok(gen);
     }
     // An async function runs on a coroutine and returns a Promise: it executes
@@ -10860,6 +10892,77 @@ impl JsHost {
             self.hide_prop(&proto, "constructor");
             self.hide_prop(&proto, "@@toStringTag");
             self.native_protos.insert(ctor.to_string(), proto);
+        }
+        self.ensure_generator_protos();
+    }
+
+    /// `%AsyncIteratorPrototype%`, `%GeneratorPrototype%` and
+    /// `%AsyncGeneratorPrototype%` (ECMA-262 27.1.3, 27.5.1, 27.6.1), hung off
+    /// `GeneratorFunction.prototype.prototype` and
+    /// `AsyncGeneratorFunction.prototype.prototype`.
+    ///
+    /// Each generator function's own `prototype` inherits from the matching
+    /// one, and each generator object from its function's `prototype`, so
+    /// `Object.getPrototypeOf(Object.getPrototypeOf(async function* () {})
+    /// .prototype)` — the idiom node's own `lib/` uses to reach
+    /// `%AsyncIteratorPrototype%` — is a real object with
+    /// `[Symbol.asyncIterator]` and `[Symbol.asyncDispose]`. It read `null`.
+    /// `%GeneratorPrototype%` inherits from `Iterator.prototype`.
+    fn ensure_generator_protos(&mut self) {
+        // The keys below are SYMBOL keys only once their well-known symbols
+        // exist; `own_symbol_keys` cannot mint one, so listing these
+        // prototypes before any script read `Symbol.asyncIterator` showed none.
+        for s in ["asyncIterator", "asyncDispose", "toStringTag"] {
+            self.well_known_symbol(s);
+        }
+        let attrs_fixed = PropAttrs {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        };
+        let async_iter = self.new_object(IndexMap::new());
+        let obj_proto = self.object_proto();
+        self.set_proto(&async_iter, obj_proto);
+        for m in ["@@asyncIterator", "@@asyncDispose"] {
+            let thunk = self.alloc(JsObj::Builtin(format!("@proto:AsyncIterator:{m}")));
+            if let Some(JsObj::Object(p)) = self.get_mut(&async_iter) {
+                p.insert(m.into(), thunk);
+            }
+            self.hide_prop(&async_iter, m);
+        }
+        self.native_protos
+            .insert("AsyncIterator".into(), async_iter.clone());
+        let iter_proto = self.alloc(JsObj::Builtin("Iterator.prototype".into()));
+        for (kind, fn_kind, parent) in [
+            ("Generator", "GeneratorFunction", iter_proto),
+            ("AsyncGenerator", "AsyncGeneratorFunction", async_iter),
+        ] {
+            let Some(fn_proto) = self.native_protos.get(fn_kind).cloned() else {
+                continue;
+            };
+            let proto = self.new_object(IndexMap::new());
+            self.set_proto(&proto, parent);
+            let tag = self.new_str(kind);
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert("constructor".into(), fn_proto.clone());
+            }
+            for m in ["next", "return", "throw"] {
+                let thunk = self.alloc(JsObj::Builtin(format!("@proto:{kind}:{m}")));
+                if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                    p.insert(m.into(), thunk);
+                }
+                self.hide_prop(&proto, m);
+            }
+            if let Some(JsObj::Object(p)) = self.get_mut(&proto) {
+                p.insert("@@toStringTag".into(), tag);
+            }
+            self.set_prop_attrs(&proto, "constructor", attrs_fixed);
+            self.set_prop_attrs(&proto, "@@toStringTag", attrs_fixed);
+            if let Some(JsObj::Object(p)) = self.get_mut(&fn_proto) {
+                p.insert("prototype".into(), proto.clone());
+            }
+            self.set_prop_attrs(&fn_proto, "prototype", attrs_fixed);
+            self.native_protos.insert(kind.into(), proto);
         }
     }
 

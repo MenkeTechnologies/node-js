@@ -353,6 +353,34 @@ return   undefined true
 after    undefined true
 self     function true
 novalue  undefined
+==== asynciteratorproto.js ====
+agp object [ 'constructor', 'next', 'return', 'throw' ] [ Symbol(Symbol.toStringTag) ]
+aip true [ Symbol(Symbol.asyncIterator), Symbol(Symbol.asyncDispose) ]
+aip proto true
+gp [ 'constructor', 'next', 'return', 'throw' ] [object Generator] [object AsyncGenerator]
+ctor true true
+desc false false true true
+name next 1 next 1
+sync TypeError Method [Generator].prototype.next called on incompatible receiver #<Object>
+name return 1 return 1
+sync TypeError Method [Generator].prototype.return called on incompatible receiver #<Object>
+name throw 1 throw 1
+sync TypeError Method [Generator].prototype.throw called on incompatible receiver #<Object>
+fn names [Symbol.asyncIterator] [Symbol.asyncDispose]
+self 5
+own proto true [ 'count' ]
+instance true true 2
+fallback true
+async instance true true
+identity true true
+inspect Object [AsyncGenerator] {}
+async TypeError Method [AsyncGenerator].prototype.next called on incompatible receiver #<Object>
+async TypeError Method [AsyncGenerator].prototype.return called on incompatible receiver #<Object>
+async TypeError Method [AsyncGenerator].prototype.throw called on incompatible receiver #<Object>
+iter self true
+dispose undefined 1
+no return undefined
+v a
 ==== bigint.js ====
 10n -3n bigint
 255 ff 11111111

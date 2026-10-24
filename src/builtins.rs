@@ -1860,11 +1860,23 @@ pub fn get_property_recv(recv: &Value, name: &str, receiver: &Value) -> Result<V
             } else {
                 "@@iterator"
             };
-            if name == want || is_generator_method(name) || crate::stdlib::iterator::is_helper(name)
-            {
+            // `next`/`return`/`throw` and `[Symbol.asyncIterator]` are the
+            // intrinsic prototypes' own functions, so they and anything else
+            // are inherited: from the function's `prototype`, then
+            // `%GeneratorPrototype%` and `Iterator.prototype` (or
+            // `%AsyncGeneratorPrototype%` and `%AsyncIteratorPrototype%`).
+            // The sync `[Symbol.iterator]` and the iterator helpers still
+            // dispatch on the generator itself.
+            let inherited = name == "@@asyncIterator" || is_generator_method(name);
+            if !inherited && (name == want || crate::stdlib::iterator::is_helper(name)) {
                 bound_method(recv, name)
             } else {
-                with_host(|h| h.fn_prop(recv, name)).unwrap_or(Value::Undef)
+                match with_host(|h| h.fn_prop(recv, name).ok_or_else(|| h.proto_of(recv))) {
+                    Ok(v) => v,
+                    Err(Some(proto)) => get_property_recv(&proto, name, receiver)?,
+                    Err(None) if name == want || inherited => bound_method(recv, name),
+                    Err(None) => Value::Undef,
+                }
             }
         }
         Some(ObjKind::Promise) => {
@@ -2848,12 +2860,38 @@ fn ensure_fn_prototype(recv: &Value) -> Value {
     }
     with_host(|h| {
         let proto = h.new_object(IndexMap::new());
-        if let Some(JsObj::Object(p)) = h.get_mut(&proto) {
-            p.insert("constructor".to_string(), recv.clone());
+        // A generator function's `prototype` has no `constructor` and inherits
+        // from `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%` (15.5.4,
+        // 15.6.4), which is where its objects find `next`.
+        if let Some(kind) = h.generator_kind(recv) {
+            h.ensure_native_protos();
+            if let Some(gp) = h.native_proto(kind) {
+                h.set_proto(&proto, gp);
+            }
+        } else {
+            if let Some(JsObj::Object(p)) = h.get_mut(&proto) {
+                p.insert("constructor".to_string(), recv.clone());
+            }
+            h.hide_prop(&proto, "constructor");
         }
-        h.hide_prop(&proto, "constructor");
         h.set_fn_prop(recv, "prototype", proto.clone());
         proto
+    })
+}
+
+/// The prototype a generator object inherits from: its function's
+/// `prototype` when that is an object, else the intrinsic
+/// `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%` (27.5.3.x
+/// `OrdinaryCreateFromConstructor` with the intrinsic fallback).
+pub fn generator_instance_proto(func: &Value) -> Option<Value> {
+    let kind = with_host(|h| h.generator_kind(func))?;
+    let p = ensure_fn_prototype(func);
+    if with_host(|h| !h.is_nullish(&p) && !host::is_primitive(h, &p)) {
+        return Some(p);
+    }
+    with_host(|h| {
+        h.ensure_native_protos();
+        h.native_proto(kind)
     })
 }
 
@@ -3725,6 +3763,72 @@ fn this_primitive_value(ctor: &str, recv: &Value) -> Option<Value> {
     None
 }
 
+/// The methods of `%GeneratorPrototype%`, `%AsyncGeneratorPrototype%` and
+/// `%AsyncIteratorPrototype%` (installed by `ensure_generator_protos`), called
+/// through the prototype rather than off a generator: a matching generator
+/// runs the method; anything else is V8's incompatible-receiver TypeError,
+/// which the async form REJECTS with (27.6.3.3 `AsyncGeneratorValidate`).
+fn generator_proto_method(
+    recv: &Value,
+    ctor: &str,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    match (ctor, method) {
+        ("AsyncIterator", "@@asyncIterator") => Some(Ok(recv.clone())),
+        // 27.1.3.1: call `this.return()` if there is one, and settle with
+        // `undefined` once its result does.
+        ("AsyncIterator", "@@asyncDispose") => Some(async_iterator_dispose(recv)),
+        ("Generator" | "AsyncGenerator", "next" | "return" | "throw") => {
+            let is_async = ctor == "AsyncGenerator";
+            let ok =
+                with_host(|h| h.is_generator_val(recv) && h.is_async_gen_val(recv) == is_async);
+            if ok {
+                return Some(host::call_method(recv, method, args.to_vec()));
+            }
+            let err = host::type_error(&format!(
+                "Method [{ctor}].prototype.{method} called on incompatible receiver {}",
+                no_side_effects_string(recv)
+            ));
+            if !is_async {
+                return Some(Err(err));
+            }
+            let reason = with_host(|h| synth_error(h, &err));
+            let p = with_host(|h| h.new_promise());
+            if let Some(id) = with_host(|h| h.promise_id(&p)) {
+                host::reject_promise_val(id, reason);
+            }
+            Some(Ok(p))
+        }
+        _ => None,
+    }
+}
+
+/// `%AsyncIteratorPrototype%[@@asyncDispose]()`.
+fn async_iterator_dispose(recv: &Value) -> Result<Value, String> {
+    let reject = |e: &str| {
+        let p = with_host(|h| h.new_promise());
+        if let Some(id) = with_host(|h| h.promise_id(&p)) {
+            host::reject_promise_val(id, host::take_exc_or_error(e));
+        }
+        Ok(p)
+    };
+    let ret = match get_property(recv, "return") {
+        Ok(r) => r,
+        Err(e) => return reject(&e),
+    };
+    if with_host(|h| h.is_nullish(&ret)) {
+        return Ok(host::promise_of(&Value::Undef));
+    }
+    let result = match host::invoke(&ret, Vec::new(), Some(recv.clone())) {
+        Ok(r) => r,
+        Err(e) => return reject(&e),
+    };
+    // `@@pnoop` answers `undefined`, the value the dispose settles with.
+    let to_undef = make_builtin("@@pnoop".to_string());
+    host::call_method(&host::promise_of(&result), "then", vec![to_undef])
+}
+
 pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result<Value, String> {
     let (ctor, method) = ctor_method.split_once(':').unwrap_or(("", ctor_method));
     // A prototype slot that holds ANOTHER method's function object (24.1.3.12,
@@ -3736,6 +3840,9 @@ pub fn proto_method(recv: &Value, ctor_method: &str, args: Vec<Value>) -> Result
         ("Map", "@@iterator") => "entries",
         _ => method,
     };
+    if let Some(r) = generator_proto_method(recv, ctor, method, &args) {
+        return r;
+    }
     // A prototype ACCESSOR installed by `ensure_ctor_proto`: it reads or writes
     // the instance's hidden `@@<name>` slot, which is where the value lives now
     // that the public name is a getter rather than an own property.
@@ -6985,6 +7092,12 @@ pub fn builtin_meta(key: &str) -> Option<(&'static str, u32)> {
                 .find(|(k, _, _)| *k == key)
                 .map(|(_, name, len)| (*name, *len))
         })
+        .or_else(|| {
+            GENERATOR_PROTO_ARITY
+                .iter()
+                .find(|(k, _, _)| *k == key)
+                .map(|(_, name, len)| (*name, *len))
+        })
         // A core-module function (`fs.readFileSync`): measured from the
         // reference binary by `gen-core-arity`. `.length` read `undefined` for
         // every one of them.
@@ -7040,6 +7153,29 @@ const TIMER_ARITY: &[(&str, &str, u32)] = &[
     ("timers/promises.setTimeout", "setTimeout", 2),
     ("timers/promises.setInterval", "setInterval", 2),
     ("timers/promises.setImmediate", "setImmediate", 1),
+];
+
+/// `name` and `length` of the `%GeneratorPrototype%`, `%AsyncGeneratorPrototype%`
+/// and `%AsyncIteratorPrototype%` methods (`ensure_generator_protos`), which the
+/// generated table does not reach: it walks the global constructors, and these
+/// prototypes hang off no global. Measured against node v26.12.1.
+const GENERATOR_PROTO_ARITY: &[(&str, &str, u32)] = &[
+    ("@proto:Generator:next", "next", 1),
+    ("@proto:Generator:return", "return", 1),
+    ("@proto:Generator:throw", "throw", 1),
+    ("@proto:AsyncGenerator:next", "next", 1),
+    ("@proto:AsyncGenerator:return", "return", 1),
+    ("@proto:AsyncGenerator:throw", "throw", 1),
+    (
+        "@proto:AsyncIterator:@@asyncIterator",
+        "[Symbol.asyncIterator]",
+        0,
+    ),
+    (
+        "@proto:AsyncIterator:@@asyncDispose",
+        "[Symbol.asyncDispose]",
+        0,
+    ),
 ];
 
 /// The `name` a builtin function reports. The table answers for an intrinsic;
