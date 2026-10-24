@@ -3281,8 +3281,7 @@ Still open, found here:
 Pinned in `examples/asynciteratorproto.js`, `timerdeadlines.js`,
 `webstreampull.js`, `bytestreams.js`, `webstreampipe.js`,
 `coresymbolprops.js`, `accessorexports.js`, `emitterproto.js` and
-`urlprotocolfile.js`; each fix was
-re-broken alone and its record went red.
+`urlprotocolfile.js`; each fix was re-broken alone and its record went red.
 
 | Case | node | was |
 |---|---|---|
@@ -3304,7 +3303,7 @@ re-broken alone and its record went red.
 | `o.propertyIsEnumerable(sym)` for any symbol-keyed property | its `enumerable` | `false` — the symbol's display string was looked up |
 | core-module exports node defines as accessors (`timers.promises`, `crypto.webcrypto`, `events.defaultMaxListeners`, …; measured: `CORE_ACCESSOR_EXPORTS`) | an accessor descriptor (getter/setter names measured); `[Getter]` / `[Getter/Setter]` under inspect | a data property holding the value |
 | `http.globalAgent === http.globalAgent` (and `https`) | `true` | `false` — a new Agent per read |
-| `u = new URL('http://a/'); u.protocol = 'file'` (any special URL without credentials or a port) | `file://a/` | unchanged — the `url` crate refuses every change to `file`; node-js now applies it itself |
+| `u = new URL('http://a/'); u.protocol = 'file'` (any special URL without credentials or a port) | `file://a/` | unchanged — the `url` crate refuses every change to `file` |
 | `EventEmitter.prototype.on` (any of its methods), `EventEmitter.prototype.on === EventEmitter.prototype.addListener` | the method; `true` | `undefined` while `getOwnPropertyNames` listed the name |
 | `Object.getOwnPropertyNames(EventEmitter.prototype)`, `Object.keys` | node's order with `_events`, `_eventsCount`, `_maxListeners` (measured: `CLASS_PROTO_ORDER`) | the method list alone |
 | `Object.getPrototypeOf(new EventEmitter()) === EventEmitter.prototype` when the prototype is read first | `true` | `false` — a namespace handle until the first emitter built the real object |
