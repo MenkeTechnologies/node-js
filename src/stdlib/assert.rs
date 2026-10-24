@@ -1003,7 +1003,23 @@ fn deep_equal_body(
                     .all(|(x, y)| deep_equal_seen(x, y, strict_mode, seen))
         }
         (Some(Kind::Object), Some(Kind::Object)) => {
+            // Two Buffers compare by the bytes they VIEW. Where a Buffer sits in
+            // its store (`byteOffset`, `buffer`, the shared `@@bytes` pool) is
+            // not its value: two equal Buffers from the pool differ in all of it.
+            let both_buffers = [a, b]
+                .iter()
+                .all(|v| crate::stdlib::native_tag(v).as_deref() == Some("Buffer"));
+            if both_buffers
+                && crate::stdlib::buffer::view_bytes(a) != crate::stdlib::buffer::view_bytes(b)
+            {
+                return false;
+            }
+            let is_view_slot = |k: &str| {
+                both_buffers && matches!(k, "byteOffset" | "buffer" | "@@bytes" | "@@buffer")
+            };
             let (ea, eb) = with_host(|h| (object_of(h, a), object_of(h, b)));
+            let ea: Vec<_> = ea.into_iter().filter(|(k, _)| !is_view_slot(k)).collect();
+            let eb: Vec<_> = eb.into_iter().filter(|(k, _)| !is_view_slot(k)).collect();
             if ea.len() != eb.len() {
                 return false;
             }
@@ -1025,6 +1041,8 @@ fn deep_equal_body(
             // not properties — they must not affect the key COUNT above, which
             // node takes over enumerable keys only.
             let (ia, ib) = with_host(|h| (internals_of(h, a), internals_of(h, b)));
+            let ia: Vec<_> = ia.into_iter().filter(|(k, _)| !is_view_slot(k)).collect();
+            let ib: Vec<_> = ib.into_iter().filter(|(k, _)| !is_view_slot(k)).collect();
             if ia.len() != ib.len() {
                 return false;
             }

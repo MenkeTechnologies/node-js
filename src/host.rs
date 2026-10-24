@@ -1173,6 +1173,9 @@ pub struct JsHost {
     /// `Builtin` handle, so these cannot live in `fn_props` (which is per-heap-
     /// index); this stable side table lets `Error.prepareStackTrace = fn` persist.
     builtin_statics: HashMap<String, IndexMap<String, Value>>,
+    /// `lib/buffer.js`'s shared allocation pool, `(allocPool, poolSize,
+    /// poolOffset)` — created on first use by `buffer::pooled`.
+    pub buffer_pool: Option<(Value, usize, usize)>,
     /// The shared well-known `Object.prototype` object (chain root for objects).
     object_proto: Value,
     /// Class name of each class `prototype` object, by heap index — lets an
@@ -1526,6 +1529,7 @@ impl JsHost {
             forced_strict: 0,
             module_scope: false,
             builtin_statics: HashMap::new(),
+            buffer_pool: None,
             object_proto: Value::Undef,
             proto_class: HashMap::new(),
             class_registry: HashMap::new(),

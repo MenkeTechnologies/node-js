@@ -388,7 +388,7 @@ fn read_file_sync(args: &[Value]) -> Result<Value, String> {
         let bytes = read_fd_to_end(fd)?;
         return Ok(match enc {
             Some(e) => with_host(|h| h.new_str(super::buffer::encode_bytes(&bytes, &e))),
-            None => super::buffer::from_bytes(&bytes),
+            None => super::buffer::pooled(&bytes),
         });
     }
     let path = arg_str(args, 0);
@@ -398,9 +398,10 @@ fn read_file_sync(args: &[Value]) -> Result<Value, String> {
         // text": `readFileSync(p, 'hex')` gives the hex digits of the file, and
         // `'base64'` its base64. Every encoding used to come back as the raw
         // UTF-8 text.
+        // node reads into `Buffer.allocUnsafe(size)`, a slice of the pool.
         Ok(bytes) => Ok(match enc {
             Some(e) => with_host(|h| h.new_str(super::buffer::encode_bytes(&bytes, &e))),
-            None => super::buffer::from_bytes(&bytes),
+            None => super::buffer::pooled(&bytes),
         }),
         // A DIRECTORY opens fine and fails at the `read`, which is the syscall
         // node names — and it names no path there, because the descriptor no

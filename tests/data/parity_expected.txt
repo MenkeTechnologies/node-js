@@ -471,6 +471,29 @@ azzaQa true 1 2
 <Buffer 09 ee> 6
 0 0 undefined [] true
 TypeError Cannot perform %TypedArray%.prototype.values on a detached or out-of-bounds ArrayBuffer
+==== bufferpool.js ====
+first 0 65600
+second 8 true
+allocUnsafe 16 array 32
+concat 40 typed 48
+arraylike 56 copy 64
+json 72 copyBytesFrom 80
+hex-empty 88 0 next 88
+alloc 0 3
+slow 3 of 2
+empty 0 0 0
+limit 65600 32768
+estimate 65600 32864 27000
+big 0 40000
+refill 24800 false 65600
+fill 65512 0 false
+producers 65600 65600 65600
+TypeError ArrayBuffer is not detachable and could not be cloned.
+DataCloneError Cannot transfer object of unsupported type.
+clone 65600 abc
+own 4 0
+poolSize 65600 8
+equal true true false
 ==== buffers.js ====
 Int8      80=-128 ff=-1 7f=127
 UInt8     00=0 ff=255

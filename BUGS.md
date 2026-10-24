@@ -685,15 +685,17 @@ Two divergences remain:
    implements a subset of those methods and marks them non-enumerable, so
    `for (k in buf)` yields the indices only. Emitting our shorter list instead
    would advertise methods Node has that node-js does not.
-2. **Buffers are not allocated from a pool.** Every Buffer is a view onto an
-   `ArrayBuffer` (`buf.buffer`) and shares its bytes, and `subarray`/`slice`
-   are windows onto the same memory. But node carves small `Buffer.from(string
-   | array)`/`allocUnsafe` results out of a shared pool, so there
-   `buf.buffer.byteLength` is the pool's size, `buf.byteOffset` is wherever the
-   pool cursor stood, and `buf.buffer.transfer()` throws `ArrayBuffer is not
-   detachable and could not be cloned.` Here each Buffer owns an exactly-sized
-   buffer at offset 0, which is detachable. Code that honours
-   `byteOffset`/`length` behaves identically either way.
+2. **The Buffer pool is modelled for the `buffer` module's own allocators and
+   two producers, not for every node API.** `Buffer.from` (string,
+   array-like, `toJSON` form), `allocUnsafe`, `concat`, `copyBytesFrom`,
+   `fs.readFileSync` and the `zlib` one-shot functions slice the shared pool
+   as node's `lib/buffer.js` does (byteOffset, the 65600-byte pool, the
+   untransferable pool). Other node producers that use `allocUnsafe`
+   internally still return a Buffer with its own memory. Also: node's
+   `poolBase` depends on the pool's real address and is 0 here; in node a
+   write to a FILE or terminal stdout takes pool space (a pipe does not), and
+   here nothing does; an async `zlib` result is allocated when the call is
+   made, not when its callback runs.
 
 A builtin namespace (`require('buffer')`, `Buffer`, `fs`, …) enumerates the
 members node-js ACTUALLY implements under `for…in` / `Object.keys` — not Node's
@@ -3452,3 +3454,23 @@ reached — every iterator is linked when allocated — was deleted).
 | `class C extends Iterator {}` | the abstract `Iterator` constructor (callable via `super`) | `Iterator is not a constructor` |
 | `for (k in Object.create(Iterator.prototype))` after `Iterator.prototype.q = 1` | `q` | nothing: `enum_keys` does not list a namespace prototype's patched members |
 | the `URLSearchParams`, `Headers` and `FormData` iterators' prototype | its own `next` + tag (plus `inspect.custom` for URLSearchParams), inheriting `Iterator.prototype` | `Iterator.prototype`'s member list itself |
+
+## FIXED in round 24 — the Buffer pool, verified against node v26.12.1
+
+Pinned in `examples/bufferpool.js`; each part was re-broken alone and the
+record went red.
+
+| Case | node | was |
+|---|---|---|
+| `Buffer.from('abc').byteOffset`, `.buffer.byteLength`, then the next small Buffer's | `0`, `65600`, `8` — slices of one 64 KiB pool (plus 64 bytes of alignment padding), 8-byte aligned | `0`, `3`, `0` — every Buffer owned an exactly-sized buffer |
+| which allocators pool | `Buffer.from` of a string / array-like / `{type:'Buffer',data}`, `allocUnsafe`, `concat`, `copyBytesFrom`, `fs.readFileSync`, `zlib.*Sync` and async results; not `alloc`, `allocUnsafeSlow`, `of`, or anything at or above `Buffer.poolSize >>> 1` | none |
+| a string near the pool's end | a new pool when the estimate (4 bytes per UTF-16 unit, or the real length once that reaches the limit) does not fit | — |
+| `Buffer.from('a').buffer.transfer()`, `structuredClone(pool, { transfer: [pool] })` | `TypeError: ArrayBuffer is not detachable and could not be cloned.`; `DataCloneError: Cannot transfer object of unsupported type.` | the pool was detached |
+| `Buffer.from({ type: 'Buffer', data: [1, 2] })` | `<Buffer 01 02>` | `ERR_INVALID_ARG_TYPE` |
+| `isDeepStrictEqual(Buffer.from('abc'), Buffer.alloc(3, 'abc'))` | `true` (compared by the bytes viewed) | `false` once the two sat at different offsets: `assert` compared `byteOffset` and the whole shared store |
+
+### Still open — found here, not fixed
+
+| Case | node | node-js |
+|---|---|---|
+| `assert.deepEqual(Buffer.from('abc'), new Uint8Array([97, 98, 99]))` (loose) | passes | fails: a Buffer and a typed array are compared through different internal slots |

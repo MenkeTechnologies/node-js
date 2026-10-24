@@ -481,6 +481,113 @@ pub fn from_bytes(bytes: &[u8]) -> Value {
     share_array_buffer(&ab, 0, bytes.len())
 }
 
+// ── the allocation pool (`lib/buffer.js`) ────────────────────────────────────
+//
+// Node carves small Buffers out of one shared ArrayBuffer: `Buffer.from` of a
+// string or an array-like, `Buffer.allocUnsafe` and `Buffer.concat` take a
+// slice of `allocPool` and advance `poolOffset` past it, 8-byte aligned; a new
+// pool is made when the slice does not fit. So `buf.byteOffset` is the slice's
+// place in the pool, `buf.buffer.byteLength` is the pool's (64 KiB plus the
+// 64 bytes `createUnsafeAlignedBuffer` over-allocates), and `buf.buffer
+// .transfer()` throws, the pool being marked untransferable. `Buffer.alloc`,
+// `allocUnsafeSlow` and `Buffer.of` never use the pool. `poolBase` — where the
+// aligned pool starts inside its ArrayBuffer — depends on a real address in
+// node and is 0 here, which is what node reports whenever the backing store
+// is already 64-byte aligned.
+
+/// `kPoolAlignment`, and so the padding `createUnsafeAlignedBuffer` adds.
+const POOL_PADDING: usize = 64;
+
+/// `Buffer.poolSize` as a script currently sees it (it is writable).
+fn pool_size_value() -> f64 {
+    let set = with_host(|h| h.builtin_static("Buffer", "poolSize"));
+    match set {
+        Some(v) => with_host(|h| h.to_number(&v)),
+        None => 65536.0,
+    }
+}
+
+/// `Buffer.poolSize >>> 1`, the size below which a Buffer is pooled.
+fn pool_half() -> usize {
+    let n = pool_size_value();
+    let u = if n.is_finite() {
+        n.trunc().rem_euclid(4294967296.0) as u32
+    } else {
+        0
+    };
+    (u >> 1) as usize
+}
+
+/// `createPool()`: a fresh untransferable pool of `Buffer.poolSize` bytes.
+fn create_pool() {
+    let size = pool_size_value().max(0.0) as usize;
+    let arr = with_host(|h| h.new_array(vec![Value::Float(0.0); size + POOL_PADDING]));
+    let ab = crate::stdlib::typedarray::array_buffer_over(arr);
+    crate::stdlib::typedarray::mark_untransferable(&ab);
+    with_host(|h| h.buffer_pool = Some((ab, size, 0)));
+}
+
+/// A Buffer of `bytes` sliced out of the pool, after checking that `reserve`
+/// bytes fit (`fromStringFast` checks its upper estimate, not the length it
+/// ends up writing).
+fn pool_slice(reserve: usize, bytes: &[u8]) -> Value {
+    let fits = with_host(
+        |h| matches!(h.buffer_pool, Some((_, size, off)) if reserve <= size - off.min(size)),
+    );
+    if !fits {
+        create_pool();
+    }
+    let Some((ab, size, off)) = with_host(|h| h.buffer_pool.clone()) else {
+        return from_bytes(bytes);
+    };
+    if let Some(store) = crate::stdlib::typedarray::buffer_store(&ab) {
+        with_host(|h| {
+            if let Some(JsObj::Array(items)) = h.get_mut(&store) {
+                for (i, b) in bytes.iter().enumerate() {
+                    items[off + i] = Value::Float(*b as f64);
+                }
+            }
+        });
+    }
+    let buf = share_array_buffer(&ab, off, bytes.len());
+    // `alignPool()`: the next slice starts on an 8-byte boundary.
+    let next = (off + bytes.len() + 7) & !7;
+    with_host(|h| h.buffer_pool = Some((ab, size, next)));
+    buf
+}
+
+/// `allocate(size)` / `fromArrayLike`: a pooled Buffer holding `bytes` when it
+/// is non-empty and under half the pool size, an own allocation otherwise.
+pub fn pooled(bytes: &[u8]) -> Value {
+    if bytes.is_empty() || bytes.len() >= pool_half() {
+        return from_bytes(bytes);
+    }
+    pool_slice(bytes.len(), bytes)
+}
+
+/// `fromString` / `fromStringFast`: `s` encoded under `enc`, pooled when its
+/// length estimate (four bytes per UTF-16 unit, or the real byte length once
+/// that estimate reaches half the pool) is under half the pool size.
+fn pooled_string(s: &str, enc: &str) -> Value {
+    let bytes = decode_str(s, enc);
+    if s.is_empty() {
+        return from_bytes(&bytes);
+    }
+    let max = pool_half();
+    let units = s.encode_utf16().count();
+    if units >= max {
+        return from_bytes(&bytes);
+    }
+    let mut estimate = units * 4;
+    if estimate >= max {
+        estimate = bytes.len();
+    }
+    if estimate >= max {
+        return from_bytes(&bytes);
+    }
+    pool_slice(estimate, &bytes)
+}
+
 /// A Buffer's window onto its byte store as `(byteOffset, length)`.
 ///
 /// A Buffer built from its own bytes spans the whole store, so this is
@@ -679,10 +786,10 @@ pub fn static_call(method: &str, args: &[Value]) -> Option<Result<Value, String>
             };
             Ok(from_bytes(&bytes))
         }
-        // `allocUnsafeSlow` differs from `allocUnsafe` only in skipping Node's
-        // shared pool — an allocator detail with no observable difference here,
-        // where every Buffer already owns its bytes.
-        "allocUnsafe" | "allocUnsafeSlow" => validate_size(args).map(|n| from_bytes(&vec![0u8; n])),
+        // `allocUnsafe` slices the shared pool (`allocate`); `allocUnsafeSlow`
+        // never does.
+        "allocUnsafe" => validate_size(args).map(|n| pooled(&vec![0u8; n])),
+        "allocUnsafeSlow" => validate_size(args).map(|n| from_bytes(&vec![0u8; n])),
         "concat" => concat(args),
         // `Buffer.of(...bytes)` — the `%TypedArray%.of` form: each argument is one
         // byte. Measured: `Buffer.of(1,2,3).toString('hex') === '010203'`,
@@ -839,7 +946,7 @@ fn from(args: &[Value]) -> Result<Value, String> {
     }
     // Any byte-like source (array of bytes, Buffer, typed array).
     if let Some(bytes) = bytes_like(&v) {
-        return Ok(from_bytes(&bytes));
+        return Ok(pooled(&bytes));
     }
     // A string, with an optional encoding.
     if with_host(|h| h.as_str(&v)).is_some() || matches!(v, Value::Str(_)) {
@@ -848,7 +955,7 @@ fn from(args: &[Value]) -> Result<Value, String> {
         } else {
             "utf8".into()
         };
-        return Ok(from_bytes(&decode_str(&arg_str(args, 0), &enc)));
+        return Ok(pooled_string(&arg_str(args, 0), &enc));
     }
     // A `DataView` yields an EMPTY buffer: `Buffer.from` wants something
     // array-like, and a DataView carries `byteLength` but no `length`.
@@ -871,8 +978,17 @@ fn from(args: &[Value]) -> Result<Value, String> {
                     let b = with_host(|h| h.to_number(&e));
                     out.push(if b.is_finite() { b as i64 as u8 } else { 0 });
                 }
-                return Ok(from_bytes(&out));
+                return Ok(pooled(&out));
             }
+        }
+        // `fromObject`'s second form: what `buf.toJSON()` produced,
+        // `{ type: 'Buffer', data: [...] }`, rebuilds the bytes of `data`.
+        let ty = crate::builtins::get_property(&v, "type").unwrap_or(Value::Undef);
+        let data = crate::builtins::get_property(&v, "data").unwrap_or(Value::Undef);
+        if with_host(|h| h.as_str(&ty).is_some_and(|t| t == "Buffer"))
+            && with_host(|h| matches!(h.get(&data), Some(JsObj::Array(_))))
+        {
+            return Ok(pooled(&bytes_like(&data).unwrap_or_default()));
         }
     }
     // Anything else is a TypeError, not a stringification: `Buffer.from(5)`
@@ -957,7 +1073,7 @@ fn concat(args: &[Value]) -> Result<Value, String> {
     if let Some(n) = length {
         out.resize(n, 0);
     }
-    Ok(from_bytes(&out))
+    Ok(pooled(&out))
 }
 
 /// `validateOffset(value, name)` from `lib/buffer.js`: a Number, an integer,
@@ -1995,5 +2111,6 @@ fn copy_bytes_from(args: &[Value]) -> Result<Value, String> {
         }
         None => len,
     };
-    Ok(from_bytes(&bytes[offset * bpe..end * bpe]))
+    // `fromArrayLike(new Uint8Array(…))`: pooled like any array-like.
+    Ok(pooled(&bytes[offset * bpe..end * bpe]))
 }

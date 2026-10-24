@@ -102,7 +102,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     // calls (input read, output alloc) never nest into a double borrow.
     let base = method.strip_suffix("Sync")?;
     let out = oneshot(base, &input_bytes(args));
-    Some(out.map(|bytes| buffer::from_bytes(&bytes)))
+    // `zlibBufferSync` ends in `Buffer.concat`, so the result is pooled.
+    Some(out.map(|bytes| buffer::pooled(&bytes)))
 }
 
 /// Names that take a trailing `callback(err, buffer)`.
@@ -130,7 +131,7 @@ fn run_async(op: &str, args: &[Value]) -> Result<Value, String> {
     };
     let input = input_bytes(args);
     let (err, buf) = match oneshot(op, &input) {
-        Ok(bytes) => (with_host(|h| h.null()), buffer::from_bytes(&bytes)),
+        Ok(bytes) => (with_host(|h| h.null()), buffer::pooled(&bytes)),
         // An error-first callback receives an ERROR OBJECT, not the message:
         // `zlib.gunzip(garbage, cb)` gives an `err` whose `code` is
         // `Z_DATA_ERROR`. A bare string made that — and `err.message` — all

@@ -17019,6 +17019,13 @@ fn structured_clone(args: Vec<Value>) -> Result<Value, String> {
                 "Found invalid value in transferList.",
             ));
         }
+        // The Buffer pool is marked untransferable.
+        if crate::stdlib::typedarray::is_untransferable(item) {
+            return Err(host::dom_error(
+                "DataCloneError",
+                "Cannot transfer object of unsupported type.",
+            ));
+        }
     }
     let out = deep_clone(&arg0(&args))?;
     for item in &list {

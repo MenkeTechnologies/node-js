@@ -1117,6 +1117,22 @@ pub fn array_buffer_over(arr: Value) -> Value {
     })
 }
 
+/// Whether `ab` was marked UNTRANSFERABLE (`internal/buffer`'s
+/// `markAsUntransferable`), as the Buffer pool is: `transfer()` and a
+/// `structuredClone` transfer list both refuse it.
+pub fn is_untransferable(ab: &Value) -> bool {
+    with_host(|h| matches!(h.get(ab), Some(JsObj::Object(p)) if p.contains_key("@@untransferable")))
+}
+
+/// Mark `ab` untransferable (see [`is_untransferable`]).
+pub fn mark_untransferable(ab: &Value) {
+    with_host(|h| {
+        if let Some(JsObj::Object(p)) = h.get_mut(ab) {
+            p.insert("@@untransferable".into(), Value::Bool(true));
+        }
+    });
+}
+
 /// Whether `ab` has been DETACHED — its bytes handed to another buffer by
 /// `transfer`, or given away by `structuredClone`'s `transfer` option.
 ///
@@ -1188,6 +1204,11 @@ pub fn buffer_transfer(ab: &Value, args: &[Value], fixed: bool) -> Result<Value,
         return Err(crate::host::type_error(&format!(
             "Cannot perform ArrayBuffer.prototype.{method} on a detached ArrayBuffer"
         )));
+    }
+    if is_untransferable(ab) {
+        return Err(crate::host::type_error(
+            "ArrayBuffer is not detachable and could not be cloned.",
+        ));
     }
     let old = byte_len_of(ab);
     let new_len = match args.first().filter(|v| !matches!(v, Value::Undef)) {
