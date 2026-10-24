@@ -1095,6 +1095,8 @@ pub struct JsHost {
     pub macrotasks: Vec<Timer>,
     /// Monotonic timer-id source.
     next_timer: u64,
+    /// The virtual clock (ms): the `vdeadline` of the latest timer fired.
+    virtual_now: f64,
     /// Cloned by I/O worker threads to post `IoTask`s back to the main-thread
     /// event loop. Kept alive for the host's lifetime so the loop's `recv` never
     /// sees a spurious `Disconnected` while a server is running.
@@ -1219,6 +1221,12 @@ pub struct Timer {
     pub deadline: Instant,
     /// The async context frame the timer was created in; its callback runs in it.
     pub frame: AsyncFrame,
+    /// The virtual-clock deadline: the host's `virtual_now` when scheduled plus
+    /// `delay`. The virtual clock fires timers in this order, so a 5 ms timer
+    /// scheduled at virtual time 10 runs after a 12 ms one scheduled at 0;
+    /// ordering by `delay` alone ran every short timer first, however late it
+    /// was scheduled.
+    pub vdeadline: f64,
 }
 
 /// One suspended generator. `coro` is `None` only while actively running (taken
@@ -1391,6 +1399,7 @@ impl JsHost {
             nextticks: std::collections::VecDeque::new(),
             macrotasks: Vec::new(),
             next_timer: 1,
+            virtual_now: 0.0,
             io_tx,
             io_rx: Some(io_rx),
             open_handles: 0,
@@ -11431,6 +11440,7 @@ impl JsHost {
             refed: true,
             deadline,
             frame: self.async_frame.clone(),
+            vdeadline: self.virtual_now + delay,
         });
         id
     }
@@ -11456,6 +11466,7 @@ impl JsHost {
             refed: t.refed,
             deadline,
             frame: t.frame.clone(),
+            vdeadline: self.virtual_now + period,
         });
     }
     /// `timeout.ref()` / `timeout.unref()` — set the handle bit on a pending
@@ -11482,6 +11493,7 @@ impl JsHost {
         for t in &mut self.macrotasks {
             if t.id == id && !t.cancelled {
                 t.deadline = now + Duration::from_millis(t.delay.max(0.0) as u64);
+                t.vdeadline = self.virtual_now + t.delay;
             }
         }
     }
@@ -11531,20 +11543,23 @@ impl JsHost {
         }
     }
     fn pop_next_timer(&mut self) -> Option<Timer> {
-        // Earliest (delay, seq) fires first — a deterministic virtual clock.
+        // Earliest (vdeadline, seq) fires first — a deterministic virtual
+        // clock, advanced to each timer's deadline as it fires.
         let idx = self
             .macrotasks
             .iter()
             .enumerate()
             .filter(|(_, t)| !t.cancelled)
             .min_by(|(_, a), (_, b)| {
-                a.delay
-                    .partial_cmp(&b.delay)
+                a.vdeadline
+                    .partial_cmp(&b.vdeadline)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.seq.cmp(&b.seq))
             })
-            .map(|(i, _)| i);
-        idx.map(|i| self.macrotasks.remove(i))
+            .map(|(i, _)| i)?;
+        let t = self.macrotasks.remove(idx);
+        self.virtual_now = self.virtual_now.max(t.vdeadline);
+        Some(t)
     }
     fn next_microtask(&mut self) -> Option<Task> {
         // Node's `processTicksAndRejections` runs in ROUNDS: drain the nextTick
