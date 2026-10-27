@@ -2525,8 +2525,8 @@ net-internal  [true,true]
 neighbours    ["string",true,true,"string",true]
 ==== ossurface.js ====
 uid,gid,username,homedir,shell true true true true string string
-get [null] 0
-get [0] 0
+get [null] 19
+get [0] 19
 get [1.5] RangeError:ERR_OUT_OF_RANGE:The value of "pid" is out of range. It must be an integer. Received 1.5
 get [2147483648] RangeError:ERR_OUT_OF_RANGE:The value of "pid" is out of range. It must be >= -2147483648 && <= 2147483647. Received 2147483648
 get ["x"] TypeError:ERR_INVALID_ARG_TYPE:The "pid" argument must be of type number. Received type string ('x')
