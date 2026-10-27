@@ -219,7 +219,7 @@ fn code_constant(name: &str) -> Option<&'static str> {
 }
 
 /// Every name [`constant`] answers — the namespace's value exports, listed
-/// for `is_method` and the key listing. Kept in step with [`CODE_CONSTANTS`]
+/// for `is_method` and the key listing. Kept in step with `CODE_CONSTANTS`
 /// by the `value_keys_cover_every_constant` test.
 pub const VALUE_KEYS: &[&str] = &[
     "ADDRCONFIG",

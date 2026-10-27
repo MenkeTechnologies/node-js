@@ -601,7 +601,7 @@ fn window(recv: &Value) -> (usize, usize) {
     })
 }
 
-/// [`window`] over a Buffer's own properties, with the host borrow held.
+/// `window` over a Buffer's own properties, with the host borrow held.
 pub fn window_h(h: &crate::host::JsHost, p: &IndexMap<String, Value>) -> (usize, usize) {
     let off = p.get("byteOffset").map(|o| h.to_number(o)).unwrap_or(0.0) as usize;
     let store = match p.get("@@bytes").and_then(|v| h.get(v)) {
