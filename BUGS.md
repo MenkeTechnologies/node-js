@@ -1508,7 +1508,8 @@ the 12/24 split of `h11`/`h24`, an explicit one keeps the cycle), and the
 skeleton becomes a pattern through a port of ICU's `DateTimePatternGenerator`
 (`getBestRaw`'s distance search and tie-break, `adjustFieldTypes`,
 `getBestAppending` with en's `appendItems`, and the date/time glue chosen by the
-month width — `", "` or `" at "`) over en's `availableFormats`. So the odd
+month width — `", "` or `" at "`) over en's `availableFormats`, from ICU 79 /
+CLDR 49 (the data node v26.12.1 ships). So the odd
 combinations come out as node prints them: `{day: '2-digit', hour: '2-digit',
 second: 'numeric', hour12: false}` is `09, 9 (hour: 13)`. `dateStyle`/
 `timeStyle`, day periods (`in the morning`, `noon`), fractional seconds, every
@@ -3474,3 +3475,23 @@ record went red.
 | Case | node | node-js |
 |---|---|---|
 | `assert.deepEqual(Buffer.from('abc'), new Uint8Array([97, 98, 99]))` (loose) | passes | fails: a Buffer and a typed array are compared through different internal slots |
+
+## FIXED in round 25 — `console.dir` options and ICU 79 date patterns, verified against node v26.12.1
+
+Pinned in `tests/language_parity.rs` (`console_dir_spreads_its_options_over_custom_inspect_false`,
+`locale_date_patterns_follow_icu_79`) and `parity-scripts/data/28_date_locale_options.js`.
+
+| Case | node | was |
+|---|---|---|
+| `console.dir({a:{b:{c:{d:1}}}}, {depth: 0})` | `{ a: [Object] }` — the options bag reaches `inspect` | `{ a: { b: { c: [Object] } } }` — options ignored |
+| `console.dir(obj)` where `obj` has `[util.inspect.custom]` | the raw object: `console.dir` is `inspect(obj, { customInspect: false, ...options })` | the custom method's output |
+| `{weekday: 'short', year: 'numeric', second: 'numeric'}` | `Fri, 2024, 9` — CLDR 49's `Day-Of-Week` append item is `{1}, {0}` | `2024 Fri, 9` (CLDR 47's `{0} {1}`) |
+| `{year: '2-digit', month: 'short'}` | `Feb ’24` — CLDR 49's `yyMMM` / `yyMMMd` / `yy` items, which only a two-digit-year request may match (ICU 79 `yearLengthIsCompatible`) | `Feb 24` |
+
+### Still open — found here, not fixed
+
+| Case | node v26.12.1 | node-js |
+|---|---|---|
+| `Europe/London` in winter, `timeZoneName: 'short'` | `GMT+0` — CLDR 49 moved London and Dublin off the `GMT` metazone onto `British`/`Irish` | `GMT`: zone names are keyed by the `localtime` abbreviation, not by metazone |
+| `Object.getOwnPropertyNames(Date.prototype).length` | `48` (`toTemporalInstant`) | `47` — `Temporal` is not implemented (`examples/protolistings.js`) |
+| `util.inspect('x', {colors: true})` | `\x1b[32m'x'\x1b[39m` | `'x'` — the inspector has no stylize pass |

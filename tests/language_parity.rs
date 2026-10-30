@@ -1634,3 +1634,46 @@ try { { let w = 1; } w; } catch (e) { console.log(e.message); }
     let expected = "3\nundefined undefined\nundefined\nundefined undefined\nundefined\nundefined\nw is not defined";
     assert_eq!(run(src), expected);
 }
+
+/// `console.dir(obj, options)` is `inspect(obj, { customInspect: false,
+/// ...options })` (node v26.12.1).
+#[test]
+fn console_dir_spreads_its_options_over_custom_inspect_false() {
+    let src = r##"
+const util = require('util');
+const o = { a: 1, [util.inspect.custom]() { return 'CUSTOM'; } };
+console.dir(o);
+console.dir(o, { customInspect: true });
+console.dir({ a: { b: { c: { d: 1 } } } }, { depth: 0 });
+console.dir({ a: { b: { c: { d: {} } } } }, { depth: null });
+console.dir({ b: 2, a: 1 }, { sorted: true });
+console.dir([1, 2, 3, 4], { maxArrayLength: 1 });
+console.dir('s', null);
+"##;
+    let expected = "{\n  a: 1,\n  Symbol(nodejs.util.inspect.custom): [Function: [nodejs.util.inspect.custom]]\n}\nCUSTOM\n{ a: [Object] }\n{\n  a: { b: { c: { d: {} } } }\n}\n{ a: 1, b: 2 }\n[ 1, ... 3 more items ]\n's'";
+    assert_eq!(run(src), expected);
+}
+
+/// `toLocaleString` option bags resolve through ICU 79 / CLDR 49 en data: a
+/// weekday the nearest pattern lacks is prepended (`Fri, 2024, 9`), and a
+/// two-digit year takes the `’yy` patterns (node v26.12.1).
+#[test]
+fn locale_date_patterns_follow_icu_79() {
+    let src = r##"
+const d = new Date(Date.UTC(2024, 1, 9, 13, 5, 9, 4));
+const show = (o) => console.log(d.toLocaleString('en-US', { timeZone: 'UTC', ...o }));
+show({ weekday: 'short', year: 'numeric', second: 'numeric' });
+show({ weekday: 'long', era: 'short', month: 'narrow', hour: '2-digit', minute: 'numeric' });
+show({ weekday: 'narrow', month: 'short', hour: '2-digit', timeZoneName: 'short' });
+show({ year: '2-digit', month: 'short', day: '2-digit', minute: '2-digit' });
+show({ year: '2-digit', month: 'narrow', hour: '2-digit' });
+show({ year: '2-digit', month: 'short' });
+show({ year: 'numeric', month: 'short' });
+show({ year: '2-digit', month: '2-digit' });
+show({ year: '2-digit', era: 'short', month: 'short' });
+show({ year: '2-digit' });
+console.log(d.toLocaleDateString('en-US', { year: '2-digit', month: 'short', day: 'numeric', timeZone: 'UTC' }));
+"##;
+    let expected = "Fri, 2024, 9\nFriday, AD, 01:05 PM\nF, Feb, 01 PM UTC\nFeb 09, ’24, 5\nF ’24, 01 PM\nFeb ’24\nFeb 2024\n02/24\nFeb 24 AD\n’24\nFeb 9, ’24";
+    assert_eq!(run(src), expected);
+}

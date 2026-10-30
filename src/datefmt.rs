@@ -8,9 +8,10 @@
 //! `availableFormats`, adjusting field widths, appending fields no pattern
 //! carries and gluing a date half to a time half. That is what this module is: a
 //! port of `dtptngen.cpp`'s `getBestPattern` / `getBestRaw` /
-//! `getBestAppending` / `adjustFieldTypes` over the en data ICU 77 ships, so
-//! every option combination resolves to the pattern node's does — including the
-//! odd ones, like `{day: '2-digit', hour: '2-digit', second: 'numeric'}` printing
+//! `getBestAppending` / `adjustFieldTypes` over the en data ICU 79 (CLDR 49)
+//! ships, so every option combination resolves to the pattern node's does —
+//! including the odd ones, like
+//! `{day: '2-digit', hour: '2-digit', second: 'numeric'}` printing
 //! `09, 9 (hour: 13)`.
 //!
 //! The `locales` argument is still ignored: every locale formats as en-US, as
@@ -86,6 +87,7 @@ const TYPES: &[(char, usize, i32, usize)] = &[
     ('c', WEEKDAY, NARROW - 2 * DELTA, 5),
     ('c', WEEKDAY, SHORTER - 2 * DELTA, 6),
     ('d', DAY, NUMERIC, 1),
+    ('d', DAY, SHORT, 3),
     ('D', DAY_OF_YEAR, NUMERIC, 1),
     ('F', DAY_OF_WEEK_IN_MONTH, NUMERIC, 1),
     ('a', DAYPERIOD, SHORT, 1),
@@ -269,9 +271,12 @@ struct Entry {
     specified: bool,
 }
 
-/// en's `availableFormats` (ICU 77 / CLDR 47), in the resource bundle's key
-/// order. The week-numbering items are left out: ECMA-402 never asks for a
-/// week field, and they carry fields no request has, so they never win.
+/// en's `availableFormats` (ICU 79 / CLDR 49, root merged under en), in the
+/// resource bundle's key order. The `ddd` items are CLDR 49's ordinal day
+/// (`9th`), which no ECMA-402 request names; the `yy` items carry a literal
+/// `’` that only a two-digit-year request may match (see `best_raw`). The
+/// week-numbering items are left out: ECMA-402 never asks for a week field,
+/// and they carry fields no request has, so they never win.
 const AVAILABLE_FORMATS: &[(&str, &str)] = &[
     ("Bh", "h B"),
     ("Bhm", "h:mm B"),
@@ -291,7 +296,14 @@ const AVAILABLE_FORMATS: &[(&str, &str)] = &[
     ("GyMEd", "E, M/d/y G"),
     ("GyMMM", "MMM y G"),
     ("GyMMMEd", "E, MMM d, y G"),
+    ("GyMMMEddd", "E, MMM ddd, y G"),
+    ("GyMMMM", "MMMM y G"),
+    ("GyMMMMEd", "E, MMMM d, y G"),
+    ("GyMMMMEddd", "E, MMMM ddd, y G"),
+    ("GyMMMMd", "MMMM d, y G"),
+    ("GyMMMMddd", "MMMM ddd, y G"),
     ("GyMMMd", "MMM d, y G"),
+    ("GyMMMddd", "MMM ddd, y G"),
     ("GyMd", "M/d/y G"),
     ("H", "HH"),
     ("Hm", "HH:mm"),
@@ -303,8 +315,13 @@ const AVAILABLE_FORMATS: &[(&str, &str)] = &[
     ("MEd", "E, M/d"),
     ("MMM", "LLL"),
     ("MMMEd", "E, MMM d"),
+    ("MMMEddd", "E, MMM ddd"),
+    ("MMMMEd", "E, MMMM d"),
+    ("MMMMEddd", "E, MMMM ddd"),
     ("MMMMd", "MMMM d"),
+    ("MMMMddd", "MMMM ddd"),
     ("MMMd", "MMM d"),
+    ("MMMddd", "MMM ddd"),
     ("Md", "M/d"),
     ("d", "d"),
     ("h", "h a"),
@@ -319,11 +336,20 @@ const AVAILABLE_FORMATS: &[(&str, &str)] = &[
     ("yMEd", "E, M/d/y"),
     ("yMMM", "MMM y"),
     ("yMMMEd", "E, MMM d, y"),
+    ("yMMMEddd", "E, MMM ddd, y"),
     ("yMMMM", "MMMM y"),
+    ("yMMMMEd", "E, MMMM d, y"),
+    ("yMMMMEddd", "E, MMMM ddd, y"),
+    ("yMMMMd", "MMMM d, y"),
+    ("yMMMMddd", "MMMM ddd, y"),
     ("yMMMd", "MMM d, y"),
+    ("yMMMddd", "MMM ddd, y"),
     ("yMd", "M/d/y"),
     ("yQQQ", "QQQ y"),
     ("yQQQQ", "QQQQ y"),
+    ("yy", "’yy"),
+    ("yyMMM", "MMM ’yy"),
+    ("yyMMMd", "MMM d, ’yy"),
 ];
 
 /// en's date styles (`full` … `short`) and time styles. ICU's own patterns put
@@ -397,11 +423,26 @@ fn entries() -> &'static [Entry] {
     })
 }
 
+/// `yearLengthIsCompatible`: a numeric two-digit year in `trial` matches only a
+/// request for a numeric two-digit year.
+fn year_length_compatible(req: &Skeleton, trial: &Skeleton) -> bool {
+    let len = |s: &Skeleton| s.orig[YEAR].map_or(0, |(_, n)| n);
+    req.ty[YEAR] <= 0 || trial.ty[YEAR] <= 0 || len(trial) != 2 || len(req) == 2
+}
+
 /// `getBestRaw`: the entry nearest `req` over the fields in `include`, with
 /// the missing and extra field masks of that match.
+///
+/// An entry whose skeleton names a TWO-digit numeric year (`yyMMMd` →
+/// `MMM d, ’yy`) is skipped unless the request asks for one too
+/// (`yearLengthIsCompatible`): its literal `’` only makes sense before two
+/// digits, and on distance alone `yyyy` is nearer `yy` than `y`.
 fn best_raw(req: &Skeleton, include: u32) -> (&'static Entry, u32, u32) {
     let mut best: Option<(&Entry, i32, u32, u32)> = None;
     for e in entries() {
+        if !year_length_compatible(req, &e.skel) {
+            continue;
+        }
         let (d, missing, extra) = req.distance(&e.skel, include);
         let better = match best {
             None => true,
@@ -462,8 +503,10 @@ fn adjust(
         } else if let Some(spec) = entry_skel {
             let skel_len = spec.orig[field].map_or(0, |(_, n)| n);
             let pat_numeric = row_ty > 0;
-            let skel_numeric = spec.ty[field] > 0;
-            if skel_len == req_len || pat_numeric != skel_numeric {
+            // Since ICU 79 the pattern is compared against the REQUESTED
+            // field's kind; ICU 77 compared it against the specified skeleton's.
+            let req_numeric = req.ty[field] > 0;
+            if skel_len == req_len || pat_numeric != req_numeric {
                 adj_len = len;
             }
         }
@@ -520,7 +563,9 @@ fn best_appending(req: &Skeleton, fields: u32) -> String {
     result
 }
 
-/// en's `appendItems` (from root), with each field's wide display name.
+/// en's `appendItems` (CLDR 49), with each field's wide display name. A
+/// missing weekday is PREPENDED behind a comma (`Day-Of-Week` is `{1}, {0}`),
+/// so `{weekday: 'short', year: 'numeric', second: 'numeric'}` is `Fri, 2024, 9`.
 fn append_item(field: usize, result: &str, temp: &str) -> String {
     let name = match field {
         ERA => "era",
@@ -541,7 +586,8 @@ fn append_item(field: usize, result: &str, temp: &str) -> String {
         _ => "time zone",
     };
     match field {
-        ERA | YEAR | WEEKDAY | ZONE => format!("{result} {temp}"),
+        ERA | YEAR | ZONE => format!("{result} {temp}"),
+        WEEKDAY => format!("{temp}, {result}"),
         QUARTER | MONTH | WEEK_OF_YEAR | DAY | HOUR | MINUTE | SECOND => {
             format!("{result} ('{name}': {temp})")
         }
