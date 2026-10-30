@@ -344,6 +344,10 @@ pub struct SwitchCase {
 pub struct Declarator {
     pub target: Expr,
     pub init: Option<Expr>,
+    /// Where each name the target binds is written, in source order — what
+    /// an early error such as a redeclaration is reported at. Empty when the
+    /// declaration was synthesised or parsed without source spans.
+    pub bound: Vec<(String, Pos)>,
 }
 
 /// A JavaScript statement.

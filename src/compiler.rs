@@ -264,6 +264,15 @@ pub struct Compiler {
 
 // ── early errors: duplicate lexical declarations ─────────────────────────────
 
+/// The names strict code may not BIND or ASSIGN to (13.1.1, 14.3.1.1).
+const RESERVED_IN_STRICT: [&str; 2] = ["eval", "arguments"];
+
+/// `SyntaxError: Unexpected eval or arguments in strict mode` — raised for a
+/// binding, a parameter, an assignment target and an update target alike.
+fn strict_reserved_error() -> String {
+    "SyntaxError: Unexpected eval or arguments in strict mode".to_string()
+}
+
 /// Reject a duplicate lexical declaration before anything runs, as node does.
 ///
 /// `let a = 1; let a = 2;` is a SyntaxError at PARSE time in node, and this
@@ -277,67 +286,160 @@ pub struct Compiler {
 /// name that a `var` in the same subtree hoists onto, and a lexical name
 /// colliding with a function declaration beside it. Repeated `var`s, and the
 /// same name in nested scopes, stay legal.
-/// The names strict code may not BIND or ASSIGN to (13.1.1, 14.3.1.1).
-const RESERVED_IN_STRICT: [&str; 2] = ["eval", "arguments"];
-
-/// `SyntaxError: Unexpected eval or arguments in strict mode` — raised for a
-/// binding, a parameter, an assignment target and an update target alike.
-fn strict_reserved_error() -> String {
-    "SyntaxError: Unexpected eval or arguments in strict mode".to_string()
+///
+/// V8 finds a collision while parsing, when the second of the two
+/// declarations is reached, so the one reported is the collision whose later
+/// declaration comes first in the source, and the report's arrow underlines
+/// that declaration's name (`parser::note_error_span`).
+pub fn check_early_errors(stmts: &[Stmt]) -> Result<(), String> {
+    let mut found = None;
+    redeclarations(stmts, &mut found);
+    check_redeclared(found)
 }
 
-pub fn check_early_errors(stmts: &[Stmt]) -> Result<(), String> {
-    let mut lexical: Vec<String> = Vec::new();
-    let mut functions: Vec<String> = Vec::new();
+/// Report the collision [`redeclarations`] found, if any.
+fn check_redeclared(found: Option<Binding>) -> Result<(), String> {
+    match found {
+        Some(b) => {
+            crate::parser::note_error_span(b.pos, b.end);
+            Err(already_declared(&b.name))
+        }
+        None => Ok(()),
+    }
+}
+
+/// A declared name and the span V8 reports a collision with it at: the first
+/// character of the name for a variable, the first of the declaration for a
+/// function, the whole declaration for a class. `end` 0 is that one
+/// character; `pos` 0 is a declaration with no source position.
+#[derive(Clone)]
+struct Binding {
+    name: String,
+    pos: Pos,
+    end: Pos,
+}
+
+/// The bindings a declaration target introduces, each placed where `bound`
+/// (the parser's record of the target) says its name is written.
+fn bindings_at(target: &Expr, bound: &[(String, Pos)]) -> Vec<Binding> {
+    let mut names = Vec::new();
+    pattern_names(target, &mut names);
+    names
+        .into_iter()
+        .map(|name| {
+            let pos = bound.iter().find(|(n, _)| *n == name).map_or(0, |b| b.1);
+            Binding { name, pos, end: 0 }
+        })
+        .collect()
+}
+
+/// Where a declaration spanning `span` starts, as a [`Pos`] (0: unplaced).
+fn span_pos(span: Span) -> Pos {
+    if span == (0, 0) {
+        0
+    } else {
+        span.0 + 1
+    }
+}
+
+/// Keep the collision whose reported declaration comes first in the source;
+/// one with no position is reported only when no placed one is found.
+fn note_redeclared(found: &mut Option<Binding>, b: &Binding) {
+    let key = |b: &Binding| if b.pos == 0 { Pos::MAX } else { b.pos };
+    if !found.as_ref().is_some_and(|f| key(b) >= key(f)) {
+        *found = Some(b.clone());
+    }
+}
+
+/// The later of two colliding declarations — the one V8 reports.
+fn later<'a>(a: &'a Binding, b: &'a Binding) -> &'a Binding {
+    if a.pos > b.pos {
+        a
+    } else {
+        b
+    }
+}
+
+/// Note every collision in the statement list `stmts` and the lists nested in
+/// it, and hand back the list's own lexical declarations.
+fn redeclarations(stmts: &[Stmt], found: &mut Option<Binding>) -> Vec<Binding> {
+    let mut lexical: Vec<Binding> = Vec::new();
+    let mut functions: Vec<Binding> = Vec::new();
+    let mut declare_lexical = |b: Binding, found: &mut Option<Binding>| {
+        if let Some(prev) = lexical.iter().find(|l| l.name == b.name) {
+            note_redeclared(found, later(prev, &b));
+        }
+        lexical.push(b);
+    };
     for st in stmts {
         match &st.kind {
             StmtKind::Decl { kind, decls } if !matches!(kind, DeclKind::Var) => {
                 for d in decls {
-                    let mut names = Vec::new();
-                    pattern_names(&d.target, &mut names);
-                    for n in names {
-                        if lexical.contains(&n) {
-                            return Err(already_declared(&n));
-                        }
-                        lexical.push(n);
+                    for b in bindings_at(&d.target, &d.bound) {
+                        declare_lexical(b, found);
                     }
                 }
             }
             StmtKind::ClassDecl(c) => {
                 if let Some(n) = &c.name {
-                    if lexical.contains(n) {
-                        return Err(already_declared(n));
-                    }
-                    lexical.push(n.clone());
+                    let pos = span_pos(c.span);
+                    let end = if pos == 0 { 0 } else { c.span.1 + 1 };
+                    declare_lexical(
+                        Binding {
+                            name: n.clone(),
+                            pos,
+                            end,
+                        },
+                        found,
+                    );
                 }
             }
-            StmtKind::FuncDecl { name, .. } => functions.push(name.clone()),
+            StmtKind::FuncDecl { name, span, .. } => functions.push(Binding {
+                name: name.clone(),
+                pos: span_pos(*span),
+                end: 0,
+            }),
             _ => {}
         }
     }
     // A function declaration and a lexical binding of the same name cannot
     // share a scope, whichever order they appear in.
     for f in &functions {
-        if lexical.contains(f) {
-            return Err(already_declared(f));
+        for l in lexical.iter().filter(|l| l.name == f.name) {
+            note_redeclared(found, later(f, l));
         }
     }
     // A `var` anywhere below hoists PAST any block between it and its function
     // scope, so it collides with a lexical name declared here.
-    let mut vars: Vec<String> = Vec::new();
+    let mut vars: Vec<Binding> = Vec::new();
     for st in stmts {
-        collect_var_names(st, &mut vars);
+        collect_var_bindings(st, &mut vars);
     }
-    for n in &lexical {
-        if vars.contains(n) {
-            return Err(already_declared(n));
+    for l in &lexical {
+        for v in vars.iter().filter(|v| v.name == l.name) {
+            note_redeclared(found, later(v, l));
         }
     }
     // Each nested statement list is its own scope.
     for st in stmts {
-        check_nested(&st.kind)?;
+        nested_redeclarations(&st.kind, found);
     }
-    Ok(())
+    lexical
+}
+
+/// [`check_early_errors`] for a function body, which also may not redeclare a
+/// parameter lexically (`function f(a) { let a }`, 15.2.1).
+fn check_function_body(params: &[Param], body: &[Stmt]) -> Result<(), String> {
+    let mut found = None;
+    let lexical = redeclarations(body, &mut found);
+    let mut names = Vec::new();
+    for p in params {
+        pattern_names(&p.pattern, &mut names);
+    }
+    for l in lexical.iter().filter(|l| names.contains(&l.name)) {
+        note_redeclared(&mut found, l);
+    }
+    check_redeclared(found)
 }
 
 fn already_declared(name: &str) -> String {
@@ -345,23 +447,23 @@ fn already_declared(name: &str) -> String {
 }
 
 /// Recurse into the statement lists that form their own scopes. A function
-/// BODY is checked when that function is compiled, so the walk does not
-/// descend into one here.
-fn check_nested(k: &StmtKind) -> Result<(), String> {
-    let one = |s: &Stmt| check_nested(&s.kind);
+/// BODY is checked when that function is compiled (`build_function`), so the
+/// walk does not descend into one here.
+fn nested_redeclarations(k: &StmtKind, found: &mut Option<Binding>) {
     match k {
-        StmtKind::Block(b) => check_early_errors(b),
+        StmtKind::Block(b) => {
+            redeclarations(b, found);
+        }
         StmtKind::If { cons, alt, .. } => {
-            one(cons)?;
-            match alt {
-                Some(a) => one(a),
-                None => Ok(()),
+            nested_redeclarations(&cons.kind, found);
+            if let Some(a) = alt {
+                nested_redeclarations(&a.kind, found);
             }
         }
         StmtKind::While { body, .. }
         | StmtKind::DoWhile { body, .. }
         | StmtKind::With { body, .. }
-        | StmtKind::Labeled { body, .. } => one(body),
+        | StmtKind::Labeled { body, .. } => nested_redeclarations(&body.kind, found),
         // A `for (let …)` head is its own scope, and a `var` in the body hoists
         // THROUGH it onto the same name — a collision no block-level check sees.
         StmtKind::ForOf {
@@ -379,35 +481,45 @@ fn check_nested(k: &StmtKind) -> Result<(), String> {
             let mut head = Vec::new();
             pattern_names(target, &mut head);
             let mut vars = Vec::new();
-            collect_var_names(body, &mut vars);
-            if let Some(n) = head.iter().find(|n| vars.contains(n)) {
-                return Err(already_declared(n));
+            collect_var_bindings(body, &mut vars);
+            for v in vars.iter().filter(|v| head.contains(&v.name)) {
+                note_redeclared(found, v);
             }
-            one(body)
+            nested_redeclarations(&body.kind, found);
         }
-        StmtKind::ForOf { body, .. } | StmtKind::ForIn { body, .. } => one(body),
-        StmtKind::For { body, .. } => one(body),
+        StmtKind::ForOf { body, .. } | StmtKind::ForIn { body, .. } => {
+            nested_redeclarations(&body.kind, found)
+        }
+        StmtKind::For { body, .. } => nested_redeclarations(&body.kind, found),
         StmtKind::Try {
             block,
             handler,
             finalizer,
         } => {
-            check_early_errors(block)?;
-            if let Some((_, h)) = handler {
-                check_early_errors(h)?;
+            redeclarations(block, found);
+            if let Some((param, h)) = handler {
+                // The catch parameter and the handler body's lexical
+                // declarations share a scope (14.15.1).
+                let lexical = redeclarations(h, found);
+                let mut names = Vec::new();
+                if let Some(p) = param {
+                    pattern_names(p, &mut names);
+                }
+                for l in lexical.iter().filter(|l| names.contains(&l.name)) {
+                    note_redeclared(found, l);
+                }
             }
-            match finalizer {
-                Some(f) => check_early_errors(f),
-                None => Ok(()),
+            if let Some(f) = finalizer {
+                redeclarations(f, found);
             }
         }
         StmtKind::Switch { cases, .. } => {
             // Every case shares ONE block scope, so their statements are
             // checked together rather than case by case.
             let all: Vec<Stmt> = cases.iter().flat_map(|c| c.body.clone()).collect();
-            check_early_errors(&all)
+            redeclarations(&all, found);
         }
-        _ => Ok(()),
+        _ => {}
     }
 }
 
@@ -874,6 +986,7 @@ impl Compiler {
                 is_generator,
                 is_async,
                 span,
+                ..
             } = &s.kind
             {
                 let def_id = self.build_function(name, params, body, *is_generator, *is_async)?;
@@ -2280,6 +2393,7 @@ impl Compiler {
                         decls: vec![Declarator {
                             target: Expr::Ident(own.clone()),
                             init: Some(Expr::Undefined),
+                            bound: Vec::new(),
                         }],
                     })];
                     body.extend(f.iter().cloned());
@@ -2370,6 +2484,7 @@ impl Compiler {
         is_generator: bool,
         is_async: bool,
     ) -> Result<usize, String> {
+        check_function_body(params, body)?;
         let (param_slots, prologue) = self.lower_params(params)?;
         let mut fb = ChunkBuilder::new();
         // Each function body is its own frame, so it gets its own slot table.
@@ -3122,6 +3237,7 @@ impl Compiler {
                         decls: vec![Declarator {
                             target: pattern.clone(),
                             init: Some(Expr::Ident(synth)),
+                            bound: Vec::new(),
                         }],
                     }));
                 }
@@ -5033,31 +5149,49 @@ fn default_stmt(name: &str, default: &Expr) -> Stmt {
 /// Function *expressions* and arrows are inside `Expr`, which is not walked at
 /// all: a `var` can only be introduced by a statement.
 pub(crate) fn collect_var_names(s: &Stmt, out: &mut Vec<String>) {
+    walk_var_targets(s, &mut |target, _| pattern_names(target, out));
+}
+
+/// [`collect_var_names`] with where each declaration is written.
+fn collect_var_bindings(s: &Stmt, out: &mut Vec<Binding>) {
+    walk_var_targets(s, &mut |target, bound| {
+        out.extend(bindings_at(target, bound))
+    });
+}
+
+/// What [`walk_var_targets`] calls per target: the target and its names'
+/// positions (`ast::Declarator::bound`).
+type VarTargetFn<'a> = dyn FnMut(&Expr, &[(String, Pos)]) + 'a;
+
+/// Each `var` declaration target hoisting out of `s` — through blocks, loops,
+/// `switch` and `try`, never into a function — with where its names are
+/// written (nothing for a `for (var … of/in …)` head, which records none).
+fn walk_var_targets(s: &Stmt, f: &mut VarTargetFn) {
     match &s.kind {
         StmtKind::Decl {
             kind: DeclKind::Var,
             decls,
         } => {
             for d in decls {
-                pattern_names(&d.target, out);
+                f(&d.target, &d.bound);
             }
         }
-        StmtKind::Block(body) => body.iter().for_each(|s| collect_var_names(s, out)),
+        StmtKind::Block(body) => body.iter().for_each(|s| walk_var_targets(s, f)),
         StmtKind::If { cons, alt, .. } => {
-            collect_var_names(cons, out);
+            walk_var_targets(cons, f);
             if let Some(a) = alt {
-                collect_var_names(a, out);
+                walk_var_targets(a, f);
             }
         }
         StmtKind::While { body, .. }
         | StmtKind::With { body, .. }
         | StmtKind::DoWhile { body, .. }
-        | StmtKind::Labeled { body, .. } => collect_var_names(body, out),
+        | StmtKind::Labeled { body, .. } => walk_var_targets(body, f),
         StmtKind::For { init, body, .. } => {
             if let Some(i) = init {
-                collect_var_names(i, out);
+                walk_var_targets(i, f);
             }
-            collect_var_names(body, out);
+            walk_var_targets(body, f);
         }
         StmtKind::ForOf {
             decl_kind,
@@ -5072,13 +5206,13 @@ pub(crate) fn collect_var_names(s: &Stmt, out: &mut Vec<String>) {
             ..
         } => {
             if *decl_kind == Some(DeclKind::Var) {
-                pattern_names(target, out);
+                f(target, &[]);
             }
-            collect_var_names(body, out);
+            walk_var_targets(body, f);
         }
         StmtKind::Switch { cases, .. } => {
             for c in cases {
-                c.body.iter().for_each(|s| collect_var_names(s, out));
+                c.body.iter().for_each(|s| walk_var_targets(s, f));
             }
         }
         StmtKind::Try {
@@ -5086,14 +5220,14 @@ pub(crate) fn collect_var_names(s: &Stmt, out: &mut Vec<String>) {
             handler,
             finalizer,
         } => {
-            block.iter().for_each(|s| collect_var_names(s, out));
+            block.iter().for_each(|s| walk_var_targets(s, f));
             if let Some((_, body)) = handler {
                 // The catch PARAMETER is block-scoped to the handler, so it is
                 // not collected; a `var` in the handler body still hoists.
-                body.iter().for_each(|s| collect_var_names(s, out));
+                body.iter().for_each(|s| walk_var_targets(s, f));
             }
-            if let Some(f) = finalizer {
-                f.iter().for_each(|s| collect_var_names(s, out));
+            if let Some(fin) = finalizer {
+                fin.iter().for_each(|s| walk_var_targets(s, f));
             }
         }
         _ => {}

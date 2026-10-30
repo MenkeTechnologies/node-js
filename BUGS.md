@@ -3396,6 +3396,7 @@ knows where it is.
 | an unhandled rejection, an ES module's evaluation error | the arrow where the error was created (`new`) | the message only |
 | a required module's throw | the module's own `file:line`; its frames `Object.<anonymous>` | the message only |
 | a SyntaxError in the entry file, a required file or an ES module | the arrow under the offending token | the message, plus a `while loading <file>` line for a required file |
+| a lexer error (`"\xZ1"`, `1__0`, an unterminated string), an early error (`let a; let a`, a body redeclaring a parameter or a catch parameter, a redeclared destructured name or class), `({ a = 1 })` outside a pattern | the range V8 reports underlined: the token or escape, the redeclaring name, the whole class, `a = 1`; an empty range at the end of the input | the message only; a redeclaration inside a function body or a catch block, and a shorthand initializer inside a binding default, were not reported at all |
 | `new Error().stack` | `    at f (file:line:col)` per frame | `    at f` — no location; anonymous functions printed as an empty name |
 | `this` at a required module's top level | `module.exports` | `globalThis` |
 | `node --lsp` diagnostics for a syntax error | on the offending token | on the first line of the file |

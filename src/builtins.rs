@@ -6271,6 +6271,7 @@ fn b_throw(vm: &mut VM, _: u8) -> Value {
                 h.throw_site = Some(host::ThrowSite {
                     msg: msg.clone(),
                     pos: created as u32,
+                    end: 0,
                     depth: h.stack_depth(),
                     frames: None,
                 });

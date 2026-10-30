@@ -1124,6 +1124,7 @@ pub fn lower(stmts: Vec<Stmt>, info: &ModuleInfo, referrer: &str, generator: boo
                     decls: vec![Declarator {
                         target: Expr::Ident("default".into()),
                         init: Some(e),
+                        bound: Vec::new(),
                     }],
                 },
                 line,
@@ -1915,7 +1916,10 @@ fn parse_file(path: &str) -> Result<Value, String> {
         ..
     } = &lowered
     {
-        crate::compiler::check_early_errors(b)?;
+        crate::compiler::check_early_errors(b).inspect_err(|e| {
+            let at = crate::parser::take_error_pos();
+            host::note_syntax_error(&source, host::ScriptOrigin::named(file_url(path)), e, at);
+        })?;
     }
     let id = PARSED.with(|p| p.borrow().len());
     let record = info_value(id, &info, &source);

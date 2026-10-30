@@ -131,14 +131,18 @@ struct Parser {
     /// Whether a `return` is legal here: inside a function body, or at the top
     /// of a file (which Node wraps in one). An `eval`'s top level is not.
     in_function: bool,
-    /// Token positions of `{ a = 1 }` shorthand initialisers seen in an
-    /// expression. They are legal only if the object turns out to be a pattern
+    /// The `{ a = 1 }` shorthand initialisers seen in an expression: the `=`
+    /// token and the source span of `a = 1`. They are legal only if the object turns out to be a pattern
     /// (an assignment target, a `for` head); anything left when the statement
     /// ends is the `Invalid shorthand property initializer` early error.
-    cover_init: Vec<usize>,
+    cover_init: Vec<(usize, Pos, Pos)>,
     /// Set while parsing a binding pattern, where `{ a = 1 }` is simply a
-    /// default and never a cover grammar.
+    /// default and never a cover grammar. Cleared again inside a default
+    /// value or a computed key, which are expressions.
     in_binding: bool,
+    /// The names a binding pattern being parsed binds, with where each is
+    /// written; drained by [`Parser::parse_binding_target_at`].
+    bound_at: Vec<(String, Pos)>,
     /// Whether the source is parsed with the Module goal (16.2): strict,
     /// top-level `await`, `import`/`export` declarations and `import.meta`.
     module: bool,
@@ -163,12 +167,12 @@ fn parse_source(
     in_eval: bool,
     caller_strict: bool,
 ) -> Result<Vec<Stmt>, String> {
-    ERROR_POS.with(|p| p.set(0));
+    note_error_span(0, 0);
     let desugared = crate::rust_ffi::desugar(src);
     // A `rust { … }` block is rewritten before lexing, so offsets would point
     // into text the caller never sees; record spans only when nothing moved.
     let spans = desugared == src;
-    let toks = lex(&desugared)?;
+    let toks = lex_noting(&desugared, spans)?;
     let mut p = Parser {
         toks,
         pos: 0,
@@ -182,6 +186,7 @@ fn parse_source(
         in_function: !in_eval,
         cover_init: Vec::new(),
         in_binding: false,
+        bound_at: Vec::new(),
         spans,
         module: false,
     };
@@ -196,6 +201,8 @@ fn parse_source(
 thread_local! {
     /// Where the last parse that failed stopped — see [`take_error_pos`].
     static ERROR_POS: std::cell::Cell<Pos> = const { std::cell::Cell::new(0) };
+    /// The end of the span it underlines — see [`take_error_end`].
+    static ERROR_END: std::cell::Cell<Pos> = const { std::cell::Cell::new(0) };
 }
 
 /// The [`Pos`] of the token the last failed [`parse`] / [`parse_module`]
@@ -205,13 +212,38 @@ pub fn take_error_pos() -> Pos {
     ERROR_POS.with(|p| p.replace(0))
 }
 
+/// One past the last character V8 underlines for that SyntaxError — the end
+/// of the offending token (`0`: underline the one character at the position).
+/// Taken by `host::note_syntax_error` alongside [`take_error_pos`].
+pub fn take_error_end() -> Pos {
+    ERROR_END.with(|p| p.replace(0))
+}
+
+/// Record a SyntaxError found after parsing — an early error such as a
+/// redeclaration — at the source span `[pos, end)`, for [`take_error_pos`].
+pub fn note_error_span(pos: Pos, end: Pos) {
+    ERROR_POS.with(|p| p.set(pos));
+    ERROR_END.with(|p| p.set(end));
+}
+
+/// [`lex`], recording the span of the token an error stopped in when `spans`
+/// says positions refer to the caller's text.
+fn lex_noting(src: &str, spans: bool) -> Result<Vec<Token>, String> {
+    lex(src).inspect_err(|_| {
+        let (start, end) = crate::lexer::take_error_span();
+        if spans {
+            note_error_span(start + 1, end + 1);
+        }
+    })
+}
+
 /// Parse `src` with the Module goal (ECMA-262 16.2.1): the code is strict,
 /// `await` is an operator at the top level, `return` there is an error, and the
 /// top level may hold `import`/`export` declarations. A hashbang line is a
 /// comment only at the very start of the text.
 pub fn parse_module(src: &str) -> Result<Vec<Stmt>, String> {
-    ERROR_POS.with(|p| p.set(0));
-    let toks = lex(src)?;
+    note_error_span(0, 0);
+    let toks = lex_noting(src, true)?;
     let mut p = Parser {
         toks,
         pos: 0,
@@ -225,6 +257,7 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, String> {
         in_function: false,
         cover_init: Vec::new(),
         in_binding: false,
+        bound_at: Vec::new(),
         spans: true,
         module: true,
     };
@@ -300,9 +333,14 @@ impl Parser {
         step: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Result<T, String> {
         let r = step(self);
-        if r.is_err() {
-            let pos = self.pos_here();
-            ERROR_POS.with(|p| p.set(pos));
+        // An error that placed itself (`note_error_span`) keeps its place.
+        if r.is_err() && ERROR_POS.with(|p| p.get()) == 0 {
+            let end = if self.spans {
+                self.toks[self.pos].end + 1
+            } else {
+                0
+            };
+            note_error_span(self.pos_here(), end);
         }
         r
     }
@@ -577,8 +615,9 @@ impl Parser {
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
         let stmt = self.parse_stmt_inner()?;
         // Whatever `{ a = 1 }` is still unclaimed by a pattern is an error
-        // (13.2.5.1): report it where V8 does, at the statement's end.
-        if !self.cover_init.is_empty() {
+        // (13.2.5.1), reported where V8 reports it: under `a = 1`.
+        if let Some(&(_, pos, end)) = self.cover_init.first() {
+            note_error_span(pos, end);
             return Err("SyntaxError: Invalid shorthand property initializer".to_string());
         }
         Ok(stmt)
@@ -1311,7 +1350,7 @@ impl Parser {
     fn parse_property_key(&mut self) -> Result<(Expr, bool), String> {
         if self.is_punct("[") {
             self.advance();
-            let k = self.parse_assign()?;
+            let k = self.outside_binding(Self::parse_assign)?;
             self.expect_punct("]")?;
             Ok((k, true))
         } else {
@@ -1448,13 +1487,17 @@ impl Parser {
     fn parse_declarators(&mut self) -> Result<Vec<Declarator>, String> {
         let mut decls = Vec::new();
         loop {
-            let target = self.parse_binding_target()?;
+            let (target, bound) = self.parse_binding_target_at()?;
             let init = if self.eat_punct("=") {
                 Some(self.parse_assign()?)
             } else {
                 None
             };
-            decls.push(Declarator { target, init });
+            decls.push(Declarator {
+                target,
+                init,
+                bound,
+            });
             if !self.eat_punct(",") {
                 break;
             }
@@ -1464,6 +1507,36 @@ impl Parser {
 
     /// A binding target: identifier or array/object destructuring pattern.
     fn parse_binding_target(&mut self) -> Result<Expr, String> {
+        self.parse_binding_target_at().map(|(target, _)| target)
+    }
+
+    /// [`Parser::parse_binding_target`], with where each name it binds is
+    /// written (empty without source spans).
+    fn parse_binding_target_at(&mut self) -> Result<(Expr, Vec<(String, Pos)>), String> {
+        let mark = self.bound_at.len();
+        let pos = self.pos_here();
+        let target = self.parse_binding_pattern();
+        let mut bound = self.bound_at.split_off(mark);
+        let target = target?;
+        if let Expr::Ident(n) = &target {
+            bound = vec![(n.clone(), pos)];
+        }
+        if !self.spans {
+            bound.clear();
+        }
+        Ok((target, bound))
+    }
+
+    /// Run `f` on an expression nested in a binding pattern — a default value
+    /// or a computed key — where names are references, not bindings.
+    fn outside_binding<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.in_binding, false);
+        let r = f(self);
+        self.in_binding = outer;
+        r
+    }
+
+    fn parse_binding_pattern(&mut self) -> Result<Expr, String> {
         if self.is_punct("[") || self.is_punct("{") {
             let outer = std::mem::replace(&mut self.in_binding, true);
             let pattern = if self.is_punct("[") {
@@ -1573,8 +1646,11 @@ impl Parser {
             return self.parse_c_for(None);
         }
         // Parse the first binding/expression, then decide of/in vs C-style.
+        let mut first_bound = Vec::new();
         let first_target = if decl_kind.is_some() {
-            self.parse_binding_target()?
+            let (target, bound) = self.parse_binding_target_at()?;
+            first_bound = bound;
+            target
         } else {
             self.parse_expr_no_in()?
         };
@@ -1615,15 +1691,20 @@ impl Parser {
             let mut decls = vec![Declarator {
                 target: first_target,
                 init,
+                bound: first_bound,
             }];
             while self.eat_punct(",") {
-                let target = self.parse_binding_target()?;
+                let (target, bound) = self.parse_binding_target_at()?;
                 let init = if self.eat_punct("=") {
                     Some(self.parse_assign()?)
                 } else {
                     None
                 };
-                decls.push(Declarator { target, init });
+                decls.push(Declarator {
+                    target,
+                    init,
+                    bound,
+                });
             }
             // `for (let a, b of …)` / `for (let a = 1 of …)` are for-of headers
             // that carry more than a bare binding.
@@ -1842,7 +1923,7 @@ impl Parser {
             {
                 return Err("SyntaxError: Invalid left-hand side in assignment".to_string());
             }
-            self.cover_init.retain(|&at| at < start);
+            self.cover_init.retain(|&(at, ..)| at < start);
         }
         let compound = match op.as_str() {
             "=" => None,
@@ -1880,7 +1961,7 @@ impl Parser {
             _ => return Ok(left),
         };
         self.advance();
-        let value = self.parse_assign()?;
+        let value = self.outside_binding(Self::parse_assign)?;
         Ok(Expr::Assign {
             target: Box::new(left),
             op: compound.map(AssignOp::Binary),
@@ -2404,6 +2485,9 @@ impl Parser {
                         Err("SyntaxError: Unexpected strict mode reserved word".to_string())
                     }
                     _ => {
+                        if self.in_binding {
+                            self.bound_at.push((s.clone(), self.pos_here()));
+                        }
                         self.advance();
                         Ok(Expr::Ident(s))
                     }
@@ -2509,6 +2593,7 @@ impl Parser {
                 self.advance();
                 m_gen = true;
             }
+            let key_pos = self.pos_here();
             let (key, computed) = self.parse_property_key()?;
             // Method shorthand `key(params) { }` (incl. `*gen(){}`, `async m(){}`).
             if self.is_punct("(") {
@@ -2556,13 +2641,22 @@ impl Parser {
                     Expr::Str(s) => s.clone(),
                     _ => return Err(format!("SyntaxError: bad shorthand (line {})", self.line())),
                 };
+                if self.in_binding {
+                    self.bound_at.push((name.clone(), key_pos));
+                }
                 let value = if self.is_punct("=") {
-                    if !self.in_binding {
-                        self.cover_init.push(self.pos);
-                    }
+                    let eq = self.pos;
                     self.advance();
                     // Pattern default; represent as Assign so destructuring reads it.
-                    let d = self.parse_assign()?;
+                    let d = self.outside_binding(Self::parse_assign)?;
+                    if !self.in_binding {
+                        let end = if self.spans {
+                            self.toks[self.pos - 1].end + 1
+                        } else {
+                            0
+                        };
+                        self.cover_init.push((eq, key_pos, end));
+                    }
                     Expr::Assign {
                         target: Box::new(Expr::Ident(name.clone())),
                         op: None,
@@ -2760,6 +2854,7 @@ fn field_parser(src: &str, base: Option<u32>) -> Result<Parser, String> {
         in_function: true,
         cover_init: Vec::new(),
         in_binding: false,
+        bound_at: Vec::new(),
         spans: base.is_some(),
         module: false,
     })

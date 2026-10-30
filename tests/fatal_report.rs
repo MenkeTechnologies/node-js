@@ -181,6 +181,56 @@ fn a_syntax_error_points_at_the_offending_token() {
     );
 }
 
+/// A lexer error and an early error point where V8's scanner and parser put
+/// them: the escape a string could not decode, the name a destructuring
+/// redeclares, a parameter a function body redeclares, the `y = 1` of a
+/// shorthand initializer outside a pattern, the whole of a redeclaring class,
+/// the empty range at the end of the input (no caret at all), and an ES
+/// module's redeclaration under its file URL.
+#[test]
+fn lexer_and_early_errors_point_at_the_source() {
+    let cases = [
+        (
+            "lex.js",
+            "const s = \"abc\\xZ1\";\n",
+            "{dir}/lex.js:1\nconst s = \"abc\\xZ1\";\n              ^^^^\n\nSyntaxError: Invalid hexadecimal escape sequence\n\nNode.js {version}\n",
+        ),
+        (
+            "redecl.js",
+            "let total = 1;\nconst [first, total] = [];\n",
+            "{dir}/redecl.js:2\nconst [first, total] = [];\n              ^\n\nSyntaxError: Identifier 'total' has already been declared\n\nNode.js {version}\n",
+        ),
+        (
+            "param.js",
+            "function f(n) {\n  let n = 2;\n}\n",
+            "{dir}/param.js:2\n  let n = 2;\n      ^\n\nSyntaxError: Identifier 'n' has already been declared\n\nNode.js {version}\n",
+        ),
+        (
+            "cover.js",
+            "let x = {\n  y = 1 };\n",
+            "{dir}/cover.js:2\n  y = 1 };\n  ^^^^^\n\nSyntaxError: Invalid shorthand property initializer\n\nNode.js {version}\n",
+        ),
+        (
+            "cls.js",
+            "let x;\n  class x {}\n",
+            "{dir}/cls.js:2\n  class x {}\n  ^^^^^^^^^^\n\nSyntaxError: Identifier 'x' has already been declared\n\nNode.js {version}\n",
+        ),
+        (
+            "eof.js",
+            "let k = `\n",
+            "{dir}/eof.js:2\n\n\n\nSyntaxError: Unexpected end of input\n\nNode.js {version}\n",
+        ),
+        (
+            "red.mjs",
+            "let fs2 = 1;\nvar fs2;\n",
+            "file://{dir}/red.mjs:2\nvar fs2;\n    ^\n\nSyntaxError: Identifier 'fs2' has already been declared\n\nNode.js {version}\n",
+        ),
+    ];
+    for (name, src, expected) in cases {
+        assert_fatal(&[(name, src)], &[name], expected);
+    }
+}
+
 #[test]
 fn an_eval_script_has_unnamed_top_level_frames() {
     assert_fatal(

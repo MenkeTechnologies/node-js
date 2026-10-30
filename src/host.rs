@@ -491,6 +491,10 @@ pub struct SourceLocation<'a> {
 pub struct ThrowSite {
     pub msg: String,
     pub pos: u32,
+    /// One past the last position the report's caret underlines, for a
+    /// SyntaxError, whose range is its offending token (empty at the end of
+    /// the input); 0 for V8's one-character raise range.
+    pub end: u32,
     pub depth: usize,
     pub frames: Option<String>,
 }
@@ -3252,6 +3256,7 @@ impl JsHost {
         self.throw_site = Some(ThrowSite {
             msg: msg.to_string(),
             pos,
+            end: 0,
             depth,
             frames,
         });
@@ -4631,23 +4636,23 @@ fn uncaught_value(msg: &str) -> Value {
 /// `util.inspect` has no colours, so it never does.
 pub fn fatal_report(msg: &str) -> String {
     let value = uncaught_value(msg);
-    let (is_object, is_error, pos) = with_host(|h| {
+    let (is_object, is_error, pos, end) = with_host(|h| {
         let is_object = matches!(h.type_of(&value), "object" | "function") && !h.is_null(&value);
         let is_error = crate::builtins::has_error_data(h, &value);
-        let pos = if h.fatal_from_promise {
+        let (pos, end) = if h.fatal_from_promise {
             match lookup_chain(h, &value, "@@pos") {
-                Some(Value::Int(p)) => p as u32,
-                _ => 0,
+                Some(Value::Int(p)) => (p as u32, 0),
+                _ => (0, 0),
             }
         } else {
             h.throw_site
                 .as_ref()
                 .filter(|s| s.msg == msg)
-                .map_or(0, |s| s.pos)
+                .map_or((0, 0), |s| (s.pos, s.end))
         };
-        (is_object, is_error, pos)
+        (is_object, is_error, pos, end)
     });
-    let arrow = with_host(|h| source_arrow(h, pos));
+    let arrow = with_host(|h| source_arrow_span(h, pos, end));
     // `AppendExceptionLine` keeps the arrow on the error for the report to
     // print only for a native error, or for anything thrown by `[eval]` /
     // `[stdin]` source (which node runs through `vm`); otherwise it writes
@@ -4726,7 +4731,10 @@ pub fn fatal_report(msg: &str) -> String {
 /// at script-relative position `pos` (from `parser::take_error_pos`): the
 /// text joins the source address space so the SyntaxError's report can show
 /// node's arrow under the offending token.
+///
+/// The end of the underlined span comes from `parser::take_error_end`.
 pub fn note_syntax_error(src: &str, origin: ScriptOrigin, msg: &str, pos: u32) {
+    let end = crate::parser::take_error_end();
     if pos == 0 {
         return;
     }
@@ -4738,6 +4746,7 @@ pub fn note_syntax_error(src: &str, origin: ScriptOrigin, msg: &str, pos: u32) {
         h.throw_site = Some(ThrowSite {
             msg: msg.to_string(),
             pos: base + pos - 1,
+            end: if end >= pos { base + end - 1 } else { 0 },
             depth: h.stack_depth(),
             frames,
         });
@@ -4760,18 +4769,31 @@ pub fn preserving_fatal_state<R>(f: impl FnOnce() -> R) -> R {
 /// copies the line's tabs and puts one `^` under the column — V8 reports a
 /// raise as the one-character range `[pos, pos + 1)`.
 pub fn source_arrow(h: &JsHost, pos: u32) -> Option<String> {
+    source_arrow_span(h, pos, 0)
+}
+
+/// [`source_arrow`] for the range `[pos, end)`: one `^` per column, none for
+/// an empty range (the end of the input), and no caret line at all for a
+/// range that runs past the end of its line, as `GetErrorSource` prints it.
+/// An `end` of 0 is the one-character range.
+pub fn source_arrow_span(h: &JsHost, pos: u32, end: u32) -> Option<String> {
     let l = h.source_location(pos).filter(|l| !l.internal)?;
+    let head = format!("{}:{}\n{}\n", l.name, l.line, l.source_line);
+    let end_col = match h.source_location(end) {
+        _ if end == 0 || end < pos => l.col + 1,
+        Some(e) if e.line == l.line => e.col,
+        _ => return Some(head),
+    };
     let mut caret: String = l
         .source_line
         .chars()
         .take(l.col as usize - 1)
         .map(|c| if c == '\t' { '\t' } else { ' ' })
         .collect();
-    caret.push('^');
-    Some(format!(
-        "{}:{}\n{}\n{caret}\n",
-        l.name, l.line, l.source_line
-    ))
+    for _ in l.col..end_col {
+        caret.push('^');
+    }
+    Some(format!("{head}{caret}\n"))
 }
 
 /// Offer an uncaught exception to `process.on('uncaughtException')`; `Ok(true)`

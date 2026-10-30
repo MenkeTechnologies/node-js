@@ -80,6 +80,10 @@ struct Lexer {
     /// The legacy form the token being scanned has used so far; moved into
     /// the token by `push`.
     legacy: Legacy,
+    /// The char span `[start, end)` V8's scanner reports for the error being
+    /// returned, where it is narrower than the token (an escape, a numeric
+    /// separator); `None` reports the token being scanned.
+    err_span: Option<(usize, usize)>,
 }
 
 /// Multi-char operators, longest first so the scanner is greedy.
@@ -91,6 +95,17 @@ const OPS2: &[&str] = &[
     "==", "!=", "<=", ">=", "&&", "||", "??", "?.", "=>", "++", "--", "+=", "-=", "*=", "/=", "%=",
     "&=", "|=", "^=", "<<", ">>", "**",
 ];
+
+thread_local! {
+    /// The UTF-8 byte span `[start, end)` of the token the last failed [`lex`]
+    /// was scanning — what V8 underlines under an invalid token.
+    static ERROR_SPAN: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The byte span of the token the last failed [`lex`] stopped in.
+pub fn take_error_span() -> (u32, u32) {
+    ERROR_SPAN.with(|s| s.replace((0, 0)))
+}
 
 /// Tokenize `src` into a token stream ending in `Eof`.
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
@@ -105,8 +120,26 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         out: Vec::new(),
         pending_newline: false,
         legacy: Legacy::None,
+        err_span: None,
     };
-    lx.run()?;
+    if let Err(e) = lx.run() {
+        // V8's scanner reports the token it was scanning, at least the one
+        // character it stopped on; running out of input is reported as the
+        // empty range at the end.
+        let end = lx.byte_at[lx.pos];
+        let at = |i: usize| lx.byte_at[i.min(lx.src.len())];
+        let span = if let Some((s, e)) = lx.err_span {
+            (at(s), at(e))
+        } else if e.ends_with("Unexpected end of input") {
+            (end, end)
+        } else {
+            let start = lx.byte_at[lx.tok_start.min(lx.pos)];
+            let one_past = lx.byte_at[(lx.pos + 1).min(lx.src.len())];
+            (start, if end > start { end } else { one_past })
+        };
+        ERROR_SPAN.with(|s| s.set(span));
+        return Err(e);
+    }
     Ok(lx.out)
 }
 
@@ -297,7 +330,9 @@ impl Lexer {
         loop {
             match self.peek() {
                 None | Some('\n') => {
-                    return Err("SyntaxError: Invalid regular expression: missing /".to_string())
+                    // Reported at the `/` token the parser had (`kUnterminatedRegExp`).
+                    self.err_span = Some((self.tok_start, self.tok_start + 1));
+                    return Err("SyntaxError: Invalid regular expression: missing /".to_string());
                 }
                 Some('\\') => {
                     // Keep the escape verbatim (the translator interprets it).
@@ -497,6 +532,7 @@ impl Lexer {
                     self.bump();
                     if let Some(e) = self.bump() {
                         let _ = push_escape(&mut cur, e, self);
+                        self.err_span = None;
                     }
                     for c in &self.src[start..self.pos] {
                         cur_raw.push(*c);
@@ -560,15 +596,17 @@ impl Lexer {
                         prev_digit = false;
                     }
                     Some('_') => {
+                        self.err_span = Some((self.pos + 1, self.pos + 2));
                         return Err(
                             "SyntaxError: Only one underscore is allowed as numeric separator"
                                 .to_string(),
-                        )
+                        );
                     }
                     _ => {
+                        self.err_span = Some((self.pos + 1, self.pos + 2));
                         return Err("SyntaxError: Numeric separators are not allowed at the \
                                     end of numeric literals"
-                            .to_string())
+                            .to_string());
                     }
                 }
             } else {
@@ -782,9 +820,16 @@ fn push_code_point(out: &mut String, n: u32) {
 /// template scanner discards it, since an untagged-template error is reported
 /// by its own rules and a tagged one cooks to `undefined`. Unknown escapes keep
 /// the literal char, which is what NonEscapeCharacter means.
+///
+/// The error spans are V8's (`Scanner::ScanHexNumber`, `ScanUnicodeEscape`,
+/// `ScanUnlimitedLengthHexNumber`): a fixed-length escape from its `\` for its
+/// full length, a bad `\u{…}` at the offending character, and an out-of-range
+/// one from the `\` through the digit that overflowed.
 fn push_escape(out: &mut String, e: char, lx: &mut Lexer) -> Result<(), String> {
     const BAD_HEX: &str = "SyntaxError: Invalid hexadecimal escape sequence";
     const BAD_UNICODE: &str = "SyntaxError: Invalid Unicode escape sequence";
+    // The `\` and `e` have been consumed.
+    let begin = lx.pos - 2;
     match e {
         'n' => out.push('\n'),
         't' => out.push('\t'),
@@ -828,7 +873,10 @@ fn push_escape(out: &mut String, e: char, lx: &mut Lexer) -> Result<(), String> 
                         n = n * 16 + d;
                         lx.bump();
                     }
-                    None => return Err(BAD_HEX.to_string()),
+                    None => {
+                        lx.err_span = Some((begin, begin + 4));
+                        return Err(BAD_HEX.to_string());
+                    }
                 }
             }
             push_code_point(out, n);
@@ -849,9 +897,13 @@ fn push_escape(out: &mut String, e: char, lx: &mut Lexer) -> Result<(), String> 
                             digits += 1;
                             lx.bump();
                         }
-                        _ => return Err(BAD_UNICODE.to_string()),
+                        _ => {
+                            lx.err_span = Some((lx.pos, lx.pos + 1));
+                            return Err(BAD_UNICODE.to_string());
+                        }
                     }
                     if n > 0x10FFFF {
+                        lx.err_span = Some((begin, lx.pos));
                         return Err("SyntaxError: Undefined Unicode code-point".to_string());
                     }
                 }
@@ -864,7 +916,10 @@ fn push_escape(out: &mut String, e: char, lx: &mut Lexer) -> Result<(), String> 
                             n = n * 16 + d;
                             lx.bump();
                         }
-                        None => return Err(BAD_UNICODE.to_string()),
+                        None => {
+                            lx.err_span = Some((begin, begin + 6));
+                            return Err(BAD_UNICODE.to_string());
+                        }
                     }
                 }
                 // A HIGH surrogate followed by a `\uXXXX` LOW surrogate is one
