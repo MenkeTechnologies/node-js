@@ -369,28 +369,93 @@ fn convert_alpn_protocols(args: &[Value]) -> Result<Value, String> {
     Ok(buf)
 }
 
-/// `tls.getCACertificates([type])` — return PEM strings for the requested store.
-///
-/// LIMITATION: the bundled `'default'` Mozilla store cannot be reproduced from
-/// `webpki-roots`, which ships extracted *trust anchors* (subject + SPKI + name
-/// constraints), not full X.509 certificates — so no faithful PEM can be built
-/// from them. `'default'` therefore returns whatever was installed via
-/// `setDefaultCACertificates` (empty until then); `'system'`/`'extra'`/`'bundled'`
-/// return `[]`.
+/// node's bundled Mozilla root store (`src/node_root_certs.h` of the reference
+/// release, transcribed by `scripts/gen_root_certs.pl`), one PEM block each.
+const ROOT_CERTS_PEM: &str = include_str!("root_certs.pem");
+
+/// The bundled root certificates as PEM strings, in node's order, each from
+/// `-----BEGIN CERTIFICATE-----` to `-----END CERTIFICATE-----`.
+fn bundled_root_pems() -> impl Iterator<Item = &'static str> {
+    const END: &str = "-----END CERTIFICATE-----";
+    ROOT_CERTS_PEM
+        .split_inclusive(END)
+        .map(str::trim_start)
+        .filter(|c| c.ends_with(END))
+}
+
+/// A frozen array of `certs` (`ObjectFreeze`, as node's caches are).
+fn frozen_strings<'a>(certs: impl Iterator<Item = &'a str>) -> Value {
+    with_host(|h| {
+        let items = certs.map(|c| h.new_str(c.to_string())).collect();
+        let arr = h.new_array(items);
+        h.seal_object(&arr, true);
+        arr
+    })
+}
+
+/// The data exports of `tls` (`lib/tls.js`). `rootCertificates` is the
+/// `cacheBundledRootCertificates` getter's value, built once by the caller.
+pub fn constant(name: &str) -> Option<Value> {
+    Some(match name {
+        "rootCertificates" => frozen_strings(bundled_root_pems()),
+        "DEFAULT_MIN_VERSION" => with_host(|h| h.new_str("TLSv1.2")),
+        "DEFAULT_MAX_VERSION" => with_host(|h| h.new_str("TLSv1.3")),
+        "DEFAULT_ECDH_CURVE" => with_host(|h| h.new_str("auto")),
+        "DEFAULT_CIPHERS" => with_host(|h| h.new_str(DEFAULT_CIPHERS)),
+        "CLIENT_RENEG_LIMIT" => Value::Float(3.0),
+        "CLIENT_RENEG_WINDOW" => Value::Float(600.0),
+        _ => return None,
+    })
+}
+
+/// `tls.DEFAULT_CIPHERS`: node's default cipher list (`--tls-cipher-list`
+/// unset), the TLS 1.3 suites followed by the OpenSSL 1.2 selection.
+const DEFAULT_CIPHERS: &str = "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:\
+TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:\
+ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:\
+ECDHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:\
+DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:\
+!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA";
+
+/// `tls.getCACertificates([type])` (`lib/tls.js`): `'bundled'` is
+/// `tls.rootCertificates`; `'default'` is the set `setDefaultCACertificates`
+/// installed, else a frozen copy of the bundled store (node adds
+/// `NODE_EXTRA_CA_CERTS` to it, which is not read here); `'extra'` and
+/// `'system'` are empty — this runtime reads neither the extra-certs file nor
+/// the OS store. Any other type is `ERR_INVALID_ARG_VALUE`.
 fn get_ca_certificates(args: &[Value]) -> Result<Value, String> {
-    let kind = if args.is_empty() {
+    thread_local! {
+        static DEFAULT: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    let kind = if args.is_empty() || matches!(args[0], Value::Undef) {
         "default".to_string()
     } else {
         super::arg_str(args, 0)
     };
-    let certs: Vec<String> = match kind.as_str() {
-        "default" => DEFAULT_CA_CERTS.with(|c| c.borrow().clone()),
-        _ => Vec::new(),
-    };
-    Ok(with_host(|h| {
-        let items = certs.into_iter().map(|c| h.new_str(c)).collect();
-        h.new_array(items)
-    }))
+    match kind.as_str() {
+        "bundled" => Ok(super::constant("tls", "rootCertificates").unwrap_or(Value::Undef)),
+        "default" => {
+            let set = DEFAULT_CA_CERTS.with(|c| c.borrow().clone());
+            if !set.is_empty() {
+                return Ok(frozen_strings(set.iter().map(String::as_str)));
+            }
+            if let Some(v) = DEFAULT.with(|d| d.borrow().clone()) {
+                return Ok(v);
+            }
+            let v = frozen_strings(bundled_root_pems());
+            DEFAULT.with(|d| *d.borrow_mut() = Some(v.clone()));
+            Ok(v)
+        }
+        "system" | "extra" => Ok(frozen_strings(std::iter::empty())),
+        _ => Err(crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_VALUE",
+            &format!(
+                "The argument 'type' is invalid. Received {}",
+                with_host(|h| h.inspect(&args[0]))
+            ),
+        )),
+    }
 }
 
 /// `tls.setDefaultCACertificates(certs)` — store `certs` (PEM strings or Buffers)

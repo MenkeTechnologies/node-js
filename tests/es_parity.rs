@@ -336,6 +336,33 @@ async function chunks(b) { const out = []; for await (const c of b.stream()) out
     assert_eq!(run(src), expected);
 }
 
+/// `tls.rootCertificates` is node's bundled Mozilla store (`root_certs.pem`,
+/// transcribed from `node_root_certs.h`): a frozen array, one object, the
+/// same PEM text in the same order (the digest pins all of it).
+/// `getCACertificates('bundled')` is that array, `'default'` a frozen copy
+/// until `setDefaultCACertificates`; `DEFAULT_MIN_VERSION` and the other data
+/// exports carry node's values. All of them were `undefined`, and
+/// `getCACertificates()` was empty. Expected output from node v26.12.1.
+#[test]
+fn tls_root_certificates_are_nodes_bundled_store() {
+    let src = r#"
+const tls = require("tls");
+const r = tls.rootCertificates;
+console.log(Array.isArray(r), r.length, Object.isFrozen(r), r === tls.rootCertificates);
+console.log(JSON.stringify(r[0].slice(0, 40)), JSON.stringify(r[r.length - 1].slice(-30)));
+console.log(require("crypto").createHash("sha256").update(r.join("|")).digest("hex"));
+console.log(tls.DEFAULT_MIN_VERSION, tls.DEFAULT_MAX_VERSION, tls.DEFAULT_ECDH_CURVE, tls.CLIENT_RENEG_LIMIT, tls.CLIENT_RENEG_WINDOW, tls.DEFAULT_CIPHERS.length);
+const b = tls.getCACertificates("bundled"), d = tls.getCACertificates();
+console.log(b === r, d === r, d.length, Object.isFrozen(d), d === tls.getCACertificates(), tls.getCACertificates("extra").length);
+try { tls.getCACertificates("x"); } catch (e) { console.log(e.code, e.message); }
+const desc = Object.getOwnPropertyDescriptor(tls, "rootCertificates");
+console.log(typeof desc.get, desc.enumerable, desc.configurable, desc.get.name);
+tls.setDefaultCACertificates([r[0]]); console.log(tls.getCACertificates().length);
+"#;
+    let expected = "true 118 true true\n\"-----BEGIN CERTIFICATE-----\\nMIICiTCCAg+g\" \"rw==\\n-----END CERTIFICATE-----\"\nf959927264e7eb623c373b2a87a9832f93a180ad1329f9d0e8423ef7dd477787\nTLSv1.2 TLSv1.3 auto 3 600 416\ntrue false 118 true true 0\nERR_INVALID_ARG_VALUE The argument 'type' is invalid. Received 'x'\nfunction true false cacheBundledRootCertificates\n1";
+    assert_eq!(run(src), expected);
+}
+
 // ── array iteration is live ──────────────────────────────────────────────────
 
 /// An array iterator reads the array at every step (23.1.5.1). `for-of`, spread

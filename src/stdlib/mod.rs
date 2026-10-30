@@ -525,6 +525,11 @@ fn constant_uncached(ns: &str, name: &str) -> Option<Value> {
         "path" => path::constant(path::Flavor::Posix, name),
         "path/win32" => path::constant(path::Flavor::Win32, name),
         "os" => os::constant(name),
+        // node caches the frozen bundled store, so every read is one array.
+        "tls" if name == "rootCertificates" => {
+            cached_module_value("tls.rootCertificates", || tls::constant(name))
+        }
+        "tls" => tls::constant(name),
         // `fs.constants` and `crypto.constants` were absent, so
         // `fs.constants.O_RDONLY` and `crypto.constants.RSA_PKCS1_PADDING` —
         // which libraries pass straight through to `open` and to RSA — read as
