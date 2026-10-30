@@ -1735,3 +1735,63 @@ console.log(AbortSignal.any(s).aborted);
     let expected = "false undefined true [object AbortSignal]\na abort, any.aborted = true nested.aborted = true\nany abort first\nany onabort\nnested abort true\ntrue first first\ntrue done\nfalse undefined\nTypeError ERR_INVALID_ARG_TYPE signals cannot be converted to sequence.\nTypeError ERR_INVALID_ARG_TYPE signals cannot be converted to sequence.\nTypeError ERR_INVALID_ARG_TYPE signals[0] is not of type AbortSignal.\nTypeError ERR_INVALID_ARG_TYPE signals[1] is not of type AbortSignal.\nTypeError ERR_INVALID_ARG_TYPE signals cannot be converted to sequence.\nfalse";
     assert_eq!(run(src), expected);
 }
+
+/// Specific zone names come from the zone's ICU 79 metazone: `toString`'s
+/// parenthetical (the metazone the zone belongs to now, daylight per V8's
+/// equivalent-time rule, else the current raw offset) and `timeZoneName`
+/// `long`/`short` (the metazone at the instant, from 1970 on). Each expected
+/// block was captured from node v26.12.1 under that `TZ`.
+#[test]
+fn zone_names_come_from_the_metazone() {
+    let src = r##"
+const ts = [Date.UTC(2024, 0, 15, 12), Date.UTC(2024, 6, 15, 12), Date.UTC(1975, 3, 1), -1e12];
+console.log(ts.map((t) => String(new Date(t)).slice(25)).join(' | '));
+const zones = ['America/New_York', 'Europe/Paris', 'Europe/London', 'Atlantic/Reykjavik', 'Asia/Kolkata', 'Pacific/Honolulu', 'Antarctica/DumontDUrville', 'GB'];
+for (const timeZone of zones) {
+  const names = [];
+  for (const t of ts) for (const timeZoneName of ['long', 'short']) {
+    names.push(new Date(t).toLocaleTimeString('en-US', { timeZone, timeZoneName }).replace(/^.* [AP]M /, ''));
+  }
+  console.log(timeZone, names.join(' | '));
+}
+"##;
+    let mut f = tempfile::Builder::new()
+        .suffix(".js")
+        .tempfile()
+        .expect("temp file");
+    f.write_all(src.as_bytes()).expect("write source");
+    let cases = [
+        (
+            "America/New_York",
+            "GMT-0500 (Eastern Standard Time) | GMT-0400 (Eastern Daylight Time) | GMT-0400 (Eastern Daylight Time) | GMT-0400 (Eastern Daylight Time)\nAmerica/New_York Eastern Standard Time | EST | Eastern Daylight Time | EDT | Eastern Daylight Time | EDT | GMT-04:00 | GMT-4\nEurope/Paris Central European Standard Time | GMT+1 | Central European Summer Time | GMT+2 | Central European Standard Time | GMT+1 | GMT+01:00 | GMT+1\nEurope/London GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1\nAtlantic/Reykjavik Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | GMT+00:00 | GMT+0\nAsia/Kolkata India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | GMT+05:30 | GMT+5:30\nPacific/Honolulu Hawaii Time | HST | Hawaii Time | HST | Hawaii Time | HST | GMT-10:30 | GMT-10:30\nAntarctica/DumontDUrville Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | GMT+10:00 | GMT+10\nGB GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1",
+        ),
+        (
+            "Europe/London",
+            "GMT+0000 (GMT+00:00) | GMT+0100 (British Summer Time) | GMT+0100 (British Summer Time) | GMT+0100 (British Summer Time)\nAmerica/New_York Eastern Standard Time | EST | Eastern Daylight Time | EDT | Eastern Daylight Time | EDT | GMT-04:00 | GMT-4\nEurope/Paris Central European Standard Time | GMT+1 | Central European Summer Time | GMT+2 | Central European Standard Time | GMT+1 | GMT+01:00 | GMT+1\nEurope/London GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1\nAtlantic/Reykjavik Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | GMT+00:00 | GMT+0\nAsia/Kolkata India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | GMT+05:30 | GMT+5:30\nPacific/Honolulu Hawaii Time | HST | Hawaii Time | HST | Hawaii Time | HST | GMT-10:30 | GMT-10:30\nAntarctica/DumontDUrville Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | GMT+10:00 | GMT+10\nGB GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1",
+        ),
+        (
+            "Asia/Damascus",
+            "GMT+0300 (GMT+03:00) | GMT+0300 (GMT+03:00) | GMT+0200 (GMT+03:00) | GMT+0200 (GMT+03:00)\nAmerica/New_York Eastern Standard Time | EST | Eastern Daylight Time | EDT | Eastern Daylight Time | EDT | GMT-04:00 | GMT-4\nEurope/Paris Central European Standard Time | GMT+1 | Central European Summer Time | GMT+2 | Central European Standard Time | GMT+1 | GMT+01:00 | GMT+1\nEurope/London GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1\nAtlantic/Reykjavik Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | GMT+00:00 | GMT+0\nAsia/Kolkata India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | GMT+05:30 | GMT+5:30\nPacific/Honolulu Hawaii Time | HST | Hawaii Time | HST | Hawaii Time | HST | GMT-10:30 | GMT-10:30\nAntarctica/DumontDUrville Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | GMT+10:00 | GMT+10\nGB GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1",
+        ),
+        (
+            "Asia/Tokyo",
+            "GMT+0900 (Japan Standard Time) | GMT+0900 (Japan Standard Time) | GMT+0900 (Japan Standard Time) | GMT+0900 (Japan Standard Time)\nAmerica/New_York Eastern Standard Time | EST | Eastern Daylight Time | EDT | Eastern Daylight Time | EDT | GMT-04:00 | GMT-4\nEurope/Paris Central European Standard Time | GMT+1 | Central European Summer Time | GMT+2 | Central European Standard Time | GMT+1 | GMT+01:00 | GMT+1\nEurope/London GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1\nAtlantic/Reykjavik Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | GMT+00:00 | GMT+0\nAsia/Kolkata India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | GMT+05:30 | GMT+5:30\nPacific/Honolulu Hawaii Time | HST | Hawaii Time | HST | Hawaii Time | HST | GMT-10:30 | GMT-10:30\nAntarctica/DumontDUrville Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | GMT+10:00 | GMT+10\nGB GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1",
+        ),
+        (
+            "UTC",
+            "GMT+0000 (Coordinated Universal Time) | GMT+0000 (Coordinated Universal Time) | GMT+0000 (Coordinated Universal Time) | GMT+0000 (Coordinated Universal Time)\nAmerica/New_York Eastern Standard Time | EST | Eastern Daylight Time | EDT | Eastern Daylight Time | EDT | GMT-04:00 | GMT-4\nEurope/Paris Central European Standard Time | GMT+1 | Central European Summer Time | GMT+2 | Central European Standard Time | GMT+1 | GMT+01:00 | GMT+1\nEurope/London GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1\nAtlantic/Reykjavik Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | Greenwich Mean Time | GMT | GMT+00:00 | GMT+0\nAsia/Kolkata India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | India Standard Time | GMT+5:30 | GMT+05:30 | GMT+5:30\nPacific/Honolulu Hawaii Time | HST | Hawaii Time | HST | Hawaii Time | HST | GMT-10:30 | GMT-10:30\nAntarctica/DumontDUrville Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | Dumont d’Urville Time | GMT+10 | GMT+10:00 | GMT+10\nGB GMT+00:00 | GMT+0 | British Summer Time | GMT+1 | British Summer Time | GMT+1 | GMT+01:00 | GMT+1",
+        ),
+    ];
+    for (tz, expected) in cases {
+        let out = Command::new(env!("CARGO_BIN_EXE_node"))
+            .arg(f.path())
+            .env("TZ", tz)
+            .output()
+            .expect("spawn node binary");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            expected,
+            "TZ={tz}"
+        );
+    }
+}

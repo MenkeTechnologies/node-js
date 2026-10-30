@@ -37,6 +37,7 @@ pub mod slots;
 pub mod stdlib;
 pub mod tiers;
 pub mod tzif;
+pub mod tznames;
 pub mod utf16;
 
 pub use fusevm::Value;

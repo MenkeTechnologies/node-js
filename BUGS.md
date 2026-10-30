@@ -1522,9 +1522,9 @@ zone names × cycles × zones × styles) are byte-identical to node v26.10.0;
 `parity-scripts/data/28_date_locale_options.js` samples them. Before, every
 option was dropped: `{weekday: 'long', year: 'numeric', month: 'long', day:
 'numeric'}` printed `2/29/2024`. Still not modelled: the `locales` argument,
-and a zone's long name outside UTC, `GMT` and the US zones (`Asia/Kolkata`
-long is `GMT+05:30` here, `India Standard Time` in node) — en's metazone names
-are ICU data.
+and a zone's GENERIC name (`timeZoneName: 'shortGeneric'`/`'longGeneric'`)
+outside UTC, `GMT` and the US zones. Specific names (`short`/`long`) come from
+the zone's metazone (`src/tznames.rs`, round 25).
 
 `String.prototype.normalize` remains the identity (no normalization tables) but
 now VALIDATES the form: node throws `RangeError` outside NFC/NFD/NFKC/NFKD, and
@@ -2806,11 +2806,6 @@ Still divergent, and why:
   same representation problem as the note above about it being a real Array.
   `examples/argumentsobject.js` pins everything else and deliberately omits the
   three lines that would show the mapping.
-- **A zone's LONG name needs ICU.** `toString` renders `GMT-0500 (EST)` where
-  node writes `GMT-0500 (Eastern Standard Time)`; `localtime_r` supplies the
-  abbreviation and nothing else. UTC is the one name spelled out, since it is
-  not data. The clock and the numeric offset are right in every zone
-  (`examples/datelocal.js`).
 - **`toLocaleString` ignores its `locales` argument**: every locale formats as
   en-US. The `options` bag is honored (see "the locale surface" above).
 - **Children and `zlib` jobs are run SYNCHRONOUSLY, so two outstanding
@@ -3476,11 +3471,12 @@ record went red.
 |---|---|---|
 | `assert.deepEqual(Buffer.from('abc'), new Uint8Array([97, 98, 99]))` (loose) | passes | fails: a Buffer and a typed array are compared through different internal slots |
 
-## FIXED in round 25 — `console.dir` and `formatWithOptions` options, timer clamping, `AbortSignal.any`, ICU 79 date patterns, verified against node v26.12.1
+## FIXED in round 25 — `console.dir` and `formatWithOptions` options, timer clamping, `AbortSignal.any`, ICU 79 date patterns and zone names, verified against node v26.12.1
 
 Pinned in `tests/language_parity.rs` (`console_dir_spreads_its_options_over_custom_inspect_false`,
 `format_with_options_applies_the_bag_to_every_inspect`,
-`locale_date_patterns_follow_icu_79`, `abort_signal_any_follows_its_sources`), `tests/timers.rs`
+`locale_date_patterns_follow_icu_79`, `abort_signal_any_follows_its_sources`,
+`zone_names_come_from_the_metazone`), `tests/timers.rs`
 (`out_of_range_timeouts_clamp_to_one_millisecond`) and `parity-scripts/data/28_date_locale_options.js`.
 
 | Case | node | was |
@@ -3492,11 +3488,16 @@ Pinned in `tests/language_parity.rs` (`console_dir_spreads_its_options_over_cust
 | `AbortSignal.any([a.signal, b.signal])` | a composite signal that aborts with the first source; a timeout signal does not hold the process open (`setUnrefTimeout`) | `AbortSignal.any is not a function`; `AbortSignal.timeout(50).onabort` kept the process alive and fired |
 | `{weekday: 'short', year: 'numeric', second: 'numeric'}` | `Fri, 2024, 9` — CLDR 49's `Day-Of-Week` append item is `{1}, {0}` | `2024 Fri, 9` (CLDR 47's `{0} {1}`) |
 | `{year: '2-digit', month: 'short'}` | `Feb ’24` — CLDR 49's `yyMMM` / `yyMMMd` / `yy` items, which only a two-digit-year request may match (ICU 79 `yearLengthIsCompatible`) | `Feb 24` |
+| `String(new Date(0))` under `TZ=Europe/Paris`; `timeZoneName: 'long'` in `Asia/Kolkata` | `GMT+0100 (Central European Standard Time)`; `India Standard Time` — ICU names a zone through its metazone (`src/tznames.rs`, a transcription of ICU 79.1's zone aliases, metazone history and en names): `toString` by the metazone the zone belongs to now, daylight per V8's equivalent-time rule, else the zone's current raw offset; `timeZoneName` by the metazone at the instant, from 1970 on | `(CET)` — the `localtime` abbreviation; `GMT+05:30` — only UTC, GMT and the US zones had names. Over every zone `Intl.supportedValuesOf('timeZone')` lists, `toString` at four sample instants and the `long`/`short` names match node except for `America/Punta_Arenas` (below) |
 
 ### Still open — found here, not fixed
 
 | Case | node v26.12.1 | node-js |
 |---|---|---|
-| `Europe/London` in winter, `timeZoneName: 'short'` | `GMT+0` — CLDR 49 moved London and Dublin off the `GMT` metazone onto `British`/`Irish` | `GMT`: zone names are keyed by the `localtime` abbreviation, not by metazone |
+| `Europe/London`, `timeZoneName: 'shortGeneric'` / `'longGeneric'` | `United Kingdom Time` / `British Time` — CLDR 49's `British` metazone and the location format | `GMT` / `Greenwich Mean Time`: GENERIC names are still keyed by the `localtime` abbreviation (US zones, GMT, UTC only) |
+| `America/Punta_Arenas` in 2024 under `TZ` | `Chile Summer Time` | `Chile Standard Time` — its TZif type is not daylight time; ICU's rules say it is |
 | `Object.getOwnPropertyNames(Date.prototype).length` | `48` (`toTemporalInstant`) | `47` — `Temporal` is not implemented (`examples/protolistings.js`) |
 | `util.inspect('x', {colors: true})` | `\x1b[32m'x'\x1b[39m` | `'x'` — the inspector has no stylize pass |
+| `Readable.from(['ab']).pipe(new PassThrough()).on('data', …)`; `pipe` into a `Writable`; `push` after `pipe` | `ab`; `finish`; the pushed chunk | nothing; no `finish`; nothing — `src/stdlib/stream.rs` is a best-effort native model (no flowing/paused modes, `pipe` copies the queue once). The fix is a port of `lib/internal/streams` like `webstreams.js` |
+| `const s = 1; new Function('return typeof s')()`, `(0, eval)('typeof module')` | `undefined` — global code does not see the entry module's scope | `number` / `object`: the entry script's top-level bindings live in the global scope |
+| `{ using x = { [Symbol.dispose]() {} } }`, `DisposableStack`, `SuppressedError` | supported | `SyntaxError`; `undefined` |

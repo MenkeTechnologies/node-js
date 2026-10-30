@@ -530,11 +530,8 @@ fn utc_string(ms: f64) -> String {
 /// (21.4.4.42 TimeString + TimeZoneString). The clock is LOCAL and the offset
 /// is the zone's real one; both were fixed at UTC before.
 ///
-/// The parenthetical is the zone's LONG name, which node takes from ICU. There
-/// is none here, so only UTC — the one name that is not data — is spelled out
-/// and every other zone reports the abbreviation `localtime_r` supplies
-/// (`GMT-0500 (EST)` where node writes `(Eastern Standard Time)`). Recorded in
-/// BUGS.md.
+/// The parenthetical is the zone's LONG name, which node takes from ICU
+/// (`GMT-0500 (Eastern Standard Time)`); see [`zone_name`].
 fn time_string(ms: f64) -> String {
     if ms.is_nan() {
         return "Invalid Date".into();
@@ -555,13 +552,72 @@ fn time_string(ms: f64) -> String {
     )
 }
 
-/// The zone's display name for `toString`. UTC is spelled out the way node
-/// does; anything else falls back to the abbreviation.
+/// The zone's display name for `toString`: V8's `LocalTimezone`. It asks ICU
+/// (`TimeZone::getDisplayName(isDst, LONG)`) for the zone's long specific name
+/// through the metazone the zone belongs to NOW, so a 1938 date in Tokyo is
+/// still `Japan Standard Time`; `isDst` is whether the instant has a daylight
+/// offset, which V8 computes for an instant outside 1970..2038 at its
+/// equivalent time ([`v8_equivalent_time`]). A zone whose metazone has no such
+/// name (`Europe/London` in winter) is the localized GMT format of the zone's
+/// CURRENT raw offset, plus an hour when daylight in a zone that still keeps
+/// daylight time — `Asia/Damascus` is `GMT+03:00` for a 1975 date whose own
+/// offset was +2.
+///
+/// Without a resolvable zone id (`TZ` holding a POSIX rule), UTC is spelled
+/// out and anything else falls back to the abbreviation `localtime_r` reports.
 fn zone_name(ms: f64) -> String {
-    if zone_offset_ms(ms) == 0.0 {
-        return "Coordinated Universal Time".into();
+    let Some((id, tz)) =
+        crate::tznames::local_zone_id().and_then(|id| crate::tzif::load(&id).map(|tz| (id, tz)))
+    else {
+        if zone_offset_ms(ms) == 0.0 {
+            return "Coordinated Universal Time".into();
+        }
+        return zone_abbrev(ms).unwrap_or_else(|| "Coordinated Universal Time".into());
+    };
+    let dst = tz.at((v8_equivalent_time(ms) / 1000.0).floor() as i64).dst;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    if let Some(name) = crate::tznames::specific_name(&id, now, dst, true) {
+        return name.to_string();
     }
-    zone_abbrev(ms).unwrap_or_else(|| "Coordinated Universal Time".into())
+    // The raw offset and the daylight savings in force around now (half a
+    // year either side). ICU adds the savings only when the zone still uses
+    // daylight time (`useDaylightTime`); they are not always an hour
+    // (`Antarctica/Troll` saves two).
+    let around: Vec<_> = [now - 15_778_800, now, now + 15_778_800]
+        .iter()
+        .map(|&t| tz.at(t))
+        .collect();
+    let raw = around
+        .iter()
+        .find(|t| !t.dst)
+        .map_or(around[1].offset, |t| t.offset);
+    let savings = around.iter().find(|t| t.dst).map_or(0, |t| t.offset - raw);
+    let off_min = (raw + if dst { savings } else { 0 }) / 60;
+    let sign = if off_min < 0 { '-' } else { '+' };
+    format!(
+        "GMT{sign}{:02}:{:02}",
+        off_min.abs() / 60,
+        off_min.abs() % 60
+    )
+}
+
+/// V8's `DateCache::EquivalentTime`: an instant before 1970 or past 2038 moved
+/// to the same month, day and time of a year in 2008..2037 that starts on the
+/// same weekday and has the same leap-ness. V8 asks for daylight time there.
+fn v8_equivalent_time(ms: f64) -> f64 {
+    const MAX_EPOCH_MS: f64 = i32::MAX as f64 * 1000.0;
+    if (0.0..=MAX_EPOCH_MS).contains(&ms) {
+        return ms;
+    }
+    let (days, within) = split_day(ms);
+    let (year, month, day) = civil_from_days(days);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let week_day = (days_from_civil(year, 0, 1) + 4).rem_euclid(7);
+    let recent = if leap { 1956 } else { 1967 } + (week_day * 12) % 28;
+    let equivalent = 2008 + (recent + 3 * 28 - 2008) % 28;
+    (days_from_civil(equivalent, month, day) as f64) * MS_PER_DAY + within as f64
 }
 
 /// The local zone's abbreviation at `ms` (`EST`, `EDT`, `UTC`), as

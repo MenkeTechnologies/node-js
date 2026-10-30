@@ -1091,21 +1091,35 @@ struct Fields {
     abbrev: Option<String>,
     /// Whether the zone is UTC itself, which has names of its own.
     utc: bool,
+    /// The zone's IANA id and whether this instant is daylight time, from 1970
+    /// on — what its specific names (`z`, `zzzz`) are looked up by.
+    zone: Option<(String, bool)>,
+    /// The instant, in UTC epoch seconds.
+    epoch_secs: i64,
 }
 
 impl Format {
     /// Render the time value `ms` (finite) with this format.
     pub fn format(&self, ms: f64) -> String {
-        let (offset_ms, abbrev) = match &self.zone {
+        let secs = (ms / 1000.0).floor() as i64;
+        let (offset_ms, abbrev, zone) = match &self.zone {
             Zone::Local => (
                 crate::stdlib::date::zone_offset_ms(ms),
                 crate::stdlib::date::zone_abbrev(ms),
+                crate::tznames::local_zone_id().and_then(|id| {
+                    let dst = crate::tzif::load(&id)?.at(secs).dst;
+                    Some((id, dst))
+                }),
             ),
-            Zone::Utc => (0.0, None),
-            Zone::Fixed(m) => (*m as f64 * 60_000.0, None),
+            Zone::Utc => (0.0, None, None),
+            Zone::Fixed(m) => (*m as f64 * 60_000.0, None, None),
             Zone::Named(tz) => {
-                let ty = tz.at((ms / 1000.0).floor() as i64);
-                (ty.offset as f64 * 1000.0, Some(ty.abbrev))
+                let ty = tz.at(secs);
+                (
+                    ty.offset as f64 * 1000.0,
+                    Some(ty.abbrev),
+                    Some((tz.name.clone(), ty.dst)),
+                )
             }
         };
         let local = ms + offset_ms;
@@ -1130,6 +1144,8 @@ impl Format {
                 Zone::Named(_) => offset_ms == 0.0 && abbrev.as_deref() == Some("UTC"),
             },
             abbrev: abbrev.filter(|_| ms >= 0.0),
+            zone: zone.filter(|_| ms >= 0.0),
+            epoch_secs: secs,
         };
         let pattern_has_minute = self.pattern.contains('m');
         let pattern_has_second = self.pattern.contains('s');
@@ -1231,12 +1247,18 @@ impl Format {
         }
     }
 
-    /// The `timeZoneName` text. UTC has names of its own, and so do the zones
-    /// in [`named_zone`]; any other zone is named by its offset
-    /// (node knows the long names of every zone from ICU; this does not).
+    /// The `timeZoneName` text. UTC has names of its own. A specific name (`z`,
+    /// `zzzz`) comes from the zone's metazone ([`crate::tznames`]), else the GMT
+    /// offset. A generic one (`v`, `vvvv`) is known only for the zones in
+    /// [`named_zone`], keyed by abbreviation; any other zone is named by its
+    /// offset.
     fn zone_name(&self, c: char, n: usize, f: &Fields) -> String {
         let long = n >= 4;
         let utc = f.utc;
+        if let ('z', false, Some((id, dst))) = (c, utc, &f.zone) {
+            return crate::tznames::specific_name(id, f.epoch_secs, *dst, long)
+                .map_or_else(|| gmt_offset(f.offset_sec, long), str::to_string);
+        }
         let named = f.abbrev.as_deref().and_then(named_zone);
         match (c, utc, named) {
             ('z', true, _) if long => "Coordinated Universal Time".into(),

@@ -10,11 +10,13 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// One local-time type: offset east of UTC in seconds, and its abbreviation.
+/// One local-time type: offset east of UTC in seconds, its abbreviation, and
+/// whether it is daylight time (`tt_isdst`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalType {
     pub offset: i64,
     pub abbrev: String,
+    pub dst: bool,
 }
 
 /// A parsed zone.
@@ -153,13 +155,13 @@ fn parse(b: &[u8], name: &str) -> Option<Tz> {
     let mut raw_types = Vec::with_capacity(typecnt);
     for i in 0..typecnt {
         let at = p + i * 6;
-        raw_types.push((be32(b, at)?, *b.get(at + 5)? as usize));
+        raw_types.push((be32(b, at)?, *b.get(at + 4)? != 0, *b.get(at + 5)? as usize));
     }
     p += typecnt * 6;
     let chars = b.get(p..p + charcnt)?;
     let types: Vec<LocalType> = raw_types
         .into_iter()
-        .map(|(offset, idx)| {
+        .map(|(offset, dst, idx)| {
             let end = chars[idx.min(chars.len())..]
                 .iter()
                 .position(|&ch| ch == 0)
@@ -167,6 +169,7 @@ fn parse(b: &[u8], name: &str) -> Option<Tz> {
             LocalType {
                 offset,
                 abbrev: String::from_utf8_lossy(&chars[idx.min(end)..end]).into_owned(),
+                dst,
             }
         })
         .collect();
@@ -201,6 +204,7 @@ impl PosixRule {
         let std = LocalType {
             offset: std_off,
             abbrev: std_name,
+            dst: false,
         };
         if cur.is_empty() {
             return Some(PosixRule { std, dst: None });
@@ -219,6 +223,7 @@ impl PosixRule {
                 LocalType {
                     offset: dst_off,
                     abbrev: dst_name,
+                    dst: true,
                 },
                 RuleDate::parse(start)?,
                 RuleDate::parse(end)?,
