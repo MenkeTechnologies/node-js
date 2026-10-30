@@ -76,15 +76,23 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             }
             Err(e) => Err(e),
         },
-        // `console.dir` renders its first argument through the same inspector,
-        // ignoring the (rarely-used) options argument.
-        "dir" => match crate::host::inspect_js(&args.first().cloned().unwrap_or(Value::Undef)) {
-            Ok(s) => {
-                emit(&s, false);
-                Ok(Value::Undef)
+        // `console.dir(obj, options)` is lib/internal/console/constructor.js's
+        // `inspect(object, { customInspect: false, ...options })`: a value's
+        // own `[util.inspect.custom]` is skipped unless the options turn it
+        // back on, and every other inspect option (`depth`, `sorted`, …) is
+        // honoured.
+        "dir" => {
+            let opts = dir_options(args.get(1));
+            let target = args.first().cloned().unwrap_or(Value::Undef);
+            match crate::stdlib::util::call("inspect", &[target, opts]) {
+                Some(Ok(s)) => {
+                    emit(&with_host(|h| h.str_of(&s)), false);
+                    Ok(Value::Undef)
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(Value::Undef),
             }
-            Err(e) => Err(e),
-        },
+        }
         // `console.trace` prints a "Trace:"-prefixed message to stderr. A full
         // captured stack is not attached here (no cheap synchronous stack source
         // at this layer); the message content matches Node.
@@ -277,6 +285,20 @@ fn format_args(args: &[Value]) -> Result<String, String> {
 }
 
 /// The label argument (`args[0]`) as a string, or `fallback` when absent.
+/// `{ customInspect: false, ...options }` for `console.dir`. A non-object
+/// `options` (absent, `null`, a number) spreads to nothing, as in node.
+fn dir_options(options: Option<&Value>) -> Value {
+    let mut props: IndexMap<String, Value> = IndexMap::new();
+    props.insert("customInspect".into(), Value::Bool(false));
+    if let Some(o) = options.filter(|o| matches!(o, Value::Obj(_))) {
+        // A getter on the options object runs, exactly as object spread does.
+        for (k, v) in crate::host::own_enum_entries_deep(o).unwrap_or_default() {
+            props.insert(k, v);
+        }
+    }
+    with_host(|h| h.new_object(props))
+}
+
 fn label_arg(args: &[Value], fallback: &str) -> String {
     match args.first() {
         Some(v) => with_host(|h| h.str_of(v)),
