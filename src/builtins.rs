@@ -8462,8 +8462,12 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
             require_callback(&arg0(&args))?;
             schedule_timer(name, args)
         }
-        "clearTimeout" | "clearInterval" | "clearImmediate" => {
-            clear_timer(&arg0(&args));
+        "clearTimeout" | "clearInterval" => {
+            crate::stdlib::timers::clear_timeout(&arg0(&args));
+            Ok(Value::Undef)
+        }
+        "clearImmediate" => {
+            crate::stdlib::timers::clear_immediate(&arg0(&args));
             Ok(Value::Undef)
         }
         "Promise.resolve" => promise_resolve(arg0(&args)),
@@ -18237,14 +18241,6 @@ fn timeout_duration(after: Option<&Value>) -> Result<f64, String> {
         warn("TimeoutNaNWarning", "is not a number.");
     }
     Ok(1.0)
-}
-
-/// `clearTimeout`/`clearInterval`/`clearImmediate` — cancel by handle object or
-/// by the bare id it coerces to (code that stored `+timer` still works).
-fn clear_timer(v: &Value) {
-    let id =
-        crate::stdlib::timers::handle_id(v).unwrap_or_else(|| with_host(|h| h.to_number(v)) as u64);
-    with_host(|h| h.cancel_timer(id));
 }
 
 /// `Math.f16round(x)` — `x` rounded to the nearest IEEE 754 binary16 value

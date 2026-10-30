@@ -71,6 +71,55 @@ pub fn handle_id(v: &Value) -> Option<u64> {
     })
 }
 
+thread_local! {
+    /// node's `knownTimersById`: the `Timeout`s whose id has been taken as a
+    /// primitive, which are the only ones `clearTimeout` will find by id.
+    static KNOWN_IDS: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn note_known_id(id: u64) {
+    KNOWN_IDS.with(|k| k.borrow_mut().insert(id));
+}
+
+/// `clearTimeout`/`clearInterval` (`lib/timers.js`): a `Timeout` handle is
+/// cleared; a number or string clears the `Timeout` that coerced to it, if
+/// any. Anything else — an `Immediate` among them — is ignored.
+pub fn clear_timeout(v: &Value) {
+    if native_tag(v).as_deref() == Some("Timeout") {
+        if let Some(id) = handle_id(v) {
+            with_host(|h| h.cancel_timer(id));
+        }
+        return;
+    }
+    let key = with_host(|h| {
+        if matches!(v, Value::Int(_) | Value::Float(_)) || h.as_str(v).is_some() {
+            Some(h.to_number(v))
+        } else {
+            None
+        }
+    });
+    if let Some(n) = key.filter(|n| n.fract() == 0.0 && *n >= 0.0) {
+        let id = n as u64;
+        if KNOWN_IDS.with(|k| k.borrow().contains(&id)) {
+            with_host(|h| h.cancel_timer(id));
+        }
+    }
+}
+
+/// `clearImmediate`: only an `Immediate` handle is cleared.
+pub fn clear_immediate(v: &Value) {
+    if native_tag(v).as_deref() == Some("Immediate") {
+        if let Some(id) = handle_id(v) {
+            with_host(|h| h.cancel_timer(id));
+        }
+    }
+}
+
+fn native_tag(v: &Value) -> Option<String> {
+    super::native_tag(v)
+}
+
 /// Dispatch a method on a `Timeout`/`Immediate` handle.
 ///
 /// `ref`/`unref`/`refresh` return the handle itself (Node chains them); they are
@@ -100,8 +149,14 @@ pub fn instance_call(recv: &Value, method: &str, _args: &[Value]) -> Result<Valu
         // `Object.prototype.valueOf`, which returns the receiver — node's
         // `Timeout` does not override it, and reporting the id there made
         // `t.valueOf() === t` false.
-        "@@toPrimitive" => Ok(Value::Float(id as f64)),
-        "toString" => Ok(with_host(|h| h.new_str(id.to_string()))),
+        "@@toPrimitive" => {
+            note_known_id(id);
+            Ok(Value::Float(id as f64))
+        }
+        "toString" => {
+            note_known_id(id);
+            Ok(with_host(|h| h.new_str(id.to_string())))
+        }
         _ => Err(crate::host::type_error(&format!(
             "timeout.{method} is not a function"
         ))),
@@ -122,14 +177,11 @@ pub const METHODS: &[&str] = &[
 ];
 
 /// Dispatch a `timers.<method>` call by delegating to the matching global timer
-/// builtin. `clearImmediate` has no distinct global handler (the loop cancels by
-/// id regardless of kind), so it maps to `clearTimeout`.
+/// builtin.
 pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let global = match method {
-        "setTimeout" | "setInterval" | "setImmediate" | "clearTimeout" | "clearInterval" => method,
-        // No separate global `clearImmediate` handler exists; cancellation is by
-        // timer id in both cases, so route it through `clearTimeout`.
-        "clearImmediate" => "clearTimeout",
+        "setTimeout" | "setInterval" | "setImmediate" | "clearTimeout" | "clearInterval"
+        | "clearImmediate" => method,
         _ => return None,
     };
     Some(crate::builtins::call_builtin_function(

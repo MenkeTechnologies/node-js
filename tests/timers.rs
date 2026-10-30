@@ -352,6 +352,29 @@ fn a_handle_coerces_to_its_timer_id_and_clears_by_either() {
     assert_eq!(run(src), "number true true\ndone");
 }
 
+/// Each `clear*` clears only its own kind, as `lib/timers.js` does:
+/// `clearTimeout`/`clearInterval` take a `Timeout`, or a number or string a
+/// `Timeout` has coerced to (`knownTimersById`), and ignore an `Immediate`;
+/// `clearImmediate` takes only an `Immediate`. Any of the three cancelled
+/// any timer by id here. Expected output from node v26.12.1.
+#[test]
+fn each_clear_function_clears_only_its_own_kind() {
+    let src = r#"
+const out = [];
+const i1 = setImmediate(() => out.push("imm1")); clearTimeout(i1); clearInterval(i1);
+const t1 = setTimeout(() => out.push("t1"), 1); clearImmediate(t1);
+const t2 = setTimeout(() => out.push("t2 (cleared by id)"), 1); clearTimeout(+t2);
+const t3 = setTimeout(() => out.push("t3"), 1); clearTimeout(Number(String(t3)) + 1000);
+const t4 = setTimeout(() => out.push("t4 (cleared by string)"), 1); clearTimeout(`${t4}`);
+const i2 = setImmediate(() => out.push("imm2 (cleared)")); clearImmediate(i2);
+const iv = setInterval(() => { out.push("iv"); clearInterval(iv); }, 1);
+const t5 = setTimeout(() => out.push("t5 (cleared by interval)"), 1); clearInterval(t5);
+const i3 = setImmediate(() => out.push("imm3 (timers.clearImmediate)")); require("timers").clearImmediate(i3);
+setTimeout(() => console.log(out.join("\n")), 20);
+"#;
+    assert_eq!(run(src), "imm1\nt1\nt3\niv");
+}
+
 // ── unref semantics ──────────────────────────────────────────────────────────
 
 /// An unref'd timer still fires while the loop is alive for another reason, but
