@@ -311,6 +311,31 @@ exitCode exit 4";
     assert_eq!(run(src), expected);
 }
 
+/// `Blob.prototype.stream()` is node's `createBlobReaderStream`: a byte
+/// stream that yields one `Uint8Array` per part of the blob (a nested blob's
+/// parts included, empty parts skipped, a slice cut to its range), and serves
+/// a BYOB reader. It threw `Response.body streaming is not implemented`.
+/// Expected output from node v26.12.1.
+#[test]
+fn blob_stream_yields_one_chunk_per_part() {
+    let src = r#"
+async function chunks(b) { const out = []; for await (const c of b.stream()) out.push(Object.prototype.toString.call(c) + ":" + Buffer.from(c).toString()); return out.join(" | "); }
+(async () => {
+  console.log(await chunks(new Blob(["ab", "cd"])));
+  console.log(await chunks(new Blob(["ab", "", new Uint8Array([99, 100]), new Blob(["x", "y"])])));
+  console.log(await chunks(new Blob(["abc", "def", "ghi"]).slice(1, 7)));
+  console.log(await chunks(new Blob([])));
+  console.log(await chunks(new File(["f1", "f2"], "n")));
+  const r = new Blob(["ab", "cd"]).stream().getReader({ mode: "byob" });
+  console.log(r.constructor.name);
+  const s = new Blob(["q"]).stream(); console.log(s.constructor.name, s.locked);
+  const rd = new Blob(["a", "b"]).stream().getReader(); console.log(JSON.stringify(await rd.read()), (await rd.read()).value.length, JSON.stringify(await rd.read()));
+})();
+"#;
+    let expected = "[object Uint8Array]:ab | [object Uint8Array]:cd\n[object Uint8Array]:ab | [object Uint8Array]:cd | [object Uint8Array]:x | [object Uint8Array]:y\n[object Uint8Array]:bc | [object Uint8Array]:def | [object Uint8Array]:g\n\n[object Uint8Array]:f1 | [object Uint8Array]:f2\nReadableStreamBYOBReader\nReadableStream false\n{\"done\":false,\"value\":{\"0\":97}} 1 {\"done\":true}";
+    assert_eq!(run(src), expected);
+}
+
 // ── array iteration is live ──────────────────────────────────────────────────
 
 /// An array iterator reads the array at every step (23.1.5.1). `for-of`, spread

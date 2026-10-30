@@ -569,11 +569,10 @@ pub fn body_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, St
                 .unwrap_or(bytes.len())
                 .clamp(start, bytes.len());
             let ct = args.get(2).map(str_of).unwrap_or_default();
-            Ok(new_blob(&bytes[start..end], &ct, None))
+            let parts = slice_parts(&blob_parts(recv), start, end);
+            Ok(new_blob_parts(&bytes[start..end], &parts, &ct, None))
         }
-        "stream" => Err(crate::host::type_error(
-            "Response.body streaming is not implemented on this build",
-        )),
+        "stream" => blob_stream(recv),
         _ => Err(crate::host::type_error(&format!(
             "{method} is not a function"
         ))),
@@ -609,7 +608,29 @@ fn percent_decode(s: &str) -> String {
 // ── Blob / File ──────────────────────────────────────────────────────────────
 
 fn new_blob(bytes: &[u8], content_type: &str, file_name: Option<&str>) -> Value {
+    new_blob_parts(bytes, &[bytes.len()], content_type, file_name)
+}
+
+/// A `Blob` (or `File`) over `bytes`, made of parts of the lengths `parts`
+/// (summing to `bytes.len()`). node keeps a blob as the list of its parts — a
+/// `DataQueue` entry each — and `stream()` reads it part by part, so the
+/// boundaries are observable as its chunks.
+fn new_blob_parts(
+    bytes: &[u8],
+    parts: &[usize],
+    content_type: &str,
+    file_name: Option<&str>,
+) -> Value {
     let body = store_body(bytes);
+    let part_lens = with_host(|h| {
+        h.new_array(
+            parts
+                .iter()
+                .filter(|&&n| n > 0)
+                .map(|&n| Value::Float(n as f64))
+                .collect(),
+        )
+    });
     let obj = with_host(|h| {
         let mut m = IndexMap::new();
         m.insert(
@@ -623,10 +644,83 @@ fn new_blob(bytes: &[u8], content_type: &str, file_name: Option<&str>) -> Value 
             m.insert("lastModified".into(), Value::Float(0.0));
         }
         m.insert("@@body".into(), body);
+        m.insert("@@parts".into(), part_lens);
         h.new_object(m)
     });
-    with_host(|h| h.hide_prop(&obj, "@@body"));
+    with_host(|h| {
+        h.hide_prop(&obj, "@@body");
+        h.hide_prop(&obj, "@@parts");
+    });
     obj
+}
+
+/// The lengths of a blob's non-empty parts, in order.
+fn blob_parts(blob: &Value) -> Vec<usize> {
+    let Some(arr) = prop(blob, "@@parts") else {
+        let n = body_bytes(blob).len();
+        return if n > 0 { vec![n] } else { Vec::new() };
+    };
+    with_host(|h| match h.get(&arr) {
+        Some(JsObj::Array(items)) => items.iter().map(|v| h.to_number(v) as usize).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// The parts of the byte range `start..end` of a blob made of `parts`: each
+/// part cut to the range, as slicing a `DataQueue` keeps its entries.
+fn slice_parts(parts: &[usize], start: usize, end: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for &n in parts {
+        let (lo, hi) = (at.max(start), (at + n).min(end));
+        if lo < hi {
+            out.push(hi - lo);
+        }
+        at += n;
+    }
+    out
+}
+
+/// The part lengths a `BlobPart` list contributes: a blob part brings its own
+/// parts, anything else is one part.
+fn parts_of(parts: &[Value]) -> (Vec<u8>, Vec<usize>) {
+    let mut bytes = Vec::new();
+    let mut lens = Vec::new();
+    for p in parts {
+        let b = blob_part_bytes(p);
+        match super::native_tag(p).as_deref() {
+            Some("Blob") | Some("File") => lens.extend(blob_parts(p)),
+            _ => lens.push(b.len()),
+        }
+        bytes.extend(b);
+    }
+    (bytes, lens)
+}
+
+/// `Blob.prototype.stream()`: node's `createBlobReaderStream`
+/// (`lib/internal/blob.js`, ported in `blob_stream.js`) over a reader that
+/// hands back one part per pull, as the in-memory `DataQueue` reader does.
+fn blob_stream(blob: &Value) -> Result<Value, String> {
+    thread_local! {
+        static MAKE: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    let make = match MAKE.with(|m| m.borrow().clone()) {
+        Some(f) => f,
+        None => {
+            let f = crate::eval_internal(include_str!("blob_stream.js"))?;
+            MAKE.with(|m| *m.borrow_mut() = Some(f.clone()));
+            f
+        }
+    };
+    let bytes = body_bytes(blob);
+    let mut at = 0;
+    let mut chunks = Vec::new();
+    for n in blob_parts(blob) {
+        chunks.push(to_uint8array(&bytes[at..at + n])?);
+        at += n;
+    }
+    let chunks = with_host(|h| h.new_array(chunks));
+    crate::host::invoke(&make, vec![chunks], None)
 }
 
 /// One `BlobPart`: a `body_init_bytes` source, except that a `null` part is
@@ -642,35 +736,33 @@ fn blob_part_bytes(p: &Value) -> Vec<u8> {
 }
 
 pub fn construct_blob(args: &[Value]) -> Result<Value, String> {
-    let mut bytes = Vec::new();
-    if let Some(parts) = args.first() {
-        for p in crate::host::iter_all(parts).unwrap_or_default() {
-            bytes.extend(blob_part_bytes(&p));
-        }
-    }
+    let parts = match args.first() {
+        Some(parts) => crate::host::iter_all(parts).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let (bytes, lens) = parts_of(&parts);
     let ct = args
         .get(1)
         .and_then(|o| prop(o, "type"))
         .map(|v| str_of(&v))
         .unwrap_or_default();
-    Ok(new_blob(&bytes, &ct, None))
+    Ok(new_blob_parts(&bytes, &lens, &ct, None))
 }
 
 /// `new File(parts, name[, options])` — a `Blob` that also carries a name.
 pub fn construct_file(args: &[Value]) -> Result<Value, String> {
-    let mut bytes = Vec::new();
-    if let Some(parts) = args.first() {
-        for p in crate::host::iter_all(parts).unwrap_or_default() {
-            bytes.extend(blob_part_bytes(&p));
-        }
-    }
+    let parts = match args.first() {
+        Some(parts) => crate::host::iter_all(parts).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let (bytes, lens) = parts_of(&parts);
     let name = super::arg_str(args, 1);
     let ct = args
         .get(2)
         .and_then(|o| prop(o, "type"))
         .map(|v| str_of(&v))
         .unwrap_or_default();
-    Ok(new_blob(&bytes, &ct, Some(&name)))
+    Ok(new_blob_parts(&bytes, &lens, &ct, Some(&name)))
 }
 
 // ── FormData ─────────────────────────────────────────────────────────────────
