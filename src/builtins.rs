@@ -7710,7 +7710,7 @@ pub fn eval_source(arg: Option<&Value>, direct: bool) -> Result<Value, String> {
         direct && with_host(|h| h.in_with_scope()),
     )?);
     if !direct {
-        return host::run_chunk_in_global_scope(chunk);
+        return host::run_chunk_in_eval_scope(chunk);
     }
     // A STRICT direct eval gets its OWN variable environment (19.2.1.1 step 12),
     // so its `var`s and function declarations die with it. Only a SLOPPY one

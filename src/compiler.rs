@@ -592,6 +592,9 @@ pub fn compile_completion_strict(
     b.emit(Op::Pop, 0);
     c.completion = true;
     c.hoist_vars(&mut b, stmts)?;
+    // The eval's own `let`/`const`/`class` exist from its start, in their dead
+    // zone (19.2.1.3 EvalDeclarationInstantiation step 15), as a script's do.
+    c.hoist_lexical(&mut b, stmts);
     c.hoist_funcs(&mut b, stmts)?;
     c.compile_stmts(&mut b, stmts)?;
     c.completion = false;

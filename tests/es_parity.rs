@@ -237,6 +237,45 @@ strict index Cannot assign to read only property 'length' of object '[object Arr
     assert_eq!(run(src), expected);
 }
 
+/// The top level of eval code has a temporal dead zone (19.2.1.3 step 15): a
+/// `let`, `const` or `class` read before its declaration is the TDZ
+/// `ReferenceError` in a direct eval, an indirect one and `vm.runInThisContext`
+/// alike, where it read as unbound (`typeof` answered `"undefined"`). An
+/// indirect eval's lexical declarations live in their own environment and do
+/// not become globals; `vm` script ones do. Expected output from node v26.12.1.
+#[test]
+fn eval_code_has_a_dead_zone_at_its_top_level() {
+    let src = r#"
+eval("let q = 1"); console.log(typeof q);
+(0, eval)("let q2 = 1"); console.log(typeof q2);
+function f() { eval("let r = 1; var v = 2"); return [typeof r, typeof v]; } console.log(f());
+let outer = 5; console.log(eval("let outer = 6; outer"), outer);
+try { eval("x; const x = 1;"); console.log("noerr"); } catch (e) { console.log(e.constructor.name, e.message); }
+try { eval("typeof y; let y = 1;"); console.log("noerr"); } catch (e) { console.log(e.constructor.name, e.message); }
+try { (0,eval)("z; let z = 1;"); console.log("noerr"); } catch (e) { console.log(e.constructor.name, e.message); }
+try { eval("{ w; let w = 1; }"); console.log("noerr"); } catch (e) { console.log(e.constructor.name, e.message); }
+try { eval("function g(){ return k } g(); let k = 1;"); console.log("noerr"); } catch (e) { console.log(e.constructor.name, e.message); }
+try { eval("new C(); class C {}"); console.log("noerr"); } catch (e) { console.log(e.constructor.name, e.message); }
+console.log(eval("let a1 = 3; a1 * 2"));
+const vm = require("vm"); try { vm.runInThisContext("m; let m = 1"); } catch (e) { console.log(e.constructor.name, e.message); }
+try { new Function("n; let n = 1")(); } catch (e) { console.log(e.constructor.name, e.message); }
+"#;
+    let expected = "undefined\n\
+undefined\n\
+[ 'undefined', 'number' ]\n\
+6 5\n\
+ReferenceError Cannot access 'x' before initialization\n\
+ReferenceError Cannot access 'y' before initialization\n\
+ReferenceError Cannot access 'z' before initialization\n\
+ReferenceError Cannot access 'w' before initialization\n\
+ReferenceError Cannot access 'k' before initialization\n\
+ReferenceError Cannot access 'C' before initialization\n\
+6\n\
+ReferenceError Cannot access 'm' before initialization\n\
+ReferenceError Cannot access 'n' before initialization";
+    assert_eq!(run(src), expected);
+}
+
 // ── array iteration is live ──────────────────────────────────────────────────
 
 /// An array iterator reads the array at every step (23.1.5.1). `for-of`, spread

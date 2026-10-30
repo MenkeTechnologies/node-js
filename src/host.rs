@@ -4575,12 +4575,24 @@ pub fn run_chunk_in_global_scope(chunk: Chunk) -> Result<Value, String> {
     // lifted for the duration, or `(0, eval)('var g = 1')` stopped reaching
     // `globalThis.g`.
     let prev_scope = with_host(|h| std::mem::take(&mut h.module_scope));
-    let out = run_chunk_in_global_scope_inner(chunk);
+    let out = run_chunk_in_global_scope_inner(chunk, false);
     with_host(|h| h.module_scope = prev_scope);
     out
 }
 
-fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
+/// [`run_chunk_in_global_scope`] for an INDIRECT eval, whose `let`, `const`
+/// and `class` live in a fresh declarative environment under the global one
+/// (19.2.1.1 `PerformEval` step 16) and die with it, while its `var`s still
+/// bind globally. A script (`vm.runInThisContext`) shares the global lexical
+/// scope instead.
+pub fn run_chunk_in_eval_scope(chunk: Chunk) -> Result<Value, String> {
+    let prev_scope = with_host(|h| std::mem::take(&mut h.module_scope));
+    let out = run_chunk_in_global_scope_inner(chunk, true);
+    with_host(|h| h.module_scope = prev_scope);
+    out
+}
+
+fn run_chunk_in_global_scope_inner(chunk: Chunk, own_lexical: bool) -> Result<Value, String> {
     let global_env = with_host(|h| h.global_env.clone());
     with_host(|h| {
         h.settle_op_pos();
@@ -4599,7 +4611,10 @@ fn run_chunk_in_global_scope_inner(chunk: Chunk) -> Result<Value, String> {
             owner: None,
             is_module: true,
             this_state: ThisState::Plain,
-        })
+        });
+        if own_lexical {
+            h.push_scope();
+        }
     });
     let r = run_chunk_on(chunk);
     with_host(|h| {
