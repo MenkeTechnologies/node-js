@@ -343,6 +343,44 @@ for await b
     );
 }
 
+/// The unsettled top-level `await` warning names each module of the entry's
+/// graph that is stalled in its OWN body — not the entry, and not a module
+/// that only waits on a dependency — with node's source arrow under that
+/// module's `await` and the three blank lines behind it. Captured from node
+/// v26.12.1 with the directory prefix removed.
+#[test]
+fn unsettled_await_warning_points_at_the_stalled_await() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for (name, src) in [
+        (
+            "main.mjs",
+            "import \"./a.mjs\";\nimport \"./b.mjs\";\nawait 1;\n",
+        ),
+        (
+            "a.mjs",
+            "const x = 1;\n  const v = await  new Promise(() => {});\n",
+        ),
+        (
+            "b.mjs",
+            "import \"./a.mjs\";\nexport let y = await new Promise(() => {}).then(x => x);\n",
+        ),
+    ] {
+        std::fs::write(dir.path().join(name), src).expect("write module");
+    }
+    let out = run_in(dir.path(), &["main.mjs"], None);
+    assert_eq!(out.status.code(), Some(13));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let head = "Warning: Detected unsettled top-level await at file://";
+    let rest = stderr
+        .strip_prefix(head)
+        .unwrap_or_else(|| panic!("{stderr}"));
+    let rest = &rest[rest.find("/a.mjs:").unwrap_or_else(|| panic!("{stderr}"))..];
+    assert_eq!(
+        rest,
+        "/a.mjs:2\n  const v = await  new Promise(() => {});\n            ^\n\n\n\n"
+    );
+}
+
 /// The exit status of an entry module that never finishes its top-level
 /// `await` is 13 (unless the program set one), with node's warning; one that
 /// throws or rejects exits 1 after printing what ran first.

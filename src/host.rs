@@ -764,6 +764,10 @@ pub struct PromiseCell {
     /// True once a rejection has been observed by a handler (`.then`/`.catch`),
     /// so the loop doesn't report it as unhandled.
     pub handled: bool,
+    /// For the result promise of an async body: the source position of the
+    /// `await` it is suspended in (0 when running, done, or not an async
+    /// body). What node's unsettled top-level `await` warning points at.
+    pub await_pos: u32,
 }
 
 /// A pending Promise reaction: a user `.then` (JS handlers + a result promise) or
@@ -4755,7 +4759,7 @@ pub fn preserving_fatal_state<R>(f: impl FnOnce() -> R) -> R {
 /// `src/node_errors.cc`): `file:line`, the source line, and a caret line that
 /// copies the line's tabs and puts one `^` under the column — V8 reports a
 /// raise as the one-character range `[pos, pos + 1)`.
-fn source_arrow(h: &JsHost, pos: u32) -> Option<String> {
+pub fn source_arrow(h: &JsHost, pos: u32) -> Option<String> {
     let l = h.source_location(pos).filter(|l| !l.internal)?;
     let mut caret: String = l
         .source_line
@@ -12185,6 +12189,7 @@ impl JsHost {
             value: Value::Undef,
             reactions: Vec::new(),
             handled: false,
+            await_pos: 0,
         });
         self.alloc(JsObj::Promise { id })
     }
@@ -12585,7 +12590,9 @@ fn run_async(gen: Value) -> Value {
 /// Resume an async coroutine one step, wiring `await` continuations to promise
 /// settlement.
 fn drive_async(gen: Value, rid: u32, send: Value) {
-    match gen_resume(&gen, send) {
+    let step = gen_resume(&gen, send);
+    with_host(|h| h.promises[rid as usize].await_pos = AWAIT_POS.with(|p| p.replace(0)));
+    match step {
         Ok(GenStep::Yield(awaited)) => {
             let ap = promise_of(&awaited);
             let aid = with_host(|h| h.promise_id(&ap).unwrap());
@@ -12616,7 +12623,10 @@ fn drive_async(gen: Value, rid: u32, send: Value) {
 
 /// The AWAIT op body (runs inside the async coroutine): suspend, yielding the
 /// awaited value; on resume, unwrap the settlement packet (throwing on reject).
-pub fn await_value(awaited: Value) -> Result<Value, String> {
+///
+/// `pos` is the `await` keyword's source position, which the driver records
+/// on the body's result promise while it is suspended there.
+pub fn await_value(awaited: Value, pos: u32) -> Result<Value, String> {
     // Inside an `async function*`, `await` and `yield` share one coroutine
     // yielder, so an awaited value has to be tagged or the driver would hand it
     // to the consumer as if the body had yielded it.
@@ -12628,6 +12638,7 @@ pub fn await_value(awaited: Value) -> Result<Value, String> {
         }),
         _ => awaited,
     };
+    AWAIT_POS.with(|p| p.set(pos));
     let packet = gen_yield(awaited)?;
     let items = with_host(|h| h.iter_vec(&packet)).unwrap_or_default();
     let tag = items
@@ -12641,6 +12652,22 @@ pub fn await_value(awaited: Value) -> Result<Value, String> {
     } else {
         Ok(val)
     }
+}
+
+thread_local! {
+    /// The position of the `await` a coroutine has just suspended in, handed
+    /// from [`await_value`] (inside the coroutine) to the driver that resumed
+    /// it, which takes it on the yield.
+    static AWAIT_POS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The `await` position the async body settling promise `p` is suspended in,
+/// or 0.
+pub fn suspended_await_pos(p: &Value) -> u32 {
+    with_host(|h| {
+        h.promise_id(p)
+            .map_or(0, |id| h.promises[id as usize].await_pos)
+    })
 }
 
 /// Hidden key marking an `await` suspension inside an async generator.
@@ -12766,6 +12793,7 @@ fn drive_async_gen(gen: Value, sid: u32, packet: Value) {
 /// body's completion. Shared by the initial resume of a queued request and by
 /// every await-resumption of it.
 fn settle_async_gen_step(gen: Value, sid: u32, step: Result<GenStep, String>) {
+    with_host(|h| h.promises[sid as usize].await_pos = AWAIT_POS.with(|p| p.replace(0)));
     let id = match with_host(|h| match h.get(&gen) {
         Some(JsObj::Generator { id }) => Some(*id),
         _ => None,

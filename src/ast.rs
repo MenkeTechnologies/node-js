@@ -167,8 +167,9 @@ pub enum Expr {
         arg: Option<Box<Expr>>,
         delegate: bool,
     },
-    /// `await expr` (async function).
-    Await(Box<Expr>),
+    /// `await expr` (async function), at the `await` keyword: where a
+    /// suspension that never resumes is reported.
+    Await(Box<Expr>, Pos),
     /// A `class` expression.
     Class(Box<ClassNode>),
 

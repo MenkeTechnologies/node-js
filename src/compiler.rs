@@ -3382,9 +3382,11 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::NEW_TARGET, 0), 0);
             }
             Expr::Yield { arg, delegate } => self.compile_yield(b, arg, *delegate)?,
-            Expr::Await(inner) => {
+            Expr::Await(inner, pos) => {
                 self.compile_expr(b, inner)?;
+                let start = b.current_pos();
                 b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0);
+                self.mark_pos(b, start, *pos, PosScope::Operation);
             }
             Expr::Sequence(items) => {
                 for (i, it) in items.iter().enumerate() {

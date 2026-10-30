@@ -2387,12 +2387,13 @@ impl Parser {
                     }
                     "import" if !self.peek_punct_at(1, "(") => Err(self.unexpected()),
                     "await" if self.in_async => {
+                        let pos = self.pos_here();
                         self.advance();
                         let e = self.parse_unary()?;
                         // An AwaitExpression is a UnaryExpression, so it too
                         // cannot sit directly left of `**`.
                         self.reject_unary_before_pow()?;
-                        Ok(Expr::Await(Box::new(e)))
+                        Ok(Expr::Await(Box::new(e), pos))
                     }
                     _ if is_keyword(&s) => Err(self.unexpected()),
                     // The future-reserved words are not identifiers in strict code.

@@ -54,6 +54,9 @@
       meta: undefined,
       fn: undefined,
       gen: undefined,
+      // What the body returned when it ran asynchronously: the promise an
+      // unsettled top-level `await` leaves pending.
+      body: undefined,
       getters: undefined,
       // Synthetic records: export names and, once evaluated, their values.
       exportNames: undefined,
@@ -506,7 +509,8 @@
   }
 
   function executeAsyncModule(m) {
-    Promise.resolve(executeModule(m)).then(
+    m.body = executeModule(m);
+    Promise.resolve(m.body).then(
       () => asyncModuleExecutionFulfilled(m),
       (e) => asyncModuleExecutionRejected(m, e),
     );
@@ -570,6 +574,7 @@
    *  node's asynchronous loader does. */
   function runMain(file, url, isMain) {
     const m = recordFor([url, file, 'module'], undefined);
+    mainModule = m;
     m.isMain = isMain;
     loadGraph(m);
     link(m);
@@ -588,11 +593,33 @@
     });
   }
 
-  /** Whether the entry module's evaluation is still waiting on a top-level
-   *  `await` — node's exit status 13 when the loop drains that way. */
+  /** The entry module's evaluation, when the loop drains with it still
+   *  waiting on a top-level `await` (node's exit status 13): `[url, body]` for
+   *  each module of its graph that is itself suspended in one, found as V8's
+   *  SourceTextModule::InnerGetStalledTopLevelAwaitModule finds them — a
+   *  module still evaluating asynchronously with no async dependency left
+   *  pending is stalled in its own body; any other is searched through its
+   *  requested modules, each visited once. `undefined` once it has settled. */
   let mainSettled = true;
+  let mainModule;
   function mainUnsettled() {
-    return !mainSettled;
+    if (mainSettled) return undefined;
+    const stalled = [];
+    const visited = new Set();
+    const search = (m) => {
+      if (m.pendingAsyncDependencies === 0 && m.asyncEvaluation) {
+        stalled.push([m.url, m.body]);
+        return;
+      }
+      for (const r of m.requested) {
+        if (r.cyclic && !visited.has(r)) {
+          visited.add(r);
+          search(r);
+        }
+      }
+    };
+    search(mainModule);
+    return stalled;
   }
 
   function attributesOf(options) {

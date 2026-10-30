@@ -233,7 +233,7 @@ fn stmt_slot_safe(s: &Stmt) -> bool {
 fn expr_slot_safe(e: &Expr) -> bool {
     let all = |xs: &[Expr]| xs.iter().all(expr_slot_safe);
     match e {
-        Expr::Yield { .. } | Expr::Await(_) => false,
+        Expr::Yield { .. } | Expr::Await(..) => false,
         // `delete x` is a binding operation a slot cannot express — the NAME is
         // refused in the walk, the statement holding it is fine.
         Expr::Unary(_, inner) | Expr::Spread(inner) => expr_slot_safe(inner),
@@ -514,7 +514,7 @@ impl Planner {
                     self.walk_expr(inner);
                 }
             }
-            Expr::Unary(_, inner) | Expr::Spread(inner) | Expr::Await(inner) => {
+            Expr::Unary(_, inner) | Expr::Spread(inner) | Expr::Await(inner, _) => {
                 self.walk_expr(inner)
             }
             Expr::Yield { arg: Some(a), .. } => self.walk_expr(a),
@@ -707,9 +707,10 @@ fn collect_escaping_expr(e: &Expr, out: &mut FxHashSet<String>) {
         // class body is resolved from the environment when that chunk runs.
         Expr::Function { .. } | Expr::Class(_) => collect_all_idents_expr(e, out),
         Expr::Ident(_) | Expr::Null | Expr::Undefined | Expr::True | Expr::False => {}
-        Expr::Unary(_, x) | Expr::Spread(x) | Expr::Await(x) | Expr::Member { object: x, .. } => {
-            collect_escaping_expr(x, out)
-        }
+        Expr::Unary(_, x)
+        | Expr::Spread(x)
+        | Expr::Await(x, _)
+        | Expr::Member { object: x, .. } => collect_escaping_expr(x, out),
         Expr::Yield { arg: Some(a), .. } => collect_escaping_expr(a, out),
         Expr::Template { exprs, .. } => exprs.iter().for_each(|x| collect_escaping_expr(x, out)),
         Expr::TaggedTemplate { tag, exprs, .. } => {
@@ -917,9 +918,10 @@ fn collect_all_idents_expr(e: &Expr, out: &mut FxHashSet<String>) {
                 crate::ast::FnBody::Expr(x) => collect_all_idents_expr(x, out),
             }
         }
-        Expr::Unary(_, x) | Expr::Spread(x) | Expr::Await(x) | Expr::Member { object: x, .. } => {
-            collect_all_idents_expr(x, out)
-        }
+        Expr::Unary(_, x)
+        | Expr::Spread(x)
+        | Expr::Await(x, _)
+        | Expr::Member { object: x, .. } => collect_all_idents_expr(x, out),
         Expr::Yield { arg: Some(a), .. } => collect_all_idents_expr(a, out),
         Expr::Template { exprs, .. } => all(exprs, out),
         Expr::TaggedTemplate { tag, exprs, .. } => {

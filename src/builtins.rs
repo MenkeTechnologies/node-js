@@ -344,7 +344,7 @@ fn b_def_accessor(vm: &mut VM, _: u8) -> Value {
 
 fn b_await(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
-    match host::await_value(v) {
+    match host::await_value(v, op_pos(vm)) {
         Ok(r) => r,
         Err(e) => abort(vm, e),
     }

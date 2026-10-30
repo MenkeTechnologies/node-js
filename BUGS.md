@@ -3343,6 +3343,10 @@ How it is built, so the divergences below can be read against it:
   GetExportedNames, the namespace exotic object (a `Proxy` over a sealed
   null-prototype target), Evaluate/InnerModuleEvaluation and the async
   evaluation steps. CommonJS, JSON and core modules are synthetic records.
+- An entry left suspended when the loop drains is searched as V8's
+  `InnerGetStalledTopLevelAwaitModule` searches it; each module stalled in
+  its own body is reported at the `await` it is suspended in, which the
+  driver records on the body's result promise.
 
 Still open:
 
@@ -3353,7 +3357,6 @@ Still open:
 | a read of an imported binding | a direct binding access | one extra closure call (`%imp[k]()`): 300k calls of an imported function took 2893 ms against 1947 ms for a local one (debug build) |
 | `import * as p from 'process'` (and other core modules) `Object.keys(p)` | every key `Object.keys(process)` lists in node (84) | the keys this runtime enumerates (47). A named import of a member it does not list but that reads back defined (`import { argv } from 'process'`) still links |
 | core-module named exports | a snapshot, refreshed by `module.syncBuiltinESMExports()` | read from the module object on each access |
-| unsettled top-level `await` | the warning names `file:///…:line` and shows the source line | the warning names the module URL only (exit status 13 matches) |
 | `require()` of an ES module that is still evaluating (a cycle through `require`) | `ERR_REQUIRE_CYCLE_MODULE` | the namespace, partially evaluated |
 | `--import`, `--loader`, `module.register` hooks; `data:` URLs; `--input-type`; WebAssembly and source-phase imports | supported | absent |
 | `--dump-ast`, `--dump-bytecode`, `--disasm`, `--tiers`, `--build`, `--dap` on a module file | — | parse the file as a script |

@@ -119,7 +119,7 @@ pub fn expr_captures(e: &Expr) -> bool {
             expr_captures(tag) || exprs.iter().any(expr_captures)
         }
         Expr::Yield { arg, .. } => arg.as_deref().is_some_and(expr_captures),
-        Expr::Await(inner) | Expr::Spread(inner) | Expr::Unary(_, inner) => expr_captures(inner),
+        Expr::Await(inner, _) | Expr::Spread(inner) | Expr::Unary(_, inner) => expr_captures(inner),
         Expr::Array(items) | Expr::Sequence(items) => items.iter().any(expr_captures),
         Expr::Object(props) => props.iter().any(prop_captures),
         Expr::Logical(_, l, r) | Expr::Binary(_, l, r) => expr_captures(l) || expr_captures(r),
@@ -180,7 +180,7 @@ fn mentions_eval(e: &Expr) -> bool {
         Expr::Conditional { test, cons, alt } => {
             mentions_eval(test) || mentions_eval(cons) || mentions_eval(alt)
         }
-        Expr::Unary(_, inner) | Expr::Await(inner) | Expr::Spread(inner) => mentions_eval(inner),
+        Expr::Unary(_, inner) | Expr::Await(inner, _) | Expr::Spread(inner) => mentions_eval(inner),
         _ => false,
     }
 }

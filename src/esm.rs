@@ -342,7 +342,7 @@ impl AwaitProbe<'_> {
             return;
         }
         match e {
-            Expr::Await(_) => *self.found = true,
+            Expr::Await(..) => *self.found = true,
             // A nested function's `await` belongs to it.
             Expr::Function { .. } => {}
             // Class bodies are functions too, but a computed key or the
@@ -483,7 +483,7 @@ fn walk_expr_children(e: &Expr, ex: &mut dyn FnMut(&Expr)) {
             exprs.iter().for_each(&mut *ex);
         }
         Expr::Yield { arg, .. } => arg.iter().for_each(|x| ex(x)),
-        Expr::Await(x) | Expr::Spread(x) | Expr::Unary(_, x) => ex(x),
+        Expr::Await(x, _) | Expr::Spread(x) | Expr::Unary(_, x) => ex(x),
         Expr::Array(items) | Expr::Sequence(items) => items.iter().for_each(&mut *ex),
         Expr::Object(props) => {
             for p in props {
@@ -1061,7 +1061,7 @@ impl Rewriter<'_> {
                     self.expr(a);
                 }
             }
-            Expr::Await(x) | Expr::Spread(x) | Expr::Unary(_, x) => self.expr(x),
+            Expr::Await(x, _) | Expr::Spread(x) | Expr::Unary(_, x) => self.expr(x),
             Expr::Array(items) | Expr::Sequence(items) => {
                 items.iter_mut().for_each(|x| self.expr(x))
             }
@@ -2100,7 +2100,6 @@ pub fn main_program(entry: &str, source: Option<String>, is_main: bool) -> Vec<S
     if let Some(text) = source {
         VIRTUAL.with(|v| v.borrow_mut().insert(entry.to_string(), text));
     }
-    ENTRY_URL.with(|u| *u.borrow_mut() = file_url(entry));
     // The entry module's body runs in a function of its own; the program
     // frame that starts the loader is no part of a stack node prints.
     with_host(|h| h.module_frame_done = true);
@@ -2144,26 +2143,40 @@ pub fn namespace_refusal(recv: &Value, op: Refused, key: &str) -> Option<String>
 /// When the event loop has drained with the ENTRY module still suspended in a
 /// top-level `await`, node warns and exits 13 (unless the program chose an
 /// exit code). Called once the loop is empty, before the `exit` event.
+///
+/// node prints one warning per module of the entry's graph that is stalled in
+/// its own body (`ModuleWrap`'s check over V8's stalled-module messages), each
+/// with the source arrow of the `await` it is suspended in, then the blank
+/// lines its `FormatErrorMessage` leaves behind an empty reason.
 pub fn settle_unfinished_entry() -> Result<(), String> {
     if LOADER.with(|l| l.borrow().is_none()) {
         return Ok(());
     }
     let pending = loader_call("mainUnsettled", Vec::new())?;
-    if !with_host(|h| h.truthy(&pending)) {
+    if matches!(pending, Value::Undef) {
         return Ok(());
     }
-    let url = ENTRY_URL.with(|u| u.borrow().clone());
+    let stalled = with_host(|h| h.iter_vec(&pending)).unwrap_or_default();
+    let mut out = String::new();
+    for entry in stalled {
+        let pair = with_host(|h| h.iter_vec(&entry)).unwrap_or_default();
+        let url = with_host(|h| h.str_of(pair.first().unwrap_or(&Value::Undef)));
+        let pos = pair.get(1).map_or(0, host::suspended_await_pos);
+        out.push_str("Warning: Detected unsettled top-level await at ");
+        match with_host(|h| host::source_arrow(h, pos)) {
+            Some(arrow) => {
+                out.push_str(&arrow);
+                out.push_str("\n\n\n");
+            }
+            None => {
+                out.push_str(&url);
+                out.push('\n');
+            }
+        }
+    }
     with_host(|h| {
-        h.write_out(
-            &format!("Warning: Detected unsettled top-level await at {url}\n"),
-            true,
-        );
+        h.write_out(&out, true);
         h.exit_code.get_or_insert(13);
     });
     Ok(())
-}
-
-thread_local! {
-    /// The entry module's URL, named by the unsettled-`await` warning.
-    static ENTRY_URL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
