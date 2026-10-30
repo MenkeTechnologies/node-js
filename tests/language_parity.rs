@@ -1677,3 +1677,27 @@ console.log(d.toLocaleDateString('en-US', { year: '2-digit', month: 'short', day
     let expected = "Fri, 2024, 9\nFriday, AD, 01:05 PM\nF, Feb, 01 PM UTC\nFeb 09, ’24, 5\nF ’24, 01 PM\nFeb ’24\nFeb 2024\n02/24\nFeb 24 AD\n’24\nFeb 9, ’24";
     assert_eq!(run(src), expected);
 }
+
+/// `util.formatWithOptions` applies its bag to every inspect it makes; `%s`
+/// and `%o` spread their own settings over it (node v26.12.1).
+#[test]
+fn format_with_options_applies_the_bag_to_every_inspect() {
+    let src = r##"
+const util = require('util');
+const deep = { a: { b: { c: { d: 1 } } } };
+console.log(util.formatWithOptions({ depth: 0 }, '%O', deep));
+console.log(util.formatWithOptions({ depth: 0 }, 'x', deep, [1, [2, [3]]]));
+console.log(util.formatWithOptions({ depth: 0 }, deep));
+console.log(util.formatWithOptions({ depth: 1 }, '%o', deep));
+console.log(util.formatWithOptions({ depth: 5 }, '%s', deep));
+console.log(util.formatWithOptions({ sorted: true, breakLength: Infinity }, '%O', { b: 1, a: 2 }));
+console.log(util.formatWithOptions({ compact: false }, '%s|%O', { a: 1 }, { a: 1 }));
+console.log(util.formatWithOptions([], '%d', 1));
+console.log(util.format('%O', deep), util.inspect(deep));
+for (const o of [1, null, undefined, 's', () => {}]) {
+  try { util.formatWithOptions(o, 'x'); } catch (e) { console.log(e.name, e.code, `[${e.message}]`); }
+}
+"##;
+    let expected = "{ a: [Object] }\nx { a: [Object] } [ 1, [Array] ]\n{ a: [Object] }\n{\n  a: { b: { c: { d: 1 } } }\n}\n{ a: [Object] }\n{ a: 2, b: 1 }\n{ a: 1 }|{\n  a: 1\n}\n1\n{ a: { b: { c: [Object] } } } { a: { b: { c: [Object] } } }\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received type number (1)]\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received null]\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received undefined]\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received type string ('s')]\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received function ]";
+    assert_eq!(run(src), expected);
+}

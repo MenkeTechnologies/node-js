@@ -7155,7 +7155,7 @@ pub fn set_inspect_show_proxy(s: bool) {
     INSPECT_SHOW_PROXY.with(|x| x.set(s));
 }
 
-fn inspect_show_proxy() -> bool {
+pub(crate) fn inspect_show_proxy() -> bool {
     INSPECT_SHOW_PROXY.with(|x| x.get())
 }
 
@@ -7266,7 +7266,7 @@ pub fn set_inspect_break_length(n: usize) {
     INSPECT_BREAK_LENGTH.with(|x| x.set(n));
 }
 
-fn inspect_compact() -> i64 {
+pub(crate) fn inspect_compact() -> i64 {
     INSPECT_COMPACT.with(|x| x.get())
 }
 
@@ -7282,7 +7282,7 @@ fn inspect_indent_limit() -> i64 {
     inspect_max_depth().saturating_mul(2)
 }
 
-fn inspect_max_depth() -> i64 {
+pub(crate) fn inspect_max_depth() -> i64 {
     INSPECT_MAX_DEPTH.with(|c| c.get())
 }
 

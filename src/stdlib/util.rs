@@ -60,143 +60,35 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 Err(e) => Err(e),
             }
         }
-        // `formatWithOptions(inspectOptions, fmt, ...args)`: the options object
-        // only tunes `inspect` styling, which we do not vary — drop it and format
-        // the remaining arguments exactly like `format`.
-        "formatWithOptions" => match format(args.get(1..).unwrap_or(&[])) {
-            Ok(s) => Ok(with_host(|h| h.new_str(s))),
-            Err(e) => Err(e),
-        },
+        // `formatWithOptions(inspectOptions, fmt, ...args)`: `format`, with
+        // the options bag applied to every value it inspects. A non-object
+        // bag is node's `validateObject` rejection.
+        "formatWithOptions" => {
+            let opts = args.first().cloned().unwrap_or(Value::Undef);
+            let is_object = with_host(|h| {
+                matches!(opts, Value::Obj(_)) && h.type_of(&opts) == "object" && !h.is_null(&opts)
+            });
+            if !is_object {
+                return Some(Err(crate::host::invalid_arg_type(
+                    "inspectOptions",
+                    "argument",
+                    "object",
+                    &opts,
+                )));
+            }
+            apply_inspect_options(&opts);
+            let out = format(args.get(1..).unwrap_or(&[]));
+            reset_inspect_options();
+            out.map(|s| with_host(|h| h.new_str(s)))
+        }
         "inspect" => {
             if let Some(v) = args.first() {
                 crate::builtins::materialize_stack(v);
             }
-            // Honor an options `{ depth: N | null }` (default 2; null = unlimited).
-            let depth = match args.get(1) {
-                Some(opts) => match crate::builtins::get_property(opts, "depth") {
-                    Ok(Value::Undef) => 2,
-                    Ok(v) if with_host(|h| h.is_null(&v)) => i64::MAX,
-                    Ok(v) => {
-                        let n = with_host(|h| h.to_number(&v));
-                        // A NEGATIVE depth is legal and means "already past the
-                        // limit"; only `null` and a non-finite depth mean
-                        // unlimited. Treating anything below zero as unlimited
-                        // made `{ depth: -1 }` print the whole object.
-                        match n {
-                            _ if n.is_nan() || n == f64::INFINITY => i64::MAX,
-                            _ if n == f64::NEG_INFINITY => i64::MIN,
-                            _ => n.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64,
-                        }
-                    }
-                    Err(_) => 2,
-                },
-                None => 2,
-            };
-            crate::host::set_inspect_max_depth(depth);
-            // `compact` (default 3) decides how deep a subtree may be and still
-            // print on one line; `false` means never. `breakLength` (80 here) is
-            // the column budget for that line.
-            let opts = args.get(1).cloned().unwrap_or(Value::Undef);
-            let read = |k: &str| crate::builtins::get_property(&opts, k).unwrap_or(Value::Undef);
-            let compact = match read("compact") {
-                Value::Undef => 3,
-                Value::Bool(false) => 0,
-                // `compact: true` is node's legacy "always join" mode; no depth
-                // gate applies, which a very large number expresses exactly.
-                Value::Bool(true) => i64::MAX,
-                v => with_host(|h| h.to_number(&v)).max(0.0) as i64,
-            };
-            let break_length = match read("breakLength") {
-                Value::Undef => 80,
-                v => {
-                    let n = with_host(|h| h.to_number(&v));
-                    if n.is_finite() {
-                        n.max(0.0) as usize
-                    } else {
-                        usize::MAX
-                    }
-                }
-            };
-            // `sorted` accepts a comparator function in node; only the boolean
-            // form is honored here, and any truthy value turns plain sorting on.
-            // Read the option OUT of the host before borrowing it: `read` borrows
-            // the host itself, so `with_host(|h| h.truthy(&read("sorted")))` is a
-            // nested borrow and aborts the process with "RefCell already
-            // borrowed", which no script can catch.
-            let sorted_opt = read("sorted");
-            let sorted = with_host(|h| h.truthy(&sorted_opt));
-            // `customInspect` defaults to TRUE, so only an explicit `false`
-            // turns a value's own `[util.inspect.custom]` rendering off.
-            let custom_inspect = match read("customInspect") {
-                Value::Undef => true,
-                v => with_host(|h| h.truthy(&v)),
-            };
-            let show_hidden_opt = read("showHidden");
-            let show_hidden = with_host(|h| h.truthy(&show_hidden_opt));
-            // `maxArrayLength: null | Infinity` means "no limit". Node also
-            // accepts 0 (show none but the tail count), which falls out of the
-            // clamp below without a special case.
-            let max_array_length = match read("maxArrayLength") {
-                Value::Undef => crate::host::DEFAULT_MAX_ARRAY_LENGTH,
-                v if with_host(|h| h.is_null(&v)) => usize::MAX,
-                v => {
-                    let n = with_host(|h| h.to_number(&v));
-                    if n.is_finite() {
-                        n.max(0.0) as usize
-                    } else {
-                        usize::MAX
-                    }
-                }
-            };
-            let numeric_separator_opt = read("numericSeparator");
-            let numeric_separator = with_host(|h| h.truthy(&numeric_separator_opt));
-            let show_proxy_opt = read("showProxy");
-            let show_proxy = with_host(|h| h.truthy(&show_proxy_opt));
-            // `maxStringLength: null | Infinity` means "no limit", as for arrays.
-            let max_string_length = match read("maxStringLength") {
-                Value::Undef => crate::host::DEFAULT_MAX_STRING_LENGTH,
-                v if with_host(|h| h.is_null(&v)) => usize::MAX,
-                v => {
-                    let n = with_host(|h| h.to_number(&v));
-                    if n.is_finite() {
-                        n.max(0.0) as usize
-                    } else {
-                        usize::MAX
-                    }
-                }
-            };
-            // `getters: true | 'get' | 'set'`.
-            let getters_opt = read("getters");
-            let getters = with_host(|h| match h.as_str(&getters_opt).as_deref() {
-                Some("get") => 2,
-                Some("set") => 3,
-                _ if h.truthy(&getters_opt) => 1,
-                _ => 0,
-            });
-            crate::host::set_inspect_getters(getters);
-            crate::host::set_inspect_numeric_separator(numeric_separator);
-            crate::host::set_inspect_show_proxy(show_proxy);
-            crate::host::set_inspect_max_string_length(max_string_length);
-            crate::host::set_inspect_compact(compact);
-            crate::host::set_inspect_break_length(break_length);
-            crate::host::set_inspect_sorted(sorted);
-            crate::host::set_inspect_max_array_length(max_array_length);
-            crate::host::set_inspect_custom(custom_inspect);
-            crate::host::set_inspect_show_hidden(show_hidden);
+            apply_inspect_options(&args.get(1).cloned().unwrap_or(Value::Undef));
             let rendered = crate::host::inspect_js(&args.first().cloned().unwrap_or(Value::Undef));
-            let out = rendered.map(|s| with_host(|h| h.new_str(s)));
-            crate::host::set_inspect_max_depth(2);
-            crate::host::set_inspect_compact(3);
-            crate::host::set_inspect_break_length(80);
-            crate::host::set_inspect_sorted(false);
-            crate::host::set_inspect_max_array_length(crate::host::DEFAULT_MAX_ARRAY_LENGTH);
-            crate::host::set_inspect_custom(true);
-            crate::host::set_inspect_getters(0);
-            crate::host::set_inspect_numeric_separator(false);
-            crate::host::set_inspect_show_proxy(false);
-            crate::host::set_inspect_max_string_length(crate::host::DEFAULT_MAX_STRING_LENGTH);
-            crate::host::set_inspect_show_hidden(false);
-            out
+            reset_inspect_options();
+            rendered.map(|s| with_host(|h| h.new_str(s)))
         }
         // `deprecate(fn, msg)`: return a callable that behaves like `fn`. The
         // house rule is no deprecation nags, so no warning is emitted — the
@@ -282,6 +174,139 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "debug" => return Some(debuglog(args)),
         _ => return None,
     })
+}
+
+/// Set every `util.inspect` option `options` names for the next render;
+/// [`reset_inspect_options`] puts the defaults back. Shared by `inspect` and
+/// `formatWithOptions`, which hands the same bag to every `inspect` it makes.
+fn apply_inspect_options(options: &Value) {
+    // Honor an options `{ depth: N | null }` (default 2; null = unlimited).
+    let depth = match Some(options).filter(|o| !matches!(o, Value::Undef)) {
+        Some(opts) => match crate::builtins::get_property(opts, "depth") {
+            Ok(Value::Undef) => 2,
+            Ok(v) if with_host(|h| h.is_null(&v)) => i64::MAX,
+            Ok(v) => {
+                let n = with_host(|h| h.to_number(&v));
+                // A NEGATIVE depth is legal and means "already past the
+                // limit"; only `null` and a non-finite depth mean
+                // unlimited. Treating anything below zero as unlimited
+                // made `{ depth: -1 }` print the whole object.
+                match n {
+                    _ if n.is_nan() || n == f64::INFINITY => i64::MAX,
+                    _ if n == f64::NEG_INFINITY => i64::MIN,
+                    _ => n.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+                }
+            }
+            Err(_) => 2,
+        },
+        None => 2,
+    };
+    crate::host::set_inspect_max_depth(depth);
+    // `compact` (default 3) decides how deep a subtree may be and still
+    // print on one line; `false` means never. `breakLength` (80 here) is
+    // the column budget for that line.
+    let opts = options.clone();
+    let read = |k: &str| crate::builtins::get_property(&opts, k).unwrap_or(Value::Undef);
+    let compact = match read("compact") {
+        Value::Undef => 3,
+        Value::Bool(false) => 0,
+        // `compact: true` is node's legacy "always join" mode; no depth
+        // gate applies, which a very large number expresses exactly.
+        Value::Bool(true) => i64::MAX,
+        v => with_host(|h| h.to_number(&v)).max(0.0) as i64,
+    };
+    let break_length = match read("breakLength") {
+        Value::Undef => 80,
+        v => {
+            let n = with_host(|h| h.to_number(&v));
+            if n.is_finite() {
+                n.max(0.0) as usize
+            } else {
+                usize::MAX
+            }
+        }
+    };
+    // `sorted` accepts a comparator function in node; only the boolean
+    // form is honored here, and any truthy value turns plain sorting on.
+    // Read the option OUT of the host before borrowing it: `read` borrows
+    // the host itself, so `with_host(|h| h.truthy(&read("sorted")))` is a
+    // nested borrow and aborts the process with "RefCell already
+    // borrowed", which no script can catch.
+    let sorted_opt = read("sorted");
+    let sorted = with_host(|h| h.truthy(&sorted_opt));
+    // `customInspect` defaults to TRUE, so only an explicit `false`
+    // turns a value's own `[util.inspect.custom]` rendering off.
+    let custom_inspect = match read("customInspect") {
+        Value::Undef => true,
+        v => with_host(|h| h.truthy(&v)),
+    };
+    let show_hidden_opt = read("showHidden");
+    let show_hidden = with_host(|h| h.truthy(&show_hidden_opt));
+    // `maxArrayLength: null | Infinity` means "no limit". Node also
+    // accepts 0 (show none but the tail count), which falls out of the
+    // clamp below without a special case.
+    let max_array_length = match read("maxArrayLength") {
+        Value::Undef => crate::host::DEFAULT_MAX_ARRAY_LENGTH,
+        v if with_host(|h| h.is_null(&v)) => usize::MAX,
+        v => {
+            let n = with_host(|h| h.to_number(&v));
+            if n.is_finite() {
+                n.max(0.0) as usize
+            } else {
+                usize::MAX
+            }
+        }
+    };
+    let numeric_separator_opt = read("numericSeparator");
+    let numeric_separator = with_host(|h| h.truthy(&numeric_separator_opt));
+    let show_proxy_opt = read("showProxy");
+    let show_proxy = with_host(|h| h.truthy(&show_proxy_opt));
+    // `maxStringLength: null | Infinity` means "no limit", as for arrays.
+    let max_string_length = match read("maxStringLength") {
+        Value::Undef => crate::host::DEFAULT_MAX_STRING_LENGTH,
+        v if with_host(|h| h.is_null(&v)) => usize::MAX,
+        v => {
+            let n = with_host(|h| h.to_number(&v));
+            if n.is_finite() {
+                n.max(0.0) as usize
+            } else {
+                usize::MAX
+            }
+        }
+    };
+    // `getters: true | 'get' | 'set'`.
+    let getters_opt = read("getters");
+    let getters = with_host(|h| match h.as_str(&getters_opt).as_deref() {
+        Some("get") => 2,
+        Some("set") => 3,
+        _ if h.truthy(&getters_opt) => 1,
+        _ => 0,
+    });
+    crate::host::set_inspect_getters(getters);
+    crate::host::set_inspect_numeric_separator(numeric_separator);
+    crate::host::set_inspect_show_proxy(show_proxy);
+    crate::host::set_inspect_max_string_length(max_string_length);
+    crate::host::set_inspect_compact(compact);
+    crate::host::set_inspect_break_length(break_length);
+    crate::host::set_inspect_sorted(sorted);
+    crate::host::set_inspect_max_array_length(max_array_length);
+    crate::host::set_inspect_custom(custom_inspect);
+    crate::host::set_inspect_show_hidden(show_hidden);
+}
+
+/// The `util.inspect` defaults, restored after every render.
+fn reset_inspect_options() {
+    crate::host::set_inspect_max_depth(2);
+    crate::host::set_inspect_compact(3);
+    crate::host::set_inspect_break_length(80);
+    crate::host::set_inspect_sorted(false);
+    crate::host::set_inspect_max_array_length(crate::host::DEFAULT_MAX_ARRAY_LENGTH);
+    crate::host::set_inspect_custom(true);
+    crate::host::set_inspect_getters(0);
+    crate::host::set_inspect_numeric_separator(false);
+    crate::host::set_inspect_show_proxy(false);
+    crate::host::set_inspect_max_string_length(crate::host::DEFAULT_MAX_STRING_LENGTH);
+    crate::host::set_inspect_show_hidden(false);
 }
 
 /// `util.inherits(ctor, superCtor)`.
@@ -468,9 +493,16 @@ pub fn format(args: &[Value]) -> Result<String, String> {
                 if let Some(b) = bigint {
                     out.push_str(&b);
                 } else if use_inspect {
+                    // `{ ...inspectOptions, depth: 0, colors: false, compact: 3 }`.
+                    let (depth, compact) = (
+                        crate::host::inspect_max_depth(),
+                        crate::host::inspect_compact(),
+                    );
                     crate::host::set_inspect_max_depth(0);
+                    crate::host::set_inspect_compact(3);
                     let s = crate::host::inspect_js(arg);
-                    crate::host::set_inspect_max_depth(2);
+                    crate::host::set_inspect_max_depth(depth);
+                    crate::host::set_inspect_compact(compact);
                     let s = s?;
                     out.push_str(&s);
                 } else {
@@ -534,14 +566,21 @@ pub fn format(args: &[Value]) -> Result<String, String> {
             // instead of two. Rendering both as the default inspect made `%o` a
             // silent alias of `%O`.
             'O' => out.push_str(&crate::host::inspect_js(arg)?),
+            // Both spread over `formatWithOptions`'s bag, so the previous
+            // settings are restored rather than reset.
             'o' => {
+                let saved = (
+                    crate::host::inspect_show_proxy(),
+                    crate::host::inspect_show_hidden(),
+                    crate::host::inspect_max_depth(),
+                );
                 crate::host::set_inspect_show_proxy(true);
                 crate::host::set_inspect_show_hidden(true);
                 crate::host::set_inspect_max_depth(4);
                 let s = crate::host::inspect_js(arg);
-                crate::host::set_inspect_show_hidden(false);
-                crate::host::set_inspect_show_proxy(false);
-                crate::host::set_inspect_max_depth(2);
+                crate::host::set_inspect_show_proxy(saved.0);
+                crate::host::set_inspect_show_hidden(saved.1);
+                crate::host::set_inspect_max_depth(saved.2);
                 out.push_str(&s?);
             }
             'c' => {} // CSS directive: consumes the arg, emits nothing.
