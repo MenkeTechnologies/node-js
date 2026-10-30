@@ -135,8 +135,11 @@ fn run_print(src: &str) -> ExitCode {
 
 /// Whether the last of the `-e`/`-p` family on the command line was a print
 /// form. `node -e 'console.log(9)' -p '1+1'` prints only `2` on node v26.7.0.
+/// Only the runtime's flags count; a `-p` among the program's arguments does not.
 fn last_eval_flag_is_print() -> bool {
-    std::env::args()
+    nodejs::cli::split_argv(std::env::args())
+        .exec
+        .into_iter()
         .rfind(|a| matches!(a.as_str(), "-e" | "--eval" | "-p" | "--print"))
         .map(|a| a == "-p" || a == "--print")
         .unwrap_or(false)

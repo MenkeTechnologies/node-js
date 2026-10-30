@@ -2156,6 +2156,37 @@ fn a_double_dash_ends_the_runtime_flags_and_is_in_neither_list() {
     );
 }
 
+#[test]
+fn runtime_options_stop_at_the_entry_script() {
+    // node reads its own options only up to the entry script: `node args.js
+    // -p 8080` runs `args.js` with `-p 8080` as program arguments, and
+    // `execArgv` is empty. node-js used to evaluate `8080` and never run the
+    // file. `node v26.12.1` prints `[] ["-p","8080","-e","x"]`.
+    let dir = std::env::temp_dir().join(format!("nodejs_argv_stop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("args.js");
+    std::fs::write(
+        &path,
+        "console.log(JSON.stringify(process.execArgv), JSON.stringify(process.argv.slice(2)))",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_node"))
+        .arg(&path)
+        .args(["-p", "8080", "-e", "x"])
+        .output()
+        .expect("spawn node binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        "[] [\"-p\",\"8080\",\"-e\",\"x\"]"
+    );
+}
+
 /// Minimal JSON string encoding for the one expected value above.
 fn serde_json_string(s: &str) -> String {
     let mut out = String::from("\"");

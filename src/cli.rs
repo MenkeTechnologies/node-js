@@ -80,8 +80,29 @@ pub struct Cli {
 }
 
 /// Parse the process arguments.
+///
+/// Only the runtime's own part of the command line reaches clap: node stops
+/// reading its options at the entry script, so `node args.js -p 8080` hands
+/// `-p 8080` to the program rather than evaluating `8080`. [`split_argv`] finds
+/// that boundary; the entry script is passed behind `--` so a name that starts
+/// with a dash is still a file.
 pub fn parse() -> Cli {
-    Cli::parse()
+    let argv0 = std::env::args()
+        .next()
+        .unwrap_or_else(|| "node".to_string());
+    Cli::parse_from(runtime_args(argv0, split_argv(std::env::args())))
+}
+
+/// The arguments clap should see: `argv0`, the runtime flags, and the entry
+/// script (behind `--`), but none of the program's own arguments.
+fn runtime_args(argv0: String, split: Argv) -> Vec<String> {
+    let mut out = vec![argv0];
+    out.extend(split.exec);
+    if let Some(script) = split.script {
+        out.push("--".to_string());
+        out.push(script);
+    }
+    out
 }
 
 /// How Node divides the command line, which is NOT the raw `argv` the OS handed
