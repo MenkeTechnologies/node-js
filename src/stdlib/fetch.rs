@@ -840,12 +840,15 @@ pub fn fire_timeout_abort(idx: u32) -> Result<Value, String> {
     Ok(Value::Undef)
 }
 
-/// Mark a signal aborted and dispatch its `abort` event: `onabort` and every
-/// `addEventListener('abort')` listener receive a real `Event` whose `target`
-/// is the signal, in registration order, through the same `EventTarget`
-/// dispatch a script's own `dispatchEvent` uses.
+/// Port of lib/internal/abort_controller.js `abortSignal`: mark the signal
+/// aborted, mark every not-yet-aborted signal `AbortSignal.any` made dependent
+/// on it aborted with the same reason, then run the abort steps — the signal's
+/// own first, then each dependent's. The abort steps dispatch an `abort`
+/// event: `onabort` and every `addEventListener('abort')` listener receive a
+/// real `Event` whose `target` is the signal, in registration order, through
+/// the same `EventTarget` dispatch a script's own `dispatchEvent` uses.
 fn abort_signal(signal: &Value, reason: Value) -> Result<(), String> {
-    if matches!(prop(signal, "@@aborted"), Some(Value::Bool(true))) {
+    if is_aborted(signal) {
         return Ok(());
     }
     let reason = if matches!(reason, Value::Undef) {
@@ -854,11 +857,108 @@ fn abort_signal(signal: &Value, reason: Value) -> Result<(), String> {
         reason
     };
     set_prop(signal, "@@aborted", Value::Bool(true));
-    set_prop(signal, "@@reason", reason);
+    set_prop(signal, "@@reason", reason.clone());
+    let dependents: Vec<Value> = signal_list(signal, "@@dependents")
+        .into_iter()
+        .filter(|d| !is_aborted(d))
+        .collect();
+    for d in &dependents {
+        set_prop(d, "@@reason", reason.clone());
+        set_prop(d, "@@aborted", Value::Bool(true));
+    }
+    run_abort(signal)?;
+    for d in &dependents {
+        run_abort(d)?;
+    }
+    Ok(())
+}
+
+/// `runAbort`: dispatch the `abort` event at `signal`.
+fn run_abort(signal: &Value) -> Result<(), String> {
     let ty = new_str("abort");
     let event = super::event_target::construct("Event", &[ty]).unwrap_or(Ok(Value::Undef))?;
     super::event_target::dispatch(signal, &[event])?;
     Ok(())
+}
+
+fn is_aborted(signal: &Value) -> bool {
+    matches!(prop(signal, "@@aborted"), Some(Value::Bool(true)))
+}
+
+/// A hidden array of signals on `signal` (`@@sources` / `@@dependents`).
+fn signal_list(signal: &Value, key: &str) -> Vec<Value> {
+    let Some(list) = prop(signal, key) else {
+        return Vec::new();
+    };
+    with_host(|h| match h.get(&list) {
+        Some(JsObj::Array(items)) => items.clone(),
+        _ => Vec::new(),
+    })
+}
+
+/// Append `item` to the hidden array `key` on `signal`, creating it.
+fn push_signal(signal: &Value, key: &str, item: Value) {
+    let mut items = signal_list(signal, key);
+    items.push(item);
+    let list = with_host(|h| h.new_array(items));
+    set_prop(signal, key, list);
+}
+
+/// `AbortSignal.any(signals)`: a composite signal that aborts with the first
+/// of `signals` to abort — at once, if one already has. Its sources are the
+/// NON-composite signals behind `signals` (a composite argument contributes
+/// its own sources), and each source records it as a dependent, so a nested
+/// `any` aborts in the same step as the one it was built from.
+fn abort_signal_any(signals: &Value) -> Result<Value, String> {
+    let not_sequence = || {
+        crate::host::coded_error(
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            "signals cannot be converted to sequence.",
+        )
+    };
+    // WebIDL `sequence<AbortSignal>`: an Object with an `@@iterator`.
+    let is_object =
+        with_host(|h| matches!(signals, Value::Obj(_)) && h.type_of(signals) == "object");
+    if !is_object {
+        return Err(not_sequence());
+    }
+    let iter = crate::builtins::get_property(signals, "@@iterator")?;
+    if !with_host(|h| crate::host::is_callable(h, &iter)) {
+        return Err(not_sequence());
+    }
+    let items = crate::host::iter_all(signals)?;
+    for (i, s) in items.iter().enumerate() {
+        if super::native_tag(s).as_deref() != Some("AbortSignal") {
+            return Err(crate::host::coded_error(
+                "TypeError",
+                "ERR_INVALID_ARG_TYPE",
+                &format!("signals[{i}] is not of type AbortSignal."),
+            ));
+        }
+    }
+    let result = new_abort_signal();
+    set_prop(&result, "@@composite", Value::Bool(true));
+    for s in &items {
+        let sources = if matches!(prop(s, "@@composite"), Some(Value::Bool(true))) {
+            signal_list(s, "@@sources")
+        } else {
+            vec![s.clone()]
+        };
+        if is_aborted(s) {
+            abort_signal(&result, prop(s, "@@reason").unwrap_or(Value::Undef))?;
+            return Ok(result);
+        }
+        for src in sources {
+            if is_aborted(&src) {
+                abort_signal(&result, prop(&src, "@@reason").unwrap_or(Value::Undef))?;
+                return Ok(result);
+            }
+            push_signal(&result, "@@sources", src.clone());
+            push_signal(&src, "@@dependents", result.clone());
+        }
+    }
+    Ok(result)
 }
 
 pub fn abort_controller_call(recv: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
@@ -893,7 +993,7 @@ pub fn abort_signal_call(recv: &Value, method: &str, args: &[Value]) -> Result<V
     }
 }
 
-/// `AbortSignal.abort(reason)` / `AbortSignal.timeout(ms)`.
+/// `AbortSignal.abort(reason)` / `AbortSignal.timeout(ms)` / `AbortSignal.any(signals)`.
 pub fn abort_signal_static(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match method {
         "abort" => {
@@ -906,14 +1006,22 @@ pub fn abort_signal_static(method: &str, args: &[Value]) -> Option<Result<Value,
             // The abort is a real scheduled macrotask: a native continuation
             // thunk (the `@@`-prefixed convention `@@presolve:<id>` already
             // uses) carries the signal's heap index to the timer callback.
+            // node arms it with `setUnrefTimeout`, so a pending timeout signal
+            // does not keep the process alive.
             let ms = super::arg_num(args, 0);
             let Value::Obj(idx) = s else {
                 return Some(Ok(s));
             };
             let cb = with_host(|h| h.alloc(JsObj::Builtin(format!("@@aborttimeout:{idx}"))));
-            with_host(|h| h.add_timer(ms, cb, Vec::new(), None));
+            with_host(|h| {
+                let id = h.add_timer(ms, cb, Vec::new(), None);
+                h.set_timer_refed(id, false);
+            });
             Some(Ok(s))
         }
+        "any" => Some(abort_signal_any(
+            &args.first().cloned().unwrap_or(Value::Undef),
+        )),
         _ => None,
     }
 }
@@ -1187,4 +1295,4 @@ pub fn static_call(ns: &str, method: &str, args: &[Value]) -> Option<Result<Valu
 }
 
 pub const RESPONSE_STATICS: &[&str] = &["json", "error", "redirect"];
-pub const ABORT_SIGNAL_STATICS: &[&str] = &["abort", "timeout"];
+pub const ABORT_SIGNAL_STATICS: &[&str] = &["abort", "timeout", "any"];

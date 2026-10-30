@@ -1701,3 +1701,37 @@ for (const o of [1, null, undefined, 's', () => {}]) {
     let expected = "{ a: [Object] }\nx { a: [Object] } [ 1, [Array] ]\n{ a: [Object] }\n{\n  a: { b: { c: { d: 1 } } }\n}\n{ a: [Object] }\n{ a: 2, b: 1 }\n{ a: 1 }|{\n  a: 1\n}\n1\n{ a: { b: { c: [Object] } } } { a: { b: { c: [Object] } } }\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received type number (1)]\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received null]\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received undefined]\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received type string ('s')]\nTypeError ERR_INVALID_ARG_TYPE [The \"inspectOptions\" argument must be of type object. Received function ]";
     assert_eq!(run(src), expected);
 }
+
+/// `AbortSignal.any` follows its sources (flattening a composite argument),
+/// aborts dependents before running any abort steps, and validates its
+/// argument as a WebIDL `sequence<AbortSignal>`; a timeout signal's timer is
+/// unref'd, so the last `onabort` never runs (node v26.12.1).
+#[test]
+fn abort_signal_any_follows_its_sources() {
+    let src = r##"
+const a = new AbortController(), b = new AbortController();
+const any = AbortSignal.any([a.signal, b.signal]);
+const nested = AbortSignal.any([any]);
+console.log(any.aborted, any.reason, any instanceof AbortSignal, Object.prototype.toString.call(any));
+a.signal.addEventListener('abort', () => console.log('a abort, any.aborted =', any.aborted, 'nested.aborted =', nested.aborted));
+any.addEventListener('abort', () => console.log('any abort', any.reason));
+any.onabort = () => console.log('any onabort');
+nested.addEventListener('abort', () => console.log('nested abort', nested.reason === any.reason));
+a.abort('first');
+b.abort('second');
+console.log(any.aborted, any.reason, nested.reason);
+const pre = AbortSignal.any([AbortSignal.abort('done'), b.signal]);
+console.log(pre.aborted, pre.reason);
+const empty = AbortSignal.any([]);
+console.log(empty.aborted, empty.reason);
+for (const bad of [undefined, 1, [1], [a.signal, {}], 'x']) {
+  try { AbortSignal.any(bad); console.log('ok', bad); } catch (e) { console.log(e.name, e.code, e.message); }
+}
+const t = AbortSignal.any([AbortSignal.timeout(1)]);
+t.onabort = () => console.log('timeout', t.reason.name);
+const s = new Set([new AbortController().signal]);
+console.log(AbortSignal.any(s).aborted);
+"##;
+    let expected = "false undefined true [object AbortSignal]\na abort, any.aborted = true nested.aborted = true\nany abort first\nany onabort\nnested abort true\ntrue first first\ntrue done\nfalse undefined\nTypeError ERR_INVALID_ARG_TYPE signals cannot be converted to sequence.\nTypeError ERR_INVALID_ARG_TYPE signals cannot be converted to sequence.\nTypeError ERR_INVALID_ARG_TYPE signals[0] is not of type AbortSignal.\nTypeError ERR_INVALID_ARG_TYPE signals[1] is not of type AbortSignal.\nTypeError ERR_INVALID_ARG_TYPE signals cannot be converted to sequence.\nfalse";
+    assert_eq!(run(src), expected);
+}

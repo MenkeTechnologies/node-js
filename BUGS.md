@@ -3476,11 +3476,11 @@ record went red.
 |---|---|---|
 | `assert.deepEqual(Buffer.from('abc'), new Uint8Array([97, 98, 99]))` (loose) | passes | fails: a Buffer and a typed array are compared through different internal slots |
 
-## FIXED in round 25 — `console.dir` and `formatWithOptions` options, timer clamping, ICU 79 date patterns, verified against node v26.12.1
+## FIXED in round 25 — `console.dir` and `formatWithOptions` options, timer clamping, `AbortSignal.any`, ICU 79 date patterns, verified against node v26.12.1
 
 Pinned in `tests/language_parity.rs` (`console_dir_spreads_its_options_over_custom_inspect_false`,
 `format_with_options_applies_the_bag_to_every_inspect`,
-`locale_date_patterns_follow_icu_79`), `tests/timers.rs`
+`locale_date_patterns_follow_icu_79`, `abort_signal_any_follows_its_sources`), `tests/timers.rs`
 (`out_of_range_timeouts_clamp_to_one_millisecond`) and `parity-scripts/data/28_date_locale_options.js`.
 
 | Case | node | was |
@@ -3489,6 +3489,7 @@ Pinned in `tests/language_parity.rs` (`console_dir_spreads_its_options_over_cust
 | `console.dir(obj)` where `obj` has `[util.inspect.custom]` | the raw object: `console.dir` is `inspect(obj, { customInspect: false, ...options })` | the custom method's output |
 | `util.formatWithOptions({depth: 0}, "%O", {a:{b:1}})` | `{ a: [Object] }` | `{ a: { b: 1 } }` — the bag was dropped |
 | `setTimeout(b, 1); setTimeout(c, 0)` | `b` then `c` — the `Timeout` constructor clamps every duration outside `[1, 2**31-1]` to 1, with `TimeoutNegativeWarning` / `TimeoutNaNWarning` (once each) and `TimeoutOverflowWarning` | `c` first: 0 was a shorter delay than 1; an overflow was not clamped (`3e9` waited ~35 days); no warnings |
+| `AbortSignal.any([a.signal, b.signal])` | a composite signal that aborts with the first source; a timeout signal does not hold the process open (`setUnrefTimeout`) | `AbortSignal.any is not a function`; `AbortSignal.timeout(50).onabort` kept the process alive and fired |
 | `{weekday: 'short', year: 'numeric', second: 'numeric'}` | `Fri, 2024, 9` — CLDR 49's `Day-Of-Week` append item is `{1}, {0}` | `2024 Fri, 9` (CLDR 47's `{0} {1}`) |
 | `{year: '2-digit', month: 'short'}` | `Feb ’24` — CLDR 49's `yyMMM` / `yyMMMd` / `yy` items, which only a two-digit-year request may match (ICU 79 `yearLengthIsCompatible`) | `Feb 24` |
 
