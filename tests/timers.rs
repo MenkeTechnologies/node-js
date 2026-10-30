@@ -487,3 +487,28 @@ fn thread_pool_callbacks_run_after_pending_jobs() {
     "#;
     assert_eq!(run(src), "promise 4");
 }
+
+/// The `Timeout` constructor clamps any duration outside `[1, 2**31-1]` to 1, so
+/// `0`, `undefined`, `0.5`, a negative, `NaN` and an overflow all join the 1ms
+/// list and fire in the order they were set, with node's warnings (captured
+/// from node v26.12.1).
+#[test]
+fn out_of_range_timeouts_clamp_to_one_millisecond() {
+    let src = r##"
+process.on('warning', (w) => console.log('warning', w.name, JSON.stringify(w.message)));
+setTimeout(() => console.log('b 1'), 1);
+setTimeout(() => console.log('c 0'), 0);
+setTimeout(() => console.log('d undefined'));
+setTimeout(() => console.log('e 0.5'), 0.5);
+setTimeout(() => console.log('f -5'), -5);
+setTimeout(() => console.log('f2 -1 (warned once)'), -1);
+setTimeout(() => console.log('g NaN'), 'abc');
+setTimeout(() => console.log('h overflow'), 3e9);
+setTimeout(() => console.log('i valueOf'), { valueOf() { console.log('valueOf ran'); return 1; } });
+try { setTimeout(() => {}, Symbol()); } catch (e) { console.log(e.name, e.message); }
+let n = 0;
+const iv = setInterval(() => { console.log('interval', ++n); if (n === 2) clearInterval(iv); }, 0);
+"##;
+    let expected = "valueOf ran\nTypeError Cannot convert a Symbol value to a number\nwarning TimeoutNegativeWarning \"-5 is a negative number.\\nTimeout duration was set to 1.\"\nwarning TimeoutNaNWarning \"NaN is not a number.\\nTimeout duration was set to 1.\"\nwarning TimeoutOverflowWarning \"3000000000 does not fit into a 32-bit signed integer.\\nTimeout duration was set to 1.\"\nb 1\nc 0\nd undefined\ne 0.5\nf -5\nf2 -1 (warned once)\ng NaN\nh overflow\ni valueOf\ninterval 1\ninterval 2";
+    assert_eq!(run(src), expected);
+}

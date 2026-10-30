@@ -8444,7 +8444,7 @@ pub fn call_builtin_function(name: &str, args: Vec<Value>) -> Result<Value, Stri
         }
         "setTimeout" | "setInterval" | "setImmediate" => {
             require_callback(&arg0(&args))?;
-            Ok(schedule_timer(name, args))
+            schedule_timer(name, args)
         }
         "clearTimeout" | "clearInterval" | "clearImmediate" => {
             clear_timer(&arg0(&args));
@@ -17936,31 +17936,73 @@ fn enqueue_microtask(next_tick: bool, cb: Value, args: Vec<Value>) {
 /// `setInterval` schedules a *repeating* timer: the loop re-arms it each time it
 /// fires, so it runs until cleared and — being referenced — holds the process
 /// open exactly as in Node.
-fn schedule_timer(name: &str, args: Vec<Value>) -> Value {
+fn schedule_timer(name: &str, args: Vec<Value>) -> Result<Value, String> {
     let cb = arg0(&args);
     let delay = if name == "setImmediate" {
-        -1.0 // before any 0ms timeout
+        -1.0 // before any timeout
     } else {
-        args.get(1)
-            .map(|d| with_host(|h| h.to_number(d)))
-            .unwrap_or(0.0)
-            .max(0.0)
+        timeout_duration(args.get(1))?
     };
     let extra = if name == "setImmediate" {
         args.get(1..).map(|s| s.to_vec()).unwrap_or_default()
     } else {
         args.get(2..).map(|s| s.to_vec()).unwrap_or_default()
     };
-    // Node clamps a sub-1ms interval to 1ms, so `setInterval(fn, 0)` yields a
-    // ~1000Hz timer rather than a busy loop that starves the rest of the queue.
-    let interval = (name == "setInterval").then(|| delay.max(1.0));
+    let interval = (name == "setInterval").then_some(delay);
     let id = with_host(|h| h.add_timer(delay, cb, extra, interval));
     let tag = if name == "setImmediate" {
         "Immediate"
     } else {
         "Timeout"
     };
-    crate::stdlib::timers::new_handle(id, tag)
+    Ok(crate::stdlib::timers::new_handle(id, tag))
+}
+
+thread_local! {
+    static WARNED_NEGATIVE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WARNED_NAN_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The `Timeout` constructor's duration (lib/internal/timers.js): `undefined`
+/// is 1, anything else is `after * 1`, and whatever is not in
+/// `[1, TIMEOUT_MAX]` becomes 1 — so `setTimeout(f, 0)` and `setTimeout(f, 1)`
+/// share one list and fire in the order they were set. Out-of-range values
+/// warn as node does: an overflow every time, a negative number and a NaN once
+/// per process.
+fn timeout_duration(after: Option<&Value>) -> Result<f64, String> {
+    const TIMEOUT_MAX: f64 = 2_147_483_647.0;
+    let after = match after {
+        None | Some(Value::Undef) => return Ok(1.0),
+        Some(v) => host::to_number_value(v)?,
+    };
+    if (1.0..=TIMEOUT_MAX).contains(&after) {
+        return Ok(after);
+    }
+    let shown = host::fmt_number(after);
+    let warn = |name: &str, what: &str| {
+        crate::stdlib::process::emit_warning(
+            name,
+            None,
+            &format!("{shown} {what}\nTimeout duration was set to 1."),
+            None,
+        )
+    };
+    let first = |flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>| {
+        !flag.with(|f| f.replace(true))
+    };
+    if after > TIMEOUT_MAX {
+        warn(
+            "TimeoutOverflowWarning",
+            "does not fit into a 32-bit signed integer.",
+        );
+    } else if after < 0.0 {
+        if first(&WARNED_NEGATIVE_TIMEOUT) {
+            warn("TimeoutNegativeWarning", "is a negative number.");
+        }
+    } else if after.is_nan() && first(&WARNED_NAN_TIMEOUT) {
+        warn("TimeoutNaNWarning", "is not a number.");
+    }
+    Ok(1.0)
 }
 
 /// `clearTimeout`/`clearInterval`/`clearImmediate` — cancel by handle object or
