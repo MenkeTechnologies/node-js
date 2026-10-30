@@ -1,6 +1,6 @@
-//! Named IANA time zones, read from the system's compiled zoneinfo
-//! (`/usr/share/zoneinfo`, RFC 8536 TZif files) — what `Intl` and
-//! `toLocaleString` need for a `timeZone: "America/New_York"` option.
+//! Named IANA time zones, read from RFC 8536 TZif data — the copy embedded by
+//! `jiff_tzdb`, falling back to the system's `/usr/share/zoneinfo` — what
+//! `Intl` and `toLocaleString` need for a `timeZone: "America/New_York"` option.
 //!
 //! A TZif file lists every transition up to some year and then, in its footer,
 //! the POSIX `TZ` rule that continues past the last one (`EST5EDT,M3.2.0,
@@ -77,8 +77,8 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
-/// The zone named `name`, if the system has it. Names are matched as the
-/// filesystem matches them; `..` and absolute paths are refused.
+/// The zone named `name`, from the embedded database (matched without regard
+/// to ASCII case) or else the system copy; `..` and absolute paths are refused.
 pub fn load(name: &str) -> Option<Rc<Tz>> {
     if name.is_empty()
         || name.starts_with('/')
@@ -94,15 +94,22 @@ pub fn load(name: &str) -> Option<Rc<Tz>> {
     if let Some(hit) = CACHE.with(|c| c.borrow().get(name).cloned()) {
         return hit;
     }
-    let tz = [
-        "/usr/share/zoneinfo",
-        "/usr/lib/zoneinfo",
-        "/usr/share/lib/zoneinfo",
-    ]
-    .iter()
-    .find_map(|dir| std::fs::read(format!("{dir}/{name}")).ok())
-    .and_then(|bytes| parse(&bytes, name))
-    .map(Rc::new);
+    // The embedded database first, like Node's bundled ICU data: system
+    // copies differ by distro build (backzone or not), which changes
+    // pre-1970 offsets. The system dirs cover names the bundle lacks.
+    let tz = jiff_tzdb::get(name)
+        .and_then(|(_, bytes)| parse(bytes, name))
+        .or_else(|| {
+            [
+                "/usr/share/zoneinfo",
+                "/usr/lib/zoneinfo",
+                "/usr/share/lib/zoneinfo",
+            ]
+            .iter()
+            .find_map(|dir| std::fs::read(format!("{dir}/{name}")).ok())
+            .and_then(|bytes| parse(&bytes, name))
+        })
+        .map(Rc::new);
     CACHE.with(|c| c.borrow_mut().insert(name.to_string(), tz.clone()));
     tz
 }

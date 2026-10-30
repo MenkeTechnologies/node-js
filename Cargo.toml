@@ -122,6 +122,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 libc = "0.2"
 
+# The IANA tz database (main data, as Node's bundled ICU uses), embedded so a
+# named zone resolves the same on every host — distro zoneinfo builds differ
+# (Ubuntu compiles in backzone: pre-1970 Reykjavik is GMT-1 there, GMT in Node).
+jiff-tzdb = "0.1.8"
+
 # Interactive REPL (`node --repl` / TTY fallthrough): reedline line editor,
 # nu-ansi-term for status colors.
 reedline = "0.47.0"
