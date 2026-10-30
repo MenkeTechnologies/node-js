@@ -59,7 +59,10 @@
 //! `new Worker` `incr_handle`s the MAIN loop so the process stays alive while the
 //! worker runs; the worker's `'exit'` `decr_handle`s it. On the worker side,
 //! registering a `parentPort` `'message'` listener `incr_handle`s the WORKER loop
-//! (keeping the worker alive to receive messages), and `terminate` releases it.
+//! (keeping the worker alive to receive messages); `terminate` or
+//! `parentPort.close()` releases it. `process.exit(code)` on a worker ends that
+//! worker with `code` (`exit_if_worker`), and one that completes leaves with
+//! its `process.exitCode`.
 //!
 //! # terminate is cooperative (documented limitation)
 //!
@@ -159,6 +162,13 @@ struct WorkerCtx {
     rx: Option<Receiver<WorkerMsg>>,
     /// Whether the forwarding bridge thread has been started.
     bridge_started: bool,
+    /// Whether the bridge's hold on this worker's loop has been released, by
+    /// `terminate` or by `parentPort.close()` — whichever comes first.
+    port_released: bool,
+    /// `parentPort.close()` was called: later `postMessage`s are dropped.
+    port_closed: bool,
+    /// The port's `'close'` has been emitted: later deliveries are dropped.
+    port_close_emitted: bool,
 }
 
 thread_local! {
@@ -435,6 +445,9 @@ fn worker_thread_main(
             self_id: id,
             rx: Some(rx),
             bridge_started: false,
+            port_released: false,
+            port_closed: false,
+            port_close_emitted: false,
         });
     });
 
@@ -452,7 +465,11 @@ fn worker_thread_main(
     };
 
     match outcome {
-        Ok(_) => post_to_main(&main_tx, id, MainEvent::Exit(0)),
+        // A worker that ran to completion leaves with its `process.exitCode`.
+        Ok(_) => {
+            let code = with_host(|h| h.exit_code).unwrap_or(0);
+            post_to_main(&main_tx, id, MainEvent::Exit(code));
+        }
         Err(e) => {
             post_to_main(&main_tx, id, MainEvent::Error(e));
             post_to_main(&main_tx, id, MainEvent::Exit(1));
@@ -526,7 +543,7 @@ fn start_parent_bridge() {
                     WorkerMsg::Terminate => {
                         // Release the worker loop so it can unwind and exit.
                         let _ = io_for_thread.send(Box::new(|| {
-                            with_host(|h| h.decr_handle());
+                            release_parent_port();
                             Ok(())
                         }));
                         break;
@@ -539,10 +556,82 @@ fn start_parent_bridge() {
     let _ = worker_io;
 }
 
+/// Drop the bridge's hold on this worker's event loop, once: what lets a
+/// worker whose only remaining handle was its `parentPort` end.
+fn release_parent_port() {
+    let release = WORKER_CTX.with(|c| {
+        let mut cb = c.borrow_mut();
+        match cb.as_mut() {
+            Some(ctx) if ctx.bridge_started && !ctx.port_released => {
+                ctx.port_released = true;
+                true
+            }
+            _ => false,
+        }
+    });
+    if release {
+        with_host(|h| h.decr_handle());
+    }
+}
+
+/// `parentPort.close()` (`MessagePort.prototype.close`): the port stops
+/// sending at once, and — after the messages already queued for it — emits
+/// `'close'` and stops holding the worker open, so a worker with nothing else
+/// to do ends.
+fn close_parent_port() {
+    let first = WORKER_CTX.with(|c| {
+        let mut cb = c.borrow_mut();
+        match cb.as_mut() {
+            Some(ctx) if !ctx.port_closed => {
+                ctx.port_closed = true;
+                true
+            }
+            _ => false,
+        }
+    });
+    if !first {
+        return;
+    }
+    // Queued on this worker's own loop, behind whatever the bridge has already
+    // forwarded; the loop is held until it runs.
+    with_host(|h| h.incr_handle());
+    let task: IoTask = Box::new(|| {
+        WORKER_CTX.with(|c| {
+            if let Some(ctx) = c.borrow_mut().as_mut() {
+                ctx.port_close_emitted = true;
+            }
+        });
+        release_parent_port();
+        with_host(|h| h.decr_handle());
+        emit_event(&ensure_parent_port(), "close", vec![])
+    });
+    let _ = with_host(|h| h.io_sender()).send(task);
+}
+
+/// `process.exit(code)` on a worker thread ends the WORKER, not the process
+/// (node's `process.exit` in a worker stops its isolate): the `Worker`'s
+/// `'exit'` fires on the spawning thread with `code`, and nothing after the
+/// call runs on this one. A thread cannot be stopped from inside its own JS
+/// stack, so it is parked for good once the event is posted. Returns on the
+/// main thread.
+pub fn exit_if_worker(code: i32) {
+    let target = WORKER_CTX.with(|c| c.borrow().as_ref().map(|x| (x.main_tx.clone(), x.self_id)));
+    let Some((main_tx, id)) = target else {
+        return;
+    };
+    post_to_main(&main_tx, id, MainEvent::Exit(code));
+    loop {
+        std::thread::park();
+    }
+}
+
 /// Deliver a main→worker message on the WORKER thread (runs inside the worker
 /// event loop): deserialize on the worker heap and emit `'message'` on
 /// `parentPort`.
 fn parent_deliver(json: String) -> Result<(), String> {
+    if WORKER_CTX.with(|c| c.borrow().as_ref().is_some_and(|x| x.port_close_emitted)) {
+        return Ok(());
+    }
     let port = ensure_parent_port();
     let v = deserialize(&json)?;
     emit_event(&port, "message", vec![v])
@@ -631,7 +720,7 @@ fn port_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, Stri
         "postMessage" => {
             let json = serialize(&arg0(&args))?;
             WORKER_CTX.with(|c| {
-                if let Some(ctx) = c.borrow().as_ref() {
+                if let Some(ctx) = c.borrow().as_ref().filter(|x| !x.port_closed) {
                     post_to_main(&ctx.main_tx, ctx.self_id, MainEvent::Message(json));
                 }
             });
@@ -641,7 +730,11 @@ fn port_call(recv: &Value, method: &str, args: Vec<Value>) -> Result<Value, Stri
             start_parent_bridge();
             Ok(Value::Undef)
         }
-        "close" | "ref" | "unref" => Ok(recv.clone()),
+        "close" => {
+            close_parent_port();
+            Ok(Value::Undef)
+        }
+        "ref" | "unref" => Ok(recv.clone()),
         _ => Err(crate::host::type_error(&format!(
             "port.{method} is not a function"
         ))),

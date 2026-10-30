@@ -276,6 +276,41 @@ ReferenceError Cannot access 'n' before initialization";
     assert_eq!(run(src), expected);
 }
 
+/// A worker ends when its `parentPort` is closed (after `'close'`), and a
+/// `postMessage` after `close()` is dropped; `process.exit(3)` in a worker ends
+/// the worker — its `exit` listeners, then the `Worker`'s `'exit'` with 3 — not
+/// the process; a worker that completes leaves with its `process.exitCode`.
+/// The first hung, the second killed the whole process with status 3, the
+/// third reported 0. Expected output from node v26.12.1.
+#[test]
+fn a_worker_ends_on_port_close_and_on_its_own_process_exit() {
+    let src = r#"
+const { Worker } = require("worker_threads");
+const closer = new Worker(`const { parentPort } = require("worker_threads");
+parentPort.on("message", (m) => { console.log("got", m); parentPort.close(); parentPort.postMessage("dropped"); });
+parentPort.on("close", () => console.log("port close"));`, { eval: true });
+closer.on("message", (m) => console.log("main got", m));
+closer.on("exit", (c) => {
+  console.log("closer exit", c);
+  const exiter = new Worker(`process.on("exit", (c) => console.log("worker exit listener", c));
+console.log("before"); process.exit(3); console.log("after");`, { eval: true });
+  exiter.on("exit", (c) => {
+    console.log("exiter exit", c);
+    new Worker("process.exitCode = 4", { eval: true }).on("exit", (c) => console.log("exitCode exit", c));
+  });
+});
+closer.postMessage("one");
+"#;
+    let expected = "got one\n\
+port close\n\
+closer exit 0\n\
+before\n\
+worker exit listener 3\n\
+exiter exit 3\n\
+exitCode exit 4";
+    assert_eq!(run(src), expected);
+}
+
 // ── array iteration is live ──────────────────────────────────────────────────
 
 /// An array iterator reads the array at every step (23.1.5.1). `for-of`, spread

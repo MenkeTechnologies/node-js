@@ -652,6 +652,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             // `process.exit()` would recompile every module it loaded, every
             // run, and never benefit from the cache at all.
             crate::cache::flush();
+            // In a worker this ends the worker thread and does not return.
+            super::worker_threads::exit_if_worker(code);
             std::process::exit(code);
         }
         // `process.chdir(dir)` really changes the working directory, and throws on
