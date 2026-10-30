@@ -121,6 +121,122 @@ fn run(src: &str) -> String {
     stdout.trim_end().to_string()
 }
 
+/// The mutating `Array.prototype` methods on an array that can refuse a write
+/// follow the spec steps (23.1.3): each element and `length` is `Set` with
+/// `throw = true` and removed with `DeletePropertyOrThrow`, so the first
+/// refused step is the TypeError and the array is left as that step found it.
+/// Every mutator except `push` used to edit a frozen array's element vector and
+/// return normally; `push()` with nothing to push skipped its `length` write,
+/// a hole in a frozen array was reported read-only rather than not
+/// extensible, a strict `length` shrink stopped by a sealed element was
+/// silent, and an index written past a non-writable `length` grew the array.
+/// Expected output from node v26.12.1.
+#[test]
+fn array_mutators_refuse_a_frozen_or_sealed_array_as_the_spec_steps_do() {
+    let src = r#"
+const out = [];
+const t = (n, f) => { try { f(); out.push(n + " ok"); } catch (e) { out.push(n + " " + e.message); } };
+const kinds = {
+  frozen: () => Object.freeze([3, 1, 2]),
+  sealed: () => Object.seal([3, 1, 2]),
+  holey: () => Object.freeze([3, , 2]),
+  fixedLength: () => Object.defineProperty([3, 1, 2], "length", { writable: false }),
+};
+for (const [k, make] of Object.entries(kinds)) {
+  for (const [m, args] of [["pop", []], ["shift", []], ["unshift", []], ["sort", []], ["reverse", []], ["fill", [0, 1]], ["splice", [0, 1]], ["copyWithin", [0, 1]], ["push", []]]) {
+    const a = make();
+    t(k + "." + m, () => a[m](...args));
+    out.push("= " + JSON.stringify(Object.getOwnPropertyNames(a)) + " " + a.length);
+  }
+}
+const s = Object.seal([1, 2, 3]);
+t("strict length", () => { "use strict"; s.length = 1; });
+out.push("= " + s.length);
+const p = Object.defineProperty([1, 2], "length", { writable: false });
+p[5] = 1;
+out.push("= " + p.length + " " + Object.keys(p));
+t("strict index", () => { "use strict"; p[2] = 3; });
+console.log(out.join("\n"));
+"#;
+    let expected = "frozen.pop Cannot delete property '2' of [object Array]\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+frozen.shift Cannot assign to read only property '0' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+frozen.unshift Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+frozen.sort Cannot assign to read only property '0' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+frozen.reverse Cannot assign to read only property '0' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+frozen.fill Cannot assign to read only property '1' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+frozen.splice Cannot assign to read only property '0' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+frozen.copyWithin Cannot assign to read only property '0' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+frozen.push Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.pop Cannot delete property '2' of [object Array]\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.shift Cannot delete property '2' of [object Array]\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.unshift ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.sort ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.reverse ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.fill ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.splice Cannot delete property '2' of [object Array]\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.copyWithin ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+sealed.push ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+holey.pop Cannot delete property '2' of [object Array]\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+holey.shift Cannot delete property '0' of [object Array]\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+holey.unshift Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+holey.sort Cannot assign to read only property '0' of object '[object Array]'\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+holey.reverse Cannot assign to read only property '0' of object '[object Array]'\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+holey.fill Cannot add property 1, object is not extensible\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+holey.splice Cannot delete property '0' of [object Array]\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+holey.copyWithin Cannot delete property '0' of [object Array]\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+holey.push Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"2\",\"length\"] 3\n\
+fixedLength.pop Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"1\",\"length\"] 3\n\
+fixedLength.shift Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"1\",\"length\"] 3\n\
+fixedLength.unshift Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+fixedLength.sort ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+fixedLength.reverse ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+fixedLength.fill ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+fixedLength.splice Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"1\",\"length\"] 3\n\
+fixedLength.copyWithin ok\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+fixedLength.push Cannot assign to read only property 'length' of object '[object Array]'\n\
+= [\"0\",\"1\",\"2\",\"length\"] 3\n\
+strict length Cannot delete property '2' of [object Array]\n\
+= 3\n\
+= 2 0,1\n\
+strict index Cannot assign to read only property 'length' of object '[object Array]'";
+    assert_eq!(run(src), expected);
+}
+
 // ── array iteration is live ──────────────────────────────────────────────────
 
 /// An array iterator reads the array at every step (23.1.5.1). `for-of`, spread

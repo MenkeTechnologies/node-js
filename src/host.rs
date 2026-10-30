@@ -2169,7 +2169,7 @@ impl JsHost {
     /// which is the mode every script here runs in; so does adding a *new* key to
     /// a non-extensible object.
     pub fn can_write_prop(&self, owner: &Value, key: &str) -> bool {
-        if !self.prop_attrs(owner, key).writable {
+        if !self.prop_attrs(owner, key).writable || self.past_fixed_length(owner, key) {
             return false;
         }
         // An intrinsic prototype on the chain may define the name NON-WRITABLE,
@@ -2254,6 +2254,20 @@ impl JsHost {
         }
     }
 
+    /// Whether `key` is an array index at or past the `length` of an array
+    /// whose `length` is not writable — an element 10.4.2.1 step 3.b refuses
+    /// to add, since adding it would have to grow `length`.
+    pub fn past_fixed_length(&self, owner: &Value, key: &str) -> bool {
+        match self.get(owner) {
+            Some(JsObj::Array(items)) => {
+                array_index(key).is_some_and(|i| i as usize >= items.len())
+                    && !self.prop_attrs(owner, "length").writable
+                    && !crate::builtins::is_arguments_h(self, owner)
+            }
+            _ => false,
+        }
+    }
+
     /// Mark `v` closed to new properties (`Object.preventExtensions`).
     pub fn prevent_extensions(&mut self, v: &Value) {
         if let Value::Obj(i) = v {
@@ -2263,6 +2277,20 @@ impl JsHost {
 
     pub fn is_extensible(&self, v: &Value) -> bool {
         !matches!(v, Value::Obj(i) if self.non_extensible.contains(i))
+    }
+
+    /// Whether `v` is closed to new properties or carries any own property
+    /// that is not a plain writable, enumerable, configurable data property —
+    /// the objects on which a write or delete can be refused.
+    pub fn has_integrity_limits(&self, v: &Value) -> bool {
+        match v {
+            Value::Obj(i) => {
+                self.non_extensible.contains(i)
+                    || self.prop_attrs.contains_key(i)
+                    || self.accessors.contains_key(i)
+            }
+            _ => false,
+        }
     }
 
     /// Apply `Object.seal` (`freeze == false`) or `Object.freeze` (`true`): close

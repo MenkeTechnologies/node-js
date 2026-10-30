@@ -5173,6 +5173,12 @@ fn display_key(name: &str) -> String {
 }
 
 fn write_refused(recv: &Value, name: &str) -> String {
+    // V8 reports an element refused by a fixed `length` as that `length`.
+    let name = if with_host(|h| h.past_fixed_length(recv, name)) {
+        "length"
+    } else {
+        name
+    };
     let shown = display_key(name);
     let extensible = with_host(|h| h.is_extensible(recv));
     // Which of the two messages applies turns on whether the key already
@@ -5182,9 +5188,11 @@ fn write_refused(recv: &Value, name: &str) -> String {
     let has_own = with_host(|h| match h.get(recv) {
         Some(JsObj::Object(p)) => p.contains_key(name),
         Some(JsObj::Array(items)) => {
-            name.parse::<usize>()
-                .map(|i| i < items.len())
-                .unwrap_or(false)
+            name == "length"
+                || name
+                    .parse::<usize>()
+                    .map(|i| i < items.len() && !h.is_hole(recv, i))
+                    .unwrap_or(false)
                 || h.fn_prop(recv, name).is_some()
         }
         Some(JsObj::RegExp(_)) => name == "lastIndex" || h.fn_prop(recv, name).is_some(),
@@ -5524,7 +5532,7 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             }
             stop
         });
-        Some(floor.max(want))
+        Some((floor.max(want), want))
     } else {
         None
     };
@@ -5539,7 +5547,7 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
             }
         }
         Some(JsObj::Array(items)) => {
-            if let Some(n) = new_len {
+            if let Some((n, _)) = new_len {
                 // Growing `length` appends HOLES (`a=[1]; a.length=3` still has
                 // just the one own key); shrinking drops any hole past the end.
                 let old = items.len();
@@ -5568,6 +5576,13 @@ fn set_property(recv: &Value, name: &str, val: Value) -> Result<(), String> {
         }
         _ => {}
     });
+    // Step 17.b.ii: the delete that stopped the shrink makes `[[Set]]` return
+    // false, which strict code reports as that failed delete.
+    if let Some((n, want)) = new_len {
+        if n > want && with_host(|h| h.current_strict()) {
+            return Err(refused_delete_error(recv, &(n - 1).to_string()));
+        }
+    }
     Ok(())
 }
 
@@ -12451,13 +12466,248 @@ fn array_species_create(
 }
 
 fn array_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
-    let r = array_method_on(recv, recv, name, args);
+    let r = if ARRAY_MUTATORS.contains(&name) && with_host(|h| h.has_integrity_limits(recv)) {
+        array_mutate_checked(recv, name, args)
+    } else {
+        array_method_on(recv, recv, name, args)
+    };
     // A mutator ran directly on a mapped `arguments` object: its elements are
     // aliases of the parameters, so the parameters follow.
     if ARRAY_MUTATORS.contains(&name) && is_arguments(recv) {
         with_host(|h| h.sync_arguments_to_params(recv));
     }
     r
+}
+
+/// A mutating `Array.prototype` method on an array that can refuse a write —
+/// frozen, sealed, non-extensible, or with a property defined read-only,
+/// non-configurable or as an accessor.
+///
+/// The fast implementations edit the element vector directly, which on such
+/// an array changed it where node throws. These follow the spec text step by
+/// step instead (23.1.3), each element and `length` written with `Set(…,
+/// true)` and removed with `DeletePropertyOrThrow`, so the first refused step
+/// raises the error V8 raises and everything before it has happened.
+fn array_mutate_checked(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    let args = coerce_numeric_args(ARRAY_METHOD_NUMERIC_ARGS, name, args)?;
+    host::JsHost::with_forced_strict(|| array_mutate_spec(recv, name, args))
+}
+
+fn array_mutate_spec(o: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    let key = |k: usize| k.to_string();
+    let get = |k: usize| get_property(o, &key(k));
+    let has = |k: usize| has_property(o, &key(k));
+    let set = |k: usize, v: Value| set_property(o, &key(k), v);
+    // DeletePropertyOrThrow: a refused delete is a TypeError whatever the
+    // caller's strictness.
+    let del = |k: usize| match delete_property(o, &key(k))? {
+        true => Ok(()),
+        false => Err(refused_delete_error(o, &key(k))),
+    };
+    let set_len = |n: usize| set_property(o, "length", Value::Float(n as f64));
+    // `Set(O, to, Get(O, from))` when `from` is present, else delete `to`:
+    // the move every shifting method is made of.
+    let move_elem = |from: usize, to: usize| -> Result<(), String> {
+        if has(from)? {
+            let v = get(from)?;
+            set(to, v)
+        } else {
+            del(to)
+        }
+    };
+    let len = array_len(o);
+    let num = |i: usize| match args.get(i) {
+        None | Some(Value::Undef) => None,
+        Some(v) => Some(with_host(|h| h.to_number(v))),
+    };
+    // A relative index argument (`ToIntegerOrInfinity`, negative from the
+    // end), clamped into `0..=len`.
+    let relative = |n: f64| -> usize {
+        let n = if n.is_nan() { 0.0 } else { n.trunc() };
+        if n < 0.0 {
+            (len as f64 + n).max(0.0) as usize
+        } else {
+            n.min(len as f64) as usize
+        }
+    };
+    match name {
+        // 23.1.3.23
+        "push" => {
+            let mut n = len;
+            for v in args {
+                set(n, v)?;
+                n += 1;
+            }
+            set_len(n)?;
+            Ok(Value::Float(n as f64))
+        }
+        // 23.1.3.22
+        "pop" => {
+            if len == 0 {
+                set_len(0)?;
+                return Ok(Value::Undef);
+            }
+            let element = get(len - 1)?;
+            del(len - 1)?;
+            set_len(len - 1)?;
+            Ok(element)
+        }
+        // 23.1.3.27
+        "shift" => {
+            if len == 0 {
+                set_len(0)?;
+                return Ok(Value::Undef);
+            }
+            let first = get(0)?;
+            for k in 1..len {
+                move_elem(k, k - 1)?;
+            }
+            del(len - 1)?;
+            set_len(len - 1)?;
+            Ok(first)
+        }
+        // 23.1.3.37
+        "unshift" => {
+            let count = args.len();
+            if count > 0 {
+                for k in (1..=len).rev() {
+                    move_elem(k - 1, k + count - 1)?;
+                }
+                for (j, v) in args.into_iter().enumerate() {
+                    set(j, v)?;
+                }
+            }
+            set_len(len + count)?;
+            Ok(Value::Float((len + count) as f64))
+        }
+        // 23.1.3.26
+        "reverse" => {
+            for lower in 0..len / 2 {
+                let upper = len - lower - 1;
+                let lower_v = if has(lower)? { Some(get(lower)?) } else { None };
+                let upper_v = if has(upper)? { Some(get(upper)?) } else { None };
+                match (lower_v, upper_v) {
+                    (Some(l), Some(u)) => {
+                        set(lower, u)?;
+                        set(upper, l)?;
+                    }
+                    (None, Some(u)) => {
+                        set(lower, u)?;
+                        del(upper)?;
+                    }
+                    (Some(l), None) => {
+                        del(lower)?;
+                        set(upper, l)?;
+                    }
+                    (None, None) => {}
+                }
+            }
+            Ok(o.clone())
+        }
+        // 23.1.3.7
+        "fill" => {
+            let value = args.first().cloned().unwrap_or(Value::Undef);
+            let start = num(1).map_or(0, relative);
+            let end = num(2).map_or(len, relative);
+            for k in start..end.max(start) {
+                set(k, value.clone())?;
+            }
+            Ok(o.clone())
+        }
+        // 23.1.3.4
+        "copyWithin" => {
+            let to = num(0).map_or(0, relative);
+            let from = num(1).map_or(0, relative);
+            let fin = num(2).map_or(len, relative);
+            let count = fin.saturating_sub(from).min(len - to);
+            if from < to && to < from + count {
+                for i in (0..count).rev() {
+                    move_elem(from + i, to + i)?;
+                }
+            } else {
+                for i in 0..count {
+                    move_elem(from + i, to + i)?;
+                }
+            }
+            Ok(o.clone())
+        }
+        // 23.1.3.30: the present elements are sorted first, then written back
+        // from index 0, and the indices past them deleted.
+        "sort" => {
+            let mut present = Vec::new();
+            for k in 0..len {
+                if has(k)? {
+                    present.push(get(k)?);
+                }
+            }
+            let count = present.len();
+            let tmp = with_host(|h| h.new_array(present));
+            array_method_on(&tmp, o, "sort", args)?;
+            let sorted = with_host(|h| match h.get(&tmp) {
+                Some(JsObj::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            });
+            for (j, v) in sorted.into_iter().enumerate() {
+                set(j, v)?;
+            }
+            for j in count..len {
+                del(j)?;
+            }
+            Ok(o.clone())
+        }
+        // 23.1.3.31
+        "splice" => {
+            let start = num(0).map_or(0, relative);
+            let delete = match args.len() {
+                0 => 0,
+                1 => len - start,
+                _ => {
+                    let d = num(1).unwrap_or(0.0);
+                    let d = if d.is_nan() { 0.0 } else { d.trunc() };
+                    (d.max(0.0) as usize).min(len - start)
+                }
+            };
+            let items: Vec<Value> = args.into_iter().skip(2).collect();
+            let mut removed = Vec::with_capacity(delete);
+            let mut holes = rustc_hash::FxHashSet::default();
+            for k in 0..delete {
+                if has(start + k)? {
+                    removed.push(get(start + k)?);
+                } else {
+                    holes.insert(k);
+                    removed.push(Value::Undef);
+                }
+            }
+            let out = array_species_create(
+                o,
+                removed,
+                SpeciesWrite {
+                    ctor_len: delete,
+                    set_length: true,
+                },
+            )?;
+            with_host(|h| h.install_holes(&out, holes));
+            let count = items.len();
+            if count < delete {
+                for k in start..len - delete {
+                    move_elem(k + delete, k + count)?;
+                }
+                for k in (len - delete + count..len).rev() {
+                    del(k)?;
+                }
+            } else if count > delete {
+                for k in (start + 1..=len - delete).rev() {
+                    move_elem(k + delete - 1, k + count - 1)?;
+                }
+            }
+            for (i, v) in items.into_iter().enumerate() {
+                set(start + i, v)?;
+            }
+            set_len(len - delete + count)?;
+            Ok(out)
+        }
+        _ => array_method_on(o, o, name, args),
+    }
 }
 
 /// The `Array.prototype` methods that WRITE to their receiver, and so need the
@@ -12591,25 +12841,8 @@ fn array_method_on(
     let args = coerce_numeric_args(ARRAY_METHOD_NUMERIC_ARGS, name, args)?;
     match name {
         "push" => {
-            // 23.1.3.23 step 4 defines each new element through
-            // `CreateDataPropertyOrThrow`, so a NON-EXTENSIBLE array refuses it:
-            // `Object.seal(a)` / `preventExtensions(a)` then `a.push(x)` is a
-            // TypeError. The elements were appended to the backing vector
-            // regardless, so sealing an array did not seal it.
-            if !args.is_empty() && !with_host(|h| h.is_extensible(recv)) {
-                let at = array_len(recv);
-                return Err(host::type_error(&format!(
-                    "Cannot add property {at}, object is not extensible"
-                )));
-            }
-            // Step 5 then SETS `length`, so a non-writable one refuses the push
-            // too — `defineProperty(a, 'length', {writable: false})` makes an
-            // array append-proof without sealing it.
-            if !args.is_empty() && !with_host(|h| h.prop_attrs(recv, "length").writable) {
-                return Err(host::type_error(
-                    "Cannot assign to read only property 'length' of object '[object Array]'",
-                ));
-            }
+            // A receiver that could refuse the appends or the `length` write
+            // runs the spec steps instead (`array_mutate_checked`).
             // `push` returns the new length; take it from the same mutable
             // borrow rather than copying the array back out to count it.
             let len = with_host(|h| {

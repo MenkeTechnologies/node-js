@@ -3505,3 +3505,12 @@ Pinned in `tests/language_parity.rs` (`console_dir_spreads_its_options_over_cust
 | `Readable.from(['ab']).pipe(new PassThrough()).on('data', …)`; `pipe` into a `Writable`; `push` after `pipe` | `ab`; `finish`; the pushed chunk | nothing; no `finish`; nothing — `src/stdlib/stream.rs` is a best-effort native model (no flowing/paused modes, `pipe` copies the queue once). The fix is a port of `lib/internal/streams` like `webstreams.js` |
 | `const s = 1; new Function('return typeof s')()`, `(0, eval)('typeof module')` | `undefined` — global code does not see the entry module's scope | `number` / `object`: the entry script's top-level bindings live in the global scope |
 | `{ using x = { [Symbol.dispose]() {} } }`, `DisposableStack`, `SuppressedError` | supported | `SyntaxError`; `undefined` |
+
+## FIXED in round 26 — verified against node v26.12.1
+
+Each row is pinned by a test in `tests/` that fails without the fix.
+
+| Case | node | was |
+|---|---|---|
+| `pop`, `shift`, `unshift`, `sort`, `reverse`, `fill`, `splice`, `copyWithin`, `push()` on a frozen, sealed or fixed-`length` array (`array_mutators_refuse_a_frozen_or_sealed_array_as_the_spec_steps_do`) | the TypeError of the first refused `Set`/`DeletePropertyOrThrow` of the spec steps (`Cannot delete property '2' of [object Array]`, `Cannot assign to read only property '0' …`), the array left as that step found it | every mutator but `push(x)` edited the element vector and returned normally |
+| `a[5] = 1` past a non-writable `length`; strict `sealed.length = 1` | refused (`Cannot assign to read only property 'length'`); `Cannot delete property '2'` | the array grew; the shrink stopped silently |
