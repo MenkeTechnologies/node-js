@@ -4,7 +4,7 @@
 // (metazoneInfo), en's metazone names (`zone/en.txt`, each `meta:` entry's
 // ls/ld/ss/sd) and the zone-specific names of `zone/en.txt` over
 // `zone/root.txt`. Times are UTC epoch seconds. Formatted by rustfmt; do not
-// edit by hand.
+// edit by hand: regenerate with scripts/gen_tznames.pl.
 
 /// `(alias, ICU canonical id)`, sorted by alias.
 pub(crate) const ALIASES: &[(&str, &str)] = &[
