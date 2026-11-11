@@ -183,7 +183,7 @@ fn read_fd_to_end(fd: i32) -> Result<Vec<u8>, String> {
     let r = if fd == 0 {
         // Through Rust's shared stdin buffer, so a read here and a
         // `readline` read of the same input never skip each other's bytes.
-        std::io::stdin().lock().read_to_end(&mut out)
+        crate::host::with_stdin_reader(|r| r.read_to_end(&mut out))
     } else {
         match with_file(fd, |file| {
             let mut fr: &File = file;
@@ -1387,7 +1387,7 @@ fn read_validated(
     let (offset, length) = (offset as usize, length as usize);
     let dest = &mut bytes[offset..offset + length];
     let got = if fd == 0 && position.is_none() {
-        std::io::stdin().lock().read(dest)
+        crate::host::with_stdin_reader(|r| r.read(dest))
     } else {
         use std::os::unix::fs::FileExt;
         match with_file(fd, |file| match position {

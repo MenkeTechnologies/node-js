@@ -1268,6 +1268,13 @@ pub struct JsHost {
     /// valid UTF-8 (`process.stdout.write(Buffer.from([0xff]))`), and a `String`
     /// buffer can only hold the lossy `U+FFFD` transcription of it.
     capture: Option<Vec<u8>>,
+    /// Whether [`Self::capture`] also takes stderr writes: set by
+    /// [`JsHost::begin_capture`] (a TUI keeps both streams off the terminal),
+    /// cleared by [`JsHost::begin_stdout_capture`].
+    capture_stderr: bool,
+    /// Standard input an embedder supplied ([`JsHost::set_stdin`]); `None` reads
+    /// the process stdin. Read through [`with_stdin_reader`].
+    stdin: Option<std::io::Cursor<Vec<u8>>>,
     /// `process.exitCode`: the code the process exits with when the event loop
     /// drains, or `None` while unset. Separate from an explicit
     /// `process.exit(n)`, which exits immediately with `n`.
@@ -1468,6 +1475,20 @@ pub fn with_host<R>(f: impl FnOnce(&mut JsHost) -> R) -> R {
 }
 
 /// Reset the host to a clean slate (fresh module frame).
+/// Run `f` against the program's standard input: the buffer set by
+/// [`JsHost::set_stdin`] when there is one, else the locked process stdin.
+///
+/// The buffer is taken out of the host for the duration of `f`, so `f` runs
+/// with no host borrow held.
+pub fn with_stdin_reader<T>(f: impl FnOnce(&mut dyn std::io::BufRead) -> T) -> T {
+    let Some(mut buf) = with_host(|h| h.stdin.take()) else {
+        return f(&mut std::io::stdin().lock());
+    };
+    let r = f(&mut buf);
+    with_host(|h| h.stdin = Some(buf));
+    r
+}
+
 pub fn reset_host() {
     with_host(|h| *h = JsHost::new());
     // Drop any cached module handles / factory closure — they index the old heap.
@@ -1561,6 +1582,8 @@ impl JsHost {
             io_rx: Some(io_rx),
             open_handles: 0,
             capture: None,
+            capture_stderr: false,
+            stdin: None,
             exit_code: None,
             fatal_handler_failed: false,
             exiting: false,
@@ -3756,6 +3779,23 @@ impl JsHost {
     /// discarded, so each run starts clean.
     pub fn begin_capture(&mut self) {
         self.capture = Some(Vec::new());
+        self.capture_stderr = true;
+    }
+
+    /// Like [`begin_capture`], but only stdout is captured; stderr writes
+    /// (`console.error`, `process.stderr.write`) still reach the process.
+    ///
+    /// [`begin_capture`]: JsHost::begin_capture
+    pub fn begin_stdout_capture(&mut self) {
+        self.capture = Some(Vec::new());
+        self.capture_stderr = false;
+    }
+
+    /// Make `input` the program's standard input: `process.stdin`,
+    /// `fs.readFileSync(0)`, `fs.readSync(0, …)` and `readline` all read it
+    /// instead of the process stdin.
+    pub fn set_stdin(&mut self, input: &[u8]) {
+        self.stdin = Some(std::io::Cursor::new(input.to_vec()));
     }
 
     /// Stop capturing and take everything written since [`begin_capture`],
@@ -3801,8 +3841,10 @@ impl JsHost {
     /// [`write_out`]: JsHost::write_out
     pub fn write_out_bytes(&mut self, bytes: &[u8], stderr: bool) {
         if let Some(buf) = &mut self.capture {
-            buf.extend_from_slice(bytes);
-            return;
+            if !stderr || self.capture_stderr {
+                buf.extend_from_slice(bytes);
+                return;
+            }
         }
         use std::io::Write as _;
         if stderr {

@@ -27,7 +27,6 @@ use crate::host::{is_callable, with_host, JsObj};
 use fusevm::Value;
 use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
 
 pub const METHODS: &[&str] = &[
     "createInterface",
@@ -462,19 +461,17 @@ fn clear_listeners(recv: &Value, event: Option<&str>) {
 /// Read one line from stdin, stripping the trailing CR/LF. EOF yields "".
 fn read_line() -> String {
     let mut line = String::new();
-    let _ = io::stdin().read_line(&mut line);
+    let _ = crate::host::with_stdin_reader(|r| r.read_line(&mut line));
     while line.ends_with('\n') || line.ends_with('\r') {
         line.pop();
     }
     line
 }
 
-/// Write `s` to real stdout and flush (this is explicit program output — a
-/// readline prompt / write — not informational chatter).
+/// Write `s` as program stdout (a cursor-control sequence) through the host's
+/// output sink, so an embedder's capture sees it like any `console.log`.
 fn write_stdout(s: &str) {
-    let mut out = io::stdout();
-    let _ = out.write_all(s.as_bytes());
-    let _ = out.flush();
+    with_host(|h| h.write_out(s, false));
 }
 
 /// Write to the interface's configured `output` stream, falling back to stdout

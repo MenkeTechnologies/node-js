@@ -66,3 +66,60 @@ fn seeded_globals_are_real_strings() {
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(out, "string\n");
 }
+
+// ── run_program: the uniform `(src, input) -> Result<stdout, error>` entry ──
+
+#[test]
+fn run_program_captures_stdout_only() {
+    let out = nodejs::run_program(
+        r#"process.stdout.write("raw "); console.log("log"); console.error("err");"#,
+        "",
+    );
+    assert_eq!(out.as_deref(), Ok("raw log\n"));
+}
+
+/// `fs.readFileSync(0)` and a `readline` interface over `process.stdin` both
+/// read the supplied input, not the test process's stdin.
+#[test]
+fn run_program_feeds_input_as_stdin() {
+    let sync = nodejs::run_program(
+        r#"console.log(require("fs").readFileSync(0, "utf8").toUpperCase())"#,
+        "ab\ncd\n",
+    );
+    assert_eq!(sync.as_deref(), Ok("AB\nCD\n\n"));
+    let lines = nodejs::run_program(
+        r#"
+        const rl = require("readline").createInterface({ input: process.stdin });
+        rl.on("line", l => console.log(l.length));
+        "#,
+        "abc\nde\n",
+    );
+    assert_eq!(lines.as_deref(), Ok("3\n2\n"));
+}
+
+#[test]
+fn run_program_errors_and_exit_status() {
+    let thrown = nodejs::run_program("throw new Error('boom')", "").unwrap_err();
+    assert!(thrown.contains("boom"), "{thrown}");
+    assert!(nodejs::run_program("let = ;", "").is_err());
+    assert!(nodejs::run_program("console.log('x'); process.exit(3)", "").is_err());
+    assert!(nodejs::run_program("process.exitCode = 2", "").is_err());
+    let early = nodejs::run_program("console.log('x'); process.exit(0); console.log('y')", "");
+    assert_eq!(early.as_deref(), Ok("x\n"));
+}
+
+#[test]
+fn run_program_concurrent_calls_do_not_mix_output() {
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let src = format!("for (let k = 0; k < 200; k++) console.log({i})");
+                (i, nodejs::run_program(&src, "").unwrap())
+            })
+        })
+        .collect();
+    for h in handles {
+        let (i, out) = h.join().unwrap();
+        assert_eq!(out, format!("{i}\n").repeat(200));
+    }
+}

@@ -654,6 +654,8 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
             crate::cache::flush();
             // In a worker this ends the worker thread and does not return.
             super::worker_threads::exit_if_worker(code);
+            // Under `run_program` this unwinds to the embedder instead.
+            crate::embed::exit_if_embedded(code);
             std::process::exit(code);
         }
         // `process.chdir(dir)` really changes the working directory, and throws on
@@ -762,7 +764,10 @@ pub fn call(method: &str, args: &[Value]) -> Option<Result<Value, String>> {
         // `ref`/`unref` on the process object are chainable no-ops (no libuv
         // handle refcount to touch); return the process namespace.
         "ref" | "unref" => Ok(with_host(|h| h.alloc(JsObj::Builtin("process".into())))),
-        "abort" => std::process::abort(),
+        "abort" => {
+            crate::embed::exit_if_embedded(134);
+            std::process::abort()
+        }
         "getActiveResourcesInfo" => Ok(with_host(|h| h.new_array(Vec::new()))),
         "resourceUsage" => Ok(resource_usage()),
         "threadCpuUsage" => Ok(thread_cpu_usage()),
@@ -1506,14 +1511,13 @@ fn incomplete_utf8_tail(b: &[u8]) -> usize {
 
 /// One turn of the stdin pump.
 fn stdin_pump() -> Result<(), String> {
-    use std::io::Read;
     let recv = stdin_value();
     if with_stdin(|s| s.paused) {
         with_stdin(|s| s.pumping = false);
         return Ok(());
     }
     let mut buf = vec![0u8; 65536];
-    let n = std::io::stdin().lock().read(&mut buf).unwrap_or(0);
+    let n = crate::host::with_stdin_reader(|r| r.read(&mut buf)).unwrap_or(0);
     if n == 0 {
         return stdin_end(&recv);
     }

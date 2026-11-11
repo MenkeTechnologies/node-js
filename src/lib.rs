@@ -20,6 +20,7 @@ pub mod compiler;
 pub mod core_arity;
 pub mod dap;
 pub mod datefmt;
+pub mod embed;
 pub mod esm;
 pub mod host;
 pub mod ieee754;
@@ -41,6 +42,7 @@ pub mod tznames;
 pub mod utf16;
 
 pub use fusevm::Value;
+pub use embed::run_program;
 
 /// Stack reserved for the thread JS runs on ([`run_on_js_stack`]).
 ///
@@ -400,17 +402,27 @@ pub fn eval_str_print(src: &str, origin: &str) -> Result<(), String> {
 /// assert_eq!(out, "HI\n");
 /// ```
 pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, String>, String) {
-    host::reset_host();
-    if let Ok(cwd) = std::env::current_dir() {
-        module::set_entry_dir(cwd);
-    }
-    host::with_host(|h| {
+    run_on_fresh_host(src, |h| {
         for (name, text) in globals {
             let value = h.new_str(*text);
             h.set_global(name, value);
         }
         h.begin_capture();
-    });
+    })
+}
+
+/// Reset the host, let `setup` prepare it (globals, capture, stdin), run `src`
+/// to completion, and return the outcome with whatever capture collected.
+/// Shared by [`eval_str_captured`] and [`embed::run_program`].
+pub(crate) fn run_on_fresh_host(
+    src: &str,
+    setup: impl FnOnce(&mut host::JsHost),
+) -> (Result<Value, String>, String) {
+    host::reset_host();
+    if let Ok(cwd) = std::env::current_dir() {
+        module::set_entry_dir(cwd);
+    }
+    host::with_host(setup);
     let result = compile_or_load(src).and_then(run_compiled);
     let output = host::with_host(|h| h.end_capture());
     (result, output)

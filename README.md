@@ -41,6 +41,7 @@ The binary is `node`.
 - [\[0x04\] Not Yet (Later Waves)](#0x04-not-yet-later-waves)
 - [\[0x05\] Parity Harness & Fuzzer](#0x05-parity-harness--fuzzer)
 - [\[0x06\] Build](#0x06-build)
+- [\[0x06a\] Embedding](#0x06a-embedding)
 - [\[0x07\] Documentation](#0x07-documentation)
 - [\[0xFF\] License](#0xff-license)
 
@@ -358,6 +359,29 @@ cargo test
 node-js is a standalone crate (an explicit empty `[workspace]` stops cargo
 walking up to the meta parent). `fusevm` is pulled from crates.io with the `jit`,
 `jit-disk-cache`, `aot`, and `ffi` features.
+
+## [0x06a] EMBEDDING
+
+The `nodejs` library crate exposes one string-in/string-out entry point for Rust hosts:
+
+```rust
+pub fn run_program(src: &str, input: &str) -> Result<String, String>
+```
+
+- Each call runs on its own thread (`JS_STACK_SIZE` stack) with a freshly reset host; no state carries over between calls, and concurrent calls never share an output buffer.
+- `input` is the program's standard input: `process.stdin` (events, `read()`, async iteration), `fs.readFileSync(0)`, `fs.readSync(0, …)` and `readline`.
+- Returns everything written to stdout (`console.log`, `process.stdout.write`, readline cursor writes). stderr (`console.error`) still goes to the process stderr.
+- Compile errors, uncaught exceptions, a nonzero `process.exitCode`, `process.exit(n)` with n != 0, `process.abort()` and runtime panics return `Err(message)`. `process.exit(0)` returns `Ok` with the output written so far; the process is never exited.
+
+```rust
+let out = nodejs::run_program(
+    r#"console.log(require("fs").readFileSync(0, "utf8").trim().toUpperCase())"#,
+    "hi\n",
+)?;
+assert_eq!(out, "HI\n");
+```
+
+`eval_str_captured(src, globals)` is the lower-level variant: it binds string globals, captures stdout and stderr together, and returns the completion value alongside the output.
 
 ## [0x07] DOCUMENTATION
 
