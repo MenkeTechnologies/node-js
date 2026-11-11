@@ -41,8 +41,8 @@ pub mod tzif;
 pub mod tznames;
 pub mod utf16;
 
-pub use fusevm::Value;
 pub use embed::run_program;
+pub use fusevm::Value;
 
 /// Stack reserved for the thread JS runs on ([`run_on_js_stack`]).
 ///
